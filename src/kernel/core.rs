@@ -17,8 +17,8 @@ use super::{
     error::KernelError,
     policy::{Capability, PolicyStore, Scope},
     runtime::{
-        MockRuntimeAdapter, RuntimeEvent, RuntimeRegistry, RuntimeSessionStartInput,
-        RuntimeTurnInput,
+        MockRuntimeAdapter, RuntimeCapabilityRequest, RuntimeCapabilityResult, RuntimeEvent,
+        RuntimeRegistry, RuntimeSessionStartInput, RuntimeTurnInput,
     },
     selector::SkillSelector,
     sessions::SessionStore,
@@ -154,7 +154,7 @@ impl Kernel {
             .await
             .map_err(|err| KernelError::Runtime(err.to_string()))?;
 
-        let runtime_events = adapter
+        let turn_output = adapter
             .turn(RuntimeTurnInput {
                 runtime_session_id: handle.runtime_session_id.clone(),
                 prompt: req.user_text.clone(),
@@ -162,6 +162,22 @@ impl Kernel {
             })
             .await
             .map_err(|err| KernelError::Runtime(err.to_string()))?;
+
+        let mut runtime_events = turn_output.events;
+        if !turn_output.capability_requests.is_empty() {
+            let capability_results = self
+                .evaluate_capability_requests(
+                    session.session_id,
+                    &allowed_skills,
+                    turn_output.capability_requests,
+                )
+                .await?;
+            let followup = adapter
+                .resolve_capability_requests(&handle, capability_results)
+                .await
+                .map_err(|err| KernelError::Runtime(err.to_string()))?;
+            runtime_events.extend(followup);
+        }
 
         adapter
             .close(&handle)
@@ -452,4 +468,95 @@ fn to_skill_view(skill: super::skills::SkillRecord) -> SkillView {
 
 fn internal(err: anyhow::Error) -> KernelError {
     KernelError::Internal(err.to_string())
+}
+
+impl Kernel {
+    async fn evaluate_capability_requests(
+        &self,
+        session_id: uuid::Uuid,
+        allowed_skill_ids: &[String],
+        requests: Vec<RuntimeCapabilityRequest>,
+    ) -> Result<Vec<RuntimeCapabilityResult>, KernelError> {
+        let session_scope = Scope::Session(session_id);
+        let any_scope = Scope::Any;
+
+        let mut results = Vec::with_capacity(requests.len());
+        for request in requests {
+            let request_id = request.request_id.clone();
+            let skill_id = request.skill_id.clone();
+            let requested_scope_raw = request
+                .scope
+                .clone()
+                .unwrap_or_else(|| session_scope.as_str());
+
+            let mut decision_scope = session_scope.clone();
+            let mut allowed = false;
+            let mut reason = None;
+
+            let skill_is_selected = allowed_skill_ids.iter().any(|value| value == &skill_id);
+            if !skill_is_selected {
+                reason = Some("skill is not selected for this turn".to_string());
+            } else {
+                match request.scope.as_deref() {
+                    Some(raw_scope) => match Scope::from_str(raw_scope) {
+                        Ok(parsed) => {
+                            decision_scope = parsed;
+                        }
+                        Err(err) => {
+                            reason = Some(format!("invalid scope from runtime: {}", err));
+                        }
+                    },
+                    None => {
+                        decision_scope = session_scope.clone();
+                    }
+                }
+            }
+
+            if reason.is_none() {
+                let allowed_for_scope = self
+                    .policy
+                    .is_allowed(&skill_id, request.capability, &decision_scope)
+                    .await
+                    .map_err(internal)?;
+                let allowed_globally = self
+                    .policy
+                    .is_allowed(&skill_id, request.capability, &any_scope)
+                    .await
+                    .map_err(internal)?;
+
+                allowed = allowed_for_scope || allowed_globally;
+                if !allowed {
+                    reason = Some("policy denied capability request".to_string());
+                }
+            }
+
+            self.audit
+                .append(
+                    "capability.request",
+                    Some(session_id),
+                    Some("kernel".to_string()),
+                    json!({
+                        "request_id": request_id,
+                        "skill_id": skill_id,
+                        "capability": request.capability.as_str(),
+                        "requested_scope": requested_scope_raw,
+                        "effective_scope": decision_scope.as_str(),
+                        "allowed": allowed,
+                        "reason": reason.clone(),
+                        "payload": request.payload,
+                    }),
+                )
+                .await
+                .map_err(internal)?;
+
+            results.push(RuntimeCapabilityResult {
+                request_id,
+                allowed,
+                reason,
+                output: serde_json::Value::Null,
+            });
+        }
+
+        Ok(results)
+    }
 }
