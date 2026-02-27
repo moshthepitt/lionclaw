@@ -42,6 +42,21 @@
 - `cancel()`
 - `close()`
 
+Runtime module layout:
+
+- `kernel/runtime/mod.rs`: shared runtime contracts + registry.
+- `kernel/runtime/builtins.rs`: built-in adapter IDs + registration.
+- `kernel/runtime/adapters/mock.rs`: deterministic test adapter.
+- `kernel/runtime/adapters/codex.rs`: production subprocess adapter.
+- `kernel/runtime/adapters/subprocess.rs`: shared subprocess execution utility.
+
+Adding a new adapter:
+
+1. Add `kernel/runtime/adapters/<adapter>.rs` implementing `RuntimeAdapter`.
+2. Export it from `kernel/runtime/adapters/mod.rs`.
+3. Register it in `kernel/runtime/builtins.rs`.
+4. Add unit tests in the adapter module + one kernel-level integration case.
+
 ## Channel-Skill Contract
 
 - `id()`

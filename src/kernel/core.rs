@@ -17,8 +17,9 @@ use super::{
     error::KernelError,
     policy::{Capability, PolicyStore, Scope},
     runtime::{
-        CodexRuntimeAdapter, MockRuntimeAdapter, RuntimeCapabilityRequest, RuntimeCapabilityResult,
+        register_builtin_runtime_adapters, RuntimeCapabilityRequest, RuntimeCapabilityResult,
         RuntimeEvent, RuntimeRegistry, RuntimeSessionStartInput, RuntimeTurnInput,
+        BUILTIN_RUNTIME_MOCK,
     },
     selector::SkillSelector,
     sessions::SessionStore,
@@ -57,11 +58,8 @@ impl Kernel {
     }
 
     async fn bootstrap(&self) {
-        let runtime = Arc::new(MockRuntimeAdapter);
-        let codex_runtime = Arc::new(CodexRuntimeAdapter::from_env());
         let channel = Arc::new(LocalCliChannel);
-        self.runtime.register("mock", runtime).await;
-        self.runtime.register("codex", codex_runtime).await;
+        register_builtin_runtime_adapters(&self.runtime).await;
         self.channels.register(channel).await;
     }
 
@@ -142,7 +140,9 @@ impl Kernel {
             }
         }
 
-        let runtime_id = req.runtime_id.unwrap_or_else(|| "mock".to_string());
+        let runtime_id = req
+            .runtime_id
+            .unwrap_or_else(|| BUILTIN_RUNTIME_MOCK.to_string());
         let adapter = self.runtime.get(&runtime_id).await.ok_or_else(|| {
             KernelError::NotFound(format!("runtime adapter '{}' not found", runtime_id))
         })?;
