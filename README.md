@@ -1,0 +1,34 @@
+# LionClaw
+
+LionClaw is a secure-first local agent kernel.
+
+It is built around four constraints:
+
+1. Anthropic skill format (`SKILL.md`) is used as-is.
+2. Security boundaries are enforced by the kernel, not by prompt text.
+3. Channels are skills (no default external channel in core).
+4. Multiple agent runtimes are supported via adapters (`codex`, `claude-code`, `gemini-cli`, etc.).
+
+## Status
+
+`v0` is an implementation skeleton with:
+
+- A runnable daemon (`lionclawd`) HTTP API
+- In-memory kernel services (sessions, skills, policy, audit)
+- Runtime adapter contract + mock adapter implementation
+- Channel-skill contract + local stub channel
+- Planning and roadmap docs
+
+See:
+
+- `docs/V0_PLAN.md`
+- `docs/ARCHITECTURE.md`
+- `docs/ROADMAP.md`
+
+## Run
+
+```bash
+cargo run
+```
+
+Server starts on `127.0.0.1:3000` by default.

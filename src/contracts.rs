@@ -1,0 +1,144 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustTier {
+    Main,
+    Untrusted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionOpenRequest {
+    pub channel_id: String,
+    pub peer_id: String,
+    pub trust_tier: TrustTier,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionOpenResponse {
+    pub session_id: Uuid,
+    pub channel_id: String,
+    pub peer_id: String,
+    pub trust_tier: TrustTier,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTurnRequest {
+    pub session_id: Uuid,
+    pub user_text: String,
+    pub runtime_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeEventDto {
+    pub kind: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTurnResponse {
+    pub session_id: Uuid,
+    pub assistant_text: String,
+    pub selected_skills: Vec<String>,
+    pub runtime_id: String,
+    pub runtime_events: Vec<RuntimeEventDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillInstallRequest {
+    pub source: String,
+    pub reference: Option<String>,
+    pub hash: Option<String>,
+    pub skill_md: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillInstallResponse {
+    pub skill_id: String,
+    pub name: String,
+    pub hash: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillView {
+    pub skill_id: String,
+    pub name: String,
+    pub description: String,
+    pub source: String,
+    pub reference: Option<String>,
+    pub hash: String,
+    pub enabled: bool,
+    pub installed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillListResponse {
+    pub skills: Vec<SkillView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillToggleRequest {
+    pub skill_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillToggleResponse {
+    pub skill_id: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyGrantRequest {
+    pub skill_id: String,
+    pub capability: String,
+    pub scope: String,
+    pub ttl_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyGrantResponse {
+    pub grant_id: Uuid,
+    pub skill_id: String,
+    pub capability: String,
+    pub scope: String,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyRevokeRequest {
+    pub grant_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyRevokeResponse {
+    pub grant_id: Uuid,
+    pub revoked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEventView {
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub session_id: Option<Uuid>,
+    pub actor: Option<String>,
+    pub details: Value,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditQueryResponse {
+    pub events: Vec<AuditEventView>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuditQueryParams {
+    pub session_id: Option<Uuid>,
+    pub event_type: Option<String>,
+    pub since: Option<String>,
+    pub limit: Option<usize>,
+}
