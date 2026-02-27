@@ -1,7 +1,10 @@
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use tokio::sync::RwLock;
+use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
+
+use crate::kernel::db::{datetime_to_ms, ms_to_datetime, now_ms};
 
 #[derive(Debug, Clone)]
 pub struct AuditEvent {
@@ -13,14 +16,14 @@ pub struct AuditEvent {
     pub timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct AuditLog {
-    events: RwLock<Vec<AuditEvent>>,
+    pool: SqlitePool,
 }
 
 impl AuditLog {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
     }
 
     pub async fn append(
@@ -29,16 +32,29 @@ impl AuditLog {
         session_id: Option<Uuid>,
         actor: Option<String>,
         details: Value,
-    ) {
-        let event = AuditEvent {
-            event_id: Uuid::new_v4(),
-            event_type: event_type.into(),
-            session_id,
-            actor,
-            details,
-            timestamp: Utc::now(),
-        };
-        self.events.write().await.push(event);
+    ) -> Result<()> {
+        let event_id = Uuid::new_v4();
+        let event_type = event_type.into();
+        let details_json =
+            serde_json::to_string(&details).context("failed to encode audit details")?;
+        let timestamp_ms = now_ms();
+
+        sqlx::query(
+            "INSERT INTO audit_events \
+             (event_id, event_type, session_id, actor, details_json, timestamp_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(event_id.to_string())
+        .bind(&event_type)
+        .bind(session_id.map(|value| value.to_string()))
+        .bind(actor)
+        .bind(details_json)
+        .bind(timestamp_ms)
+        .execute(&self.pool)
+        .await
+        .context("failed to append audit event")?;
+
+        Ok(())
     }
 
     pub async fn query(
@@ -47,35 +63,57 @@ impl AuditLog {
         event_type: Option<String>,
         since: Option<DateTime<Utc>>,
         limit: Option<usize>,
-    ) -> Vec<AuditEvent> {
-        let limit = limit.unwrap_or(100).min(1000);
-        let wanted_type = event_type.map(|v| v.to_lowercase());
+    ) -> Result<Vec<AuditEvent>> {
+        let limit = limit.unwrap_or(100).min(1000) as i64;
+        let session_id_raw = session_id.map(|value| value.to_string());
+        let since_ms = since.map(datetime_to_ms);
 
-        let events = self.events.read().await;
-        let mut filtered = events
-            .iter()
-            .filter(|event| {
-                if let Some(id) = session_id {
-                    if event.session_id != Some(id) {
-                        return false;
-                    }
-                }
-                if let Some(ref et) = wanted_type {
-                    if event.event_type.to_lowercase() != *et {
-                        return false;
-                    }
-                }
-                if let Some(ts) = since {
-                    if event.timestamp < ts {
-                        return false;
-                    }
-                }
-                true
+        let rows = sqlx::query(
+            "SELECT event_id, event_type, session_id, actor, details_json, timestamp_ms \
+             FROM audit_events \
+             WHERE (?1 IS NULL OR session_id = ?1) \
+               AND (?2 IS NULL OR lower(event_type) = lower(?2)) \
+               AND (?3 IS NULL OR timestamp_ms >= ?3) \
+             ORDER BY timestamp_ms DESC \
+             LIMIT ?4",
+        )
+        .bind(session_id_raw)
+        .bind(event_type)
+        .bind(since_ms)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to query audit events")?;
+
+        rows.into_iter()
+            .map(|row| {
+                let event_id_raw: String = row.get("event_id");
+                let session_id_raw: Option<String> = row.get("session_id");
+                let details_raw: String = row.get("details_json");
+                let timestamp_ms: i64 = row.get("timestamp_ms");
+
+                let event_id = Uuid::parse_str(&event_id_raw)
+                    .with_context(|| format!("invalid event id '{}'", event_id_raw))?;
+                let session_id = session_id_raw
+                    .map(|value| {
+                        Uuid::parse_str(&value)
+                            .with_context(|| format!("invalid session id '{}'", value))
+                    })
+                    .transpose()?;
+                let details = serde_json::from_str(&details_raw)
+                    .with_context(|| format!("invalid audit details '{}'", details_raw))?;
+                let timestamp = ms_to_datetime(timestamp_ms)
+                    .ok_or_else(|| anyhow!("invalid timestamp_ms '{}'", timestamp_ms))?;
+
+                Ok(AuditEvent {
+                    event_id,
+                    event_type: row.get("event_type"),
+                    session_id,
+                    actor: row.get("actor"),
+                    details,
+                    timestamp,
+                })
             })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        filtered.sort_by_key(|event| event.timestamp);
-        filtered.into_iter().rev().take(limit).collect()
+            .collect()
     }
 }

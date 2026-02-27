@@ -1,8 +1,9 @@
-use std::collections::HashMap;
-
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
-use tokio::sync::RwLock;
+use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
+
+use crate::kernel::db::{ms_to_datetime, now_ms};
 
 #[derive(Debug, Clone)]
 pub struct SkillRecord {
@@ -24,17 +25,17 @@ pub struct SkillInstallInput {
     pub skill_md: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct SkillStore {
-    by_id: RwLock<HashMap<String, SkillRecord>>,
+    pool: SqlitePool,
 }
 
 impl SkillStore {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
     }
 
-    pub async fn install(&self, input: SkillInstallInput) -> SkillRecord {
+    pub async fn install(&self, input: SkillInstallInput) -> Result<SkillRecord> {
         let (name, description) = input
             .skill_md
             .as_deref()
@@ -56,56 +57,152 @@ impl SkillStore {
             hex::encode(hasher.finalize())
         });
 
+        let reference_key = input.reference.unwrap_or_default();
+
+        if let Some(existing) = self
+            .find_by_provenance(&input.source, &reference_key, &hash)
+            .await?
+        {
+            return Ok(existing);
+        }
+
         let short_hash = &hash[..12.min(hash.len())];
         let skill_id = format!("{}-{}", sanitize_skill_name(&name), short_hash);
+        let installed_at_ms = now_ms();
 
-        let record = SkillRecord {
-            skill_id: skill_id.clone(),
-            name,
-            description,
-            source: input.source,
-            reference: input.reference,
-            hash,
-            enabled: false,
-            installed_at: Utc::now(),
-        };
+        let insert_result = sqlx::query(
+            "INSERT INTO skills \
+             (skill_id, name, description, source, reference, hash, enabled, installed_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+        )
+        .bind(&skill_id)
+        .bind(&name)
+        .bind(&description)
+        .bind(&input.source)
+        .bind(&reference_key)
+        .bind(&hash)
+        .bind(installed_at_ms)
+        .execute(&self.pool)
+        .await;
 
-        self.by_id.write().await.insert(skill_id, record.clone());
-        record
+        if let Err(err) = insert_result {
+            if let Some(existing) = self
+                .find_by_provenance(&input.source, &reference_key, &hash)
+                .await?
+            {
+                return Ok(existing);
+            }
+            return Err(err).context("failed to insert skill");
+        }
+
+        self.get(&skill_id)
+            .await?
+            .ok_or_else(|| anyhow!("skill disappeared immediately after insert"))
     }
 
-    pub async fn list(&self) -> Vec<SkillRecord> {
-        let mut skills = self
-            .by_id
-            .read()
+    pub async fn list(&self) -> Result<Vec<SkillRecord>> {
+        let rows = sqlx::query(
+            "SELECT skill_id, name, description, source, reference, hash, enabled, installed_at_ms \
+             FROM skills \
+             ORDER BY installed_at_ms ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list skills")?;
+
+        rows.into_iter().map(map_skill_row).collect()
+    }
+
+    pub async fn set_enabled(&self, skill_id: &str, enabled: bool) -> Result<Option<SkillRecord>> {
+        let changed = sqlx::query("UPDATE skills SET enabled = ?2 WHERE skill_id = ?1")
+            .bind(skill_id)
+            .bind(if enabled { 1 } else { 0 })
+            .execute(&self.pool)
             .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        skills.sort_by_key(|skill| skill.installed_at);
-        skills
+            .context("failed to update skill enabled state")?;
+
+        if changed.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        self.get(skill_id).await
     }
 
-    pub async fn set_enabled(&self, skill_id: &str, enabled: bool) -> Option<SkillRecord> {
-        let mut skills = self.by_id.write().await;
-        let skill = skills.get_mut(skill_id)?;
-        skill.enabled = enabled;
-        Some(skill.clone())
+    pub async fn get(&self, skill_id: &str) -> Result<Option<SkillRecord>> {
+        let row = sqlx::query(
+            "SELECT skill_id, name, description, source, reference, hash, enabled, installed_at_ms \
+             FROM skills \
+             WHERE skill_id = ?1",
+        )
+        .bind(skill_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query skill")?;
+
+        row.map(map_skill_row).transpose()
     }
 
-    pub async fn get(&self, skill_id: &str) -> Option<SkillRecord> {
-        self.by_id.read().await.get(skill_id).cloned()
+    pub async fn list_enabled(&self) -> Result<Vec<SkillRecord>> {
+        let rows = sqlx::query(
+            "SELECT skill_id, name, description, source, reference, hash, enabled, installed_at_ms \
+             FROM skills \
+             WHERE enabled = 1 \
+             ORDER BY installed_at_ms ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list enabled skills")?;
+
+        rows.into_iter().map(map_skill_row).collect()
     }
 
-    pub async fn list_enabled(&self) -> Vec<SkillRecord> {
-        self.by_id
-            .read()
-            .await
-            .values()
-            .filter(|skill| skill.enabled)
-            .cloned()
-            .collect()
+    async fn find_by_provenance(
+        &self,
+        source: &str,
+        reference: &str,
+        hash: &str,
+    ) -> Result<Option<SkillRecord>> {
+        let row = sqlx::query(
+            "SELECT skill_id, name, description, source, reference, hash, enabled, installed_at_ms \
+             FROM skills \
+             WHERE source = ?1 AND reference = ?2 AND hash = ?3",
+        )
+        .bind(source)
+        .bind(reference)
+        .bind(hash)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query skill by provenance")?;
+
+        row.map(map_skill_row).transpose()
     }
+}
+
+fn map_skill_row(row: SqliteRow) -> Result<SkillRecord> {
+    let installed_at_ms: i64 = row.get("installed_at_ms");
+    let installed_at = ms_to_datetime(installed_at_ms)
+        .ok_or_else(|| anyhow!("invalid installed_at_ms '{}'", installed_at_ms))?;
+
+    let enabled_raw: i64 = row.get("enabled");
+    let enabled = enabled_raw != 0;
+
+    let reference_raw: String = row.get("reference");
+    let reference = if reference_raw.is_empty() {
+        None
+    } else {
+        Some(reference_raw)
+    };
+
+    Ok(SkillRecord {
+        skill_id: row.get("skill_id"),
+        name: row.get("name"),
+        description: row.get("description"),
+        source: row.get("source"),
+        reference,
+        hash: row.get("hash"),
+        enabled,
+        installed_at,
+    })
 }
 
 fn derive_name_from_source(source: &str) -> String {

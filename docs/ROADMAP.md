@@ -35,7 +35,7 @@ To claim "NanoClaw-level runnable", LionClaw must support all items below:
 
 - [x] Daemon scaffold (`lionclawd`) and health endpoint.
 - [x] Core API surface for sessions, skills, policy, and audit.
-- [x] In-memory services for sessions/skills/policy/audit.
+- [x] SQLite-backed services for sessions/skills/policy/audit.
 - [x] Runtime adapter interface and mock runtime adapter.
 - [x] Channel interface and local channel stub.
 - [x] Deterministic skill selector scaffold.

@@ -43,7 +43,7 @@ LionClaw v0 is a local daemon kernel that:
 ## v0 Deliverables
 
 1. Kernel API endpoints for session/skill/policy/audit basics.
-2. In-memory implementations of kernel services.
+2. SQLite-backed implementations of kernel services.
 3. Runtime adapter interface + mock adapter.
 4. Channel-skill interface + local channel stub.
 5. Skill selection pipeline with deterministic, simple scoring.

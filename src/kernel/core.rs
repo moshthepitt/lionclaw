@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::Path, str::FromStr, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
@@ -13,8 +13,9 @@ use crate::contracts::{
 use super::{
     audit::AuditLog,
     channels::{ChannelRegistry, LocalCliChannel},
+    db::Db,
     error::KernelError,
-    policy::PolicyStore,
+    policy::{Capability, PolicyStore, Scope},
     runtime::{
         MockRuntimeAdapter, RuntimeEvent, RuntimeRegistry, RuntimeSessionStartInput,
         RuntimeTurnInput,
@@ -35,22 +36,24 @@ pub struct Kernel {
 }
 
 impl Kernel {
-    pub async fn new() -> Self {
+    pub async fn new(db_path: &Path) -> anyhow::Result<Self> {
+        let db = Db::connect_file(db_path).await?;
+        let pool = db.pool();
         let runtime = RuntimeRegistry::new();
         let channels = ChannelRegistry::new();
 
         let kernel = Self {
-            sessions: SessionStore::new(),
-            skills: SkillStore::new(),
+            sessions: SessionStore::new(pool.clone()),
+            skills: SkillStore::new(pool.clone()),
             selector: SkillSelector::new(),
-            policy: PolicyStore::new(),
+            policy: PolicyStore::new(pool.clone()),
             runtime,
             channels,
-            audit: AuditLog::new(),
+            audit: AuditLog::new(pool),
         };
 
         kernel.bootstrap().await;
-        kernel
+        Ok(kernel)
     }
 
     async fn bootstrap(&self) {
@@ -77,7 +80,8 @@ impl Kernel {
                 req.peer_id.trim().to_string(),
                 req.trust_tier,
             )
-            .await;
+            .await
+            .map_err(internal)?;
 
         self.audit
             .append(
@@ -86,7 +90,8 @@ impl Kernel {
                 Some("api".to_string()),
                 json!({"channel_id": session.channel_id, "peer_id": session.peer_id}),
             )
-            .await;
+            .await
+            .map_err(internal)?;
 
         Ok(SessionOpenResponse {
             session_id: session.session_id,
@@ -109,17 +114,28 @@ impl Kernel {
             .sessions
             .get(req.session_id)
             .await
+            .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("session not found".to_string()))?;
 
-        let enabled_skills = self.skills.list_enabled().await;
+        let enabled_skills = self.skills.list_enabled().await.map_err(internal)?;
         let selected_skill_ids = self.selector.select(&req.user_text, &enabled_skills);
-        let scope = format!("session:{}", req.session_id);
+        let session_scope = Scope::Session(req.session_id);
+        let any_scope = Scope::Any;
 
         let mut allowed_skills = Vec::new();
         for skill_id in selected_skill_ids {
-            if self.policy.is_allowed(&skill_id, "skill.use", &scope).await
-                || self.policy.is_allowed(&skill_id, "skill.use", "*").await
-            {
+            let allowed_for_session = self
+                .policy
+                .is_allowed(&skill_id, Capability::SkillUse, &session_scope)
+                .await
+                .map_err(internal)?;
+            let allowed_globally = self
+                .policy
+                .is_allowed(&skill_id, Capability::SkillUse, &any_scope)
+                .await
+                .map_err(internal)?;
+
+            if allowed_for_session || allowed_globally {
                 allowed_skills.push(skill_id);
             }
         }
@@ -152,7 +168,11 @@ impl Kernel {
             .await
             .map_err(|err| KernelError::Runtime(err.to_string()))?;
 
-        let _ = self.sessions.record_turn(session.session_id).await;
+        let _ = self
+            .sessions
+            .record_turn(session.session_id)
+            .await
+            .map_err(internal)?;
 
         let mut assistant = String::new();
         let mut event_views = Vec::new();
@@ -200,12 +220,13 @@ impl Kernel {
                     "prompt_len": req.user_text.len(),
                 }),
             )
-            .await;
+            .await
+            .map_err(internal)?;
 
         Ok(SessionTurnResponse {
             session_id: session.session_id,
             assistant_text: assistant,
-            selected_skills: self.selector.select(&req.user_text, &enabled_skills),
+            selected_skills: allowed_skills,
             runtime_id,
             runtime_events: event_views,
         })
@@ -227,7 +248,8 @@ impl Kernel {
                 hash: req.hash,
                 skill_md: req.skill_md,
             })
-            .await;
+            .await
+            .map_err(internal)?;
 
         self.audit
             .append(
@@ -236,7 +258,8 @@ impl Kernel {
                 Some("api".to_string()),
                 json!({"skill_id": installed.skill_id, "name": installed.name, "hash": installed.hash}),
             )
-            .await;
+            .await
+            .map_err(internal)?;
 
         Ok(SkillInstallResponse {
             skill_id: installed.skill_id,
@@ -246,16 +269,17 @@ impl Kernel {
         })
     }
 
-    pub async fn list_skills(&self) -> SkillListResponse {
+    pub async fn list_skills(&self) -> Result<SkillListResponse, KernelError> {
         let skills = self
             .skills
             .list()
             .await
+            .map_err(internal)?
             .into_iter()
             .map(to_skill_view)
             .collect::<Vec<_>>();
 
-        SkillListResponse { skills }
+        Ok(SkillListResponse { skills })
     }
 
     pub async fn enable_skill(&self, skill_id: String) -> Result<SkillToggleResponse, KernelError> {
@@ -263,6 +287,7 @@ impl Kernel {
             .skills
             .set_enabled(&skill_id, true)
             .await
+            .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("skill not found".to_string()))?;
 
         self.audit
@@ -272,7 +297,8 @@ impl Kernel {
                 Some("api".to_string()),
                 json!({"skill_id": updated.skill_id}),
             )
-            .await;
+            .await
+            .map_err(internal)?;
 
         Ok(SkillToggleResponse {
             skill_id: updated.skill_id,
@@ -288,6 +314,7 @@ impl Kernel {
             .skills
             .set_enabled(&skill_id, false)
             .await
+            .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("skill not found".to_string()))?;
 
         self.audit
@@ -297,7 +324,8 @@ impl Kernel {
                 Some("api".to_string()),
                 json!({"skill_id": updated.skill_id}),
             )
-            .await;
+            .await
+            .map_err(internal)?;
 
         Ok(SkillToggleResponse {
             skill_id: updated.skill_id,
@@ -309,20 +337,34 @@ impl Kernel {
         &self,
         req: PolicyGrantRequest,
     ) -> Result<PolicyGrantResponse, KernelError> {
-        if self.skills.get(&req.skill_id).await.is_none() {
+        if self
+            .skills
+            .get(&req.skill_id)
+            .await
+            .map_err(internal)?
+            .is_none()
+        {
             return Err(KernelError::NotFound("skill not found".to_string()));
         }
 
-        if req.capability.trim().is_empty() || req.scope.trim().is_empty() {
-            return Err(KernelError::BadRequest(
-                "capability and scope are required".to_string(),
-            ));
+        let capability = Capability::from_str(&req.capability)
+            .map_err(|err| KernelError::BadRequest(format!("invalid capability: {}", err)))?;
+        let scope = Scope::from_str(&req.scope)
+            .map_err(|err| KernelError::BadRequest(format!("invalid scope: {}", err)))?;
+
+        if let Some(ttl) = req.ttl_seconds {
+            if ttl <= 0 {
+                return Err(KernelError::BadRequest(
+                    "ttl_seconds must be greater than zero".to_string(),
+                ));
+            }
         }
 
         let grant = self
             .policy
-            .grant(req.skill_id, req.capability, req.scope, req.ttl_seconds)
-            .await;
+            .grant(req.skill_id, capability, scope, req.ttl_seconds)
+            .await
+            .map_err(internal)?;
 
         self.audit
             .append(
@@ -332,18 +374,19 @@ impl Kernel {
                 json!({
                     "grant_id": grant.grant_id,
                     "skill_id": grant.skill_id,
-                    "capability": grant.capability,
-                    "scope": grant.scope,
+                    "capability": grant.capability.as_str(),
+                    "scope": grant.scope.as_str(),
                     "created_at": grant.created_at,
                 }),
             )
-            .await;
+            .await
+            .map_err(internal)?;
 
         Ok(PolicyGrantResponse {
             grant_id: grant.grant_id,
             skill_id: grant.skill_id,
-            capability: grant.capability,
-            scope: grant.scope,
+            capability: grant.capability.as_str().to_string(),
+            scope: grant.scope.as_str(),
             expires_at: grant.expires_at,
         })
     }
@@ -352,20 +395,17 @@ impl Kernel {
         &self,
         grant_id: uuid::Uuid,
     ) -> Result<PolicyRevokeResponse, KernelError> {
-        let revoked = self.policy.revoke(grant_id).await;
-
-        if !revoked {
-            return Err(KernelError::NotFound("grant not found".to_string()));
-        }
+        let revoked = self.policy.revoke(grant_id).await.map_err(internal)?;
 
         self.audit
             .append(
                 "policy.revoke",
                 None,
                 Some("api".to_string()),
-                json!({"grant_id": grant_id}),
+                json!({"grant_id": grant_id, "revoked": revoked}),
             )
-            .await;
+            .await
+            .map_err(internal)?;
 
         Ok(PolicyRevokeResponse { grant_id, revoked })
     }
@@ -376,11 +416,12 @@ impl Kernel {
         event_type: Option<String>,
         since: Option<DateTime<Utc>>,
         limit: Option<usize>,
-    ) -> AuditQueryResponse {
+    ) -> Result<AuditQueryResponse, KernelError> {
         let events = self
             .audit
             .query(session_id, event_type, since, limit)
             .await
+            .map_err(internal)?
             .into_iter()
             .map(|event| AuditEventView {
                 event_id: event.event_id,
@@ -392,7 +433,7 @@ impl Kernel {
             })
             .collect::<Vec<_>>();
 
-        AuditQueryResponse { events }
+        Ok(AuditQueryResponse { events })
     }
 }
 
@@ -407,4 +448,8 @@ fn to_skill_view(skill: super::skills::SkillRecord) -> SkillView {
         enabled: skill.enabled,
         installed_at: skill.installed_at,
     }
+}
+
+fn internal(err: anyhow::Error) -> KernelError {
+    KernelError::Internal(err.to_string())
 }

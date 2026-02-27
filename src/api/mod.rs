@@ -71,7 +71,7 @@ async fn install_skill(
 }
 
 async fn list_skills(State(state): State<ApiState>) -> Result<Json<SkillListResponse>, ApiError> {
-    let result = state.kernel.list_skills().await;
+    let result = state.kernel.list_skills().await?;
     Ok(Json(result))
 }
 
@@ -124,7 +124,7 @@ async fn query_audit(
     let response = state
         .kernel
         .query_audit(params.session_id, params.event_type, since, params.limit)
-        .await;
+        .await?;
 
     Ok(Json(response))
 }

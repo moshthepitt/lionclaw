@@ -14,7 +14,7 @@ It is built around four constraints:
 `v0` is an implementation skeleton with:
 
 - A runnable daemon (`lionclawd`) HTTP API
-- In-memory kernel services (sessions, skills, policy, audit)
+- SQLite-backed kernel services (sessions, skills, policy, audit)
 - Runtime adapter contract + mock adapter implementation
 - Channel-skill contract + local stub channel
 - Planning and roadmap docs
@@ -32,3 +32,4 @@ cargo run
 ```
 
 Server starts on `127.0.0.1:3000` by default.
+SQLite database defaults to `./lionclaw.db` (override via `LIONCLAW_DB_PATH`).

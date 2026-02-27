@@ -10,7 +10,7 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let config = Config::from_env();
-    let kernel = Arc::new(Kernel::new().await);
+    let kernel = Arc::new(Kernel::new(&config.db_path).await?);
     let app = build_router(kernel);
 
     let listener = TcpListener::bind(config.bind_addr)

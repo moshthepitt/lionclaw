@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::str::FromStr;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,6 +9,27 @@ use uuid::Uuid;
 pub enum TrustTier {
     Main,
     Untrusted,
+}
+
+impl TrustTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Untrusted => "untrusted",
+        }
+    }
+}
+
+impl FromStr for TrustTier {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "main" => Ok(Self::Main),
+            "untrusted" => Ok(Self::Untrusted),
+            other => Err(format!("invalid trust tier '{}'", other)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

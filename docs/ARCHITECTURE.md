@@ -8,7 +8,7 @@
 - `kernel.policy`: capability grant/revoke and allow checks.
 - `kernel.runtime`: runtime adapter contract and registry.
 - `kernel.channels`: channel-skill contract and registry.
-- `kernel.audit`: append-only in-memory event log.
+- `kernel.audit`: append-only audit event log persisted in SQLite.
 
 ## API Contracts
 

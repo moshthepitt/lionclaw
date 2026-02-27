@@ -1,8 +1,10 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
+    pub db_path: PathBuf,
 }
 
 impl Config {
@@ -17,8 +19,13 @@ impl Config {
             .and_then(|raw| raw.parse::<u16>().ok())
             .unwrap_or(3000);
 
+        let db_path = std::env::var("LIONCLAW_DB_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("lionclaw.db"));
+
         Self {
             bind_addr: SocketAddr::new(host, port),
+            db_path,
         }
     }
 }
