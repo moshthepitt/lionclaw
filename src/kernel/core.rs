@@ -17,8 +17,8 @@ use super::{
     error::KernelError,
     policy::{Capability, PolicyStore, Scope},
     runtime::{
-        MockRuntimeAdapter, RuntimeCapabilityRequest, RuntimeCapabilityResult, RuntimeEvent,
-        RuntimeRegistry, RuntimeSessionStartInput, RuntimeTurnInput,
+        CodexRuntimeAdapter, MockRuntimeAdapter, RuntimeCapabilityRequest, RuntimeCapabilityResult,
+        RuntimeEvent, RuntimeRegistry, RuntimeSessionStartInput, RuntimeTurnInput,
     },
     selector::SkillSelector,
     sessions::SessionStore,
@@ -58,8 +58,10 @@ impl Kernel {
 
     async fn bootstrap(&self) {
         let runtime = Arc::new(MockRuntimeAdapter);
+        let codex_runtime = Arc::new(CodexRuntimeAdapter::from_env());
         let channel = Arc::new(LocalCliChannel);
         self.runtime.register("mock", runtime).await;
+        self.runtime.register("codex", codex_runtime).await;
         self.channels.register(channel).await;
     }
 

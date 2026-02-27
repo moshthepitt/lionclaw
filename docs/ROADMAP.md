@@ -62,11 +62,11 @@ Exit criteria:
 
 Goal: real runtime support with kernel-owned execution boundaries.
 
-- [ ] Implement subprocess adapter manager for long-lived runtime sessions.
-- [ ] Implement `codex` adapter.
+- [x] Implement subprocess adapter manager for long-lived runtime sessions.
+- [x] Implement `codex` adapter.
 - [ ] Implement `claude-code` adapter.
 - [ ] Implement `gemini-cli` adapter.
-- [ ] Define runtime protocol for capability requests (`capability.request` / `capability.result`).
+- [x] Define runtime protocol for capability requests (`capability.request` / `capability.result`).
 - [ ] Route all side effects through kernel brokers (fs/net/secret/channel/send/scheduler).
 - [ ] Add runtime health, timeout, cancellation, and backpressure controls.
 - [ ] Add per-runtime working directory and environment isolation policy.

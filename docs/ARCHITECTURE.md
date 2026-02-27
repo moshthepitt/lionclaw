@@ -38,6 +38,7 @@
 - `info()`
 - `session_start()`
 - `turn()`
+- `resolve_capability_requests()`
 - `cancel()`
 - `close()`
 
@@ -52,8 +53,9 @@
 
 1. Default deny: policy checks deny unless grant exists.
 2. No default external channel in core.
-3. Local mock runtime only by default.
-4. Auditing for all API-initiated mutations.
+3. Runtime adapters registered by default: local `mock` and subprocess `codex`.
+4. `codex` adapter runs in secure defaults (`read-only` sandbox, `--ephemeral`) until brokered capability routing is complete.
+5. Auditing for all API-initiated mutations.
 
 ## Planned Hardening After v0
 

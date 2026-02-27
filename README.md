@@ -15,7 +15,7 @@ It is built around four constraints:
 
 - A runnable daemon (`lionclawd`) HTTP API
 - SQLite-backed kernel services (sessions, skills, policy, audit)
-- Runtime adapter contract + mock adapter implementation
+- Runtime adapter contract + `mock` and `codex` adapter implementations
 - Channel-skill contract + local stub channel
 - Planning and roadmap docs
 
@@ -33,3 +33,32 @@ cargo run
 
 Server starts on `127.0.0.1:3000` by default.
 SQLite database defaults to `./lionclaw.db` (override via `LIONCLAW_DB_PATH`).
+
+## Runtime: Codex Adapter
+
+LionClaw registers a `codex` runtime adapter at startup.
+
+Secure defaults:
+
+- `codex exec --json`
+- `--sandbox read-only`
+- `--ephemeral`
+- `--skip-git-repo-check`
+
+Optional overrides:
+
+- `LIONCLAW_CODEX_BIN` (default: `codex`)
+- `LIONCLAW_CODEX_MODEL` (unset by default)
+- `LIONCLAW_CODEX_SANDBOX` (default: `read-only`)
+- `LIONCLAW_CODEX_EPHEMERAL` (`true` by default)
+- `LIONCLAW_CODEX_SKIP_GIT_REPO_CHECK` (`true` by default)
+
+Use it by setting `runtime_id` on turn requests:
+
+```json
+{
+  "session_id": "00000000-0000-0000-0000-000000000000",
+  "user_text": "summarize the selected skills for this task",
+  "runtime_id": "codex"
+}
+```
