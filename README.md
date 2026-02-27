@@ -15,7 +15,7 @@ It is built around four constraints:
 
 - A runnable daemon (`lionclawd`) HTTP API
 - SQLite-backed kernel services (sessions, skills, policy, audit)
-- Runtime adapter contract + `mock` and `codex` adapter implementations
+- Runtime adapter contract + `mock`, `codex`, and `opencode` adapter implementations
 - Channel-skill contract + local stub channel
 - Planning and roadmap docs
 
@@ -62,3 +62,22 @@ Use it by setting `runtime_id` on turn requests:
   "runtime_id": "codex"
 }
 ```
+
+## Runtime: OpenCode Adapter
+
+LionClaw also registers an `opencode` runtime adapter at startup.
+
+Default invocation:
+
+- `opencode run --format json "<prompt>"`
+
+Optional overrides:
+
+- `LIONCLAW_OPENCODE_BIN` (default: `opencode`)
+- `LIONCLAW_OPENCODE_FORMAT` (default: `json`)
+- `LIONCLAW_OPENCODE_MODEL` (unset by default)
+- `LIONCLAW_OPENCODE_AGENT` (unset by default)
+- `LIONCLAW_OPENCODE_XDG_DATA_HOME` (unset by default)
+- `LIONCLAW_OPENCODE_CONTINUE_LAST_SESSION` (`false` by default)
+
+Use it by setting `runtime_id: "opencode"` in turn requests.

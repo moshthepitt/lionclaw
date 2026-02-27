@@ -11,9 +11,13 @@ use super::policy::Capability;
 pub mod adapters;
 pub mod builtins;
 
-pub use adapters::{CodexRuntimeAdapter, CodexRuntimeConfig, MockRuntimeAdapter};
+pub use adapters::{
+    CodexRuntimeAdapter, CodexRuntimeConfig, MockRuntimeAdapter, OpenCodeRuntimeAdapter,
+    OpenCodeRuntimeConfig,
+};
 pub use builtins::{
     register_builtin_runtime_adapters, BUILTIN_RUNTIME_CODEX, BUILTIN_RUNTIME_MOCK,
+    BUILTIN_RUNTIME_OPENCODE,
 };
 
 #[derive(Debug, Clone)]

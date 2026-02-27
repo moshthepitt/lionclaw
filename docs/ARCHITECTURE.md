@@ -48,6 +48,7 @@ Runtime module layout:
 - `kernel/runtime/builtins.rs`: built-in adapter IDs + registration.
 - `kernel/runtime/adapters/mock.rs`: deterministic test adapter.
 - `kernel/runtime/adapters/codex.rs`: production subprocess adapter.
+- `kernel/runtime/adapters/opencode.rs`: production subprocess adapter.
 - `kernel/runtime/adapters/subprocess.rs`: shared subprocess execution utility.
 
 Adding a new adapter:
@@ -68,9 +69,10 @@ Adding a new adapter:
 
 1. Default deny: policy checks deny unless grant exists.
 2. No default external channel in core.
-3. Runtime adapters registered by default: local `mock` and subprocess `codex`.
+3. Runtime adapters registered by default: local `mock`, subprocess `codex`, and subprocess `opencode`.
 4. `codex` adapter runs in secure defaults (`read-only` sandbox, `--ephemeral`) until brokered capability routing is complete.
-5. Auditing for all API-initiated mutations.
+5. `opencode` adapter runs in JSON event mode and maps runtime events into kernel events.
+6. Auditing for all API-initiated mutations.
 
 ## Planned Hardening After v0
 
