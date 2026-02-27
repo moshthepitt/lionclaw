@@ -535,8 +535,10 @@ exit 7
     fn write_script(path: &std::path::Path, content: &str) {
         use std::{fs, os::unix::fs::PermissionsExt};
 
-        fs::write(path, content).expect("write script");
+        let temp_path = path.with_extension("tmp");
+        fs::write(&temp_path, content).expect("write temp script");
         let permissions = fs::Permissions::from_mode(0o755);
-        fs::set_permissions(path, permissions).expect("chmod");
+        fs::set_permissions(&temp_path, permissions).expect("chmod temp script");
+        fs::rename(&temp_path, path).expect("install script");
     }
 }
