@@ -163,6 +163,10 @@ impl From<KernelError> for ApiError {
                 status: StatusCode::BAD_GATEWAY,
                 message,
             },
+            KernelError::RuntimeTimeout(message) => Self {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                message,
+            },
             KernelError::Internal(message) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 message,

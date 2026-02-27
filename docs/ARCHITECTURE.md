@@ -72,7 +72,8 @@ Adding a new adapter:
 3. Runtime adapters registered by default: local `mock`, subprocess `codex`, and subprocess `opencode`.
 4. `codex` adapter runs in secure defaults (`read-only` sandbox, `--ephemeral`) until brokered capability routing is complete.
 5. `opencode` adapter runs in JSON event mode and maps runtime events into kernel events.
-6. Auditing for all API-initiated mutations.
+6. Kernel-enforced runtime turn timeout + cancellation path (`runtime.turn.timeout` audit event on timeout).
+7. Auditing for all API-initiated mutations.
 
 ## Planned Hardening After v0
 

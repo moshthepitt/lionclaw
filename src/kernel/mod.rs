@@ -9,5 +9,5 @@ pub mod selector;
 pub mod sessions;
 pub mod skills;
 
-pub use core::Kernel;
+pub use core::{Kernel, KernelOptions};
 pub use error::KernelError;

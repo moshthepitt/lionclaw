@@ -33,6 +33,7 @@ cargo run
 
 Server starts on `127.0.0.1:3000` by default.
 SQLite database defaults to `./lionclaw.db` (override via `LIONCLAW_DB_PATH`).
+Runtime turn timeout defaults to `120000` ms (override via `LIONCLAW_RUNTIME_TURN_TIMEOUT_MS`).
 
 ## Runtime: Codex Adapter
 

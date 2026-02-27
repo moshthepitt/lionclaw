@@ -1,7 +1,8 @@
-use std::{path::Path, str::FromStr, sync::Arc};
+use std::{path::Path, str::FromStr, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
+use tokio::time::sleep;
 
 use crate::contracts::{
     AuditEventView, AuditQueryResponse, PolicyGrantRequest, PolicyGrantResponse,
@@ -17,14 +18,27 @@ use super::{
     error::KernelError,
     policy::{Capability, PolicyStore, Scope},
     runtime::{
-        register_builtin_runtime_adapters, RuntimeCapabilityRequest, RuntimeCapabilityResult,
-        RuntimeEvent, RuntimeRegistry, RuntimeSessionStartInput, RuntimeTurnInput,
-        BUILTIN_RUNTIME_MOCK,
+        register_builtin_runtime_adapters, RuntimeAdapter, RuntimeCapabilityRequest,
+        RuntimeCapabilityResult, RuntimeEvent, RuntimeRegistry, RuntimeSessionHandle,
+        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnOutput, BUILTIN_RUNTIME_MOCK,
     },
     selector::SkillSelector,
     sessions::SessionStore,
     skills::{SkillInstallInput, SkillStore},
 };
+
+#[derive(Debug, Clone, Copy)]
+pub struct KernelOptions {
+    pub runtime_turn_timeout: Duration,
+}
+
+impl Default for KernelOptions {
+    fn default() -> Self {
+        Self {
+            runtime_turn_timeout: Duration::from_secs(120),
+        }
+    }
+}
 
 pub struct Kernel {
     sessions: SessionStore,
@@ -34,14 +48,24 @@ pub struct Kernel {
     runtime: RuntimeRegistry,
     channels: ChannelRegistry,
     audit: AuditLog,
+    runtime_turn_timeout: Duration,
 }
 
 impl Kernel {
     pub async fn new(db_path: &Path) -> anyhow::Result<Self> {
+        Self::new_with_options(db_path, KernelOptions::default()).await
+    }
+
+    pub async fn new_with_options(db_path: &Path, options: KernelOptions) -> anyhow::Result<Self> {
         let db = Db::connect_file(db_path).await?;
         let pool = db.pool();
         let runtime = RuntimeRegistry::new();
         let channels = ChannelRegistry::new();
+        let runtime_turn_timeout = if options.runtime_turn_timeout.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            options.runtime_turn_timeout
+        };
 
         let kernel = Self {
             sessions: SessionStore::new(pool.clone()),
@@ -51,6 +75,7 @@ impl Kernel {
             runtime,
             channels,
             audit: AuditLog::new(pool),
+            runtime_turn_timeout,
         };
 
         kernel.bootstrap().await;
@@ -61,6 +86,14 @@ impl Kernel {
         let channel = Arc::new(LocalCliChannel);
         register_builtin_runtime_adapters(&self.runtime).await;
         self.channels.register(channel).await;
+    }
+
+    pub async fn register_runtime_adapter(
+        &self,
+        id: impl Into<String>,
+        adapter: Arc<dyn RuntimeAdapter>,
+    ) {
+        self.runtime.register(id, adapter).await;
     }
 
     pub async fn open_session(
@@ -156,14 +189,34 @@ impl Kernel {
             .await
             .map_err(|err| KernelError::Runtime(err.to_string()))?;
 
-        let turn_output = adapter
-            .turn(RuntimeTurnInput {
-                runtime_session_id: handle.runtime_session_id.clone(),
-                prompt: req.user_text.clone(),
-                selected_skills: allowed_skills.clone(),
-            })
-            .await
-            .map_err(|err| KernelError::Runtime(err.to_string()))?;
+        let turn_result = self
+            .execute_runtime_turn(
+                adapter.clone(),
+                &runtime_id,
+                session.session_id,
+                &handle,
+                RuntimeTurnInput {
+                    runtime_session_id: handle.runtime_session_id.clone(),
+                    prompt: req.user_text.clone(),
+                    selected_skills: allowed_skills.clone(),
+                },
+            )
+            .await;
+
+        let close_result = self
+            .close_runtime_session(adapter.clone(), &runtime_id, session.session_id, &handle)
+            .await;
+
+        let turn_output = match turn_result {
+            Ok(output) => {
+                close_result?;
+                output
+            }
+            Err(turn_err) => {
+                let _ = close_result;
+                return Err(turn_err);
+            }
+        };
 
         let mut runtime_events = turn_output.events;
         if !turn_output.capability_requests.is_empty() {
@@ -473,6 +526,157 @@ fn internal(err: anyhow::Error) -> KernelError {
 }
 
 impl Kernel {
+    async fn execute_runtime_turn(
+        &self,
+        adapter: Arc<dyn RuntimeAdapter>,
+        runtime_id: &str,
+        session_id: uuid::Uuid,
+        handle: &RuntimeSessionHandle,
+        input: RuntimeTurnInput,
+    ) -> Result<RuntimeTurnOutput, KernelError> {
+        let timeout_ms = self.runtime_turn_timeout.as_millis() as u64;
+        self.audit
+            .append(
+                "runtime.turn.start",
+                Some(session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "runtime_id": runtime_id,
+                    "runtime_session_id": handle.runtime_session_id,
+                    "timeout_ms": timeout_ms,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+
+        let adapter_for_task = adapter.clone();
+        let mut turn_task = tokio::spawn(async move { adapter_for_task.turn(input).await });
+        let turn_result = tokio::select! {
+            output = &mut turn_task => Some(output),
+            _ = sleep(self.runtime_turn_timeout) => None,
+        };
+
+        match turn_result {
+            Some(Ok(Ok(output))) => {
+                self.audit
+                    .append(
+                        "runtime.turn.finish",
+                        Some(session_id),
+                        Some("kernel".to_string()),
+                        json!({
+                            "runtime_id": runtime_id,
+                            "runtime_session_id": handle.runtime_session_id,
+                            "event_count": output.events.len(),
+                            "capability_request_count": output.capability_requests.len(),
+                        }),
+                    )
+                    .await
+                    .map_err(internal)?;
+                Ok(output)
+            }
+            Some(Ok(Err(err))) => {
+                let message = err.to_string();
+                self.audit
+                    .append(
+                        "runtime.turn.error",
+                        Some(session_id),
+                        Some("kernel".to_string()),
+                        json!({
+                            "runtime_id": runtime_id,
+                            "runtime_session_id": handle.runtime_session_id,
+                            "error": message,
+                        }),
+                    )
+                    .await
+                    .map_err(internal)?;
+                Err(KernelError::Runtime(message))
+            }
+            Some(Err(err)) => {
+                let message = format!("runtime turn task failed: {}", err);
+                self.audit
+                    .append(
+                        "runtime.turn.error",
+                        Some(session_id),
+                        Some("kernel".to_string()),
+                        json!({
+                            "runtime_id": runtime_id,
+                            "runtime_session_id": handle.runtime_session_id,
+                            "error": message,
+                        }),
+                    )
+                    .await
+                    .map_err(internal)?;
+                Err(KernelError::Runtime(message))
+            }
+            None => {
+                let reason = format!("turn timed out after {} ms", timeout_ms);
+
+                if let Err(cancel_err) = adapter.cancel(handle, Some(reason.clone())).await {
+                    self.audit
+                        .append(
+                            "runtime.turn.cancel_error",
+                            Some(session_id),
+                            Some("kernel".to_string()),
+                            json!({
+                                "runtime_id": runtime_id,
+                                "runtime_session_id": handle.runtime_session_id,
+                                "error": cancel_err.to_string(),
+                            }),
+                        )
+                        .await
+                        .map_err(internal)?;
+                }
+
+                turn_task.abort();
+                let _ = turn_task.await;
+
+                self.audit
+                    .append(
+                        "runtime.turn.timeout",
+                        Some(session_id),
+                        Some("kernel".to_string()),
+                        json!({
+                            "runtime_id": runtime_id,
+                            "runtime_session_id": handle.runtime_session_id,
+                            "timeout_ms": timeout_ms,
+                        }),
+                    )
+                    .await
+                    .map_err(internal)?;
+
+                Err(KernelError::RuntimeTimeout(reason))
+            }
+        }
+    }
+
+    async fn close_runtime_session(
+        &self,
+        adapter: Arc<dyn RuntimeAdapter>,
+        runtime_id: &str,
+        session_id: uuid::Uuid,
+        handle: &RuntimeSessionHandle,
+    ) -> Result<(), KernelError> {
+        if let Err(err) = adapter.close(handle).await {
+            let message = err.to_string();
+            self.audit
+                .append(
+                    "runtime.turn.close_error",
+                    Some(session_id),
+                    Some("kernel".to_string()),
+                    json!({
+                        "runtime_id": runtime_id,
+                        "runtime_session_id": handle.runtime_session_id,
+                        "error": message,
+                    }),
+                )
+                .await
+                .map_err(internal)?;
+            return Err(KernelError::Runtime(message));
+        }
+
+        Ok(())
+    }
+
     async fn evaluate_capability_requests(
         &self,
         session_id: uuid::Uuid,

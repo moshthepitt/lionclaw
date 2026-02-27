@@ -40,6 +40,7 @@ pub async fn run_non_interactive(invocation: &SubprocessInvocation) -> Result<Su
                 .map(|(key, value)| (key, value)),
         );
     }
+    command.kill_on_drop(true);
 
     command
         .stdin(Stdio::piped())

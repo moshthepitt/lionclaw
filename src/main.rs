@@ -1,7 +1,12 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
-use lionclaw::{api::build_router, config::Config, kernel::Kernel};
+use lionclaw::{
+    api::build_router,
+    config::Config,
+    kernel::{Kernel, KernelOptions},
+};
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -10,7 +15,15 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let config = Config::from_env();
-    let kernel = Arc::new(Kernel::new(&config.db_path).await?);
+    let kernel = Arc::new(
+        Kernel::new_with_options(
+            &config.db_path,
+            KernelOptions {
+                runtime_turn_timeout: Duration::from_millis(config.runtime_turn_timeout_ms),
+            },
+        )
+        .await?,
+    );
     let app = build_router(kernel);
 
     let listener = TcpListener::bind(config.bind_addr)

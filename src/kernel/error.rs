@@ -10,6 +10,8 @@ pub enum KernelError {
     Conflict(String),
     #[error("runtime error: {0}")]
     Runtime(String),
+    #[error("runtime timeout: {0}")]
+    RuntimeTimeout(String),
     #[error("internal error: {0}")]
     Internal(String),
 }

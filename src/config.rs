@@ -5,6 +5,7 @@ use std::path::PathBuf;
 pub struct Config {
     pub bind_addr: SocketAddr,
     pub db_path: PathBuf,
+    pub runtime_turn_timeout_ms: u64,
 }
 
 impl Config {
@@ -23,9 +24,16 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("lionclaw.db"));
 
+        let runtime_turn_timeout_ms = std::env::var("LIONCLAW_RUNTIME_TURN_TIMEOUT_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(120_000);
+
         Self {
             bind_addr: SocketAddr::new(host, port),
             db_path,
+            runtime_turn_timeout_ms,
         }
     }
 }
