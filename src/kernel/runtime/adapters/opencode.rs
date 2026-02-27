@@ -304,7 +304,9 @@ fn extract_opencode_error_detail(stdout: &[u8]) -> Option<String> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        let json = serde_json::from_str::<Value>(line).ok()?;
+        let Ok(json) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         if let Some(message) = extract_error_message(&json) {
             return Some(message);
         }
