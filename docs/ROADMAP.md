@@ -9,6 +9,14 @@ Status key:
 - `[x]` done
 - `[ ]` todo
 
+## Pinned Direction (2026-02-27)
+
+- [x] Record binary-install + runtime-agnostic target model in
+      `docs/BINARY_RUNTIME_AGNOSTIC_MODEL.md`.
+- [ ] Keep runtime selection at startup (`lionctl up`), not channel install/bind.
+- [ ] Keep channel integrations as external skill workers, never built-in channel transport.
+- [ ] Move all installed-state assumptions to `~/.lionclaw` (no repo-path coupling).
+
 ## Non-Negotiable Invariants
 
 - [ ] Anthropic `SKILL.md` format remains unchanged input.
