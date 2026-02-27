@@ -1,3 +1,6 @@
 /target/
 **/*.log
 .DS_Store
+lionclaw.db
+lionclaw.db-shm
+lionclaw.db-wal
