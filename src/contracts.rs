@@ -170,3 +170,124 @@ pub struct AuditQueryParams {
     pub since: Option<String>,
     pub limit: Option<usize>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelBindRequest {
+    pub channel_id: String,
+    pub skill_id: String,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub config: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelBindingView {
+    pub channel_id: String,
+    pub skill_id: String,
+    pub enabled: bool,
+    pub config: Value,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelBindResponse {
+    pub binding: ChannelBindingView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelListResponse {
+    pub bindings: Vec<ChannelBindingView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPeerView {
+    pub channel_id: String,
+    pub peer_id: String,
+    pub status: String,
+    pub trust_tier: TrustTier,
+    pub pairing_code: Option<String>,
+    pub first_seen: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPeerListResponse {
+    pub peers: Vec<ChannelPeerView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPeerApproveRequest {
+    pub channel_id: String,
+    pub peer_id: String,
+    pub pairing_code: String,
+    #[serde(default)]
+    pub trust_tier: Option<TrustTier>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPeerBlockRequest {
+    pub channel_id: String,
+    pub peer_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPeerResponse {
+    pub peer: ChannelPeerView,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChannelPeerListParams {
+    pub channel_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelInboundRequest {
+    pub channel_id: String,
+    pub peer_id: String,
+    pub text: String,
+    #[serde(default)]
+    pub update_id: Option<i64>,
+    #[serde(default)]
+    pub external_message_id: Option<String>,
+    #[serde(default)]
+    pub runtime_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelInboundResponse {
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxPullRequest {
+    pub channel_id: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxMessageView {
+    pub message_id: Uuid,
+    pub channel_id: String,
+    pub peer_id: String,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxPullResponse {
+    pub messages: Vec<ChannelOutboxMessageView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxAckRequest {
+    pub message_id: Uuid,
+    pub external_message_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxAckResponse {
+    pub message_id: Uuid,
+    pub acknowledged: bool,
+}

@@ -17,7 +17,7 @@ It is built around four constraints:
 - SQLite-backed kernel services (sessions, skills, policy, audit)
 - Runtime adapter contract + `mock`, `codex`, and `opencode` adapter implementations
 - Kernel capability broker flow for runtime capability requests/results
-- Channel-skill contract + local stub channel
+- Channel bridge APIs for external skill workers (`inbound`, `outbox pull`, `outbox ack`)
 - Planning and roadmap docs
 
 See:
@@ -35,6 +35,19 @@ cargo run
 Server starts on `127.0.0.1:3000` by default.
 SQLite database defaults to `./lionclaw.db` (override via `LIONCLAW_DB_PATH`).
 Runtime turn timeout defaults to `120000` ms (override via `LIONCLAW_RUNTIME_TURN_TIMEOUT_MS`).
+
+## Channel APIs
+
+LionClaw exposes channel management APIs:
+
+- `POST /v0/channels/bind`
+- `GET /v0/channels/list`
+- `GET /v0/channels/peers`
+- `POST /v0/channels/peers/approve`
+- `POST /v0/channels/peers/block`
+- `POST /v0/channels/inbound`
+- `POST /v0/channels/outbox/pull`
+- `POST /v0/channels/outbox/ack`
 
 ## Runtime: Codex Adapter
 
@@ -83,3 +96,31 @@ Optional overrides:
 - `LIONCLAW_OPENCODE_CONTINUE_LAST_SESSION` (`false` by default)
 
 Use it by setting `runtime_id: "opencode"` in turn requests.
+
+## Channel Skills (External Workers)
+
+LionClaw core does not include Telegram/Discord/WhatsApp transport code.
+Each channel runs as an external skill worker that:
+
+1. Receives platform updates.
+2. Calls `POST /v0/channels/inbound` with normalized text payloads.
+3. Polls `POST /v0/channels/outbox/pull` for pending replies.
+4. Delivers replies to the platform.
+5. Calls `POST /v0/channels/outbox/ack` with platform message IDs.
+
+Bind a channel ID to an enabled skill:
+
+```json
+{
+  "channel_id": "telegram",
+  "skill_id": "<enabled-skill-id>",
+  "enabled": true,
+  "config": {
+    "runtime_id": "codex"
+  }
+}
+```
+
+Then run an external worker skill for `telegram`. A starter skill package is included at:
+
+- `skills/channel-telegram`

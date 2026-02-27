@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use super::{channels::ChannelRegistry, policy::Capability};
+use super::policy::Capability;
 use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -40,7 +40,6 @@ impl CapabilityBroker {
 
     pub async fn execute(
         &self,
-        channels: &ChannelRegistry,
         context: &CapabilityExecutionContext<'_>,
         capability: Capability,
         payload: &Value,
@@ -50,7 +49,7 @@ impl CapabilityBroker {
             Capability::FsWrite => self.filesystem.write(payload).await,
             Capability::NetEgress => self.network.egress(payload).await,
             Capability::SecretRequest => self.secrets.request(payload).await,
-            Capability::ChannelSend => send_channel_message(channels, context, payload).await,
+            Capability::ChannelSend => build_channel_send_intent(context, payload).await,
             Capability::SchedulerRun => self.scheduler.run(payload).await,
             Capability::Any | Capability::SkillUse => Err(anyhow!(
                 "capability '{}' is not broker-executable",
@@ -246,8 +245,7 @@ struct SchedulerRunRequest {
     job: String,
 }
 
-async fn send_channel_message(
-    channels: &ChannelRegistry,
+async fn build_channel_send_intent(
     context: &CapabilityExecutionContext<'_>,
     payload: &Value,
 ) -> Result<Value> {
@@ -276,20 +274,10 @@ async fn send_channel_message(
         return Err(anyhow!("channel.send conversation_ref cannot be empty"));
     }
 
-    let channel = channels
-        .get(&channel_id)
-        .await
-        .ok_or_else(|| anyhow!("channel '{}' is not registered", channel_id))?;
-
-    let message_id = channel
-        .send(&conversation_ref, &request.content)
-        .await
-        .with_context(|| format!("failed to send message through channel '{}'", channel_id))?;
-
     Ok(json!({
         "channel_id": channel_id,
         "conversation_ref": conversation_ref,
-        "message_id": message_id,
+        "content": request.content,
     }))
 }
 

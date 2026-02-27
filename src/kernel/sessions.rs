@@ -73,6 +73,27 @@ impl SessionStore {
         row.map(map_session_row).transpose()
     }
 
+    pub async fn find_latest_by_channel_peer(
+        &self,
+        channel_id: &str,
+        peer_id: &str,
+    ) -> Result<Option<Session>> {
+        let row = sqlx::query(
+            "SELECT session_id, channel_id, peer_id, trust_tier, created_at_ms, last_turn_at_ms, turn_count \
+             FROM sessions \
+             WHERE channel_id = ?1 AND peer_id = ?2 \
+             ORDER BY created_at_ms DESC \
+             LIMIT 1",
+        )
+        .bind(channel_id)
+        .bind(peer_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query latest session by channel and peer")?;
+
+        row.map(map_session_row).transpose()
+    }
+
     pub async fn record_turn(&self, session_id: Uuid) -> Result<Option<Session>> {
         let now = now_ms();
         let updated = sqlx::query(

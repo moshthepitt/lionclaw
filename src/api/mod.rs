@@ -12,10 +12,14 @@ use serde_json::json;
 
 use crate::{
     contracts::{
-        AuditQueryParams, AuditQueryResponse, PolicyGrantRequest, PolicyGrantResponse,
-        PolicyRevokeRequest, PolicyRevokeResponse, SessionOpenRequest, SessionOpenResponse,
-        SessionTurnRequest, SessionTurnResponse, SkillInstallRequest, SkillInstallResponse,
-        SkillListResponse, SkillToggleRequest, SkillToggleResponse,
+        AuditQueryParams, AuditQueryResponse, ChannelBindRequest, ChannelBindResponse,
+        ChannelInboundRequest, ChannelInboundResponse, ChannelListResponse,
+        ChannelOutboxAckRequest, ChannelOutboxAckResponse, ChannelOutboxPullRequest,
+        ChannelOutboxPullResponse, ChannelPeerApproveRequest, ChannelPeerBlockRequest,
+        ChannelPeerListParams, ChannelPeerListResponse, ChannelPeerResponse, PolicyGrantRequest,
+        PolicyGrantResponse, PolicyRevokeRequest, PolicyRevokeResponse, SessionOpenRequest,
+        SessionOpenResponse, SessionTurnRequest, SessionTurnResponse, SkillInstallRequest,
+        SkillInstallResponse, SkillListResponse, SkillToggleRequest, SkillToggleResponse,
     },
     kernel::{Kernel, KernelError},
 };
@@ -36,6 +40,14 @@ pub fn build_router(kernel: Arc<Kernel>) -> Router {
         .route("/v0/skills/list", get(list_skills))
         .route("/v0/skills/enable", post(enable_skill))
         .route("/v0/skills/disable", post(disable_skill))
+        .route("/v0/channels/bind", post(bind_channel))
+        .route("/v0/channels/list", get(list_channels))
+        .route("/v0/channels/peers", get(list_channel_peers))
+        .route("/v0/channels/peers/approve", post(approve_channel_peer))
+        .route("/v0/channels/peers/block", post(block_channel_peer))
+        .route("/v0/channels/inbound", post(channel_inbound))
+        .route("/v0/channels/outbox/pull", post(channel_outbox_pull))
+        .route("/v0/channels/outbox/ack", post(channel_outbox_ack))
         .route("/v0/policy/grant", post(grant_policy))
         .route("/v0/policy/revoke", post(revoke_policy))
         .route("/v0/audit/query", get(query_audit))
@@ -88,6 +100,69 @@ async fn disable_skill(
     Json(req): Json<SkillToggleRequest>,
 ) -> Result<Json<SkillToggleResponse>, ApiError> {
     let result = state.kernel.disable_skill(req.skill_id).await?;
+    Ok(Json(result))
+}
+
+async fn bind_channel(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelBindRequest>,
+) -> Result<Json<ChannelBindResponse>, ApiError> {
+    let result = state.kernel.bind_channel(req).await?;
+    Ok(Json(result))
+}
+
+async fn list_channels(
+    State(state): State<ApiState>,
+) -> Result<Json<ChannelListResponse>, ApiError> {
+    let result = state.kernel.list_channels().await?;
+    Ok(Json(result))
+}
+
+async fn list_channel_peers(
+    State(state): State<ApiState>,
+    Query(params): Query<ChannelPeerListParams>,
+) -> Result<Json<ChannelPeerListResponse>, ApiError> {
+    let result = state.kernel.list_channel_peers(params.channel_id).await?;
+    Ok(Json(result))
+}
+
+async fn approve_channel_peer(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelPeerApproveRequest>,
+) -> Result<Json<ChannelPeerResponse>, ApiError> {
+    let result = state.kernel.approve_channel_peer(req).await?;
+    Ok(Json(result))
+}
+
+async fn block_channel_peer(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelPeerBlockRequest>,
+) -> Result<Json<ChannelPeerResponse>, ApiError> {
+    let result = state.kernel.block_channel_peer(req).await?;
+    Ok(Json(result))
+}
+
+async fn channel_inbound(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelInboundRequest>,
+) -> Result<Json<ChannelInboundResponse>, ApiError> {
+    let result = state.kernel.ingest_channel_inbound(req).await?;
+    Ok(Json(result))
+}
+
+async fn channel_outbox_pull(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelOutboxPullRequest>,
+) -> Result<Json<ChannelOutboxPullResponse>, ApiError> {
+    let result = state.kernel.pull_channel_outbox(req).await?;
+    Ok(Json(result))
+}
+
+async fn channel_outbox_ack(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelOutboxAckRequest>,
+) -> Result<Json<ChannelOutboxAckResponse>, ApiError> {
+    let result = state.kernel.ack_channel_outbox(req).await?;
     Ok(Json(result))
 }
 

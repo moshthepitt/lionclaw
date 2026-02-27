@@ -45,7 +45,7 @@ LionClaw v0 is a local daemon kernel that:
 1. Kernel API endpoints for session/skill/policy/audit basics.
 2. SQLite-backed implementations of kernel services.
 3. Runtime adapter interface + mock adapter.
-4. Channel-skill interface + local channel stub.
+4. Channel bridge API for external channel skills (`inbound`, `outbox pull/ack`).
 5. Skill selection pipeline with deterministic, simple scoring.
 
 ## Non-Goals (v0)

@@ -3,18 +3,24 @@ use std::{path::Path, str::FromStr, sync::Arc, time::Duration};
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use tokio::time::sleep;
+use uuid::Uuid;
 
 use crate::contracts::{
-    AuditEventView, AuditQueryResponse, PolicyGrantRequest, PolicyGrantResponse,
-    PolicyRevokeResponse, RuntimeEventDto, SessionOpenRequest, SessionOpenResponse,
-    SessionTurnRequest, SessionTurnResponse, SkillInstallRequest, SkillInstallResponse,
-    SkillListResponse, SkillToggleResponse, SkillView,
+    AuditEventView, AuditQueryResponse, ChannelBindRequest, ChannelBindResponse,
+    ChannelBindingView, ChannelInboundRequest, ChannelInboundResponse, ChannelListResponse,
+    ChannelOutboxAckRequest, ChannelOutboxAckResponse, ChannelOutboxMessageView,
+    ChannelOutboxPullRequest, ChannelOutboxPullResponse, ChannelPeerApproveRequest,
+    ChannelPeerBlockRequest, ChannelPeerListResponse, ChannelPeerResponse, ChannelPeerView,
+    PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeResponse, RuntimeEventDto,
+    SessionOpenRequest, SessionOpenResponse, SessionTurnRequest, SessionTurnResponse,
+    SkillInstallRequest, SkillInstallResponse, SkillListResponse, SkillToggleResponse, SkillView,
+    TrustTier,
 };
 
 use super::{
     audit::AuditLog,
     capability_broker::{CapabilityBroker, CapabilityExecutionContext},
-    channels::{ChannelRegistry, LocalCliChannel},
+    channel_state::{ChannelPeerStatus, ChannelStateStore},
     db::Db,
     error::KernelError,
     policy::{Capability, PolicyStore, Scope},
@@ -50,7 +56,7 @@ pub struct Kernel {
     selector: SkillSelector,
     policy: PolicyStore,
     runtime: RuntimeRegistry,
-    channels: ChannelRegistry,
+    channel_state: ChannelStateStore,
     audit: AuditLog,
     capability_broker: CapabilityBroker,
     runtime_turn_timeout: Duration,
@@ -66,7 +72,6 @@ impl Kernel {
         let db = Db::connect_file(db_path).await?;
         let pool = db.pool();
         let runtime = RuntimeRegistry::new();
-        let channels = ChannelRegistry::new();
         let runtime_turn_timeout = if options.runtime_turn_timeout.is_zero() {
             Duration::from_millis(1)
         } else {
@@ -79,7 +84,7 @@ impl Kernel {
             selector: SkillSelector::new(),
             policy: PolicyStore::new(pool.clone()),
             runtime,
-            channels,
+            channel_state: ChannelStateStore::new(pool.clone()),
             audit: AuditLog::new(pool),
             capability_broker: CapabilityBroker::default(),
             runtime_turn_timeout,
@@ -91,9 +96,7 @@ impl Kernel {
     }
 
     async fn bootstrap(&self) {
-        let channel = Arc::new(LocalCliChannel);
         register_builtin_runtime_adapters(&self.runtime).await;
-        self.channels.register(channel).await;
     }
 
     pub async fn register_runtime_adapter(
@@ -389,6 +392,11 @@ impl Kernel {
         Ok(SkillListResponse { skills })
     }
 
+    pub async fn is_skill_enabled(&self, skill_id: &str) -> Result<bool, KernelError> {
+        let skill = self.skills.get(skill_id).await.map_err(internal)?;
+        Ok(skill.map(|value| value.enabled).unwrap_or(false))
+    }
+
     pub async fn enable_skill(&self, skill_id: String) -> Result<SkillToggleResponse, KernelError> {
         let updated = self
             .skills
@@ -438,6 +446,539 @@ impl Kernel {
             skill_id: updated.skill_id,
             enabled: updated.enabled,
         })
+    }
+
+    pub async fn bind_channel(
+        &self,
+        req: ChannelBindRequest,
+    ) -> Result<ChannelBindResponse, KernelError> {
+        if req.channel_id.trim().is_empty() || req.skill_id.trim().is_empty() {
+            return Err(KernelError::BadRequest(
+                "channel_id and skill_id are required".to_string(),
+            ));
+        }
+
+        let channel_id = req.channel_id.trim().to_string();
+        let skill_id = req.skill_id.trim().to_string();
+        let enabled = req.enabled.unwrap_or(true);
+        let config = req
+            .config
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+
+        let skill = self
+            .skills
+            .get(&skill_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("skill not found".to_string()))?;
+
+        if !skill.enabled {
+            return Err(KernelError::BadRequest(
+                "channel binding requires an enabled skill".to_string(),
+            ));
+        }
+
+        let binding = self
+            .channel_state
+            .upsert_binding(&channel_id, &skill_id, enabled, config.clone())
+            .await
+            .map_err(internal)?;
+
+        self.audit
+            .append(
+                "channel.binding.upsert",
+                None,
+                Some("api".to_string()),
+                json!({
+                    "channel_id": binding.channel_id,
+                    "skill_id": binding.skill_id,
+                    "enabled": binding.enabled,
+                    "config": binding.config,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+
+        Ok(ChannelBindResponse {
+            binding: to_channel_binding_view(binding),
+        })
+    }
+
+    pub async fn list_channels(&self) -> Result<ChannelListResponse, KernelError> {
+        let bindings = self
+            .channel_state
+            .list_bindings()
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(to_channel_binding_view)
+            .collect::<Vec<_>>();
+
+        Ok(ChannelListResponse { bindings })
+    }
+
+    pub async fn list_channel_peers(
+        &self,
+        channel_id: Option<String>,
+    ) -> Result<ChannelPeerListResponse, KernelError> {
+        let peers = self
+            .channel_state
+            .list_peers(channel_id.as_deref())
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(to_channel_peer_view)
+            .collect::<Vec<_>>();
+
+        Ok(ChannelPeerListResponse { peers })
+    }
+
+    pub async fn approve_channel_peer(
+        &self,
+        req: ChannelPeerApproveRequest,
+    ) -> Result<ChannelPeerResponse, KernelError> {
+        if req.channel_id.trim().is_empty()
+            || req.peer_id.trim().is_empty()
+            || req.pairing_code.trim().is_empty()
+        {
+            return Err(KernelError::BadRequest(
+                "channel_id, peer_id and pairing_code are required".to_string(),
+            ));
+        }
+
+        let channel_id = req.channel_id.trim().to_string();
+        let peer_id = req.peer_id.trim().to_string();
+        let pairing_code = req.pairing_code.trim().to_string();
+        let trust_tier = req.trust_tier.unwrap_or(TrustTier::Main);
+
+        let peer = self
+            .channel_state
+            .get_peer(&channel_id, &peer_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("channel peer not found".to_string()))?;
+
+        if peer.pairing_code != pairing_code {
+            return Err(KernelError::BadRequest("invalid pairing_code".to_string()));
+        }
+
+        let approved = self
+            .channel_state
+            .approve_peer(&channel_id, &peer_id, trust_tier)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("channel peer not found".to_string()))?;
+
+        self.audit
+            .append(
+                "channel.peer.approved",
+                None,
+                Some("api".to_string()),
+                json!({
+                    "channel_id": approved.channel_id,
+                    "peer_id": approved.peer_id,
+                    "trust_tier": approved.trust_tier.as_str(),
+                }),
+            )
+            .await
+            .map_err(internal)?;
+
+        Ok(ChannelPeerResponse {
+            peer: to_channel_peer_view(approved),
+        })
+    }
+
+    pub async fn block_channel_peer(
+        &self,
+        req: ChannelPeerBlockRequest,
+    ) -> Result<ChannelPeerResponse, KernelError> {
+        if req.channel_id.trim().is_empty() || req.peer_id.trim().is_empty() {
+            return Err(KernelError::BadRequest(
+                "channel_id and peer_id are required".to_string(),
+            ));
+        }
+
+        let channel_id = req.channel_id.trim().to_string();
+        let peer_id = req.peer_id.trim().to_string();
+        let blocked = self
+            .channel_state
+            .block_peer(&channel_id, &peer_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("channel peer not found".to_string()))?;
+
+        self.audit
+            .append(
+                "channel.peer.blocked",
+                None,
+                Some("api".to_string()),
+                json!({
+                    "channel_id": blocked.channel_id,
+                    "peer_id": blocked.peer_id,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+
+        Ok(ChannelPeerResponse {
+            peer: to_channel_peer_view(blocked),
+        })
+    }
+
+    pub async fn ingest_channel_inbound(
+        &self,
+        req: ChannelInboundRequest,
+    ) -> Result<ChannelInboundResponse, KernelError> {
+        let accepted = self
+            .process_inbound_channel_text(
+                &req.channel_id,
+                &req.peer_id,
+                &req.text,
+                req.runtime_id,
+                req.update_id,
+                req.external_message_id,
+            )
+            .await?;
+
+        Ok(ChannelInboundResponse { accepted })
+    }
+
+    pub async fn pull_channel_outbox(
+        &self,
+        req: ChannelOutboxPullRequest,
+    ) -> Result<ChannelOutboxPullResponse, KernelError> {
+        if req.channel_id.trim().is_empty() {
+            return Err(KernelError::BadRequest(
+                "channel_id is required".to_string(),
+            ));
+        }
+
+        self.require_active_channel_binding(req.channel_id.trim())
+            .await?;
+
+        let limit = req.limit.unwrap_or(50).clamp(1, 200);
+        let messages = self
+            .channel_state
+            .list_pending_outbox(req.channel_id.trim(), limit)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(to_channel_outbox_message_view)
+            .collect::<Vec<_>>();
+
+        self.audit
+            .append(
+                "channel.outbox.pulled",
+                None,
+                Some("api".to_string()),
+                json!({
+                    "channel_id": req.channel_id.trim(),
+                    "count": messages.len(),
+                    "limit": limit,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+
+        Ok(ChannelOutboxPullResponse { messages })
+    }
+
+    pub async fn ack_channel_outbox(
+        &self,
+        req: ChannelOutboxAckRequest,
+    ) -> Result<ChannelOutboxAckResponse, KernelError> {
+        if req.external_message_id.trim().is_empty() {
+            return Err(KernelError::BadRequest(
+                "external_message_id is required".to_string(),
+            ));
+        }
+
+        let acknowledged = self
+            .channel_state
+            .ack_outbound_message(req.message_id, req.external_message_id.trim())
+            .await
+            .map_err(internal)?;
+
+        if acknowledged {
+            self.audit
+                .append(
+                    "channel.outbound.acked",
+                    None,
+                    Some("api".to_string()),
+                    json!({
+                        "message_id": req.message_id,
+                        "external_message_id": req.external_message_id.trim(),
+                    }),
+                )
+                .await
+                .map_err(internal)?;
+        }
+
+        Ok(ChannelOutboxAckResponse {
+            message_id: req.message_id,
+            acknowledged,
+        })
+    }
+
+    pub async fn get_channel_binding(
+        &self,
+        channel_id: &str,
+    ) -> Result<Option<super::channel_state::ChannelBindingRecord>, KernelError> {
+        self.channel_state
+            .get_binding(channel_id)
+            .await
+            .map_err(internal)
+    }
+
+    pub async fn get_channel_offset(&self, channel_id: &str) -> Result<i64, KernelError> {
+        self.channel_state
+            .get_offset(channel_id)
+            .await
+            .map_err(internal)
+    }
+
+    pub async fn set_channel_offset(
+        &self,
+        channel_id: &str,
+        offset: i64,
+    ) -> Result<(), KernelError> {
+        self.channel_state
+            .set_offset(channel_id, offset)
+            .await
+            .map_err(internal)
+    }
+
+    pub async fn process_inbound_channel_text(
+        &self,
+        channel_id: &str,
+        peer_id: &str,
+        text: &str,
+        runtime_id: Option<String>,
+        update_id: Option<i64>,
+        external_message_id: Option<String>,
+    ) -> Result<bool, KernelError> {
+        if channel_id.trim().is_empty() || peer_id.trim().is_empty() || text.trim().is_empty() {
+            return Err(KernelError::BadRequest(
+                "channel_id, peer_id and text are required".to_string(),
+            ));
+        }
+
+        self.require_active_channel_binding(channel_id).await?;
+
+        let inserted = self
+            .channel_state
+            .insert_inbound_message(channel_id, peer_id, external_message_id, update_id, text)
+            .await
+            .map_err(internal)?;
+        if !inserted {
+            return Ok(false);
+        }
+
+        let peer = match self
+            .channel_state
+            .get_peer(channel_id, peer_id)
+            .await
+            .map_err(internal)?
+        {
+            Some(existing) => existing,
+            None => {
+                let pending = self
+                    .channel_state
+                    .upsert_pending_peer(channel_id, peer_id, &generate_pairing_code())
+                    .await
+                    .map_err(internal)?;
+
+                self.audit
+                    .append(
+                        "channel.peer.pending",
+                        None,
+                        Some("kernel".to_string()),
+                        json!({
+                            "channel_id": channel_id,
+                            "peer_id": peer_id,
+                            "pairing_code": pending.pairing_code,
+                        }),
+                    )
+                    .await
+                    .map_err(internal)?;
+
+                let _ = self
+                    .send_channel_text(
+                        channel_id,
+                        peer_id,
+                        &format!(
+                            "Pairing required. Approve this peer with code {} via /v0/channels/peers/approve.",
+                            pending.pairing_code
+                        ),
+                    )
+                    .await;
+
+                self.audit
+                    .append(
+                        "channel.inbound.rejected",
+                        None,
+                        Some("kernel".to_string()),
+                        json!({
+                            "channel_id": channel_id,
+                            "peer_id": peer_id,
+                            "reason": "peer_pending_approval",
+                            "update_id": update_id,
+                        }),
+                    )
+                    .await
+                    .map_err(internal)?;
+
+                return Ok(true);
+            }
+        };
+
+        match peer.status {
+            ChannelPeerStatus::Pending => {
+                let _ = self
+                    .send_channel_text(
+                        channel_id,
+                        peer_id,
+                        &format!(
+                            "Peer is pending approval. Use pairing code {} via /v0/channels/peers/approve.",
+                            peer.pairing_code
+                        ),
+                    )
+                    .await;
+                self.audit
+                    .append(
+                        "channel.inbound.rejected",
+                        None,
+                        Some("kernel".to_string()),
+                        json!({
+                            "channel_id": channel_id,
+                            "peer_id": peer_id,
+                            "reason": "peer_pending_approval",
+                            "update_id": update_id,
+                        }),
+                    )
+                    .await
+                    .map_err(internal)?;
+                return Ok(true);
+            }
+            ChannelPeerStatus::Blocked => {
+                self.audit
+                    .append(
+                        "channel.inbound.rejected",
+                        None,
+                        Some("kernel".to_string()),
+                        json!({
+                            "channel_id": channel_id,
+                            "peer_id": peer_id,
+                            "reason": "peer_blocked",
+                            "update_id": update_id,
+                        }),
+                    )
+                    .await
+                    .map_err(internal)?;
+                return Ok(true);
+            }
+            ChannelPeerStatus::Approved => {}
+        }
+
+        self.audit
+            .append(
+                "channel.inbound.accepted",
+                None,
+                Some("kernel".to_string()),
+                json!({
+                    "channel_id": channel_id,
+                    "peer_id": peer_id,
+                    "update_id": update_id,
+                    "text_len": text.len(),
+                }),
+            )
+            .await
+            .map_err(internal)?;
+
+        let session = match self
+            .sessions
+            .find_latest_by_channel_peer(channel_id, peer_id)
+            .await
+            .map_err(internal)?
+        {
+            Some(existing) => existing,
+            None => self
+                .sessions
+                .open(
+                    channel_id.to_string(),
+                    peer_id.to_string(),
+                    peer.trust_tier.clone(),
+                )
+                .await
+                .map_err(internal)?,
+        };
+
+        self.audit
+            .append(
+                "channel.turn.started",
+                Some(session.session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "channel_id": channel_id,
+                    "peer_id": peer_id,
+                    "runtime_id": runtime_id,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+
+        let turn = self
+            .turn_session(SessionTurnRequest {
+                session_id: session.session_id,
+                user_text: text.to_string(),
+                runtime_id,
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await;
+
+        let turn = match turn {
+            Ok(value) => value,
+            Err(err) => {
+                self.audit
+                    .append(
+                        "channel.turn.failed",
+                        Some(session.session_id),
+                        Some("kernel".to_string()),
+                        json!({
+                            "channel_id": channel_id,
+                            "peer_id": peer_id,
+                            "error": err.to_string(),
+                        }),
+                    )
+                    .await
+                    .map_err(internal)?;
+                return Err(err);
+            }
+        };
+
+        if !turn.assistant_text.trim().is_empty() {
+            self.send_channel_text(channel_id, peer_id, &turn.assistant_text)
+                .await?;
+        }
+
+        self.audit
+            .append(
+                "channel.turn.succeeded",
+                Some(session.session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "channel_id": channel_id,
+                    "peer_id": peer_id,
+                    "runtime_id": turn.runtime_id,
+                    "assistant_text_len": turn.assistant_text.len(),
+                }),
+            )
+            .await
+            .map_err(internal)?;
+
+        Ok(true)
     }
 
     pub async fn grant_policy(
@@ -557,8 +1098,80 @@ fn to_skill_view(skill: super::skills::SkillRecord) -> SkillView {
     }
 }
 
+fn to_channel_binding_view(
+    binding: super::channel_state::ChannelBindingRecord,
+) -> ChannelBindingView {
+    ChannelBindingView {
+        channel_id: binding.channel_id,
+        skill_id: binding.skill_id,
+        enabled: binding.enabled,
+        config: binding.config,
+        updated_at: binding.updated_at,
+    }
+}
+
+fn to_channel_peer_view(peer: super::channel_state::ChannelPeerRecord) -> ChannelPeerView {
+    let pairing_code = if peer.status == ChannelPeerStatus::Pending {
+        Some(peer.pairing_code)
+    } else {
+        None
+    };
+
+    ChannelPeerView {
+        channel_id: peer.channel_id,
+        peer_id: peer.peer_id,
+        status: peer.status.as_str().to_string(),
+        trust_tier: peer.trust_tier,
+        pairing_code,
+        first_seen: peer.first_seen,
+        updated_at: peer.updated_at,
+    }
+}
+
+fn to_channel_outbox_message_view(
+    message: super::channel_state::ChannelOutboxMessageRecord,
+) -> ChannelOutboxMessageView {
+    ChannelOutboxMessageView {
+        message_id: message.message_id,
+        channel_id: message.channel_id,
+        peer_id: message.peer_id,
+        content: message.content,
+        created_at: message.created_at,
+    }
+}
+
 fn internal(err: anyhow::Error) -> KernelError {
     KernelError::Internal(err.to_string())
+}
+
+fn parse_channel_send_intent(
+    value: &serde_json::Value,
+) -> Result<(String, String, String), String> {
+    let channel_id = value
+        .get("channel_id")
+        .and_then(|raw| raw.as_str())
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .ok_or_else(|| "channel.send broker output missing channel_id".to_string())?;
+    let conversation_ref = value
+        .get("conversation_ref")
+        .and_then(|raw| raw.as_str())
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .ok_or_else(|| "channel.send broker output missing conversation_ref".to_string())?;
+    let content = value
+        .get("content")
+        .and_then(|raw| raw.as_str())
+        .ok_or_else(|| "channel.send broker output missing content".to_string())?;
+    if content.trim().is_empty() {
+        return Err("channel.send broker output missing content".to_string());
+    }
+
+    Ok((
+        channel_id.to_string(),
+        conversation_ref.to_string(),
+        content.to_string(),
+    ))
 }
 
 fn summarize_capability_output(
@@ -577,7 +1190,7 @@ fn summarize_capability_output(
         Capability::ChannelSend => json!({
             "channel_id": output.get("channel_id"),
             "conversation_ref": output.get("conversation_ref"),
-            "message_id": output.get("message_id"),
+            "message_ids": output.get("message_ids"),
         }),
         _ => json!({
             "type": json_value_type(output),
@@ -594,6 +1207,64 @@ fn json_value_type(value: &serde_json::Value) -> &'static str {
         serde_json::Value::Array(_) => "array",
         serde_json::Value::Object(_) => "object",
     }
+}
+
+fn split_text_chunks(content: &str, max_len: usize) -> Vec<String> {
+    if content.is_empty() {
+        return vec![String::new()];
+    }
+    if content.len() <= max_len {
+        return vec![content.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+
+    for line in content.lines() {
+        let additional = if current.is_empty() {
+            line.len()
+        } else {
+            line.len() + 1
+        };
+        if !current.is_empty() && current.len() + additional > max_len {
+            chunks.push(std::mem::take(&mut current));
+        }
+
+        if line.len() > max_len {
+            let mut slice = line;
+            while slice.len() > max_len {
+                let mut split_at = max_len;
+                while !slice.is_char_boundary(split_at) {
+                    split_at -= 1;
+                }
+                chunks.push(slice[..split_at].to_string());
+                slice = &slice[split_at..];
+            }
+            if !slice.is_empty() {
+                if !current.is_empty() {
+                    current.push('\n');
+                }
+                current.push_str(slice);
+            }
+            continue;
+        }
+
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(line);
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn generate_pairing_code() -> String {
+    let bytes = *Uuid::new_v4().as_bytes();
+    let number = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 1_000_000;
+    format!("{:06}", number)
 }
 
 impl Kernel {
@@ -808,6 +1479,76 @@ impl Kernel {
         Ok(())
     }
 
+    async fn require_active_channel_binding(&self, channel_id: &str) -> Result<(), KernelError> {
+        let binding = self
+            .channel_state
+            .get_binding(channel_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                KernelError::NotFound(format!("channel '{}' is not bound to a skill", channel_id))
+            })?;
+
+        if !binding.enabled {
+            return Err(KernelError::Conflict(format!(
+                "channel '{}' binding is disabled",
+                channel_id
+            )));
+        }
+
+        let skill_enabled = self
+            .skills
+            .get(&binding.skill_id)
+            .await
+            .map_err(internal)?
+            .map(|skill| skill.enabled)
+            .unwrap_or(false);
+        if !skill_enabled {
+            return Err(KernelError::Conflict(format!(
+                "channel '{}' binding skill '{}' is disabled",
+                channel_id, binding.skill_id
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn send_channel_text(
+        &self,
+        channel_id: &str,
+        peer_id: &str,
+        content: &str,
+    ) -> Result<Vec<uuid::Uuid>, KernelError> {
+        self.require_active_channel_binding(channel_id).await?;
+        let mut message_ids = Vec::new();
+
+        for chunk in split_text_chunks(content, 3500) {
+            let message_id = self
+                .channel_state
+                .queue_outbound_message(channel_id, peer_id, &chunk)
+                .await
+                .map_err(internal)?;
+            message_ids.push(message_id);
+
+            self.audit
+                .append(
+                    "channel.outbound.queued",
+                    None,
+                    Some("kernel".to_string()),
+                    json!({
+                        "channel_id": channel_id,
+                        "peer_id": peer_id,
+                        "message_id": message_id,
+                        "content_len": chunk.len(),
+                    }),
+                )
+                .await
+                .map_err(internal)?;
+        }
+
+        Ok(message_ids)
+    }
+
     async fn evaluate_capability_requests(
         &self,
         session_id: uuid::Uuid,
@@ -883,12 +1624,44 @@ impl Kernel {
                 executed = true;
                 match self
                     .capability_broker
-                    .execute(&self.channels, &context, capability, &payload)
+                    .execute(&context, capability, &payload)
                     .await
                 {
                     Ok(value) => {
-                        output = value;
-                        allowed = true;
+                        if capability == Capability::ChannelSend {
+                            match parse_channel_send_intent(&value) {
+                                Ok((channel_id, peer_id, content)) => {
+                                    match self
+                                        .send_channel_text(&channel_id, &peer_id, &content)
+                                        .await
+                                    {
+                                        Ok(queued_message_ids) => {
+                                            output = json!({
+                                                "channel_id": channel_id,
+                                                "conversation_ref": peer_id,
+                                                "message_ids": queued_message_ids,
+                                            });
+                                            allowed = true;
+                                        }
+                                        Err(err) => {
+                                            let detail = err.to_string();
+                                            execution_error = Some(detail.clone());
+                                            reason = Some(format!(
+                                                "broker execution failed: {}",
+                                                detail
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(detail) => {
+                                    execution_error = Some(detail.clone());
+                                    reason = Some(format!("broker execution failed: {}", detail));
+                                }
+                            }
+                        } else {
+                            output = value;
+                            allowed = true;
+                        }
                     }
                     Err(err) => {
                         let detail = err.to_string();

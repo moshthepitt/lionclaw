@@ -7,7 +7,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use lionclaw::{
     contracts::{
-        PolicyGrantRequest, SessionOpenRequest, SessionTurnRequest, SkillInstallRequest, TrustTier,
+        ChannelBindRequest, PolicyGrantRequest, SessionOpenRequest, SessionTurnRequest,
+        SkillInstallRequest, TrustTier,
     },
     kernel::{
         policy::Capability,
@@ -165,6 +166,15 @@ async fn channel_send_capability_uses_session_channel_defaults() {
         "Capability broker channel send skill",
     )
     .await;
+    kernel
+        .bind_channel(ChannelBindRequest {
+            channel_id: "local-cli".to_string(),
+            skill_id: skill_id.clone(),
+            enabled: Some(true),
+            config: None,
+        })
+        .await
+        .expect("bind local-cli channel to skill");
     grant_capability(&kernel, &skill_id, "channel.send").await;
 
     let response = kernel
@@ -199,12 +209,16 @@ async fn channel_send_capability_uses_session_channel_defaults() {
         Some(peer_id),
         "channel broker should default to session peer id"
     );
+    let message_ids = details["output_summary"]["message_ids"]
+        .as_array()
+        .expect("message ids");
     assert!(
-        details["output_summary"]["message_id"]
-            .as_str()
-            .expect("message id")
-            .starts_with("local:"),
-        "local channel stub should return a local message id"
+        !message_ids.is_empty(),
+        "queued outbound message ids must exist"
+    );
+    assert!(
+        message_ids.iter().all(|entry| entry.as_str().is_some()),
+        "queued message ids should serialize as strings"
     );
 }
 

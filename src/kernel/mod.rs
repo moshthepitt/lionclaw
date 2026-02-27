@@ -1,6 +1,6 @@
 pub mod audit;
 pub mod capability_broker;
-pub mod channels;
+pub mod channel_state;
 pub mod core;
 pub mod db;
 pub mod error;
