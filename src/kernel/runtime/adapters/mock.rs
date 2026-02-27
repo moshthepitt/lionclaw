@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::kernel::{
@@ -52,7 +52,7 @@ impl RuntimeAdapter for MockRuntimeAdapter {
 
         let mut capability_requests = Vec::new();
         if let Some(skill_id) = input.selected_skills.first() {
-            for (index, capability) in parse_capability_markers(&input.prompt)
+            for (index, (capability, payload)) in parse_capability_markers(&input.prompt)
                 .into_iter()
                 .enumerate()
             {
@@ -61,7 +61,7 @@ impl RuntimeAdapter for MockRuntimeAdapter {
                     skill_id: skill_id.clone(),
                     capability,
                     scope: None,
-                    payload: Value::Null,
+                    payload,
                 });
             }
         }
@@ -113,18 +113,42 @@ impl RuntimeAdapter for MockRuntimeAdapter {
     }
 }
 
-fn parse_capability_markers(prompt: &str) -> Vec<Capability> {
+fn parse_capability_markers(prompt: &str) -> Vec<(Capability, Value)> {
     let mut requested = Vec::new();
-    for (marker, capability) in [
-        ("[cap:fs.read]", Capability::FsRead),
-        ("[cap:fs.write]", Capability::FsWrite),
-        ("[cap:net.egress]", Capability::NetEgress),
-        ("[cap:secret.request]", Capability::SecretRequest),
-        ("[cap:channel.send]", Capability::ChannelSend),
-        ("[cap:scheduler.run]", Capability::SchedulerRun),
+    for (marker, capability, payload) in [
+        (
+            "[cap:fs.read]",
+            Capability::FsRead,
+            json!({"path": "README.md"}),
+        ),
+        (
+            "[cap:fs.write]",
+            Capability::FsWrite,
+            json!({"path": "target/lionclaw-mock-write.txt", "content": "mock runtime write"}),
+        ),
+        (
+            "[cap:net.egress]",
+            Capability::NetEgress,
+            json!({"method": "GET", "url": "https://example.invalid"}),
+        ),
+        (
+            "[cap:secret.request]",
+            Capability::SecretRequest,
+            json!({"name": "example-secret"}),
+        ),
+        (
+            "[cap:channel.send]",
+            Capability::ChannelSend,
+            json!({"content": "mock runtime channel send"}),
+        ),
+        (
+            "[cap:scheduler.run]",
+            Capability::SchedulerRun,
+            json!({"job": "mock-job"}),
+        ),
     ] {
         if prompt.contains(marker) {
-            requested.push(capability);
+            requested.push((capability, payload));
         }
     }
     requested

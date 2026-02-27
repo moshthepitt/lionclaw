@@ -6,6 +6,7 @@
 - `kernel.skills`: installed skill registry and enable/disable state.
 - `kernel.selector`: turn-time skill relevance selection.
 - `kernel.policy`: capability grant/revoke and allow checks.
+- `kernel.capability_broker`: brokered capability execution (`fs`, `net`, `secret`, `channel.send`, `scheduler`).
 - `kernel.runtime`: runtime adapter contract and registry.
 - `kernel.channels`: channel-skill contract and registry.
 - `kernel.audit`: append-only audit event log persisted in SQLite.
@@ -42,6 +43,16 @@
 - `cancel()`
 - `close()`
 
+## Capability Broker Contract
+
+Runtime adapters submit `RuntimeCapabilityRequest` items. Kernel flow:
+
+1. Validate requesting skill is selected for the turn.
+2. Evaluate policy for requested capability and scope.
+3. If allowed, execute through kernel broker only.
+4. Return `RuntimeCapabilityResult` to adapter.
+5. Audit both request and result (`capability.request`, `capability.result`).
+
 Runtime module layout:
 
 - `kernel/runtime/mod.rs`: shared runtime contracts + registry.
@@ -70,10 +81,15 @@ Adding a new adapter:
 1. Default deny: policy checks deny unless grant exists.
 2. No default external channel in core.
 3. Runtime adapters registered by default: local `mock`, subprocess `codex`, and subprocess `opencode`.
-4. `codex` adapter runs in secure defaults (`read-only` sandbox, `--ephemeral`) until brokered capability routing is complete.
+4. `codex` adapter runs in secure defaults (`read-only` sandbox, `--ephemeral`) and kernel-owned capability broker routing.
 5. `opencode` adapter runs in JSON event mode and maps runtime events into kernel events.
 6. Kernel-enforced runtime turn timeout + cancellation path (`runtime.turn.timeout` audit event on timeout).
-7. Auditing for all API-initiated mutations.
+7. Runtime execution policy supports per-turn working directory, timeout, and env passthrough constraints.
+8. Capability side effects route through kernel brokers only:
+   - `fs.read` / `fs.write` use workspace-bounded filesystem broker.
+   - `channel.send` uses channel registry broker path.
+   - `net.egress`, `secret.request`, `scheduler.run` are broker-gated and denied until configured.
+9. Auditing covers API mutations plus capability request/result decisions.
 
 ## Planned Hardening After v0
 

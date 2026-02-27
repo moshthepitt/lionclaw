@@ -13,6 +13,7 @@ use crate::contracts::{
 
 use super::{
     audit::AuditLog,
+    capability_broker::{CapabilityBroker, CapabilityExecutionContext},
     channels::{ChannelRegistry, LocalCliChannel},
     db::Db,
     error::KernelError,
@@ -51,6 +52,7 @@ pub struct Kernel {
     runtime: RuntimeRegistry,
     channels: ChannelRegistry,
     audit: AuditLog,
+    capability_broker: CapabilityBroker,
     runtime_turn_timeout: Duration,
     runtime_execution_policy: RuntimeExecutionPolicy,
 }
@@ -79,6 +81,7 @@ impl Kernel {
             runtime,
             channels,
             audit: AuditLog::new(pool),
+            capability_broker: CapabilityBroker::default(),
             runtime_turn_timeout,
             runtime_execution_policy: options.runtime_execution_policy,
         };
@@ -242,6 +245,8 @@ impl Kernel {
                 let capability_results = self
                     .evaluate_capability_requests(
                         session.session_id,
+                        &session.channel_id,
+                        &session.peer_id,
                         &allowed_skills,
                         turn_output.capability_requests,
                     )
@@ -556,6 +561,41 @@ fn internal(err: anyhow::Error) -> KernelError {
     KernelError::Internal(err.to_string())
 }
 
+fn summarize_capability_output(
+    capability: Capability,
+    output: &serde_json::Value,
+) -> serde_json::Value {
+    match capability {
+        Capability::FsRead => json!({
+            "path": output.get("path"),
+            "bytes": output.get("bytes"),
+        }),
+        Capability::FsWrite => json!({
+            "path": output.get("path"),
+            "bytes_written": output.get("bytes_written"),
+        }),
+        Capability::ChannelSend => json!({
+            "channel_id": output.get("channel_id"),
+            "conversation_ref": output.get("conversation_ref"),
+            "message_id": output.get("message_id"),
+        }),
+        _ => json!({
+            "type": json_value_type(output),
+        }),
+    }
+}
+
+fn json_value_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 impl Kernel {
     async fn resolve_runtime_execution_context(
         &self,
@@ -771,6 +811,8 @@ impl Kernel {
     async fn evaluate_capability_requests(
         &self,
         session_id: uuid::Uuid,
+        session_channel_id: &str,
+        session_peer_id: &str,
         allowed_skill_ids: &[String],
         requests: Vec<RuntimeCapabilityRequest>,
     ) -> Result<Vec<RuntimeCapabilityResult>, KernelError> {
@@ -781,14 +823,20 @@ impl Kernel {
         for request in requests {
             let request_id = request.request_id.clone();
             let skill_id = request.skill_id.clone();
+            let capability = request.capability;
+            let payload = request.payload.clone();
             let requested_scope_raw = request
                 .scope
                 .clone()
                 .unwrap_or_else(|| session_scope.as_str());
 
             let mut decision_scope = session_scope.clone();
+            let mut policy_allowed = false;
             let mut allowed = false;
+            let mut executed = false;
+            let mut output = serde_json::Value::Null;
             let mut reason = None;
+            let mut execution_error = None;
 
             let skill_is_selected = allowed_skill_ids.iter().any(|value| value == &skill_id);
             if !skill_is_selected {
@@ -812,18 +860,41 @@ impl Kernel {
             if reason.is_none() {
                 let allowed_for_scope = self
                     .policy
-                    .is_allowed(&skill_id, request.capability, &decision_scope)
+                    .is_allowed(&skill_id, capability, &decision_scope)
                     .await
                     .map_err(internal)?;
                 let allowed_globally = self
                     .policy
-                    .is_allowed(&skill_id, request.capability, &any_scope)
+                    .is_allowed(&skill_id, capability, &any_scope)
                     .await
                     .map_err(internal)?;
 
-                allowed = allowed_for_scope || allowed_globally;
-                if !allowed {
+                policy_allowed = allowed_for_scope || allowed_globally;
+                if !policy_allowed {
                     reason = Some("policy denied capability request".to_string());
+                }
+            }
+
+            if reason.is_none() {
+                let context = CapabilityExecutionContext {
+                    session_channel_id,
+                    session_peer_id,
+                };
+                executed = true;
+                match self
+                    .capability_broker
+                    .execute(&self.channels, &context, capability, &payload)
+                    .await
+                {
+                    Ok(value) => {
+                        output = value;
+                        allowed = true;
+                    }
+                    Err(err) => {
+                        let detail = err.to_string();
+                        execution_error = Some(detail.clone());
+                        reason = Some(format!("broker execution failed: {}", detail));
+                    }
                 }
             }
 
@@ -835,12 +906,32 @@ impl Kernel {
                     json!({
                         "request_id": request_id,
                         "skill_id": skill_id,
-                        "capability": request.capability.as_str(),
+                        "capability": capability.as_str(),
                         "requested_scope": requested_scope_raw,
                         "effective_scope": decision_scope.as_str(),
+                        "policy_allowed": policy_allowed,
+                        "executed": executed,
                         "allowed": allowed,
                         "reason": reason.clone(),
-                        "payload": request.payload,
+                        "execution_error": execution_error,
+                        "payload": payload,
+                    }),
+                )
+                .await
+                .map_err(internal)?;
+
+            self.audit
+                .append(
+                    "capability.result",
+                    Some(session_id),
+                    Some("kernel".to_string()),
+                    json!({
+                        "request_id": request_id,
+                        "skill_id": skill_id,
+                        "capability": capability.as_str(),
+                        "allowed": allowed,
+                        "reason": reason.clone(),
+                        "output_summary": summarize_capability_output(capability, &output),
                     }),
                 )
                 .await
@@ -850,7 +941,7 @@ impl Kernel {
                 request_id,
                 allowed,
                 reason,
-                output: serde_json::Value::Null,
+                output,
             });
         }
 

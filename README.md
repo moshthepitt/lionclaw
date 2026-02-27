@@ -16,6 +16,7 @@ It is built around four constraints:
 - A runnable daemon (`lionclawd`) HTTP API
 - SQLite-backed kernel services (sessions, skills, policy, audit)
 - Runtime adapter contract + `mock`, `codex`, and `opencode` adapter implementations
+- Kernel capability broker flow for runtime capability requests/results
 - Channel-skill contract + local stub channel
 - Planning and roadmap docs
 
