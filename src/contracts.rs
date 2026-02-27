@@ -53,6 +53,12 @@ pub struct SessionTurnRequest {
     pub session_id: Uuid,
     pub user_text: String,
     pub runtime_id: Option<String>,
+    #[serde(default)]
+    pub runtime_working_dir: Option<String>,
+    #[serde(default)]
+    pub runtime_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub runtime_env_passthrough: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -20,6 +20,7 @@ async fn main() -> anyhow::Result<()> {
             &config.db_path,
             KernelOptions {
                 runtime_turn_timeout: Duration::from_millis(config.runtime_turn_timeout_ms),
+                ..KernelOptions::default()
             },
         )
         .await?,

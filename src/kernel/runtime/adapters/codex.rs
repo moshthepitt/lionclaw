@@ -59,6 +59,7 @@ impl CodexRuntimeConfig {
 #[derive(Debug, Clone)]
 struct CodexSessionState {
     working_dir: Option<String>,
+    environment: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -94,6 +95,7 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
         let runtime_session_id = format!("codex-{}", Uuid::new_v4());
         let state = CodexSessionState {
             working_dir: input.working_dir,
+            environment: input.environment,
         };
         self.sessions
             .write()
@@ -116,7 +118,7 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
             executable: self.config.executable.clone(),
             args: build_codex_exec_args(&self.config, session.working_dir.as_deref()),
             working_dir: None,
-            environment: Vec::new(),
+            environment: session.environment.clone(),
             input: input.prompt,
         };
 
@@ -355,6 +357,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0
             .session_start(RuntimeSessionStartInput {
                 session_id: Uuid::new_v4(),
                 working_dir: None,
+                environment: Vec::new(),
                 selected_skills: Vec::new(),
             })
             .await
@@ -413,6 +416,7 @@ exit 7
             .session_start(RuntimeSessionStartInput {
                 session_id: Uuid::new_v4(),
                 working_dir: None,
+                environment: Vec::new(),
                 selected_skills: Vec::new(),
             })
             .await

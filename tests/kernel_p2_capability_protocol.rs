@@ -58,6 +58,9 @@ description: Handles capability-gated runtime operations
             session_id: session.session_id,
             user_text: "use capability-protocol [cap:fs.read]".to_string(),
             runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
         })
         .await
         .expect("turn before fs.read grant");
@@ -85,6 +88,9 @@ description: Handles capability-gated runtime operations
             session_id: session.session_id,
             user_text: "use capability-protocol [cap:fs.read]".to_string(),
             runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
         })
         .await
         .expect("turn after fs.read grant");

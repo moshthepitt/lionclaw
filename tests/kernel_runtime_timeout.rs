@@ -26,6 +26,7 @@ async fn runtime_timeout_triggers_cancel_close_and_audit() {
         &sandbox.db_path(),
         KernelOptions {
             runtime_turn_timeout: Duration::from_millis(50),
+            ..KernelOptions::default()
         },
     )
     .await
@@ -58,6 +59,9 @@ async fn runtime_timeout_triggers_cancel_close_and_audit() {
             session_id: session.session_id,
             user_text: "trigger timeout".to_string(),
             runtime_id: Some("slow".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
         })
         .await
         .expect_err("turn should timeout");

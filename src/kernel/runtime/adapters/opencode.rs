@@ -66,6 +66,7 @@ impl OpenCodeRuntimeConfig {
 #[derive(Debug, Clone)]
 struct OpenCodeSessionState {
     working_dir: Option<String>,
+    environment: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -101,6 +102,7 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
         let runtime_session_id = format!("opencode-{}", Uuid::new_v4());
         let state = OpenCodeSessionState {
             working_dir: input.working_dir,
+            environment: input.environment,
         };
         self.sessions
             .write()
@@ -127,7 +129,10 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
                 &input.prompt,
             ),
             working_dir: None,
-            environment: build_opencode_environment(&self.config),
+            environment: merge_environment(
+                build_opencode_environment(&self.config),
+                session.environment.clone(),
+            ),
             input: String::new(),
         };
 
@@ -229,6 +234,19 @@ fn build_opencode_environment(config: &OpenCodeRuntimeConfig) -> Vec<(String, St
         env.push(("XDG_DATA_HOME".to_string(), xdg_data_home.to_string()));
     }
     env
+}
+
+fn merge_environment(
+    mut base: Vec<(String, String)>,
+    extra: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    for (key, value) in extra {
+        if base.iter().any(|(existing_key, _)| existing_key == &key) {
+            continue;
+        }
+        base.push((key, value));
+    }
+    base
 }
 
 fn env_flag(name: &str) -> Option<bool> {
@@ -429,6 +447,7 @@ echo '{"type":"step_finish","part":{"type":"step-finish"}}'
             .session_start(RuntimeSessionStartInput {
                 session_id: Uuid::new_v4(),
                 working_dir: None,
+                environment: Vec::new(),
                 selected_skills: Vec::new(),
             })
             .await
@@ -480,6 +499,7 @@ exit 7
             .session_start(RuntimeSessionStartInput {
                 session_id: Uuid::new_v4(),
                 working_dir: None,
+                environment: Vec::new(),
                 selected_skills: Vec::new(),
             })
             .await

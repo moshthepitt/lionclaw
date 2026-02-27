@@ -48,6 +48,9 @@ description: Handles restart durability requests
                 session_id: opened.session_id,
                 user_text: "please use restart skill for this task".to_string(),
                 runtime_id: Some("mock".to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
             })
             .await
             .expect("turn should succeed");
@@ -93,6 +96,9 @@ description: Handles restart durability requests
             session_id,
             user_text: "restart skill should still be available".to_string(),
             runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
         })
         .await
         .expect("turn after restart");
@@ -147,6 +153,9 @@ description: Handles expiring policy windows
             session_id: opened.session_id,
             user_text: "ttl skill now".to_string(),
             runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
         })
         .await
         .expect("turn during ttl");
@@ -162,6 +171,9 @@ description: Handles expiring policy windows
             session_id: opened.session_id,
             user_text: "ttl skill now".to_string(),
             runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
         })
         .await
         .expect("turn after ttl");
@@ -184,6 +196,9 @@ async fn audit_query_respects_filters_limit_and_order() {
             session_id: first_session.session_id,
             user_text: "first event".to_string(),
             runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
         })
         .await
         .expect("turn one");
@@ -211,6 +226,9 @@ async fn audit_query_respects_filters_limit_and_order() {
             session_id: first_session.session_id,
             user_text: "second event".to_string(),
             runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
         })
         .await
         .expect("turn two");
@@ -222,6 +240,9 @@ async fn audit_query_respects_filters_limit_and_order() {
             session_id: second_session.session_id,
             user_text: "third event".to_string(),
             runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
         })
         .await
         .expect("turn three");

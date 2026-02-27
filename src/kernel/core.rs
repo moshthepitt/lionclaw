@@ -22,20 +22,23 @@ use super::{
         RuntimeCapabilityResult, RuntimeEvent, RuntimeRegistry, RuntimeSessionHandle,
         RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnOutput, BUILTIN_RUNTIME_MOCK,
     },
+    runtime_policy::{RuntimeExecutionContext, RuntimeExecutionPolicy, RuntimeExecutionRequest},
     selector::SkillSelector,
     sessions::SessionStore,
     skills::{SkillInstallInput, SkillStore},
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct KernelOptions {
     pub runtime_turn_timeout: Duration,
+    pub runtime_execution_policy: RuntimeExecutionPolicy,
 }
 
 impl Default for KernelOptions {
     fn default() -> Self {
         Self {
             runtime_turn_timeout: Duration::from_secs(120),
+            runtime_execution_policy: RuntimeExecutionPolicy::default(),
         }
     }
 }
@@ -49,6 +52,7 @@ pub struct Kernel {
     channels: ChannelRegistry,
     audit: AuditLog,
     runtime_turn_timeout: Duration,
+    runtime_execution_policy: RuntimeExecutionPolicy,
 }
 
 impl Kernel {
@@ -76,6 +80,7 @@ impl Kernel {
             channels,
             audit: AuditLog::new(pool),
             runtime_turn_timeout,
+            runtime_execution_policy: options.runtime_execution_policy,
         };
 
         kernel.bootstrap().await;
@@ -179,11 +184,23 @@ impl Kernel {
         let adapter = self.runtime.get(&runtime_id).await.ok_or_else(|| {
             KernelError::NotFound(format!("runtime adapter '{}' not found", runtime_id))
         })?;
+        let execution_context = self
+            .resolve_runtime_execution_context(
+                session.session_id,
+                &runtime_id,
+                RuntimeExecutionRequest::new(
+                    req.runtime_working_dir.clone(),
+                    req.runtime_env_passthrough.clone().unwrap_or_default(),
+                    req.runtime_timeout_ms,
+                ),
+            )
+            .await?;
 
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
                 session_id: session.session_id,
-                working_dir: None,
+                working_dir: execution_context.working_dir.clone(),
+                environment: execution_context.environment.clone(),
                 selected_skills: allowed_skills.clone(),
             })
             .await
@@ -195,6 +212,7 @@ impl Kernel {
                 &runtime_id,
                 session.session_id,
                 &handle,
+                execution_context.timeout,
                 RuntimeTurnInput {
                     runtime_session_id: handle.runtime_session_id.clone(),
                     prompt: req.user_text.clone(),
@@ -203,41 +221,51 @@ impl Kernel {
             )
             .await;
 
-        let close_result = self
-            .close_runtime_session(adapter.clone(), &runtime_id, session.session_id, &handle)
-            .await;
-
         let turn_output = match turn_result {
-            Ok(output) => {
-                close_result?;
-                output
-            }
+            Ok(output) => output,
             Err(turn_err) => {
-                let _ = close_result;
+                let _ = self
+                    .close_runtime_session(
+                        adapter.clone(),
+                        &runtime_id,
+                        session.session_id,
+                        &handle,
+                    )
+                    .await;
                 return Err(turn_err);
             }
         };
 
-        let mut runtime_events = turn_output.events;
-        if !turn_output.capability_requests.is_empty() {
-            let capability_results = self
-                .evaluate_capability_requests(
-                    session.session_id,
-                    &allowed_skills,
-                    turn_output.capability_requests,
-                )
-                .await?;
-            let followup = adapter
-                .resolve_capability_requests(&handle, capability_results)
-                .await
-                .map_err(|err| KernelError::Runtime(err.to_string()))?;
-            runtime_events.extend(followup);
-        }
+        let runtime_events_result = async {
+            let mut runtime_events = turn_output.events;
+            if !turn_output.capability_requests.is_empty() {
+                let capability_results = self
+                    .evaluate_capability_requests(
+                        session.session_id,
+                        &allowed_skills,
+                        turn_output.capability_requests,
+                    )
+                    .await?;
+                let followup = adapter
+                    .resolve_capability_requests(&handle, capability_results)
+                    .await
+                    .map_err(|err| KernelError::Runtime(err.to_string()))?;
+                runtime_events.extend(followup);
+            }
 
-        adapter
-            .close(&handle)
-            .await
-            .map_err(|err| KernelError::Runtime(err.to_string()))?;
+            Ok::<Vec<RuntimeEvent>, KernelError>(runtime_events)
+        }
+        .await;
+
+        let close_result = self
+            .close_runtime_session(adapter.clone(), &runtime_id, session.session_id, &handle)
+            .await;
+        let runtime_events = match (runtime_events_result, close_result) {
+            (Ok(events), Ok(())) => events,
+            (Err(err), Ok(())) => return Err(err),
+            (Ok(_), Err(close_err)) => return Err(close_err),
+            (Err(err), Err(_)) => return Err(err),
+        };
 
         let _ = self
             .sessions
@@ -289,6 +317,9 @@ impl Kernel {
                     "runtime_id": runtime_id,
                     "selected_skills": allowed_skills,
                     "prompt_len": req.user_text.len(),
+                    "runtime_working_dir": execution_context.working_dir,
+                    "runtime_timeout_ms": execution_context.timeout.as_millis() as u64,
+                    "runtime_env_passthrough_count": execution_context.environment.len(),
                 }),
             )
             .await
@@ -526,15 +557,75 @@ fn internal(err: anyhow::Error) -> KernelError {
 }
 
 impl Kernel {
+    async fn resolve_runtime_execution_context(
+        &self,
+        session_id: uuid::Uuid,
+        runtime_id: &str,
+        request: RuntimeExecutionRequest,
+    ) -> Result<RuntimeExecutionContext, KernelError> {
+        let request_working_dir = request.working_dir.clone();
+        let request_timeout_ms = request.timeout_ms;
+        let request_env = request.env_passthrough_keys.clone();
+
+        match self
+            .runtime_execution_policy
+            .evaluate(runtime_id, request, self.runtime_turn_timeout)
+        {
+            Ok(context) => {
+                self.audit
+                    .append(
+                        "runtime.policy.allow",
+                        Some(session_id),
+                        Some("kernel".to_string()),
+                        json!({
+                            "runtime_id": runtime_id,
+                            "requested_working_dir": request_working_dir,
+                            "requested_timeout_ms": request_timeout_ms,
+                            "requested_env_passthrough": request_env,
+                            "effective_working_dir": context.working_dir,
+                            "effective_timeout_ms": context.timeout.as_millis() as u64,
+                            "effective_env_passthrough_count": context.environment.len(),
+                        }),
+                    )
+                    .await
+                    .map_err(internal)?;
+                Ok(context)
+            }
+            Err(reason) => {
+                self.audit
+                    .append(
+                        "runtime.policy.deny",
+                        Some(session_id),
+                        Some("kernel".to_string()),
+                        json!({
+                            "runtime_id": runtime_id,
+                            "requested_working_dir": request_working_dir,
+                            "requested_timeout_ms": request_timeout_ms,
+                            "requested_env_passthrough": request_env,
+                            "reason": reason,
+                        }),
+                    )
+                    .await
+                    .map_err(internal)?;
+
+                Err(KernelError::BadRequest(format!(
+                    "runtime execution policy denied request: {}",
+                    reason
+                )))
+            }
+        }
+    }
+
     async fn execute_runtime_turn(
         &self,
         adapter: Arc<dyn RuntimeAdapter>,
         runtime_id: &str,
         session_id: uuid::Uuid,
         handle: &RuntimeSessionHandle,
+        turn_timeout: Duration,
         input: RuntimeTurnInput,
     ) -> Result<RuntimeTurnOutput, KernelError> {
-        let timeout_ms = self.runtime_turn_timeout.as_millis() as u64;
+        let timeout_ms = turn_timeout.as_millis() as u64;
         self.audit
             .append(
                 "runtime.turn.start",
@@ -553,7 +644,7 @@ impl Kernel {
         let mut turn_task = tokio::spawn(async move { adapter_for_task.turn(input).await });
         let turn_result = tokio::select! {
             output = &mut turn_task => Some(output),
-            _ = sleep(self.runtime_turn_timeout) => None,
+            _ = sleep(turn_timeout) => None,
         };
 
         match turn_result {

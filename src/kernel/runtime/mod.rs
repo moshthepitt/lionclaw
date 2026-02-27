@@ -31,6 +31,7 @@ pub struct RuntimeAdapterInfo {
 pub struct RuntimeSessionStartInput {
     pub session_id: Uuid,
     pub working_dir: Option<String>,
+    pub environment: Vec<(String, String)>,
     pub selected_skills: Vec<String>,
 }
 
