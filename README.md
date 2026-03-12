@@ -1,126 +1,98 @@
 # LionClaw
 
-LionClaw is a secure-first local agent kernel.
+LionClaw is a secure-first local agent kernel that lets you run your preferred CLI runtime (for example `codex` or `opencode`) behind one policy- and audit-enforced control plane.
 
-It is built around four constraints:
+## Why it exists
 
-1. Anthropic skill format (`SKILL.md`) is used as-is.
-2. Security boundaries are enforced by the kernel, not by prompt text.
-3. Channels are skills (no default external channel in core).
-4. Multiple agent runtimes are supported via adapters (`codex`, `claude-code`, `gemini-cli`, etc.).
+Most agent stacks are either feature-heavy or loosely enforced.
+LionClaw takes the opposite path:
 
-## Status
+- Small, auditable kernel
+- Default-deny capability checks
+- Channels as installable skills (not hardcoded core features)
+- Runtime-agnostic adapters so you can swap agent CLIs without changing channel workers
 
-`v0` is an implementation skeleton with:
+## What it does
 
-- A runnable daemon (`lionclawd`) HTTP API
-- SQLite-backed kernel services (sessions, skills, policy, audit)
-- Runtime adapter contract + `mock`, `codex`, and `opencode` adapter implementations
-- Kernel capability broker flow for runtime capability requests/results
-- Channel bridge APIs for external skill workers (`inbound`, `outbox pull`, `outbox ack`)
-- Planning and roadmap docs
+LionClaw provides:
 
-See:
+- Session and turn orchestration
+- Skill install/enable state (`SKILL.md` compatible)
+- Policy checks for privileged actions
+- Append-only audit events
+- Channel bridge APIs (`inbound` and `outbox` for external workers)
+- Runtime adapter interface with current adapters: `mock`, `codex`, `opencode`
 
-- `docs/V0_PLAN.md`
-- `docs/ARCHITECTURE.md`
-- `docs/ROADMAP.md`
+## Quick start
 
-## Run
+Prerequisites:
+
+- Rust toolchain
+- A runtime CLI installed (`codex` and/or `opencode`)
+- `curl` and `jq` for API/script usage
+
+Start kernel:
 
 ```bash
 cargo run
 ```
 
-Server starts on `127.0.0.1:3000` by default.
-SQLite database defaults to `./lionclaw.db` (override via `LIONCLAW_DB_PATH`).
-Runtime turn timeout defaults to `120000` ms (override via `LIONCLAW_RUNTIME_TURN_TIMEOUT_MS`).
+Default endpoint: `http://127.0.0.1:3000`
 
-## Channel APIs
+Health check:
 
-LionClaw exposes channel management APIs:
-
-- `POST /v0/channels/bind`
-- `GET /v0/channels/list`
-- `GET /v0/channels/peers`
-- `POST /v0/channels/peers/approve`
-- `POST /v0/channels/peers/block`
-- `POST /v0/channels/inbound`
-- `POST /v0/channels/outbox/pull`
-- `POST /v0/channels/outbox/ack`
-
-## Runtime: Codex Adapter
-
-LionClaw registers a `codex` runtime adapter at startup.
-
-Secure defaults:
-
-- `codex exec --json`
-- `--sandbox read-only`
-- `--ephemeral`
-- `--skip-git-repo-check`
-
-Optional overrides:
-
-- `LIONCLAW_CODEX_BIN` (default: `codex`)
-- `LIONCLAW_CODEX_MODEL` (unset by default)
-- `LIONCLAW_CODEX_SANDBOX` (default: `read-only`)
-- `LIONCLAW_CODEX_EPHEMERAL` (`true` by default)
-- `LIONCLAW_CODEX_SKIP_GIT_REPO_CHECK` (`true` by default)
-
-Use it by setting `runtime_id` on turn requests:
-
-```json
-{
-  "session_id": "00000000-0000-0000-0000-000000000000",
-  "user_text": "summarize the selected skills for this task",
-  "runtime_id": "codex"
-}
+```bash
+curl -sS http://127.0.0.1:3000/health | jq
 ```
 
-## Runtime: OpenCode Adapter
+## How to use
 
-LionClaw also registers an `opencode` runtime adapter at startup.
+1. Install and enable a channel skill.
+2. Bind that skill to a channel ID and runtime.
+3. Run the channel worker (external process) for that skill.
+4. Send messages through the channel; LionClaw routes turns to the configured runtime.
 
-Default invocation:
+Fast path for Telegram-style channel skills:
 
-- `opencode run --format json "<prompt>"`
-
-Optional overrides:
-
-- `LIONCLAW_OPENCODE_BIN` (default: `opencode`)
-- `LIONCLAW_OPENCODE_FORMAT` (default: `json`)
-- `LIONCLAW_OPENCODE_MODEL` (unset by default)
-- `LIONCLAW_OPENCODE_AGENT` (unset by default)
-- `LIONCLAW_OPENCODE_XDG_DATA_HOME` (unset by default)
-- `LIONCLAW_OPENCODE_CONTINUE_LAST_SESSION` (`false` by default)
-
-Use it by setting `runtime_id: "opencode"` in turn requests.
-
-## Channel Skills (External Workers)
-
-LionClaw core does not include Telegram/Discord/WhatsApp transport code.
-Each channel runs as an external skill worker that:
-
-1. Receives platform updates.
-2. Calls `POST /v0/channels/inbound` with normalized text payloads.
-3. Polls `POST /v0/channels/outbox/pull` for pending replies.
-4. Delivers replies to the platform.
-5. Calls `POST /v0/channels/outbox/ack` with platform message IDs.
-
-Bind a channel ID to an enabled skill:
-
-```json
-{
-  "channel_id": "telegram",
-  "skill_id": "<enabled-skill-id>",
-  "enabled": true,
-  "config": {
-    "runtime_id": "codex"
-  }
-}
+```bash
+./scripts/install-channel-skill.sh \
+  --channel-id telegram \
+  --skill-source skills/channel-telegram \
+  --runtime-id codex
 ```
 
-Then run an external worker skill for `telegram`. A starter skill package is included at:
+Start worker in the same command:
 
-- `skills/channel-telegram`
+```bash
+TELEGRAM_BOT_TOKEN=... ./scripts/install-channel-skill.sh \
+  --channel-id telegram \
+  --skill-source skills/channel-telegram \
+  --runtime-id codex \
+  --start-worker
+```
+
+## Runtime config
+
+Codex adapter options:
+
+- `LIONCLAW_CODEX_BIN` (default `codex`)
+- `LIONCLAW_CODEX_MODEL` (optional)
+- `LIONCLAW_CODEX_SANDBOX` (default `read-only`)
+
+OpenCode adapter options:
+
+- `LIONCLAW_OPENCODE_BIN` (default `opencode`)
+- `LIONCLAW_OPENCODE_MODEL` (optional)
+- `LIONCLAW_OPENCODE_AGENT` (optional)
+
+General options:
+
+- `LIONCLAW_DB_PATH` (default `./lionclaw.db`)
+- `LIONCLAW_RUNTIME_TURN_TIMEOUT_MS` (default `120000`)
+
+## Docs
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [V0 Plan](docs/V0_PLAN.md)
+- [Roadmap](docs/ROADMAP.md)
+- [Scripts](scripts/README.md)
