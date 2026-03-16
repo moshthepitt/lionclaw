@@ -55,6 +55,16 @@ Use LionClaw interactively:
 
 ## Channels and background mode
 
+For a local end-to-end channel test without Telegram, use the terminal channel skill:
+
+```bash
+./target/debug/lionclaw skill add skills/channel-terminal --alias terminal
+./target/debug/lionclaw channel add terminal
+./skills/channel-terminal/scripts/worker.sh
+```
+
+The terminal worker will print the pairing code and approval command on first contact. To run multiple local terminal channels at once, start separate worker processes with different `LIONCLAW_CHANNEL_ID` values.
+
 Register a Telegram skill and channel:
 
 ```bash
