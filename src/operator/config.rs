@@ -293,7 +293,7 @@ pub fn normalize_local_source(source: &str) -> Result<String> {
 pub fn normalize_executable(source: &str) -> Result<String> {
     let raw = source.trim();
     if raw.is_empty() {
-        return Err(anyhow!("runtime executable path cannot be empty"));
+        return Err(anyhow!("runtime command or path cannot be empty"));
     }
 
     if looks_like_path(raw) {
@@ -338,7 +338,7 @@ pub fn validate_executable_path(path: &Path) -> Result<()> {
 pub fn validate_executable(source: &str) -> Result<()> {
     let raw = source.trim();
     if raw.is_empty() {
-        return Err(anyhow!("runtime executable path cannot be empty"));
+        return Err(anyhow!("runtime command or path cannot be empty"));
     }
 
     if looks_like_path(raw) {
@@ -449,58 +449,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn normalize_executable_keeps_bare_command_names() {
-        use std::os::unix::fs::PermissionsExt;
+        let normalized = normalize_executable("sh").expect("normalize");
 
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let bin_dir = temp_dir.path().join("bin");
-        std::fs::create_dir_all(&bin_dir).expect("mkdir");
-        let path = bin_dir.join("codex");
-        std::fs::write(&path, "#!/usr/bin/env bash\n").expect("write file");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-
-        let original_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("PATH", bin_dir.as_os_str());
-        }
-        let normalized = normalize_executable("codex").expect("normalize");
-        match original_path {
-            Some(value) => unsafe {
-                std::env::set_var("PATH", value);
-            },
-            None => unsafe {
-                std::env::remove_var("PATH");
-            },
-        }
-
-        assert_eq!(normalized, "codex");
+        assert_eq!(normalized, "sh");
     }
 
     #[cfg(unix)]
     #[test]
     fn validate_executable_resolves_bare_commands_via_path() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let bin_dir = temp_dir.path().join("bin");
-        std::fs::create_dir_all(&bin_dir).expect("mkdir");
-        let path = bin_dir.join("opencode");
-        std::fs::write(&path, "#!/usr/bin/env bash\n").expect("write file");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-
-        let original_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("PATH", bin_dir.as_os_str());
-        }
-        let result = validate_executable("opencode");
-        match original_path {
-            Some(value) => unsafe {
-                std::env::set_var("PATH", value);
-            },
-            None => unsafe {
-                std::env::remove_var("PATH");
-            },
-        }
-
-        result.expect("bare command should validate");
+        validate_executable("sh").expect("bare command should validate");
     }
 }

@@ -244,7 +244,7 @@ pub async fn run() -> Result<()> {
                             " "
                         };
                         println!(
-                            "{} {} kind={} bin={}",
+                            "{} {} kind={} command={}",
                             marker,
                             id,
                             profile.kind(),

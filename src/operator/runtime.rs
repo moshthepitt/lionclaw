@@ -198,25 +198,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn configured_runtime_command_is_validated_via_path() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let bin_dir = temp_dir.path().join("bin");
-        std::fs::create_dir_all(&bin_dir).expect("mkdir");
-        let path = bin_dir.join("codex");
-        std::fs::write(&path, "#!/usr/bin/env bash\n").expect("write file");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-
-        let original_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("PATH", bin_dir.as_os_str());
-        }
-
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
             "codex".to_string(),
             RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
+                executable: "sh".to_string(),
                 model: None,
                 sandbox: "read-only".to_string(),
                 skip_git_repo_check: true,
@@ -224,25 +210,12 @@ mod tests {
             },
         );
 
-        let result = validate_runtime_availability(&config, "codex");
-        match original_path {
-            Some(value) => unsafe {
-                std::env::set_var("PATH", value);
-            },
-            None => unsafe {
-                std::env::remove_var("PATH");
-            },
-        }
-
-        result.expect("runtime command should validate");
+        validate_runtime_availability(&config, "codex").expect("runtime command should validate");
     }
 
     #[test]
     fn configured_runtime_service_env_carries_path() {
-        let original_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("PATH", "/tmp/lionclaw-bin");
-        }
+        let path = std::env::var("PATH").expect("path");
 
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
@@ -257,18 +230,6 @@ mod tests {
         );
 
         let env = super::runtime_service_env(&config, "codex").expect("service env");
-        match original_path {
-            Some(value) => unsafe {
-                std::env::set_var("PATH", value);
-            },
-            None => unsafe {
-                std::env::remove_var("PATH");
-            },
-        }
-
-        assert_eq!(
-            env,
-            vec![("PATH".to_string(), "/tmp/lionclaw-bin".to_string())]
-        );
+        assert_eq!(env, vec![("PATH".to_string(), path)]);
     }
 }
