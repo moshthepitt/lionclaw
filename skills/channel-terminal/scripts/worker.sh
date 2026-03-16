@@ -40,6 +40,7 @@ LIONCLAW_STREAM_LIMIT="${LIONCLAW_STREAM_LIMIT:-50}"
 LIONCLAW_STREAM_WAIT_MS="${LIONCLAW_STREAM_WAIT_MS:-30000}"
 LIONCLAW_STREAM_START_MODE="${LIONCLAW_STREAM_START_MODE:-tail}"
 LIONCLAW_CONSUMER_ID="${LIONCLAW_CONSUMER_ID:-terminal:$LIONCLAW_CHANNEL_ID:$LIONCLAW_PEER_ID}"
+LIONCLAW_STREAM_RETRY_SECS="${LIONCLAW_STREAM_RETRY_SECS:-1}"
 
 WORKER_INSTANCE_ID="terminal-${LIONCLAW_CHANNEL_ID}-$$"
 inbound_sequence=0
@@ -201,12 +202,12 @@ flush_stream_once() {
 
   stream_json="$(pull_stream)" || {
     echo "warning: failed to pull channel stream" >&2
-    return
+    return 1
   }
 
   if ! jq -e '.events | type == "array"' >/dev/null <<<"$stream_json"; then
     echo "warning: invalid channel stream response: $(jq -c '.' <<<"$stream_json")" >&2
-    return
+    return 1
   fi
 
   while IFS= read -r event; do
@@ -224,7 +225,7 @@ flush_stream_once() {
 
     if [[ "$peer_id" != "$LIONCLAW_PEER_ID" ]]; then
       echo "warning: channel '$LIONCLAW_CHANNEL_ID' stream delivered peer '$peer_id' to terminal worker for '$LIONCLAW_PEER_ID'" >&2
-      return
+      return 1
     fi
 
     case "$kind" in
@@ -260,13 +261,18 @@ flush_stream_once() {
   if [[ -n "$last_sequence" ]]; then
     ack_stream "$last_sequence" || {
       echo "warning: failed to acknowledge channel stream through sequence $last_sequence" >&2
+      return 1
     }
   fi
+
+  return 0
 }
 
 stream_loop() {
   while true; do
-    flush_stream_once
+    if ! flush_stream_once; then
+      sleep "$LIONCLAW_STREAM_RETRY_SECS"
+    fi
   done
 }
 
