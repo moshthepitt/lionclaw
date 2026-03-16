@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -11,7 +10,9 @@ use crate::kernel::{
     Kernel,
 };
 
-use super::config::{normalize_executable, OperatorConfig, RuntimeProfileConfig};
+use super::config::{
+    normalize_executable, validate_executable_path, OperatorConfig, RuntimeProfileConfig,
+};
 
 pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConfig) -> Result<()> {
     for (id, runtime) in &config.runtimes {
@@ -70,12 +71,13 @@ pub fn resolve_runtime_id(config: &OperatorConfig, requested: Option<&str>) -> R
 
 pub fn validate_runtime_availability(config: &OperatorConfig, runtime_id: &str) -> Result<()> {
     if let Some(profile) = config.runtime(runtime_id) {
-        if !Path::new(profile.executable()).is_file() {
-            return Err(anyhow!(
-                "configured runtime executable '{}' does not exist",
-                profile.executable()
-            ));
-        }
+        validate_executable_path(std::path::Path::new(profile.executable())).map_err(|err| {
+            anyhow!(
+                "configured runtime executable '{}' is invalid: {}",
+                profile.executable(),
+                err
+            )
+        })?;
         return Ok(());
     }
 
@@ -145,7 +147,8 @@ fn copy_if_present(out: &mut Vec<(String, String)>, key: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::build_runtime_fallback_env;
+    use super::{build_runtime_fallback_env, validate_runtime_availability};
+    use crate::operator::config::{OperatorConfig, RuntimeProfileConfig};
 
     #[test]
     fn unsupported_runtime_requires_configuration() {
@@ -154,5 +157,31 @@ mod tests {
             err.to_string().contains("lionclaw runtime add"),
             "error should guide the user toward configuring a runtime profile"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_runtime_requires_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("codex");
+        std::fs::write(&path, "#!/usr/bin/env bash\n").expect("write file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: path.to_string_lossy().to_string(),
+                model: None,
+                sandbox: "read-only".to_string(),
+                skip_git_repo_check: true,
+                ephemeral: true,
+            },
+        );
+
+        let err = validate_runtime_availability(&config, "codex").expect_err("should fail");
+        assert!(err.to_string().contains("not marked executable"));
     }
 }

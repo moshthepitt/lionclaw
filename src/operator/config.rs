@@ -305,12 +305,43 @@ pub fn normalize_executable(source: &str) -> Result<String> {
             path.display()
         ));
     }
+    validate_executable_path(&path)?;
     Ok(path.to_string_lossy().to_string())
+}
+
+pub fn validate_executable_path(path: &Path) -> Result<()> {
+    if !path.is_file() {
+        return Err(anyhow!(
+            "runtime executable '{}' is not a file",
+            path.display()
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::metadata(path)
+            .with_context(|| format!("failed to read metadata for '{}'", path.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o111 == 0 {
+            return Err(anyhow!(
+                "runtime executable '{}' is not marked executable",
+                path.display()
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_skill_alias, normalize_local_source, OperatorConfig, RuntimeProfileConfig};
+    use super::{
+        derive_skill_alias, normalize_executable, normalize_local_source, OperatorConfig,
+        RuntimeProfileConfig,
+    };
 
     #[test]
     fn derives_channel_alias_from_source_path() {
@@ -370,5 +401,19 @@ mod tests {
 
         assert!(config.remove_runtime("codex"));
         assert!(config.defaults.runtime.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_executable_rejects_non_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("not-executable");
+        std::fs::write(&path, "#!/usr/bin/env bash\n").expect("write file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let err = normalize_executable(path.to_str().expect("path utf8")).expect_err("should fail");
+        assert!(err.to_string().contains("not marked executable"));
     }
 }
