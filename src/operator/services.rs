@@ -36,14 +36,20 @@ pub fn render_daemon_unit(
     daemon_bin: &Path,
     bind_addr: &str,
     runtime_id: &str,
+    workspace: &str,
 ) -> ManagedServiceUnit {
     let env_path = home.services_env_dir().join("lionclawd.env");
     let unit_path = home.services_systemd_dir().join(DAEMON_UNIT_NAME);
 
-    let (host, port) = bind_addr.split_once(':').unwrap_or(("127.0.0.1", "3000"));
+    let (host, port) = parse_bind_addr(bind_addr);
     let env_content = format!(
-        "LIONCLAW_HOME={home}\nLIONCLAW_HOST={host}\nLIONCLAW_PORT={port}\nLIONCLAW_DEFAULT_RUNTIME_ID={runtime_id}\n",
-        home = home.root().display()
+        "LIONCLAW_HOME={home}\nLIONCLAW_HOST={host}\nLIONCLAW_PORT={port}\nLIONCLAW_DEFAULT_RUNTIME_ID={runtime_id}\nLIONCLAW_WORKSPACE={workspace}\nLIONCLAW_WORKSPACE_ROOT={workspace_root}\n",
+        home = escape_env_value(&home.root().display().to_string()),
+        host = escape_env_value(&host),
+        port = escape_env_value(&port),
+        runtime_id = escape_env_value(runtime_id),
+        workspace = escape_env_value(workspace),
+        workspace_root = escape_env_value(&home.workspace_dir(workspace).display().to_string()),
     );
     let unit_content = format!(
         "[Unit]\nDescription=LionClaw daemon\nAfter=default.target\n\n[Service]\nType=simple\nEnvironmentFile={env}\nExecStart={exec}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
@@ -69,7 +75,7 @@ pub fn render_channel_unit(home: &LionClawHome, spec: &ChannelServiceSpec) -> Ma
     let env_content = spec
         .env
         .iter()
-        .map(|(key, value)| format!("{key}={value}\n"))
+        .map(|(key, value)| format!("{key}={}\n", escape_env_value(value)))
         .collect::<String>();
     let unit_content = format!(
         "[Unit]\nDescription=LionClaw channel worker ({channel})\nAfter=lionclawd.service\nRequires=lionclawd.service\n\n[Service]\nType=simple\nEnvironmentFile={env}\nExecStart={exec}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
@@ -105,6 +111,7 @@ impl ServiceManager for SystemdUserServiceManager {
         tokio::fs::create_dir_all(&user_unit_dir)
             .await
             .with_context(|| format!("failed to create {}", user_unit_dir.display()))?;
+        prune_stale_generated_files(home, &user_unit_dir, units)?;
 
         for unit in units {
             if let Some(parent) = unit.unit_path.parent() {
@@ -130,7 +137,7 @@ impl ServiceManager for SystemdUserServiceManager {
                 .with_context(|| format!("failed to chmod {}", unit.env_path.display()))?;
 
             let user_link = user_unit_dir.join(&unit.name);
-            if user_link.exists() {
+            if path_entry_exists(&user_link)? {
                 let metadata = std::fs::symlink_metadata(&user_link)
                     .with_context(|| format!("failed to inspect {}", user_link.display()))?;
                 if metadata.file_type().is_symlink() || metadata.is_file() {
@@ -146,8 +153,6 @@ impl ServiceManager for SystemdUserServiceManager {
                 )
             })?;
         }
-
-        let _ = home;
         run_systemctl(["--user", "daemon-reload"]).await?;
         Ok(())
     }
@@ -168,7 +173,7 @@ impl ServiceManager for SystemdUserServiceManager {
     }
 
     async fn unit_status(&self, unit: &str) -> Result<String> {
-        let output = run_command(
+        match run_command(
             "systemctl",
             [
                 "--user",
@@ -178,8 +183,12 @@ impl ServiceManager for SystemdUserServiceManager {
                 "--value",
             ],
         )
-        .await?;
-        Ok(output.trim().replace('\n', "/"))
+        .await
+        {
+            Ok(output) => Ok(output.trim().replace('\n', "/")),
+            Err(err) if is_missing_unit_error(&err) => Ok("not-installed".to_string()),
+            Err(err) => Err(err),
+        }
     }
 
     async fn logs(&self, units: &[String], lines: usize) -> Result<String> {
@@ -196,10 +205,11 @@ impl ServiceManager for SystemdUserServiceManager {
 
         let output = command.output().await.context("failed to run journalctl")?;
         if !output.status.success() {
-            return Err(anyhow!(
-                "journalctl failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.contains("No journal files were found") || stderr.contains("No entries") {
+                return Ok(String::new());
+            }
+            return Err(anyhow!("journalctl failed: {}", stderr));
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -256,6 +266,161 @@ fn systemd_user_unit_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".config/systemd/user"))
 }
 
+fn parse_bind_addr(bind_addr: &str) -> (String, String) {
+    if let Ok(addr) = bind_addr.parse::<std::net::SocketAddr>() {
+        return (addr.ip().to_string(), addr.port().to_string());
+    }
+
+    bind_addr
+        .rsplit_once(':')
+        .map(|(host, port)| (host.to_string(), port.to_string()))
+        .unwrap_or_else(|| ("127.0.0.1".to_string(), "3000".to_string()))
+}
+
+fn escape_env_value(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    format!("\"{}\"", escaped)
+}
+
+fn prune_stale_generated_files(
+    home: &LionClawHome,
+    user_unit_dir: &Path,
+    units: &[ManagedServiceUnit],
+) -> Result<()> {
+    let desired_names = units
+        .iter()
+        .map(|unit| unit.name.as_str())
+        .collect::<Vec<_>>();
+    prune_unit_dir(&home.services_systemd_dir(), &desired_names)?;
+    prune_env_dir(&home.services_env_dir(), units)?;
+    prune_user_unit_dir(home, user_unit_dir, &desired_names)?;
+    Ok(())
+}
+
+fn prune_unit_dir(dir: &Path, desired_names: &[&str]) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read directory {}", dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to iterate {}", dir.display()))?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if !file_name.starts_with("lionclaw") || !file_name.ends_with(".service") {
+            continue;
+        }
+        if desired_names.iter().any(|name| *name == file_name) {
+            continue;
+        }
+        remove_path_if_exists(&path)?;
+    }
+
+    Ok(())
+}
+
+fn prune_env_dir(dir: &Path, units: &[ManagedServiceUnit]) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    let desired = units
+        .iter()
+        .filter_map(|unit| unit.env_path.file_name().map(|value| value.to_os_string()))
+        .collect::<Vec<_>>();
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read directory {}", dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to iterate {}", dir.display()))?;
+        let file_name = entry.file_name();
+        if !desired.iter().any(|wanted| wanted == &file_name) {
+            remove_path_if_exists(&entry.path())?;
+        }
+    }
+
+    Ok(())
+}
+
+fn prune_user_unit_dir(home: &LionClawHome, dir: &Path, desired_names: &[&str]) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    let managed_dir = home.services_systemd_dir();
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read directory {}", dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to iterate {}", dir.display()))?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if !file_name.starts_with("lionclaw") || !file_name.ends_with(".service") {
+            continue;
+        }
+        if desired_names.iter().any(|name| *name == file_name) {
+            continue;
+        }
+
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+
+        let target = std::fs::read_link(&path)
+            .with_context(|| format!("failed to read link {}", path.display()))?;
+        let resolved = if target.is_absolute() {
+            target
+        } else {
+            path.parent()
+                .unwrap_or(dir)
+                .join(target)
+                .components()
+                .collect::<PathBuf>()
+        };
+        if resolved.starts_with(&managed_dir) {
+            remove_path_if_exists(&path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    if !path_entry_exists(path)? {
+        return Ok(());
+    }
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if metadata.file_type().is_dir() {
+        std::fs::remove_dir_all(path)
+            .with_context(|| format!("failed to remove {}", path.display()))?;
+    } else {
+        std::fs::remove_file(path)
+            .with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn is_missing_unit_error(err: &anyhow::Error) -> bool {
+    let message = err.to_string();
+    message.contains("not-found") || message.contains("could not be found")
+}
+
 async fn run_systemctl<const N: usize>(args: [&str; N]) -> Result<()> {
     let _ = run_command("systemctl", args).await?;
     Ok(())
@@ -281,9 +446,12 @@ async fn run_command<const N: usize>(program: &str, args: [&str; N]) -> Result<S
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{fs, os::unix::fs::symlink, path::Path};
 
-    use super::{channel_unit_name, render_channel_unit, render_daemon_unit, ChannelServiceSpec};
+    use super::{
+        channel_unit_name, path_entry_exists, prune_user_unit_dir, render_channel_unit,
+        render_daemon_unit, ChannelServiceSpec,
+    };
 
     #[test]
     fn renders_expected_unit_names() {
@@ -301,8 +469,10 @@ mod tests {
             Path::new("/tmp/bin/lionclawd"),
             "127.0.0.1:3000",
             "codex",
+            "main",
         );
         assert!(daemon.unit_content.contains("ExecStart=/tmp/bin/lionclawd"));
+        assert!(daemon.env_content.contains("LIONCLAW_WORKSPACE=\"main\""));
 
         let channel = render_channel_unit(
             &home,
@@ -313,5 +483,46 @@ mod tests {
             },
         );
         assert!(channel.unit_content.contains("lionclawd.service"));
+    }
+
+    #[test]
+    fn prunes_only_user_symlinks_that_point_to_managed_units() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        std::fs::create_dir_all(home.services_systemd_dir()).expect("managed dir");
+        let user_dir = temp_dir.path().join("systemd-user");
+        std::fs::create_dir_all(&user_dir).expect("user dir");
+
+        let managed_unit = home
+            .services_systemd_dir()
+            .join("lionclaw-channel-old.service");
+        fs::write(&managed_unit, "[Unit]\n").expect("managed unit");
+        let managed_link = user_dir.join("lionclaw-channel-old.service");
+        symlink(&managed_unit, &managed_link).expect("managed link");
+
+        let unrelated_target = temp_dir.path().join("custom.service");
+        fs::write(&unrelated_target, "[Unit]\n").expect("custom unit");
+        let unrelated_link = user_dir.join("lionclaw-custom.service");
+        symlink(&unrelated_target, &unrelated_link).expect("custom link");
+
+        prune_user_unit_dir(&home, &user_dir, &[]).expect("prune");
+
+        assert!(!managed_link.exists(), "managed symlink should be removed");
+        assert!(
+            unrelated_link.exists(),
+            "unrelated symlink should be preserved"
+        );
+    }
+
+    #[test]
+    fn detects_broken_symlink_as_existing_path_entry() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let link_path = temp_dir.path().join("broken.service");
+        symlink(temp_dir.path().join("missing.service"), &link_path).expect("broken symlink");
+
+        assert!(
+            path_entry_exists(&link_path).expect("inspect path"),
+            "broken symlink should still count as an existing entry"
+        );
     }
 }

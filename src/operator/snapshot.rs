@@ -74,7 +74,7 @@ pub fn resolve_local_source(source_uri: &str) -> Result<PathBuf> {
 fn hash_directory(root: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut files = Vec::new();
-    collect_files(root, root, &mut files)?;
+    collect_files(root, &mut files)?;
     files.sort();
 
     for path in files {
@@ -103,12 +103,12 @@ fn hash_directory(root: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     let mut entries = fs::read_dir(dir)
         .with_context(|| format!("failed to read directory {}", dir.display()))?
         .collect::<std::io::Result<Vec<_>>>()
         .with_context(|| format!("failed to iterate directory {}", dir.display()))?;
-    entries.sort_by(|left, right| left.path().cmp(&right.path()));
+    entries.sort_by_key(|left| left.path());
 
     for entry in entries {
         let path = entry.path();
@@ -118,7 +118,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> 
         }
 
         if path.is_dir() {
-            collect_files(root, &path, out)?;
+            collect_files(&path, out)?;
         } else if path.is_file() {
             out.push(path);
         }
@@ -135,7 +135,7 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
         .with_context(|| format!("failed to read directory {}", source.display()))?
         .collect::<std::io::Result<Vec<_>>>()
         .with_context(|| format!("failed to iterate directory {}", source.display()))?;
-    entries.sort_by(|left, right| left.path().cmp(&right.path()));
+    entries.sort_by_key(|left| left.path());
 
     for entry in entries {
         let path = entry.path();

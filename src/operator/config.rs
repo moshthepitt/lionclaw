@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::home::{LionClawHome, DEFAULT_WORKSPACE};
 use crate::kernel::skills::sanitize_skill_name;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OperatorConfig {
     #[serde(default)]
     pub daemon: DaemonConfig,
@@ -14,16 +14,6 @@ pub struct OperatorConfig {
     pub skills: Vec<ManagedSkillConfig>,
     #[serde(default)]
     pub channels: Vec<ManagedChannelConfig>,
-}
-
-impl Default for OperatorConfig {
-    fn default() -> Self {
-        Self {
-            daemon: DaemonConfig::default(),
-            skills: Vec::new(),
-            channels: Vec::new(),
-        }
-    }
 }
 
 impl OperatorConfig {

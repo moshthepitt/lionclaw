@@ -153,6 +153,12 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
             .push(to_locked_skill(skill, snapshot, installed.skill_id));
     }
 
+    let next_skill_ids = next_lock
+        .skills
+        .iter()
+        .map(|skill| skill.skill_id.as_str())
+        .collect::<BTreeSet<_>>();
+
     let desired_channel_ids = config
         .channels
         .iter()
@@ -217,13 +223,8 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
         });
     }
 
-    let desired_skill_aliases = config
-        .skills
-        .iter()
-        .map(|skill| skill.alias.as_str())
-        .collect::<BTreeSet<_>>();
     for old_skill in &previous_lock.skills {
-        if !desired_skill_aliases.contains(old_skill.alias.as_str()) {
+        if !next_skill_ids.contains(old_skill.skill_id.as_str()) {
             let _ = kernel.disable_skill(old_skill.skill_id.clone()).await;
         }
     }
@@ -242,6 +243,7 @@ pub async fn up<M: ServiceManager>(
     runtime_id: &str,
     binaries: &StackBinaryPaths,
 ) -> Result<ApplyResult> {
+    let previous_units = managed_unit_names(home)?;
     let applied = apply(home).await?;
     render_runtime_cache(home, &applied.config, &applied.lockfile, runtime_id).await?;
     let units = build_managed_units(
@@ -251,6 +253,17 @@ pub async fn up<M: ServiceManager>(
         runtime_id,
         binaries,
     )?;
+    let next_units = units
+        .iter()
+        .map(|unit| unit.name.clone())
+        .collect::<BTreeSet<_>>();
+    let stale_units = previous_units
+        .into_iter()
+        .filter(|unit| !next_units.contains(unit))
+        .collect::<Vec<_>>();
+    if !stale_units.is_empty() {
+        manager.down_units(&stale_units).await?;
+    }
     let unit_names = units
         .iter()
         .map(|unit| unit.name.clone())
@@ -261,8 +274,7 @@ pub async fn up<M: ServiceManager>(
 }
 
 pub async fn down<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Result<()> {
-    let lockfile = OperatorLockfile::load(home).await?;
-    let units = unit_names_from_lockfile(&lockfile);
+    let units = managed_unit_names(home)?;
     manager.down_units(&units).await
 }
 
@@ -308,8 +320,7 @@ pub async fn logs<M: ServiceManager>(
     manager: &M,
     lines: usize,
 ) -> Result<String> {
-    let lockfile = OperatorLockfile::load(home).await?;
-    let units = unit_names_from_lockfile(&lockfile);
+    let units = managed_unit_names(home)?;
     manager.logs(&units, lines).await
 }
 
@@ -388,9 +399,10 @@ fn build_managed_units(
         &binaries.daemon_bin,
         &config.daemon.bind,
         runtime_id,
+        &config.daemon.workspace,
     ));
 
-    let base_url = format!("http://{}", config.daemon.bind);
+    let base_url = base_url_from_bind(&config.daemon.bind);
     for channel in config.channels.iter().filter(|channel| channel.enabled) {
         let locked_skill = lockfile.find_skill(&channel.skill).ok_or_else(|| {
             anyhow!(
@@ -463,7 +475,7 @@ async fn render_runtime_cache(
         sections.push(format!("## {}\n\n{}", name, content.trim()));
     }
 
-    for skill in &lockfile.skills {
+    for skill in lockfile.skills.iter().filter(|skill| skill.enabled) {
         let skill_md_path = home.root().join(&skill.snapshot_dir).join("SKILL.md");
         if tokio::fs::try_exists(&skill_md_path)
             .await
@@ -517,12 +529,47 @@ fn to_locked_skill(
     }
 }
 
-fn unit_names_from_lockfile(lockfile: &OperatorLockfile) -> Vec<String> {
-    let mut units = vec![DAEMON_UNIT_NAME.to_string()];
-    for channel in &lockfile.channels {
-        units.push(channel_unit_name(&channel.id));
+fn base_url_from_bind(bind: &str) -> String {
+    if let Ok(addr) = bind.parse::<std::net::SocketAddr>() {
+        match addr {
+            std::net::SocketAddr::V4(value) => format!("http://{}:{}", value.ip(), value.port()),
+            std::net::SocketAddr::V6(value) => {
+                format!("http://[{}]:{}", value.ip(), value.port())
+            }
+        }
+    } else {
+        format!("http://{}", bind)
     }
-    units
+}
+
+fn managed_unit_names(home: &LionClawHome) -> Result<Vec<String>> {
+    let mut units = Vec::new();
+    let systemd_dir = home.services_systemd_dir();
+    if !systemd_dir.exists() {
+        return Ok(vec![DAEMON_UNIT_NAME.to_string()]);
+    }
+
+    for entry in std::fs::read_dir(&systemd_dir)
+        .with_context(|| format!("failed to read directory {}", systemd_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to iterate {}", systemd_dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
+            if name.starts_with("lionclaw") && name.ends_with(".service") {
+                units.push(name.to_string());
+            }
+        }
+    }
+
+    units.sort();
+    if !units.iter().any(|unit| unit == DAEMON_UNIT_NAME) {
+        units.insert(0, DAEMON_UNIT_NAME.to_string());
+    }
+    Ok(units)
 }
 
 async fn open_kernel(home: &LionClawHome, config: &OperatorConfig) -> Result<Kernel> {
@@ -545,9 +592,10 @@ fn to_anyhow(err: crate::kernel::KernelError) -> anyhow::Error {
 mod tests {
     use std::fs;
 
-    use super::{onboard, render_marker_file, up, ApplyResult, StackBinaryPaths};
+    use super::{apply, onboard, render_marker_file, up, ApplyResult, StackBinaryPaths};
     use crate::{
         home::LionClawHome,
+        kernel::{Kernel, KernelOptions},
         operator::{
             config::{ManagedChannelConfig, ManagedSkillConfig, OperatorConfig},
             lockfile::OperatorLockfile,
@@ -626,5 +674,71 @@ mod tests {
             .runtime_workspace_dir("codex", "main")
             .join("AGENTS.generated.md")
             .exists());
+    }
+
+    #[tokio::test]
+    async fn apply_disables_old_skill_revision_when_alias_is_updated() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home).await.expect("onboard");
+
+        let skill_source = temp_dir.path().join("channel-telegram");
+        fs::create_dir_all(skill_source.join("scripts")).expect("skill dir");
+        fs::write(
+            skill_source.join("SKILL.md"),
+            "---\nname: channel-telegram\ndescription: first revision\n---\n",
+        )
+        .expect("skill md v1");
+        fs::write(
+            skill_source.join("scripts/worker.sh"),
+            "#!/usr/bin/env bash\necho v1\n",
+        )
+        .expect("worker v1");
+
+        let config = OperatorConfig {
+            skills: vec![ManagedSkillConfig {
+                alias: "telegram".to_string(),
+                source: skill_source.to_string_lossy().to_string(),
+                reference: "local".to_string(),
+                enabled: true,
+            }],
+            ..OperatorConfig::default()
+        };
+        config.save(&home).await.expect("save config");
+        apply(&home).await.expect("apply v1");
+
+        fs::write(
+            skill_source.join("SKILL.md"),
+            "---\nname: channel-telegram\ndescription: second revision\n---\n",
+        )
+        .expect("skill md v2");
+
+        let applied = apply(&home).await.expect("apply v2");
+        let kernel = Kernel::new_with_options(
+            &home.db_path(),
+            KernelOptions {
+                default_runtime_id: None,
+                workspace_root: Some(home.workspace_dir("main")),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel");
+
+        let skills = kernel.list_skills().await.expect("list skills").skills;
+        let enabled = skills
+            .iter()
+            .filter(|skill| skill.enabled)
+            .collect::<Vec<_>>();
+        assert_eq!(enabled.len(), 1, "only one revision should remain enabled");
+        assert_eq!(
+            enabled[0].skill_id, applied.lockfile.skills[0].skill_id,
+            "the latest lockfile revision should be the enabled one"
+        );
+        assert_eq!(
+            skills.len(),
+            2,
+            "old revisions remain installed for auditability"
+        );
     }
 }
