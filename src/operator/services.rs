@@ -43,8 +43,9 @@ pub fn render_daemon_unit(
 
     let (host, port) = parse_bind_addr(bind_addr);
     let env_content = format!(
-        "LIONCLAW_HOME={home}\nLIONCLAW_HOST={host}\nLIONCLAW_PORT={port}\nLIONCLAW_DEFAULT_RUNTIME_ID={runtime_id}\nLIONCLAW_WORKSPACE={workspace}\nLIONCLAW_WORKSPACE_ROOT={workspace_root}\n",
+        "LIONCLAW_HOME={home}\nLIONCLAW_BIND_ADDR={bind_addr}\nLIONCLAW_HOST={host}\nLIONCLAW_PORT={port}\nLIONCLAW_DEFAULT_RUNTIME_ID={runtime_id}\nLIONCLAW_WORKSPACE={workspace}\nLIONCLAW_WORKSPACE_ROOT={workspace_root}\n",
         home = escape_env_value(&home.root().display().to_string()),
+        bind_addr = escape_env_value(bind_addr),
         host = escape_env_value(&host),
         port = escape_env_value(&port),
         runtime_id = escape_env_value(runtime_id),
@@ -472,6 +473,9 @@ mod tests {
             "main",
         );
         assert!(daemon.unit_content.contains("ExecStart=/tmp/bin/lionclawd"));
+        assert!(daemon
+            .env_content
+            .contains("LIONCLAW_BIND_ADDR=\"127.0.0.1:3000\""));
         assert!(daemon.env_content.contains("LIONCLAW_WORKSPACE=\"main\""));
 
         let channel = render_channel_unit(

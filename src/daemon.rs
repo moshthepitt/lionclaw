@@ -28,7 +28,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     );
     let app = build_router(kernel);
 
-    let listener = TcpListener::bind(config.bind_addr)
+    let listener = TcpListener::bind(&config.bind_addr)
         .await
         .with_context(|| format!("failed to bind {}", config.bind_addr))?;
 
