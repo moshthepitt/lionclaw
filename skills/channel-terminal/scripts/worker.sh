@@ -36,12 +36,14 @@ LIONCLAW_BASE_URL="${LIONCLAW_BASE_URL:-http://127.0.0.1:8979}"
 LIONCLAW_CHANNEL_ID="${LIONCLAW_CHANNEL_ID:-terminal}"
 LIONCLAW_PEER_ID="${LIONCLAW_PEER_ID:-$(default_peer_id)}"
 LIONCLAW_RUNTIME_ID="${LIONCLAW_RUNTIME_ID:-}"
-LIONCLAW_OUTBOX_LIMIT="${LIONCLAW_OUTBOX_LIMIT:-20}"
-LIONCLAW_OUTBOX_POLL_SECS="${LIONCLAW_OUTBOX_POLL_SECS:-1}"
+LIONCLAW_STREAM_LIMIT="${LIONCLAW_STREAM_LIMIT:-50}"
+LIONCLAW_STREAM_WAIT_MS="${LIONCLAW_STREAM_WAIT_MS:-30000}"
+LIONCLAW_STREAM_START_MODE="${LIONCLAW_STREAM_START_MODE:-tail}"
+LIONCLAW_CONSUMER_ID="${LIONCLAW_CONSUMER_ID:-terminal:$LIONCLAW_CHANNEL_ID:$LIONCLAW_PEER_ID}"
 
 WORKER_INSTANCE_ID="terminal-${LIONCLAW_CHANNEL_ID}-$$"
 inbound_sequence=0
-outbox_pid=""
+stream_pid=""
 
 lionclaw_get() {
   local path="$1"
@@ -127,32 +129,45 @@ send_inbound() {
   inbound_sequence="$((inbound_sequence + 1))"
 }
 
-pull_outbox() {
+pull_stream() {
   local request
   request="$(jq -nc \
     --arg channel_id "$LIONCLAW_CHANNEL_ID" \
-    --argjson limit "$LIONCLAW_OUTBOX_LIMIT" \
-    '{channel_id: $channel_id, limit: $limit}'
+    --arg consumer_id "$LIONCLAW_CONSUMER_ID" \
+    --arg start_mode "$LIONCLAW_STREAM_START_MODE" \
+    --argjson limit "$LIONCLAW_STREAM_LIMIT" \
+    --argjson wait_ms "$LIONCLAW_STREAM_WAIT_MS" \
+    '{
+      channel_id: $channel_id,
+      consumer_id: $consumer_id,
+      start_mode: $start_mode,
+      limit: $limit,
+      wait_ms: $wait_ms
+    }'
   )"
 
-  lionclaw_post '/v0/channels/outbox/pull' "$request"
+  lionclaw_post '/v0/channels/stream/pull' "$request"
 }
 
-ack_outbox() {
-  local message_id="$1"
-  local external_message_id="$2"
+ack_stream() {
+  local through_sequence="$1"
   local request
 
   request="$(jq -nc \
-    --arg message_id "$message_id" \
-    --arg external_message_id "$external_message_id" \
-    '{message_id: $message_id, external_message_id: $external_message_id}'
+    --arg channel_id "$LIONCLAW_CHANNEL_ID" \
+    --arg consumer_id "$LIONCLAW_CONSUMER_ID" \
+    --argjson through_sequence "$through_sequence" \
+    '{
+      channel_id: $channel_id,
+      consumer_id: $consumer_id,
+      through_sequence: $through_sequence
+    }'
   )"
 
-  lionclaw_post '/v0/channels/outbox/ack' "$request" >/dev/null
+  lionclaw_post '/v0/channels/stream/ack' "$request" >/dev/null
 }
 
-print_assistant_message() {
+print_answer_delta() {
   local content="$1"
   local line
 
@@ -161,63 +176,124 @@ print_assistant_message() {
   done <<<"$content"
 }
 
-flush_outbox_once() {
-  local outbox_json
-  outbox_json="$(pull_outbox)" || {
-    echo "warning: failed to pull channel outbox" >&2
+print_reasoning_delta() {
+  local content="$1"
+  local line
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    printf 'thinking> %s\n' "$line"
+  done <<<"$content"
+}
+
+print_status_message() {
+  local content="$1"
+  printf '[status] %s\n' "$content"
+}
+
+print_error_message() {
+  local content="$1"
+  printf '[error] %s\n' "$content" >&2
+}
+
+flush_stream_once() {
+  local stream_json
+  local last_sequence=""
+
+  stream_json="$(pull_stream)" || {
+    echo "warning: failed to pull channel stream" >&2
     return
   }
 
-  if ! jq -e '.messages | type == "array"' >/dev/null <<<"$outbox_json"; then
-    echo "warning: invalid outbox response: $(jq -c '.' <<<"$outbox_json")" >&2
+  if ! jq -e '.events | type == "array"' >/dev/null <<<"$stream_json"; then
+    echo "warning: invalid channel stream response: $(jq -c '.' <<<"$stream_json")" >&2
     return
   fi
 
-  while IFS= read -r message; do
-    local message_id
+  while IFS= read -r event; do
+    local sequence
     local peer_id
-    local content
-    local external_message_id
+    local kind
+    local lane
+    local text
 
-    message_id="$(jq -r '.message_id' <<<"$message")"
-    peer_id="$(jq -r '.peer_id' <<<"$message")"
-    content="$(jq -r '.content' <<<"$message")"
+    sequence="$(jq -r '.sequence' <<<"$event")"
+    peer_id="$(jq -r '.peer_id' <<<"$event")"
+    kind="$(jq -r '.kind' <<<"$event")"
+    lane="$(jq -r '.lane // empty' <<<"$event")"
+    text="$(jq -r '.text // empty' <<<"$event")"
 
     if [[ "$peer_id" != "$LIONCLAW_PEER_ID" ]]; then
-      echo "warning: channel '$LIONCLAW_CHANNEL_ID' has pending output for unexpected peer '$peer_id'; this worker only serves '$LIONCLAW_PEER_ID'" >&2
-      continue
+      echo "warning: channel '$LIONCLAW_CHANNEL_ID' stream delivered peer '$peer_id' to terminal worker for '$LIONCLAW_PEER_ID'" >&2
+      return
     fi
 
-    print_assistant_message "$content"
-    external_message_id="terminal-outbound:$WORKER_INSTANCE_ID:$message_id"
-    ack_outbox "$message_id" "$external_message_id"
-  done < <(jq -c '.messages[]?' <<<"$outbox_json")
+    case "$kind" in
+      message_delta)
+        case "$lane" in
+          answer)
+            print_answer_delta "$text"
+            ;;
+          reasoning)
+            print_reasoning_delta "$text"
+            ;;
+          *)
+            print_status_message "$text"
+            ;;
+        esac
+        ;;
+      status)
+        print_status_message "$text"
+        ;;
+      error)
+        print_error_message "$text"
+        ;;
+      done)
+        ;;
+      *)
+        echo "warning: unknown stream event kind '$kind'" >&2
+        ;;
+    esac
+
+    last_sequence="$sequence"
+  done < <(jq -c '.events[]?' <<<"$stream_json")
+
+  if [[ -n "$last_sequence" ]]; then
+    ack_stream "$last_sequence" || {
+      echo "warning: failed to acknowledge channel stream through sequence $last_sequence" >&2
+    }
+  fi
 }
 
-outbox_loop() {
+stream_loop() {
   while true; do
-    flush_outbox_once
-    sleep "$LIONCLAW_OUTBOX_POLL_SECS"
+    flush_stream_once
   done
 }
 
 cleanup() {
-  if [[ -n "$outbox_pid" ]]; then
-    kill "$outbox_pid" >/dev/null 2>&1 || true
-    wait "$outbox_pid" 2>/dev/null || true
+  if [[ -n "$stream_pid" ]]; then
+    kill "$stream_pid" >/dev/null 2>&1 || true
+    wait "$stream_pid" 2>/dev/null || true
   fi
 }
 
-trap cleanup EXIT INT TERM
+interrupt() {
+  echo
+  exit 130
+}
+
+trap cleanup EXIT
+trap interrupt INT TERM
 
 echo "LionClaw terminal channel worker"
 echo "channel: $LIONCLAW_CHANNEL_ID"
 echo "peer: $LIONCLAW_PEER_ID"
+echo "consumer: $LIONCLAW_CONSUMER_ID (start_mode=$LIONCLAW_STREAM_START_MODE)"
 echo "commands: /status, /quit"
 print_pairing_status
 
-outbox_loop &
-outbox_pid="$!"
+stream_loop &
+stream_pid="$!"
 
 while true; do
   IFS= read -r -p "you> " line || {

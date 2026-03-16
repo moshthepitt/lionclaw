@@ -8,14 +8,14 @@ use async_trait::async_trait;
 use lionclaw::{
     contracts::{
         ChannelBindRequest, PolicyGrantRequest, SessionOpenRequest, SessionTurnRequest,
-        SkillInstallRequest, TrustTier,
+        SkillInstallRequest, StreamEventKindDto, TrustTier,
     },
     kernel::{
         policy::Capability,
         runtime::{
             RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityRequest, RuntimeCapabilityResult,
-            RuntimeEvent, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
-            RuntimeTurnOutput,
+            RuntimeEvent, RuntimeEventSender, RuntimeSessionHandle, RuntimeSessionStartInput,
+            RuntimeTurnInput, RuntimeTurnResult,
         },
         Kernel,
     },
@@ -63,15 +63,22 @@ async fn fs_read_capability_executes_through_kernel_broker() {
         .expect("turn should succeed");
 
     assert!(
-        response
-            .runtime_events
-            .iter()
-            .any(|event| event.kind == "status" && event.text.contains("capability:req-1:granted")),
+        response.stream_events.iter().any(|event| {
+            event.kind == StreamEventKindDto::Status
+                && event
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("capability:req-1:granted"))
+        }),
         "capability should be granted after broker execution"
     );
     assert!(
-        response.runtime_events.iter().any(|event| {
-            event.kind == "status" && event.text.contains("lionclaw broker fs read test content")
+        response.stream_events.iter().any(|event| {
+            event.kind == StreamEventKindDto::Status
+                && event
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("lionclaw broker fs read test content"))
         }),
         "runtime should receive fs.read output content"
     );
@@ -120,15 +127,22 @@ async fn invalid_capability_payload_is_denied_by_broker() {
         .expect("turn should complete with denied capability result");
 
     assert!(
-        response
-            .runtime_events
-            .iter()
-            .any(|event| event.kind == "status" && event.text.contains("capability:req-1:denied")),
+        response.stream_events.iter().any(|event| {
+            event.kind == StreamEventKindDto::Status
+                && event
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("capability:req-1:denied"))
+        }),
         "invalid payload should be denied"
     );
     assert!(
-        response.runtime_events.iter().any(|event| {
-            event.kind == "status" && event.text.contains("broker execution failed")
+        response.stream_events.iter().any(|event| {
+            event.kind == StreamEventKindDto::Status
+                && event
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("broker execution failed"))
         }),
         "denied event should include broker failure reason"
     );
@@ -190,10 +204,13 @@ async fn channel_send_capability_uses_session_channel_defaults() {
         .expect("turn should succeed");
 
     assert!(
-        response
-            .runtime_events
-            .iter()
-            .any(|event| event.kind == "status" && event.text.contains("capability:req-1:granted")),
+        response.stream_events.iter().any(|event| {
+            event.kind == StreamEventKindDto::Status
+                && event
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("capability:req-1:granted"))
+        }),
         "channel send should be granted after broker execution"
     );
 
@@ -255,16 +272,18 @@ impl RuntimeAdapter for SingleCapabilityRuntimeAdapter {
         })
     }
 
-    async fn turn(&self, input: RuntimeTurnInput) -> Result<RuntimeTurnOutput> {
-        let mut output = RuntimeTurnOutput {
-            events: vec![RuntimeEvent::Status(
-                "single capability runtime started turn".to_string(),
-            )],
-            capability_requests: Vec::new(),
-        };
+    async fn turn(
+        &self,
+        input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        let _ = events.send(RuntimeEvent::Status {
+            text: "single capability runtime started turn".to_string(),
+        });
+        let mut capability_requests = Vec::new();
 
         if let Some(skill_id) = input.selected_skills.first() {
-            output.capability_requests.push(RuntimeCapabilityRequest {
+            capability_requests.push(RuntimeCapabilityRequest {
                 request_id: "req-1".to_string(),
                 skill_id: skill_id.clone(),
                 capability: self.capability,
@@ -272,40 +291,39 @@ impl RuntimeAdapter for SingleCapabilityRuntimeAdapter {
                 payload: self.payload.clone(),
             });
         } else {
-            output.events.push(RuntimeEvent::Status(
-                "single capability runtime had no selected skill".to_string(),
-            ));
-            output.events.push(RuntimeEvent::Done);
+            let _ = events.send(RuntimeEvent::Status {
+                text: "single capability runtime had no selected skill".to_string(),
+            });
+            let _ = events.send(RuntimeEvent::Done);
         }
 
-        Ok(output)
+        Ok(RuntimeTurnResult {
+            capability_requests,
+        })
     }
 
     async fn resolve_capability_requests(
         &self,
         _handle: &RuntimeSessionHandle,
         results: Vec<RuntimeCapabilityResult>,
-    ) -> Result<Vec<RuntimeEvent>> {
-        let mut events = Vec::new();
+        events: RuntimeEventSender,
+    ) -> Result<()> {
         for result in results {
             let verdict = if result.allowed { "granted" } else { "denied" };
-            events.push(RuntimeEvent::Status(format!(
-                "capability:{}:{}",
-                result.request_id, verdict
-            )));
-            events.push(RuntimeEvent::Status(format!(
-                "capability:{}:output:{}",
-                result.request_id, result.output
-            )));
+            let _ = events.send(RuntimeEvent::Status {
+                text: format!("capability:{}:{}", result.request_id, verdict),
+            });
+            let _ = events.send(RuntimeEvent::Status {
+                text: format!("capability:{}:output:{}", result.request_id, result.output),
+            });
             if let Some(reason) = result.reason {
-                events.push(RuntimeEvent::Status(format!(
-                    "capability:{}:reason:{}",
-                    result.request_id, reason
-                )));
+                let _ = events.send(RuntimeEvent::Status {
+                    text: format!("capability:{}:reason:{}", result.request_id, reason),
+                });
             }
         }
-        events.push(RuntimeEvent::Done);
-        Ok(events)
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
     }
 
     async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {

@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
 use super::policy::Capability;
@@ -65,29 +65,57 @@ pub struct RuntimeCapabilityResult {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct RuntimeTurnOutput {
-    pub events: Vec<RuntimeEvent>,
+pub struct RuntimeTurnResult {
     pub capability_requests: Vec<RuntimeCapabilityRequest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeMessageLane {
+    Answer,
+    Reasoning,
+}
+
+impl RuntimeMessageLane {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Answer => "answer",
+            Self::Reasoning => "reasoning",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum RuntimeEvent {
-    TextDelta(String),
-    Status(String),
+    MessageDelta {
+        lane: RuntimeMessageLane,
+        text: String,
+    },
+    Status {
+        text: String,
+    },
     Done,
-    Error(String),
+    Error {
+        text: String,
+    },
 }
+
+pub type RuntimeEventSender = mpsc::UnboundedSender<RuntimeEvent>;
 
 #[async_trait]
 pub trait RuntimeAdapter: Send + Sync {
     async fn info(&self) -> RuntimeAdapterInfo;
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle>;
-    async fn turn(&self, input: RuntimeTurnInput) -> Result<RuntimeTurnOutput>;
+    async fn turn(
+        &self,
+        input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult>;
     async fn resolve_capability_requests(
         &self,
         handle: &RuntimeSessionHandle,
         results: Vec<RuntimeCapabilityResult>,
-    ) -> Result<Vec<RuntimeEvent>>;
+        events: RuntimeEventSender,
+    ) -> Result<()>;
     async fn cancel(&self, handle: &RuntimeSessionHandle, reason: Option<String>) -> Result<()>;
     async fn close(&self, handle: &RuntimeSessionHandle) -> Result<()>;
 }

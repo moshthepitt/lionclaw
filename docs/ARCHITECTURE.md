@@ -8,7 +8,7 @@
 - `kernel.policy`: capability grant/revoke and allow checks.
 - `kernel.capability_broker`: brokered capability execution (`fs`, `net`, `secret`, `channel.send`, `scheduler`).
 - `kernel.runtime`: runtime adapter contract and registry.
-- `kernel.channel_state`: durable channel bindings, peer trust state, inbound logs, and outbound outbox queue.
+- `kernel.channel_state`: durable channel bindings, peer trust state, inbound logs, outbound transcript history, and append-only channel stream delivery state.
 - `kernel.audit`: append-only audit event log persisted in SQLite.
 
 ## API Contracts
@@ -33,8 +33,8 @@
 - `POST /v0/channels/peers/approve`
 - `POST /v0/channels/peers/block`
 - `POST /v0/channels/inbound`
-- `POST /v0/channels/outbox/pull`
-- `POST /v0/channels/outbox/ack`
+- `POST /v0/channels/stream/pull`
+- `POST /v0/channels/stream/ack`
 
 ### Policy
 
@@ -49,8 +49,8 @@
 
 - `info()`
 - `session_start()`
-- `turn()`
-- `resolve_capability_requests()`
+- `turn()` emits typed runtime events into a kernel-owned sink and returns capability requests.
+- `resolve_capability_requests()` emits typed follow-up events into the same sink.
 - `cancel()`
 - `close()`
 
@@ -75,8 +75,8 @@ Runtime module layout:
 
 Channel bridge layout:
 
-- `kernel/channel_state.rs`: durable channel bindings/peers/offsets/messages + outbound queue.
-- `kernel/core.rs`: channel inbound processing, pairing/approval, outbox pull/ack APIs.
+- `kernel/channel_state.rs`: durable channel bindings/peers/offsets/messages + stream event/cursor storage.
+- `kernel/core.rs`: channel inbound processing, pairing/approval, and stream pull/ack APIs.
 - `api/mod.rs`: HTTP routes for external channel skill workers.
 
 Adding a new adapter:
@@ -91,8 +91,8 @@ Adding a new adapter:
 External channel skills integrate over HTTP only:
 
 1. `POST /v0/channels/inbound` to submit normalized inbound messages.
-2. `POST /v0/channels/outbox/pull` to fetch queued outbound messages.
-3. `POST /v0/channels/outbox/ack` after platform delivery succeeds.
+2. `POST /v0/channels/stream/pull` to fetch typed outbound stream events for a consumer cursor.
+3. `POST /v0/channels/stream/ack` after a consumer has durably handled events through a sequence.
 4. `GET /v0/channels/peers` + approve/block endpoints for pairing trust management.
 
 ## Security Posture in v0
@@ -106,7 +106,7 @@ External channel skills integrate over HTTP only:
 7. Runtime execution policy supports per-turn working directory, timeout, and env passthrough constraints.
 8. Capability side effects route through kernel brokers only:
    - `fs.read` / `fs.write` use workspace-bounded filesystem broker.
-   - `channel.send` queues outbound messages in kernel outbox for external channel skills.
+   - `channel.send` records outbound transcript entries and appends typed stream events for external channel skills.
    - `net.egress`, `secret.request`, `scheduler.run` are broker-gated and denied until configured.
 9. Auditing covers API mutations plus capability request/result decisions.
 10. Channel inbound is gated by pairing approval (`pending` -> `approved`), with duplicate update suppression and worker-controlled polling offsets.

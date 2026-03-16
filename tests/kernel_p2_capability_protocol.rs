@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use lionclaw::{
     contracts::{
-        PolicyGrantRequest, SessionOpenRequest, SessionTurnRequest, SkillInstallRequest, TrustTier,
+        PolicyGrantRequest, SessionOpenRequest, SessionTurnRequest, SkillInstallRequest,
+        StreamEventKindDto, TrustTier,
     },
     kernel::Kernel,
 };
@@ -67,10 +68,13 @@ description: Handles capability-gated runtime operations
         .expect("turn before fs.read grant");
 
     assert!(
-        denied_turn
-            .runtime_events
-            .iter()
-            .any(|event| event.kind == "status" && event.text.contains("capability:req-1:denied")),
+        denied_turn.stream_events.iter().any(|event| {
+            event.kind == StreamEventKindDto::Status
+                && event
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("capability:req-1:denied"))
+        }),
         "capability request should be denied before capability grant"
     );
 
@@ -97,10 +101,13 @@ description: Handles capability-gated runtime operations
         .expect("turn after fs.read grant");
 
     assert!(
-        granted_turn
-            .runtime_events
-            .iter()
-            .any(|event| event.kind == "status" && event.text.contains("capability:req-1:granted")),
+        granted_turn.stream_events.iter().any(|event| {
+            event.kind == StreamEventKindDto::Status
+                && event
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("capability:req-1:granted"))
+        }),
         "capability request should be granted after explicit fs.read policy grant"
     );
 

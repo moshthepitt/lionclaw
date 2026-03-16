@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -7,33 +8,40 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
-use tokio::time::sleep;
+use tokio::{
+    sync::{Notify, RwLock},
+    time::{sleep, timeout},
+};
 use uuid::Uuid;
 
 use crate::contracts::{
     AuditEventView, AuditQueryResponse, ChannelBindRequest, ChannelBindResponse,
     ChannelBindingView, ChannelInboundRequest, ChannelInboundResponse, ChannelListResponse,
-    ChannelOutboxAckRequest, ChannelOutboxAckResponse, ChannelOutboxMessageView,
-    ChannelOutboxPullRequest, ChannelOutboxPullResponse, ChannelPeerApproveRequest,
-    ChannelPeerBlockRequest, ChannelPeerListResponse, ChannelPeerResponse, ChannelPeerView,
-    PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeResponse, RuntimeEventDto,
-    SessionOpenRequest, SessionOpenResponse, SessionTurnRequest, SessionTurnResponse,
-    SkillInstallRequest, SkillInstallResponse, SkillListResponse, SkillToggleResponse, SkillView,
-    TrustTier,
+    ChannelPeerApproveRequest, ChannelPeerBlockRequest, ChannelPeerListResponse,
+    ChannelPeerResponse, ChannelPeerView, ChannelStreamAckRequest, ChannelStreamAckResponse,
+    ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamPullResponse,
+    PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeResponse, SessionOpenRequest,
+    SessionOpenResponse, SessionTurnRequest, SessionTurnResponse, SkillInstallRequest,
+    SkillInstallResponse, SkillListResponse, SkillToggleResponse, SkillView, StreamEventDto,
+    StreamEventKindDto, StreamLaneDto, TrustTier,
 };
 use crate::workspace::read_workspace_sections;
 
 use super::{
     audit::AuditLog,
     capability_broker::{CapabilityBroker, CapabilityExecutionContext},
-    channel_state::{ChannelPeerStatus, ChannelStateStore},
+    channel_state::{
+        ChannelPeerStatus, ChannelStateStore, ChannelStreamEventInsert, ChannelStreamEventKind,
+        ChannelStreamEventRecord, StreamMessageLane as ChannelStreamLane,
+    },
     db::Db,
     error::KernelError,
     policy::{Capability, PolicyStore, Scope},
     runtime::{
         register_builtin_runtime_adapters, RuntimeAdapter, RuntimeCapabilityRequest,
-        RuntimeCapabilityResult, RuntimeEvent, RuntimeRegistry, RuntimeSessionHandle,
-        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnOutput, BUILTIN_RUNTIME_MOCK,
+        RuntimeCapabilityResult, RuntimeEvent, RuntimeMessageLane, RuntimeRegistry,
+        RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
+        BUILTIN_RUNTIME_MOCK,
     },
     runtime_policy::{RuntimeExecutionContext, RuntimeExecutionPolicy, RuntimeExecutionRequest},
     selector::SkillSelector,
@@ -69,6 +77,7 @@ pub struct Kernel {
     channel_state: ChannelStateStore,
     audit: AuditLog,
     capability_broker: CapabilityBroker,
+    channel_stream_notifiers: RwLock<HashMap<String, Arc<Notify>>>,
     runtime_turn_timeout: Duration,
     runtime_execution_policy: RuntimeExecutionPolicy,
     default_runtime_id: Option<String>,
@@ -104,6 +113,7 @@ impl Kernel {
             channel_state: ChannelStateStore::new(pool.clone()),
             audit: AuditLog::new(pool),
             capability_broker,
+            channel_stream_notifiers: RwLock::new(HashMap::new()),
             runtime_turn_timeout,
             runtime_execution_policy: options.runtime_execution_policy,
             default_runtime_id: options.default_runtime_id,
@@ -203,6 +213,15 @@ impl Kernel {
             }
         }
         allowed_skills.sort();
+        let turn_id = Uuid::new_v4();
+        let channel_stream_context = self
+            .channel_stream_context_for_session(
+                session.session_id,
+                &session.channel_id,
+                &session.peer_id,
+                turn_id,
+            )
+            .await?;
 
         let runtime_id = self.resolve_runtime_id(req.runtime_id.as_deref())?;
         let adapter = self.runtime.get(&runtime_id).await.ok_or_else(|| {
@@ -231,23 +250,24 @@ impl Kernel {
             .map_err(|err| KernelError::Runtime(err.to_string()))?;
 
         let turn_result = self
-            .execute_runtime_turn(
-                adapter.clone(),
-                &runtime_id,
-                session.session_id,
-                &handle,
-                execution_context.timeout,
-                RuntimeTurnInput {
+            .execute_runtime_turn(RuntimeTurnExecution {
+                adapter: adapter.clone(),
+                runtime_id: &runtime_id,
+                session_id: session.session_id,
+                handle: &handle,
+                turn_timeout: execution_context.timeout,
+                input: RuntimeTurnInput {
                     runtime_session_id: handle.runtime_session_id.clone(),
                     prompt: self
                         .build_prompt_envelope(&req.user_text, &allowed_skills)
                         .await?,
                     selected_skills: allowed_skills.clone(),
                 },
-            )
+                stream_context: channel_stream_context.clone(),
+            })
             .await;
 
-        let turn_output = match turn_result {
+        let runtime_turn = match turn_result {
             Ok(output) => output,
             Err(turn_err) => {
                 let _ = self
@@ -263,22 +283,30 @@ impl Kernel {
         };
 
         let runtime_events_result = async {
-            let mut runtime_events = turn_output.events;
-            if !turn_output.capability_requests.is_empty() {
+            let mut runtime_events = runtime_turn.events;
+            if !runtime_turn.result.capability_requests.is_empty() {
                 let capability_results = self
                     .evaluate_capability_requests(
                         session.session_id,
+                        turn_id,
                         &session.channel_id,
                         &session.peer_id,
                         &allowed_skills,
-                        turn_output.capability_requests,
+                        runtime_turn.result.capability_requests,
                     )
                     .await?;
-                let followup = adapter
-                    .resolve_capability_requests(&handle, capability_results)
+                let followup_events = self
+                    .execute_runtime_capability_followup(
+                        adapter.clone(),
+                        &runtime_id,
+                        session.session_id,
+                        &handle,
+                        capability_results,
+                        channel_stream_context.clone(),
+                    )
                     .await
                     .map_err(|err| KernelError::Runtime(err.to_string()))?;
-                runtime_events.extend(followup);
+                runtime_events.extend(followup_events);
             }
 
             Ok::<Vec<RuntimeEvent>, KernelError>(runtime_events)
@@ -302,37 +330,64 @@ impl Kernel {
             .map_err(internal)?;
 
         let mut assistant = String::new();
-        let mut event_views = Vec::new();
-        for event in runtime_events {
-            match event {
-                RuntimeEvent::TextDelta(text) => {
-                    if !assistant.is_empty() {
-                        assistant.push('\n');
-                    }
-                    assistant.push_str(&text);
-                    event_views.push(RuntimeEventDto {
-                        kind: "text_delta".to_string(),
-                        text,
-                    });
-                }
-                RuntimeEvent::Status(text) => {
-                    event_views.push(RuntimeEventDto {
-                        kind: "status".to_string(),
-                        text,
-                    });
-                }
-                RuntimeEvent::Done => {
-                    event_views.push(RuntimeEventDto {
-                        kind: "done".to_string(),
-                        text: "done".to_string(),
-                    });
-                }
-                RuntimeEvent::Error(text) => {
-                    event_views.push(RuntimeEventDto {
-                        kind: "error".to_string(),
-                        text,
-                    });
-                }
+        let mut event_views = Vec::with_capacity(runtime_events.len());
+        let mut saw_error = false;
+        for event in &runtime_events {
+            if let RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text,
+            } = event
+            {
+                assistant.push_str(text);
+            }
+            if matches!(event, RuntimeEvent::Error { .. }) {
+                saw_error = true;
+            }
+            event_views.push(to_stream_event_view(event.clone()));
+        }
+
+        if let Some(stream_context) = &channel_stream_context {
+            if saw_error {
+                self.audit
+                    .append(
+                        "channel.turn.stream_error",
+                        Some(session.session_id),
+                        Some("kernel".to_string()),
+                        json!({
+                            "channel_id": stream_context.channel_id,
+                            "peer_id": stream_context.peer_id,
+                            "turn_id": turn_id,
+                        }),
+                    )
+                    .await
+                    .map_err(internal)?;
+            }
+
+            if !assistant.trim().is_empty() {
+                let message_id = self
+                    .channel_state
+                    .insert_outbound_message(
+                        &stream_context.channel_id,
+                        &stream_context.peer_id,
+                        &assistant,
+                    )
+                    .await
+                    .map_err(internal)?;
+                self.audit
+                    .append(
+                        "channel.outbound.recorded",
+                        Some(session.session_id),
+                        Some("kernel".to_string()),
+                        json!({
+                            "channel_id": stream_context.channel_id,
+                            "peer_id": stream_context.peer_id,
+                            "message_id": message_id,
+                            "turn_id": turn_id,
+                            "content_len": assistant.len(),
+                        }),
+                    )
+                    .await
+                    .map_err(internal)?;
             }
         }
 
@@ -342,6 +397,7 @@ impl Kernel {
                 Some(session.session_id),
                 Some("api".to_string()),
                 json!({
+                    "turn_id": turn_id,
                     "runtime_id": runtime_id,
                     "selected_skills": allowed_skills,
                     "prompt_len": req.user_text.len(),
@@ -355,10 +411,11 @@ impl Kernel {
 
         Ok(SessionTurnResponse {
             session_id: session.session_id,
+            turn_id,
             assistant_text: assistant,
             selected_skills: allowed_skills,
             runtime_id,
-            runtime_events: event_views,
+            stream_events: event_views,
         })
     }
 
@@ -664,79 +721,93 @@ impl Kernel {
         Ok(ChannelInboundResponse { accepted })
     }
 
-    pub async fn pull_channel_outbox(
+    pub async fn pull_channel_stream(
         &self,
-        req: ChannelOutboxPullRequest,
-    ) -> Result<ChannelOutboxPullResponse, KernelError> {
-        if req.channel_id.trim().is_empty() {
+        req: ChannelStreamPullRequest,
+    ) -> Result<ChannelStreamPullResponse, KernelError> {
+        if req.channel_id.trim().is_empty() || req.consumer_id.trim().is_empty() {
             return Err(KernelError::BadRequest(
-                "channel_id is required".to_string(),
+                "channel_id and consumer_id are required".to_string(),
             ));
         }
 
-        self.require_active_channel_binding(req.channel_id.trim())
-            .await?;
-
+        let channel_id = req.channel_id.trim();
+        let consumer_id = req.consumer_id.trim();
+        self.require_active_channel_binding(channel_id).await?;
         let limit = req.limit.unwrap_or(50).clamp(1, 200);
-        let messages = self
-            .channel_state
-            .list_pending_outbox(req.channel_id.trim(), limit)
-            .await
-            .map_err(internal)?
+        let wait_ms = req.wait_ms.unwrap_or(0).min(30_000);
+        let after_sequence = self
+            .resolve_stream_consumer_cursor(
+                channel_id,
+                consumer_id,
+                req.start_mode
+                    .unwrap_or(crate::contracts::ChannelStreamStartMode::Resume),
+            )
+            .await?;
+        let events = self
+            .wait_for_channel_stream_events(channel_id, after_sequence, limit, wait_ms)
+            .await?
             .into_iter()
-            .map(to_channel_outbox_message_view)
+            .map(to_channel_stream_event_view)
             .collect::<Vec<_>>();
 
         self.audit
             .append(
-                "channel.outbox.pulled",
+                "channel.stream.pulled",
                 None,
                 Some("api".to_string()),
                 json!({
-                    "channel_id": req.channel_id.trim(),
-                    "count": messages.len(),
+                    "channel_id": channel_id,
+                    "consumer_id": consumer_id,
+                    "count": events.len(),
                     "limit": limit,
+                    "wait_ms": wait_ms,
                 }),
             )
             .await
             .map_err(internal)?;
 
-        Ok(ChannelOutboxPullResponse { messages })
+        Ok(ChannelStreamPullResponse { events })
     }
 
-    pub async fn ack_channel_outbox(
+    pub async fn ack_channel_stream(
         &self,
-        req: ChannelOutboxAckRequest,
-    ) -> Result<ChannelOutboxAckResponse, KernelError> {
-        if req.external_message_id.trim().is_empty() {
+        req: ChannelStreamAckRequest,
+    ) -> Result<ChannelStreamAckResponse, KernelError> {
+        if req.channel_id.trim().is_empty() || req.consumer_id.trim().is_empty() {
             return Err(KernelError::BadRequest(
-                "external_message_id is required".to_string(),
+                "channel_id and consumer_id are required".to_string(),
             ));
         }
 
+        let channel_id = req.channel_id.trim();
+        let consumer_id = req.consumer_id.trim();
         let acknowledged = self
             .channel_state
-            .ack_outbound_message(req.message_id, req.external_message_id.trim())
+            .ack_stream_consumer(channel_id, consumer_id, req.through_sequence)
             .await
             .map_err(internal)?;
 
         if acknowledged {
             self.audit
                 .append(
-                    "channel.outbound.acked",
+                    "channel.stream.acked",
                     None,
                     Some("api".to_string()),
                     json!({
-                        "message_id": req.message_id,
-                        "external_message_id": req.external_message_id.trim(),
+                        "channel_id": channel_id,
+                        "consumer_id": consumer_id,
+                        "through_sequence": req.through_sequence,
                     }),
                 )
                 .await
                 .map_err(internal)?;
         }
 
-        Ok(ChannelOutboxAckResponse {
-            message_id: req.message_id,
+        Ok(ChannelStreamAckResponse {
+            channel_id: channel_id.to_string(),
+            consumer_id: consumer_id.to_string(),
+            through_sequence: req.through_sequence,
             acknowledged,
         })
     }
@@ -834,9 +905,11 @@ impl Kernel {
                     .map_err(internal)?;
 
                 let _ = self
-                    .send_channel_text(
+                    .emit_channel_message(
                         channel_id,
                         peer_id,
+                        None,
+                        None,
                         &format!(
                             "Pairing required. Approve this peer with code {} via /v0/channels/peers/approve.",
                             pending.pairing_code
@@ -866,9 +939,11 @@ impl Kernel {
         match peer.status {
             ChannelPeerStatus::Pending => {
                 let _ = self
-                    .send_channel_text(
+                    .emit_channel_message(
                         channel_id,
                         peer_id,
+                        None,
+                        None,
                         &format!(
                             "Peer is pending approval. Use pairing code {} via /v0/channels/peers/approve.",
                             peer.pairing_code
@@ -991,11 +1066,6 @@ impl Kernel {
                 return Err(err);
             }
         };
-
-        if !turn.assistant_text.trim().is_empty() {
-            self.send_channel_text(channel_id, peer_id, &turn.assistant_text)
-                .await?;
-        }
 
         self.audit
             .append(
@@ -1162,15 +1232,61 @@ fn to_channel_peer_view(peer: super::channel_state::ChannelPeerRecord) -> Channe
     }
 }
 
-fn to_channel_outbox_message_view(
-    message: super::channel_state::ChannelOutboxMessageRecord,
-) -> ChannelOutboxMessageView {
-    ChannelOutboxMessageView {
-        message_id: message.message_id,
-        channel_id: message.channel_id,
-        peer_id: message.peer_id,
-        content: message.content,
-        created_at: message.created_at,
+fn to_channel_stream_event_view(event: ChannelStreamEventRecord) -> ChannelStreamEventView {
+    ChannelStreamEventView {
+        sequence: event.sequence,
+        channel_id: event.channel_id,
+        peer_id: event.peer_id,
+        session_id: event.session_id,
+        turn_id: event.turn_id,
+        kind: to_stream_event_kind_dto(event.kind),
+        lane: event.lane.map(to_stream_lane_dto),
+        text: event.text,
+        created_at: event.created_at,
+    }
+}
+
+fn to_stream_event_kind_dto(kind: ChannelStreamEventKind) -> StreamEventKindDto {
+    match kind {
+        ChannelStreamEventKind::MessageDelta => StreamEventKindDto::MessageDelta,
+        ChannelStreamEventKind::Status => StreamEventKindDto::Status,
+        ChannelStreamEventKind::Error => StreamEventKindDto::Error,
+        ChannelStreamEventKind::Done => StreamEventKindDto::Done,
+    }
+}
+
+fn to_stream_lane_dto(lane: ChannelStreamLane) -> StreamLaneDto {
+    match lane {
+        ChannelStreamLane::Answer => StreamLaneDto::Answer,
+        ChannelStreamLane::Reasoning => StreamLaneDto::Reasoning,
+    }
+}
+
+fn to_stream_event_view(event: RuntimeEvent) -> StreamEventDto {
+    match event {
+        RuntimeEvent::MessageDelta { lane, text } => StreamEventDto {
+            kind: StreamEventKindDto::MessageDelta,
+            lane: Some(match lane {
+                RuntimeMessageLane::Answer => StreamLaneDto::Answer,
+                RuntimeMessageLane::Reasoning => StreamLaneDto::Reasoning,
+            }),
+            text: Some(text),
+        },
+        RuntimeEvent::Status { text } => StreamEventDto {
+            kind: StreamEventKindDto::Status,
+            lane: None,
+            text: Some(text),
+        },
+        RuntimeEvent::Error { text } => StreamEventDto {
+            kind: StreamEventKindDto::Error,
+            lane: None,
+            text: Some(text),
+        },
+        RuntimeEvent::Done => StreamEventDto {
+            kind: StreamEventKindDto::Done,
+            lane: None,
+            text: None,
+        },
     }
 }
 
@@ -1301,6 +1417,30 @@ fn generate_pairing_code() -> String {
     format!("{:06}", number)
 }
 
+#[derive(Debug, Clone)]
+struct ChannelStreamContext {
+    channel_id: String,
+    peer_id: String,
+    session_id: Uuid,
+    turn_id: Uuid,
+}
+
+#[derive(Debug)]
+struct CollectedRuntimeTurn {
+    events: Vec<RuntimeEvent>,
+    result: RuntimeTurnResult,
+}
+
+struct RuntimeTurnExecution<'a> {
+    adapter: Arc<dyn RuntimeAdapter>,
+    runtime_id: &'a str,
+    session_id: Uuid,
+    handle: &'a RuntimeSessionHandle,
+    turn_timeout: Duration,
+    input: RuntimeTurnInput,
+    stream_context: Option<ChannelStreamContext>,
+}
+
 impl Kernel {
     fn resolve_runtime_id(
         &self,
@@ -1348,6 +1488,220 @@ impl Kernel {
                 .filter(|value| !value.is_empty())
                 .map(|value| value.to_string())
         }))
+    }
+
+    async fn channel_stream_context_for_session(
+        &self,
+        session_id: Uuid,
+        channel_id: &str,
+        peer_id: &str,
+        turn_id: Uuid,
+    ) -> Result<Option<ChannelStreamContext>, KernelError> {
+        let binding = self
+            .channel_state
+            .get_binding(channel_id)
+            .await
+            .map_err(internal)?;
+        let Some(binding) = binding else {
+            return Ok(None);
+        };
+        if !binding.enabled {
+            return Ok(None);
+        }
+
+        let skill_enabled = self
+            .skills
+            .get(&binding.skill_id)
+            .await
+            .map_err(internal)?
+            .map(|skill| skill.enabled)
+            .unwrap_or(false);
+        if !skill_enabled {
+            return Ok(None);
+        }
+
+        Ok(Some(ChannelStreamContext {
+            channel_id: channel_id.to_string(),
+            peer_id: peer_id.to_string(),
+            session_id,
+            turn_id,
+        }))
+    }
+
+    async fn resolve_stream_consumer_cursor(
+        &self,
+        channel_id: &str,
+        consumer_id: &str,
+        start_mode: crate::contracts::ChannelStreamStartMode,
+    ) -> Result<i64, KernelError> {
+        if let Some(cursor) = self
+            .channel_state
+            .get_stream_consumer_cursor(channel_id, consumer_id)
+            .await
+            .map_err(internal)?
+        {
+            return Ok(cursor);
+        }
+
+        let initial_cursor = match start_mode {
+            crate::contracts::ChannelStreamStartMode::Resume => 0,
+            crate::contracts::ChannelStreamStartMode::Tail => self
+                .channel_state
+                .current_stream_head(channel_id)
+                .await
+                .map_err(internal)?,
+        };
+        self.channel_state
+            .create_stream_consumer(channel_id, consumer_id, initial_cursor)
+            .await
+            .map_err(internal)?;
+        Ok(initial_cursor)
+    }
+
+    async fn wait_for_channel_stream_events(
+        &self,
+        channel_id: &str,
+        after_sequence: i64,
+        limit: usize,
+        wait_ms: u64,
+    ) -> Result<Vec<ChannelStreamEventRecord>, KernelError> {
+        let notifier = self.channel_stream_notifier(channel_id).await;
+        loop {
+            let events = self
+                .channel_state
+                .list_stream_events_after(channel_id, after_sequence, limit)
+                .await
+                .map_err(internal)?;
+            if !events.is_empty() || wait_ms == 0 {
+                return Ok(events);
+            }
+
+            let notified = notifier.notified();
+            if timeout(Duration::from_millis(wait_ms), notified)
+                .await
+                .is_err()
+            {
+                return Ok(Vec::new());
+            }
+        }
+    }
+
+    async fn channel_stream_notifier(&self, channel_id: &str) -> Arc<Notify> {
+        if let Some(existing) = self
+            .channel_stream_notifiers
+            .read()
+            .await
+            .get(channel_id)
+            .cloned()
+        {
+            return existing;
+        }
+
+        let mut notifiers = self.channel_stream_notifiers.write().await;
+        notifiers
+            .entry(channel_id.to_string())
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
+    }
+
+    async fn notify_channel_stream(&self, channel_id: &str) {
+        let notifier = self.channel_stream_notifier(channel_id).await;
+        notifier.notify_waiters();
+    }
+
+    async fn append_stream_event(
+        &self,
+        context: &ChannelStreamContext,
+        event: &RuntimeEvent,
+    ) -> Result<(), KernelError> {
+        let (kind, lane, text) = match event {
+            RuntimeEvent::MessageDelta { lane, text } => (
+                ChannelStreamEventKind::MessageDelta,
+                Some(match lane {
+                    RuntimeMessageLane::Answer => ChannelStreamLane::Answer,
+                    RuntimeMessageLane::Reasoning => ChannelStreamLane::Reasoning,
+                }),
+                Some(text.as_str()),
+            ),
+            RuntimeEvent::Status { text } => {
+                (ChannelStreamEventKind::Status, None, Some(text.as_str()))
+            }
+            RuntimeEvent::Error { text } => {
+                (ChannelStreamEventKind::Error, None, Some(text.as_str()))
+            }
+            RuntimeEvent::Done => (ChannelStreamEventKind::Done, None, None),
+        };
+
+        self.channel_state
+            .append_stream_event(ChannelStreamEventInsert {
+                channel_id: &context.channel_id,
+                peer_id: &context.peer_id,
+                session_id: context.session_id,
+                turn_id: context.turn_id,
+                kind,
+                lane,
+                text,
+            })
+            .await
+            .map_err(internal)?;
+        self.notify_channel_stream(&context.channel_id).await;
+        Ok(())
+    }
+
+    async fn emit_channel_message(
+        &self,
+        channel_id: &str,
+        peer_id: &str,
+        session_id: Option<Uuid>,
+        turn_id: Option<Uuid>,
+        content: &str,
+    ) -> Result<Vec<Uuid>, KernelError> {
+        self.require_active_channel_binding(channel_id).await?;
+        let session_id = session_id.unwrap_or_else(Uuid::new_v4);
+        let turn_id = turn_id.unwrap_or_else(Uuid::new_v4);
+        let stream_context = ChannelStreamContext {
+            channel_id: channel_id.to_string(),
+            peer_id: peer_id.to_string(),
+            session_id,
+            turn_id,
+        };
+        let mut message_ids = Vec::new();
+
+        for chunk in split_text_chunks(content, 3500) {
+            let message_id = self
+                .channel_state
+                .insert_outbound_message(channel_id, peer_id, &chunk)
+                .await
+                .map_err(internal)?;
+            message_ids.push(message_id);
+            self.append_stream_event(
+                &stream_context,
+                &RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: chunk.clone(),
+                },
+            )
+            .await?;
+            self.audit
+                .append(
+                    "channel.outbound.queued",
+                    None,
+                    Some("kernel".to_string()),
+                    json!({
+                        "channel_id": channel_id,
+                        "peer_id": peer_id,
+                        "message_id": message_id,
+                        "content_len": chunk.len(),
+                        "turn_id": turn_id,
+                    }),
+                )
+                .await
+                .map_err(internal)?;
+        }
+
+        self.append_stream_event(&stream_context, &RuntimeEvent::Done)
+            .await?;
+        Ok(message_ids)
     }
 
     async fn build_prompt_envelope(
@@ -1476,13 +1830,17 @@ impl Kernel {
 
     async fn execute_runtime_turn(
         &self,
-        adapter: Arc<dyn RuntimeAdapter>,
-        runtime_id: &str,
-        session_id: uuid::Uuid,
-        handle: &RuntimeSessionHandle,
-        turn_timeout: Duration,
-        input: RuntimeTurnInput,
-    ) -> Result<RuntimeTurnOutput, KernelError> {
+        execution: RuntimeTurnExecution<'_>,
+    ) -> Result<CollectedRuntimeTurn, KernelError> {
+        let RuntimeTurnExecution {
+            adapter,
+            runtime_id,
+            session_id,
+            handle,
+            turn_timeout,
+            input,
+            stream_context,
+        } = execution;
         let timeout_ms = turn_timeout.as_millis() as u64;
         self.audit
             .append(
@@ -1498,104 +1856,174 @@ impl Kernel {
             .await
             .map_err(internal)?;
 
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let adapter_for_task = adapter.clone();
-        let mut turn_task = tokio::spawn(async move { adapter_for_task.turn(input).await });
-        let turn_result = tokio::select! {
-            output = &mut turn_task => Some(output),
-            _ = sleep(turn_timeout) => None,
-        };
+        let mut turn_task =
+            tokio::spawn(async move { adapter_for_task.turn(input, event_tx).await });
+        let timeout_sleep = sleep(turn_timeout);
+        tokio::pin!(timeout_sleep);
+        let mut events = Vec::new();
 
-        match turn_result {
-            Some(Ok(Ok(output))) => {
-                self.audit
-                    .append(
-                        "runtime.turn.finish",
-                        Some(session_id),
-                        Some("kernel".to_string()),
-                        json!({
-                            "runtime_id": runtime_id,
-                            "runtime_session_id": handle.runtime_session_id,
-                            "event_count": output.events.len(),
-                            "capability_request_count": output.capability_requests.len(),
-                        }),
-                    )
-                    .await
-                    .map_err(internal)?;
-                Ok(output)
-            }
-            Some(Ok(Err(err))) => {
-                let message = err.to_string();
-                self.audit
-                    .append(
-                        "runtime.turn.error",
-                        Some(session_id),
-                        Some("kernel".to_string()),
-                        json!({
-                            "runtime_id": runtime_id,
-                            "runtime_session_id": handle.runtime_session_id,
-                            "error": message,
-                        }),
-                    )
-                    .await
-                    .map_err(internal)?;
-                Err(KernelError::Runtime(message))
-            }
-            Some(Err(err)) => {
-                let message = format!("runtime turn task failed: {}", err);
-                self.audit
-                    .append(
-                        "runtime.turn.error",
-                        Some(session_id),
-                        Some("kernel".to_string()),
-                        json!({
-                            "runtime_id": runtime_id,
-                            "runtime_session_id": handle.runtime_session_id,
-                            "error": message,
-                        }),
-                    )
-                    .await
-                    .map_err(internal)?;
-                Err(KernelError::Runtime(message))
-            }
-            None => {
-                let reason = format!("turn timed out after {} ms", timeout_ms);
+        loop {
+            tokio::select! {
+                maybe_event = event_rx.recv() => {
+                    match maybe_event {
+                        Some(event) => {
+                            if let Some(context) = &stream_context {
+                                self.append_stream_event(context, &event).await?;
+                            }
+                            events.push(event);
+                        }
+                        None => {
+                            if turn_task.is_finished() {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                output = &mut turn_task => {
+                    while let Some(event) = event_rx.recv().await {
+                        if let Some(context) = &stream_context {
+                            self.append_stream_event(context, &event).await?;
+                        }
+                        events.push(event);
+                    }
+                    return match output {
+                        Ok(Ok(result)) => {
+                            self.audit
+                                .append(
+                                    "runtime.turn.finish",
+                                    Some(session_id),
+                                    Some("kernel".to_string()),
+                                    json!({
+                                        "runtime_id": runtime_id,
+                                        "runtime_session_id": handle.runtime_session_id,
+                                        "event_count": events.len(),
+                                        "capability_request_count": result.capability_requests.len(),
+                                    }),
+                                )
+                                .await
+                                .map_err(internal)?;
+                            Ok(CollectedRuntimeTurn { events, result })
+                        }
+                        Ok(Err(err)) => {
+                            let message = err.to_string();
+                            self.audit
+                                .append(
+                                    "runtime.turn.error",
+                                    Some(session_id),
+                                    Some("kernel".to_string()),
+                                    json!({
+                                        "runtime_id": runtime_id,
+                                        "runtime_session_id": handle.runtime_session_id,
+                                        "error": message,
+                                    }),
+                                )
+                                .await
+                                .map_err(internal)?;
+                            Err(KernelError::Runtime(message))
+                        }
+                        Err(err) => {
+                            let message = format!("runtime turn task failed: {}", err);
+                            self.audit
+                                .append(
+                                    "runtime.turn.error",
+                                    Some(session_id),
+                                    Some("kernel".to_string()),
+                                    json!({
+                                        "runtime_id": runtime_id,
+                                        "runtime_session_id": handle.runtime_session_id,
+                                        "error": message,
+                                    }),
+                                )
+                                .await
+                                .map_err(internal)?;
+                            Err(KernelError::Runtime(message))
+                        }
+                    };
+                }
+                _ = &mut timeout_sleep => {
+                    let reason = format!("turn timed out after {} ms", timeout_ms);
 
-                if let Err(cancel_err) = adapter.cancel(handle, Some(reason.clone())).await {
+                    if let Err(cancel_err) = adapter.cancel(handle, Some(reason.clone())).await {
+                        self.audit
+                            .append(
+                                "runtime.turn.cancel_error",
+                                Some(session_id),
+                                Some("kernel".to_string()),
+                                json!({
+                                    "runtime_id": runtime_id,
+                                    "runtime_session_id": handle.runtime_session_id,
+                                    "error": cancel_err.to_string(),
+                                }),
+                            )
+                            .await
+                            .map_err(internal)?;
+                    }
+
+                    turn_task.abort();
+                    let _ = turn_task.await;
+
                     self.audit
                         .append(
-                            "runtime.turn.cancel_error",
+                            "runtime.turn.timeout",
                             Some(session_id),
                             Some("kernel".to_string()),
                             json!({
                                 "runtime_id": runtime_id,
                                 "runtime_session_id": handle.runtime_session_id,
-                                "error": cancel_err.to_string(),
+                                "timeout_ms": timeout_ms,
                             }),
                         )
                         .await
                         .map_err(internal)?;
+
+                    return Err(KernelError::RuntimeTimeout(reason));
                 }
-
-                turn_task.abort();
-                let _ = turn_task.await;
-
-                self.audit
-                    .append(
-                        "runtime.turn.timeout",
-                        Some(session_id),
-                        Some("kernel".to_string()),
-                        json!({
-                            "runtime_id": runtime_id,
-                            "runtime_session_id": handle.runtime_session_id,
-                            "timeout_ms": timeout_ms,
-                        }),
-                    )
-                    .await
-                    .map_err(internal)?;
-
-                Err(KernelError::RuntimeTimeout(reason))
             }
         }
+    }
+
+    async fn execute_runtime_capability_followup(
+        &self,
+        adapter: Arc<dyn RuntimeAdapter>,
+        runtime_id: &str,
+        session_id: uuid::Uuid,
+        handle: &RuntimeSessionHandle,
+        results: Vec<RuntimeCapabilityResult>,
+        stream_context: Option<ChannelStreamContext>,
+    ) -> Result<Vec<RuntimeEvent>, anyhow::Error> {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        adapter
+            .resolve_capability_requests(handle, results, event_tx)
+            .await?;
+
+        let mut events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            if let Some(context) = &stream_context {
+                self.append_stream_event(context, &event)
+                    .await
+                    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+            }
+            events.push(event);
+        }
+
+        self.audit
+            .append(
+                "runtime.turn.followup",
+                Some(session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "runtime_id": runtime_id,
+                    "runtime_session_id": handle.runtime_session_id,
+                    "event_count": events.len(),
+                }),
+            )
+            .await
+            .map_err(internal)
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+
+        Ok(events)
     }
 
     async fn close_runtime_session(
@@ -1660,45 +2088,10 @@ impl Kernel {
         Ok(())
     }
 
-    async fn send_channel_text(
-        &self,
-        channel_id: &str,
-        peer_id: &str,
-        content: &str,
-    ) -> Result<Vec<uuid::Uuid>, KernelError> {
-        self.require_active_channel_binding(channel_id).await?;
-        let mut message_ids = Vec::new();
-
-        for chunk in split_text_chunks(content, 3500) {
-            let message_id = self
-                .channel_state
-                .queue_outbound_message(channel_id, peer_id, &chunk)
-                .await
-                .map_err(internal)?;
-            message_ids.push(message_id);
-
-            self.audit
-                .append(
-                    "channel.outbound.queued",
-                    None,
-                    Some("kernel".to_string()),
-                    json!({
-                        "channel_id": channel_id,
-                        "peer_id": peer_id,
-                        "message_id": message_id,
-                        "content_len": chunk.len(),
-                    }),
-                )
-                .await
-                .map_err(internal)?;
-        }
-
-        Ok(message_ids)
-    }
-
     async fn evaluate_capability_requests(
         &self,
         session_id: uuid::Uuid,
+        turn_id: uuid::Uuid,
         session_channel_id: &str,
         session_peer_id: &str,
         allowed_skill_ids: &[String],
@@ -1779,7 +2172,13 @@ impl Kernel {
                             match parse_channel_send_intent(&value) {
                                 Ok((channel_id, peer_id, content)) => {
                                     match self
-                                        .send_channel_text(&channel_id, &peer_id, &content)
+                                        .emit_channel_message(
+                                            &channel_id,
+                                            &peer_id,
+                                            Some(session_id),
+                                            Some(turn_id),
+                                            &content,
+                                        )
                                         .await
                                     {
                                         Ok(queued_message_ids) => {

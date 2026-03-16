@@ -14,12 +14,13 @@ use crate::{
     contracts::{
         AuditQueryParams, AuditQueryResponse, ChannelBindRequest, ChannelBindResponse,
         ChannelInboundRequest, ChannelInboundResponse, ChannelListResponse,
-        ChannelOutboxAckRequest, ChannelOutboxAckResponse, ChannelOutboxPullRequest,
-        ChannelOutboxPullResponse, ChannelPeerApproveRequest, ChannelPeerBlockRequest,
-        ChannelPeerListParams, ChannelPeerListResponse, ChannelPeerResponse, PolicyGrantRequest,
-        PolicyGrantResponse, PolicyRevokeRequest, PolicyRevokeResponse, SessionOpenRequest,
-        SessionOpenResponse, SessionTurnRequest, SessionTurnResponse, SkillInstallRequest,
-        SkillInstallResponse, SkillListResponse, SkillToggleRequest, SkillToggleResponse,
+        ChannelPeerApproveRequest, ChannelPeerBlockRequest, ChannelPeerListParams,
+        ChannelPeerListResponse, ChannelPeerResponse, ChannelStreamAckRequest,
+        ChannelStreamAckResponse, ChannelStreamPullRequest, ChannelStreamPullResponse,
+        PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeRequest, PolicyRevokeResponse,
+        SessionOpenRequest, SessionOpenResponse, SessionTurnRequest, SessionTurnResponse,
+        SkillInstallRequest, SkillInstallResponse, SkillListResponse, SkillToggleRequest,
+        SkillToggleResponse,
     },
     kernel::{Kernel, KernelError},
 };
@@ -46,8 +47,8 @@ pub fn build_router(kernel: Arc<Kernel>) -> Router {
         .route("/v0/channels/peers/approve", post(approve_channel_peer))
         .route("/v0/channels/peers/block", post(block_channel_peer))
         .route("/v0/channels/inbound", post(channel_inbound))
-        .route("/v0/channels/outbox/pull", post(channel_outbox_pull))
-        .route("/v0/channels/outbox/ack", post(channel_outbox_ack))
+        .route("/v0/channels/stream/pull", post(channel_stream_pull))
+        .route("/v0/channels/stream/ack", post(channel_stream_ack))
         .route("/v0/policy/grant", post(grant_policy))
         .route("/v0/policy/revoke", post(revoke_policy))
         .route("/v0/audit/query", get(query_audit))
@@ -150,19 +151,19 @@ async fn channel_inbound(
     Ok(Json(result))
 }
 
-async fn channel_outbox_pull(
+async fn channel_stream_pull(
     State(state): State<ApiState>,
-    Json(req): Json<ChannelOutboxPullRequest>,
-) -> Result<Json<ChannelOutboxPullResponse>, ApiError> {
-    let result = state.kernel.pull_channel_outbox(req).await?;
+    Json(req): Json<ChannelStreamPullRequest>,
+) -> Result<Json<ChannelStreamPullResponse>, ApiError> {
+    let result = state.kernel.pull_channel_stream(req).await?;
     Ok(Json(result))
 }
 
-async fn channel_outbox_ack(
+async fn channel_stream_ack(
     State(state): State<ApiState>,
-    Json(req): Json<ChannelOutboxAckRequest>,
-) -> Result<Json<ChannelOutboxAckResponse>, ApiError> {
-    let result = state.kernel.ack_channel_outbox(req).await?;
+    Json(req): Json<ChannelStreamAckRequest>,
+) -> Result<Json<ChannelStreamAckResponse>, ApiError> {
+    let result = state.kernel.ack_channel_stream(req).await?;
     Ok(Json(result))
 }
 

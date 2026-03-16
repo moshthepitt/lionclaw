@@ -7,8 +7,8 @@ use crate::kernel::{
     policy::Capability,
     runtime::{
         RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityRequest, RuntimeCapabilityResult,
-        RuntimeEvent, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
-        RuntimeTurnOutput,
+        RuntimeEvent, RuntimeEventSender, RuntimeMessageLane, RuntimeSessionHandle,
+        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
     },
 };
 
@@ -33,11 +33,14 @@ impl RuntimeAdapter for MockRuntimeAdapter {
         })
     }
 
-    async fn turn(&self, input: RuntimeTurnInput) -> Result<RuntimeTurnOutput> {
-        let mut events = Vec::new();
-        events.push(RuntimeEvent::Status(
-            "mock runtime started turn".to_string(),
-        ));
+    async fn turn(
+        &self,
+        input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        let _ = events.send(RuntimeEvent::Status {
+            text: "mock runtime started turn".to_string(),
+        });
 
         let skill_context = if input.selected_skills.is_empty() {
             "no skill context selected".to_string()
@@ -45,10 +48,10 @@ impl RuntimeAdapter for MockRuntimeAdapter {
             format!("selected skills: {}", input.selected_skills.join(", "))
         };
 
-        events.push(RuntimeEvent::TextDelta(format!(
-            "[mock] {} | prompt: {}",
-            skill_context, input.prompt
-        )));
+        let _ = events.send(RuntimeEvent::MessageDelta {
+            lane: RuntimeMessageLane::Answer,
+            text: format!("[mock] {} | prompt: {}", skill_context, input.prompt),
+        });
 
         let mut capability_requests = Vec::new();
         if let Some(skill_id) = input.selected_skills.first() {
@@ -67,16 +70,17 @@ impl RuntimeAdapter for MockRuntimeAdapter {
         }
 
         if capability_requests.is_empty() {
-            events.push(RuntimeEvent::Done);
+            let _ = events.send(RuntimeEvent::Done);
         } else {
-            events.push(RuntimeEvent::Status(format!(
-                "mock runtime requested {} capability checks",
-                capability_requests.len()
-            )));
+            let _ = events.send(RuntimeEvent::Status {
+                text: format!(
+                    "mock runtime requested {} capability checks",
+                    capability_requests.len()
+                ),
+            });
         }
 
-        Ok(RuntimeTurnOutput {
-            events,
+        Ok(RuntimeTurnResult {
             capability_requests,
         })
     }
@@ -85,23 +89,21 @@ impl RuntimeAdapter for MockRuntimeAdapter {
         &self,
         _handle: &RuntimeSessionHandle,
         results: Vec<RuntimeCapabilityResult>,
-    ) -> Result<Vec<RuntimeEvent>> {
-        let mut events = Vec::with_capacity(results.len() + 1);
+        events: RuntimeEventSender,
+    ) -> Result<()> {
         for result in results {
             let verdict = if result.allowed { "granted" } else { "denied" };
-            events.push(RuntimeEvent::Status(format!(
-                "capability:{}:{}",
-                result.request_id, verdict
-            )));
+            let _ = events.send(RuntimeEvent::Status {
+                text: format!("capability:{}:{}", result.request_id, verdict),
+            });
             if let Some(reason) = result.reason {
-                events.push(RuntimeEvent::Status(format!(
-                    "capability:{}:reason:{}",
-                    result.request_id, reason
-                )));
+                let _ = events.send(RuntimeEvent::Status {
+                    text: format!("capability:{}:reason:{}", result.request_id, reason),
+                });
             }
         }
-        events.push(RuntimeEvent::Done);
-        Ok(events)
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
     }
 
     async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {

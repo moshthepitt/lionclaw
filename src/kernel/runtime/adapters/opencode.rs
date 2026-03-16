@@ -7,8 +7,9 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::kernel::runtime::{
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
-    RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnOutput,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
+    RuntimeMessageLane, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
+    RuntimeTurnResult,
 };
 
 use super::subprocess::{run_non_interactive, SubprocessInvocation};
@@ -112,7 +113,11 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
         Ok(RuntimeSessionHandle { runtime_session_id })
     }
 
-    async fn turn(&self, input: RuntimeTurnInput) -> Result<RuntimeTurnOutput> {
+    async fn turn(
+        &self,
+        input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
         let session = self
             .sessions
             .read()
@@ -157,16 +162,18 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
             };
         }
 
-        let mut events = parse_opencode_stdout(&output.stdout);
-        if !events
+        let parsed_events = parse_opencode_stdout(&output.stdout);
+        let has_done = parsed_events
             .iter()
-            .any(|event| matches!(event, RuntimeEvent::Done))
-        {
-            events.push(RuntimeEvent::Done);
+            .any(|event| matches!(event, RuntimeEvent::Done));
+        for event in parsed_events {
+            let _ = events.send(event);
+        }
+        if !has_done {
+            let _ = events.send(RuntimeEvent::Done);
         }
 
-        Ok(RuntimeTurnOutput {
-            events,
+        Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
         })
     }
@@ -175,13 +182,15 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
         &self,
         _handle: &RuntimeSessionHandle,
         results: Vec<RuntimeCapabilityResult>,
-    ) -> Result<Vec<RuntimeEvent>> {
+        events: RuntimeEventSender,
+    ) -> Result<()> {
         if !results.is_empty() {
             return Err(anyhow!(
                 "opencode adapter does not support runtime-side capability request resolution"
             ));
         }
-        Ok(vec![RuntimeEvent::Done])
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
     }
 
     async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
@@ -270,7 +279,10 @@ fn parse_opencode_stdout(stdout: &[u8]) -> Vec<RuntimeEvent> {
         if let Ok(json) = serde_json::from_str::<Value>(line) {
             parse_opencode_json_event(&mut events, &json);
         } else {
-            events.push(RuntimeEvent::TextDelta(line.to_string()));
+            events.push(RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: line.to_string(),
+            });
         }
     }
 
@@ -281,19 +293,23 @@ fn parse_opencode_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
     let event_type = json.get("type").and_then(Value::as_str);
 
     if let Some(event_type) = event_type {
-        events.push(RuntimeEvent::Status(format!(
-            "opencode event: {}",
-            event_type
-        )));
+        events.push(RuntimeEvent::Status {
+            text: format!("opencode event: {}", event_type),
+        });
     }
 
     if let Some(message) = extract_error_message(json) {
-        events.push(RuntimeEvent::Error(format!("opencode: {}", message)));
+        events.push(RuntimeEvent::Error {
+            text: format!("opencode: {}", message),
+        });
         return;
     }
 
     if let Some(text) = extract_text_delta(json) {
-        events.push(RuntimeEvent::TextDelta(text));
+        events.push(RuntimeEvent::MessageDelta {
+            lane: RuntimeMessageLane::Answer,
+            text,
+        });
     }
 }
 
@@ -418,11 +434,13 @@ fn collect_texts(value: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use crate::kernel::runtime::{
-        RuntimeAdapter, RuntimeEvent, RuntimeSessionStartInput, RuntimeTurnInput,
+        RuntimeAdapter, RuntimeEvent, RuntimeMessageLane, RuntimeSessionStartInput,
+        RuntimeTurnInput,
     };
 
     use super::{parse_opencode_stdout, OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig};
     use tempfile::tempdir;
+    use tokio::sync::mpsc;
     use uuid::Uuid;
 
     #[cfg(unix)]
@@ -455,25 +473,29 @@ echo '{"type":"step_finish","part":{"type":"step-finish"}}'
             .await
             .expect("start");
 
-        let output = adapter
-            .turn(RuntimeTurnInput {
-                runtime_session_id: handle.runtime_session_id.clone(),
-                prompt: "hello".to_string(),
-                selected_skills: Vec::new(),
-            })
+        let (tx, rx) = mpsc::unbounded_channel();
+        let _output = adapter
+            .turn(
+                RuntimeTurnInput {
+                    runtime_session_id: handle.runtime_session_id.clone(),
+                    prompt: "hello".to_string(),
+                    selected_skills: Vec::new(),
+                },
+                tx,
+            )
             .await
             .expect("turn");
+        let events = collect_events(rx).await;
 
         assert!(
-            output.events.iter().any(|event| matches!(
+            events.iter().any(|event| matches!(
                 event,
-                RuntimeEvent::TextDelta(text) if text == "hello from opencode"
+                RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text } if text == "hello from opencode"
             )),
             "opencode message content should map to text delta"
         );
         assert!(
-            output
-                .events
+            events
                 .iter()
                 .any(|event| matches!(event, RuntimeEvent::Done)),
             "turn output should include terminal done event"
@@ -508,11 +530,14 @@ exit 7
             .expect("start");
 
         let err = adapter
-            .turn(RuntimeTurnInput {
-                runtime_session_id: handle.runtime_session_id,
-                prompt: "hello".to_string(),
-                selected_skills: Vec::new(),
-            })
+            .turn(
+                RuntimeTurnInput {
+                    runtime_session_id: handle.runtime_session_id,
+                    prompt: "hello".to_string(),
+                    selected_skills: Vec::new(),
+                },
+                mpsc::unbounded_channel().0,
+            )
             .await
             .expect_err("turn should fail");
 
@@ -529,8 +554,16 @@ exit 7
         assert_eq!(events.len(), 1, "expected one parsed event");
         assert!(matches!(
             &events[0],
-            RuntimeEvent::TextDelta(text) if text == "plain line"
+            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text } if text == "plain line"
         ));
+    }
+
+    async fn collect_events(mut rx: mpsc::UnboundedReceiver<RuntimeEvent>) -> Vec<RuntimeEvent> {
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
     }
 
     #[cfg(unix)]

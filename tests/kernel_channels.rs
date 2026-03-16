@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use lionclaw::{
     contracts::{
-        ChannelBindRequest, ChannelOutboxAckRequest, ChannelOutboxPullRequest,
-        ChannelPeerApproveRequest, PolicyGrantRequest, SessionOpenRequest, SkillInstallRequest,
-        TrustTier,
+        ChannelBindRequest, ChannelPeerApproveRequest, ChannelStreamAckRequest,
+        ChannelStreamPullRequest, ChannelStreamStartMode, PolicyGrantRequest, SessionOpenRequest,
+        SkillInstallRequest, StreamEventKindDto, StreamLaneDto, TrustTier,
     },
     kernel::{Kernel, KernelError},
 };
@@ -181,7 +181,7 @@ description: inbound skill for channel flow
         "only one succeeded channel turn should be recorded"
     );
 
-    let outbound_events = kernel
+    let queued_events = kernel
         .query_audit(
             None,
             Some("channel.outbound.queued".to_string()),
@@ -189,15 +189,24 @@ description: inbound skill for channel flow
             Some(20),
         )
         .await
-        .expect("query outbound events");
+        .expect("query queued outbound events");
+    let recorded_events = kernel
+        .query_audit(
+            None,
+            Some("channel.outbound.recorded".to_string()),
+            None,
+            Some(20),
+        )
+        .await
+        .expect("query recorded outbound events");
     assert!(
-        outbound_events.events.len() >= 2,
-        "pairing prompt and assistant response should both send outbound messages"
+        !queued_events.events.is_empty() && !recorded_events.events.is_empty(),
+        "pairing prompt and assistant response should both produce outbound audit records"
     );
 }
 
 #[tokio::test]
-async fn channel_outbox_pull_and_ack_round_trip() {
+async fn channel_stream_pull_and_ack_round_trip() {
     let env = TestEnv::new();
     let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
 
@@ -246,34 +255,56 @@ description: channel outbox skill
         .expect("process inbound");
     assert!(accepted, "new inbound message should be accepted");
 
-    let outbox = kernel
-        .pull_channel_outbox(ChannelOutboxPullRequest {
+    let stream = kernel
+        .pull_channel_stream(ChannelStreamPullRequest {
             channel_id: "telegram".to_string(),
+            consumer_id: "telegram-worker".to_string(),
+            start_mode: Some(ChannelStreamStartMode::Resume),
             limit: Some(10),
+            wait_ms: Some(0),
         })
         .await
-        .expect("pull outbox");
-    assert_eq!(outbox.messages.len(), 1, "pairing prompt should be queued");
+        .expect("pull stream");
+    assert!(
+        stream.events.iter().any(|event| {
+            event.kind == StreamEventKindDto::MessageDelta
+                && event.lane == Some(StreamLaneDto::Answer)
+                && event
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("Pairing required"))
+        }),
+        "pairing prompt should stream as answer delta"
+    );
+    let through_sequence = stream
+        .events
+        .last()
+        .expect("stream events should exist")
+        .sequence;
 
     let ack = kernel
-        .ack_channel_outbox(ChannelOutboxAckRequest {
-            message_id: outbox.messages[0].message_id,
-            external_message_id: "telegram-msg-1".to_string(),
+        .ack_channel_stream(ChannelStreamAckRequest {
+            channel_id: "telegram".to_string(),
+            consumer_id: "telegram-worker".to_string(),
+            through_sequence,
         })
         .await
-        .expect("ack outbound");
+        .expect("ack stream");
     assert!(ack.acknowledged, "first ack should succeed");
 
-    let outbox_after_ack = kernel
-        .pull_channel_outbox(ChannelOutboxPullRequest {
+    let stream_after_ack = kernel
+        .pull_channel_stream(ChannelStreamPullRequest {
             channel_id: "telegram".to_string(),
+            consumer_id: "telegram-worker".to_string(),
+            start_mode: Some(ChannelStreamStartMode::Resume),
             limit: Some(10),
+            wait_ms: Some(0),
         })
         .await
-        .expect("pull outbox after ack");
+        .expect("pull stream after ack");
     assert!(
-        outbox_after_ack.messages.is_empty(),
-        "acked message must not appear in pending outbox"
+        stream_after_ack.events.is_empty(),
+        "acked events must not appear in resumed channel stream"
     );
 }
 

@@ -18,7 +18,10 @@ LIONCLAW_HOME="${LIONCLAW_HOME:-$HOME/.lionclaw}"
 LIONCLAW_BASE_URL="${LIONCLAW_BASE_URL:-http://127.0.0.1:8979}"
 LIONCLAW_CHANNEL_ID="${LIONCLAW_CHANNEL_ID:-telegram}"
 LIONCLAW_RUNTIME_ID="${LIONCLAW_RUNTIME_ID:-}"
-LIONCLAW_OUTBOX_LIMIT="${LIONCLAW_OUTBOX_LIMIT:-20}"
+LIONCLAW_STREAM_LIMIT="${LIONCLAW_STREAM_LIMIT:-100}"
+LIONCLAW_STREAM_WAIT_MS="${LIONCLAW_STREAM_WAIT_MS:-30000}"
+LIONCLAW_STREAM_START_MODE="${LIONCLAW_STREAM_START_MODE:-resume}"
+LIONCLAW_CONSUMER_ID="${LIONCLAW_CONSUMER_ID:-telegram:$LIONCLAW_CHANNEL_ID}"
 TELEGRAM_POLL_TIMEOUT_SECS="${TELEGRAM_POLL_TIMEOUT_SECS:-25}"
 TELEGRAM_LOOP_DELAY_SECS="${TELEGRAM_LOOP_DELAY_SECS:-1}"
 LIONCLAW_CHANNEL_RUNTIME_DIR="${LIONCLAW_CHANNEL_RUNTIME_DIR:-$LIONCLAW_HOME/runtime/channels/$LIONCLAW_CHANNEL_ID}"
@@ -75,29 +78,41 @@ send_inbound() {
   lionclaw_post '/v0/channels/inbound' "$payload" >/dev/null
 }
 
-pull_outbox() {
+pull_stream() {
   local request
   request="$(jq -nc \
     --arg channel_id "$LIONCLAW_CHANNEL_ID" \
-    --argjson limit "$LIONCLAW_OUTBOX_LIMIT" \
-    '{channel_id: $channel_id, limit: $limit}'
+    --arg consumer_id "$LIONCLAW_CONSUMER_ID" \
+    --arg start_mode "$LIONCLAW_STREAM_START_MODE" \
+    --argjson limit "$LIONCLAW_STREAM_LIMIT" \
+    --argjson wait_ms "$LIONCLAW_STREAM_WAIT_MS" \
+    '{
+      channel_id: $channel_id,
+      consumer_id: $consumer_id,
+      start_mode: $start_mode,
+      limit: $limit,
+      wait_ms: $wait_ms
+    }'
   )"
 
-  lionclaw_post '/v0/channels/outbox/pull' "$request"
+  lionclaw_post '/v0/channels/stream/pull' "$request"
 }
 
-ack_outbox() {
-  local message_id="$1"
-  local external_message_id="$2"
-
+ack_stream() {
+  local through_sequence="$1"
   local request
   request="$(jq -nc \
-    --arg message_id "$message_id" \
-    --arg external_message_id "$external_message_id" \
-    '{message_id: $message_id, external_message_id: $external_message_id}'
+    --arg channel_id "$LIONCLAW_CHANNEL_ID" \
+    --arg consumer_id "$LIONCLAW_CONSUMER_ID" \
+    --argjson through_sequence "$through_sequence" \
+    '{
+      channel_id: $channel_id,
+      consumer_id: $consumer_id,
+      through_sequence: $through_sequence
+    }'
   )"
 
-  lionclaw_post '/v0/channels/outbox/ack' "$request" >/dev/null
+  lionclaw_post '/v0/channels/stream/ack' "$request" >/dev/null
 }
 
 process_updates() {
@@ -136,49 +151,104 @@ process_updates() {
   done < <(jq -c '.result[]?' <<<"$updates_json")
 }
 
-flush_outbox() {
-  local outbox
-  if ! outbox="$(pull_outbox)"; then
-    echo "lionclaw outbox pull request failed" >&2
+send_telegram_message() {
+  local peer_id="$1"
+  local content="$2"
+  local send_result
+
+  if ! send_result="$(curl -fsS -X POST "$(telegram_api sendMessage)" \
+    --data-urlencode "chat_id=$peer_id" \
+    --data-urlencode "text=$content")"; then
+    echo "telegram sendMessage request failed for peer_id=$peer_id" >&2
+    return 1
+  fi
+
+  if ! jq -e '.ok == true' >/dev/null <<<"$send_result"; then
+    echo "telegram sendMessage failed: $(jq -c '.' <<<"$send_result")" >&2
+    return 1
+  fi
+
+  return 0
+}
+
+flush_stream() {
+  local stream_json
+  local last_safe_sequence=""
+  local stop_processing=0
+
+  declare -A answer_buffers=()
+  declare -A pending_turns=()
+
+  if ! stream_json="$(pull_stream)"; then
+    echo "lionclaw stream pull request failed" >&2
     return
   fi
 
-  if ! jq -e '.messages | type == "array"' >/dev/null <<<"$outbox"; then
-    echo "lionclaw outbox pull failed: $(jq -c '.' <<<"$outbox")" >&2
+  if ! jq -e '.events | type == "array"' >/dev/null <<<"$stream_json"; then
+    echo "lionclaw stream pull failed: $(jq -c '.' <<<"$stream_json")" >&2
     return
   fi
 
-  while IFS= read -r message; do
-    local message_id
-    message_id="$(jq -r '.message_id' <<<"$message")"
-
+  while IFS= read -r event; do
+    local sequence
     local peer_id
-    peer_id="$(jq -r '.peer_id' <<<"$message")"
+    local turn_id
+    local kind
+    local lane
+    local text
+    local key
 
-    local content
-    content="$(jq -r '.content' <<<"$message")"
+    sequence="$(jq -r '.sequence' <<<"$event")"
+    peer_id="$(jq -r '.peer_id' <<<"$event")"
+    turn_id="$(jq -r '.turn_id' <<<"$event")"
+    kind="$(jq -r '.kind' <<<"$event")"
+    lane="$(jq -r '.lane // empty' <<<"$event")"
+    text="$(jq -r '.text // empty' <<<"$event")"
+    key="$peer_id|$turn_id"
 
-    local send_result
-    if ! send_result="$(curl -fsS -X POST "$(telegram_api sendMessage)" \
-      --data-urlencode "chat_id=$peer_id" \
-      --data-urlencode "text=$content")"; then
-      echo "telegram sendMessage request failed for message_id=$message_id" >&2
-      continue
+    case "$kind" in
+      message_delta)
+        if [[ "$lane" == "answer" ]]; then
+          answer_buffers["$key"]+="$text"
+          pending_turns["$key"]=1
+        fi
+        ;;
+      status)
+        ;;
+      error)
+        echo "lionclaw stream error for peer_id=$peer_id turn_id=$turn_id: $text" >&2
+        ;;
+      done)
+        if [[ -v pending_turns["$key"] ]]; then
+          if [[ -n "${answer_buffers[$key]:-}" ]]; then
+            if ! send_telegram_message "$peer_id" "${answer_buffers[$key]}"; then
+              stop_processing=1
+              break
+            fi
+          fi
+          unset "answer_buffers[$key]"
+          unset "pending_turns[$key]"
+        fi
+        ;;
+      *)
+        echo "lionclaw stream contained unknown event kind '$kind'" >&2
+        ;;
+    esac
+
+    if [[ ${#pending_turns[@]} -eq 0 ]]; then
+      last_safe_sequence="$sequence"
     fi
+  done < <(jq -c '.events[]?' <<<"$stream_json")
 
-    if ! jq -e '.ok == true' >/dev/null <<<"$send_result"; then
-      echo "telegram sendMessage failed: $(jq -c '.' <<<"$send_result")" >&2
-      continue
+  if [[ "$stop_processing" -eq 0 && -n "$last_safe_sequence" ]]; then
+    if ! ack_stream "$last_safe_sequence"; then
+      echo "lionclaw stream ack failed through sequence $last_safe_sequence" >&2
     fi
-
-    local telegram_message_id
-    telegram_message_id="$(jq -r '.result.message_id | tostring' <<<"$send_result")"
-    ack_outbox "$message_id" "telegram-message:$peer_id:$telegram_message_id"
-  done < <(jq -c '.messages[]?' <<<"$outbox")
+  fi
 }
 
 while true; do
   process_updates
-  flush_outbox
+  flush_stream
   sleep "$TELEGRAM_LOOP_DELAY_SECS"
 done

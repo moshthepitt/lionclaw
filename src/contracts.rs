@@ -61,19 +61,59 @@ pub struct SessionTurnRequest {
     pub runtime_env_passthrough: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamLaneDto {
+    Answer,
+    Reasoning,
+}
+
+impl StreamLaneDto {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Answer => "answer",
+            Self::Reasoning => "reasoning",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamEventKindDto {
+    MessageDelta,
+    Status,
+    Error,
+    Done,
+}
+
+impl StreamEventKindDto {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::MessageDelta => "message_delta",
+            Self::Status => "status",
+            Self::Error => "error",
+            Self::Done => "done",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RuntimeEventDto {
-    pub kind: String,
-    pub text: String,
+pub struct StreamEventDto {
+    pub kind: StreamEventKindDto,
+    #[serde(default)]
+    pub lane: Option<StreamLaneDto>,
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionTurnResponse {
     pub session_id: Uuid,
+    pub turn_id: Uuid,
     pub assistant_text: String,
     pub selected_skills: Vec<String>,
     pub runtime_id: String,
-    pub runtime_events: Vec<RuntimeEventDto>,
+    pub stream_events: Vec<StreamEventDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,35 +301,65 @@ pub struct ChannelInboundResponse {
     pub accepted: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelOutboxPullRequest {
-    pub channel_id: String,
-    #[serde(default)]
-    pub limit: Option<usize>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelStreamStartMode {
+    Resume,
+    Tail,
+}
+
+impl ChannelStreamStartMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Resume => "resume",
+            Self::Tail => "tail",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelOutboxMessageView {
-    pub message_id: Uuid,
+pub struct ChannelStreamPullRequest {
+    pub channel_id: String,
+    pub consumer_id: String,
+    #[serde(default)]
+    pub start_mode: Option<ChannelStreamStartMode>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelStreamEventView {
+    pub sequence: i64,
     pub channel_id: String,
     pub peer_id: String,
-    pub content: String,
+    pub session_id: Uuid,
+    pub turn_id: Uuid,
+    pub kind: StreamEventKindDto,
+    #[serde(default)]
+    pub lane: Option<StreamLaneDto>,
+    #[serde(default)]
+    pub text: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelOutboxPullResponse {
-    pub messages: Vec<ChannelOutboxMessageView>,
+pub struct ChannelStreamPullResponse {
+    pub events: Vec<ChannelStreamEventView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelOutboxAckRequest {
-    pub message_id: Uuid,
-    pub external_message_id: String,
+pub struct ChannelStreamAckRequest {
+    pub channel_id: String,
+    pub consumer_id: String,
+    pub through_sequence: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelOutboxAckResponse {
-    pub message_id: Uuid,
+pub struct ChannelStreamAckResponse {
+    pub channel_id: String,
+    pub consumer_id: String,
+    pub through_sequence: i64,
     pub acknowledged: bool,
 }

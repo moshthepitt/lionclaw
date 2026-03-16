@@ -45,7 +45,7 @@ To claim "NanoClaw-level runnable", LionClaw must support all items below:
 - [x] Core API surface for sessions, skills, policy, and audit.
 - [x] SQLite-backed services for sessions/skills/policy/audit.
 - [x] Runtime adapter interface and mock runtime adapter.
-- [x] Channel bridge persistence + APIs (`bind`, `inbound`, `outbox pull/ack`, peer pairing).
+- [x] Channel bridge persistence + APIs (`bind`, `inbound`, `stream pull/ack`, peer pairing).
 - [x] Deterministic skill selector scaffold.
 - [x] Basic audit logging for API mutations.
 

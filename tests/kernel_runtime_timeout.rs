@@ -11,7 +11,8 @@ use lionclaw::{
     kernel::{
         runtime::{
             RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
-            RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnOutput,
+            RuntimeEventSender, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
+            RuntimeTurnResult,
         },
         Kernel, KernelError, KernelOptions,
     },
@@ -130,10 +131,14 @@ impl RuntimeAdapter for SlowRuntimeAdapter {
         })
     }
 
-    async fn turn(&self, _input: RuntimeTurnInput) -> Result<RuntimeTurnOutput> {
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
         tokio::time::sleep(self.sleep_for).await;
-        Ok(RuntimeTurnOutput {
-            events: vec![RuntimeEvent::Done],
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
         })
     }
@@ -142,8 +147,10 @@ impl RuntimeAdapter for SlowRuntimeAdapter {
         &self,
         _handle: &RuntimeSessionHandle,
         _results: Vec<RuntimeCapabilityResult>,
-    ) -> Result<Vec<RuntimeEvent>> {
-        Ok(vec![RuntimeEvent::Done])
+        events: RuntimeEventSender,
+    ) -> Result<()> {
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
     }
 
     async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {

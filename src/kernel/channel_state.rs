@@ -62,12 +62,87 @@ pub struct ChannelPeerRecord {
 }
 
 #[derive(Debug, Clone)]
-pub struct ChannelOutboxMessageRecord {
-    pub message_id: Uuid,
+pub struct ChannelStreamEventRecord {
+    pub sequence: i64,
     pub channel_id: String,
     pub peer_id: String,
-    pub content: String,
+    pub session_id: Uuid,
+    pub turn_id: Uuid,
+    pub kind: ChannelStreamEventKind,
+    pub lane: Option<StreamMessageLane>,
+    pub text: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ChannelStreamEventInsert<'a> {
+    pub channel_id: &'a str,
+    pub peer_id: &'a str,
+    pub session_id: Uuid,
+    pub turn_id: Uuid,
+    pub kind: ChannelStreamEventKind,
+    pub lane: Option<StreamMessageLane>,
+    pub text: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelStreamEventKind {
+    MessageDelta,
+    Status,
+    Error,
+    Done,
+}
+
+impl ChannelStreamEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MessageDelta => "message_delta",
+            Self::Status => "status",
+            Self::Error => "error",
+            Self::Done => "done",
+        }
+    }
+}
+
+impl FromStr for ChannelStreamEventKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "message_delta" => Ok(Self::MessageDelta),
+            "status" => Ok(Self::Status),
+            "error" => Ok(Self::Error),
+            "done" => Ok(Self::Done),
+            other => Err(format!("invalid channel stream event kind '{}'", other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamMessageLane {
+    Answer,
+    Reasoning,
+}
+
+impl StreamMessageLane {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Answer => "answer",
+            Self::Reasoning => "reasoning",
+        }
+    }
+}
+
+impl FromStr for StreamMessageLane {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "answer" => Ok(Self::Answer),
+            "reasoning" => Ok(Self::Reasoning),
+            other => Err(format!("invalid stream message lane '{}'", other)),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -354,7 +429,7 @@ impl ChannelStateStore {
         }
     }
 
-    pub async fn queue_outbound_message(
+    pub async fn insert_outbound_message(
         &self,
         channel_id: &str,
         peer_id: &str,
@@ -380,43 +455,144 @@ impl ChannelStateStore {
         Ok(message_id)
     }
 
-    pub async fn list_pending_outbox(
+    pub async fn append_stream_event(
         &self,
-        channel_id: &str,
-        limit: usize,
-    ) -> Result<Vec<ChannelOutboxMessageRecord>> {
-        let query_limit = i64::try_from(limit).context("invalid outbox limit")?;
-        let rows = sqlx::query(
-            "SELECT message_id, channel_id, peer_id, content, created_at_ms \
-             FROM channel_messages \
-             WHERE channel_id = ?1 AND direction = 'outbound' AND external_message_id IS NULL \
-             ORDER BY created_at_ms ASC \
-             LIMIT ?2",
+        insert: ChannelStreamEventInsert<'_>,
+    ) -> Result<ChannelStreamEventRecord> {
+        let now = now_ms();
+
+        let done = sqlx::query(
+            "INSERT INTO channel_stream_events \
+             (channel_id, peer_id, session_id, turn_id, kind, lane, text, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(insert.channel_id)
+        .bind(insert.peer_id)
+        .bind(insert.session_id.to_string())
+        .bind(insert.turn_id.to_string())
+        .bind(insert.kind.as_str())
+        .bind(insert.lane.map(StreamMessageLane::as_str))
+        .bind(insert.text)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("failed to append channel stream event")?;
+
+        let sequence = done.last_insert_rowid();
+        let row = sqlx::query(
+            "SELECT sequence, channel_id, peer_id, session_id, turn_id, kind, lane, text, created_at_ms \
+             FROM channel_stream_events WHERE sequence = ?1",
+        )
+        .bind(sequence)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to reload appended channel stream event")?;
+
+        map_stream_event_row(row)
+    }
+
+    pub async fn current_stream_head(&self, channel_id: &str) -> Result<i64> {
+        let row = sqlx::query(
+            "SELECT COALESCE(MAX(sequence), 0) AS sequence \
+             FROM channel_stream_events WHERE channel_id = ?1",
         )
         .bind(channel_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to query current channel stream head")?;
+
+        Ok(row.get::<i64, _>("sequence"))
+    }
+
+    pub async fn get_stream_consumer_cursor(
+        &self,
+        channel_id: &str,
+        consumer_id: &str,
+    ) -> Result<Option<i64>> {
+        let row = sqlx::query(
+            "SELECT last_acked_sequence FROM channel_stream_consumers \
+             WHERE channel_id = ?1 AND consumer_id = ?2",
+        )
+        .bind(channel_id)
+        .bind(consumer_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query channel stream consumer")?;
+
+        Ok(row.map(|value| value.get::<i64, _>("last_acked_sequence")))
+    }
+
+    pub async fn create_stream_consumer(
+        &self,
+        channel_id: &str,
+        consumer_id: &str,
+        last_acked_sequence: i64,
+    ) -> Result<()> {
+        let now = now_ms();
+
+        sqlx::query(
+            "INSERT INTO channel_stream_consumers \
+             (channel_id, consumer_id, last_acked_sequence, updated_at_ms) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(channel_id)
+        .bind(consumer_id)
+        .bind(last_acked_sequence)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("failed to create channel stream consumer")?;
+
+        Ok(())
+    }
+
+    pub async fn list_stream_events_after(
+        &self,
+        channel_id: &str,
+        after_sequence: i64,
+        limit: usize,
+    ) -> Result<Vec<ChannelStreamEventRecord>> {
+        let query_limit = i64::try_from(limit).context("invalid channel stream limit")?;
+        let rows = sqlx::query(
+            "SELECT sequence, channel_id, peer_id, session_id, turn_id, kind, lane, text, created_at_ms \
+             FROM channel_stream_events \
+             WHERE channel_id = ?1 AND sequence > ?2 \
+             ORDER BY sequence ASC \
+             LIMIT ?3",
+        )
+        .bind(channel_id)
+        .bind(after_sequence)
         .bind(query_limit)
         .fetch_all(&self.pool)
         .await
-        .context("failed to list pending channel outbox messages")?;
+        .context("failed to list channel stream events")?;
 
-        rows.into_iter().map(map_outbox_row).collect()
+        rows.into_iter().map(map_stream_event_row).collect()
     }
 
-    pub async fn ack_outbound_message(
+    pub async fn ack_stream_consumer(
         &self,
-        message_id: Uuid,
-        external_message_id: &str,
+        channel_id: &str,
+        consumer_id: &str,
+        through_sequence: i64,
     ) -> Result<bool> {
+        let now = now_ms();
         let changed = sqlx::query(
-            "UPDATE channel_messages \
-             SET external_message_id = ?2 \
-             WHERE message_id = ?1 AND direction = 'outbound' AND external_message_id IS NULL",
+            "UPDATE channel_stream_consumers \
+             SET last_acked_sequence = CASE \
+                    WHEN last_acked_sequence < ?3 THEN ?3 \
+                    ELSE last_acked_sequence \
+                 END, \
+                 updated_at_ms = ?4 \
+             WHERE channel_id = ?1 AND consumer_id = ?2",
         )
-        .bind(message_id.to_string())
-        .bind(external_message_id)
+        .bind(channel_id)
+        .bind(consumer_id)
+        .bind(through_sequence)
+        .bind(now)
         .execute(&self.pool)
         .await
-        .context("failed to acknowledge outbound channel message")?;
+        .context("failed to acknowledge channel stream consumer")?;
 
         Ok(changed.rows_affected() > 0)
     }
@@ -531,19 +707,36 @@ fn map_peer_row(row: SqliteRow) -> Result<ChannelPeerRecord> {
     })
 }
 
-fn map_outbox_row(row: SqliteRow) -> Result<ChannelOutboxMessageRecord> {
+fn map_stream_event_row(row: SqliteRow) -> Result<ChannelStreamEventRecord> {
     let created_at_ms: i64 = row.get("created_at_ms");
     let created_at = ms_to_datetime(created_at_ms)
         .ok_or_else(|| anyhow!("invalid created_at_ms '{}'", created_at_ms))?;
-    let message_id_raw: String = row.get("message_id");
-    let message_id = Uuid::parse_str(&message_id_raw)
-        .map_err(|err| anyhow!("invalid message_id '{}': {}", message_id_raw, err))?;
+    let session_id_raw: String = row.get("session_id");
+    let session_id = Uuid::parse_str(&session_id_raw)
+        .map_err(|err| anyhow!("invalid session_id '{}': {}", session_id_raw, err))?;
+    let turn_id_raw: String = row.get("turn_id");
+    let turn_id = Uuid::parse_str(&turn_id_raw)
+        .map_err(|err| anyhow!("invalid turn_id '{}': {}", turn_id_raw, err))?;
+    let kind_raw: String = row.get("kind");
+    let kind = ChannelStreamEventKind::from_str(&kind_raw)
+        .map_err(|err| anyhow!("invalid channel stream event kind: {}", err))?;
+    let lane = row
+        .get::<Option<String>, _>("lane")
+        .map(|raw| {
+            StreamMessageLane::from_str(&raw)
+                .map_err(|err| anyhow!("invalid stream message lane: {}", err))
+        })
+        .transpose()?;
 
-    Ok(ChannelOutboxMessageRecord {
-        message_id,
+    Ok(ChannelStreamEventRecord {
+        sequence: row.get("sequence"),
         channel_id: row.get("channel_id"),
         peer_id: row.get("peer_id"),
-        content: row.get("content"),
+        session_id,
+        turn_id,
+        kind,
+        lane,
+        text: row.get("text"),
         created_at,
     })
 }
