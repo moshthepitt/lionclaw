@@ -1,5 +1,6 @@
 import unittest
 
+from lionclaw_channel_terminal.app import AppConfig, TerminalChannelApp
 from lionclaw_channel_terminal.state import ChannelViewState, StreamEvent
 
 
@@ -52,6 +53,68 @@ class ChannelViewStateTests(unittest.TestCase):
         state = ChannelViewState(peer_id="mosh")
         state.set_pairing_state(status="blocked")
         self.assertTrue(state.input_disabled())
+
+
+class _FailingApi:
+    async def send_inbound(self, text: str) -> None:
+        raise RuntimeError("boom")
+
+
+class _SuccessfulApi:
+    def __init__(self) -> None:
+        self.sent_text: str | None = None
+
+    async def send_inbound(self, text: str) -> None:
+        self.sent_text = text
+
+
+class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
+    async def test_submit_text_does_not_append_failed_send(self):
+        app = TerminalChannelApp(
+            AppConfig(
+                home="/tmp/lionclaw",
+                base_url="http://127.0.0.1:8979",
+                channel_id="terminal",
+                peer_id="mosh",
+                consumer_id="interactive:test",
+                stream_start_mode="tail",
+                stream_limit=50,
+                stream_wait_ms=0,
+                runtime_id=None,
+            )
+        )
+        app.api = _FailingApi()
+        app._render_views = lambda: None  # type: ignore[method-assign]
+
+        accepted = await app.submit_text("hello")
+
+        self.assertFalse(accepted)
+        self.assertEqual(app.state.transcript_text(), "")
+        self.assertIn("send failed: boom", app.state.status_text())
+
+    async def test_submit_text_appends_only_after_success(self):
+        app = TerminalChannelApp(
+            AppConfig(
+                home="/tmp/lionclaw",
+                base_url="http://127.0.0.1:8979",
+                channel_id="terminal",
+                peer_id="mosh",
+                consumer_id="interactive:test",
+                stream_start_mode="tail",
+                stream_limit=50,
+                stream_wait_ms=0,
+                runtime_id=None,
+            )
+        )
+        api = _SuccessfulApi()
+        app.api = api
+        app._render_views = lambda: None  # type: ignore[method-assign]
+
+        accepted = await app.submit_text("hello")
+
+        self.assertTrue(accepted)
+        self.assertEqual(api.sent_text, "hello")
+        self.assertIn("you> hello", app.state.transcript_text())
 
 
 if __name__ == "__main__":

@@ -1,6 +1,4 @@
 from __future__ import annotations
-
-import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -112,8 +110,3 @@ class LionClawApi:
             },
         )
         response.raise_for_status()
-
-    async def stream_forever(self):
-        while True:
-            yield await self.pull_stream()
-            await asyncio.sleep(0)

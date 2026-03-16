@@ -99,7 +99,6 @@ class TerminalChannelApp(App[None]):
             stream_limit=config.stream_limit,
             stream_wait_ms=config.stream_wait_ms,
         )
-        self._status_messages: asyncio.Queue[str] = asyncio.Queue()
 
     def compose(self) -> ComposeResult:
         yield Static(id="pairing-banner")
@@ -138,13 +137,23 @@ class TerminalChannelApp(App[None]):
             await self._push_status("input disabled: peer is blocked")
             return
 
-        self.state.append_user_message(text)
-        self._render_views()
+        await self.submit_text(text)
+
+    async def submit_text(self, text: str) -> bool:
+        if self.state.input_disabled():
+            await self._push_status("input disabled: peer is blocked")
+            return False
+
         try:
             await self.api.send_inbound(text)
         except Exception as err:  # noqa: BLE001
             self.state.status_lines.append(f"send failed: {err}")
             self._render_views()
+            return False
+
+        self.state.append_user_message(text)
+        self._render_views()
+        return True
 
     async def refresh_pairing_state(self) -> None:
         try:
