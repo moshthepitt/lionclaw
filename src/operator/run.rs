@@ -3,7 +3,10 @@ use std::io::{BufRead, Write};
 use anyhow::{anyhow, Result};
 
 use crate::{
-    contracts::{SessionOpenRequest, SessionTurnRequest, TrustTier},
+    contracts::{
+        SessionOpenRequest, SessionTurnRequest, StreamEventDto, StreamEventKindDto, StreamLaneDto,
+        TrustTier,
+    },
     home::LionClawHome,
     kernel::Kernel,
     operator::{
@@ -91,9 +94,7 @@ async fn run_repl<R: BufRead, W: Write>(
             .await
         {
             Ok(turn) => {
-                if !turn.assistant_text.trim().is_empty() {
-                    writeln!(output, "{}", turn.assistant_text.trim_end())?;
-                }
+                render_turn_stream(&turn.stream_events, output)?;
             }
             Err(err) => {
                 writeln!(output, "error: {}", err)?;
@@ -117,6 +118,44 @@ fn kernel_to_anyhow(err: crate::kernel::KernelError) -> anyhow::Error {
     anyhow!(err.to_string())
 }
 
+fn render_turn_stream<W: Write>(events: &[StreamEventDto], output: &mut W) -> Result<()> {
+    for event in events {
+        match (&event.kind, &event.lane, event.text.as_deref()) {
+            (StreamEventKindDto::MessageDelta, Some(StreamLaneDto::Answer), Some(text)) => {
+                write_prefixed_lines(output, "lionclaw> ", text)?;
+            }
+            (StreamEventKindDto::MessageDelta, Some(StreamLaneDto::Reasoning), Some(text)) => {
+                write_prefixed_lines(output, "thinking> ", text)?;
+            }
+            (StreamEventKindDto::Status, _, Some(text)) => {
+                writeln!(output, "[status] {}", text)?;
+            }
+            (StreamEventKindDto::Error, _, Some(text)) => {
+                writeln!(output, "[error] {}", text)?;
+            }
+            (StreamEventKindDto::Done, _, _) | (_, _, None) => {}
+            (_, _, Some(text)) => {
+                writeln!(output, "{}", text)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn write_prefixed_lines<W: Write>(output: &mut W, prefix: &str, text: &str) -> Result<()> {
+    if text.is_empty() {
+        writeln!(output, "{}", prefix)?;
+        return Ok(());
+    }
+
+    for line in text.lines() {
+        writeln!(output, "{}{}", prefix, line)?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -124,8 +163,9 @@ mod tests {
 
     use sqlx::{Row, SqlitePool};
 
-    use super::run_local_with_io;
+    use super::{render_turn_stream, run_local_with_io};
     use crate::{
+        contracts::{StreamEventDto, StreamEventKindDto, StreamLaneDto},
         home::LionClawHome,
         operator::config::{OperatorConfig, RuntimeProfileConfig},
     };
@@ -258,6 +298,49 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             .expect_err("missing executable should error");
 
         assert!(err.to_string().contains("configured runtime command"));
+    }
+
+    #[test]
+    fn render_turn_stream_formats_lanes_and_status() {
+        let mut output = Vec::new();
+        render_turn_stream(
+            &[
+                StreamEventDto {
+                    kind: StreamEventKindDto::Status,
+                    lane: None,
+                    text: Some("runtime started".to_string()),
+                },
+                StreamEventDto {
+                    kind: StreamEventKindDto::MessageDelta,
+                    lane: Some(StreamLaneDto::Reasoning),
+                    text: Some("planning next step".to_string()),
+                },
+                StreamEventDto {
+                    kind: StreamEventKindDto::MessageDelta,
+                    lane: Some(StreamLaneDto::Answer),
+                    text: Some("hello\nworld".to_string()),
+                },
+                StreamEventDto {
+                    kind: StreamEventKindDto::Error,
+                    lane: None,
+                    text: Some("something failed".to_string()),
+                },
+                StreamEventDto {
+                    kind: StreamEventKindDto::Done,
+                    lane: None,
+                    text: None,
+                },
+            ],
+            &mut output,
+        )
+        .expect("render stream");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("[status] runtime started"));
+        assert!(output.contains("thinking> planning next step"));
+        assert!(output.contains("lionclaw> hello"));
+        assert!(output.contains("lionclaw> world"));
+        assert!(output.contains("[error] something failed"));
     }
 
     #[cfg(unix)]
