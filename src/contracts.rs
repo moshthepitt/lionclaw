@@ -82,6 +82,8 @@ pub struct SkillInstallRequest {
     pub reference: Option<String>,
     pub hash: Option<String>,
     pub skill_md: Option<String>,
+    #[serde(default)]
+    pub snapshot_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

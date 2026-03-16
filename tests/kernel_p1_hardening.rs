@@ -392,6 +392,7 @@ async fn install_skill(
             reference: Some("main".to_string()),
             hash: Some("fixed-hash".to_string()),
             skill_md: Some(skill_md.to_string()),
+            snapshot_path: None,
         })
         .await
         .expect("install skill")

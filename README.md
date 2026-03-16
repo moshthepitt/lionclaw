@@ -1,98 +1,93 @@
 # LionClaw
 
-LionClaw is a secure-first local agent kernel that lets you run your preferred CLI runtime (for example `codex` or `opencode`) behind one policy- and audit-enforced control plane.
+LionClaw is a secure-first local agent kernel with an operator CLI.
+
+- `lionclaw` manages installed state, services, pairing, and channels.
+- `lionclawd` runs the kernel daemon.
+- Runtime adapters remain replaceable: current built-ins are `mock`, `codex`, and `opencode`.
 
 ## Why it exists
 
-Most agent stacks are either feature-heavy or loosely enforced.
-LionClaw takes the opposite path:
+LionClaw keeps the core small and auditable while making channels installable skills instead of built-in transport code.
 
-- Small, auditable kernel
-- Default-deny capability checks
-- Channels as installable skills (not hardcoded core features)
-- Runtime-agnostic adapters so you can swap agent CLIs without changing channel workers
+- Default-deny policy checks
+- Kernel-owned audit trail
+- Runtime-agnostic control plane
+- Binary-installable state under `~/.lionclaw`
 
 ## What it does
 
 LionClaw provides:
 
-- Session and turn orchestration
-- Skill install/enable state (`SKILL.md` compatible)
-- Policy checks for privileged actions
-- Append-only audit events
-- Channel bridge APIs (`inbound` and `outbox` for external workers)
-- Runtime adapter interface with current adapters: `mock`, `codex`, `opencode`
+- SQLite-backed sessions, skills, policy, audit, and channel state
+- Immutable skill snapshots under `~/.lionclaw/skills`
+- Workspace identity files under `~/.lionclaw/workspaces/main`
+- Prompt-envelope composition from identity files plus installed skill context
+- Channel bridge APIs for external worker skills
+- Linux `systemd --user` service generation through `lionclaw up`
 
 ## Quick start
 
-Prerequisites:
-
-- Rust toolchain
-- A runtime CLI installed (`codex` and/or `opencode`)
-- `curl` and `jq` for API/script usage
-
-Start kernel:
+Build both binaries:
 
 ```bash
-cargo run
+cargo build --bins
 ```
 
-Default endpoint: `http://127.0.0.1:3000`
-
-Health check:
+Initialize local state:
 
 ```bash
-curl -sS http://127.0.0.1:3000/health | jq
+./target/debug/lionclaw onboard
 ```
 
-## How to use
-
-1. Install and enable a channel skill.
-2. Bind that skill to a channel ID and runtime.
-3. Run the channel worker (external process) for that skill.
-4. Send messages through the channel; LionClaw routes turns to the configured runtime.
-
-Fast path for Telegram-style channel skills:
+Register a Telegram skill and channel:
 
 ```bash
-./scripts/install-channel-skill.sh \
-  --channel-id telegram \
-  --skill-source skills/channel-telegram \
-  --runtime-id codex
+./target/debug/lionclaw skill add skills/channel-telegram --alias telegram
+./target/debug/lionclaw channel add telegram
 ```
 
-Start worker in the same command:
+Apply desired state and start services with a runtime:
 
 ```bash
-TELEGRAM_BOT_TOKEN=... ./scripts/install-channel-skill.sh \
-  --channel-id telegram \
-  --skill-source skills/channel-telegram \
-  --runtime-id codex \
-  --start-worker
+TELEGRAM_BOT_TOKEN=... ./target/debug/lionclaw up --runtime codex
 ```
+
+Inspect the stack:
+
+```bash
+./target/debug/lionclaw status
+./target/debug/lionclaw pairing list
+```
+
+## State layout
+
+LionClaw defaults to `~/.lionclaw`:
+
+- `db/lionclaw.db`
+- `config/lionclaw.toml`
+- `config/lionclaw.lock`
+- `skills/<skill-id>@<hash>/`
+- `workspaces/main/`
+- `runtime/`
+- `services/`
+
+Override the root with `LIONCLAW_HOME`.
 
 ## Runtime config
 
-Codex adapter options:
-
-- `LIONCLAW_CODEX_BIN` (default `codex`)
-- `LIONCLAW_CODEX_MODEL` (optional)
-- `LIONCLAW_CODEX_SANDBOX` (default `read-only`)
-
-OpenCode adapter options:
-
-- `LIONCLAW_OPENCODE_BIN` (default `opencode`)
-- `LIONCLAW_OPENCODE_MODEL` (optional)
-- `LIONCLAW_OPENCODE_AGENT` (optional)
-
-General options:
-
-- `LIONCLAW_DB_PATH` (default `./lionclaw.db`)
-- `LIONCLAW_RUNTIME_TURN_TIMEOUT_MS` (default `120000`)
+- `LIONCLAW_DEFAULT_RUNTIME_ID`
+- `LIONCLAW_CODEX_BIN`
+- `LIONCLAW_CODEX_MODEL`
+- `LIONCLAW_CODEX_SANDBOX`
+- `LIONCLAW_OPENCODE_BIN`
+- `LIONCLAW_OPENCODE_MODEL`
+- `LIONCLAW_OPENCODE_AGENT`
+- `LIONCLAW_RUNTIME_TURN_TIMEOUT_MS`
 
 ## Docs
 
 - [Architecture](docs/ARCHITECTURE.md)
-- [V0 Plan](docs/V0_PLAN.md)
+- [Binary Model](docs/BINARY_RUNTIME_AGNOSTIC_MODEL.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Scripts](scripts/README.md)

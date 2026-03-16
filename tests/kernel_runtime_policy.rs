@@ -26,6 +26,7 @@ async fn runtime_policy_allows_configured_execution_overrides() {
         KernelOptions {
             runtime_turn_timeout: Duration::from_millis(300),
             runtime_execution_policy: RuntimeExecutionPolicy::default().with_rule("mock", rule),
+            ..KernelOptions::default()
         },
     )
     .await

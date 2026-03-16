@@ -34,6 +34,7 @@ description: Handles capability-gated runtime operations
 ---"#
                     .to_string(),
             ),
+            snapshot_path: None,
         })
         .await
         .expect("install skill");

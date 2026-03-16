@@ -13,6 +13,8 @@ pub struct SkillRecord {
     pub source: String,
     pub reference: Option<String>,
     pub hash: String,
+    pub snapshot_path: Option<String>,
+    pub skill_md: Option<String>,
     pub enabled: bool,
     pub installed_at: DateTime<Utc>,
 }
@@ -23,6 +25,7 @@ pub struct SkillInstallInput {
     pub reference: Option<String>,
     pub hash: Option<String>,
     pub skill_md: Option<String>,
+    pub snapshot_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,14 +69,15 @@ impl SkillStore {
             return Ok(existing);
         }
 
-        let short_hash = &hash[..12.min(hash.len())];
-        let skill_id = format!("{}-{}", sanitize_skill_name(&name), short_hash);
+        let skill_id = derive_skill_id(&name, &hash);
         let installed_at_ms = now_ms();
+        let snapshot_path = input.snapshot_path.unwrap_or_default();
+        let skill_md = input.skill_md.unwrap_or_default();
 
         let insert_result = sqlx::query(
             "INSERT INTO skills \
-             (skill_id, name, description, source, reference, hash, enabled, installed_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+             (skill_id, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
         )
         .bind(&skill_id)
         .bind(&name)
@@ -81,6 +85,8 @@ impl SkillStore {
         .bind(&input.source)
         .bind(&reference_key)
         .bind(&hash)
+        .bind(&snapshot_path)
+        .bind(&skill_md)
         .bind(installed_at_ms)
         .execute(&self.pool)
         .await;
@@ -102,7 +108,7 @@ impl SkillStore {
 
     pub async fn list(&self) -> Result<Vec<SkillRecord>> {
         let rows = sqlx::query(
-            "SELECT skill_id, name, description, source, reference, hash, enabled, installed_at_ms \
+            "SELECT skill_id, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms \
              FROM skills \
              ORDER BY installed_at_ms ASC",
         )
@@ -130,7 +136,7 @@ impl SkillStore {
 
     pub async fn get(&self, skill_id: &str) -> Result<Option<SkillRecord>> {
         let row = sqlx::query(
-            "SELECT skill_id, name, description, source, reference, hash, enabled, installed_at_ms \
+            "SELECT skill_id, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms \
              FROM skills \
              WHERE skill_id = ?1",
         )
@@ -144,7 +150,7 @@ impl SkillStore {
 
     pub async fn list_enabled(&self) -> Result<Vec<SkillRecord>> {
         let rows = sqlx::query(
-            "SELECT skill_id, name, description, source, reference, hash, enabled, installed_at_ms \
+            "SELECT skill_id, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms \
              FROM skills \
              WHERE enabled = 1 \
              ORDER BY installed_at_ms ASC",
@@ -163,7 +169,7 @@ impl SkillStore {
         hash: &str,
     ) -> Result<Option<SkillRecord>> {
         let row = sqlx::query(
-            "SELECT skill_id, name, description, source, reference, hash, enabled, installed_at_ms \
+            "SELECT skill_id, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms \
              FROM skills \
              WHERE source = ?1 AND reference = ?2 AND hash = ?3",
         )
@@ -193,6 +199,20 @@ fn map_skill_row(row: SqliteRow) -> Result<SkillRecord> {
         Some(reference_raw)
     };
 
+    let snapshot_path_raw: String = row.get("snapshot_path");
+    let snapshot_path = if snapshot_path_raw.trim().is_empty() {
+        None
+    } else {
+        Some(snapshot_path_raw)
+    };
+
+    let skill_md_raw: String = row.get("skill_md");
+    let skill_md = if skill_md_raw.trim().is_empty() {
+        None
+    } else {
+        Some(skill_md_raw)
+    };
+
     Ok(SkillRecord {
         skill_id: row.get("skill_id"),
         name: row.get("name"),
@@ -200,12 +220,14 @@ fn map_skill_row(row: SqliteRow) -> Result<SkillRecord> {
         source: row.get("source"),
         reference,
         hash: row.get("hash"),
+        snapshot_path,
+        skill_md,
         enabled,
         installed_at,
     })
 }
 
-fn derive_name_from_source(source: &str) -> String {
+pub fn derive_name_from_source(source: &str) -> String {
     source
         .split('/')
         .next_back()
@@ -215,7 +237,7 @@ fn derive_name_from_source(source: &str) -> String {
         .to_string()
 }
 
-fn sanitize_skill_name(name: &str) -> String {
+pub fn sanitize_skill_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
         if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
@@ -231,7 +253,12 @@ fn sanitize_skill_name(name: &str) -> String {
     }
 }
 
-fn parse_skill_frontmatter(content: &str) -> (String, String) {
+pub fn derive_skill_id(name: &str, hash: &str) -> String {
+    let short_hash = &hash[..12.min(hash.len())];
+    format!("{}-{}", sanitize_skill_name(name), short_hash)
+}
+
+pub fn parse_skill_frontmatter(content: &str) -> (String, String) {
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
         return ("skill".to_string(), "Installed skill".to_string());
@@ -264,7 +291,7 @@ fn parse_skill_frontmatter(content: &str) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_skill_frontmatter;
+    use super::{derive_skill_id, parse_skill_frontmatter, sanitize_skill_name};
 
     #[test]
     fn parses_name_and_description() {
@@ -278,5 +305,14 @@ body"#;
         let (name, description) = parse_skill_frontmatter(input);
         assert_eq!(name, "demo-skill");
         assert_eq!(description, "Demo skill description");
+    }
+
+    #[test]
+    fn derives_stable_skill_id() {
+        assert_eq!(
+            derive_skill_id("Channel Telegram", "0123456789abcdef"),
+            "channel-telegram-0123456789ab"
+        );
+        assert_eq!(sanitize_skill_name("Channel Telegram"), "channel-telegram");
     }
 }

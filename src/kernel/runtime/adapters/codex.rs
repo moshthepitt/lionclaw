@@ -454,10 +454,14 @@ exit 7
 
     #[cfg(unix)]
     fn write_script(path: &std::path::Path, content: &str) {
-        use std::{fs, os::unix::fs::PermissionsExt};
+        use std::{fs, io::Write, os::unix::fs::PermissionsExt};
 
         let temp_path = path.with_extension("tmp");
-        fs::write(&temp_path, content).expect("write temp script");
+        let mut file = fs::File::create(&temp_path).expect("create temp script");
+        file.write_all(content.as_bytes())
+            .expect("write temp script");
+        file.sync_all().expect("sync temp script");
+        drop(file);
         let permissions = fs::Permissions::from_mode(0o755);
         fs::set_permissions(&temp_path, permissions).expect("chmod temp script");
         fs::rename(&temp_path, path).expect("install script");

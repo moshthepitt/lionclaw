@@ -27,6 +27,7 @@ description: channel skill
 ---"#
                     .to_string(),
             ),
+            snapshot_path: None,
         })
         .await
         .expect("install skill");
@@ -73,6 +74,7 @@ description: inbound skill for channel flow
 ---"#
                     .to_string(),
             ),
+            snapshot_path: None,
         })
         .await
         .expect("install skill");
@@ -211,6 +213,7 @@ description: channel outbox skill
 ---"#
                     .to_string(),
             ),
+            snapshot_path: None,
         })
         .await
         .expect("install skill");

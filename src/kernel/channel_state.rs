@@ -70,6 +70,16 @@ pub struct ChannelOutboxMessageRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ChannelHealthRecord {
+    pub channel_id: String,
+    pub pending_peer_count: u64,
+    pub approved_peer_count: u64,
+    pub blocked_peer_count: u64,
+    pub latest_inbound_at: Option<DateTime<Utc>>,
+    pub latest_outbound_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageDirection {
     Inbound,
@@ -409,6 +419,72 @@ impl ChannelStateStore {
         .context("failed to acknowledge outbound channel message")?;
 
         Ok(changed.rows_affected() > 0)
+    }
+
+    pub async fn channel_health(&self, channel_id: &str) -> Result<ChannelHealthRecord> {
+        let peer_counts = sqlx::query(
+            "SELECT status, COUNT(*) AS count \
+             FROM channel_peers \
+             WHERE channel_id = ?1 \
+             GROUP BY status",
+        )
+        .bind(channel_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to query channel peer counts")?;
+
+        let latest_row = sqlx::query(
+            "SELECT \
+                MAX(CASE WHEN direction = 'inbound' THEN created_at_ms END) AS latest_inbound_at_ms, \
+                MAX(CASE WHEN direction = 'outbound' THEN created_at_ms END) AS latest_outbound_at_ms \
+             FROM channel_messages \
+             WHERE channel_id = ?1",
+        )
+        .bind(channel_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to query channel message activity")?;
+
+        let mut pending_peer_count = 0_u64;
+        let mut approved_peer_count = 0_u64;
+        let mut blocked_peer_count = 0_u64;
+
+        for row in peer_counts {
+            let status: String = row.get("status");
+            let count_raw: i64 = row.get("count");
+            let count = u64::try_from(count_raw)
+                .with_context(|| format!("invalid channel peer count '{}'", count_raw))?;
+            match status.as_str() {
+                "pending" => pending_peer_count = count,
+                "approved" => approved_peer_count = count,
+                "blocked" => blocked_peer_count = count,
+                _ => {}
+            }
+        }
+
+        let latest_inbound_at = latest_row
+            .get::<Option<i64>, _>("latest_inbound_at_ms")
+            .map(|value| {
+                ms_to_datetime(value)
+                    .ok_or_else(|| anyhow!("invalid latest_inbound_at_ms '{}'", value))
+            })
+            .transpose()?;
+        let latest_outbound_at = latest_row
+            .get::<Option<i64>, _>("latest_outbound_at_ms")
+            .map(|value| {
+                ms_to_datetime(value)
+                    .ok_or_else(|| anyhow!("invalid latest_outbound_at_ms '{}'", value))
+            })
+            .transpose()?;
+
+        Ok(ChannelHealthRecord {
+            channel_id: channel_id.to_string(),
+            pending_peer_count,
+            approved_peer_count,
+            blocked_peer_count,
+            latest_inbound_at,
+            latest_outbound_at,
+        })
     }
 }
 

@@ -341,6 +341,7 @@ async fn prepare_session_with_skill(
                 "---\nname: {}\ndescription: {}\n---",
                 skill_name, skill_description
             )),
+            snapshot_path: None,
         })
         .await
         .expect("install skill");

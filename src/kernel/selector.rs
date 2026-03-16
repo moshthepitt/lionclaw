@@ -63,6 +63,8 @@ mod tests {
             source: "local".to_string(),
             reference: None,
             hash: "hash".to_string(),
+            snapshot_path: None,
+            skill_md: None,
             enabled: true,
             installed_at: Utc::now(),
         }];
