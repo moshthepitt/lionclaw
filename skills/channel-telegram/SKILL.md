@@ -20,7 +20,7 @@ This skill does not modify LionClaw kernel code. It runs an external worker that
 - `curl`
 - `jq`
 - Telegram bot token with DM access
-- Running LionClaw daemon (default `http://127.0.0.1:3000`)
+- Running LionClaw daemon (default `http://127.0.0.1:8979`)
 
 ## Setup
 
@@ -42,7 +42,7 @@ This skill does not modify LionClaw kernel code. It runs an external worker that
 
 ```bash
 TELEGRAM_BOT_TOKEN=... \
-LIONCLAW_BASE_URL=http://127.0.0.1:3000 \
+LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
 ./skills/channel-telegram/scripts/worker.sh
 ```
 

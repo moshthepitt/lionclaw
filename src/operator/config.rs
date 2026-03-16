@@ -191,7 +191,7 @@ pub struct ManagedChannelConfig {
 }
 
 pub fn default_bind() -> String {
-    "127.0.0.1:3000".to_string()
+    "127.0.0.1:8979".to_string()
 }
 
 pub fn default_workspace() -> String {

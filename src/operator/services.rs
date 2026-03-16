@@ -289,7 +289,7 @@ fn parse_bind_addr(bind_addr: &str) -> (String, String) {
     bind_addr
         .rsplit_once(':')
         .map(|(host, port)| (host.to_string(), port.to_string()))
-        .unwrap_or_else(|| ("127.0.0.1".to_string(), "3000".to_string()))
+        .unwrap_or_else(|| ("127.0.0.1".to_string(), "8979".to_string()))
 }
 
 fn escape_env_value(value: &str) -> String {
@@ -482,7 +482,7 @@ mod tests {
         let daemon = render_daemon_unit(
             &home,
             Path::new("/tmp/bin/lionclawd"),
-            "127.0.0.1:3000",
+            "127.0.0.1:8979",
             "codex",
             "main",
             &[],
@@ -490,7 +490,7 @@ mod tests {
         assert!(daemon.unit_content.contains("ExecStart=/tmp/bin/lionclawd"));
         assert!(daemon
             .env_content
-            .contains("LIONCLAW_BIND_ADDR=\"127.0.0.1:3000\""));
+            .contains("LIONCLAW_BIND_ADDR=\"127.0.0.1:8979\""));
         assert!(daemon.env_content.contains("LIONCLAW_WORKSPACE=\"main\""));
 
         let channel = render_channel_unit(

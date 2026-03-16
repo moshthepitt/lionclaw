@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 use crate::home::{LionClawHome, DEFAULT_WORKSPACE};
 
+const DEFAULT_BIND_HOST: &str = "127.0.0.1";
+const DEFAULT_BIND_PORT: &str = "8979";
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: String,
@@ -74,12 +77,12 @@ fn resolve_bind_addr(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("127.0.0.1");
+        .unwrap_or(DEFAULT_BIND_HOST);
     let port = port
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("3000");
+        .unwrap_or(DEFAULT_BIND_PORT);
     join_host_port(host, port)
 }
 
@@ -93,15 +96,15 @@ fn join_host_port(host: &str, port: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{join_host_port, resolve_bind_addr};
+    use super::{join_host_port, resolve_bind_addr, DEFAULT_BIND_HOST, DEFAULT_BIND_PORT};
 
     #[test]
     fn prefers_explicit_bind_addr_env() {
         assert_eq!(
             resolve_bind_addr(
                 Some("localhost:4000".to_string()),
-                Some("127.0.0.1".to_string()),
-                Some("3000".to_string()),
+                Some(DEFAULT_BIND_HOST.to_string()),
+                Some(DEFAULT_BIND_PORT.to_string()),
             ),
             "localhost:4000"
         );
@@ -117,6 +120,9 @@ mod tests {
 
     #[test]
     fn wraps_ipv6_host_when_joining() {
-        assert_eq!(join_host_port("::1", "3000"), "[::1]:3000");
+        assert_eq!(
+            join_host_port("::1", DEFAULT_BIND_PORT),
+            format!("[::1]:{}", DEFAULT_BIND_PORT)
+        );
     }
 }

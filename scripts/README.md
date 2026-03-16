@@ -10,7 +10,7 @@ LionClaw keeps channels as installable skills and the kernel API explicit. The r
 
 ## Usage
 Prerequisites:
-- LionClaw kernel running (default `http://127.0.0.1:3000`)
+- LionClaw kernel running (default `http://127.0.0.1:8979`)
 - `curl` and `jq`
 - A valid skill folder with `SKILL.md`
 

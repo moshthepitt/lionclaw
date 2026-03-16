@@ -32,7 +32,7 @@ default_peer_id() {
 }
 
 LIONCLAW_HOME="${LIONCLAW_HOME:-$HOME/.lionclaw}"
-LIONCLAW_BASE_URL="${LIONCLAW_BASE_URL:-http://127.0.0.1:3000}"
+LIONCLAW_BASE_URL="${LIONCLAW_BASE_URL:-http://127.0.0.1:8979}"
 LIONCLAW_CHANNEL_ID="${LIONCLAW_CHANNEL_ID:-terminal}"
 LIONCLAW_PEER_ID="${LIONCLAW_PEER_ID:-$(default_peer_id)}"
 LIONCLAW_RUNTIME_ID="${LIONCLAW_RUNTIME_ID:-}"
@@ -242,6 +242,4 @@ while true; do
     echo "warning: failed to submit inbound message" >&2
     continue
   fi
-
-  flush_outbox_once
 done

@@ -7,7 +7,7 @@ Usage:
   install-channel-skill.sh [options]
 
 Options:
-  --base-url URL         LionClaw base URL (default: http://127.0.0.1:3000)
+  --base-url URL         LionClaw base URL (default: http://127.0.0.1:8979)
   --channel-id ID        Channel ID to bind (default: telegram)
   --skill-source PATH    Skill source path (default: skills/channel-telegram)
   --skill-ref REF        Skill reference (default: local)
@@ -36,7 +36,7 @@ post_json() {
     -d "$body"
 }
 
-BASE_URL="${BASE_URL:-http://127.0.0.1:3000}"
+BASE_URL="${BASE_URL:-http://127.0.0.1:8979}"
 CHANNEL_ID="${CHANNEL_ID:-telegram}"
 SKILL_SOURCE="${SKILL_SOURCE:-skills/channel-telegram}"
 SKILL_REF="${SKILL_REF:-local}"

@@ -60,6 +60,7 @@ For a local end-to-end channel test without Telegram, use the terminal channel s
 ```bash
 ./target/debug/lionclaw skill add skills/channel-terminal --alias terminal
 ./target/debug/lionclaw channel add terminal
+./target/debug/lionclaw service up --runtime codex
 ./skills/channel-terminal/scripts/worker.sh
 ```
 
