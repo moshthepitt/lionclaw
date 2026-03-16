@@ -7,7 +7,11 @@ use crate::{
     contracts::TrustTier,
     home::LionClawHome,
     operator::{
-        config::{derive_skill_alias, normalize_executable, OperatorConfig, RuntimeProfileConfig},
+        attach::attach_channel,
+        config::{
+            derive_skill_alias, normalize_executable, ChannelLaunchMode, OperatorConfig,
+            RuntimeProfileConfig,
+        },
         reconcile::{
             add_channel, add_skill, apply, down, logs, onboard, pairing_approve, pairing_block,
             pairing_list, remove_channel, remove_skill, resolve_stack_binaries, status, up,
@@ -141,6 +145,7 @@ struct SkillRmArgs {
 enum ChannelCommand {
     Add(ChannelAddArgs),
     Rm(ChannelRmArgs),
+    Attach(ChannelAttachArgs),
     Pairing {
         #[command(subcommand)]
         command: ChannelPairingCommand,
@@ -152,6 +157,8 @@ struct ChannelAddArgs {
     id: String,
     #[arg(long)]
     skill: Option<String>,
+    #[arg(long, default_value = "service")]
+    launch: String,
     #[arg(long = "required-env")]
     required_env: Vec<String>,
 }
@@ -159,6 +166,15 @@ struct ChannelAddArgs {
 #[derive(Debug, Args)]
 struct ChannelRmArgs {
     id: String,
+}
+
+#[derive(Debug, Args)]
+struct ChannelAttachArgs {
+    id: String,
+    #[arg(long)]
+    peer: Option<String>,
+    #[arg(long)]
+    runtime: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -268,10 +284,17 @@ pub async fn run() -> Result<()> {
                     let runtime_id = resolve_runtime_id(&config, args.runtime.as_deref())?;
                     let binaries = resolve_stack_binaries()?;
                     let applied = up(&home, &manager, &runtime_id, &binaries).await?;
+                    let managed_channels = applied
+                        .config
+                        .channels
+                        .iter()
+                        .filter(|channel| {
+                            channel.enabled && channel.launch_mode == ChannelLaunchMode::Service
+                        })
+                        .count();
                     println!(
                         "started LionClaw services with runtime {} ({} channels)",
-                        runtime_id,
-                        applied.lockfile.channels.len()
+                        runtime_id, managed_channels
                     );
                 }
                 ServiceCommand::Down => {
@@ -283,9 +306,10 @@ pub async fn run() -> Result<()> {
                     println!("daemon: {}", stack.daemon_status);
                     for channel in stack.channels {
                         println!(
-                            "channel={} skill={} binding={} unit={} peers(pending={},approved={},blocked={}) inbound={} outbound={}",
+                            "channel={} skill={} launch={} binding={} unit={} peers(pending={},approved={},blocked={}) inbound={} outbound={}",
                             channel.id,
                             channel.skill,
+                            channel.launch_mode,
                             channel.binding_enabled,
                             channel.unit_status,
                             channel.pending_peers,
@@ -322,8 +346,22 @@ pub async fn run() -> Result<()> {
         Command::Channel { command } => match command {
             ChannelCommand::Add(args) => {
                 let skill = args.skill.unwrap_or_else(|| args.id.clone());
-                add_channel(&home, args.id.clone(), skill.clone(), args.required_env).await?;
-                println!("registered channel {} -> {}", args.id, skill);
+                let launch_mode =
+                    ChannelLaunchMode::from_str(&args.launch).map_err(anyhow::Error::msg)?;
+                add_channel(
+                    &home,
+                    args.id.clone(),
+                    skill.clone(),
+                    launch_mode,
+                    args.required_env,
+                )
+                .await?;
+                println!(
+                    "registered channel {} -> {} ({})",
+                    args.id,
+                    skill,
+                    launch_mode.as_str()
+                );
             }
             ChannelCommand::Rm(args) => {
                 let removed = remove_channel(&home, &args.id).await?;
@@ -332,6 +370,10 @@ pub async fn run() -> Result<()> {
                     if removed { "removed" } else { "left unchanged" },
                     args.id
                 );
+            }
+            ChannelCommand::Attach(args) => {
+                let manager = SystemdUserServiceManager;
+                attach_channel(&home, &manager, args.id, args.peer, args.runtime).await?;
             }
             ChannelCommand::Pairing { command } => match command {
                 ChannelPairingCommand::List(args) => {

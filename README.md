@@ -59,12 +59,18 @@ For a local end-to-end channel test without Telegram, use the terminal channel s
 
 ```bash
 ./target/debug/lionclaw skill add skills/channel-terminal --alias terminal
-./target/debug/lionclaw channel add terminal
-./target/debug/lionclaw service up --runtime codex
-./skills/channel-terminal/scripts/worker.sh
+./target/debug/lionclaw channel add terminal --launch interactive
+./target/debug/lionclaw channel attach terminal --runtime codex
 ```
 
-The terminal worker will print the pairing code and approval command on first contact. To run multiple local terminal channels at once, start separate worker processes with different `LIONCLAW_CHANNEL_ID` values.
+`channel attach` runs the interactive worker in your current TTY. It will ensure the daemon is running, start from the current stream head, and print the pairing code and approval command on first contact.
+
+To run multiple local terminal channels at once, register multiple interactive channels and attach each one in its own terminal:
+
+```bash
+./target/debug/lionclaw channel add terminal2 --skill terminal --launch interactive
+./target/debug/lionclaw channel attach terminal2
+```
 
 Register a Telegram skill and channel:
 

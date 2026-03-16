@@ -12,7 +12,7 @@ Options:
   --skill-source PATH    Skill source path (default: skills/channel-telegram)
   --skill-ref REF        Skill reference (default: local)
   --runtime-id ID        Optional runtime override to set in bind config and worker env (default: omitted)
-  --start-worker         Start <skill-source>/scripts/worker.sh after install+bind
+  --start-worker         Start <skill-source>/scripts/worker or legacy scripts/worker.sh after install+bind
   -h, --help             Show help
 
 Environment pass-through for worker:
@@ -115,7 +115,17 @@ if [[ -z "$RUNTIME_ID" ]]; then
 fi
 
 if [[ "$START_WORKER" == true ]]; then
-  WORKER="$SKILL_SOURCE/scripts/worker.sh"
+  WORKER=""
+  for candidate in "$SKILL_SOURCE/scripts/worker" "$SKILL_SOURCE/scripts/worker.sh"; do
+    if [[ -f "$candidate" ]]; then
+      WORKER="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$WORKER" ]]; then
+    echo "worker entrypoint is missing under '$SKILL_SOURCE'; expected scripts/worker or scripts/worker.sh" >&2
+    exit 1
+  fi
   if [[ ! -x "$WORKER" ]]; then
     chmod +x "$WORKER" 2>/dev/null || true
   fi

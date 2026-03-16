@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+require_command() {
+  local name="$1"
+  if ! command -v "$name" >/dev/null 2>&1; then
+    echo "missing required command: $name" >&2
+    exit 1
+  fi
+}
+
+require_command bash
+require_command python3
+require_command uv
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SKILL_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+RUNTIME_DIR="${LIONCLAW_CHANNEL_RUNTIME_DIR:-${TMPDIR:-/tmp}/lionclaw-channel-terminal-runtime}"
+
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$RUNTIME_DIR/uv-cache}"
+export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$RUNTIME_DIR/.venv}"
+
+mkdir -p "$RUNTIME_DIR" "$UV_CACHE_DIR"
+
+exec uv run --project "$SKILL_ROOT" python -m lionclaw_channel_terminal "$@"

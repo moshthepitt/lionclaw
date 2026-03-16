@@ -187,7 +187,41 @@ pub struct ManagedChannelConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     #[serde(default)]
+    pub launch_mode: ChannelLaunchMode,
+    #[serde(default)]
     pub required_env: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelLaunchMode {
+    #[default]
+    Service,
+    Interactive,
+}
+
+impl ChannelLaunchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Service => "service",
+            Self::Interactive => "interactive",
+        }
+    }
+}
+
+impl std::str::FromStr for ChannelLaunchMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim() {
+            "service" => Ok(Self::Service),
+            "interactive" => Ok(Self::Interactive),
+            other => Err(format!(
+                "invalid channel launch mode '{}'; expected 'service' or 'interactive'",
+                other
+            )),
+        }
+    }
 }
 
 pub fn default_bind() -> String {
@@ -369,7 +403,7 @@ fn normalize_executable_path(raw: &str) -> Result<PathBuf> {
 mod tests {
     use super::{
         derive_skill_alias, normalize_executable, normalize_local_source, validate_executable,
-        OperatorConfig, RuntimeProfileConfig,
+        ChannelLaunchMode, ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig,
     };
 
     #[test]
@@ -389,6 +423,47 @@ mod tests {
         assert!(config.skills.is_empty());
         assert!(config.channels.is_empty());
         assert!(config.runtimes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn channel_launch_mode_defaults_to_service() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = OperatorConfig::default();
+        config.upsert_channel(ManagedChannelConfig {
+            id: "terminal".to_string(),
+            skill: "terminal".to_string(),
+            enabled: true,
+            launch_mode: ChannelLaunchMode::default(),
+            required_env: Vec::new(),
+        });
+        config.save(&home).await.expect("save config");
+
+        let loaded = OperatorConfig::load(&home).await.expect("load config");
+        assert_eq!(loaded.channels.len(), 1);
+        assert_eq!(loaded.channels[0].launch_mode, ChannelLaunchMode::Service);
+    }
+
+    #[tokio::test]
+    async fn channel_launch_mode_round_trips() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = OperatorConfig::default();
+        config.upsert_channel(ManagedChannelConfig {
+            id: "terminal".to_string(),
+            skill: "terminal".to_string(),
+            enabled: true,
+            launch_mode: ChannelLaunchMode::Interactive,
+            required_env: Vec::new(),
+        });
+        config.save(&home).await.expect("save config");
+
+        let loaded = OperatorConfig::load(&home).await.expect("load config");
+        assert_eq!(loaded.channels.len(), 1);
+        assert_eq!(
+            loaded.channels[0].launch_mode,
+            ChannelLaunchMode::Interactive
+        );
     }
 
     #[test]

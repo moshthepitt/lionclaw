@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::home::LionClawHome;
+use crate::operator::config::ChannelLaunchMode;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OperatorLockfile {
@@ -79,4 +80,6 @@ pub struct LockedChannel {
     pub skill: String,
     pub skill_id: String,
     pub enabled: bool,
+    #[serde(default)]
+    pub launch_mode: ChannelLaunchMode,
 }

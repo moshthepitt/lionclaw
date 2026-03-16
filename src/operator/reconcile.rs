@@ -10,7 +10,8 @@ use crate::{
     kernel::{Kernel, KernelOptions},
     operator::{
         config::{
-            normalize_local_source, ManagedChannelConfig, ManagedSkillConfig, OperatorConfig,
+            normalize_local_source, ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig,
+            OperatorConfig,
         },
         lockfile::{LockedChannel, LockedSkill, OperatorLockfile},
         runtime::{
@@ -42,6 +43,7 @@ pub struct ChannelStatus {
     pub id: String,
     pub skill: String,
     pub skill_id: String,
+    pub launch_mode: String,
     pub binding_enabled: bool,
     pub unit_status: String,
     pub pending_peers: u64,
@@ -93,6 +95,7 @@ pub async fn add_channel(
     home: &LionClawHome,
     id: String,
     skill: String,
+    launch_mode: ChannelLaunchMode,
     required_env: Vec<String>,
 ) -> Result<()> {
     let mut config = OperatorConfig::load(home).await?;
@@ -100,6 +103,7 @@ pub async fn add_channel(
         id,
         skill,
         enabled: true,
+        launch_mode,
         required_env,
     });
     config.save(home).await
@@ -223,6 +227,7 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
             skill: channel.skill.clone(),
             skill_id: skill_id.clone(),
             enabled: channel.enabled,
+            launch_mode: channel.launch_mode,
         });
     }
 
@@ -298,11 +303,16 @@ pub async fn status<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Resu
             .get_channel_health(&channel.id)
             .await
             .map_err(to_anyhow)?;
-        let unit_status = manager.unit_status(&channel_unit_name(&channel.id)).await?;
+        let unit_status = if channel.launch_mode == ChannelLaunchMode::Interactive {
+            "interactive".to_string()
+        } else {
+            manager.unit_status(&channel_unit_name(&channel.id)).await?
+        };
         channels.push(ChannelStatus {
             id: channel.id.clone(),
             skill: channel.skill.clone(),
             skill_id: channel.skill_id.clone(),
+            launch_mode: channel.launch_mode.as_str().to_string(),
             binding_enabled: binding.enabled,
             unit_status,
             pending_peers: health.pending_peer_count,
@@ -390,7 +400,7 @@ pub fn resolve_stack_binaries() -> Result<StackBinaryPaths> {
     Ok(StackBinaryPaths { daemon_bin })
 }
 
-fn build_managed_units(
+pub(crate) fn build_managed_units(
     home: &LionClawHome,
     config: &OperatorConfig,
     lockfile: &OperatorLockfile,
@@ -409,7 +419,11 @@ fn build_managed_units(
     ));
 
     let base_url = base_url_from_bind(&config.daemon.bind);
-    for channel in config.channels.iter().filter(|channel| channel.enabled) {
+    for channel in config
+        .channels
+        .iter()
+        .filter(|channel| channel.enabled && channel.launch_mode == ChannelLaunchMode::Service)
+    {
         let locked_skill = lockfile.find_skill(&channel.skill).ok_or_else(|| {
             anyhow!(
                 "managed channel '{}' references unknown locked skill '{}'",
@@ -417,17 +431,8 @@ fn build_managed_units(
                 channel.skill
             )
         })?;
-        let worker_path = home
-            .root()
-            .join(&locked_skill.snapshot_dir)
-            .join("scripts/worker.sh");
-        if !worker_path.exists() {
-            return Err(anyhow!(
-                "worker script is missing for channel '{}' at '{}'",
-                channel.id,
-                worker_path.display()
-            ));
-        }
+        let worker_path = resolve_worker_entrypoint(home, &locked_skill.snapshot_dir)
+            .with_context(|| format!("channel '{}' worker resolution failed", channel.id))?;
 
         let mut env = vec![
             (
@@ -535,7 +540,7 @@ fn to_locked_skill(
     }
 }
 
-fn base_url_from_bind(bind: &str) -> String {
+pub(crate) fn base_url_from_bind(bind: &str) -> String {
     if let Ok(addr) = bind.parse::<std::net::SocketAddr>() {
         match addr {
             std::net::SocketAddr::V4(value) => format!("http://{}:{}", value.ip(), value.port()),
@@ -546,6 +551,24 @@ fn base_url_from_bind(bind: &str) -> String {
     } else {
         format!("http://{}", bind)
     }
+}
+
+pub(crate) fn resolve_worker_entrypoint(
+    home: &LionClawHome,
+    snapshot_dir: &str,
+) -> Result<PathBuf> {
+    let snapshot_root = home.root().join(snapshot_dir);
+    for relative in ["scripts/worker", "scripts/worker.sh"] {
+        let candidate = snapshot_root.join(relative);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(anyhow!(
+        "worker entrypoint is missing under '{}'; expected 'scripts/worker' or legacy 'scripts/worker.sh'",
+        snapshot_root.display()
+    ))
 }
 
 fn managed_unit_names(home: &LionClawHome) -> Result<Vec<String>> {
@@ -610,10 +633,11 @@ mod tests {
         kernel::{Kernel, KernelOptions},
         operator::{
             config::{
-                ManagedChannelConfig, ManagedSkillConfig, OperatorConfig, RuntimeProfileConfig,
+                ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig, OperatorConfig,
+                RuntimeProfileConfig,
             },
             lockfile::OperatorLockfile,
-            services::FakeServiceManager,
+            services::{FakeServiceManager, ServiceManager},
         },
     };
 
@@ -687,6 +711,7 @@ mod tests {
                 id: "telegram".to_string(),
                 skill: "telegram".to_string(),
                 enabled: true,
+                launch_mode: ChannelLaunchMode::Service,
                 required_env: Vec::new(),
             }],
             ..OperatorConfig::default()
@@ -773,6 +798,88 @@ mod tests {
             skills.len(),
             2,
             "old revisions remain installed for auditability"
+        );
+    }
+
+    #[tokio::test]
+    async fn up_skips_interactive_channels_for_service_units() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home).await.expect("onboard");
+        let runtime_stub = temp_dir.path().join("codex-stub.sh");
+        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&runtime_stub, fs::Permissions::from_mode(0o755))
+                .expect("chmod runtime stub");
+        }
+
+        let skill_source = temp_dir.path().join("channel-terminal");
+        fs::create_dir_all(skill_source.join("scripts")).expect("skill dir");
+        fs::write(
+            skill_source.join("SKILL.md"),
+            "---\nname: channel-terminal\ndescription: test\n---\n",
+        )
+        .expect("skill md");
+        fs::write(skill_source.join("scripts/worker"), "#!/usr/bin/env bash\n").expect("worker");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                skill_source.join("scripts/worker"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod worker");
+        }
+
+        let config = OperatorConfig {
+            runtimes: [(
+                "codex".to_string(),
+                RuntimeProfileConfig::Codex {
+                    executable: runtime_stub.to_string_lossy().to_string(),
+                    model: None,
+                    sandbox: "read-only".to_string(),
+                    skip_git_repo_check: true,
+                    ephemeral: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            skills: vec![ManagedSkillConfig {
+                alias: "terminal".to_string(),
+                source: skill_source.to_string_lossy().to_string(),
+                reference: "local".to_string(),
+                enabled: true,
+            }],
+            channels: vec![ManagedChannelConfig {
+                id: "terminal".to_string(),
+                skill: "terminal".to_string(),
+                enabled: true,
+                launch_mode: ChannelLaunchMode::Interactive,
+                required_env: Vec::new(),
+            }],
+            ..OperatorConfig::default()
+        };
+        config.save(&home).await.expect("save config");
+        OperatorLockfile::default()
+            .save(&home)
+            .await
+            .expect("save lock");
+
+        let manager = FakeServiceManager::default();
+        let binaries = StackBinaryPaths {
+            daemon_bin: "/tmp/lionclawd".into(),
+        };
+        let applied = up(&home, &manager, "codex", &binaries).await.expect("up");
+
+        assert_eq!(applied.lockfile.channels.len(), 1);
+        assert_eq!(
+            manager
+                .unit_status("lionclaw-channel-terminal.service")
+                .await
+                .expect("unit status"),
+            "not-found"
         );
     }
 }

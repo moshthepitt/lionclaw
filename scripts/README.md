@@ -8,7 +8,7 @@ LionClaw keeps channels as installable skills and the kernel API explicit. The r
 These helpers are not the primary product path. Normal operator flows should prefer the `lionclaw` CLI, with runtime selection handled at `lionclaw service up --runtime ...`.
 
 ## Available scripts
-- `install-channel-skill.sh`: installs a channel skill, enables it, binds it to a channel, and optionally starts the channel worker.
+- `install-channel-skill.sh`: installs a channel skill, enables it, binds it to a channel, and optionally starts the channel worker. It prefers `scripts/worker` and falls back to legacy `scripts/worker.sh`.
 
 ## Usage
 Prerequisites:

@@ -113,7 +113,7 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in entries {
         let path = entry.path();
         let file_name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
-        if file_name == ".git" || file_name == "target" {
+        if should_ignore_snapshot_entry(file_name) {
             continue;
         }
 
@@ -140,6 +140,10 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
     for entry in entries {
         let path = entry.path();
         let target = destination.join(entry.file_name());
+        let file_name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+        if should_ignore_snapshot_entry(file_name) {
+            continue;
+        }
 
         if path.is_dir() {
             copy_directory(&path, &target)?;
@@ -155,6 +159,19 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn should_ignore_snapshot_entry(file_name: &str) -> bool {
+    matches!(
+        file_name,
+        ".git"
+            | "target"
+            | ".venv"
+            | "__pycache__"
+            | ".pytest_cache"
+            | ".mypy_cache"
+            | ".ruff_cache"
+    )
 }
 
 #[cfg(test)]
@@ -200,5 +217,40 @@ mod tests {
         assert_eq!(first.hash, second.hash);
         assert_eq!(first.snapshot_abs_dir, second.snapshot_abs_dir);
         assert!(first.snapshot_abs_dir.join("scripts/worker.sh").exists());
+    }
+
+    #[test]
+    fn ignores_local_runtime_cache_directories() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source_dir = temp_dir.path().join("channel-terminal");
+        fs::create_dir_all(source_dir.join("scripts")).expect("scripts dir");
+        fs::create_dir_all(source_dir.join(".venv/bin")).expect("venv dir");
+        fs::create_dir_all(source_dir.join("pkg/__pycache__")).expect("pycache dir");
+        fs::create_dir_all(source_dir.join(".pytest_cache")).expect("pytest cache dir");
+        fs::write(
+            source_dir.join("SKILL.md"),
+            "---\nname: channel-terminal\ndescription: test\n---\n",
+        )
+        .expect("skill");
+        fs::write(source_dir.join("scripts/worker"), "#!/usr/bin/env bash\n").expect("worker");
+        fs::write(source_dir.join(".venv/bin/python"), "shim\n").expect("venv file");
+        fs::write(source_dir.join("pkg/__pycache__/state.pyc"), "cache\n").expect("pycache file");
+        fs::write(source_dir.join(".pytest_cache/CACHEDIR.TAG"), "cache\n").expect("pytest file");
+
+        let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        fs::create_dir_all(home.skills_dir()).expect("skills dir");
+
+        let snapshot = install_snapshot(
+            &home,
+            "terminal",
+            source_dir.to_string_lossy().as_ref(),
+            "local",
+        )
+        .expect("snapshot");
+
+        assert!(snapshot.snapshot_abs_dir.join("scripts/worker").exists());
+        assert!(!snapshot.snapshot_abs_dir.join(".venv").exists());
+        assert!(!snapshot.snapshot_abs_dir.join("pkg/__pycache__").exists());
+        assert!(!snapshot.snapshot_abs_dir.join(".pytest_cache").exists());
     }
 }

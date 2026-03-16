@@ -79,6 +79,12 @@ Channel bridge layout:
 - `kernel/core.rs`: channel inbound processing, pairing/approval, and stream pull/ack APIs.
 - `api/mod.rs`: HTTP routes for external channel skill workers.
 
+Operator launch model:
+
+- `launch_mode=service`: channel worker is supervised by `lionclaw service up` through the platform service manager.
+- `launch_mode=interactive`: channel worker is foreground-only and started with `lionclaw channel attach <id>`.
+- Worker entrypoint resolution prefers `scripts/worker` and falls back to legacy `scripts/worker.sh`.
+
 Adding a new adapter:
 
 1. Add `kernel/runtime/adapters/<adapter>.rs` implementing `RuntimeAdapter`.

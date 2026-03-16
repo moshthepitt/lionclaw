@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lionclaw-channel-terminal"
+version = "0.1.0"
+description = "Interactive terminal channel skill for LionClaw"
+requires-python = ">=3.12"
+dependencies = [
+  "httpx==0.28.1",
+  "textual==0.86.1",
+]

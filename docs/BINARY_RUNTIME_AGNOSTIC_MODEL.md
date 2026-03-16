@@ -83,6 +83,14 @@ Background/channel deployment remains explicit admin flow:
 3. `lionclaw service up --runtime codex`
 4. `lionclaw channel pairing list|approve|block`
 
+Interactive channel skills stay explicit too:
+
+1. `lionclaw skill add skills/channel-terminal --alias terminal`
+2. `lionclaw channel add terminal --launch interactive`
+3. `lionclaw channel attach terminal`
+
+Interactive channels are foreground-only. They are attached through the current TTY, use ephemeral tail-only consumers, and are not managed by `lionclaw service up`.
+
 No manual API choreography should be required for normal usage or operator flows.
 
 ## Implementation checklist anchor
