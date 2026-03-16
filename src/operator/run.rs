@@ -65,7 +65,7 @@ async fn run_repl<R: BufRead, W: Write>(
     )?;
 
     loop {
-        write!(output, "lionclaw> ")?;
+        write!(output, "you> ")?;
         output.flush()?;
 
         let mut line = String::new();
@@ -204,6 +204,8 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             .expect("run local");
 
         let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("you> "));
+        assert!(output.contains("lionclaw> hello from repl"));
         assert!(output.contains("hello from repl"));
         assert!(home.workspace_dir("main").join("SOUL.md").exists());
         assert!(home.lock_path().exists());

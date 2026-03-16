@@ -9,6 +9,7 @@ use lionclaw::{
     kernel::{Kernel, KernelError},
 };
 use tempfile::TempDir;
+use tokio::time::{sleep, Duration};
 
 #[tokio::test]
 async fn channel_bind_requires_enabled_skill() {
@@ -305,6 +306,148 @@ description: channel outbox skill
     assert!(
         stream_after_ack.events.is_empty(),
         "acked events must not appear in resumed channel stream"
+    );
+}
+
+#[tokio::test]
+async fn channel_stream_tail_starts_from_current_head() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+
+    let skill = kernel
+        .install_skill(SkillInstallRequest {
+            source: "local/channel-tail-skill".to_string(),
+            reference: Some("main".to_string()),
+            hash: Some("channel-tail-skill-hash".to_string()),
+            skill_md: Some(
+                r#"---
+name: tail-skill
+description: channel tail skill
+---"#
+                    .to_string(),
+            ),
+            snapshot_path: None,
+        })
+        .await
+        .expect("install skill");
+
+    kernel
+        .enable_skill(skill.skill_id.clone())
+        .await
+        .expect("enable skill");
+
+    kernel
+        .bind_channel(ChannelBindRequest {
+            channel_id: "terminal".to_string(),
+            skill_id: skill.skill_id,
+            enabled: Some(true),
+            config: None,
+        })
+        .await
+        .expect("bind channel");
+
+    kernel
+        .process_inbound_channel_text(
+            "terminal",
+            "peer-tail",
+            "hello before tail connect",
+            Some("mock".to_string()),
+            Some(5001),
+            Some("tail-5001".to_string()),
+        )
+        .await
+        .expect("process inbound");
+
+    let initial = kernel
+        .pull_channel_stream(ChannelStreamPullRequest {
+            channel_id: "terminal".to_string(),
+            consumer_id: "terminal-worker".to_string(),
+            start_mode: Some(ChannelStreamStartMode::Tail),
+            limit: Some(10),
+            wait_ms: Some(0),
+        })
+        .await
+        .expect("tail pull");
+    assert!(
+        initial.events.is_empty(),
+        "tail mode should not replay stream history on first connect"
+    );
+}
+
+#[tokio::test]
+async fn channel_stream_long_poll_wakes_for_new_events() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+
+    let skill = kernel
+        .install_skill(SkillInstallRequest {
+            source: "local/channel-wait-skill".to_string(),
+            reference: Some("main".to_string()),
+            hash: Some("channel-wait-skill-hash".to_string()),
+            skill_md: Some(
+                r#"---
+name: wait-skill
+description: channel wait skill
+---"#
+                    .to_string(),
+            ),
+            snapshot_path: None,
+        })
+        .await
+        .expect("install skill");
+
+    kernel
+        .enable_skill(skill.skill_id.clone())
+        .await
+        .expect("enable skill");
+
+    kernel
+        .bind_channel(ChannelBindRequest {
+            channel_id: "telegram".to_string(),
+            skill_id: skill.skill_id,
+            enabled: Some(true),
+            config: None,
+        })
+        .await
+        .expect("bind channel");
+
+    let delayed_inbound = async {
+        sleep(Duration::from_millis(50)).await;
+        kernel
+            .process_inbound_channel_text(
+                "telegram",
+                "peer-wait",
+                "hello after long poll",
+                Some("mock".to_string()),
+                Some(6001),
+                Some("wait-6001".to_string()),
+            )
+            .await
+            .expect("delayed inbound");
+    };
+
+    let (stream, _) = tokio::join!(
+        kernel.pull_channel_stream(ChannelStreamPullRequest {
+            channel_id: "telegram".to_string(),
+            consumer_id: "telegram-worker".to_string(),
+            start_mode: Some(ChannelStreamStartMode::Resume),
+            limit: Some(10),
+            wait_ms: Some(1_000),
+        }),
+        delayed_inbound
+    );
+    let stream = stream.expect("long-poll stream");
+
+    assert!(
+        stream.events.iter().any(|event| {
+            event.kind == StreamEventKindDto::MessageDelta
+                && event.lane == Some(StreamLaneDto::Answer)
+                && event
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("Pairing required"))
+        }),
+        "long-poll should return newly appended stream events"
     );
 }
 

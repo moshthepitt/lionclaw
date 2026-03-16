@@ -1567,6 +1567,7 @@ impl Kernel {
     ) -> Result<Vec<ChannelStreamEventRecord>, KernelError> {
         let notifier = self.channel_stream_notifier(channel_id).await;
         loop {
+            let notified = notifier.notified();
             let events = self
                 .channel_state
                 .list_stream_events_after(channel_id, after_sequence, limit)
@@ -1576,7 +1577,6 @@ impl Kernel {
                 return Ok(events);
             }
 
-            let notified = notifier.notified();
             if timeout(Duration::from_millis(wait_ms), notified)
                 .await
                 .is_err()
