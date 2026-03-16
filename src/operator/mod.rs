@@ -2,5 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod lockfile;
 pub mod reconcile;
+pub mod run;
+pub mod runtime;
 pub mod services;
 pub mod snapshot;

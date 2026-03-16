@@ -12,7 +12,7 @@ LionClaw is a kernel/control plane that should work when installed as binaries o
 
 1. LionClaw is runtime-agnostic. `codex`, `claude-code`, `opencode`, and future runtimes are adapter choices, not product identity.
 2. Channels are skills. Transport workers (Telegram/Discord/etc.) live outside kernel Rust code.
-3. Runtime is selected later at startup (`lionclaw up`), not during `lionclaw channel add`.
+3. Runtime is selected at invocation (`lionclaw run` or `lionclaw service up`), not during `lionclaw channel add`.
 4. Identity/persona is kernel-owned and runtime-independent via workspace files (`IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md`).
 5. Anthropic `SKILL.md` stays unchanged as the skill instruction standard.
 6. Security controls stay in kernel policy/sandbox/audit, never in prompt-only logic.
@@ -57,29 +57,33 @@ Default secure deployment:
 
 This may mean many processes (example: 13 channels + kernel). That is acceptable for isolation.
 
-Operationally, users still get one-command control through `lionclaw`:
+Operationally, users get one interactive path plus explicit admin control through `lionclaw`:
 
+- `lionclaw run [runtime]` (interactive local use)
 - `lionclaw apply` (reconcile desired state)
-- `lionclaw up` (start stack + ensure auto-restart policy)
-- `lionclaw down`
-- `lionclaw status`
-- `lionclaw logs`
+- `lionclaw service up` (start supervised stack + ensure auto-restart policy)
+- `lionclaw service down`
+- `lionclaw service status`
+- `lionclaw service logs`
 
 Under the hood, LionClaw uses platform service managers (systemd --user / launchd / Windows equivalent) for restart and supervision.
 
-## CLI UX target (operator-first)
+## CLI UX target
 
 Expected user flow:
 
 1. `lionclaw onboard`
-2. `lionclaw channel add telegram`
-3. `lionclaw channel add discord`
-4. `lionclaw skill add <source>`
-5. `lionclaw apply`
-6. `lionclaw up --runtime codex` (runtime selected here)
-7. `lionclaw pairing list|approve`
+2. `lionclaw runtime add codex --kind codex --bin /abs/path/to/codex`
+3. `lionclaw run codex`
 
-No manual API choreography should be required for normal operator flows.
+Background/channel deployment remains explicit admin flow:
+
+1. `lionclaw skill add <source>`
+2. `lionclaw channel add telegram`
+3. `lionclaw service up --runtime codex`
+4. `lionclaw channel pairing list|approve|block`
+
+No manual API choreography should be required for normal usage or operator flows.
 
 ## Implementation checklist anchor
 
@@ -87,7 +91,7 @@ No manual API choreography should be required for normal operator flows.
 - [x] Move skill installs to canonical snapshot store under `~/.lionclaw/skills`.
 - [x] Remove repo-path assumptions from worker resolution.
 - [x] Add workspace identity bootstrap templates in `~/.lionclaw/workspaces/main/`.
-- [x] Add runtime selection at `lionclaw up` with default/global routing.
+- [x] Add runtime selection at invocation with default/global routing.
 - [x] Add supervisor/service generation with restart policies.
 - [x] Add `lionclaw` pairing and channel health workflows.
 - [x] Add marker-based skill injection cache as non-authoritative derived output.

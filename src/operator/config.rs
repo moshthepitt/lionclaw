@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::home::{LionClawHome, DEFAULT_WORKSPACE};
@@ -10,6 +11,10 @@ use crate::kernel::skills::sanitize_skill_name;
 pub struct OperatorConfig {
     #[serde(default)]
     pub daemon: DaemonConfig,
+    #[serde(default)]
+    pub defaults: OperatorDefaults,
+    #[serde(default)]
+    pub runtimes: BTreeMap<String, RuntimeProfileConfig>,
     #[serde(default)]
     pub skills: Vec<ManagedSkillConfig>,
     #[serde(default)]
@@ -79,11 +84,59 @@ impl OperatorConfig {
         before != self.channels.len()
     }
 
+    pub fn upsert_runtime(&mut self, id: String, runtime: RuntimeProfileConfig) {
+        let should_set_default = self.defaults.runtime.is_none();
+        self.runtimes.insert(id.clone(), runtime);
+        if should_set_default {
+            self.defaults.runtime = Some(id);
+        }
+        self.normalize();
+    }
+
+    pub fn remove_runtime(&mut self, id: &str) -> bool {
+        let removed = self.runtimes.remove(id).is_some();
+        if removed && self.defaults.runtime.as_deref() == Some(id) {
+            self.defaults.runtime = None;
+        }
+        self.normalize();
+        removed
+    }
+
+    pub fn runtime(&self, id: &str) -> Option<&RuntimeProfileConfig> {
+        self.runtimes.get(id)
+    }
+
+    pub fn resolve_runtime_id(&self, requested: Option<&str>) -> Result<String> {
+        if let Some(runtime_id) = requested.map(str::trim).filter(|value| !value.is_empty()) {
+            return Ok(runtime_id.to_string());
+        }
+
+        self.defaults
+            .runtime
+            .clone()
+            .ok_or_else(|| anyhow!("runtime is required when no default runtime is configured"))
+    }
+
+    pub fn set_default_runtime(&mut self, id: &str) -> Result<()> {
+        if !self.runtimes.contains_key(id) {
+            return Err(anyhow!("runtime profile '{}' is not configured", id));
+        }
+        self.defaults.runtime = Some(id.to_string());
+        self.normalize();
+        Ok(())
+    }
+
     pub fn workspace_root(&self, home: &LionClawHome) -> PathBuf {
         home.workspace_dir(&self.daemon.workspace)
     }
 
     fn normalize(&mut self) {
+        self.defaults.runtime = self
+            .defaults
+            .runtime
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         self.skills
             .sort_by(|left, right| left.alias.cmp(&right.alias));
         self.channels.sort_by(|left, right| left.id.cmp(&right.id));
@@ -92,6 +145,12 @@ impl OperatorConfig {
             channel.required_env.dedup();
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorDefaults {
+    #[serde(default)]
+    pub runtime: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,12 +198,70 @@ pub fn default_workspace() -> String {
     DEFAULT_WORKSPACE.to_string()
 }
 
+fn default_codex_sandbox() -> String {
+    "read-only".to_string()
+}
+
+fn default_opencode_format() -> String {
+    "json".to_string()
+}
+
 fn default_reference() -> String {
     "local".to_string()
 }
 
 fn default_enabled() -> bool {
     true
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum RuntimeProfileConfig {
+    #[serde(rename = "codex")]
+    Codex {
+        executable: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default = "default_codex_sandbox")]
+        sandbox: String,
+        #[serde(default = "default_true")]
+        skip_git_repo_check: bool,
+        #[serde(default = "default_true")]
+        ephemeral: bool,
+    },
+    #[serde(rename = "opencode")]
+    OpenCode {
+        executable: String,
+        #[serde(default = "default_opencode_format")]
+        format: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        agent: Option<String>,
+        #[serde(default)]
+        xdg_data_home: Option<String>,
+        #[serde(default)]
+        continue_last_session: bool,
+    },
+}
+
+impl RuntimeProfileConfig {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Codex { .. } => "codex",
+            Self::OpenCode { .. } => "opencode",
+        }
+    }
+
+    pub fn executable(&self) -> &str {
+        match self {
+            Self::Codex { executable, .. } | Self::OpenCode { executable, .. } => executable,
+        }
+    }
 }
 
 pub fn derive_skill_alias(source: &str) -> String {
@@ -173,9 +290,27 @@ pub fn normalize_local_source(source: &str) -> Result<String> {
     Ok(format!("local:{}", absolute.display()))
 }
 
+pub fn normalize_executable(source: &str) -> Result<String> {
+    let raw = source.trim();
+    if raw.is_empty() {
+        return Err(anyhow!("runtime executable path cannot be empty"));
+    }
+
+    let path = which::which(raw)
+        .or_else(|_| std::fs::canonicalize(raw))
+        .with_context(|| format!("failed to resolve runtime executable '{}'", source))?;
+    if !path.is_file() {
+        return Err(anyhow!(
+            "runtime executable '{}' is not a file",
+            path.display()
+        ));
+    }
+    Ok(path.to_string_lossy().to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{derive_skill_alias, normalize_local_source, OperatorConfig};
+    use super::{derive_skill_alias, normalize_local_source, OperatorConfig, RuntimeProfileConfig};
 
     #[test]
     fn derives_channel_alias_from_source_path() {
@@ -193,11 +328,47 @@ mod tests {
         let config = OperatorConfig::load(&home).await.expect("load");
         assert!(config.skills.is_empty());
         assert!(config.channels.is_empty());
+        assert!(config.runtimes.is_empty());
     }
 
     #[test]
     fn normalizes_local_source_uri() {
         let absolute = normalize_local_source(".").expect("normalize");
         assert!(absolute.starts_with("local:/"));
+    }
+
+    #[test]
+    fn first_runtime_becomes_default() {
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "/tmp/codex".to_string(),
+                model: None,
+                sandbox: "read-only".to_string(),
+                skip_git_repo_check: true,
+                ephemeral: true,
+            },
+        );
+
+        assert_eq!(config.defaults.runtime.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn removing_default_runtime_clears_default() {
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "/tmp/codex".to_string(),
+                model: None,
+                sandbox: "read-only".to_string(),
+                skip_git_repo_check: true,
+                ephemeral: true,
+            },
+        );
+
+        assert!(config.remove_runtime("codex"));
+        assert!(config.defaults.runtime.is_none());
     }
 }

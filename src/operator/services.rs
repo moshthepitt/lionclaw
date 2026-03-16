@@ -37,21 +37,35 @@ pub fn render_daemon_unit(
     bind_addr: &str,
     runtime_id: &str,
     workspace: &str,
+    extra_env: &[(String, String)],
 ) -> ManagedServiceUnit {
     let env_path = home.services_env_dir().join("lionclawd.env");
     let unit_path = home.services_systemd_dir().join(DAEMON_UNIT_NAME);
 
     let (host, port) = parse_bind_addr(bind_addr);
-    let env_content = format!(
-        "LIONCLAW_HOME={home}\nLIONCLAW_BIND_ADDR={bind_addr}\nLIONCLAW_HOST={host}\nLIONCLAW_PORT={port}\nLIONCLAW_DEFAULT_RUNTIME_ID={runtime_id}\nLIONCLAW_WORKSPACE={workspace}\nLIONCLAW_WORKSPACE_ROOT={workspace_root}\n",
-        home = escape_env_value(&home.root().display().to_string()),
-        bind_addr = escape_env_value(bind_addr),
-        host = escape_env_value(&host),
-        port = escape_env_value(&port),
-        runtime_id = escape_env_value(runtime_id),
-        workspace = escape_env_value(workspace),
-        workspace_root = escape_env_value(&home.workspace_dir(workspace).display().to_string()),
-    );
+    let mut env_lines = vec![
+        (
+            "LIONCLAW_HOME".to_string(),
+            home.root().display().to_string(),
+        ),
+        ("LIONCLAW_BIND_ADDR".to_string(), bind_addr.to_string()),
+        ("LIONCLAW_HOST".to_string(), host),
+        ("LIONCLAW_PORT".to_string(), port),
+        (
+            "LIONCLAW_DEFAULT_RUNTIME_ID".to_string(),
+            runtime_id.to_string(),
+        ),
+        ("LIONCLAW_WORKSPACE".to_string(), workspace.to_string()),
+        (
+            "LIONCLAW_WORKSPACE_ROOT".to_string(),
+            home.workspace_dir(workspace).display().to_string(),
+        ),
+    ];
+    env_lines.extend(extra_env.iter().cloned());
+    let env_content = env_lines
+        .iter()
+        .map(|(key, value)| format!("{key}={}\n", escape_env_value(value)))
+        .collect::<String>();
     let unit_content = format!(
         "[Unit]\nDescription=LionClaw daemon\nAfter=default.target\n\n[Service]\nType=simple\nEnvironmentFile={env}\nExecStart={exec}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
         env = env_path.display(),
@@ -471,6 +485,7 @@ mod tests {
             "127.0.0.1:3000",
             "codex",
             "main",
+            &[],
         );
         assert!(daemon.unit_content.contains("ExecStart=/tmp/bin/lionclawd"));
         assert!(daemon

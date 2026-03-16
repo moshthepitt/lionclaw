@@ -1,17 +1,19 @@
 use std::str::FromStr;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::{Args, Parser, Subcommand};
 
 use crate::{
     contracts::TrustTier,
     home::LionClawHome,
     operator::{
-        config::derive_skill_alias,
+        config::{derive_skill_alias, normalize_executable, OperatorConfig, RuntimeProfileConfig},
         reconcile::{
             add_channel, add_skill, apply, down, logs, onboard, pairing_approve, pairing_block,
             pairing_list, remove_channel, remove_skill, resolve_stack_binaries, status, up,
         },
+        run::run_local,
+        runtime::resolve_runtime_id,
         services::SystemdUserServiceManager,
     },
 };
@@ -28,10 +30,15 @@ pub struct Cli {
 enum Command {
     Onboard,
     Apply,
-    Up(UpArgs),
-    Down,
-    Status,
-    Logs(LogsArgs),
+    Run(RunArgs),
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommand,
+    },
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
     Skill {
         #[command(subcommand)]
         command: SkillCommand,
@@ -40,22 +47,74 @@ enum Command {
         #[command(subcommand)]
         command: ChannelCommand,
     },
-    Pairing {
-        #[command(subcommand)]
-        command: PairingCommand,
-    },
 }
 
 #[derive(Debug, Args)]
-struct UpArgs {
+struct RunArgs {
+    runtime: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    Up(ServiceUpArgs),
+    Down,
+    Status,
+    Logs(LogsArgs),
+}
+
+#[derive(Debug, Args)]
+struct ServiceUpArgs {
     #[arg(long)]
-    runtime: String,
+    runtime: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct LogsArgs {
     #[arg(long, default_value_t = 200)]
     lines: usize,
+}
+
+#[derive(Debug, Subcommand)]
+enum RuntimeCommand {
+    Add(RuntimeAddArgs),
+    Rm(RuntimeRmArgs),
+    Ls,
+    SetDefault(RuntimeSetDefaultArgs),
+}
+
+#[derive(Debug, Args)]
+struct RuntimeAddArgs {
+    id: String,
+    #[arg(long)]
+    kind: String,
+    #[arg(long = "bin")]
+    executable: String,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long, default_value = "read-only")]
+    sandbox: String,
+    #[arg(long)]
+    no_skip_git_repo_check: bool,
+    #[arg(long)]
+    no_ephemeral: bool,
+    #[arg(long, default_value = "json")]
+    format: String,
+    #[arg(long)]
+    agent: Option<String>,
+    #[arg(long = "xdg-data-home")]
+    xdg_data_home: Option<String>,
+    #[arg(long)]
+    continue_last_session: bool,
+}
+
+#[derive(Debug, Args)]
+struct RuntimeRmArgs {
+    id: String,
+}
+
+#[derive(Debug, Args)]
+struct RuntimeSetDefaultArgs {
+    id: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -82,6 +141,10 @@ struct SkillRmArgs {
 enum ChannelCommand {
     Add(ChannelAddArgs),
     Rm(ChannelRmArgs),
+    Pairing {
+        #[command(subcommand)]
+        command: ChannelPairingCommand,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -99,7 +162,7 @@ struct ChannelRmArgs {
 }
 
 #[derive(Debug, Subcommand)]
-enum PairingCommand {
+enum ChannelPairingCommand {
     List(PairingListArgs),
     Approve(PairingApproveArgs),
     Block(PairingBlockArgs),
@@ -147,44 +210,97 @@ pub async fn run() -> Result<()> {
                 applied.lockfile.channels.len()
             );
         }
-        Command::Up(args) => {
-            let manager = SystemdUserServiceManager;
-            let binaries = resolve_stack_binaries()?;
-            let applied = up(&home, &manager, &args.runtime, &binaries).await?;
-            println!(
-                "started lionclaw with runtime {} ({} channels)",
-                args.runtime,
-                applied.lockfile.channels.len()
-            );
+        Command::Run(args) => {
+            run_local(&home, args.runtime).await?;
         }
-        Command::Down => {
-            let manager = SystemdUserServiceManager;
-            down(&home, &manager).await?;
-            println!("stopped managed LionClaw services");
-        }
-        Command::Status => {
-            let manager = SystemdUserServiceManager;
-            let stack = status(&home, &manager).await?;
-            println!("daemon: {}", stack.daemon_status);
-            for channel in stack.channels {
+        Command::Runtime { command } => match command {
+            RuntimeCommand::Add(args) => {
+                let executable = normalize_executable(&args.executable)?;
+                let profile = build_runtime_profile(&args, executable)?;
+                let mut config = OperatorConfig::load(&home).await?;
+                config.upsert_runtime(args.id.clone(), profile);
+                config.save(&home).await?;
+                println!("configured runtime {}", args.id);
+            }
+            RuntimeCommand::Rm(args) => {
+                let mut config = OperatorConfig::load(&home).await?;
+                let removed = config.remove_runtime(&args.id);
+                config.save(&home).await?;
                 println!(
-                    "channel={} skill={} binding={} unit={} peers(pending={},approved={},blocked={}) inbound={} outbound={}",
-                    channel.id,
-                    channel.skill,
-                    channel.binding_enabled,
-                    channel.unit_status,
-                    channel.pending_peers,
-                    channel.approved_peers,
-                    channel.blocked_peers,
-                    channel.latest_inbound_at.as_deref().unwrap_or("-"),
-                    channel.latest_outbound_at.as_deref().unwrap_or("-"),
+                    "{} {}",
+                    if removed { "removed" } else { "left unchanged" },
+                    args.id
                 );
             }
-        }
-        Command::Logs(args) => {
+            RuntimeCommand::Ls => {
+                let config = OperatorConfig::load(&home).await?;
+                if config.runtimes.is_empty() {
+                    println!("no runtimes configured");
+                } else {
+                    for (id, profile) in &config.runtimes {
+                        let marker = if config.defaults.runtime.as_deref() == Some(id.as_str()) {
+                            "*"
+                        } else {
+                            " "
+                        };
+                        println!(
+                            "{} {} kind={} bin={}",
+                            marker,
+                            id,
+                            profile.kind(),
+                            profile.executable()
+                        );
+                    }
+                }
+            }
+            RuntimeCommand::SetDefault(args) => {
+                let mut config = OperatorConfig::load(&home).await?;
+                config.set_default_runtime(&args.id)?;
+                config.save(&home).await?;
+                println!("default runtime set to {}", args.id);
+            }
+        },
+        Command::Service { command } => {
             let manager = SystemdUserServiceManager;
-            let output = logs(&home, &manager, args.lines).await?;
-            print!("{output}");
+            match command {
+                ServiceCommand::Up(args) => {
+                    let config = OperatorConfig::load(&home).await?;
+                    let runtime_id = resolve_runtime_id(&config, args.runtime.as_deref())?;
+                    let binaries = resolve_stack_binaries()?;
+                    let applied = up(&home, &manager, &runtime_id, &binaries).await?;
+                    println!(
+                        "started LionClaw services with runtime {} ({} channels)",
+                        runtime_id,
+                        applied.lockfile.channels.len()
+                    );
+                }
+                ServiceCommand::Down => {
+                    down(&home, &manager).await?;
+                    println!("stopped managed LionClaw services");
+                }
+                ServiceCommand::Status => {
+                    let stack = status(&home, &manager).await?;
+                    println!("daemon: {}", stack.daemon_status);
+                    for channel in stack.channels {
+                        println!(
+                            "channel={} skill={} binding={} unit={} peers(pending={},approved={},blocked={}) inbound={} outbound={}",
+                            channel.id,
+                            channel.skill,
+                            channel.binding_enabled,
+                            channel.unit_status,
+                            channel.pending_peers,
+                            channel.approved_peers,
+                            channel.blocked_peers,
+                            channel.latest_inbound_at.as_deref().unwrap_or("-"),
+                            channel.latest_outbound_at.as_deref().unwrap_or("-"),
+                        );
+                    }
+                }
+                ServiceCommand::Logs(args) => {
+                    let output = logs(&home, &manager, args.lines).await?;
+                    print!("{output}");
+                }
+            }
         }
         Command::Skill { command } => match command {
             SkillCommand::Add(args) => {
@@ -217,44 +333,99 @@ pub async fn run() -> Result<()> {
                     args.id
                 );
             }
-        },
-        Command::Pairing { command } => match command {
-            PairingCommand::List(args) => {
-                for peer in pairing_list(&home, args.channel_id).await? {
+            ChannelCommand::Pairing { command } => match command {
+                ChannelPairingCommand::List(args) => {
+                    for peer in pairing_list(&home, args.channel_id).await? {
+                        println!(
+                            "channel={} peer={} status={} trust={} code={}",
+                            peer.channel_id,
+                            peer.peer_id,
+                            peer.status,
+                            peer.trust_tier.as_str(),
+                            peer.pairing_code.as_deref().unwrap_or("-"),
+                        );
+                    }
+                }
+                ChannelPairingCommand::Approve(args) => {
+                    let trust_tier =
+                        TrustTier::from_str(&args.trust_tier).map_err(anyhow::Error::msg)?;
+                    let peer = pairing_approve(
+                        &home,
+                        args.channel_id,
+                        args.peer_id,
+                        args.pairing_code,
+                        trust_tier,
+                    )
+                    .await?;
                     println!(
-                        "channel={} peer={} status={} trust={} code={}",
-                        peer.channel_id,
-                        peer.peer_id,
-                        peer.status,
-                        peer.trust_tier.as_str(),
-                        peer.pairing_code.as_deref().unwrap_or("-"),
+                        "approved {}:{} ({})",
+                        peer.peer.channel_id,
+                        peer.peer.peer_id,
+                        peer.peer.trust_tier.as_str()
                     );
                 }
-            }
-            PairingCommand::Approve(args) => {
-                let trust_tier =
-                    TrustTier::from_str(&args.trust_tier).map_err(anyhow::Error::msg)?;
-                let peer = pairing_approve(
-                    &home,
-                    args.channel_id,
-                    args.peer_id,
-                    args.pairing_code,
-                    trust_tier,
-                )
-                .await?;
-                println!(
-                    "approved {}:{} ({})",
-                    peer.peer.channel_id,
-                    peer.peer.peer_id,
-                    peer.peer.trust_tier.as_str()
-                );
-            }
-            PairingCommand::Block(args) => {
-                let peer = pairing_block(&home, args.channel_id, args.peer_id).await?;
-                println!("blocked {}:{}", peer.peer.channel_id, peer.peer.peer_id);
-            }
+                ChannelPairingCommand::Block(args) => {
+                    let peer = pairing_block(&home, args.channel_id, args.peer_id).await?;
+                    println!("blocked {}:{}", peer.peer.channel_id, peer.peer.peer_id);
+                }
+            },
         },
     }
 
+    Ok(())
+}
+
+fn build_runtime_profile(
+    args: &RuntimeAddArgs,
+    executable: String,
+) -> Result<RuntimeProfileConfig> {
+    match args.kind.trim() {
+        "codex" => {
+            reject_opencode_only_flags(args)?;
+            Ok(RuntimeProfileConfig::Codex {
+                executable,
+                model: args.model.clone(),
+                sandbox: args.sandbox.clone(),
+                skip_git_repo_check: !args.no_skip_git_repo_check,
+                ephemeral: !args.no_ephemeral,
+            })
+        }
+        "opencode" => {
+            reject_codex_only_flags(args)?;
+            Ok(RuntimeProfileConfig::OpenCode {
+                executable,
+                format: args.format.clone(),
+                model: args.model.clone(),
+                agent: args.agent.clone(),
+                xdg_data_home: args.xdg_data_home.clone(),
+                continue_last_session: args.continue_last_session,
+            })
+        }
+        other => Err(anyhow!(
+            "unsupported runtime kind '{}'; expected 'codex' or 'opencode'",
+            other
+        )),
+    }
+}
+
+fn reject_opencode_only_flags(args: &RuntimeAddArgs) -> Result<()> {
+    if args.agent.is_some()
+        || args.xdg_data_home.is_some()
+        || args.continue_last_session
+        || args.format != "json"
+    {
+        return Err(anyhow!(
+            "opencode-specific flags are not valid for kind 'codex'"
+        ));
+    }
+    Ok(())
+}
+
+fn reject_codex_only_flags(args: &RuntimeAddArgs) -> Result<()> {
+    if args.no_skip_git_repo_check || args.no_ephemeral || args.sandbox != "read-only" {
+        return Err(anyhow!(
+            "codex-specific flags are not valid for kind 'opencode'"
+        ));
+    }
     Ok(())
 }

@@ -9,23 +9,37 @@ use crate::{
     api::build_router,
     config::Config,
     kernel::{Kernel, KernelOptions},
+    operator::{config::OperatorConfig, runtime::register_configured_runtimes},
 };
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
     config.home.ensure_base_dirs().await?;
+    let operator_config = OperatorConfig::load(&config.home).await?;
+    let workspace_root = if std::env::var_os("LIONCLAW_WORKSPACE").is_some()
+        || std::env::var_os("LIONCLAW_WORKSPACE_ROOT").is_some()
+    {
+        config.workspace_root.clone()
+    } else {
+        operator_config.workspace_root(&config.home)
+    };
+    let default_runtime_id = config
+        .default_runtime_id
+        .clone()
+        .or_else(|| operator_config.defaults.runtime.clone());
 
     let kernel = Arc::new(
         Kernel::new_with_options(
             &config.db_path,
             KernelOptions {
                 runtime_turn_timeout: Duration::from_millis(config.runtime_turn_timeout_ms),
-                default_runtime_id: config.default_runtime_id.clone(),
-                workspace_root: Some(config.workspace_root.clone()),
+                default_runtime_id,
+                workspace_root: Some(workspace_root),
                 ..KernelOptions::default()
             },
         )
         .await?,
     );
+    register_configured_runtimes(&kernel, &operator_config).await?;
     let app = build_router(kernel);
 
     let listener = TcpListener::bind(&config.bind_addr)

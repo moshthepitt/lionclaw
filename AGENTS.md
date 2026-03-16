@@ -29,6 +29,15 @@ Contributors (human or AI) should follow the workflow and quality gates below.
 - Build tests as composable scenarios with reusable setup helpers.
 - When behavior changes, update tests and docs in the same change.
 
+## Product Lessons
+- LionClaw must have one obvious everyday command path.
+- `lionclaw run [runtime]` is the canonical interactive path.
+- Raw HTTP is for workers, tests, and debugging only; never document it as normal usage.
+- `systemd --user` is deployment/admin plumbing for background services and many channels, not the default local interactive path.
+- Runtime configuration must live in LionClaw state/config, not rely on accidental shell PATH or session env.
+- LionClaw owns the product entrypoint; runtimes are engines behind it.
+- Channels remain external skills/workers; do not absorb transport logic into Rust core to paper over UX gaps.
+
 ## Required Verification Commands
 Run from repository root before considering work complete:
 - `cargo fmt -- --check`

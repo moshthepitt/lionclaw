@@ -1,10 +1,11 @@
 # LionClaw
 
-LionClaw is a secure-first local agent kernel with an operator CLI.
+LionClaw is a secure-first local agent kernel with one canonical user path:
 
-- `lionclaw` manages installed state, services, pairing, and channels.
-- `lionclawd` runs the kernel daemon.
-- Runtime adapters remain replaceable: current built-ins are `mock`, `codex`, and `opencode`.
+- `lionclaw onboard`
+- `lionclaw run [runtime]`
+
+`lionclawd` still exists for supervised background operation, but normal interactive use goes through `lionclaw`, not raw HTTP or direct runtime CLI invocations.
 
 ## Why it exists
 
@@ -23,8 +24,8 @@ LionClaw provides:
 - Immutable skill snapshots under `~/.lionclaw/skills`
 - Workspace identity files under `~/.lionclaw/workspaces/main`
 - Prompt-envelope composition from identity files plus installed skill context
-- Channel bridge APIs for external worker skills
-- Linux `systemd --user` service generation through `lionclaw up`
+- A kernel-backed local REPL via `lionclaw run`
+- Background service management for channels via `lionclaw service ...`
 
 ## Quick start
 
@@ -40,6 +41,20 @@ Initialize local state:
 ./target/debug/lionclaw onboard
 ```
 
+Configure a runtime profile:
+
+```bash
+./target/debug/lionclaw runtime add codex --kind codex --bin /abs/path/to/codex
+```
+
+Use LionClaw interactively:
+
+```bash
+./target/debug/lionclaw run codex
+```
+
+## Channels and background mode
+
 Register a Telegram skill and channel:
 
 ```bash
@@ -47,17 +62,18 @@ Register a Telegram skill and channel:
 ./target/debug/lionclaw channel add telegram
 ```
 
-Apply desired state and start services with a runtime:
+Start the supervised stack for channels and automation:
 
 ```bash
-TELEGRAM_BOT_TOKEN=... ./target/debug/lionclaw up --runtime codex
+TELEGRAM_BOT_TOKEN=... ./target/debug/lionclaw service up --runtime codex
 ```
 
-Inspect the stack:
+Inspect or manage the background stack:
 
 ```bash
-./target/debug/lionclaw status
-./target/debug/lionclaw pairing list
+./target/debug/lionclaw service status
+./target/debug/lionclaw channel pairing list
+./target/debug/lionclaw service logs
 ```
 
 ## State layout
@@ -75,6 +91,10 @@ LionClaw defaults to `~/.lionclaw`:
 Override the root with `LIONCLAW_HOME`.
 
 ## Runtime config
+
+Runtime profiles live in `~/.lionclaw/config/lionclaw.toml`.
+
+Compatibility env vars still exist for low-level/manual use and temporary migration:
 
 - `LIONCLAW_DEFAULT_RUNTIME_ID`
 - `LIONCLAW_CODEX_BIN`

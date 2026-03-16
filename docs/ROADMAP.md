@@ -13,7 +13,7 @@ Status key:
 
 - [x] Record binary-install + runtime-agnostic target model in
       `docs/BINARY_RUNTIME_AGNOSTIC_MODEL.md`.
-- [x] Keep runtime selection at startup (`lionclaw up`), not channel install/bind.
+- [x] Keep runtime selection at invocation (`lionclaw run` / `lionclaw service up`), not channel install/bind.
 - [ ] Keep channel integrations as external skill workers, never built-in channel transport.
 - [ ] Move all installed-state assumptions to `~/.lionclaw` (no repo-path coupling).
 

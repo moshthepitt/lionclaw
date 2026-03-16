@@ -13,6 +13,9 @@ use crate::{
             normalize_local_source, ManagedChannelConfig, ManagedSkillConfig, OperatorConfig,
         },
         lockfile::{LockedChannel, LockedSkill, OperatorLockfile},
+        runtime::{
+            register_configured_runtimes, runtime_service_env, validate_runtime_availability,
+        },
         services::{
             channel_unit_name, render_channel_unit, render_daemon_unit, ChannelServiceSpec,
             ManagedServiceUnit, ServiceManager, DAEMON_UNIT_NAME,
@@ -115,7 +118,7 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
     bootstrap_workspace(&config.workspace_root(home)).await?;
     let previous_lock = OperatorLockfile::load(home).await?;
 
-    let kernel = open_kernel(home, &config).await?;
+    let kernel = open_kernel(home, &config, None).await?;
     let mut next_lock = OperatorLockfile::default();
     let mut installed_skills = BTreeMap::new();
 
@@ -245,6 +248,7 @@ pub async fn up<M: ServiceManager>(
 ) -> Result<ApplyResult> {
     let previous_units = managed_unit_names(home)?;
     let applied = apply(home).await?;
+    validate_runtime_availability(&applied.config, runtime_id)?;
     render_runtime_cache(home, &applied.config, &applied.lockfile, runtime_id).await?;
     let units = build_managed_units(
         home,
@@ -281,7 +285,7 @@ pub async fn down<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Result
 pub async fn status<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Result<StackStatus> {
     let config = OperatorConfig::load(home).await?;
     let lockfile = OperatorLockfile::load(home).await?;
-    let kernel = open_kernel(home, &config).await?;
+    let kernel = open_kernel(home, &config, None).await?;
 
     let mut channels = Vec::new();
     for channel in &lockfile.channels {
@@ -329,7 +333,7 @@ pub async fn pairing_list(
     channel_id: Option<String>,
 ) -> Result<Vec<crate::contracts::ChannelPeerView>> {
     let config = OperatorConfig::load(home).await?;
-    let kernel = open_kernel(home, &config).await?;
+    let kernel = open_kernel(home, &config, None).await?;
     let peers = kernel
         .list_channel_peers(channel_id)
         .await
@@ -345,7 +349,7 @@ pub async fn pairing_approve(
     trust_tier: TrustTier,
 ) -> Result<ChannelPeerResponse> {
     let config = OperatorConfig::load(home).await?;
-    let kernel = open_kernel(home, &config).await?;
+    let kernel = open_kernel(home, &config, None).await?;
     kernel
         .approve_channel_peer(ChannelPeerApproveRequest {
             channel_id,
@@ -363,7 +367,7 @@ pub async fn pairing_block(
     peer_id: String,
 ) -> Result<ChannelPeerResponse> {
     let config = OperatorConfig::load(home).await?;
-    let kernel = open_kernel(home, &config).await?;
+    let kernel = open_kernel(home, &config, None).await?;
     kernel
         .block_channel_peer(crate::contracts::ChannelPeerBlockRequest {
             channel_id,
@@ -394,12 +398,14 @@ fn build_managed_units(
     binaries: &StackBinaryPaths,
 ) -> Result<Vec<ManagedServiceUnit>> {
     let mut units = Vec::new();
+    let daemon_runtime_env = runtime_service_env(config, runtime_id)?;
     units.push(render_daemon_unit(
         home,
         &binaries.daemon_bin,
         &config.daemon.bind,
         runtime_id,
         &config.daemon.workspace,
+        &daemon_runtime_env,
     ));
 
     let base_url = base_url_from_bind(&config.daemon.bind);
@@ -458,7 +464,7 @@ fn build_managed_units(
     Ok(units)
 }
 
-async fn render_runtime_cache(
+pub(crate) async fn render_runtime_cache(
     home: &LionClawHome,
     config: &OperatorConfig,
     lockfile: &OperatorLockfile,
@@ -572,16 +578,22 @@ fn managed_unit_names(home: &LionClawHome) -> Result<Vec<String>> {
     Ok(units)
 }
 
-async fn open_kernel(home: &LionClawHome, config: &OperatorConfig) -> Result<Kernel> {
-    Kernel::new_with_options(
+pub(crate) async fn open_kernel(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+    default_runtime_id: Option<String>,
+) -> Result<Kernel> {
+    let kernel = Kernel::new_with_options(
         &home.db_path(),
         KernelOptions {
-            default_runtime_id: None,
+            default_runtime_id: default_runtime_id.or_else(|| config.defaults.runtime.clone()),
             workspace_root: Some(config.workspace_root(home)),
             ..KernelOptions::default()
         },
     )
-    .await
+    .await?;
+    register_configured_runtimes(&kernel, config).await?;
+    Ok(kernel)
 }
 
 fn to_anyhow(err: crate::kernel::KernelError) -> anyhow::Error {
@@ -597,7 +609,9 @@ mod tests {
         home::LionClawHome,
         kernel::{Kernel, KernelOptions},
         operator::{
-            config::{ManagedChannelConfig, ManagedSkillConfig, OperatorConfig},
+            config::{
+                ManagedChannelConfig, ManagedSkillConfig, OperatorConfig, RuntimeProfileConfig,
+            },
             lockfile::OperatorLockfile,
             services::FakeServiceManager,
         },
@@ -628,6 +642,14 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         onboard(&home).await.expect("onboard");
+        let runtime_stub = temp_dir.path().join("codex-stub.sh");
+        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(&runtime_stub, permissions).expect("chmod runtime stub");
+        }
 
         let skill_source = temp_dir.path().join("channel-telegram");
         fs::create_dir_all(skill_source.join("scripts")).expect("skill dir");
@@ -643,6 +665,18 @@ mod tests {
         .expect("worker");
 
         let config = OperatorConfig {
+            runtimes: [(
+                "codex".to_string(),
+                RuntimeProfileConfig::Codex {
+                    executable: runtime_stub.to_string_lossy().to_string(),
+                    model: None,
+                    sandbox: "read-only".to_string(),
+                    skip_git_repo_check: true,
+                    ephemeral: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
             skills: vec![ManagedSkillConfig {
                 alias: "telegram".to_string(),
                 source: skill_source.to_string_lossy().to_string(),
