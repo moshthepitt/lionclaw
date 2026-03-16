@@ -11,7 +11,7 @@ Options:
   --channel-id ID        Channel ID to bind (default: telegram)
   --skill-source PATH    Skill source path (default: skills/channel-telegram)
   --skill-ref REF        Skill reference (default: local)
-  --runtime-id ID        Runtime ID to set in bind config (default: codex, use "" to omit)
+  --runtime-id ID        Optional runtime override to set in bind config and worker env (default: omitted)
   --start-worker         Start <skill-source>/scripts/worker.sh after install+bind
   -h, --help             Show help
 
@@ -40,7 +40,7 @@ BASE_URL="${BASE_URL:-http://127.0.0.1:8979}"
 CHANNEL_ID="${CHANNEL_ID:-telegram}"
 SKILL_SOURCE="${SKILL_SOURCE:-skills/channel-telegram}"
 SKILL_REF="${SKILL_REF:-local}"
-RUNTIME_ID="${RUNTIME_ID:-codex}"
+RUNTIME_ID="${RUNTIME_ID:-}"
 START_WORKER=false
 
 while [[ $# -gt 0 ]]; do
@@ -106,7 +106,13 @@ echo "Installed skill: $SKILL_ID"
 echo "$BIND_RESP" | jq
 echo
 echo "Pairing check command:"
-echo "  curl -sS \"$BASE_URL/v0/channels/peers?channel_id=$CHANNEL_ID\" | jq"
+echo "  lionclaw channel pairing list --channel-id $CHANNEL_ID"
+
+if [[ -z "$RUNTIME_ID" ]]; then
+  echo
+  echo "Runtime selection:"
+  echo "  use 'lionclaw service up --runtime <id>' for the normal managed flow"
+fi
 
 if [[ "$START_WORKER" == true ]]; then
   WORKER="$SKILL_SOURCE/scripts/worker.sh"
@@ -120,7 +126,9 @@ if [[ "$START_WORKER" == true ]]; then
 
   export LIONCLAW_BASE_URL="$BASE_URL"
   export LIONCLAW_CHANNEL_ID="$CHANNEL_ID"
-  export LIONCLAW_RUNTIME_ID="$RUNTIME_ID"
+  if [[ -n "$RUNTIME_ID" ]]; then
+    export LIONCLAW_RUNTIME_ID="$RUNTIME_ID"
+  fi
 
   echo
   echo "Starting worker: $WORKER"

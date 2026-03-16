@@ -24,18 +24,17 @@ This skill does not modify LionClaw kernel code. It runs an external worker that
 
 ## Setup
 
-1. Install + enable a LionClaw skill to bind to channel `telegram`.
-2. Bind the channel to the enabled skill:
+1. Register the skill and channel:
 
-```json
-{
-  "channel_id": "telegram",
-  "skill_id": "<enabled-skill-id>",
-  "enabled": true,
-  "config": {
-    "runtime_id": "codex"
-  }
-}
+```bash
+lionclaw skill add skills/channel-telegram --alias telegram
+lionclaw channel add telegram
+```
+
+2. Start the LionClaw daemon or managed service stack:
+
+```bash
+lionclaw service up --runtime codex
 ```
 
 3. Run the worker script:
@@ -50,4 +49,5 @@ LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
 
 - Peer pairing remains kernel-enforced (`pending` -> `approved` via `/v0/channels/peers/approve`).
 - `peer_id` is Telegram `chat.id` serialized as string.
+- Runtime selection normally comes from the daemon or `lionclaw service up --runtime ...`. `LIONCLAW_RUNTIME_ID` is an optional per-worker override for low-level testing.
 - The worker stores Telegram offset in `.lionclaw-telegram-offset` by default.
