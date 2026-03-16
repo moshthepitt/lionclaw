@@ -44,7 +44,7 @@ Initialize local state:
 Configure a runtime profile:
 
 ```bash
-./target/debug/lionclaw runtime add codex --kind codex --bin /abs/path/to/codex
+./target/debug/lionclaw runtime add codex --kind codex --bin codex
 ```
 
 Use LionClaw interactively:

@@ -73,7 +73,7 @@ Under the hood, LionClaw uses platform service managers (systemd --user / launch
 Expected user flow:
 
 1. `lionclaw onboard`
-2. `lionclaw runtime add codex --kind codex --bin /abs/path/to/codex`
+2. `lionclaw runtime add codex --kind codex --bin codex`
 3. `lionclaw run codex`
 
 Background/channel deployment remains explicit admin flow:

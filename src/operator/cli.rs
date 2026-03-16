@@ -87,7 +87,7 @@ struct RuntimeAddArgs {
     id: String,
     #[arg(long)]
     kind: String,
-    #[arg(long = "bin")]
+    #[arg(long = "bin", help = "Runtime command name or executable path")]
     executable: String,
     #[arg(long)]
     model: Option<String>,

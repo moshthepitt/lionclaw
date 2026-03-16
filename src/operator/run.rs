@@ -257,7 +257,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             .await
             .expect_err("missing executable should error");
 
-        assert!(err.to_string().contains("configured runtime executable"));
+        assert!(err.to_string().contains("configured runtime command"));
     }
 
     #[cfg(unix)]
