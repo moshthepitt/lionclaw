@@ -5,15 +5,20 @@ description: Run and operate a local terminal/TUI channel for LionClaw using the
 
 # Terminal Channel Worker
 
-Use this skill when the user wants a proper terminal/TUI-backed local channel for LionClaw.
+Use this skill when the user wants a real terminal/TUI channel instead of the direct CLI path.
 
-This skill runs an external interactive worker that:
+What you run:
 
-1. reads terminal input from a local peer,
-2. posts inbound text to `/v0/channels/inbound`,
-3. long-polls `/v0/channels/stream/pull`,
-4. renders outbound `answer`, `reasoning`, `status`, and `error` events in separate terminal regions,
-5. advances its consumer cursor through `/v0/channels/stream/ack`.
+1. attach a terminal to LionClaw,
+2. type messages as a local peer,
+3. see answer, reasoning, status, and error lanes in separate regions.
+
+Under the hood, the worker:
+
+1. posts inbound text to `/v0/channels/inbound`,
+2. long-polls `/v0/channels/stream/pull`,
+3. renders typed outbound events in separate terminal regions,
+4. advances its consumer cursor through `/v0/channels/stream/ack`.
 
 ## Prerequisites
 

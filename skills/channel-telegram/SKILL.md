@@ -7,7 +7,13 @@ description: Run and operate a Telegram channel worker for LionClaw using the ke
 
 Use this skill when the user wants Telegram as a LionClaw channel.
 
-This skill runs an external worker that:
+What you run:
+
+1. start LionClaw in service mode,
+2. run the Telegram worker,
+3. let it bridge Telegram traffic into LionClaw.
+
+Under the hood, the worker:
 
 1. polls Telegram updates,
 2. posts inbound text to `/v0/channels/inbound`,

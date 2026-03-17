@@ -1,11 +1,13 @@
 # Scripts
 
-This directory contains low-level setup helpers for LionClaw.
+This directory contains the sharp tools.
 
 ## Why this exists
-Use these when you want direct control over channel install, bind, and worker startup. The normal path is the `lionclaw` CLI; these scripts are for manual setup, testing, and debugging.
+Most users should stay on the main `lionclaw` path.
 
-For normal operator flows, prefer the `lionclaw` CLI, with runtime selection handled at `lionclaw service up --runtime ...`.
+These scripts are here for the moments when you want direct control over install, bind, and worker startup. Manual setup. Debugging. Tight feedback loops.
+
+Use them when you mean it.
 
 ## Available scripts
 - `install-channel-skill.sh`: installs a channel skill, enables it, binds it to a channel, and optionally starts the channel worker. It prefers `scripts/worker` and falls back to legacy `scripts/worker.sh`.

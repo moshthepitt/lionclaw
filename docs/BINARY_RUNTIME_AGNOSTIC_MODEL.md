@@ -6,12 +6,14 @@ This document captures decisions we agreed to preserve while building LionClaw.
 
 ## Why this exists
 
-LionClaw should work as an installed CLI and background service, not only from a source checkout.
+LionClaw should behave like a real installed product.
+
+Not a repo ritual. Not a source-checkout trick. Not a one-runtime wrapper pretending to be a system.
 
 ## Non-negotiable decisions
 
 1. LionClaw is runtime-agnostic. `codex`, `claude-code`, `opencode`, and future runtimes are adapter choices, not product identity.
-2. Channels are skills. Transport workers (Telegram/Discord/etc.) are installed separately from the core CLI.
+2. Everything beyond the small core is a skill. Channels are one important case, not the exception.
 3. Runtime is selected at invocation (`lionclaw run` or `lionclaw service up`), not during `lionclaw channel add`.
 4. Identity/persona is runtime-independent and comes from workspace files (`IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md`).
 5. Anthropic `SKILL.md` stays unchanged as the skill instruction standard.
@@ -66,7 +68,7 @@ From the operator side, LionClaw has one normal interactive path plus explicit s
 - `lionclaw service status`
 - `lionclaw service logs`
 
-For background operation, LionClaw uses platform service managers (systemd --user / launchd / Windows equivalent) for restart and supervision.
+Background operation is explicit. If you want long-running channels and auto-restart, LionClaw uses the platform service manager for that job.
 
 ## CLI UX target
 

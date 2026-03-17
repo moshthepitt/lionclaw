@@ -1,31 +1,34 @@
 # LionClaw
 
-LionClaw gives you one CLI to run local AI workspaces, skills, and channels:
-
-- `lionclaw onboard`
-- `lionclaw run [runtime]`
-
-Use `lionclaw run` for normal interactive work. Use `lionclaw service ...` when you want background channels or automation.
+LionClaw is a local AI CLI for people who want power without handing the whole machine to a sprawling agent stack.
 
 ## Why it exists
 
-LionClaw keeps local AI setup understandable and controlled while making channels installable skills instead of built-in integrations.
+Most agent tools make the wrong tradeoff.
 
-- Default-deny capability policy
-- Built-in audit trail
-- Works with multiple runtimes through one CLI
-- Binary-installable state under `~/.lionclaw`
+They either grow into sprawling always-on systems you do not understand, or they stay thin and leave the model sitting too close to your machine.
+
+LionClaw takes a harder line. Keep the trusted core small. Put policy, audit, state, and runtime control there. Push everything else outward.
+
+That is the point of LionClaw:
+
+- one CLI you actually use
+- one small core you can reason about
+- everything beyond that core installed as a skill
+- background operation turned on only when you ask for it
+
+Channels are skills. Future capabilities are skills. The core stays small on purpose.
 
 ## What it does
 
 LionClaw provides:
 
-- SQLite-backed sessions, skills, policy, audit, and channel state
-- Immutable skill snapshots under `~/.lionclaw/skills`
-- Workspace identity files under `~/.lionclaw/workspaces/main`
-- Automatic runtime context from workspace identity files plus installed skill context
-- A local interactive path via `lionclaw run`
-- Background service management for channels via `lionclaw service ...`
+- one local entrypoint for interactive AI work through `lionclaw run`
+- immutable installed skills under `~/.lionclaw/skills`
+- workspace identity files under `~/.lionclaw/workspaces/main`
+- durable state for sessions, policy, audit, and channels
+- multiple runtime adapters behind one CLI
+- explicit service management for background channels and automation
 
 ## Quick start
 
@@ -55,7 +58,9 @@ Use LionClaw interactively:
 
 ## Channels and background mode
 
-For a local end-to-end channel test without Telegram, use the terminal channel skill:
+When you want a real channel instead of the direct CLI path, install one as a skill.
+
+For a local end-to-end test without Telegram, use the terminal channel skill:
 
 ```bash
 ./target/debug/lionclaw skill add skills/channel-terminal --alias terminal
@@ -63,7 +68,7 @@ For a local end-to-end channel test without Telegram, use the terminal channel s
 ./target/debug/lionclaw channel attach terminal --runtime codex
 ```
 
-`channel attach` opens the interactive worker in your current TTY. If needed, it starts the background service for you, begins at the current stream head, and prints the pairing code and approval command on first contact.
+`channel attach` opens the worker in your current TTY. If needed, it starts LionClaw for you, begins at the current stream head, and prints the pairing code and approval command on first contact.
 
 To run multiple local terminal channels at once, register multiple interactive channels and attach each one in its own terminal:
 
@@ -79,13 +84,13 @@ Register a Telegram skill and channel:
 ./target/debug/lionclaw channel add telegram
 ```
 
-Start the supervised stack for channels and automation:
+When you want channels or automation running in the background, use service mode:
 
 ```bash
 TELEGRAM_BOT_TOKEN=... ./target/debug/lionclaw service up --runtime codex
 ```
 
-Inspect or manage the background stack:
+Then inspect or manage it with:
 
 ```bash
 ./target/debug/lionclaw service status

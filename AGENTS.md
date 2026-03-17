@@ -40,6 +40,8 @@ Contributors (human or AI) should follow the workflow and quality gates below.
 - Product-facing docs must be command-first and readable without architecture context.
 - Internal implementation names such as `lionclawd`, `kernel`, and raw HTTP APIs should appear in product docs only when operationally necessary.
 - The README first screen must explain LionClaw in user terms and avoid “not X / not Y” framing.
+- Product-facing docs should lead with the problem, the stance, and the command the reader runs.
+- The README should preserve the core thesis: keep the trusted core small, and make everything beyond that core a skill.
 
 ## Required Verification Commands
 Run from repository root before considering work complete:
