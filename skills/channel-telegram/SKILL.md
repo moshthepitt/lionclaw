@@ -7,7 +7,7 @@ description: Run and operate a Telegram channel worker for LionClaw using the ke
 
 Use this skill when the user wants Telegram as a LionClaw channel.
 
-This skill does not modify LionClaw kernel code. It runs an external worker that:
+This skill runs an external worker that:
 
 1. polls Telegram updates,
 2. posts inbound text to `/v0/channels/inbound`,
@@ -20,7 +20,7 @@ This skill does not modify LionClaw kernel code. It runs an external worker that
 - `curl`
 - `jq`
 - Telegram bot token with DM access
-- Running LionClaw daemon (default `http://127.0.0.1:8979`)
+- LionClaw running (default `http://127.0.0.1:8979`)
 
 ## Setup
 
@@ -31,7 +31,7 @@ lionclaw skill add skills/channel-telegram --alias telegram
 lionclaw channel add telegram
 ```
 
-2. Start the LionClaw daemon or managed service stack:
+2. Start LionClaw for background channels:
 
 ```bash
 lionclaw service up --runtime codex
@@ -47,8 +47,8 @@ LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
 
 ## Notes
 
-- Peer pairing remains kernel-enforced (`pending` -> `approved` via `/v0/channels/peers/approve`).
+- Peer pairing stays enforced by LionClaw (`pending` -> `approved` via `/v0/channels/peers/approve`).
 - `peer_id` is Telegram `chat.id` serialized as string.
 - The worker defaults `consumer_id` to `telegram:<channel_id>` and `start_mode=resume`, so undelivered stream events are replayed after worker restart.
-- Runtime selection normally comes from the daemon or `lionclaw service up --runtime ...`. `LIONCLAW_RUNTIME_ID` is an optional per-worker override for low-level testing.
+- Runtime selection normally comes from `lionclaw service up --runtime ...`. `LIONCLAW_RUNTIME_ID` is an optional per-worker override for low-level testing.
 - The worker stores Telegram offset in `.lionclaw-telegram-offset` by default.

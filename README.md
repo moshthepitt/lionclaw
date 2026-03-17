@@ -1,19 +1,19 @@
 # LionClaw
 
-LionClaw is a secure-first local agent kernel with one canonical user path:
+LionClaw gives you one CLI to run local AI workspaces, skills, and channels:
 
 - `lionclaw onboard`
 - `lionclaw run [runtime]`
 
-`lionclawd` still exists for supervised background operation, but normal interactive use goes through `lionclaw`, not raw HTTP or direct runtime CLI invocations.
+Use `lionclaw run` for normal interactive work. Use `lionclaw service ...` when you want background channels or automation.
 
 ## Why it exists
 
-LionClaw keeps the core small and auditable while making channels installable skills instead of built-in transport code.
+LionClaw keeps local AI setup understandable and controlled while making channels installable skills instead of built-in integrations.
 
-- Default-deny policy checks
-- Kernel-owned audit trail
-- Runtime-agnostic control plane
+- Default-deny capability policy
+- Built-in audit trail
+- Works with multiple runtimes through one CLI
 - Binary-installable state under `~/.lionclaw`
 
 ## What it does
@@ -23,8 +23,8 @@ LionClaw provides:
 - SQLite-backed sessions, skills, policy, audit, and channel state
 - Immutable skill snapshots under `~/.lionclaw/skills`
 - Workspace identity files under `~/.lionclaw/workspaces/main`
-- Prompt-envelope composition from identity files plus installed skill context
-- A kernel-backed local REPL via `lionclaw run`
+- Automatic runtime context from workspace identity files plus installed skill context
+- A local interactive path via `lionclaw run`
 - Background service management for channels via `lionclaw service ...`
 
 ## Quick start
@@ -63,7 +63,7 @@ For a local end-to-end channel test without Telegram, use the terminal channel s
 ./target/debug/lionclaw channel attach terminal --runtime codex
 ```
 
-`channel attach` runs the interactive worker in your current TTY. It will ensure the daemon is running, start from the current stream head, and print the pairing code and approval command on first contact.
+`channel attach` opens the interactive worker in your current TTY. If needed, it starts the background service for you, begins at the current stream head, and prints the pairing code and approval command on first contact.
 
 To run multiple local terminal channels at once, register multiple interactive channels and attach each one in its own terminal:
 
@@ -111,7 +111,7 @@ Override the root with `LIONCLAW_HOME`.
 
 Runtime profiles live in `~/.lionclaw/config/lionclaw.toml`.
 
-Compatibility env vars still exist for low-level/manual use and temporary migration:
+These env vars are still supported for manual setup and migration:
 
 - `LIONCLAW_DEFAULT_RUNTIME_ID`
 - `LIONCLAW_CODEX_BIN`

@@ -37,6 +37,9 @@ Contributors (human or AI) should follow the workflow and quality gates below.
 - Runtime configuration must live in LionClaw state/config, not rely on accidental shell PATH or session env.
 - LionClaw owns the product entrypoint; runtimes are engines behind it.
 - Channels remain external skills/workers; do not absorb transport logic into Rust core to paper over UX gaps.
+- Product-facing docs must be command-first and readable without architecture context.
+- Internal implementation names such as `lionclawd`, `kernel`, and raw HTTP APIs should appear in product docs only when operationally necessary.
+- The README first screen must explain LionClaw in user terms and avoid “not X / not Y” framing.
 
 ## Required Verification Commands
 Run from repository root before considering work complete:

@@ -6,14 +6,14 @@ This document captures decisions we agreed to preserve while building LionClaw.
 
 ## Why this exists
 
-LionClaw is a kernel/control plane that should work when installed as binaries on a machine that does not have this source repository.
+LionClaw should work as an installed CLI and background service, not only from a source checkout.
 
 ## Non-negotiable decisions
 
 1. LionClaw is runtime-agnostic. `codex`, `claude-code`, `opencode`, and future runtimes are adapter choices, not product identity.
-2. Channels are skills. Transport workers (Telegram/Discord/etc.) live outside kernel Rust code.
+2. Channels are skills. Transport workers (Telegram/Discord/etc.) are installed separately from the core CLI.
 3. Runtime is selected at invocation (`lionclaw run` or `lionclaw service up`), not during `lionclaw channel add`.
-4. Identity/persona is kernel-owned and runtime-independent via workspace files (`IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md`).
+4. Identity/persona is runtime-independent and comes from workspace files (`IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md`).
 5. Anthropic `SKILL.md` stays unchanged as the skill instruction standard.
 6. Security controls stay in kernel policy/sandbox/audit, never in prompt-only logic.
 
@@ -32,7 +32,7 @@ No runtime flow should depend on repository-relative paths.
 
 ## Identity and prompt envelope
 
-Per turn, kernel composes a runtime-agnostic prompt envelope from:
+Per turn, LionClaw composes a runtime-agnostic prompt envelope from:
 
 1. kernel safety/system sections,
 2. workspace identity files (`IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md`),
@@ -50,14 +50,14 @@ Adapters receive the assembled envelope; they do not own persona.
 
 ## Process and service model
 
-Default secure deployment:
+Default background deployment:
 
-1. one `lionclawd` kernel process,
+1. one `lionclawd` process,
 2. one worker process per active channel account (or strict trust boundary).
 
-This may mean many processes (example: 13 channels + kernel). That is acceptable for isolation.
+This may mean many processes (example: 13 channels plus the background service). That is acceptable for isolation.
 
-Operationally, users get one interactive path plus explicit admin control through `lionclaw`:
+From the operator side, LionClaw has one normal interactive path plus explicit service commands:
 
 - `lionclaw run [runtime]` (interactive local use)
 - `lionclaw apply` (reconcile desired state)
@@ -66,17 +66,17 @@ Operationally, users get one interactive path plus explicit admin control throug
 - `lionclaw service status`
 - `lionclaw service logs`
 
-Under the hood, LionClaw uses platform service managers (systemd --user / launchd / Windows equivalent) for restart and supervision.
+For background operation, LionClaw uses platform service managers (systemd --user / launchd / Windows equivalent) for restart and supervision.
 
 ## CLI UX target
 
-Expected user flow:
+Normal user flow:
 
 1. `lionclaw onboard`
 2. `lionclaw runtime add codex --kind codex --bin codex`
 3. `lionclaw run codex`
 
-Background/channel deployment remains explicit admin flow:
+Background channels remain an explicit service flow:
 
 1. `lionclaw skill add <source>`
 2. `lionclaw channel add telegram`
@@ -89,7 +89,7 @@ Interactive channel skills stay explicit too:
 2. `lionclaw channel add terminal --launch interactive`
 3. `lionclaw channel attach terminal`
 
-Interactive channels are foreground-only. They are attached through the current TTY, use ephemeral tail-only consumers, and are not managed by `lionclaw service up`.
+Interactive channels are foreground-only. They attach to the current TTY, use ephemeral tail-only consumers, and are not managed by `lionclaw service up`.
 
 No manual API choreography should be required for normal usage or operator flows.
 

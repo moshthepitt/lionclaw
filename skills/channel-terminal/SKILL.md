@@ -7,7 +7,7 @@ description: Run and operate a local terminal/TUI channel for LionClaw using the
 
 Use this skill when the user wants a proper terminal/TUI-backed local channel for LionClaw.
 
-This skill stays outside LionClaw kernel code. It runs an external interactive worker that:
+This skill runs an external interactive worker that:
 
 1. reads terminal input from a local peer,
 2. posts inbound text to `/v0/channels/inbound`,
@@ -19,7 +19,7 @@ This skill stays outside LionClaw kernel code. It runs an external interactive w
 
 - `python3`
 - `uv`
-- Running LionClaw daemon (default `http://127.0.0.1:8979`)
+- A configured LionClaw runtime if `channel attach` needs to start LionClaw for you
 
 ## Setup
 
@@ -36,12 +36,12 @@ lionclaw channel add terminal --launch interactive
 lionclaw channel attach terminal
 ```
 
-If LionClaw is not already running, `channel attach` will ensure the daemon is started using the default runtime, or the runtime passed with `--runtime`.
+If LionClaw is not already running, `channel attach` will start it using the default runtime, or the runtime passed with `--runtime`.
 
 ## Notes
 
-- Pairing remains kernel-enforced. The TUI shows pending pairing state and the exact approval command to run through `lionclaw channel pairing approve ...`.
+- Pairing stays enforced by LionClaw. The TUI shows pending pairing state and the exact approval command to run through `lionclaw channel pairing approve ...`.
 - The worker defaults to `channel_id=terminal` and `peer_id=$USER` (falling back to `$USERNAME` or `local-user`).
 - `channel attach` uses an ephemeral consumer id and `start_mode=tail`, so each attach session starts from the current stream head instead of replaying old output from previous sessions.
-- Runtime selection normally comes from the daemon or `lionclaw channel attach <id> --runtime ...` when the daemon must be started.
+- Runtime selection normally comes from the running LionClaw service or `lionclaw channel attach <id> --runtime ...` when attach needs to start it.
 - The legacy shell worker is kept only as a debug harness in `scripts/debug-worker.sh`.
