@@ -43,6 +43,12 @@ lionclaw channel attach terminal
 
 If LionClaw is not already running, `channel attach` will start it using the default runtime, or the runtime passed with `--runtime`.
 
+For repeated manual testing, you can use the repo helper:
+
+```bash
+./scripts/attach-terminal-test.sh /tmp/lionclaw-terminal-e2e
+```
+
 ## Notes
 
 - Pairing stays enforced by LionClaw. The TUI shows pending pairing state and the exact approval command to run through `lionclaw channel pairing approve ...`.

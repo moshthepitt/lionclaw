@@ -11,6 +11,7 @@ Use them when you mean it.
 
 ## Available scripts
 - `install-channel-skill.sh`: installs a channel skill, enables it, binds it to a channel, and optionally starts the channel worker. It prefers `scripts/worker` and falls back to legacy `scripts/worker.sh`.
+- `attach-terminal-test.sh`: rebuilds LionClaw, stops managed services for a specific `LIONCLAW_HOME`, and attaches the interactive terminal channel in the current TTY.
 
 ## Usage
 Prerequisites:
@@ -44,4 +45,14 @@ Optional low-level per-worker runtime override:
 Show options:
 ```bash
 ./scripts/install-channel-skill.sh --help
+```
+
+Rebuild + restart + attach the terminal test channel:
+```bash
+./scripts/attach-terminal-test.sh /tmp/lionclaw-terminal-e2e
+```
+
+Override the runtime or channel:
+```bash
+./scripts/attach-terminal-test.sh /tmp/lionclaw-terminal-e2e codex terminal
 ```
