@@ -43,6 +43,12 @@ lionclaw channel attach terminal
 
 If LionClaw is not already running, `channel attach` will start it using the default runtime, or the runtime passed with `--runtime`.
 
+For a fresh manual test home in one command:
+
+```bash
+./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e
+```
+
 For repeated manual testing, you can use the repo helper:
 
 ```bash

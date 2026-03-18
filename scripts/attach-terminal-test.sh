@@ -59,6 +59,8 @@ runtime_id="${2:-$(resolve_default_runtime)}"
 printf 'Using LIONCLAW_HOME=%s\n' "$LIONCLAW_HOME"
 printf 'Using runtime=%s channel=%s\n' "$runtime_id" "$channel_id"
 
-cargo build --bins
+if [[ "${LIONCLAW_SKIP_BUILD:-0}" != "1" ]]; then
+  cargo build --bins
+fi
 "./target/debug/lionclaw" service down
 exec "./target/debug/lionclaw" channel attach "$channel_id" --runtime "$runtime_id"

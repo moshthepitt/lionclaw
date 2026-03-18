@@ -63,6 +63,14 @@ When you want a real channel instead of the direct CLI path, install one as a sk
 For a local end-to-end test without Telegram, use the terminal channel skill:
 
 ```bash
+./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e
+```
+
+That one command bootstraps a fresh test home, configures the terminal channel, and attaches it in your current TTY.
+
+If you prefer the underlying manual steps, they are:
+
+```bash
 ./target/debug/lionclaw skill add skills/channel-terminal --alias terminal
 ./target/debug/lionclaw channel add terminal --launch interactive
 ./target/debug/lionclaw channel attach terminal --runtime codex

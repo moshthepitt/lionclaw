@@ -10,6 +10,7 @@ These scripts are here for the moments when you want direct control over install
 Use them when you mean it.
 
 ## Available scripts
+- `bootstrap-terminal-test.sh`: bootstraps or refreshes a manual terminal-channel test home, configures the runtime and terminal channel, then attaches it in the current TTY.
 - `install-channel-skill.sh`: installs a channel skill, enables it, binds it to a channel, and optionally starts the channel worker. It prefers `scripts/worker` and falls back to legacy `scripts/worker.sh`.
 - `attach-terminal-test.sh`: rebuilds LionClaw, stops managed services for a specific `LIONCLAW_HOME`, and attaches the interactive terminal channel in the current TTY.
 
@@ -45,6 +46,16 @@ Optional low-level per-worker runtime override:
 Show options:
 ```bash
 ./scripts/install-channel-skill.sh --help
+```
+
+Fresh terminal-channel test home in one command:
+```bash
+./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e
+```
+
+Override the runtime id, command, or channel:
+```bash
+./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e work codex terminal
 ```
 
 Rebuild + restart + attach the terminal test channel:
