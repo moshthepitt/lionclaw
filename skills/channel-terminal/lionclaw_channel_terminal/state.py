@@ -40,6 +40,7 @@ class ChannelViewState:
     peer_id: str
     transcript: list[TranscriptEntry] = field(default_factory=list)
     reasoning_by_turn: dict[str, str] = field(default_factory=dict)
+    answer_started_by_turn: set[str] = field(default_factory=set)
     latest_reasoning_turn_id: str | None = None
     active_turn_id: str | None = None
     pending_submission: bool = False
@@ -61,6 +62,7 @@ class ChannelViewState:
         self.active_turn_id = turn_id
         self.latest_reasoning_turn_id = turn_id
         self.reasoning_by_turn.pop(turn_id, None)
+        self.answer_started_by_turn.discard(turn_id)
 
     def clear_pending_turn(self) -> None:
         self.pending_submission = False
@@ -75,10 +77,13 @@ class ChannelViewState:
             return
 
         if event.kind == "message_delta" and event.lane == "answer" and event.text:
+            self.answer_started_by_turn.add(event.turn_id)
             self._append_answer_delta(event.turn_id, event.text)
             return
 
         if event.kind == "message_delta" and event.lane == "reasoning" and event.text:
+            if event.turn_id in self.answer_started_by_turn:
+                return
             self.reasoning_by_turn[event.turn_id] = (
                 self.reasoning_by_turn.get(event.turn_id, "") + event.text
             )
@@ -134,6 +139,8 @@ class ChannelViewState:
         if self.active_turn_id is not None:
             content = self.reasoning_by_turn.get(self.active_turn_id, "")
             if not content:
+                if self.active_turn_id in self.answer_started_by_turn:
+                    return "No pre-answer reasoning for this turn."
                 return "Waiting for reasoning for this turn..."
             return "\n".join(_prefix_lines("thinking> ", content))
 

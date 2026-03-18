@@ -74,6 +74,52 @@ class ChannelViewStateTests(unittest.TestCase):
         self.assertEqual(state.reasoning_text(), "Waiting to queue this turn...")
         self.assertTrue(state.input_disabled())
 
+    def test_answer_without_reasoning_replaces_waiting_placeholder(self):
+        state = ChannelViewState(peer_id="mosh")
+        state.begin_submit("hello")
+        state.mark_queued("turn-1")
+
+        state.apply_stream_event(
+            StreamEvent(
+                sequence=1,
+                peer_id="mosh",
+                turn_id="turn-1",
+                kind="message_delta",
+                lane="answer",
+                text="hello back",
+            )
+        )
+
+        self.assertEqual(state.reasoning_text(), "No pre-answer reasoning for this turn.")
+
+    def test_reasoning_after_answer_is_suppressed_for_active_turn(self):
+        state = ChannelViewState(peer_id="mosh")
+        state.begin_submit("hello")
+        state.mark_queued("turn-1")
+
+        state.apply_stream_event(
+            StreamEvent(
+                sequence=1,
+                peer_id="mosh",
+                turn_id="turn-1",
+                kind="message_delta",
+                lane="answer",
+                text="hello back",
+            )
+        )
+        state.apply_stream_event(
+            StreamEvent(
+                sequence=2,
+                peer_id="mosh",
+                turn_id="turn-1",
+                kind="message_delta",
+                lane="reasoning",
+                text="late reasoning",
+            )
+        )
+
+        self.assertNotIn("late reasoning", state.reasoning_text())
+
 
 class _FailingApi:
     async def send_inbound(self, text: str) -> InboundResponse:
