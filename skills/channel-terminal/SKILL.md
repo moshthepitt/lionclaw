@@ -49,6 +49,8 @@ For a fresh manual test home in one command:
 ./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e
 ```
 
+That helper gives a fresh test home its own loopback bind, so it does not inherit state from another LionClaw daemon already running elsewhere on your machine.
+
 For repeated manual testing, you can use the repo helper:
 
 ```bash
@@ -57,9 +59,9 @@ For repeated manual testing, you can use the repo helper:
 
 ## Notes
 
-- Pairing stays enforced by LionClaw. The TUI shows pending pairing state and the exact approval command to run through `lionclaw channel pairing approve ...`.
+- LionClaw enforces pairing. The TUI shows pending pairing state and the exact approval command to run through `lionclaw channel pairing approve ...`.
 - The worker defaults to `channel_id=terminal` and `peer_id=$USER` (falling back to `$USERNAME` or `local-user`).
 - `channel attach` uses an ephemeral consumer id and `start_mode=tail`, so each attach session starts from the current stream head instead of replaying old output from previous sessions.
 - The TUI echoes your message immediately, shows a local pending state right away, and then follows live `queue.*` / `runtime.*` stream events for the active turn.
-- Runtime selection normally comes from the running LionClaw service or `lionclaw channel attach <id> --runtime ...` when attach needs to start it.
-- The legacy shell worker is kept only as a debug harness in `scripts/debug-worker.sh`.
+- Runtime selection normally comes from the running LionClaw service or `lionclaw channel attach <id> --runtime ...` when attach needs to start it. Attach only reuses a daemon when that daemon belongs to the same `LIONCLAW_HOME`.
+- A shell debug harness is available in `scripts/debug-worker.sh`.

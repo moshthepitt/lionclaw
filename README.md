@@ -17,7 +17,7 @@ That is the point of LionClaw:
 - everything beyond that core installed as a skill
 - background operation turned on only when you ask for it
 
-Channels are skills. Future capabilities are skills. The core stays small on purpose.
+Channels are skills. Future capabilities are skills. The core is small on purpose.
 
 ## What it does
 
@@ -66,7 +66,7 @@ For a local end-to-end test without Telegram, use the terminal channel skill:
 ./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e
 ```
 
-That one command bootstraps a fresh test home, configures the terminal channel, and attaches it in your current TTY.
+That one command bootstraps a fresh test home on its own loopback bind, configures the terminal channel, and attaches it in your current TTY.
 
 If you prefer the underlying manual steps, they are:
 
@@ -76,7 +76,7 @@ If you prefer the underlying manual steps, they are:
 ./target/debug/lionclaw channel attach terminal --runtime codex
 ```
 
-`channel attach` opens the worker in your current TTY. If needed, it starts LionClaw for you, begins at the current stream head, and prints the pairing code and approval command on first contact.
+`channel attach` opens the worker in your current TTY. If needed, it starts LionClaw for you, begins at the current stream head, and prints the pairing code and approval command on first contact. It only reuses a daemon when that daemon belongs to the same `LIONCLAW_HOME`.
 
 To run multiple local terminal channels at once, register multiple interactive channels and attach each one in its own terminal:
 
@@ -124,7 +124,7 @@ Override the root with `LIONCLAW_HOME`.
 
 Runtime profiles live in `~/.lionclaw/config/lionclaw.toml`.
 
-These env vars are still supported for manual setup and migration:
+Use these env vars for manual setup and migration:
 
 - `LIONCLAW_DEFAULT_RUNTIME_ID`
 - `LIONCLAW_CODEX_BIN`

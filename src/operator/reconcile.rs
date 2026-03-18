@@ -1,8 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
-
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use crate::{
     contracts::{ChannelBindRequest, ChannelPeerApproveRequest, ChannelPeerResponse, TrustTier},
@@ -13,13 +12,14 @@ use crate::{
             normalize_local_source, ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig,
             OperatorConfig,
         },
+        daemon_probe::{classify_daemon, DaemonClassification},
         lockfile::{LockedChannel, LockedSkill, OperatorLockfile},
         runtime::{
             register_configured_runtimes, runtime_service_env, validate_runtime_availability,
         },
         services::{
-            channel_unit_name, render_channel_unit, render_daemon_unit, ChannelServiceSpec,
-            ManagedServiceUnit, ServiceManager, DAEMON_UNIT_NAME,
+            channel_unit_name, render_channel_unit, render_daemon_unit, unit_status_is_active,
+            ChannelServiceSpec, ManagedServiceUnit, ServiceManager, DAEMON_UNIT_NAME,
         },
         snapshot::{install_snapshot, InstalledSnapshot},
     },
@@ -58,9 +58,19 @@ pub struct StackBinaryPaths {
     pub daemon_bin: PathBuf,
 }
 
-pub async fn onboard(home: &LionClawHome) -> Result<OperatorConfig> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnboardBindSelection {
+    Explicit(String),
+    Auto,
+}
+
+pub async fn onboard(
+    home: &LionClawHome,
+    bind_selection: Option<OnboardBindSelection>,
+) -> Result<OperatorConfig> {
     home.ensure_base_dirs().await?;
-    let config = OperatorConfig::load(home).await?;
+    let mut config = OperatorConfig::load(home).await?;
+    config.daemon.bind = resolve_onboard_bind(&config.daemon.bind, bind_selection.as_ref())?;
     bootstrap_workspace(&config.workspace_root(home)).await?;
     config.save(home).await?;
     OperatorLockfile::load(home).await?.save(home).await?;
@@ -251,6 +261,41 @@ pub async fn up<M: ServiceManager>(
     runtime_id: &str,
     binaries: &StackBinaryPaths,
 ) -> Result<ApplyResult> {
+    let config = OperatorConfig::load(home).await?;
+    let home_id = home.ensure_home_id().await?;
+    match classify_daemon(&config.daemon.bind, &home_id).await? {
+        DaemonClassification::Absent => {}
+        DaemonClassification::SameHome => {
+            let daemon_status = manager.unit_status(DAEMON_UNIT_NAME).await?;
+            if !unit_status_is_active(&daemon_status) {
+                return Err(anyhow!(
+                    "bind '{}' is already served by this LionClaw home, but not by the managed {} unit; stop the foreground daemon before running 'lionclaw service up'",
+                    config.daemon.bind,
+                    DAEMON_UNIT_NAME
+                ));
+            }
+        }
+        DaemonClassification::ForeignHome(info) => {
+            return Err(anyhow!(
+                "bind '{}' is already served by a different LionClaw home at '{}'; stop that daemon or choose a different bind",
+                config.daemon.bind,
+                info.home_root
+            ));
+        }
+        DaemonClassification::IncompatibleLionClaw => {
+            return Err(anyhow!(
+                "bind '{}' is already served by an older LionClaw daemon; restart that daemon before running 'lionclaw service up'",
+                config.daemon.bind
+            ));
+        }
+        DaemonClassification::UnknownListener => {
+            return Err(anyhow!(
+                "bind '{}' is already in use by a non-LionClaw listener",
+                config.daemon.bind
+            ));
+        }
+    }
+
     let previous_units = managed_unit_names(home)?;
     let applied = apply(home).await?;
     validate_runtime_availability(&applied.config, runtime_id)?;
@@ -278,8 +323,37 @@ pub async fn up<M: ServiceManager>(
         .map(|unit| unit.name.clone())
         .collect::<Vec<_>>();
     manager.apply_units(home, &units).await?;
-    manager.up_units(&unit_names).await?;
+    let mut units_to_start = Vec::new();
+    for unit_name in &unit_names {
+        let status = manager.unit_status(unit_name).await?;
+        if !unit_status_is_active(&status) {
+            units_to_start.push(unit_name.clone());
+        }
+    }
+    if !units_to_start.is_empty() {
+        manager.up_units(&units_to_start).await?;
+    }
     Ok(applied)
+}
+
+fn resolve_onboard_bind(
+    current_bind: &str,
+    selection: Option<&OnboardBindSelection>,
+) -> Result<String> {
+    match selection {
+        None => Ok(current_bind.to_string()),
+        Some(OnboardBindSelection::Explicit(bind)) => Ok(bind.trim().to_string()),
+        Some(OnboardBindSelection::Auto) => allocate_auto_bind(),
+    }
+}
+
+fn allocate_auto_bind() -> Result<String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .context("failed to allocate an automatic loopback bind")?;
+    let addr = listener
+        .local_addr()
+        .context("failed to read automatic bind address")?;
+    Ok(format!("127.0.0.1:{}", addr.port()))
 }
 
 pub async fn down<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Result<()> {
@@ -627,8 +701,14 @@ fn to_anyhow(err: crate::kernel::KernelError) -> anyhow::Error {
 mod tests {
     use std::fs;
 
-    use super::{apply, onboard, render_marker_file, up, ApplyResult, StackBinaryPaths};
+    use axum::{routing::get, Json, Router};
+    use serde_json::json;
+
+    use super::{
+        apply, onboard, render_marker_file, up, ApplyResult, OnboardBindSelection, StackBinaryPaths,
+    };
     use crate::{
+        contracts::DaemonInfoResponse,
         home::LionClawHome,
         kernel::{Kernel, KernelOptions},
         operator::{
@@ -637,19 +717,44 @@ mod tests {
                 RuntimeProfileConfig,
             },
             lockfile::OperatorLockfile,
-            services::{FakeServiceManager, ServiceManager},
+            services::{FakeServiceManager, ServiceManager, DAEMON_UNIT_NAME},
         },
     };
+
+    async fn spawn_probe_server(app: Router, bind_addr: &str) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::TcpListener::bind(bind_addr)
+            .await
+            .expect("bind probe server");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve probe app");
+        })
+    }
 
     #[tokio::test]
     async fn onboard_bootstraps_workspace_and_config() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let config = onboard(&home).await.expect("onboard");
+        let config = onboard(&home, None).await.expect("onboard");
 
         assert_eq!(config.daemon.workspace, "main");
         assert!(home.config_path().exists());
+        assert!(home.home_id_path().exists());
         assert!(home.workspace_dir("main").join("SOUL.md").exists());
+    }
+
+    #[tokio::test]
+    async fn onboard_with_auto_bind_persists_loopback_port() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let config = onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
+
+        assert!(config.daemon.bind.starts_with("127.0.0.1:"));
+        assert_ne!(config.daemon.bind, "127.0.0.1:8979");
+
+        let reloaded = OperatorConfig::load(&home).await.expect("load config");
+        assert_eq!(reloaded.daemon.bind, config.daemon.bind);
     }
 
     #[test]
@@ -665,7 +770,9 @@ mod tests {
     async fn up_with_fake_manager_materializes_units() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home).await.expect("onboard");
+        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
         #[cfg(unix)]
@@ -688,34 +795,31 @@ mod tests {
         )
         .expect("worker");
 
-        let config = OperatorConfig {
-            runtimes: [(
-                "codex".to_string(),
-                RuntimeProfileConfig::Codex {
-                    executable: runtime_stub.to_string_lossy().to_string(),
-                    model: None,
-                    sandbox: "read-only".to_string(),
-                    skip_git_repo_check: true,
-                    ephemeral: true,
-                },
-            )]
-            .into_iter()
-            .collect(),
-            skills: vec![ManagedSkillConfig {
-                alias: "telegram".to_string(),
-                source: skill_source.to_string_lossy().to_string(),
-                reference: "local".to_string(),
-                enabled: true,
-            }],
-            channels: vec![ManagedChannelConfig {
-                id: "telegram".to_string(),
-                skill: "telegram".to_string(),
-                enabled: true,
-                launch_mode: ChannelLaunchMode::Service,
-                required_env: Vec::new(),
-            }],
-            ..OperatorConfig::default()
-        };
+        config.runtimes = [(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: runtime_stub.to_string_lossy().to_string(),
+                model: None,
+                sandbox: "read-only".to_string(),
+                skip_git_repo_check: true,
+                ephemeral: true,
+            },
+        )]
+        .into_iter()
+        .collect();
+        config.skills = vec![ManagedSkillConfig {
+            alias: "telegram".to_string(),
+            source: skill_source.to_string_lossy().to_string(),
+            reference: "local".to_string(),
+            enabled: true,
+        }];
+        config.channels = vec![ManagedChannelConfig {
+            id: "telegram".to_string(),
+            skill: "telegram".to_string(),
+            enabled: true,
+            launch_mode: ChannelLaunchMode::Service,
+            required_env: Vec::new(),
+        }];
         config.save(&home).await.expect("save config");
         OperatorLockfile::default()
             .save(&home)
@@ -739,7 +843,7 @@ mod tests {
     async fn apply_disables_old_skill_revision_when_alias_is_updated() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home).await.expect("onboard");
+        onboard(&home, None).await.expect("onboard");
 
         let skill_source = temp_dir.path().join("channel-telegram");
         fs::create_dir_all(skill_source.join("scripts")).expect("skill dir");
@@ -805,7 +909,9 @@ mod tests {
     async fn up_skips_interactive_channels_for_service_units() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home).await.expect("onboard");
+        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
         #[cfg(unix)]
@@ -833,34 +939,31 @@ mod tests {
             .expect("chmod worker");
         }
 
-        let config = OperatorConfig {
-            runtimes: [(
-                "codex".to_string(),
-                RuntimeProfileConfig::Codex {
-                    executable: runtime_stub.to_string_lossy().to_string(),
-                    model: None,
-                    sandbox: "read-only".to_string(),
-                    skip_git_repo_check: true,
-                    ephemeral: true,
-                },
-            )]
-            .into_iter()
-            .collect(),
-            skills: vec![ManagedSkillConfig {
-                alias: "terminal".to_string(),
-                source: skill_source.to_string_lossy().to_string(),
-                reference: "local".to_string(),
-                enabled: true,
-            }],
-            channels: vec![ManagedChannelConfig {
-                id: "terminal".to_string(),
-                skill: "terminal".to_string(),
-                enabled: true,
-                launch_mode: ChannelLaunchMode::Interactive,
-                required_env: Vec::new(),
-            }],
-            ..OperatorConfig::default()
-        };
+        config.runtimes = [(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: runtime_stub.to_string_lossy().to_string(),
+                model: None,
+                sandbox: "read-only".to_string(),
+                skip_git_repo_check: true,
+                ephemeral: true,
+            },
+        )]
+        .into_iter()
+        .collect();
+        config.skills = vec![ManagedSkillConfig {
+            alias: "terminal".to_string(),
+            source: skill_source.to_string_lossy().to_string(),
+            reference: "local".to_string(),
+            enabled: true,
+        }];
+        config.channels = vec![ManagedChannelConfig {
+            id: "terminal".to_string(),
+            skill: "terminal".to_string(),
+            enabled: true,
+            launch_mode: ChannelLaunchMode::Interactive,
+            required_env: Vec::new(),
+        }];
         config.save(&home).await.expect("save config");
         OperatorLockfile::default()
             .save(&home)
@@ -881,5 +984,185 @@ mod tests {
                 .expect("unit status"),
             "not-found"
         );
+    }
+
+    #[tokio::test]
+    async fn up_rejects_foreign_home_daemon_on_configured_bind() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
+        let bind_addr = OperatorConfig::load(&home)
+            .await
+            .expect("load config")
+            .daemon
+            .bind;
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    move || async move {
+                        Json(DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: "foreign-home".to_string(),
+                            home_root: "/tmp/foreign-home".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        })
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+        let manager = FakeServiceManager::default();
+        let binaries = StackBinaryPaths {
+            daemon_bin: "/tmp/lionclawd".into(),
+        };
+
+        let err = up(&home, &manager, "codex", &binaries)
+            .await
+            .expect_err("foreign daemon should fail");
+        assert!(err.to_string().contains("/tmp/foreign-home"));
+    }
+
+    #[tokio::test]
+    async fn up_rejects_same_home_foreground_daemon_without_active_unit() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let config = onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let bind_addr = config.daemon.bind;
+        let home_root = home.root().display().to_string();
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    let home_id = home_id.clone();
+                    let home_root = home_root.clone();
+                    move || async move {
+                        Json(DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: home_id.clone(),
+                            home_root: home_root.clone(),
+                            bind_addr: bind_addr.clone(),
+                        })
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+        let manager = FakeServiceManager::default();
+        manager.set_unit_status(DAEMON_UNIT_NAME, "loaded/inactive/dead");
+        let binaries = StackBinaryPaths {
+            daemon_bin: "/tmp/lionclawd".into(),
+        };
+
+        let err = up(&home, &manager, "codex", &binaries)
+            .await
+            .expect_err("foreground daemon without active unit should fail");
+        assert!(err.to_string().contains("foreground daemon"));
+    }
+
+    #[tokio::test]
+    async fn up_reuses_same_home_daemon_when_managed_unit_is_active() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
+        let runtime_stub = temp_dir.path().join("codex-stub.sh");
+        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&runtime_stub, fs::Permissions::from_mode(0o755))
+                .expect("chmod runtime stub");
+        }
+        config.runtimes = [(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: runtime_stub.to_string_lossy().to_string(),
+                model: None,
+                sandbox: "read-only".to_string(),
+                skip_git_repo_check: true,
+                ephemeral: true,
+            },
+        )]
+        .into_iter()
+        .collect();
+        config.save(&home).await.expect("save config");
+
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let bind_addr = config.daemon.bind.clone();
+        let home_root = home.root().display().to_string();
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    let home_id = home_id.clone();
+                    let home_root = home_root.clone();
+                    move || async move {
+                        Json(DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: home_id.clone(),
+                            home_root: home_root.clone(),
+                            bind_addr: bind_addr.clone(),
+                        })
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+        let manager = FakeServiceManager::default();
+        manager.set_unit_status(DAEMON_UNIT_NAME, "loaded/active/running");
+        let binaries = StackBinaryPaths {
+            daemon_bin: "/tmp/lionclawd".into(),
+        };
+
+        up(&home, &manager, "codex", &binaries)
+            .await
+            .expect("same-home managed daemon should be reused");
+    }
+
+    #[tokio::test]
+    async fn up_rejects_unknown_listener_on_bind() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
+        let bind_addr = OperatorConfig::load(&home)
+            .await
+            .expect("load config")
+            .daemon
+            .bind;
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/health",
+                get(|| async { Json(json!({"service": "other", "status": "ok"})) }),
+            ),
+            &bind_addr,
+        )
+        .await;
+        let manager = FakeServiceManager::default();
+        let binaries = StackBinaryPaths {
+            daemon_bin: "/tmp/lionclawd".into(),
+        };
+
+        let err = up(&home, &manager, "codex", &binaries)
+            .await
+            .expect_err("unknown listener should fail");
+        assert!(err.to_string().contains("non-LionClaw listener"));
     }
 }

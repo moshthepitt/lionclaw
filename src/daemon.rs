@@ -8,12 +8,14 @@ use tracing::info;
 use crate::{
     api::build_router,
     config::Config,
+    contracts::DaemonInfoResponse,
     kernel::{Kernel, KernelOptions},
     operator::{config::OperatorConfig, runtime::register_configured_runtimes},
 };
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
     config.home.ensure_base_dirs().await?;
+    let home_id = config.home.ensure_home_id().await?;
     let operator_config = OperatorConfig::load(&config.home).await?;
     let workspace_root = if std::env::var_os("LIONCLAW_WORKSPACE").is_some()
         || std::env::var_os("LIONCLAW_WORKSPACE_ROOT").is_some()
@@ -45,7 +47,16 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .await?,
     );
     register_configured_runtimes(&kernel, &operator_config).await?;
-    let app = build_router(kernel);
+    let app = build_router(
+        kernel,
+        DaemonInfoResponse {
+            service: "lionclawd".to_string(),
+            status: "ok".to_string(),
+            home_id,
+            home_root: config.home.root().display().to_string(),
+            bind_addr: config.bind_addr.clone(),
+        },
+    );
 
     let listener = TcpListener::bind(&config.bind_addr)
         .await

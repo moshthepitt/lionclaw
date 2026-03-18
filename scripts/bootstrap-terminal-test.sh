@@ -30,6 +30,10 @@ resolve_home() {
   fi
 }
 
+configured_bind() {
+  sed -n 's/^bind = "\(.*\)"$/\1/p' "$LIONCLAW_HOME/config/lionclaw.toml" | head -n1
+}
+
 if [[ $# -lt 1 || $# -gt 4 ]]; then
   usage >&2
   exit 64
@@ -48,10 +52,13 @@ mkdir -p "$LIONCLAW_HOME"
 cargo build --bins
 
 if [[ ! -f "$LIONCLAW_HOME/config/lionclaw.toml" ]]; then
-  "./target/debug/lionclaw" onboard
+  "./target/debug/lionclaw" onboard --bind auto
 fi
 
+bind_addr="$(configured_bind)"
+
 printf 'Using LIONCLAW_HOME=%s\n' "$LIONCLAW_HOME"
+printf 'Using bind=%s\n' "${bind_addr:-unknown}"
 printf 'Ensuring runtime=%s command=%s channel=%s\n' "$runtime_id" "$runtime_command" "$channel_id"
 
 "./target/debug/lionclaw" runtime add "$runtime_id" --kind codex --bin "$runtime_command"

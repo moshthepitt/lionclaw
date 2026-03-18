@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use uuid::Uuid;
 
 pub const DEFAULT_WORKSPACE: &str = "main";
 
@@ -43,6 +44,10 @@ impl LionClawHome {
 
     pub fn config_path(&self) -> PathBuf {
         self.config_dir().join("lionclaw.toml")
+    }
+
+    pub fn home_id_path(&self) -> PathBuf {
+        self.config_dir().join("home-id")
     }
 
     pub fn lock_path(&self) -> PathBuf {
@@ -103,7 +108,36 @@ impl LionClawHome {
                 .with_context(|| format!("failed to create {}", path.display()))?;
         }
 
+        self.ensure_home_id().await?;
         Ok(())
+    }
+
+    pub async fn read_home_id(&self) -> Result<Option<String>> {
+        let path = self.home_id_path();
+        if !tokio::fs::try_exists(&path)
+            .await
+            .with_context(|| format!("failed to stat {}", path.display()))?
+        {
+            return Ok(None);
+        }
+
+        let value = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Ok(Some(value.trim().to_string()).filter(|value| !value.is_empty()))
+    }
+
+    pub async fn ensure_home_id(&self) -> Result<String> {
+        if let Some(home_id) = self.read_home_id().await? {
+            return Ok(home_id);
+        }
+
+        let home_id = Uuid::new_v4().to_string();
+        let path = self.home_id_path();
+        tokio::fs::write(&path, format!("{home_id}\n"))
+            .await
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(home_id)
     }
 }
 
@@ -128,6 +162,10 @@ mod tests {
             std::path::PathBuf::from("/tmp/lionclaw-home/config/lionclaw.toml")
         );
         assert_eq!(
+            home.home_id_path(),
+            std::path::PathBuf::from("/tmp/lionclaw-home/config/home-id")
+        );
+        assert_eq!(
             home.lock_path(),
             std::path::PathBuf::from("/tmp/lionclaw-home/config/lionclaw.lock")
         );
@@ -138,6 +176,22 @@ mod tests {
         assert_eq!(
             home.runtime_channel_dir("telegram"),
             std::path::PathBuf::from("/tmp/lionclaw-home/runtime/channels/telegram")
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_home_id_creates_and_preserves_identity() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+
+        home.ensure_base_dirs().await.expect("base dirs");
+        let first = home.ensure_home_id().await.expect("home id");
+        let second = home.ensure_home_id().await.expect("home id");
+
+        assert_eq!(first, second);
+        assert_eq!(
+            home.read_home_id().await.expect("read home id"),
+            Some(first)
         );
     }
 }

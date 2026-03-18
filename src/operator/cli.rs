@@ -15,6 +15,7 @@ use crate::{
         reconcile::{
             add_channel, add_skill, apply, down, logs, onboard, pairing_approve, pairing_block,
             pairing_list, remove_channel, remove_skill, resolve_stack_binaries, status, up,
+            OnboardBindSelection,
         },
         run::run_local,
         runtime::resolve_runtime_id,
@@ -32,7 +33,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Onboard,
+    Onboard(OnboardArgs),
     Apply,
     Run(RunArgs),
     Runtime {
@@ -56,6 +57,15 @@ enum Command {
 #[derive(Debug, Args)]
 struct RunArgs {
     runtime: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct OnboardArgs {
+    #[arg(
+        long,
+        help = "Daemon bind address or 'auto' for an isolated loopback port"
+    )]
+    bind: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -210,12 +220,14 @@ pub async fn run() -> Result<()> {
     let home = LionClawHome::from_env();
 
     match cli.command {
-        Command::Onboard => {
-            let config = onboard(&home).await?;
+        Command::Onboard(args) => {
+            let bind_selection = args.bind.as_deref().map(parse_onboard_bind).transpose()?;
+            let config = onboard(&home, bind_selection).await?;
             println!(
-                "onboarded {} with workspace {}",
+                "onboarded {} with workspace {} on {}",
                 home.root().display(),
-                config.daemon.workspace
+                config.daemon.workspace,
+                config.daemon.bind
             );
         }
         Command::Apply => {
@@ -415,6 +427,17 @@ pub async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_onboard_bind(raw: &str) -> Result<OnboardBindSelection> {
+    let bind = raw.trim();
+    if bind.is_empty() {
+        return Err(anyhow!("--bind requires a value"));
+    }
+    if bind == "auto" {
+        return Ok(OnboardBindSelection::Auto);
+    }
+    Ok(OnboardBindSelection::Explicit(bind.to_string()))
 }
 
 fn build_runtime_profile(

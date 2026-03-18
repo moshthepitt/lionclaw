@@ -39,6 +39,10 @@ resolve_default_runtime() {
   printf '%s\n' "$runtime_id"
 }
 
+configured_bind() {
+  sed -n 's/^bind = "\(.*\)"$/\1/p' "$LIONCLAW_HOME/config/lionclaw.toml" | head -n1
+}
+
 if [[ $# -lt 1 || $# -gt 3 ]]; then
   usage >&2
   exit 64
@@ -55,8 +59,10 @@ export LIONCLAW_HOME="$lionclaw_home"
 [[ -f "$LIONCLAW_HOME/config/lionclaw.toml" ]] || die "missing config at $LIONCLAW_HOME/config/lionclaw.toml; run lionclaw onboard first"
 
 runtime_id="${2:-$(resolve_default_runtime)}"
+bind_addr="$(configured_bind)"
 
 printf 'Using LIONCLAW_HOME=%s\n' "$LIONCLAW_HOME"
+printf 'Using bind=%s\n' "${bind_addr:-unknown}"
 printf 'Using runtime=%s channel=%s\n' "$runtime_id" "$channel_id"
 
 if [[ "${LIONCLAW_SKIP_BUILD:-0}" != "1" ]]; then

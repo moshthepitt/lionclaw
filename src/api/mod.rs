@@ -17,10 +17,10 @@ use crate::{
         ChannelPeerApproveRequest, ChannelPeerBlockRequest, ChannelPeerListParams,
         ChannelPeerListResponse, ChannelPeerResponse, ChannelStreamAckRequest,
         ChannelStreamAckResponse, ChannelStreamPullRequest, ChannelStreamPullResponse,
-        PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeRequest, PolicyRevokeResponse,
-        SessionOpenRequest, SessionOpenResponse, SessionTurnRequest, SessionTurnResponse,
-        SkillInstallRequest, SkillInstallResponse, SkillListResponse, SkillToggleRequest,
-        SkillToggleResponse,
+        DaemonInfoResponse, PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeRequest,
+        PolicyRevokeResponse, SessionOpenRequest, SessionOpenResponse, SessionTurnRequest,
+        SessionTurnResponse, SkillInstallRequest, SkillInstallResponse, SkillListResponse,
+        SkillToggleRequest, SkillToggleResponse,
     },
     kernel::{Kernel, KernelError},
 };
@@ -28,13 +28,18 @@ use crate::{
 #[derive(Clone)]
 pub struct ApiState {
     pub kernel: Arc<Kernel>,
+    pub daemon_info: DaemonInfoResponse,
 }
 
-pub fn build_router(kernel: Arc<Kernel>) -> Router {
-    let state = ApiState { kernel };
+pub fn build_router(kernel: Arc<Kernel>, daemon_info: DaemonInfoResponse) -> Router {
+    let state = ApiState {
+        kernel,
+        daemon_info,
+    };
 
     Router::new()
         .route("/health", get(health))
+        .route("/v0/daemon/info", get(daemon_info_endpoint))
         .route("/v0/sessions/open", post(open_session))
         .route("/v0/sessions/turn", post(turn_session))
         .route("/v0/skills/install", post(install_skill))
@@ -57,6 +62,10 @@ pub fn build_router(kernel: Arc<Kernel>) -> Router {
 
 async fn health() -> impl IntoResponse {
     Json(json!({"status": "ok", "service": "lionclawd"}))
+}
+
+async fn daemon_info_endpoint(State(state): State<ApiState>) -> Json<DaemonInfoResponse> {
+    Json(state.daemon_info)
 }
 
 async fn open_session(

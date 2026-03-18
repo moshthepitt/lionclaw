@@ -1,22 +1,14 @@
-use std::{
-    collections::BTreeMap,
-    path::PathBuf,
-    process::Stdio,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, path::PathBuf, process::Stdio, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
-use tokio::{
-    net::{lookup_host, TcpStream},
-    process::Command,
-    time::sleep,
-};
+use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::{
     home::LionClawHome,
     operator::{
         config::ChannelLaunchMode,
+        daemon_probe::{classify_daemon, wait_for_same_home_daemon, DaemonClassification},
         reconcile::{apply, base_url_from_bind, resolve_worker_entrypoint, up, StackBinaryPaths},
         services::ServiceManager,
     },
@@ -38,6 +30,7 @@ pub async fn attach_channel<M: ServiceManager>(
     requested_runtime_id: Option<String>,
 ) -> Result<()> {
     let binaries = crate::operator::reconcile::resolve_stack_binaries()?;
+    let home_id = home.ensure_home_id().await?;
     let spec = prepare_channel_attach(
         home,
         manager,
@@ -49,7 +42,34 @@ pub async fn attach_channel<M: ServiceManager>(
     .await?;
 
     if spec.started_services {
-        wait_for_daemon(&spec.bind_addr, Duration::from_secs(5)).await?;
+        match wait_for_same_home_daemon(&spec.bind_addr, &home_id, Duration::from_secs(5)).await? {
+            DaemonClassification::SameHome => {}
+            DaemonClassification::Absent => {
+                return Err(anyhow!(
+                    "lionclawd did not become available at '{}' within 5s",
+                    spec.bind_addr
+                ));
+            }
+            DaemonClassification::ForeignHome(info) => {
+                return Err(anyhow!(
+                    "bind '{}' became owned by a different LionClaw home at '{}' while attaching",
+                    spec.bind_addr,
+                    info.home_root
+                ));
+            }
+            DaemonClassification::IncompatibleLionClaw => {
+                return Err(anyhow!(
+                    "bind '{}' became available with an older LionClaw daemon while attaching",
+                    spec.bind_addr
+                ));
+            }
+            DaemonClassification::UnknownListener => {
+                return Err(anyhow!(
+                    "bind '{}' became available with a non-LionClaw listener while attaching",
+                    spec.bind_addr
+                ));
+            }
+        }
     }
 
     launch_channel_attach(spec).await
@@ -64,13 +84,34 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
     binaries: &StackBinaryPaths,
 ) -> Result<ChannelAttachSpec> {
     let initial_config = crate::operator::config::OperatorConfig::load(home).await?;
+    let home_id = home.ensure_home_id().await?;
     let mut started_services = false;
-    let applied = if daemon_is_reachable(&initial_config.daemon.bind).await {
-        apply(home).await?
-    } else {
-        let runtime_id = initial_config.resolve_runtime_id(requested_runtime_id.as_deref())?;
-        started_services = true;
-        up(home, manager, &runtime_id, binaries).await?
+    let applied = match classify_daemon(&initial_config.daemon.bind, &home_id).await? {
+        DaemonClassification::Absent => {
+            let runtime_id = initial_config.resolve_runtime_id(requested_runtime_id.as_deref())?;
+            started_services = true;
+            up(home, manager, &runtime_id, binaries).await?
+        }
+        DaemonClassification::SameHome => apply(home).await?,
+        DaemonClassification::ForeignHome(info) => {
+            return Err(anyhow!(
+                "bind '{}' is already served by a different LionClaw home at '{}'; stop that daemon or choose a different bind",
+                initial_config.daemon.bind,
+                info.home_root
+            ));
+        }
+        DaemonClassification::IncompatibleLionClaw => {
+            return Err(anyhow!(
+                "bind '{}' is already served by an older LionClaw daemon; restart that daemon before attaching",
+                initial_config.daemon.bind
+            ));
+        }
+        DaemonClassification::UnknownListener => {
+            return Err(anyhow!(
+                "bind '{}' is already in use by a non-LionClaw listener",
+                initial_config.daemon.bind
+            ));
+        }
     };
 
     let channel = applied
@@ -166,40 +207,6 @@ async fn launch_channel_attach(spec: ChannelAttachSpec) -> Result<()> {
     ))
 }
 
-async fn daemon_is_reachable(bind_addr: &str) -> bool {
-    let addrs = match lookup_host(bind_addr).await {
-        Ok(values) => values.collect::<Vec<_>>(),
-        Err(_) => return false,
-    };
-
-    for addr in addrs {
-        if matches!(
-            tokio::time::timeout(Duration::from_millis(250), TcpStream::connect(addr)).await,
-            Ok(Ok(_))
-        ) {
-            return true;
-        }
-    }
-
-    false
-}
-
-async fn wait_for_daemon(bind_addr: &str, timeout_duration: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout_duration;
-    while Instant::now() < deadline {
-        if daemon_is_reachable(bind_addr).await {
-            return Ok(());
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-
-    Err(anyhow!(
-        "lionclawd did not become reachable at '{}' within {}s",
-        bind_addr,
-        timeout_duration.as_secs()
-    ))
-}
-
 fn default_local_peer_id() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
@@ -213,8 +220,12 @@ fn default_local_peer_id() -> String {
 mod tests {
     use std::{collections::BTreeMap, fs};
 
+    use axum::{routing::get, Json, Router};
+    use serde_json::json;
+
     use super::prepare_channel_attach;
     use crate::{
+        contracts::DaemonInfoResponse,
         home::LionClawHome,
         operator::{
             config::{
@@ -250,7 +261,7 @@ mod tests {
             let addr = listener.local_addr().expect("listener addr");
             format!("127.0.0.1:{}", addr.port())
         };
-        crate::operator::reconcile::onboard(&home)
+        crate::operator::reconcile::onboard(&home, None)
             .await
             .expect("onboard");
 
@@ -304,6 +315,15 @@ mod tests {
         config.save(&home).await.expect("save config");
 
         (temp_dir, home, FakeServiceManager::default())
+    }
+
+    async fn spawn_probe_server(app: Router, bind_addr: &str) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::TcpListener::bind(bind_addr)
+            .await
+            .expect("bind probe server");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve probe app");
+        })
     }
 
     #[cfg(unix)]
@@ -373,5 +393,121 @@ mod tests {
                 .expect("unit status"),
             "loaded/active/running"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_channel_attach_reuses_same_home_daemon() {
+        let (_temp_dir, home, manager) =
+            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let bind_addr = config.daemon.bind.clone();
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    let home_root = home.root().display().to_string();
+                    let home_id = home_id.clone();
+                    move || {
+                        let response = DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: home_id.clone(),
+                            home_root: home_root.clone(),
+                            bind_addr: bind_addr.clone(),
+                        };
+                        async move { Json(response) }
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+
+        let spec = prepare_channel_attach(
+            &home,
+            &manager,
+            "terminal".to_string(),
+            None,
+            Some("codex".to_string()),
+            &binaries(),
+        )
+        .await
+        .expect("prepare attach");
+
+        assert!(!spec.started_services, "same-home daemon should be reused");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_channel_attach_rejects_foreign_home_daemon() {
+        let (_temp_dir, home, manager) =
+            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        let bind_addr = config.daemon.bind.clone();
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    move || async move {
+                        Json(DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: "foreign-home".to_string(),
+                            home_root: "/tmp/foreign-home".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        })
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+
+        let err = prepare_channel_attach(
+            &home,
+            &manager,
+            "terminal".to_string(),
+            None,
+            Some("codex".to_string()),
+            &binaries(),
+        )
+        .await
+        .expect_err("foreign daemon should fail");
+
+        assert!(err.to_string().contains("/tmp/foreign-home"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_channel_attach_rejects_incompatible_lionclaw_daemon() {
+        let (_temp_dir, home, manager) =
+            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        let bind_addr = config.daemon.bind.clone();
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/health",
+                get(|| async { Json(json!({"service": "lionclawd", "status": "ok"})) }),
+            ),
+            &bind_addr,
+        )
+        .await;
+
+        let err = prepare_channel_attach(
+            &home,
+            &manager,
+            "terminal".to_string(),
+            None,
+            Some("codex".to_string()),
+            &binaries(),
+        )
+        .await
+        .expect_err("older daemon should fail");
+
+        assert!(err.to_string().contains("older LionClaw daemon"));
     }
 }

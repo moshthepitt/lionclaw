@@ -16,8 +16,8 @@ Not a repo ritual. Not a source-checkout trick. Not a one-runtime wrapper preten
 2. Everything beyond the small core is a skill. Channels are one important case, not the exception.
 3. Runtime is selected at invocation (`lionclaw run` or `lionclaw service up`), not during `lionclaw channel add`.
 4. Identity/persona is runtime-independent and comes from workspace files (`IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md`).
-5. Anthropic `SKILL.md` stays unchanged as the skill instruction standard.
-6. Security controls stay in kernel policy/sandbox/audit, never in prompt-only logic.
+5. Anthropic `SKILL.md` is the skill instruction standard.
+6. Security controls live in kernel policy, sandboxing, and audit, never in prompt-only logic.
 
 ## Installed layout (no repo required)
 

@@ -30,7 +30,7 @@ pub(crate) async fn run_local_with_io<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,
 ) -> Result<()> {
-    onboard(home).await?;
+    onboard(home, None).await?;
     let applied = apply(home).await?;
     let runtime_id = resolve_runtime_id(&applied.config, requested_runtime.as_deref())?;
     validate_runtime_availability(&applied.config, &runtime_id)?;

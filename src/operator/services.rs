@@ -31,6 +31,10 @@ pub fn channel_unit_name(channel_id: &str) -> String {
     format!("lionclaw-channel-{}.service", channel_id)
 }
 
+pub fn unit_status_is_active(status: &str) -> bool {
+    status.split('/').nth(1) == Some("active")
+}
+
 pub fn render_daemon_unit(
     home: &LionClawHome,
     daemon_bin: &Path,
@@ -175,7 +179,6 @@ impl ServiceManager for SystemdUserServiceManager {
     async fn up_units(&self, units: &[String]) -> Result<()> {
         for unit in units {
             run_systemctl(["--user", "enable", "--now", unit]).await?;
-            run_systemctl(["--user", "restart", unit]).await?;
         }
         Ok(())
     }
@@ -235,6 +238,15 @@ impl ServiceManager for SystemdUserServiceManager {
 pub struct FakeServiceManager {
     states: Mutex<HashMap<String, String>>,
     units: Mutex<HashMap<String, ManagedServiceUnit>>,
+}
+
+impl FakeServiceManager {
+    pub fn set_unit_status(&self, unit: impl Into<String>, status: impl Into<String>) {
+        self.states
+            .lock()
+            .expect("states lock")
+            .insert(unit.into(), status.into());
+    }
 }
 
 #[async_trait]
