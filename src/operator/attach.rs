@@ -245,6 +245,11 @@ mod tests {
     ) -> (tempfile::TempDir, LionClawHome, FakeServiceManager) {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let bind = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+            let addr = listener.local_addr().expect("listener addr");
+            format!("127.0.0.1:{}", addr.port())
+        };
         crate::operator::reconcile::onboard(&home)
             .await
             .expect("onboard");
@@ -266,7 +271,7 @@ mod tests {
 
         let config = OperatorConfig {
             daemon: crate::operator::config::DaemonConfig {
-                bind: "127.0.0.1:38979".to_string(),
+                bind,
                 workspace: "main".to_string(),
             },
             runtimes: [(

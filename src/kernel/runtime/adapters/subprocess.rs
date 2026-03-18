@@ -1,7 +1,10 @@
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::Command,
+};
 
 #[derive(Debug, Clone)]
 pub struct SubprocessInvocation {
@@ -25,7 +28,13 @@ impl SubprocessOutput {
     }
 }
 
-pub async fn run_non_interactive(invocation: &SubprocessInvocation) -> Result<SubprocessOutput> {
+pub async fn run_non_interactive_streaming<F>(
+    invocation: &SubprocessInvocation,
+    mut on_stdout_line: F,
+) -> Result<SubprocessOutput>
+where
+    F: FnMut(&str) -> Result<()>,
+{
     let mut command = Command::new(&invocation.executable);
     command.args(&invocation.args);
 
@@ -65,14 +74,52 @@ pub async fn run_non_interactive(invocation: &SubprocessInvocation) -> Result<Su
             .context("failed to close subprocess stdin")?;
     }
 
-    let output = child
-        .wait_with_output()
+    let stdout = child
+        .stdout
+        .take()
+        .context("subprocess stdout was not captured")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("subprocess stderr was not captured")?;
+
+    let stderr_task = tokio::spawn(async move {
+        let mut stderr = stderr;
+        let mut captured = Vec::new();
+        stderr
+            .read_to_end(&mut captured)
+            .await
+            .context("failed to read subprocess stderr")?;
+        Ok::<Vec<u8>, anyhow::Error>(captured)
+    });
+
+    let mut stdout_reader = BufReader::new(stdout);
+    let mut captured_stdout = Vec::new();
+    let mut line = Vec::new();
+
+    loop {
+        line.clear();
+        let bytes_read = stdout_reader
+            .read_until(b'\n', &mut line)
+            .await
+            .context("failed to read subprocess stdout")?;
+        if bytes_read == 0 {
+            break;
+        }
+        captured_stdout.extend_from_slice(&line);
+        let text = String::from_utf8_lossy(&line);
+        on_stdout_line(text.as_ref())?;
+    }
+
+    let status = child
+        .wait()
         .await
         .context("failed to wait for subprocess")?;
+    let captured_stderr = stderr_task.await.context("stderr reader task failed")??;
 
     Ok(SubprocessOutput {
-        stdout: output.stdout,
-        stderr: output.stderr,
-        exit_code: output.status.code(),
+        stdout: captured_stdout,
+        stderr: captured_stderr,
+        exit_code: status.code(),
     })
 }

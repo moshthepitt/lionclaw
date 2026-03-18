@@ -15,7 +15,7 @@ What you run:
 
 Under the hood, the worker:
 
-1. posts inbound text to `/v0/channels/inbound`,
+1. posts inbound text to `/v0/channels/inbound` and binds the returned `turn_id` when the message is queued,
 2. long-polls `/v0/channels/stream/pull`,
 3. renders typed outbound events in separate terminal regions,
 4. advances its consumer cursor through `/v0/channels/stream/ack`.
@@ -48,5 +48,6 @@ If LionClaw is not already running, `channel attach` will start it using the def
 - Pairing stays enforced by LionClaw. The TUI shows pending pairing state and the exact approval command to run through `lionclaw channel pairing approve ...`.
 - The worker defaults to `channel_id=terminal` and `peer_id=$USER` (falling back to `$USERNAME` or `local-user`).
 - `channel attach` uses an ephemeral consumer id and `start_mode=tail`, so each attach session starts from the current stream head instead of replaying old output from previous sessions.
+- The TUI echoes your message immediately, shows a local pending state right away, and then follows live `queue.*` / `runtime.*` stream events for the active turn.
 - Runtime selection normally comes from the running LionClaw service or `lionclaw channel attach <id> --runtime ...` when attach needs to start it.
 - The legacy shell worker is kept only as a debug harness in `scripts/debug-worker.sh`.

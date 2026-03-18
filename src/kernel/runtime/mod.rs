@@ -91,10 +91,12 @@ pub enum RuntimeEvent {
         text: String,
     },
     Status {
+        code: Option<String>,
         text: String,
     },
     Done,
     Error {
+        code: Option<String>,
         text: String,
     },
 }
@@ -120,9 +122,9 @@ pub trait RuntimeAdapter: Send + Sync {
     async fn close(&self, handle: &RuntimeSessionHandle) -> Result<()>;
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct RuntimeRegistry {
-    adapters: RwLock<HashMap<String, Arc<dyn RuntimeAdapter>>>,
+    adapters: Arc<RwLock<HashMap<String, Arc<dyn RuntimeAdapter>>>>,
 }
 
 impl RuntimeRegistry {

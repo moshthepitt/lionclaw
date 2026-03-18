@@ -2,9 +2,10 @@ use std::path::PathBuf;
 
 use lionclaw::{
     contracts::{
-        ChannelBindRequest, ChannelPeerApproveRequest, ChannelStreamAckRequest,
-        ChannelStreamPullRequest, ChannelStreamStartMode, PolicyGrantRequest, SessionOpenRequest,
-        SkillInstallRequest, StreamEventKindDto, StreamLaneDto, TrustTier,
+        ChannelBindRequest, ChannelInboundOutcome, ChannelPeerApproveRequest,
+        ChannelStreamAckRequest, ChannelStreamPullRequest, ChannelStreamStartMode,
+        PolicyGrantRequest, SessionOpenRequest, SkillInstallRequest, StreamEventKindDto,
+        StreamLaneDto, TrustTier,
     },
     kernel::{Kernel, KernelError},
 };
@@ -95,7 +96,7 @@ description: inbound skill for channel flow
         .await
         .expect("bind channel");
 
-    kernel
+    let pending = kernel
         .process_inbound_channel_text(
             "local-cli",
             "peer-local",
@@ -106,6 +107,8 @@ description: inbound skill for channel flow
         )
         .await
         .expect("pending inbound handled");
+    assert_eq!(pending.outcome, ChannelInboundOutcome::PairingPending);
+    assert!(pending.turn_id.is_none());
 
     let peers = kernel
         .list_channel_peers(Some("local-cli".to_string()))
@@ -142,7 +145,7 @@ description: inbound skill for channel flow
         .await
         .expect("grant skill use");
 
-    kernel
+    let queued = kernel
         .process_inbound_channel_text(
             "local-cli",
             "peer-local",
@@ -153,9 +156,12 @@ description: inbound skill for channel flow
         )
         .await
         .expect("approved inbound turn should succeed");
+    assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
+    assert!(queued.turn_id.is_some());
+    assert!(queued.session_id.is_some());
 
     // Duplicate update id should be ignored by dedupe index.
-    kernel
+    let duplicate = kernel
         .process_inbound_channel_text(
             "local-cli",
             "peer-local",
@@ -166,20 +172,39 @@ description: inbound skill for channel flow
         )
         .await
         .expect("duplicate update should be ignored");
+    assert_eq!(duplicate.outcome, ChannelInboundOutcome::Duplicate);
 
-    let turn_events = kernel
-        .query_audit(
-            None,
-            Some("channel.turn.succeeded".to_string()),
-            None,
-            Some(10),
-        )
-        .await
-        .expect("query turn events");
+    let turn_events = wait_for_audit_event_count(&kernel, "channel.turn.completed", 1).await;
     assert_eq!(
         turn_events.events.len(),
         1,
-        "only one succeeded channel turn should be recorded"
+        "only one completed channel turn should be recorded"
+    );
+
+    let stream = kernel
+        .pull_channel_stream(ChannelStreamPullRequest {
+            channel_id: "local-cli".to_string(),
+            consumer_id: "local-cli-test".to_string(),
+            start_mode: Some(ChannelStreamStartMode::Resume),
+            limit: Some(50),
+            wait_ms: Some(0),
+        })
+        .await
+        .expect("pull queued stream");
+    let codes = stream
+        .events
+        .iter()
+        .filter_map(|event| event.code.as_deref())
+        .collect::<Vec<_>>();
+    assert!(codes.contains(&"queue.queued"));
+    assert!(codes.contains(&"queue.started"));
+    assert!(codes.contains(&"queue.completed"));
+    assert!(
+        stream
+            .events
+            .iter()
+            .any(|event| event.kind == StreamEventKindDto::Done),
+        "queued channel turn should terminate with done"
     );
 
     let queued_events = kernel
@@ -243,7 +268,7 @@ description: channel outbox skill
         .await
         .expect("bind channel");
 
-    let accepted = kernel
+    let inbound = kernel
         .process_inbound_channel_text(
             "telegram",
             "peer-tele",
@@ -254,7 +279,8 @@ description: channel outbox skill
         )
         .await
         .expect("process inbound");
-    assert!(accepted, "new inbound message should be accepted");
+    assert_eq!(inbound.outcome, ChannelInboundOutcome::PairingPending);
+    assert!(inbound.turn_id.is_none());
 
     let stream = kernel
         .pull_channel_stream(ChannelStreamPullRequest {
@@ -346,7 +372,7 @@ description: channel tail skill
         .await
         .expect("bind channel");
 
-    kernel
+    let pending = kernel
         .process_inbound_channel_text(
             "terminal",
             "peer-tail",
@@ -357,6 +383,7 @@ description: channel tail skill
         )
         .await
         .expect("process inbound");
+    assert_eq!(pending.outcome, ChannelInboundOutcome::PairingPending);
 
     let initial = kernel
         .pull_channel_stream(ChannelStreamPullRequest {
@@ -413,7 +440,7 @@ description: channel wait skill
 
     let delayed_inbound = async {
         sleep(Duration::from_millis(50)).await;
-        kernel
+        let pending = kernel
             .process_inbound_channel_text(
                 "telegram",
                 "peer-wait",
@@ -424,6 +451,7 @@ description: channel wait skill
             )
             .await
             .expect("delayed inbound");
+        assert_eq!(pending.outcome, ChannelInboundOutcome::PairingPending);
     };
 
     let (stream, _) = tokio::join!(
@@ -465,4 +493,26 @@ impl TestEnv {
     fn db_path(&self) -> PathBuf {
         self.temp_dir.path().join("lionclaw.db")
     }
+}
+
+async fn wait_for_audit_event_count(
+    kernel: &Kernel,
+    kind: &str,
+    expected_minimum: usize,
+) -> lionclaw::contracts::AuditQueryResponse {
+    for _ in 0..40 {
+        let response = kernel
+            .query_audit(None, Some(kind.to_string()), None, Some(50))
+            .await
+            .expect("query audit");
+        if response.events.len() >= expected_minimum {
+            return response;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    kernel
+        .query_audit(None, Some(kind.to_string()), None, Some(50))
+        .await
+        .expect("query audit")
 }

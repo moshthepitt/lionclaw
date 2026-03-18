@@ -14,6 +14,13 @@ class PeerState:
     trust_tier: str | None = None
 
 
+@dataclass(slots=True)
+class InboundResponse:
+    outcome: str
+    turn_id: str | None = None
+    session_id: str | None = None
+
+
 class LionClawApi:
     def __init__(
         self,
@@ -58,7 +65,7 @@ class LionClawApi:
             )
         return PeerState(status="unknown")
 
-    async def send_inbound(self, text: str) -> None:
+    async def send_inbound(self, text: str) -> InboundResponse:
         external_message_id = f"terminal-inbound:{self.consumer_id}:{self._inbound_sequence}"
         payload: dict[str, Any] = {
             "channel_id": self.channel_id,
@@ -70,7 +77,13 @@ class LionClawApi:
             payload["runtime_id"] = self.runtime_id
         response = await self._client.post("/v0/channels/inbound", json=payload)
         response.raise_for_status()
+        data = response.json()
         self._inbound_sequence += 1
+        return InboundResponse(
+            outcome=data["outcome"],
+            turn_id=data.get("turn_id"),
+            session_id=data.get("session_id"),
+        )
 
     async def pull_stream(self) -> tuple[list[StreamEvent], int | None]:
         response = await self._client.post(
@@ -94,6 +107,7 @@ class LionClawApi:
                 turn_id=item["turn_id"],
                 kind=item["kind"],
                 lane=item.get("lane"),
+                code=item.get("code"),
                 text=item.get("text"),
             )
             events.append(event)

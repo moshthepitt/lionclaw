@@ -8,7 +8,7 @@
 - `kernel.policy`: capability grant/revoke and allow checks.
 - `kernel.capability_broker`: brokered capability execution (`fs`, `net`, `secret`, `channel.send`, `scheduler`).
 - `kernel.runtime`: runtime adapter contract and registry.
-- `kernel.channel_state`: durable channel bindings, peer trust state, inbound logs, outbound transcript history, and append-only channel stream delivery state.
+- `kernel.channel_state`: durable channel bindings, peer trust state, inbound logs, queued channel turns, outbound transcript history, and append-only channel stream delivery state.
 - `kernel.audit`: append-only audit event log persisted in SQLite.
 
 ## API Contracts
@@ -96,10 +96,21 @@ Adding a new adapter:
 
 External channel skills integrate over HTTP only:
 
-1. `POST /v0/channels/inbound` to submit normalized inbound messages.
+1. `POST /v0/channels/inbound` to submit normalized inbound messages. For approved peers this queues a channel turn and returns an explicit outcome (`queued`, `duplicate`, `pairing_pending`, `peer_blocked`) plus `turn_id` when work was queued.
 2. `POST /v0/channels/stream/pull` to fetch typed outbound stream events for a consumer cursor.
 3. `POST /v0/channels/stream/ack` after a consumer has durably handled events through a sequence.
 4. `GET /v0/channels/peers` + approve/block endpoints for pairing trust management.
+
+Queued channel turns emit machine-stable status/error codes through the same stream contract. Kernel-generated lifecycle codes currently include:
+
+- `queue.queued`
+- `queue.started`
+- `queue.completed`
+- `queue.failed`
+- `runtime.started`
+- `runtime.completed`
+- `runtime.error`
+- `runtime.timeout`
 
 ## Security Posture in v0
 

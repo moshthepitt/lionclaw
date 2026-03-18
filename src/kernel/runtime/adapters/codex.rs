@@ -12,7 +12,7 @@ use crate::kernel::runtime::{
     RuntimeTurnResult,
 };
 
-use super::subprocess::{run_non_interactive, SubprocessInvocation};
+use super::subprocess::{run_non_interactive_streaming, SubprocessInvocation};
 
 #[derive(Debug, Clone)]
 pub struct CodexRuntimeConfig {
@@ -127,7 +127,17 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
             input: input.prompt,
         };
 
-        let output = run_non_interactive(&invocation).await?;
+        let mut saw_done = false;
+        let output = run_non_interactive_streaming(&invocation, |line| {
+            for event in parse_codex_output_line(line) {
+                if matches!(event, RuntimeEvent::Done) {
+                    saw_done = true;
+                }
+                let _ = events.send(event);
+            }
+            Ok(())
+        })
+        .await?;
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if !output.success() {
             let code = output.exit_code.unwrap_or(1);
@@ -137,14 +147,7 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
             return Err(anyhow!("codex exec exited with code {}: {}", code, stderr));
         }
 
-        let parsed_events = parse_codex_stdout(&output.stdout);
-        let has_done = parsed_events
-            .iter()
-            .any(|event| matches!(event, RuntimeEvent::Done));
-        for event in parsed_events {
-            let _ = events.send(event);
-        }
-        if !has_done {
+        if !saw_done {
             let _ = events.send(RuntimeEvent::Done);
         }
 
@@ -218,6 +221,7 @@ fn env_flag(name: &str) -> Option<bool> {
     }
 }
 
+#[cfg(test)]
 fn parse_codex_stdout(stdout: &[u8]) -> Vec<RuntimeEvent> {
     let output = String::from_utf8_lossy(stdout);
     let mut events = Vec::new();
@@ -227,16 +231,27 @@ fn parse_codex_stdout(stdout: &[u8]) -> Vec<RuntimeEvent> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        if let Ok(json) = serde_json::from_str::<Value>(line) {
-            parse_codex_json_event(&mut events, &json);
-        } else {
-            events.push(RuntimeEvent::MessageDelta {
-                lane: RuntimeMessageLane::Answer,
-                text: line.to_string(),
-            });
-        }
+        events.extend(parse_codex_output_line(line));
     }
 
+    events
+}
+
+fn parse_codex_output_line(line: &str) -> Vec<RuntimeEvent> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Vec::new();
+    }
+
+    let mut events = Vec::new();
+    if let Ok(json) = serde_json::from_str::<Value>(line) {
+        parse_codex_json_event(&mut events, &json);
+    } else {
+        events.push(RuntimeEvent::MessageDelta {
+            lane: RuntimeMessageLane::Answer,
+            text: line.to_string(),
+        });
+    }
     events
 }
 
@@ -246,17 +261,20 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
         Some("thread.started") => {
             if let Some(thread_id) = json.get("thread_id").and_then(Value::as_str) {
                 events.push(RuntimeEvent::Status {
+                    code: None,
                     text: format!("codex thread started: {}", thread_id),
                 });
             }
         }
         Some("turn.started") => {
             events.push(RuntimeEvent::Status {
+                code: None,
                 text: "codex turn started".to_string(),
             });
         }
         Some("turn.completed") => {
             events.push(RuntimeEvent::Status {
+                code: None,
                 text: "codex turn completed".to_string(),
             });
         }
@@ -266,6 +284,7 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
                 .and_then(Value::as_str)
                 .unwrap_or("codex turn failed");
             events.push(RuntimeEvent::Error {
+                code: Some("runtime.error".to_string()),
                 text: format!("codex: {}", message),
             });
         }
@@ -275,6 +294,7 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
                 .and_then(Value::as_str)
                 .unwrap_or("codex stream error");
             events.push(RuntimeEvent::Error {
+                code: Some("runtime.error".to_string()),
                 text: format!("codex: {}", message),
             });
         }
@@ -285,11 +305,13 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
         }
         Some(other) => {
             events.push(RuntimeEvent::Status {
+                code: None,
                 text: format!("codex event: {}", other),
             });
         }
         None => {
             events.push(RuntimeEvent::Status {
+                code: None,
                 text: "codex event missing type".to_string(),
             });
         }
@@ -312,6 +334,7 @@ fn parse_codex_item(events: &mut Vec<RuntimeEvent>, item: &Value) {
                 .and_then(Value::as_str)
                 .unwrap_or("codex item error");
             events.push(RuntimeEvent::Error {
+                code: Some("runtime.error".to_string()),
                 text: format!("codex: {}", message),
             });
         }
@@ -325,6 +348,7 @@ fn parse_codex_item(events: &mut Vec<RuntimeEvent>, item: &Value) {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
             events.push(RuntimeEvent::Status {
+                code: None,
                 text: format!("codex command '{}' ({})", command, status),
             });
         }
@@ -334,21 +358,32 @@ fn parse_codex_item(events: &mut Vec<RuntimeEvent>, item: &Value) {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
             events.push(RuntimeEvent::Status {
+                code: None,
                 text: format!("codex file_change ({})", status),
             });
         }
         Some("reasoning") => {
-            events.push(RuntimeEvent::Status {
-                text: "codex reasoning update".to_string(),
-            });
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                events.push(RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Reasoning,
+                    text: text.to_string(),
+                });
+            } else {
+                events.push(RuntimeEvent::Status {
+                    code: None,
+                    text: "codex reasoning update".to_string(),
+                });
+            }
         }
         Some(other) => {
             events.push(RuntimeEvent::Status {
+                code: None,
                 text: format!("codex item: {}", other),
             });
         }
         None => {
             events.push(RuntimeEvent::Status {
+                code: None,
                 text: "codex item missing type".to_string(),
             });
         }
@@ -377,6 +412,7 @@ mod tests {
             r#"#!/usr/bin/env bash
 cat >/dev/null
 echo '{"type":"turn.started"}'
+echo '{"type":"item.completed","item":{"id":"reason-1","type":"reasoning","text":"thinking through the request"}}'
 echo '{"type":"item.completed","item":{"id":"msg-1","type":"agent_message","text":"hello from codex"}}'
 echo '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":2}}'
 "#,
@@ -414,6 +450,13 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0
         assert!(
             output.capability_requests.is_empty(),
             "codex adapter should not emit kernel capability requests yet"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Reasoning, text } if text == "thinking through the request"
+            )),
+            "reasoning item text should be translated into reasoning delta"
         );
         assert!(
             events.iter().any(|event| matches!(

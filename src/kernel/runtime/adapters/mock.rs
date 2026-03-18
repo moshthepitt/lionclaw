@@ -39,6 +39,7 @@ impl RuntimeAdapter for MockRuntimeAdapter {
         events: RuntimeEventSender,
     ) -> Result<RuntimeTurnResult> {
         let _ = events.send(RuntimeEvent::Status {
+            code: None,
             text: "mock runtime started turn".to_string(),
         });
 
@@ -73,6 +74,7 @@ impl RuntimeAdapter for MockRuntimeAdapter {
             let _ = events.send(RuntimeEvent::Done);
         } else {
             let _ = events.send(RuntimeEvent::Status {
+                code: None,
                 text: format!(
                     "mock runtime requested {} capability checks",
                     capability_requests.len()
@@ -94,10 +96,12 @@ impl RuntimeAdapter for MockRuntimeAdapter {
         for result in results {
             let verdict = if result.allowed { "granted" } else { "denied" };
             let _ = events.send(RuntimeEvent::Status {
+                code: None,
                 text: format!("capability:{}:{}", result.request_id, verdict),
             });
             if let Some(reason) = result.reason {
                 let _ = events.send(RuntimeEvent::Status {
+                    code: None,
                     text: format!("capability:{}:reason:{}", result.request_id, reason),
                 });
             }

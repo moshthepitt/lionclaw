@@ -1,6 +1,7 @@
 use std::io::{BufRead, Write};
 
 use anyhow::{anyhow, Result};
+use tokio::sync::mpsc;
 
 use crate::{
     contracts::{
@@ -82,23 +83,10 @@ async fn run_repl<R: BufRead, W: Write>(
             break;
         }
 
-        match kernel
-            .turn_session(SessionTurnRequest {
-                session_id: session.session_id,
-                user_text: trimmed.to_string(),
-                runtime_id: Some(runtime_id.to_string()),
-                runtime_working_dir: None,
-                runtime_timeout_ms: None,
-                runtime_env_passthrough: None,
-            })
-            .await
+        if let Err(err) =
+            render_streaming_turn(kernel, session.session_id, runtime_id, trimmed, output).await
         {
-            Ok(turn) => {
-                render_turn_stream(&turn.stream_events, output)?;
-            }
-            Err(err) => {
-                writeln!(output, "error: {}", err)?;
-            }
+            writeln!(output, "error: {}", err)?;
         }
     }
 
@@ -118,25 +106,74 @@ fn kernel_to_anyhow(err: crate::kernel::KernelError) -> anyhow::Error {
     anyhow!(err.to_string())
 }
 
+async fn render_streaming_turn<W: Write>(
+    kernel: &Kernel,
+    session_id: uuid::Uuid,
+    runtime_id: &str,
+    user_text: &str,
+    output: &mut W,
+) -> Result<()> {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let turn_request = SessionTurnRequest {
+        session_id,
+        user_text: user_text.to_string(),
+        runtime_id: Some(runtime_id.to_string()),
+        runtime_working_dir: None,
+        runtime_timeout_ms: None,
+        runtime_env_passthrough: None,
+    };
+    let turn_future = kernel.turn_session_streaming(turn_request, tx);
+    tokio::pin!(turn_future);
+
+    loop {
+        tokio::select! {
+            result = &mut turn_future => {
+                let _ = result.map_err(kernel_to_anyhow)?;
+                break;
+            }
+            maybe_event = rx.recv() => {
+                let Some(event) = maybe_event else {
+                    continue;
+                };
+                render_turn_event(&event, output)?;
+                output.flush()?;
+            }
+        }
+    }
+
+    while let Ok(event) = rx.try_recv() {
+        render_turn_event(&event, output)?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn render_turn_stream<W: Write>(events: &[StreamEventDto], output: &mut W) -> Result<()> {
     for event in events {
-        match (&event.kind, &event.lane, event.text.as_deref()) {
-            (StreamEventKindDto::MessageDelta, Some(StreamLaneDto::Answer), Some(text)) => {
-                write_prefixed_lines(output, "lionclaw> ", text)?;
-            }
-            (StreamEventKindDto::MessageDelta, Some(StreamLaneDto::Reasoning), Some(text)) => {
-                write_prefixed_lines(output, "thinking> ", text)?;
-            }
-            (StreamEventKindDto::Status, _, Some(text)) => {
-                writeln!(output, "[status] {}", text)?;
-            }
-            (StreamEventKindDto::Error, _, Some(text)) => {
-                writeln!(output, "[error] {}", text)?;
-            }
-            (StreamEventKindDto::Done, _, _) | (_, _, None) => {}
-            (_, _, Some(text)) => {
-                writeln!(output, "{}", text)?;
-            }
+        render_turn_event(event, output)?;
+    }
+
+    Ok(())
+}
+
+fn render_turn_event<W: Write>(event: &StreamEventDto, output: &mut W) -> Result<()> {
+    match (&event.kind, &event.lane, event.text.as_deref()) {
+        (StreamEventKindDto::MessageDelta, Some(StreamLaneDto::Answer), Some(text)) => {
+            write_prefixed_lines(output, "lionclaw> ", text)?;
+        }
+        (StreamEventKindDto::MessageDelta, Some(StreamLaneDto::Reasoning), Some(text)) => {
+            write_prefixed_lines(output, "thinking> ", text)?;
+        }
+        (StreamEventKindDto::Status, _, Some(text)) => {
+            writeln!(output, "[status] {}", text)?;
+        }
+        (StreamEventKindDto::Error, _, Some(text)) => {
+            writeln!(output, "[error] {}", text)?;
+        }
+        (StreamEventKindDto::Done, _, _) | (_, _, None) => {}
+        (_, _, Some(text)) => {
+            writeln!(output, "{}", text)?;
         }
     }
 
@@ -310,26 +347,31 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
                 StreamEventDto {
                     kind: StreamEventKindDto::Status,
                     lane: None,
+                    code: None,
                     text: Some("runtime started".to_string()),
                 },
                 StreamEventDto {
                     kind: StreamEventKindDto::MessageDelta,
                     lane: Some(StreamLaneDto::Reasoning),
+                    code: None,
                     text: Some("planning next step".to_string()),
                 },
                 StreamEventDto {
                     kind: StreamEventKindDto::MessageDelta,
                     lane: Some(StreamLaneDto::Answer),
+                    code: None,
                     text: Some("hello\nworld".to_string()),
                 },
                 StreamEventDto {
                     kind: StreamEventKindDto::Error,
                     lane: None,
+                    code: None,
                     text: Some("something failed".to_string()),
                 },
                 StreamEventDto {
                     kind: StreamEventKindDto::Done,
                     lane: None,
+                    code: None,
                     text: None,
                 },
             ],

@@ -70,6 +70,7 @@ pub struct ChannelStreamEventRecord {
     pub turn_id: Uuid,
     pub kind: ChannelStreamEventKind,
     pub lane: Option<StreamMessageLane>,
+    pub code: Option<String>,
     pub text: Option<String>,
     pub created_at: DateTime<Utc>,
 }
@@ -82,6 +83,7 @@ pub struct ChannelStreamEventInsert<'a> {
     pub turn_id: Uuid,
     pub kind: ChannelStreamEventKind,
     pub lane: Option<StreamMessageLane>,
+    pub code: Option<&'a str>,
     pub text: Option<&'a str>,
 }
 
@@ -155,6 +157,18 @@ pub struct ChannelHealthRecord {
     pub latest_outbound_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ChannelMessageRecord {
+    pub message_id: Uuid,
+    pub channel_id: String,
+    pub peer_id: String,
+    pub direction: MessageDirection,
+    pub external_message_id: Option<String>,
+    pub update_id: Option<i64>,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageDirection {
     Inbound,
@@ -168,6 +182,66 @@ impl MessageDirection {
             Self::Outbound => "outbound",
         }
     }
+}
+
+impl FromStr for MessageDirection {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "inbound" => Ok(Self::Inbound),
+            "outbound" => Ok(Self::Outbound),
+            other => Err(format!("invalid message direction '{}'", other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelTurnStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
+impl ChannelTurnStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl FromStr for ChannelTurnStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            other => Err(format!("invalid channel turn status '{}'", other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelTurnRecord {
+    pub turn_id: Uuid,
+    pub channel_id: String,
+    pub peer_id: String,
+    pub session_id: Uuid,
+    pub inbound_message_id: Uuid,
+    pub runtime_id: String,
+    pub status: ChannelTurnStatus,
+    pub last_error: Option<String>,
+    pub queued_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -395,7 +469,7 @@ impl ChannelStateStore {
         external_message_id: Option<String>,
         update_id: Option<i64>,
         content: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<ChannelMessageRecord>> {
         let message_id = Uuid::new_v4();
         let now = now_ms();
 
@@ -408,7 +482,7 @@ impl ChannelStateStore {
         .bind(channel_id)
         .bind(peer_id)
         .bind(MessageDirection::Inbound.as_str())
-        .bind(external_message_id)
+        .bind(external_message_id.as_deref())
         .bind(update_id)
         .bind(content)
         .bind(now)
@@ -416,12 +490,27 @@ impl ChannelStateStore {
         .await;
 
         match result {
-            Ok(done) => Ok(done.rows_affected() > 0),
+            Ok(done) => {
+                if done.rows_affected() == 0 {
+                    return Ok(None);
+                }
+                Ok(Some(ChannelMessageRecord {
+                    message_id,
+                    channel_id: channel_id.to_string(),
+                    peer_id: peer_id.to_string(),
+                    direction: MessageDirection::Inbound,
+                    external_message_id,
+                    update_id,
+                    content: content.to_string(),
+                    created_at: ms_to_datetime(now)
+                        .ok_or_else(|| anyhow!("invalid created_at_ms '{}'", now))?,
+                }))
+            }
             Err(err) => {
                 // Duplicate inbound update IDs are expected when channel workers retry.
                 if let sqlx::Error::Database(db_err) = &err {
                     if db_err.is_unique_violation() {
-                        return Ok(false);
+                        return Ok(None);
                     }
                 }
                 Err(err).context("failed to insert channel message")
@@ -455,6 +544,20 @@ impl ChannelStateStore {
         Ok(message_id)
     }
 
+    pub async fn get_message(&self, message_id: Uuid) -> Result<Option<ChannelMessageRecord>> {
+        let row = sqlx::query(
+            "SELECT message_id, channel_id, peer_id, direction, external_message_id, update_id, content, created_at_ms \
+             FROM channel_messages \
+             WHERE message_id = ?1",
+        )
+        .bind(message_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query channel message")?;
+
+        row.map(map_message_row).transpose()
+    }
+
     pub async fn append_stream_event(
         &self,
         insert: ChannelStreamEventInsert<'_>,
@@ -463,8 +566,8 @@ impl ChannelStateStore {
 
         let done = sqlx::query(
             "INSERT INTO channel_stream_events \
-             (channel_id, peer_id, session_id, turn_id, kind, lane, text, created_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (channel_id, peer_id, session_id, turn_id, kind, lane, code, text, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
         .bind(insert.channel_id)
         .bind(insert.peer_id)
@@ -472,6 +575,7 @@ impl ChannelStateStore {
         .bind(insert.turn_id.to_string())
         .bind(insert.kind.as_str())
         .bind(insert.lane.map(StreamMessageLane::as_str))
+        .bind(insert.code)
         .bind(insert.text)
         .bind(now)
         .execute(&self.pool)
@@ -480,7 +584,7 @@ impl ChannelStateStore {
 
         let sequence = done.last_insert_rowid();
         let row = sqlx::query(
-            "SELECT sequence, channel_id, peer_id, session_id, turn_id, kind, lane, text, created_at_ms \
+            "SELECT sequence, channel_id, peer_id, session_id, turn_id, kind, lane, code, text, created_at_ms \
              FROM channel_stream_events WHERE sequence = ?1",
         )
         .bind(sequence)
@@ -554,7 +658,7 @@ impl ChannelStateStore {
     ) -> Result<Vec<ChannelStreamEventRecord>> {
         let query_limit = i64::try_from(limit).context("invalid channel stream limit")?;
         let rows = sqlx::query(
-            "SELECT sequence, channel_id, peer_id, session_id, turn_id, kind, lane, text, created_at_ms \
+            "SELECT sequence, channel_id, peer_id, session_id, turn_id, kind, lane, code, text, created_at_ms \
              FROM channel_stream_events \
              WHERE channel_id = ?1 AND sequence > ?2 \
              ORDER BY sequence ASC \
@@ -595,6 +699,159 @@ impl ChannelStateStore {
         .context("failed to acknowledge channel stream consumer")?;
 
         Ok(changed.rows_affected() > 0)
+    }
+
+    pub async fn enqueue_turn(
+        &self,
+        turn_id: Uuid,
+        channel_id: &str,
+        peer_id: &str,
+        session_id: Uuid,
+        inbound_message_id: Uuid,
+        runtime_id: &str,
+    ) -> Result<ChannelTurnRecord> {
+        let queued_at_ms = now_ms();
+        sqlx::query(
+            "INSERT INTO channel_turns \
+             (turn_id, channel_id, peer_id, session_id, inbound_message_id, runtime_id, status, last_error, queued_at_ms, started_at_ms, finished_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, ?7, NULL, NULL)",
+        )
+        .bind(turn_id.to_string())
+        .bind(channel_id)
+        .bind(peer_id)
+        .bind(session_id.to_string())
+        .bind(inbound_message_id.to_string())
+        .bind(runtime_id)
+        .bind(queued_at_ms)
+        .execute(&self.pool)
+        .await
+        .context("failed to enqueue channel turn")?;
+
+        self.get_turn(turn_id)
+            .await?
+            .ok_or_else(|| anyhow!("channel turn disappeared immediately after enqueue"))
+    }
+
+    pub async fn get_turn(&self, turn_id: Uuid) -> Result<Option<ChannelTurnRecord>> {
+        let row = sqlx::query(
+            "SELECT turn_id, channel_id, peer_id, session_id, inbound_message_id, runtime_id, status, last_error, queued_at_ms, started_at_ms, finished_at_ms \
+             FROM channel_turns WHERE turn_id = ?1",
+        )
+        .bind(turn_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query channel turn")?;
+
+        row.map(map_turn_row).transpose()
+    }
+
+    pub async fn claim_next_pending_turn(
+        &self,
+        channel_id: &str,
+        peer_id: &str,
+    ) -> Result<Option<ChannelTurnRecord>> {
+        let row = sqlx::query(
+            "SELECT turn_id \
+             FROM channel_turns \
+             WHERE channel_id = ?1 AND peer_id = ?2 AND status = 'pending' \
+             ORDER BY queued_at_ms ASC \
+             LIMIT 1",
+        )
+        .bind(channel_id)
+        .bind(peer_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to select pending channel turn")?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let turn_id_raw: String = row.get("turn_id");
+        let started_at_ms = now_ms();
+        let changed = sqlx::query(
+            "UPDATE channel_turns \
+             SET status = 'running', started_at_ms = ?2, last_error = NULL \
+             WHERE turn_id = ?1 AND status = 'pending'",
+        )
+        .bind(&turn_id_raw)
+        .bind(started_at_ms)
+        .execute(&self.pool)
+        .await
+        .context("failed to claim pending channel turn")?;
+
+        if changed.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        let turn_id = Uuid::parse_str(&turn_id_raw)
+            .with_context(|| format!("invalid claimed turn id '{}'", turn_id_raw))?;
+        self.get_turn(turn_id).await
+    }
+
+    pub async fn complete_turn(&self, turn_id: Uuid) -> Result<bool> {
+        let finished_at_ms = now_ms();
+        let changed = sqlx::query(
+            "UPDATE channel_turns \
+             SET status = 'completed', finished_at_ms = ?2 \
+             WHERE turn_id = ?1 AND status = 'running'",
+        )
+        .bind(turn_id.to_string())
+        .bind(finished_at_ms)
+        .execute(&self.pool)
+        .await
+        .context("failed to complete channel turn")?;
+
+        Ok(changed.rows_affected() > 0)
+    }
+
+    pub async fn fail_turn(&self, turn_id: Uuid, last_error: &str) -> Result<bool> {
+        let finished_at_ms = now_ms();
+        let changed = sqlx::query(
+            "UPDATE channel_turns \
+             SET status = 'failed', last_error = ?2, finished_at_ms = ?3 \
+             WHERE turn_id = ?1 AND status IN ('pending', 'running')",
+        )
+        .bind(turn_id.to_string())
+        .bind(last_error)
+        .bind(finished_at_ms)
+        .execute(&self.pool)
+        .await
+        .context("failed to fail channel turn")?;
+
+        Ok(changed.rows_affected() > 0)
+    }
+
+    pub async fn fail_running_turns(&self, last_error: &str) -> Result<u64> {
+        let finished_at_ms = now_ms();
+        let changed = sqlx::query(
+            "UPDATE channel_turns \
+             SET status = 'failed', last_error = ?1, finished_at_ms = ?2 \
+             WHERE status = 'running'",
+        )
+        .bind(last_error)
+        .bind(finished_at_ms)
+        .execute(&self.pool)
+        .await
+        .context("failed to fail stale running channel turns")?;
+
+        Ok(changed.rows_affected())
+    }
+
+    pub async fn has_pending_turns(&self, channel_id: &str, peer_id: &str) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT EXISTS( \
+                SELECT 1 FROM channel_turns \
+                WHERE channel_id = ?1 AND peer_id = ?2 AND status = 'pending' \
+             ) AS has_pending",
+        )
+        .bind(channel_id)
+        .bind(peer_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to query pending channel turns")?;
+
+        Ok(row.get::<i64, _>("has_pending") != 0)
     }
 
     pub async fn channel_health(&self, channel_id: &str) -> Result<ChannelHealthRecord> {
@@ -736,7 +993,76 @@ fn map_stream_event_row(row: SqliteRow) -> Result<ChannelStreamEventRecord> {
         turn_id,
         kind,
         lane,
+        code: row.get("code"),
         text: row.get("text"),
         created_at,
+    })
+}
+
+fn map_message_row(row: SqliteRow) -> Result<ChannelMessageRecord> {
+    let message_id_raw: String = row.get("message_id");
+    let direction_raw: String = row.get("direction");
+    let created_at_ms: i64 = row.get("created_at_ms");
+    let message_id = Uuid::parse_str(&message_id_raw)
+        .with_context(|| format!("invalid message_id '{}'", message_id_raw))?;
+    let direction = MessageDirection::from_str(&direction_raw)
+        .map_err(|err| anyhow!("invalid message direction: {}", err))?;
+    let created_at = ms_to_datetime(created_at_ms)
+        .ok_or_else(|| anyhow!("invalid created_at_ms '{}'", created_at_ms))?;
+
+    Ok(ChannelMessageRecord {
+        message_id,
+        channel_id: row.get("channel_id"),
+        peer_id: row.get("peer_id"),
+        direction,
+        external_message_id: row.get("external_message_id"),
+        update_id: row.get("update_id"),
+        content: row.get("content"),
+        created_at,
+    })
+}
+
+fn map_turn_row(row: SqliteRow) -> Result<ChannelTurnRecord> {
+    let turn_id_raw: String = row.get("turn_id");
+    let session_id_raw: String = row.get("session_id");
+    let inbound_message_id_raw: String = row.get("inbound_message_id");
+    let status_raw: String = row.get("status");
+    let queued_at_ms: i64 = row.get("queued_at_ms");
+
+    let turn_id = Uuid::parse_str(&turn_id_raw)
+        .with_context(|| format!("invalid turn_id '{}'", turn_id_raw))?;
+    let session_id = Uuid::parse_str(&session_id_raw)
+        .with_context(|| format!("invalid session_id '{}'", session_id_raw))?;
+    let inbound_message_id = Uuid::parse_str(&inbound_message_id_raw)
+        .with_context(|| format!("invalid inbound_message_id '{}'", inbound_message_id_raw))?;
+    let status = ChannelTurnStatus::from_str(&status_raw)
+        .map_err(|err| anyhow!("invalid channel turn status: {}", err))?;
+    let queued_at = ms_to_datetime(queued_at_ms)
+        .ok_or_else(|| anyhow!("invalid queued_at_ms '{}'", queued_at_ms))?;
+    let started_at = row
+        .get::<Option<i64>, _>("started_at_ms")
+        .map(|value| {
+            ms_to_datetime(value).ok_or_else(|| anyhow!("invalid started_at_ms '{}'", value))
+        })
+        .transpose()?;
+    let finished_at = row
+        .get::<Option<i64>, _>("finished_at_ms")
+        .map(|value| {
+            ms_to_datetime(value).ok_or_else(|| anyhow!("invalid finished_at_ms '{}'", value))
+        })
+        .transpose()?;
+
+    Ok(ChannelTurnRecord {
+        turn_id,
+        channel_id: row.get("channel_id"),
+        peer_id: row.get("peer_id"),
+        session_id,
+        inbound_message_id,
+        runtime_id: row.get("runtime_id"),
+        status,
+        last_error: row.get("last_error"),
+        queued_at,
+        started_at,
+        finished_at,
     })
 }

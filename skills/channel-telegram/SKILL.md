@@ -16,9 +16,9 @@ What you run:
 Under the hood, the worker:
 
 1. polls Telegram updates,
-2. posts inbound text to `/v0/channels/inbound`,
+2. posts inbound text to `/v0/channels/inbound` and treats the response as queued work, not completed work,
 3. long-polls `/v0/channels/stream/pull`,
-4. coalesces `answer` deltas into provider-facing Telegram replies,
+4. starts Telegram typing from kernel queue/runtime status events and coalesces `answer` deltas into provider-facing Telegram replies,
 5. advances its consumer cursor through `/v0/channels/stream/ack`.
 
 ## Prerequisites
@@ -56,5 +56,6 @@ LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
 - Peer pairing stays enforced by LionClaw (`pending` -> `approved` via `/v0/channels/peers/approve`).
 - `peer_id` is Telegram `chat.id` serialized as string.
 - The worker defaults `consumer_id` to `telegram:<channel_id>` and `start_mode=resume`, so undelivered stream events are replayed after worker restart.
+- Telegram delivery stays message-oriented by default: typing while a turn is active, final answer on `done`, no reasoning lane delivery.
 - Runtime selection normally comes from `lionclaw service up --runtime ...`. `LIONCLAW_RUNTIME_ID` is an optional per-worker override for low-level testing.
 - The worker stores Telegram offset in `.lionclaw-telegram-offset` by default.

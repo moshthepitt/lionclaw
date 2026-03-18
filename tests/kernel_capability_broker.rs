@@ -278,6 +278,7 @@ impl RuntimeAdapter for SingleCapabilityRuntimeAdapter {
         events: RuntimeEventSender,
     ) -> Result<RuntimeTurnResult> {
         let _ = events.send(RuntimeEvent::Status {
+            code: None,
             text: "single capability runtime started turn".to_string(),
         });
         let mut capability_requests = Vec::new();
@@ -292,6 +293,7 @@ impl RuntimeAdapter for SingleCapabilityRuntimeAdapter {
             });
         } else {
             let _ = events.send(RuntimeEvent::Status {
+                code: None,
                 text: "single capability runtime had no selected skill".to_string(),
             });
             let _ = events.send(RuntimeEvent::Done);
@@ -311,13 +313,16 @@ impl RuntimeAdapter for SingleCapabilityRuntimeAdapter {
         for result in results {
             let verdict = if result.allowed { "granted" } else { "denied" };
             let _ = events.send(RuntimeEvent::Status {
+                code: None,
                 text: format!("capability:{}:{}", result.request_id, verdict),
             });
             let _ = events.send(RuntimeEvent::Status {
+                code: None,
                 text: format!("capability:{}:output:{}", result.request_id, result.output),
             });
             if let Some(reason) = result.reason {
                 let _ = events.send(RuntimeEvent::Status {
+                    code: None,
                     text: format!("capability:{}:reason:{}", result.request_id, reason),
                 });
             }

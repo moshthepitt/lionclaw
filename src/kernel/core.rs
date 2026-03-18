@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -16,14 +16,14 @@ use uuid::Uuid;
 
 use crate::contracts::{
     AuditEventView, AuditQueryResponse, ChannelBindRequest, ChannelBindResponse,
-    ChannelBindingView, ChannelInboundRequest, ChannelInboundResponse, ChannelListResponse,
-    ChannelPeerApproveRequest, ChannelPeerBlockRequest, ChannelPeerListResponse,
-    ChannelPeerResponse, ChannelPeerView, ChannelStreamAckRequest, ChannelStreamAckResponse,
-    ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamPullResponse,
-    PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeResponse, SessionOpenRequest,
-    SessionOpenResponse, SessionTurnRequest, SessionTurnResponse, SkillInstallRequest,
-    SkillInstallResponse, SkillListResponse, SkillToggleResponse, SkillView, StreamEventDto,
-    StreamEventKindDto, StreamLaneDto, TrustTier,
+    ChannelBindingView, ChannelInboundOutcome, ChannelInboundRequest, ChannelInboundResponse,
+    ChannelListResponse, ChannelPeerApproveRequest, ChannelPeerBlockRequest,
+    ChannelPeerListResponse, ChannelPeerResponse, ChannelPeerView, ChannelStreamAckRequest,
+    ChannelStreamAckResponse, ChannelStreamEventView, ChannelStreamPullRequest,
+    ChannelStreamPullResponse, PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeResponse,
+    SessionOpenRequest, SessionOpenResponse, SessionTurnRequest, SessionTurnResponse,
+    SkillInstallRequest, SkillInstallResponse, SkillListResponse, SkillToggleResponse, SkillView,
+    StreamEventDto, StreamEventKindDto, StreamLaneDto, TrustTier,
 };
 use crate::workspace::read_workspace_sections;
 
@@ -32,7 +32,7 @@ use super::{
     capability_broker::{CapabilityBroker, CapabilityExecutionContext},
     channel_state::{
         ChannelPeerStatus, ChannelStateStore, ChannelStreamEventInsert, ChannelStreamEventKind,
-        ChannelStreamEventRecord, StreamMessageLane as ChannelStreamLane,
+        ChannelStreamEventRecord, ChannelTurnRecord, StreamMessageLane as ChannelStreamLane,
     },
     db::Db,
     error::KernelError,
@@ -68,6 +68,7 @@ impl Default for KernelOptions {
     }
 }
 
+#[derive(Clone)]
 pub struct Kernel {
     sessions: SessionStore,
     skills: SkillStore,
@@ -77,7 +78,8 @@ pub struct Kernel {
     channel_state: ChannelStateStore,
     audit: AuditLog,
     capability_broker: CapabilityBroker,
-    channel_stream_notifiers: RwLock<HashMap<String, Arc<Notify>>>,
+    channel_stream_notifiers: Arc<RwLock<HashMap<String, Arc<Notify>>>>,
+    channel_turn_workers: Arc<RwLock<HashSet<String>>>,
     runtime_turn_timeout: Duration,
     runtime_execution_policy: RuntimeExecutionPolicy,
     default_runtime_id: Option<String>,
@@ -113,7 +115,8 @@ impl Kernel {
             channel_state: ChannelStateStore::new(pool.clone()),
             audit: AuditLog::new(pool),
             capability_broker,
-            channel_stream_notifiers: RwLock::new(HashMap::new()),
+            channel_stream_notifiers: Arc::new(RwLock::new(HashMap::new())),
+            channel_turn_workers: Arc::new(RwLock::new(HashSet::new())),
             runtime_turn_timeout,
             runtime_execution_policy: options.runtime_execution_policy,
             default_runtime_id: options.default_runtime_id,
@@ -126,6 +129,10 @@ impl Kernel {
 
     async fn bootstrap(&self) {
         register_builtin_runtime_adapters(&self.runtime).await;
+        let _ = self
+            .channel_state
+            .fail_running_turns("channel turn interrupted by restart")
+            .await;
     }
 
     pub async fn register_runtime_adapter(
@@ -179,244 +186,15 @@ impl Kernel {
         &self,
         req: SessionTurnRequest,
     ) -> Result<SessionTurnResponse, KernelError> {
-        if req.user_text.trim().is_empty() {
-            return Err(KernelError::BadRequest("user_text is required".to_string()));
-        }
+        self.turn_session_with_sink(req, None).await
+    }
 
-        let session = self
-            .sessions
-            .get(req.session_id)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| KernelError::NotFound("session not found".to_string()))?;
-
-        let enabled_skills = self.skills.list_enabled().await.map_err(internal)?;
-        let selected_skill_ids = self.selector.select(&req.user_text, &enabled_skills);
-        let session_scope = Scope::Session(req.session_id);
-        let any_scope = Scope::Any;
-
-        let mut allowed_skills = Vec::new();
-        for skill_id in selected_skill_ids {
-            let allowed_for_session = self
-                .policy
-                .is_allowed(&skill_id, Capability::SkillUse, &session_scope)
-                .await
-                .map_err(internal)?;
-            let allowed_globally = self
-                .policy
-                .is_allowed(&skill_id, Capability::SkillUse, &any_scope)
-                .await
-                .map_err(internal)?;
-
-            if allowed_for_session || allowed_globally {
-                allowed_skills.push(skill_id);
-            }
-        }
-        allowed_skills.sort();
-        let turn_id = Uuid::new_v4();
-        let channel_stream_context = self
-            .channel_stream_context_for_session(
-                session.session_id,
-                &session.channel_id,
-                &session.peer_id,
-                turn_id,
-            )
-            .await?;
-
-        let runtime_id = self.resolve_runtime_id(req.runtime_id.as_deref())?;
-        let adapter = self.runtime.get(&runtime_id).await.ok_or_else(|| {
-            KernelError::NotFound(format!("runtime adapter '{}' not found", runtime_id))
-        })?;
-        let execution_context = self
-            .resolve_runtime_execution_context(
-                session.session_id,
-                &runtime_id,
-                RuntimeExecutionRequest::new(
-                    req.runtime_working_dir.clone(),
-                    req.runtime_env_passthrough.clone().unwrap_or_default(),
-                    req.runtime_timeout_ms,
-                ),
-            )
-            .await?;
-
-        let handle = adapter
-            .session_start(RuntimeSessionStartInput {
-                session_id: session.session_id,
-                working_dir: execution_context.working_dir.clone(),
-                environment: execution_context.environment.clone(),
-                selected_skills: allowed_skills.clone(),
-            })
-            .await
-            .map_err(|err| KernelError::Runtime(err.to_string()))?;
-
-        let turn_result = self
-            .execute_runtime_turn(RuntimeTurnExecution {
-                adapter: adapter.clone(),
-                runtime_id: &runtime_id,
-                session_id: session.session_id,
-                handle: &handle,
-                turn_timeout: execution_context.timeout,
-                input: RuntimeTurnInput {
-                    runtime_session_id: handle.runtime_session_id.clone(),
-                    prompt: self
-                        .build_prompt_envelope(&req.user_text, &allowed_skills)
-                        .await?,
-                    selected_skills: allowed_skills.clone(),
-                },
-                stream_context: channel_stream_context.clone(),
-            })
-            .await;
-
-        let runtime_turn = match turn_result {
-            Ok(output) => output,
-            Err(turn_err) => {
-                let _ = self
-                    .close_runtime_session(
-                        adapter.clone(),
-                        &runtime_id,
-                        session.session_id,
-                        &handle,
-                    )
-                    .await;
-                return Err(turn_err);
-            }
-        };
-
-        let runtime_events_result = async {
-            let mut runtime_events = runtime_turn.events;
-            if !runtime_turn.result.capability_requests.is_empty() {
-                let capability_results = self
-                    .evaluate_capability_requests(
-                        session.session_id,
-                        turn_id,
-                        &session.channel_id,
-                        &session.peer_id,
-                        &allowed_skills,
-                        runtime_turn.result.capability_requests,
-                    )
-                    .await?;
-                let followup_events = self
-                    .execute_runtime_capability_followup(
-                        adapter.clone(),
-                        &runtime_id,
-                        session.session_id,
-                        &handle,
-                        capability_results,
-                        channel_stream_context.clone(),
-                    )
-                    .await
-                    .map_err(|err| KernelError::Runtime(err.to_string()))?;
-                runtime_events.extend(followup_events);
-            }
-
-            Ok::<Vec<RuntimeEvent>, KernelError>(runtime_events)
-        }
-        .await;
-
-        let close_result = self
-            .close_runtime_session(adapter.clone(), &runtime_id, session.session_id, &handle)
-            .await;
-        let runtime_events = match (runtime_events_result, close_result) {
-            (Ok(events), Ok(())) => events,
-            (Err(err), Ok(())) => return Err(err),
-            (Ok(_), Err(close_err)) => return Err(close_err),
-            (Err(err), Err(_)) => return Err(err),
-        };
-
-        let _ = self
-            .sessions
-            .record_turn(session.session_id)
-            .await
-            .map_err(internal)?;
-
-        let mut assistant = String::new();
-        let mut event_views = Vec::with_capacity(runtime_events.len());
-        let mut saw_error = false;
-        for event in &runtime_events {
-            if let RuntimeEvent::MessageDelta {
-                lane: RuntimeMessageLane::Answer,
-                text,
-            } = event
-            {
-                assistant.push_str(text);
-            }
-            if matches!(event, RuntimeEvent::Error { .. }) {
-                saw_error = true;
-            }
-            event_views.push(to_stream_event_view(event.clone()));
-        }
-
-        if let Some(stream_context) = &channel_stream_context {
-            if saw_error {
-                self.audit
-                    .append(
-                        "channel.turn.stream_error",
-                        Some(session.session_id),
-                        Some("kernel".to_string()),
-                        json!({
-                            "channel_id": stream_context.channel_id,
-                            "peer_id": stream_context.peer_id,
-                            "turn_id": turn_id,
-                        }),
-                    )
-                    .await
-                    .map_err(internal)?;
-            }
-
-            if !assistant.trim().is_empty() {
-                let message_id = self
-                    .channel_state
-                    .insert_outbound_message(
-                        &stream_context.channel_id,
-                        &stream_context.peer_id,
-                        &assistant,
-                    )
-                    .await
-                    .map_err(internal)?;
-                self.audit
-                    .append(
-                        "channel.outbound.recorded",
-                        Some(session.session_id),
-                        Some("kernel".to_string()),
-                        json!({
-                            "channel_id": stream_context.channel_id,
-                            "peer_id": stream_context.peer_id,
-                            "message_id": message_id,
-                            "turn_id": turn_id,
-                            "content_len": assistant.len(),
-                        }),
-                    )
-                    .await
-                    .map_err(internal)?;
-            }
-        }
-
-        self.audit
-            .append(
-                "session.turn",
-                Some(session.session_id),
-                Some("api".to_string()),
-                json!({
-                    "turn_id": turn_id,
-                    "runtime_id": runtime_id,
-                    "selected_skills": allowed_skills,
-                    "prompt_len": req.user_text.len(),
-                    "runtime_working_dir": execution_context.working_dir,
-                    "runtime_timeout_ms": execution_context.timeout.as_millis() as u64,
-                    "runtime_env_passthrough_count": execution_context.environment.len(),
-                }),
-            )
-            .await
-            .map_err(internal)?;
-
-        Ok(SessionTurnResponse {
-            session_id: session.session_id,
-            turn_id,
-            assistant_text: assistant,
-            selected_skills: allowed_skills,
-            runtime_id,
-            stream_events: event_views,
-        })
+    pub async fn turn_session_streaming(
+        &self,
+        req: SessionTurnRequest,
+        sink: RuntimeEventSink,
+    ) -> Result<SessionTurnResponse, KernelError> {
+        self.turn_session_with_sink(req, Some(sink)).await
     }
 
     pub async fn install_skill(
@@ -707,18 +485,15 @@ impl Kernel {
         &self,
         req: ChannelInboundRequest,
     ) -> Result<ChannelInboundResponse, KernelError> {
-        let accepted = self
-            .process_inbound_channel_text(
-                &req.channel_id,
-                &req.peer_id,
-                &req.text,
-                req.runtime_id,
-                req.update_id,
-                req.external_message_id,
-            )
-            .await?;
-
-        Ok(ChannelInboundResponse { accepted })
+        self.process_inbound_channel_text(
+            &req.channel_id,
+            &req.peer_id,
+            &req.text,
+            req.runtime_id,
+            req.update_id,
+            req.external_message_id,
+        )
+        .await
     }
 
     pub async fn pull_channel_stream(
@@ -858,7 +633,7 @@ impl Kernel {
         runtime_id: Option<String>,
         update_id: Option<i64>,
         external_message_id: Option<String>,
-    ) -> Result<bool, KernelError> {
+    ) -> Result<ChannelInboundResponse, KernelError> {
         if channel_id.trim().is_empty() || peer_id.trim().is_empty() || text.trim().is_empty() {
             return Err(KernelError::BadRequest(
                 "channel_id, peer_id and text are required".to_string(),
@@ -872,9 +647,13 @@ impl Kernel {
             .insert_inbound_message(channel_id, peer_id, external_message_id, update_id, text)
             .await
             .map_err(internal)?;
-        if !inserted {
-            return Ok(false);
-        }
+        let Some(inbound_message) = inserted else {
+            return Ok(ChannelInboundResponse {
+                outcome: ChannelInboundOutcome::Duplicate,
+                turn_id: None,
+                session_id: None,
+            });
+        };
 
         let peer = match self
             .channel_state
@@ -932,7 +711,11 @@ impl Kernel {
                     .await
                     .map_err(internal)?;
 
-                return Ok(true);
+                return Ok(ChannelInboundResponse {
+                    outcome: ChannelInboundOutcome::PairingPending,
+                    turn_id: None,
+                    session_id: None,
+                });
             }
         };
 
@@ -964,7 +747,11 @@ impl Kernel {
                     )
                     .await
                     .map_err(internal)?;
-                return Ok(true);
+                return Ok(ChannelInboundResponse {
+                    outcome: ChannelInboundOutcome::PairingPending,
+                    turn_id: None,
+                    session_id: None,
+                });
             }
             ChannelPeerStatus::Blocked => {
                 self.audit
@@ -981,7 +768,11 @@ impl Kernel {
                     )
                     .await
                     .map_err(internal)?;
-                return Ok(true);
+                return Ok(ChannelInboundResponse {
+                    outcome: ChannelInboundOutcome::PeerBlocked,
+                    turn_id: None,
+                    session_id: None,
+                });
             }
             ChannelPeerStatus::Approved => {}
         }
@@ -1018,71 +809,62 @@ impl Kernel {
                 .await
                 .map_err(internal)?,
         };
-        let runtime_id = self
+        let resolved_channel_runtime_id = self
             .resolve_channel_runtime_id(channel_id, runtime_id)
             .await?;
+        let runtime_id = self.resolve_runtime_id(resolved_channel_runtime_id.as_deref())?;
+
+        let turn_id = Uuid::new_v4();
+        self.channel_state
+            .enqueue_turn(
+                turn_id,
+                channel_id,
+                peer_id,
+                session.session_id,
+                inbound_message.message_id,
+                &runtime_id,
+            )
+            .await
+            .map_err(internal)?;
+
+        let stream_context = self
+            .channel_stream_context_for_session(session.session_id, channel_id, peer_id, turn_id)
+            .await?;
+        if let Some(stream_context) = &stream_context {
+            self.emit_runtime_event(
+                &Some(stream_context.clone()),
+                &None,
+                RuntimeEvent::Status {
+                    code: Some("queue.queued".to_string()),
+                    text: "queued".to_string(),
+                },
+            )
+            .await?;
+        }
 
         self.audit
             .append(
-                "channel.turn.started",
+                "channel.turn.queued",
                 Some(session.session_id),
                 Some("kernel".to_string()),
                 json!({
                     "channel_id": channel_id,
                     "peer_id": peer_id,
                     "runtime_id": runtime_id,
+                    "turn_id": turn_id,
+                    "inbound_message_id": inbound_message.message_id,
                 }),
             )
             .await
             .map_err(internal)?;
 
-        let turn = self
-            .turn_session(SessionTurnRequest {
-                session_id: session.session_id,
-                user_text: text.to_string(),
-                runtime_id,
-                runtime_working_dir: None,
-                runtime_timeout_ms: None,
-                runtime_env_passthrough: None,
-            })
-            .await;
+        self.ensure_channel_turn_worker(channel_id, peer_id).await;
 
-        let turn = match turn {
-            Ok(value) => value,
-            Err(err) => {
-                self.audit
-                    .append(
-                        "channel.turn.failed",
-                        Some(session.session_id),
-                        Some("kernel".to_string()),
-                        json!({
-                            "channel_id": channel_id,
-                            "peer_id": peer_id,
-                            "error": err.to_string(),
-                        }),
-                    )
-                    .await
-                    .map_err(internal)?;
-                return Err(err);
-            }
-        };
-
-        self.audit
-            .append(
-                "channel.turn.succeeded",
-                Some(session.session_id),
-                Some("kernel".to_string()),
-                json!({
-                    "channel_id": channel_id,
-                    "peer_id": peer_id,
-                    "runtime_id": turn.runtime_id,
-                    "assistant_text_len": turn.assistant_text.len(),
-                }),
-            )
-            .await
-            .map_err(internal)?;
-
-        Ok(true)
+        Ok(ChannelInboundResponse {
+            outcome: ChannelInboundOutcome::Queued,
+            turn_id: Some(turn_id),
+            session_id: Some(session.session_id),
+        })
     }
 
     pub async fn grant_policy(
@@ -1241,6 +1023,7 @@ fn to_channel_stream_event_view(event: ChannelStreamEventRecord) -> ChannelStrea
         turn_id: event.turn_id,
         kind: to_stream_event_kind_dto(event.kind),
         lane: event.lane.map(to_stream_lane_dto),
+        code: event.code,
         text: event.text,
         created_at: event.created_at,
     }
@@ -1270,21 +1053,25 @@ fn to_stream_event_view(event: RuntimeEvent) -> StreamEventDto {
                 RuntimeMessageLane::Answer => StreamLaneDto::Answer,
                 RuntimeMessageLane::Reasoning => StreamLaneDto::Reasoning,
             }),
+            code: None,
             text: Some(text),
         },
-        RuntimeEvent::Status { text } => StreamEventDto {
+        RuntimeEvent::Status { code, text } => StreamEventDto {
             kind: StreamEventKindDto::Status,
             lane: None,
+            code,
             text: Some(text),
         },
-        RuntimeEvent::Error { text } => StreamEventDto {
+        RuntimeEvent::Error { code, text } => StreamEventDto {
             kind: StreamEventKindDto::Error,
             lane: None,
+            code,
             text: Some(text),
         },
         RuntimeEvent::Done => StreamEventDto {
             kind: StreamEventKindDto::Done,
             lane: None,
+            code: None,
             text: None,
         },
     }
@@ -1431,6 +1218,8 @@ struct CollectedRuntimeTurn {
     result: RuntimeTurnResult,
 }
 
+type RuntimeEventSink = tokio::sync::mpsc::UnboundedSender<StreamEventDto>;
+
 struct RuntimeTurnExecution<'a> {
     adapter: Arc<dyn RuntimeAdapter>,
     runtime_id: &'a str,
@@ -1439,9 +1228,309 @@ struct RuntimeTurnExecution<'a> {
     turn_timeout: Duration,
     input: RuntimeTurnInput,
     stream_context: Option<ChannelStreamContext>,
+    event_sink: Option<RuntimeEventSink>,
+}
+
+struct SessionTurnExecution {
+    turn_id: Uuid,
+    user_text: String,
+    requested_runtime_id: Option<String>,
+    runtime_working_dir: Option<String>,
+    runtime_timeout_ms: Option<u64>,
+    runtime_env_passthrough: Option<Vec<String>>,
+    sink: Option<RuntimeEventSink>,
+    audit_actor: String,
+}
+
+struct RuntimeCapabilityFollowupExecution<'a> {
+    adapter: Arc<dyn RuntimeAdapter>,
+    runtime_id: &'a str,
+    session_id: Uuid,
+    handle: &'a RuntimeSessionHandle,
+    results: Vec<RuntimeCapabilityResult>,
+    stream_context: Option<ChannelStreamContext>,
+    event_sink: Option<RuntimeEventSink>,
 }
 
 impl Kernel {
+    async fn turn_session_with_sink(
+        &self,
+        req: SessionTurnRequest,
+        sink: Option<RuntimeEventSink>,
+    ) -> Result<SessionTurnResponse, KernelError> {
+        if req.user_text.trim().is_empty() {
+            return Err(KernelError::BadRequest("user_text is required".to_string()));
+        }
+
+        let session = self
+            .sessions
+            .get(req.session_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("session not found".to_string()))?;
+
+        self.execute_session_turn(
+            &session,
+            SessionTurnExecution {
+                turn_id: Uuid::new_v4(),
+                user_text: req.user_text,
+                requested_runtime_id: req.runtime_id,
+                runtime_working_dir: req.runtime_working_dir,
+                runtime_timeout_ms: req.runtime_timeout_ms,
+                runtime_env_passthrough: req.runtime_env_passthrough,
+                sink,
+                audit_actor: "api".to_string(),
+            },
+        )
+        .await
+    }
+
+    async fn execute_session_turn(
+        &self,
+        session: &super::sessions::Session,
+        execution: SessionTurnExecution,
+    ) -> Result<SessionTurnResponse, KernelError> {
+        let SessionTurnExecution {
+            turn_id,
+            user_text,
+            requested_runtime_id,
+            runtime_working_dir,
+            runtime_timeout_ms,
+            runtime_env_passthrough,
+            sink,
+            audit_actor,
+        } = execution;
+        let enabled_skills = self.skills.list_enabled().await.map_err(internal)?;
+        let selected_skill_ids = self.selector.select(&user_text, &enabled_skills);
+        let session_scope = Scope::Session(session.session_id);
+        let any_scope = Scope::Any;
+
+        let mut allowed_skills = Vec::new();
+        for skill_id in selected_skill_ids {
+            let allowed_for_session = self
+                .policy
+                .is_allowed(&skill_id, Capability::SkillUse, &session_scope)
+                .await
+                .map_err(internal)?;
+            let allowed_globally = self
+                .policy
+                .is_allowed(&skill_id, Capability::SkillUse, &any_scope)
+                .await
+                .map_err(internal)?;
+
+            if allowed_for_session || allowed_globally {
+                allowed_skills.push(skill_id);
+            }
+        }
+        allowed_skills.sort();
+
+        let channel_stream_context = self
+            .channel_stream_context_for_session(
+                session.session_id,
+                &session.channel_id,
+                &session.peer_id,
+                turn_id,
+            )
+            .await?;
+
+        let runtime_id = self.resolve_runtime_id(requested_runtime_id.as_deref())?;
+        let adapter = self.runtime.get(&runtime_id).await.ok_or_else(|| {
+            KernelError::NotFound(format!("runtime adapter '{}' not found", runtime_id))
+        })?;
+        let execution_context = self
+            .resolve_runtime_execution_context(
+                session.session_id,
+                &runtime_id,
+                RuntimeExecutionRequest::new(
+                    runtime_working_dir.clone(),
+                    runtime_env_passthrough.clone().unwrap_or_default(),
+                    runtime_timeout_ms,
+                ),
+            )
+            .await?;
+
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: session.session_id,
+                working_dir: execution_context.working_dir.clone(),
+                environment: execution_context.environment.clone(),
+                selected_skills: allowed_skills.clone(),
+            })
+            .await
+            .map_err(|err| KernelError::Runtime(err.to_string()))?;
+
+        let turn_result = self
+            .execute_runtime_turn(RuntimeTurnExecution {
+                adapter: adapter.clone(),
+                runtime_id: &runtime_id,
+                session_id: session.session_id,
+                handle: &handle,
+                turn_timeout: execution_context.timeout,
+                input: RuntimeTurnInput {
+                    runtime_session_id: handle.runtime_session_id.clone(),
+                    prompt: self
+                        .build_prompt_envelope(&user_text, &allowed_skills)
+                        .await?,
+                    selected_skills: allowed_skills.clone(),
+                },
+                stream_context: channel_stream_context.clone(),
+                event_sink: sink.clone(),
+            })
+            .await;
+
+        let runtime_turn = match turn_result {
+            Ok(output) => output,
+            Err(turn_err) => {
+                let _ = self
+                    .close_runtime_session(
+                        adapter.clone(),
+                        &runtime_id,
+                        session.session_id,
+                        &handle,
+                    )
+                    .await;
+                return Err(turn_err);
+            }
+        };
+
+        let runtime_events_result = async {
+            let mut runtime_events = runtime_turn.events;
+            if !runtime_turn.result.capability_requests.is_empty() {
+                let capability_results = self
+                    .evaluate_capability_requests(
+                        session.session_id,
+                        turn_id,
+                        &session.channel_id,
+                        &session.peer_id,
+                        &allowed_skills,
+                        runtime_turn.result.capability_requests,
+                    )
+                    .await?;
+                let followup_events = self
+                    .execute_runtime_capability_followup(RuntimeCapabilityFollowupExecution {
+                        adapter: adapter.clone(),
+                        runtime_id: &runtime_id,
+                        session_id: session.session_id,
+                        handle: &handle,
+                        results: capability_results,
+                        stream_context: channel_stream_context.clone(),
+                        event_sink: sink.clone(),
+                    })
+                    .await
+                    .map_err(|err| KernelError::Runtime(err.to_string()))?;
+                runtime_events.extend(followup_events);
+            }
+
+            Ok::<Vec<RuntimeEvent>, KernelError>(runtime_events)
+        }
+        .await;
+
+        let close_result = self
+            .close_runtime_session(adapter.clone(), &runtime_id, session.session_id, &handle)
+            .await;
+        let runtime_events = match (runtime_events_result, close_result) {
+            (Ok(events), Ok(())) => events,
+            (Err(err), Ok(())) => return Err(err),
+            (Ok(_), Err(close_err)) => return Err(close_err),
+            (Err(err), Err(_)) => return Err(err),
+        };
+
+        let _ = self
+            .sessions
+            .record_turn(session.session_id)
+            .await
+            .map_err(internal)?;
+
+        let mut assistant = String::new();
+        let mut event_views = Vec::with_capacity(runtime_events.len());
+        let mut saw_error = false;
+        for event in &runtime_events {
+            if let RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text,
+            } = event
+            {
+                assistant.push_str(text);
+            }
+            if matches!(event, RuntimeEvent::Error { .. }) {
+                saw_error = true;
+            }
+            event_views.push(to_stream_event_view(event.clone()));
+        }
+
+        if let Some(stream_context) = &channel_stream_context {
+            if saw_error {
+                self.audit
+                    .append(
+                        "channel.turn.stream_error",
+                        Some(session.session_id),
+                        Some("kernel".to_string()),
+                        json!({
+                            "channel_id": stream_context.channel_id,
+                            "peer_id": stream_context.peer_id,
+                            "turn_id": turn_id,
+                        }),
+                    )
+                    .await
+                    .map_err(internal)?;
+            }
+
+            if !saw_error && !assistant.trim().is_empty() {
+                let message_id = self
+                    .channel_state
+                    .insert_outbound_message(
+                        &stream_context.channel_id,
+                        &stream_context.peer_id,
+                        &assistant,
+                    )
+                    .await
+                    .map_err(internal)?;
+                self.audit
+                    .append(
+                        "channel.outbound.recorded",
+                        Some(session.session_id),
+                        Some("kernel".to_string()),
+                        json!({
+                            "channel_id": stream_context.channel_id,
+                            "peer_id": stream_context.peer_id,
+                            "message_id": message_id,
+                            "turn_id": turn_id,
+                            "content_len": assistant.len(),
+                        }),
+                    )
+                    .await
+                    .map_err(internal)?;
+            }
+        }
+
+        self.audit
+            .append(
+                "session.turn",
+                Some(session.session_id),
+                Some(audit_actor),
+                json!({
+                    "turn_id": turn_id,
+                    "runtime_id": runtime_id,
+                    "selected_skills": allowed_skills,
+                    "prompt_len": user_text.len(),
+                    "runtime_working_dir": execution_context.working_dir,
+                    "runtime_timeout_ms": execution_context.timeout.as_millis() as u64,
+                    "runtime_env_passthrough_count": execution_context.environment.len(),
+                }),
+            )
+            .await
+            .map_err(internal)?;
+
+        Ok(SessionTurnResponse {
+            session_id: session.session_id,
+            turn_id,
+            assistant_text: assistant,
+            selected_skills: allowed_skills,
+            runtime_id,
+            stream_events: event_views,
+        })
+    }
+
     fn resolve_runtime_id(
         &self,
         requested_runtime_id: Option<&str>,
@@ -1614,22 +1703,29 @@ impl Kernel {
         context: &ChannelStreamContext,
         event: &RuntimeEvent,
     ) -> Result<(), KernelError> {
-        let (kind, lane, text) = match event {
+        let (kind, lane, code, text) = match event {
             RuntimeEvent::MessageDelta { lane, text } => (
                 ChannelStreamEventKind::MessageDelta,
                 Some(match lane {
                     RuntimeMessageLane::Answer => ChannelStreamLane::Answer,
                     RuntimeMessageLane::Reasoning => ChannelStreamLane::Reasoning,
                 }),
+                None,
                 Some(text.as_str()),
             ),
-            RuntimeEvent::Status { text } => {
-                (ChannelStreamEventKind::Status, None, Some(text.as_str()))
-            }
-            RuntimeEvent::Error { text } => {
-                (ChannelStreamEventKind::Error, None, Some(text.as_str()))
-            }
-            RuntimeEvent::Done => (ChannelStreamEventKind::Done, None, None),
+            RuntimeEvent::Status { code, text } => (
+                ChannelStreamEventKind::Status,
+                None,
+                code.as_deref(),
+                Some(text.as_str()),
+            ),
+            RuntimeEvent::Error { code, text } => (
+                ChannelStreamEventKind::Error,
+                None,
+                code.as_deref(),
+                Some(text.as_str()),
+            ),
+            RuntimeEvent::Done => (ChannelStreamEventKind::Done, None, None, None),
         };
 
         self.channel_state
@@ -1640,12 +1736,36 @@ impl Kernel {
                 turn_id: context.turn_id,
                 kind,
                 lane,
+                code,
                 text,
             })
             .await
             .map_err(internal)?;
         self.notify_channel_stream(&context.channel_id).await;
         Ok(())
+    }
+
+    fn emit_local_stream_event(&self, sink: &Option<RuntimeEventSink>, event: &RuntimeEvent) {
+        if let Some(sink) = sink {
+            let _ = sink.send(to_stream_event_view(event.clone()));
+        }
+    }
+
+    async fn emit_runtime_event(
+        &self,
+        stream_context: &Option<ChannelStreamContext>,
+        sink: &Option<RuntimeEventSink>,
+        event: RuntimeEvent,
+    ) -> Result<(), KernelError> {
+        if let Some(context) = stream_context {
+            self.append_stream_event(context, &event).await?;
+        }
+        self.emit_local_stream_event(sink, &event);
+        Ok(())
+    }
+
+    fn peer_worker_key(channel_id: &str, peer_id: &str) -> String {
+        format!("{channel_id}:{peer_id}")
     }
 
     async fn emit_channel_message(
@@ -1702,6 +1822,296 @@ impl Kernel {
         self.append_stream_event(&stream_context, &RuntimeEvent::Done)
             .await?;
         Ok(message_ids)
+    }
+
+    async fn ensure_channel_turn_worker(&self, channel_id: &str, peer_id: &str) {
+        let worker_key = Self::peer_worker_key(channel_id, peer_id);
+        {
+            let mut workers = self.channel_turn_workers.write().await;
+            if !workers.insert(worker_key.clone()) {
+                return;
+            }
+        }
+
+        let kernel = self.clone();
+        let channel_id = channel_id.to_string();
+        let peer_id = peer_id.to_string();
+        tokio::spawn(async move {
+            kernel
+                .drain_channel_turns_for_peer(worker_key, channel_id, peer_id)
+                .await;
+        });
+    }
+
+    async fn drain_channel_turns_for_peer(
+        self,
+        worker_key: String,
+        channel_id: String,
+        peer_id: String,
+    ) {
+        loop {
+            loop {
+                let turn = match self
+                    .channel_state
+                    .claim_next_pending_turn(&channel_id, &peer_id)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        let _ = self
+                            .audit
+                            .append(
+                                "channel.turn.claim_failed",
+                                None,
+                                Some("kernel".to_string()),
+                                json!({
+                                    "channel_id": channel_id,
+                                    "peer_id": peer_id,
+                                    "error": err.to_string(),
+                                }),
+                            )
+                            .await;
+                        self.channel_turn_workers.write().await.remove(&worker_key);
+                        return;
+                    }
+                };
+
+                let Some(turn) = turn else {
+                    break;
+                };
+
+                self.process_queued_channel_turn(turn).await;
+            }
+
+            self.channel_turn_workers.write().await.remove(&worker_key);
+            if !self
+                .channel_state
+                .has_pending_turns(&channel_id, &peer_id)
+                .await
+                .unwrap_or(false)
+            {
+                return;
+            }
+
+            let mut workers = self.channel_turn_workers.write().await;
+            if !workers.insert(worker_key.clone()) {
+                return;
+            }
+        }
+    }
+
+    async fn process_queued_channel_turn(&self, turn: ChannelTurnRecord) {
+        let stream_context = match self
+            .channel_stream_context_for_session(
+                turn.session_id,
+                &turn.channel_id,
+                &turn.peer_id,
+                turn.turn_id,
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                let _ = self
+                    .fail_queued_turn(
+                        &turn,
+                        "queue.failed",
+                        &format!("failed to resolve stream context: {}", err),
+                        None,
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        let _ = self
+            .emit_runtime_event(
+                &stream_context,
+                &None,
+                RuntimeEvent::Status {
+                    code: Some("queue.started".to_string()),
+                    text: "turn started".to_string(),
+                },
+            )
+            .await;
+
+        let _ = self
+            .audit
+            .append(
+                "channel.turn.started",
+                Some(turn.session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "turn_id": turn.turn_id,
+                    "channel_id": turn.channel_id,
+                    "peer_id": turn.peer_id,
+                    "runtime_id": turn.runtime_id,
+                    "inbound_message_id": turn.inbound_message_id,
+                }),
+            )
+            .await;
+
+        let inbound_message = match self
+            .channel_state
+            .get_message(turn.inbound_message_id)
+            .await
+            .map_err(internal)
+        {
+            Ok(Some(message)) => message,
+            Ok(None) => {
+                let _ = self
+                    .fail_queued_turn(
+                        &turn,
+                        "queue.failed",
+                        "queued inbound message no longer exists",
+                        stream_context,
+                    )
+                    .await;
+                return;
+            }
+            Err(err) => {
+                let _ = self
+                    .fail_queued_turn(&turn, "queue.failed", &err.to_string(), stream_context)
+                    .await;
+                return;
+            }
+        };
+
+        let session = match self.sessions.get(turn.session_id).await.map_err(internal) {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                let _ = self
+                    .fail_queued_turn(
+                        &turn,
+                        "queue.failed",
+                        "queued session no longer exists",
+                        stream_context,
+                    )
+                    .await;
+                return;
+            }
+            Err(err) => {
+                let _ = self
+                    .fail_queued_turn(&turn, "queue.failed", &err.to_string(), stream_context)
+                    .await;
+                return;
+            }
+        };
+
+        let result = self
+            .execute_session_turn(
+                &session,
+                SessionTurnExecution {
+                    turn_id: turn.turn_id,
+                    user_text: inbound_message.content,
+                    requested_runtime_id: Some(turn.runtime_id.clone()),
+                    runtime_working_dir: None,
+                    runtime_timeout_ms: None,
+                    runtime_env_passthrough: None,
+                    sink: None,
+                    audit_actor: "kernel".to_string(),
+                },
+            )
+            .await;
+
+        match result {
+            Ok(response) => {
+                let _ = self.channel_state.complete_turn(turn.turn_id).await;
+                let _ = self
+                    .audit
+                    .append(
+                        "channel.turn.completed",
+                        Some(turn.session_id),
+                        Some("kernel".to_string()),
+                        json!({
+                            "turn_id": turn.turn_id,
+                            "channel_id": turn.channel_id,
+                            "peer_id": turn.peer_id,
+                            "runtime_id": response.runtime_id,
+                            "assistant_text_len": response.assistant_text.len(),
+                        }),
+                    )
+                    .await;
+                if let Some(stream_context) = self
+                    .channel_stream_context_for_session(
+                        turn.session_id,
+                        &turn.channel_id,
+                        &turn.peer_id,
+                        turn.turn_id,
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                {
+                    let _ = self
+                        .emit_runtime_event(
+                            &Some(stream_context.clone()),
+                            &None,
+                            RuntimeEvent::Status {
+                                code: Some("queue.completed".to_string()),
+                                text: "turn completed".to_string(),
+                            },
+                        )
+                        .await;
+                    let _ = self
+                        .emit_runtime_event(&Some(stream_context), &None, RuntimeEvent::Done)
+                        .await;
+                }
+            }
+            Err(err) => {
+                let code = match err {
+                    KernelError::RuntimeTimeout(_) => "runtime.timeout",
+                    KernelError::Runtime(_) => "runtime.error",
+                    _ => "queue.failed",
+                };
+                let _ = self
+                    .fail_queued_turn(&turn, code, &err.to_string(), stream_context)
+                    .await;
+            }
+        }
+    }
+
+    async fn fail_queued_turn(
+        &self,
+        turn: &ChannelTurnRecord,
+        code: &str,
+        message: &str,
+        stream_context: Option<ChannelStreamContext>,
+    ) -> Result<(), KernelError> {
+        self.channel_state
+            .fail_turn(turn.turn_id, message)
+            .await
+            .map_err(internal)?;
+        self.audit
+            .append(
+                "channel.turn.failed",
+                Some(turn.session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "turn_id": turn.turn_id,
+                    "channel_id": turn.channel_id,
+                    "peer_id": turn.peer_id,
+                    "runtime_id": turn.runtime_id,
+                    "error": message,
+                    "code": code,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+        if code == "queue.failed" {
+            self.emit_runtime_event(
+                &stream_context,
+                &None,
+                RuntimeEvent::Error {
+                    code: Some(code.to_string()),
+                    text: message.to_string(),
+                },
+            )
+            .await?;
+        }
+        self.emit_runtime_event(&stream_context, &None, RuntimeEvent::Done)
+            .await?;
+        Ok(())
     }
 
     async fn build_prompt_envelope(
@@ -1840,6 +2250,7 @@ impl Kernel {
             turn_timeout,
             input,
             stream_context,
+            event_sink,
         } = execution;
         let timeout_ms = turn_timeout.as_millis() as u64;
         self.audit
@@ -1855,6 +2266,15 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
+        self.emit_runtime_event(
+            &stream_context,
+            &event_sink,
+            RuntimeEvent::Status {
+                code: Some("runtime.started".to_string()),
+                text: "runtime started".to_string(),
+            },
+        )
+        .await?;
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let adapter_for_task = adapter.clone();
@@ -1869,8 +2289,10 @@ impl Kernel {
                 maybe_event = event_rx.recv() => {
                     match maybe_event {
                         Some(event) => {
-                            if let Some(context) = &stream_context {
-                                self.append_stream_event(context, &event).await?;
+                            if matches!(event, RuntimeEvent::Done) && stream_context.is_some() {
+                                self.emit_local_stream_event(&event_sink, &event);
+                            } else {
+                                self.emit_runtime_event(&stream_context, &event_sink, event.clone()).await?;
                             }
                             events.push(event);
                         }
@@ -1883,8 +2305,10 @@ impl Kernel {
                 }
                 output = &mut turn_task => {
                     while let Some(event) = event_rx.recv().await {
-                        if let Some(context) = &stream_context {
-                            self.append_stream_event(context, &event).await?;
+                        if matches!(event, RuntimeEvent::Done) && stream_context.is_some() {
+                            self.emit_local_stream_event(&event_sink, &event);
+                        } else {
+                            self.emit_runtime_event(&stream_context, &event_sink, event.clone()).await?;
                         }
                         events.push(event);
                     }
@@ -1904,6 +2328,15 @@ impl Kernel {
                                 )
                                 .await
                                 .map_err(internal)?;
+                            self.emit_runtime_event(
+                                &stream_context,
+                                &event_sink,
+                                RuntimeEvent::Status {
+                                    code: Some("runtime.completed".to_string()),
+                                    text: "runtime completed".to_string(),
+                                },
+                            )
+                            .await?;
                             Ok(CollectedRuntimeTurn { events, result })
                         }
                         Ok(Err(err)) => {
@@ -1921,6 +2354,15 @@ impl Kernel {
                                 )
                                 .await
                                 .map_err(internal)?;
+                            self.emit_runtime_event(
+                                &stream_context,
+                                &event_sink,
+                                RuntimeEvent::Error {
+                                    code: Some("runtime.error".to_string()),
+                                    text: message.clone(),
+                                },
+                            )
+                            .await?;
                             Err(KernelError::Runtime(message))
                         }
                         Err(err) => {
@@ -1938,6 +2380,15 @@ impl Kernel {
                                 )
                                 .await
                                 .map_err(internal)?;
+                            self.emit_runtime_event(
+                                &stream_context,
+                                &event_sink,
+                                RuntimeEvent::Error {
+                                    code: Some("runtime.error".to_string()),
+                                    text: message.clone(),
+                                },
+                            )
+                            .await?;
                             Err(KernelError::Runtime(message))
                         }
                     };
@@ -1977,6 +2428,15 @@ impl Kernel {
                         )
                         .await
                         .map_err(internal)?;
+                    self.emit_runtime_event(
+                        &stream_context,
+                        &event_sink,
+                        RuntimeEvent::Error {
+                            code: Some("runtime.timeout".to_string()),
+                            text: reason.clone(),
+                        },
+                    )
+                    .await?;
 
                     return Err(KernelError::RuntimeTimeout(reason));
                 }
@@ -1986,13 +2446,17 @@ impl Kernel {
 
     async fn execute_runtime_capability_followup(
         &self,
-        adapter: Arc<dyn RuntimeAdapter>,
-        runtime_id: &str,
-        session_id: uuid::Uuid,
-        handle: &RuntimeSessionHandle,
-        results: Vec<RuntimeCapabilityResult>,
-        stream_context: Option<ChannelStreamContext>,
+        execution: RuntimeCapabilityFollowupExecution<'_>,
     ) -> Result<Vec<RuntimeEvent>, anyhow::Error> {
+        let RuntimeCapabilityFollowupExecution {
+            adapter,
+            runtime_id,
+            session_id,
+            handle,
+            results,
+            stream_context,
+            event_sink,
+        } = execution;
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         adapter
             .resolve_capability_requests(handle, results, event_tx)
@@ -2000,8 +2464,10 @@ impl Kernel {
 
         let mut events = Vec::new();
         while let Some(event) = event_rx.recv().await {
-            if let Some(context) = &stream_context {
-                self.append_stream_event(context, &event)
+            if matches!(event, RuntimeEvent::Done) && stream_context.is_some() {
+                self.emit_local_stream_event(&event_sink, &event);
+            } else {
+                self.emit_runtime_event(&stream_context, &event_sink, event.clone())
                     .await
                     .map_err(|err| anyhow::anyhow!(err.to_string()))?;
             }

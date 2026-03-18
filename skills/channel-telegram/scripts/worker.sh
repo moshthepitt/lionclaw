@@ -27,6 +27,8 @@ TELEGRAM_LOOP_DELAY_SECS="${TELEGRAM_LOOP_DELAY_SECS:-1}"
 LIONCLAW_CHANNEL_RUNTIME_DIR="${LIONCLAW_CHANNEL_RUNTIME_DIR:-$LIONCLAW_HOME/runtime/channels/$LIONCLAW_CHANNEL_ID}"
 mkdir -p "$LIONCLAW_CHANNEL_RUNTIME_DIR"
 TELEGRAM_OFFSET_FILE="${TELEGRAM_OFFSET_FILE:-$LIONCLAW_CHANNEL_RUNTIME_DIR/telegram.offset}"
+declare -Ag ANSWER_BUFFERS=()
+declare -Ag PENDING_TURNS=()
 
 telegram_api() {
   local method="$1"
@@ -75,7 +77,7 @@ send_inbound() {
     } + (if $runtime_id == "" then {} else { runtime_id: $runtime_id } end)'
   )"
 
-  lionclaw_post '/v0/channels/inbound' "$payload" >/dev/null
+  lionclaw_post '/v0/channels/inbound' "$payload"
 }
 
 pull_stream() {
@@ -140,10 +142,21 @@ process_updates() {
     text="$(jq -r '.message.text // .edited_message.text // .channel_post.text // empty' <<<"$update")"
 
     if [[ -n "$chat_id" && -n "$text" ]]; then
-      if ! send_inbound "$update_id" "$chat_id" "$text"; then
+      local inbound_response
+      if ! inbound_response="$(send_inbound "$update_id" "$chat_id" "$text")"; then
         echo "lionclaw inbound submit failed for update_id=$update_id" >&2
         return
       fi
+      local outcome
+      outcome="$(jq -r '.outcome' <<<"$inbound_response")"
+      case "$outcome" in
+        queued|pairing_pending|duplicate|peer_blocked)
+          ;;
+        *)
+          echo "lionclaw inbound returned unknown outcome '$outcome' for update_id=$update_id" >&2
+          return
+          ;;
+      esac
     fi
 
     offset="$((update_id + 1))"
@@ -171,13 +184,29 @@ send_telegram_message() {
   return 0
 }
 
+send_telegram_typing() {
+  local peer_id="$1"
+  local send_result
+
+  if ! send_result="$(curl -fsS -X POST "$(telegram_api sendChatAction)" \
+    --data-urlencode "chat_id=$peer_id" \
+    --data-urlencode "action=typing")"; then
+    echo "telegram sendChatAction request failed for peer_id=$peer_id" >&2
+    return 1
+  fi
+
+  if ! jq -e '.ok == true' >/dev/null <<<"$send_result"; then
+    echo "telegram sendChatAction failed: $(jq -c '.' <<<"$send_result")" >&2
+    return 1
+  fi
+
+  return 0
+}
+
 flush_stream() {
   local stream_json
   local last_safe_sequence=""
   local stop_processing=0
-
-  declare -A answer_buffers=()
-  declare -A pending_turns=()
 
   if ! stream_json="$(pull_stream)"; then
     echo "lionclaw stream pull request failed" >&2
@@ -195,6 +224,7 @@ flush_stream() {
     local turn_id
     local kind
     local lane
+    local code
     local text
     local key
 
@@ -203,31 +233,38 @@ flush_stream() {
     turn_id="$(jq -r '.turn_id' <<<"$event")"
     kind="$(jq -r '.kind' <<<"$event")"
     lane="$(jq -r '.lane // empty' <<<"$event")"
+    code="$(jq -r '.code // empty' <<<"$event")"
     text="$(jq -r '.text // empty' <<<"$event")"
     key="$peer_id|$turn_id"
 
     case "$kind" in
       message_delta)
         if [[ "$lane" == "answer" ]]; then
-          answer_buffers["$key"]+="$text"
-          pending_turns["$key"]=1
+          ANSWER_BUFFERS["$key"]+="$text"
+          PENDING_TURNS["$key"]=1
         fi
         ;;
       status)
+        if [[ "$code" == "queue.started" || "$code" == "runtime.started" ]]; then
+          if ! send_telegram_typing "$peer_id"; then
+            stop_processing=1
+            break
+          fi
+        fi
         ;;
       error)
         echo "lionclaw stream error for peer_id=$peer_id turn_id=$turn_id: $text" >&2
         ;;
       done)
-        if [[ -v pending_turns["$key"] ]]; then
-          if [[ -n "${answer_buffers[$key]:-}" ]]; then
-            if ! send_telegram_message "$peer_id" "${answer_buffers[$key]}"; then
+        if [[ -v PENDING_TURNS["$key"] ]]; then
+          if [[ -n "${ANSWER_BUFFERS[$key]:-}" ]]; then
+            if ! send_telegram_message "$peer_id" "${ANSWER_BUFFERS[$key]}"; then
               stop_processing=1
               break
             fi
           fi
-          unset "answer_buffers[$key]"
-          unset "pending_turns[$key]"
+          unset "ANSWER_BUFFERS[$key]"
+          unset "PENDING_TURNS[$key]"
         fi
         ;;
       *)
@@ -235,7 +272,7 @@ flush_stream() {
         ;;
     esac
 
-    if [[ ${#pending_turns[@]} -eq 0 ]]; then
+    if [[ ${#PENDING_TURNS[@]} -eq 0 ]]; then
       last_safe_sequence="$sequence"
     fi
   done < <(jq -c '.events[]?' <<<"$stream_json")

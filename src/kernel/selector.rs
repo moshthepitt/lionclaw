@@ -1,6 +1,6 @@
 use crate::kernel::skills::SkillRecord;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SkillSelector;
 
 impl SkillSelector {

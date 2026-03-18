@@ -8,7 +8,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Input, RichLog, Static
 
-from lionclaw_channel_terminal.api import LionClawApi
+from lionclaw_channel_terminal.api import InboundResponse, LionClawApi
 from lionclaw_channel_terminal.state import ChannelViewState
 
 
@@ -134,32 +134,39 @@ class TerminalChannelApp(App[None]):
             self.exit()
             return
         if self.state.input_disabled():
-            await self._push_status("input disabled: peer is blocked")
+            await self._push_status(
+                f"input disabled: {self.state.input_block_reason() or 'unavailable'}"
+            )
             return
 
         await self.submit_text(text)
 
     async def submit_text(self, text: str) -> bool:
         if self.state.input_disabled():
-            await self._push_status("input disabled: peer is blocked")
+            await self._push_status(
+                f"input disabled: {self.state.input_block_reason() or 'unavailable'}"
+            )
             return False
 
+        self.state.begin_submit(text)
+        self._render_views()
+
         try:
-            await self.api.send_inbound(text)
+            response = await self.api.send_inbound(text)
         except Exception as err:  # noqa: BLE001
-            self.state.status_lines.append(f"send failed: {err}")
+            self.state.mark_send_failed(str(err))
             self._render_views()
             return False
 
-        self.state.append_user_message(text)
+        accepted = self._apply_inbound_response(response)
         self._render_views()
-        return True
+        return accepted
 
     async def refresh_pairing_state(self) -> None:
         try:
             peer_state = await self.api.fetch_peer_state()
         except Exception as err:  # noqa: BLE001
-            self.state.status_lines.append(f"peer refresh failed: {err}")
+            self.state.status_lines.append(f"[error] peer refresh failed: {err}")
             self._render_views()
             return
 
@@ -168,7 +175,6 @@ class TerminalChannelApp(App[None]):
             pairing_code=peer_state.pairing_code,
             trust_tier=peer_state.trust_tier,
         )
-        self.query_one("#input", Input).disabled = self.state.input_disabled()
         self._render_views()
 
     async def stream_loop(self) -> None:
@@ -182,7 +188,7 @@ class TerminalChannelApp(App[None]):
             except asyncio.CancelledError:
                 raise
             except Exception as err:  # noqa: BLE001
-                self.state.status_lines.append(f"stream failed: {err}")
+                self.state.status_lines.append(f"[error] stream failed: {err}")
                 self._render_views()
                 await asyncio.sleep(1)
                 continue
@@ -190,7 +196,7 @@ class TerminalChannelApp(App[None]):
             self._render_views()
 
     async def _push_status(self, message: str) -> None:
-        self.state.status_lines.append(message)
+        self.state.status_lines.append(f"[status] {message}")
         self._render_views()
 
     def _render_views(self) -> None:
@@ -199,11 +205,32 @@ class TerminalChannelApp(App[None]):
         )
         self.query_one("#transcript-view", Static).update(self.state.transcript_text())
         self.query_one("#thinking-view", Static).update(self.state.reasoning_text())
+        self.query_one("#input", Input).disabled = self.state.input_disabled()
 
         status_log = self.query_one("#status-log", RichLog)
         status_log.clear()
         for line in self.state.status_text().splitlines():
             status_log.write(line)
+
+    def _apply_inbound_response(self, response: InboundResponse) -> bool:
+        if response.outcome == "queued" and response.turn_id:
+            self.state.mark_queued(response.turn_id)
+            return True
+        if response.outcome == "pairing_pending":
+            self.state.clear_pending_turn()
+            self.state.status_lines.append("[status] pairing pending")
+            return True
+        if response.outcome == "peer_blocked":
+            self.state.clear_pending_turn()
+            self.state.status_lines.append("[error] peer_blocked: peer is blocked")
+            return False
+        if response.outcome == "duplicate":
+            self.state.clear_pending_turn()
+            self.state.status_lines.append("[status] duplicate: inbound ignored")
+            return False
+
+        self.state.mark_send_failed(f"unexpected inbound outcome: {response.outcome}")
+        return False
 
 
 def run() -> None:

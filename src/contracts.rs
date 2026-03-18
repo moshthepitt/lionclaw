@@ -103,6 +103,8 @@ pub struct StreamEventDto {
     #[serde(default)]
     pub lane: Option<StreamLaneDto>,
     #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
     pub text: Option<String>,
 }
 
@@ -298,7 +300,31 @@ pub struct ChannelInboundRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelInboundResponse {
-    pub accepted: bool,
+    pub outcome: ChannelInboundOutcome,
+    #[serde(default)]
+    pub turn_id: Option<Uuid>,
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelInboundOutcome {
+    Queued,
+    Duplicate,
+    PairingPending,
+    PeerBlocked,
+}
+
+impl ChannelInboundOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Duplicate => "duplicate",
+            Self::PairingPending => "pairing_pending",
+            Self::PeerBlocked => "peer_blocked",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,6 +365,8 @@ pub struct ChannelStreamEventView {
     pub kind: StreamEventKindDto,
     #[serde(default)]
     pub lane: Option<StreamLaneDto>,
+    #[serde(default)]
+    pub code: Option<String>,
     #[serde(default)]
     pub text: Option<String>,
     pub created_at: DateTime<Utc>,

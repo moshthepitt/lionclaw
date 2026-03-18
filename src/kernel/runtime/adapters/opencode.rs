@@ -12,7 +12,7 @@ use crate::kernel::runtime::{
     RuntimeTurnResult,
 };
 
-use super::subprocess::{run_non_interactive, SubprocessInvocation};
+use super::subprocess::{run_non_interactive_streaming, SubprocessInvocation};
 
 #[derive(Debug, Clone)]
 pub struct OpenCodeRuntimeConfig {
@@ -141,15 +141,31 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
             input: String::new(),
         };
 
-        let output = run_non_interactive(&invocation).await?;
+        let mut saw_done = false;
+        let mut last_error_text: Option<String> = None;
+        let output = run_non_interactive_streaming(&invocation, |line| {
+            for event in parse_opencode_output_line(line) {
+                if matches!(event, RuntimeEvent::Done) {
+                    saw_done = true;
+                }
+                if let RuntimeEvent::Error { text, .. } = &event {
+                    last_error_text = Some(text.clone());
+                }
+                let _ = events.send(event);
+            }
+            Ok(())
+        })
+        .await?;
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if !output.success() {
             let code = output.exit_code.unwrap_or(1);
-            let detail = extract_opencode_error_detail(&output.stdout).or(if stderr.is_empty() {
-                None
-            } else {
-                Some(stderr)
-            });
+            let detail = extract_opencode_error_detail(&output.stdout)
+                .or(last_error_text)
+                .or(if stderr.is_empty() {
+                    None
+                } else {
+                    Some(stderr)
+                });
 
             return if let Some(detail) = detail {
                 Err(anyhow!(
@@ -162,14 +178,7 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
             };
         }
 
-        let parsed_events = parse_opencode_stdout(&output.stdout);
-        let has_done = parsed_events
-            .iter()
-            .any(|event| matches!(event, RuntimeEvent::Done));
-        for event in parsed_events {
-            let _ = events.send(event);
-        }
-        if !has_done {
+        if !saw_done {
             let _ = events.send(RuntimeEvent::Done);
         }
 
@@ -267,6 +276,7 @@ fn env_flag(name: &str) -> Option<bool> {
     }
 }
 
+#[cfg(test)]
 fn parse_opencode_stdout(stdout: &[u8]) -> Vec<RuntimeEvent> {
     let output = String::from_utf8_lossy(stdout);
     let mut events = Vec::new();
@@ -276,16 +286,27 @@ fn parse_opencode_stdout(stdout: &[u8]) -> Vec<RuntimeEvent> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        if let Ok(json) = serde_json::from_str::<Value>(line) {
-            parse_opencode_json_event(&mut events, &json);
-        } else {
-            events.push(RuntimeEvent::MessageDelta {
-                lane: RuntimeMessageLane::Answer,
-                text: line.to_string(),
-            });
-        }
+        events.extend(parse_opencode_output_line(line));
     }
 
+    events
+}
+
+fn parse_opencode_output_line(line: &str) -> Vec<RuntimeEvent> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Vec::new();
+    }
+
+    let mut events = Vec::new();
+    if let Ok(json) = serde_json::from_str::<Value>(line) {
+        parse_opencode_json_event(&mut events, &json);
+    } else {
+        events.push(RuntimeEvent::MessageDelta {
+            lane: RuntimeMessageLane::Answer,
+            text: line.to_string(),
+        });
+    }
     events
 }
 
@@ -294,12 +315,14 @@ fn parse_opencode_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
 
     if let Some(event_type) = event_type {
         events.push(RuntimeEvent::Status {
+            code: None,
             text: format!("opencode event: {}", event_type),
         });
     }
 
     if let Some(message) = extract_error_message(json) {
         events.push(RuntimeEvent::Error {
+            code: Some("runtime.error".to_string()),
             text: format!("opencode: {}", message),
         });
         return;
