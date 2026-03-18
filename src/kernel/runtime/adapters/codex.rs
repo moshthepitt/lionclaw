@@ -362,6 +362,12 @@ fn parse_codex_item(events: &mut Vec<RuntimeEvent>, item: &Value) {
                 text: format!("codex file_change ({})", status),
             });
         }
+        Some("web_search") => {
+            events.push(RuntimeEvent::Status {
+                code: None,
+                text: describe_codex_web_search(item),
+            });
+        }
         Some("reasoning") => {
             if let Some(text) = item.get("text").and_then(Value::as_str) {
                 events.push(RuntimeEvent::MessageDelta {
@@ -378,7 +384,7 @@ fn parse_codex_item(events: &mut Vec<RuntimeEvent>, item: &Value) {
         Some(other) => {
             events.push(RuntimeEvent::Status {
                 code: None,
-                text: format!("codex item: {}", other),
+                text: describe_codex_item(other, item),
             });
         }
         None => {
@@ -388,6 +394,93 @@ fn parse_codex_item(events: &mut Vec<RuntimeEvent>, item: &Value) {
             });
         }
     }
+}
+
+fn describe_codex_web_search(item: &Value) -> String {
+    let query = codex_item_string(item, &["query"])
+        .or_else(|| item.pointer("/input/query").and_then(Value::as_str))
+        .or_else(|| item.pointer("/action/query").and_then(Value::as_str))
+        .or_else(|| codex_item_array_first(item, &["queries"]))
+        .or_else(|| item.pointer("/input/queries/0").and_then(Value::as_str))
+        .or_else(|| item.pointer("/action/queries/0").and_then(Value::as_str));
+    let status = codex_item_string(item, &["status", "state"])
+        .or_else(|| item.pointer("/action/type").and_then(Value::as_str))
+        .map(normalize_web_search_status);
+
+    match (query, status) {
+        (Some(query), Some(status)) => {
+            format!(
+                "codex web search '{}' ({})",
+                truncate_status_detail(query),
+                status
+            )
+        }
+        (Some(query), None) => {
+            format!("codex web search '{}'", truncate_status_detail(query))
+        }
+        (None, Some(status)) => format!("codex web search ({})", status),
+        (None, None) => "codex web search".to_string(),
+    }
+}
+
+fn normalize_web_search_status(raw: &str) -> &str {
+    match raw {
+        "other" => "starting",
+        value => value,
+    }
+}
+
+fn describe_codex_item(item_type: &str, item: &Value) -> String {
+    if let Some(summary) = codex_item_summary(item) {
+        return format!("codex item {} ({})", item_type, summary);
+    }
+    format!("codex item: {}", item_type)
+}
+
+fn codex_item_summary(item: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+
+    if let Some(status) = codex_item_string(item, &["status", "state"]) {
+        parts.push(status.to_string());
+    }
+    if let Some(query) = codex_item_string(item, &["query", "location", "title", "path"]) {
+        parts.push(truncate_status_detail(query));
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+fn codex_item_string<'a>(item: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .filter_map(|key| item.get(*key))
+        .filter_map(Value::as_str)
+        .find(|value| !value.trim().is_empty())
+}
+
+fn codex_item_array_first<'a>(item: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .filter_map(|key| item.get(*key))
+        .filter_map(Value::as_array)
+        .find_map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|value| !value.trim().is_empty())
+        })
+}
+
+fn truncate_status_detail(text: &str) -> String {
+    const MAX_LEN: usize = 80;
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= MAX_LEN {
+        return trimmed.to_string();
+    }
+    let shortened: String = trimmed.chars().take(MAX_LEN - 1).collect();
+    format!("{}…", shortened)
 }
 
 #[cfg(test)]
@@ -533,6 +626,38 @@ exit 7
         assert!(matches!(
             &events[0],
             RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text } if text == "plain line"
+        ));
+    }
+
+    #[test]
+    fn codex_web_search_status_includes_query_when_available() {
+        let events = parse_codex_stdout(
+            br#"{"type":"item.completed","item":{"type":"web_search","query":"weather in Sajiloni","status":"completed"}}"#,
+        );
+        assert_eq!(events.len(), 1, "expected one parsed event");
+        assert!(matches!(
+            &events[0],
+            RuntimeEvent::Status { code: None, text }
+                if text == "codex web search 'weather in Sajiloni' (completed)"
+        ));
+    }
+
+    #[test]
+    fn codex_web_search_started_and_completed_shapes_are_both_described() {
+        let events = parse_codex_stdout(
+            br#"{"type":"item.started","item":{"id":"item_2","type":"web_search","query":"","action":{"type":"other"}}}
+{"type":"item.completed","item":{"id":"item_2","type":"web_search","query":"weather: Nairobi, Kenya","action":{"type":"search","query":"weather: Nairobi, Kenya","queries":["weather: Nairobi, Kenya"]}}}"#,
+        );
+        assert_eq!(events.len(), 2, "expected two parsed events");
+        assert!(matches!(
+            &events[0],
+            RuntimeEvent::Status { code: None, text }
+                if text == "codex web search (starting)"
+        ));
+        assert!(matches!(
+            &events[1],
+            RuntimeEvent::Status { code: None, text }
+                if text == "codex web search 'weather: Nairobi, Kenya' (search)"
         ));
     }
 
