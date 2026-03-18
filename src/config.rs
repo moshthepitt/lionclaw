@@ -10,7 +10,8 @@ pub struct Config {
     pub bind_addr: String,
     pub home: LionClawHome,
     pub db_path: PathBuf,
-    pub runtime_turn_timeout_ms: u64,
+    pub runtime_turn_idle_timeout_ms: u64,
+    pub runtime_turn_hard_timeout_ms: u64,
     pub default_runtime_id: Option<String>,
     pub workspace_root: PathBuf,
 }
@@ -28,11 +29,18 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|_| home.db_path());
 
-        let runtime_turn_timeout_ms = std::env::var("LIONCLAW_RUNTIME_TURN_TIMEOUT_MS")
+        let runtime_turn_idle_timeout_ms = std::env::var("LIONCLAW_RUNTIME_TURN_IDLE_TIMEOUT_MS")
             .ok()
+            .or_else(|| std::env::var("LIONCLAW_RUNTIME_TURN_TIMEOUT_MS").ok())
             .and_then(|raw| raw.parse::<u64>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(120_000);
+        let runtime_turn_hard_timeout_ms = std::env::var("LIONCLAW_RUNTIME_TURN_HARD_TIMEOUT_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .map(|value| value.max(runtime_turn_idle_timeout_ms))
+            .unwrap_or_else(|| runtime_turn_idle_timeout_ms.max(600_000));
 
         let default_runtime_id = std::env::var("LIONCLAW_DEFAULT_RUNTIME_ID")
             .ok()
@@ -53,7 +61,8 @@ impl Config {
             bind_addr,
             home,
             db_path,
-            runtime_turn_timeout_ms,
+            runtime_turn_idle_timeout_ms,
+            runtime_turn_hard_timeout_ms,
             default_runtime_id,
             workspace_root,
         }

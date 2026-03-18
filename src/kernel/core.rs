@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 use tokio::{
     sync::{Notify, RwLock},
-    time::{sleep, timeout},
+    time::{sleep, timeout, Instant},
 };
 use uuid::Uuid;
 
@@ -51,7 +51,8 @@ use super::{
 
 #[derive(Debug, Clone)]
 pub struct KernelOptions {
-    pub runtime_turn_timeout: Duration,
+    pub runtime_turn_idle_timeout: Duration,
+    pub runtime_turn_hard_timeout: Duration,
     pub runtime_execution_policy: RuntimeExecutionPolicy,
     pub default_runtime_id: Option<String>,
     pub workspace_root: Option<PathBuf>,
@@ -60,7 +61,8 @@ pub struct KernelOptions {
 impl Default for KernelOptions {
     fn default() -> Self {
         Self {
-            runtime_turn_timeout: Duration::from_secs(120),
+            runtime_turn_idle_timeout: Duration::from_secs(120),
+            runtime_turn_hard_timeout: Duration::from_secs(600),
             runtime_execution_policy: RuntimeExecutionPolicy::default(),
             default_runtime_id: Some(BUILTIN_RUNTIME_MOCK.to_string()),
             workspace_root: None,
@@ -80,7 +82,8 @@ pub struct Kernel {
     capability_broker: CapabilityBroker,
     channel_stream_notifiers: Arc<RwLock<HashMap<String, Arc<Notify>>>>,
     channel_turn_workers: Arc<RwLock<HashSet<String>>>,
-    runtime_turn_timeout: Duration,
+    runtime_turn_idle_timeout: Duration,
+    runtime_turn_hard_timeout: Duration,
     runtime_execution_policy: RuntimeExecutionPolicy,
     default_runtime_id: Option<String>,
     workspace_root: Option<PathBuf>,
@@ -95,10 +98,17 @@ impl Kernel {
         let db = Db::connect_file(db_path).await?;
         let pool = db.pool();
         let runtime = RuntimeRegistry::new();
-        let runtime_turn_timeout = if options.runtime_turn_timeout.is_zero() {
+        let runtime_turn_idle_timeout = if options.runtime_turn_idle_timeout.is_zero() {
             Duration::from_millis(1)
         } else {
-            options.runtime_turn_timeout
+            options.runtime_turn_idle_timeout
+        };
+        let runtime_turn_hard_timeout = if options.runtime_turn_hard_timeout.is_zero() {
+            runtime_turn_idle_timeout
+        } else {
+            options
+                .runtime_turn_hard_timeout
+                .max(runtime_turn_idle_timeout)
         };
         let capability_broker = if let Some(workspace_root) = options.workspace_root.clone() {
             CapabilityBroker::new(workspace_root)
@@ -117,7 +127,8 @@ impl Kernel {
             capability_broker,
             channel_stream_notifiers: Arc::new(RwLock::new(HashMap::new())),
             channel_turn_workers: Arc::new(RwLock::new(HashSet::new())),
-            runtime_turn_timeout,
+            runtime_turn_idle_timeout,
+            runtime_turn_hard_timeout,
             runtime_execution_policy: options.runtime_execution_policy,
             default_runtime_id: options.default_runtime_id,
             workspace_root: options.workspace_root,
@@ -1225,7 +1236,8 @@ struct RuntimeTurnExecution<'a> {
     runtime_id: &'a str,
     session_id: Uuid,
     handle: &'a RuntimeSessionHandle,
-    turn_timeout: Duration,
+    idle_timeout: Duration,
+    hard_timeout: Duration,
     input: RuntimeTurnInput,
     stream_context: Option<ChannelStreamContext>,
     event_sink: Option<RuntimeEventSink>,
@@ -1250,6 +1262,19 @@ struct RuntimeCapabilityFollowupExecution<'a> {
     results: Vec<RuntimeCapabilityResult>,
     stream_context: Option<ChannelStreamContext>,
     event_sink: Option<RuntimeEventSink>,
+}
+
+struct RuntimeTurnAbortExecution<'a> {
+    adapter: &'a dyn RuntimeAdapter,
+    handle: &'a RuntimeSessionHandle,
+    session_id: Uuid,
+    runtime_id: &'a str,
+    turn_task: &'a mut tokio::task::JoinHandle<Result<RuntimeTurnResult, anyhow::Error>>,
+    stream_context: &'a Option<ChannelStreamContext>,
+    event_sink: &'a Option<RuntimeEventSink>,
+    timeout_ms: u64,
+    reason: String,
+    timeout_kind: &'a str,
 }
 
 impl Kernel {
@@ -1365,7 +1390,8 @@ impl Kernel {
                 runtime_id: &runtime_id,
                 session_id: session.session_id,
                 handle: &handle,
-                turn_timeout: execution_context.timeout,
+                idle_timeout: execution_context.idle_timeout,
+                hard_timeout: execution_context.hard_timeout,
                 input: RuntimeTurnInput {
                     runtime_session_id: handle.runtime_session_id.clone(),
                     prompt: self
@@ -1514,7 +1540,8 @@ impl Kernel {
                     "selected_skills": allowed_skills,
                     "prompt_len": user_text.len(),
                     "runtime_working_dir": execution_context.working_dir,
-                    "runtime_timeout_ms": execution_context.timeout.as_millis() as u64,
+                    "runtime_idle_timeout_ms": execution_context.idle_timeout.as_millis() as u64,
+                    "runtime_hard_timeout_ms": execution_context.hard_timeout.as_millis() as u64,
                     "runtime_env_passthrough_count": execution_context.environment.len(),
                 }),
             )
@@ -2189,10 +2216,12 @@ impl Kernel {
         let request_timeout_ms = request.timeout_ms;
         let request_env = request.env_passthrough_keys.clone();
 
-        match self
-            .runtime_execution_policy
-            .evaluate(runtime_id, request, self.runtime_turn_timeout)
-        {
+        match self.runtime_execution_policy.evaluate(
+            runtime_id,
+            request,
+            self.runtime_turn_idle_timeout,
+            self.runtime_turn_hard_timeout,
+        ) {
             Ok(context) => {
                 self.audit
                     .append(
@@ -2205,7 +2234,8 @@ impl Kernel {
                             "requested_timeout_ms": request_timeout_ms,
                             "requested_env_passthrough": request_env,
                             "effective_working_dir": context.working_dir,
-                            "effective_timeout_ms": context.timeout.as_millis() as u64,
+                            "effective_timeout_ms": context.idle_timeout.as_millis() as u64,
+                            "effective_hard_timeout_ms": context.hard_timeout.as_millis() as u64,
                             "effective_env_passthrough_count": context.environment.len(),
                         }),
                     )
@@ -2247,12 +2277,14 @@ impl Kernel {
             runtime_id,
             session_id,
             handle,
-            turn_timeout,
+            idle_timeout,
+            hard_timeout,
             input,
             stream_context,
             event_sink,
         } = execution;
-        let timeout_ms = turn_timeout.as_millis() as u64;
+        let idle_timeout_ms = idle_timeout.as_millis() as u64;
+        let hard_timeout_ms = hard_timeout.as_millis() as u64;
         self.audit
             .append(
                 "runtime.turn.start",
@@ -2261,7 +2293,8 @@ impl Kernel {
                 json!({
                     "runtime_id": runtime_id,
                     "runtime_session_id": handle.runtime_session_id,
-                    "timeout_ms": timeout_ms,
+                    "idle_timeout_ms": idle_timeout_ms,
+                    "hard_timeout_ms": hard_timeout_ms,
                 }),
             )
             .await
@@ -2280,8 +2313,10 @@ impl Kernel {
         let adapter_for_task = adapter.clone();
         let mut turn_task =
             tokio::spawn(async move { adapter_for_task.turn(input, event_tx).await });
-        let timeout_sleep = sleep(turn_timeout);
-        tokio::pin!(timeout_sleep);
+        let idle_sleep = sleep(idle_timeout);
+        tokio::pin!(idle_sleep);
+        let hard_sleep = sleep(hard_timeout);
+        tokio::pin!(hard_sleep);
         let mut events = Vec::new();
 
         loop {
@@ -2295,6 +2330,7 @@ impl Kernel {
                                 self.emit_runtime_event(&stream_context, &event_sink, event.clone()).await?;
                             }
                             events.push(event);
+                            idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
                         }
                         None => {
                             if turn_task.is_finished() {
@@ -2393,55 +2429,104 @@ impl Kernel {
                         }
                     };
                 }
-                _ = &mut timeout_sleep => {
-                    let reason = format!("turn timed out after {} ms", timeout_ms);
-
-                    if let Err(cancel_err) = adapter.cancel(handle, Some(reason.clone())).await {
-                        self.audit
-                            .append(
-                                "runtime.turn.cancel_error",
-                                Some(session_id),
-                                Some("kernel".to_string()),
-                                json!({
-                                    "runtime_id": runtime_id,
-                                    "runtime_session_id": handle.runtime_session_id,
-                                    "error": cancel_err.to_string(),
-                                }),
-                            )
-                            .await
-                            .map_err(internal)?;
-                    }
-
-                    turn_task.abort();
-                    let _ = turn_task.await;
-
-                    self.audit
-                        .append(
-                            "runtime.turn.timeout",
-                            Some(session_id),
-                            Some("kernel".to_string()),
-                            json!({
-                                "runtime_id": runtime_id,
-                                "runtime_session_id": handle.runtime_session_id,
-                                "timeout_ms": timeout_ms,
-                            }),
-                        )
-                        .await
-                        .map_err(internal)?;
-                    self.emit_runtime_event(
-                        &stream_context,
-                        &event_sink,
-                        RuntimeEvent::Error {
-                            code: Some("runtime.timeout".to_string()),
-                            text: reason.clone(),
-                        },
-                    )
-                    .await?;
-
-                    return Err(KernelError::RuntimeTimeout(reason));
+                _ = &mut idle_sleep => {
+                    let reason = format!("turn idle timed out after {} ms", idle_timeout_ms);
+                    return self
+                        .abort_runtime_turn(RuntimeTurnAbortExecution {
+                            adapter: adapter.as_ref(),
+                            handle,
+                            session_id,
+                            runtime_id,
+                            turn_task: &mut turn_task,
+                            stream_context: &stream_context,
+                            event_sink: &event_sink,
+                            timeout_ms: idle_timeout_ms,
+                            reason,
+                            timeout_kind: "idle",
+                        })
+                        .await;
+                }
+                _ = &mut hard_sleep => {
+                    let reason = format!("turn exceeded hard timeout after {} ms", hard_timeout_ms);
+                    return self
+                        .abort_runtime_turn(RuntimeTurnAbortExecution {
+                            adapter: adapter.as_ref(),
+                            handle,
+                            session_id,
+                            runtime_id,
+                            turn_task: &mut turn_task,
+                            stream_context: &stream_context,
+                            event_sink: &event_sink,
+                            timeout_ms: hard_timeout_ms,
+                            reason,
+                            timeout_kind: "hard",
+                        })
+                        .await;
                 }
             }
         }
+    }
+
+    async fn abort_runtime_turn(
+        &self,
+        execution: RuntimeTurnAbortExecution<'_>,
+    ) -> Result<CollectedRuntimeTurn, KernelError> {
+        let RuntimeTurnAbortExecution {
+            adapter,
+            handle,
+            session_id,
+            runtime_id,
+            turn_task,
+            stream_context,
+            event_sink,
+            timeout_ms,
+            reason,
+            timeout_kind,
+        } = execution;
+        if let Err(cancel_err) = adapter.cancel(handle, Some(reason.clone())).await {
+            self.audit
+                .append(
+                    "runtime.turn.cancel_error",
+                    Some(session_id),
+                    Some("kernel".to_string()),
+                    json!({
+                        "runtime_id": runtime_id,
+                        "runtime_session_id": handle.runtime_session_id,
+                        "error": cancel_err.to_string(),
+                    }),
+                )
+                .await
+                .map_err(internal)?;
+        }
+
+        turn_task.abort();
+        let _ = turn_task.await;
+
+        self.audit
+            .append(
+                "runtime.turn.timeout",
+                Some(session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "runtime_id": runtime_id,
+                    "runtime_session_id": handle.runtime_session_id,
+                    "timeout_ms": timeout_ms,
+                    "timeout_kind": timeout_kind,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+        self.emit_runtime_event(
+            stream_context,
+            event_sink,
+            RuntimeEvent::Error {
+                code: Some("runtime.timeout".to_string()),
+                text: reason.clone(),
+            },
+        )
+        .await?;
+
+        Err(KernelError::RuntimeTimeout(reason))
     }
 
     async fn execute_runtime_capability_followup(

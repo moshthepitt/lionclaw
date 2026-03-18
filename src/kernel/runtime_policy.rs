@@ -45,7 +45,8 @@ impl RuntimeExecutionPolicy {
         &self,
         runtime_id: &str,
         request: RuntimeExecutionRequest,
-        default_timeout: Duration,
+        default_idle_timeout: Duration,
+        default_hard_timeout: Duration,
     ) -> Result<RuntimeExecutionContext, String> {
         let rule = self.rules.get(runtime_id).unwrap_or(&self.default_rule);
 
@@ -59,7 +60,7 @@ impl RuntimeExecutionPolicy {
         let requested_timeout = request
             .timeout_ms
             .map(Duration::from_millis)
-            .unwrap_or(default_timeout);
+            .unwrap_or(default_idle_timeout);
 
         if requested_timeout < rule.min_timeout || requested_timeout > rule.max_timeout {
             return Err(format!(
@@ -73,7 +74,8 @@ impl RuntimeExecutionPolicy {
         Ok(RuntimeExecutionContext {
             working_dir,
             environment,
-            timeout: requested_timeout,
+            idle_timeout: requested_timeout,
+            hard_timeout: default_hard_timeout.max(requested_timeout),
         })
     }
 }
@@ -103,7 +105,8 @@ impl RuntimeExecutionRequest {
 pub struct RuntimeExecutionContext {
     pub working_dir: Option<String>,
     pub environment: Vec<(String, String)>,
-    pub timeout: Duration,
+    pub idle_timeout: Duration,
+    pub hard_timeout: Duration,
 }
 
 fn resolve_working_dir(
@@ -215,6 +218,7 @@ mod tests {
                 "mock",
                 RuntimeExecutionRequest::new(None, Vec::new(), Some(100)),
                 Duration::from_millis(300),
+                Duration::from_millis(900),
             )
             .expect_err("timeout should be rejected");
 
@@ -242,6 +246,7 @@ mod tests {
                     Some(300),
                 ),
                 Duration::from_millis(300),
+                Duration::from_millis(900),
             )
             .expect("working dir should be allowed");
 
@@ -249,6 +254,8 @@ mod tests {
             context.working_dir.expect("working dir").contains("child"),
             "resolved working dir should match requested path"
         );
+        assert_eq!(context.idle_timeout, Duration::from_millis(300));
+        assert_eq!(context.hard_timeout, Duration::from_millis(900));
     }
 
     #[test]
@@ -266,6 +273,7 @@ mod tests {
                 "mock",
                 RuntimeExecutionRequest::new(None, vec!["FORBIDDEN_KEY".to_string()], Some(300)),
                 Duration::from_millis(300),
+                Duration::from_millis(900),
             )
             .expect_err("unknown key should be denied");
 

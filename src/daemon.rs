@@ -31,7 +31,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         Kernel::new_with_options(
             &config.db_path,
             KernelOptions {
-                runtime_turn_timeout: Duration::from_millis(config.runtime_turn_timeout_ms),
+                runtime_turn_idle_timeout: Duration::from_millis(
+                    config.runtime_turn_idle_timeout_ms,
+                ),
+                runtime_turn_hard_timeout: Duration::from_millis(
+                    config.runtime_turn_hard_timeout_ms,
+                ),
                 default_runtime_id,
                 workspace_root: Some(workspace_root),
                 ..KernelOptions::default()

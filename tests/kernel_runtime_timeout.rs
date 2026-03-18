@@ -26,7 +26,8 @@ async fn runtime_timeout_triggers_cancel_close_and_audit() {
     let kernel = Kernel::new_with_options(
         &sandbox.db_path(),
         KernelOptions {
-            runtime_turn_timeout: Duration::from_millis(50),
+            runtime_turn_idle_timeout: Duration::from_millis(50),
+            runtime_turn_hard_timeout: Duration::from_millis(200),
             ..KernelOptions::default()
         },
     )
@@ -70,7 +71,7 @@ async fn runtime_timeout_triggers_cancel_close_and_audit() {
     match err {
         KernelError::RuntimeTimeout(message) => {
             assert!(
-                message.contains("timed out"),
+                message.contains("idle timed out"),
                 "timeout error should include timeout reason"
             );
         }
@@ -104,12 +105,73 @@ async fn runtime_timeout_triggers_cancel_close_and_audit() {
         Some("slow"),
         "timeout audit should include runtime id"
     );
+    assert_eq!(
+        timeout_events.events[0].details["timeout_kind"].as_str(),
+        Some("idle"),
+        "timeout audit should distinguish idle timeout"
+    );
+}
+
+#[tokio::test]
+async fn runtime_activity_resets_idle_timeout() {
+    let sandbox = TestEnv::new();
+    let kernel = Kernel::new_with_options(
+        &sandbox.db_path(),
+        KernelOptions {
+            runtime_turn_idle_timeout: Duration::from_millis(50),
+            runtime_turn_hard_timeout: Duration::from_millis(400),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    kernel
+        .register_runtime_adapter(
+            "chatty",
+            Arc::new(ChattyRuntimeAdapter {
+                idle_gap: Duration::from_millis(20),
+                event_count: 5,
+            }),
+        )
+        .await;
+
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "local-cli".to_string(),
+            peer_id: "chatty-peer".to_string(),
+            trust_tier: TrustTier::Main,
+        })
+        .await
+        .expect("open session");
+
+    let turn = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "stay alive while events keep flowing".to_string(),
+            runtime_id: Some("chatty".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should stay alive");
+
+    assert_eq!(
+        turn.assistant_text, "done",
+        "chatty runtime should complete"
+    );
 }
 
 struct SlowRuntimeAdapter {
     cancel_calls: Arc<AtomicUsize>,
     close_calls: Arc<AtomicUsize>,
     sleep_for: Duration,
+}
+
+struct ChattyRuntimeAdapter {
+    idle_gap: Duration,
+    event_count: usize,
 }
 
 #[async_trait]
@@ -160,6 +222,66 @@ impl RuntimeAdapter for SlowRuntimeAdapter {
 
     async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
         self.close_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for ChattyRuntimeAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "chatty".to_string(),
+            version: "0.1".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        _input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("chatty-{}", Uuid::new_v4()),
+        })
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        for _ in 0..self.event_count {
+            let _ = events.send(RuntimeEvent::Status {
+                code: None,
+                text: "still working".to_string(),
+            });
+            tokio::time::sleep(self.idle_gap).await;
+        }
+        let _ = events.send(RuntimeEvent::MessageDelta {
+            lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+            text: "done".to_string(),
+        });
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(RuntimeTurnResult {
+            capability_requests: Vec::new(),
+        })
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        events: RuntimeEventSender,
+    ) -> Result<()> {
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
+    }
+
+    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
         Ok(())
     }
 }

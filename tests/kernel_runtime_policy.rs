@@ -24,7 +24,8 @@ async fn runtime_policy_allows_configured_execution_overrides() {
     let kernel = Kernel::new_with_options(
         &env.db_path(),
         KernelOptions {
-            runtime_turn_timeout: Duration::from_millis(300),
+            runtime_turn_idle_timeout: Duration::from_millis(300),
+            runtime_turn_hard_timeout: Duration::from_millis(900),
             runtime_execution_policy: RuntimeExecutionPolicy::default().with_rule("mock", rule),
             ..KernelOptions::default()
         },
@@ -71,6 +72,7 @@ async fn runtime_policy_allows_configured_execution_overrides() {
     );
     let details = &policy_events.events[0].details;
     assert_eq!(details["effective_timeout_ms"].as_u64(), Some(750));
+    assert_eq!(details["effective_hard_timeout_ms"].as_u64(), Some(900));
     assert_eq!(details["effective_env_passthrough_count"].as_u64(), Some(1));
 }
 
