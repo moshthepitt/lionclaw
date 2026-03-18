@@ -110,6 +110,9 @@ send_inbound() {
   local text="$1"
   local external_message_id
   local payload
+  local response
+  local outcome
+  local turn_id
 
   external_message_id="terminal-inbound:$WORKER_INSTANCE_ID:$inbound_sequence"
   payload="$(jq -nc \
@@ -126,8 +129,33 @@ send_inbound() {
     } + (if $runtime_id == "" then {} else { runtime_id: $runtime_id } end)'
   )"
 
-  lionclaw_post '/v0/channels/inbound' "$payload" >/dev/null
+  response="$(lionclaw_post '/v0/channels/inbound' "$payload")" || return 1
+  outcome="$(jq -r '.outcome // empty' <<<"$response")"
+  turn_id="$(jq -r '.turn_id // empty' <<<"$response")"
   inbound_sequence="$((inbound_sequence + 1))"
+
+  case "$outcome" in
+    queued)
+      if [[ -n "$turn_id" ]]; then
+        print_status_message "queued turn $turn_id" "queue.queued"
+      else
+        print_status_message "queued" "queue.queued"
+      fi
+      ;;
+    pairing_pending)
+      print_status_message "pairing pending" "pairing.pending"
+      ;;
+    duplicate)
+      print_status_message "duplicate inbound ignored" "queue.duplicate"
+      ;;
+    peer_blocked)
+      print_error_message "peer is blocked" "peer_blocked"
+      ;;
+    *)
+      print_error_message "unexpected inbound outcome '$outcome'"
+      return 1
+      ;;
+  esac
 }
 
 pull_stream() {
@@ -188,12 +216,22 @@ print_reasoning_delta() {
 
 print_status_message() {
   local content="$1"
-  printf '[status] %s\n' "$content"
+  local code="${2:-}"
+  if [[ -n "$code" ]]; then
+    printf '[status] %s: %s\n' "$code" "$content"
+  else
+    printf '[status] %s\n' "$content"
+  fi
 }
 
 print_error_message() {
   local content="$1"
-  printf '[error] %s\n' "$content" >&2
+  local code="${2:-}"
+  if [[ -n "$code" ]]; then
+    printf '[error] %s: %s\n' "$code" "$content" >&2
+  else
+    printf '[error] %s\n' "$content" >&2
+  fi
 }
 
 flush_stream_once() {
@@ -215,12 +253,14 @@ flush_stream_once() {
     local peer_id
     local kind
     local lane
+    local code
     local text
 
     sequence="$(jq -r '.sequence' <<<"$event")"
     peer_id="$(jq -r '.peer_id' <<<"$event")"
     kind="$(jq -r '.kind' <<<"$event")"
     lane="$(jq -r '.lane // empty' <<<"$event")"
+    code="$(jq -r '.code // empty' <<<"$event")"
     text="$(jq -r '.text // empty' <<<"$event")"
 
     if [[ "$peer_id" != "$LIONCLAW_PEER_ID" ]]; then
@@ -238,15 +278,15 @@ flush_stream_once() {
             print_reasoning_delta "$text"
             ;;
           *)
-            print_status_message "$text"
+            print_status_message "$text" "$code"
             ;;
         esac
         ;;
       status)
-        print_status_message "$text"
+        print_status_message "$text" "$code"
         ;;
       error)
-        print_error_message "$text"
+        print_error_message "$text" "$code"
         ;;
       done)
         ;;

@@ -1,4 +1,4 @@
-use std::process::Stdio;
+use std::{io::ErrorKind, process::Stdio, time::Duration};
 
 use anyhow::{Context, Result};
 use tokio::{
@@ -56,12 +56,7 @@ where
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command.spawn().with_context(|| {
-        format!(
-            "failed to spawn subprocess executable '{}'",
-            invocation.executable
-        )
-    })?;
+    let mut child = spawn_with_retry(&mut command, &invocation.executable).await?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin
@@ -122,4 +117,36 @@ where
         stderr: captured_stderr,
         exit_code: status.code(),
     })
+}
+
+async fn spawn_with_retry(
+    command: &mut Command,
+    executable: &str,
+) -> Result<tokio::process::Child> {
+    const ETXTBUSY_RETRIES: usize = 3;
+    const ETXTBUSY_BACKOFF_MS: u64 = 10;
+
+    for attempt in 0..=ETXTBUSY_RETRIES {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(err)
+                if err.kind() == ErrorKind::ExecutableFileBusy
+                    || err.raw_os_error() == Some(26) =>
+            {
+                if attempt == ETXTBUSY_RETRIES {
+                    return Err(err).with_context(|| {
+                        format!("failed to spawn subprocess executable '{}'", executable)
+                    });
+                }
+                tokio::time::sleep(Duration::from_millis(ETXTBUSY_BACKOFF_MS)).await;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to spawn subprocess executable '{}'", executable)
+                });
+            }
+        }
+    }
+
+    unreachable!("spawn_with_retry should return or error within retry loop")
 }
