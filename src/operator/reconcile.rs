@@ -322,16 +322,24 @@ pub async fn up<M: ServiceManager>(
         .iter()
         .map(|unit| unit.name.clone())
         .collect::<Vec<_>>();
-    manager.apply_units(home, &units).await?;
+    let changed_units = manager.apply_units(home, &units).await?;
     let mut units_to_start = Vec::new();
+    let mut units_to_restart = Vec::new();
     for unit_name in &unit_names {
         let status = manager.unit_status(unit_name).await?;
-        if !unit_status_is_active(&status) {
+        if unit_status_is_active(&status) {
+            if changed_units.iter().any(|changed| changed == unit_name) {
+                units_to_restart.push(unit_name.clone());
+            }
+        } else {
             units_to_start.push(unit_name.clone());
         }
     }
     if !units_to_start.is_empty() {
         manager.up_units(&units_to_start).await?;
+    }
+    if !units_to_restart.is_empty() {
+        manager.restart_units(&units_to_restart).await?;
     }
     Ok(applied)
 }
@@ -1133,6 +1141,10 @@ mod tests {
         up(&home, &manager, "codex", &binaries)
             .await
             .expect("same-home managed daemon should be reused");
+        assert!(
+            manager.was_restarted(DAEMON_UNIT_NAME),
+            "changed active daemon unit should be restarted"
+        );
     }
 
     #[tokio::test]

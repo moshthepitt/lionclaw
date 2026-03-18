@@ -114,8 +114,13 @@ pub fn render_channel_unit(home: &LionClawHome, spec: &ChannelServiceSpec) -> Ma
 
 #[async_trait]
 pub trait ServiceManager: Send + Sync {
-    async fn apply_units(&self, home: &LionClawHome, units: &[ManagedServiceUnit]) -> Result<()>;
+    async fn apply_units(
+        &self,
+        home: &LionClawHome,
+        units: &[ManagedServiceUnit],
+    ) -> Result<Vec<String>>;
     async fn up_units(&self, units: &[String]) -> Result<()>;
+    async fn restart_units(&self, units: &[String]) -> Result<()>;
     async fn down_units(&self, units: &[String]) -> Result<()>;
     async fn unit_status(&self, unit: &str) -> Result<String>;
     async fn logs(&self, units: &[String], lines: usize) -> Result<String>;
@@ -125,13 +130,18 @@ pub struct SystemdUserServiceManager;
 
 #[async_trait]
 impl ServiceManager for SystemdUserServiceManager {
-    async fn apply_units(&self, home: &LionClawHome, units: &[ManagedServiceUnit]) -> Result<()> {
+    async fn apply_units(
+        &self,
+        home: &LionClawHome,
+        units: &[ManagedServiceUnit],
+    ) -> Result<Vec<String>> {
         let user_unit_dir = systemd_user_unit_dir()?;
         tokio::fs::create_dir_all(&user_unit_dir)
             .await
             .with_context(|| format!("failed to create {}", user_unit_dir.display()))?;
         prune_stale_generated_files(home, &user_unit_dir, units)?;
 
+        let mut changed_units = Vec::new();
         for unit in units {
             if let Some(parent) = unit.unit_path.parent() {
                 tokio::fs::create_dir_all(parent)
@@ -144,6 +154,10 @@ impl ServiceManager for SystemdUserServiceManager {
                     .with_context(|| format!("failed to create {}", parent.display()))?;
             }
 
+            let unit_changed = file_content_differs(&unit.unit_path, &unit.unit_content)
+                .with_context(|| format!("failed to compare {}", unit.unit_path.display()))?;
+            let env_changed = file_content_differs(&unit.env_path, &unit.env_content)
+                .with_context(|| format!("failed to compare {}", unit.env_path.display()))?;
             tokio::fs::write(&unit.unit_path, &unit.unit_content)
                 .await
                 .with_context(|| format!("failed to write {}", unit.unit_path.display()))?;
@@ -171,14 +185,27 @@ impl ServiceManager for SystemdUserServiceManager {
                     user_link.display()
                 )
             })?;
+
+            if unit_changed || env_changed {
+                changed_units.push(unit.name.clone());
+            }
         }
         run_systemctl(["--user", "daemon-reload"]).await?;
-        Ok(())
+        changed_units.sort();
+        changed_units.dedup();
+        Ok(changed_units)
     }
 
     async fn up_units(&self, units: &[String]) -> Result<()> {
         for unit in units {
             run_systemctl(["--user", "enable", "--now", unit]).await?;
+        }
+        Ok(())
+    }
+
+    async fn restart_units(&self, units: &[String]) -> Result<()> {
+        for unit in units {
+            run_systemctl(["--user", "restart", unit]).await?;
         }
         Ok(())
     }
@@ -238,6 +265,7 @@ impl ServiceManager for SystemdUserServiceManager {
 pub struct FakeServiceManager {
     states: Mutex<HashMap<String, String>>,
     units: Mutex<HashMap<String, ManagedServiceUnit>>,
+    restarted: Mutex<Vec<String>>,
 }
 
 impl FakeServiceManager {
@@ -247,22 +275,55 @@ impl FakeServiceManager {
             .expect("states lock")
             .insert(unit.into(), status.into());
     }
+
+    pub fn was_restarted(&self, unit: &str) -> bool {
+        self.restarted
+            .lock()
+            .expect("restarted lock")
+            .iter()
+            .any(|value| value == unit)
+    }
 }
 
 #[async_trait]
 impl ServiceManager for FakeServiceManager {
-    async fn apply_units(&self, _home: &LionClawHome, units: &[ManagedServiceUnit]) -> Result<()> {
+    async fn apply_units(
+        &self,
+        _home: &LionClawHome,
+        units: &[ManagedServiceUnit],
+    ) -> Result<Vec<String>> {
         let mut stored = self.units.lock().expect("units lock");
+        let mut changed = Vec::new();
         for unit in units {
+            let was_changed = stored
+                .get(&unit.name)
+                .map(|existing| {
+                    existing.unit_content != unit.unit_content
+                        || existing.env_content != unit.env_content
+                })
+                .unwrap_or(true);
             stored.insert(unit.name.clone(), unit.clone());
+            if was_changed {
+                changed.push(unit.name.clone());
+            }
         }
-        Ok(())
+        Ok(changed)
     }
 
     async fn up_units(&self, units: &[String]) -> Result<()> {
         let mut states = self.states.lock().expect("states lock");
         for unit in units {
             states.insert(unit.clone(), "loaded/active/running".to_string());
+        }
+        Ok(())
+    }
+
+    async fn restart_units(&self, units: &[String]) -> Result<()> {
+        let mut states = self.states.lock().expect("states lock");
+        let mut restarted = self.restarted.lock().expect("restarted lock");
+        for unit in units {
+            states.insert(unit.clone(), "loaded/active/running".to_string());
+            restarted.push(unit.clone());
         }
         Ok(())
     }
@@ -440,6 +501,14 @@ fn path_entry_exists(path: &Path) -> Result<bool> {
         Ok(_) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn file_content_differs(path: &Path, expected: &str) -> Result<bool> {
+    match std::fs::read_to_string(path) {
+        Ok(existing) => Ok(existing != expected),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
     }
 }
 
