@@ -86,6 +86,8 @@ Inside `lionclaw run`, recovery stays command-first:
 - `/reset`
 - `/exit`
 
+The core keeps durable per-turn history, preserves partial assistant output across timeouts and restart interruption, and reopens the latest local session by most recent activity.
+
 Background channels remain an explicit service flow:
 
 1. `lionclaw skill add <source>`

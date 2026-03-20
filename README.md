@@ -64,7 +64,7 @@ Continue the latest local session instead of starting fresh:
 
 Inside the interactive REPL:
 
-- `/continue` resumes from a partial timed-out or failed reply
+- `/continue` resumes from a partial timed-out, failed, cancelled, or interrupted reply
 - `/retry` reruns the previous prompt
 - `/reset` opens a fresh session
 - `/exit` leaves the REPL

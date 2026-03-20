@@ -238,7 +238,10 @@ fn render_session_history_turn<W: Write>(turn: &SessionTurnView, output: &mut W)
     writeln!(output, "you> {}", turn.display_user_text)?;
     if matches!(
         turn.status,
-        SessionTurnStatus::TimedOut | SessionTurnStatus::Failed | SessionTurnStatus::Cancelled
+        SessionTurnStatus::TimedOut
+            | SessionTurnStatus::Failed
+            | SessionTurnStatus::Cancelled
+            | SessionTurnStatus::Interrupted
     ) && !turn.assistant_text.trim().is_empty()
     {
         writeln!(output, "{}", partial_history_marker(turn.status))?;
@@ -260,6 +263,9 @@ fn partial_history_marker(status: SessionTurnStatus) -> &'static str {
         SessionTurnStatus::Failed => "[partial] previous assistant reply failed before completion",
         SessionTurnStatus::Cancelled => {
             "[partial] previous assistant reply was cancelled before completion"
+        }
+        SessionTurnStatus::Interrupted => {
+            "[partial] previous assistant reply was interrupted before completion"
         }
         _ => "",
     }
@@ -421,11 +427,13 @@ mod tests {
     use std::io::Cursor;
 
     use sqlx::{Row, SqlitePool};
+    use uuid::Uuid;
 
-    use super::{render_turn_stream, run_local_with_io};
+    use super::{local_peer_id, render_turn_stream, run_local_with_io};
     use crate::{
         contracts::{StreamEventDto, StreamEventKindDto, StreamLaneDto},
         home::LionClawHome,
+        kernel::db::Db,
         operator::config::{OperatorConfig, RuntimeProfileConfig},
     };
 
@@ -469,8 +477,10 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         assert!(home.workspace_dir("main").join("SOUL.md").exists());
         assert!(home.lock_path().exists());
 
-        let db_url = format!("sqlite://{}", home.db_path().display());
-        let pool = SqlitePool::connect(&db_url).await.expect("connect db");
+        let pool = Db::connect_file(&home.db_path())
+            .await
+            .expect("connect db")
+            .pool();
         let row = sqlx::query("SELECT COUNT(*) AS count FROM sessions")
             .fetch_one(&pool)
             .await
@@ -531,6 +541,157 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             .expect("fetch count");
         let count: i64 = row.get("count");
         assert_eq!(count, 1, "continue mode should reuse the latest session");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn continue_last_session_prefers_recent_activity_over_newer_idle_session() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let stub = temp_dir.path().join("codex-stub.sh");
+        write_script(
+            &stub,
+            r#"#!/usr/bin/env bash
+cat >/dev/null
+echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from repl"}}'
+"#,
+        );
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: stub.to_string_lossy().to_string(),
+                model: None,
+                sandbox: "read-only".to_string(),
+                skip_git_repo_check: true,
+                ephemeral: true,
+            },
+        );
+        config.save(&home).await.expect("save config");
+
+        let mut first_input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut first_output = Vec::new();
+        run_local_with_io(&home, None, false, &mut first_input, &mut first_output)
+            .await
+            .expect("first run");
+
+        let db_url = format!("sqlite://{}", home.db_path().display());
+        let pool = SqlitePool::connect(&db_url).await.expect("connect db");
+        let first_session_row = sqlx::query(
+            "SELECT session_id, created_at_ms, last_turn_at_ms \
+             FROM sessions \
+             ORDER BY created_at_ms ASC \
+             LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("fetch first session");
+        let first_session_id: String = first_session_row.get("session_id");
+        let last_turn_at_ms: i64 = first_session_row
+            .get::<Option<i64>, _>("last_turn_at_ms")
+            .expect("last turn timestamp");
+        let newer_created_at_ms = last_turn_at_ms + 1_000;
+        sqlx::query(
+            "INSERT INTO sessions \
+             (session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, turn_count) \
+             VALUES (?1, 'local-cli', ?2, 'main', 'interactive', ?3, NULL, 0)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(local_peer_id())
+        .bind(newer_created_at_ms)
+        .execute(&pool)
+        .await
+        .expect("insert newer idle session");
+
+        let mut second_input = Cursor::new(b"/exit\n".to_vec());
+        let mut second_output = Vec::new();
+        run_local_with_io(&home, None, true, &mut second_input, &mut second_output)
+            .await
+            .expect("second run");
+
+        let second_output = String::from_utf8(second_output).expect("utf8 output");
+        assert!(second_output.contains("Recent session history:"));
+        assert!(second_output.contains("you> hello"));
+
+        let reused_session_row = sqlx::query(
+            "SELECT session_id \
+             FROM sessions \
+             WHERE turn_count > 0 \
+             ORDER BY turn_count DESC, created_at_ms ASC \
+             LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("fetch reused session");
+        let reused_session_id: String = reused_session_row.get("session_id");
+        assert_eq!(
+            reused_session_id, first_session_id,
+            "continue mode should reuse the most recently active session"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn continue_last_session_renders_interrupted_partial_history() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let stub = temp_dir.path().join("codex-stub.sh");
+        write_script(&stub, "#!/usr/bin/env bash\ncat >/dev/null\n");
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: stub.to_string_lossy().to_string(),
+                model: None,
+                sandbox: "read-only".to_string(),
+                skip_git_repo_check: true,
+                ephemeral: true,
+            },
+        );
+        config.save(&home).await.expect("save config");
+        let pool = Db::connect_file(&home.db_path())
+            .await
+            .expect("connect db")
+            .pool();
+        let peer_id = local_peer_id();
+        let session_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO sessions \
+             (session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, turn_count) \
+             VALUES (?1, 'local-cli', ?2, 'main', 'interactive', 1, 2, 1)",
+        )
+        .bind(session_id.to_string())
+        .bind(&peer_id)
+        .execute(&pool)
+        .await
+        .expect("insert session");
+        sqlx::query(
+            "INSERT INTO session_turns \
+             (turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, runtime_id, started_at_ms, finished_at_ms) \
+             VALUES (?1, ?2, 1, 'normal', 'interrupted', 'hello', 'hello', 'partial reply', 'runtime.interrupted', 'turn interrupted by kernel restart', 'codex', 1, 2)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(session_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("insert interrupted turn");
+
+        let mut input = Cursor::new(b"/exit\n".to_vec());
+        let mut output = Vec::new();
+        run_local_with_io(&home, None, true, &mut input, &mut output)
+            .await
+            .expect("continue run");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("Recent session history:"));
+        assert!(output.contains("you> hello"));
+        assert!(
+            output.contains("[partial] previous assistant reply was interrupted before completion")
+        );
+        assert!(output.contains("lionclaw> partial reply"));
+        assert!(output.contains("[error] turn interrupted by kernel restart"));
     }
 
     #[tokio::test]

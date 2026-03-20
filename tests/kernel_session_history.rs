@@ -20,7 +20,9 @@ use lionclaw::{
         Kernel, KernelError, KernelOptions,
     },
 };
+use sqlx::{Row, SqlitePool};
 use tempfile::TempDir;
+use tokio::time::sleep;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -337,6 +339,219 @@ async fn continue_requires_interactive_history_policy() {
     );
 }
 
+#[tokio::test]
+async fn kernel_restart_interrupts_running_turn_and_preserves_partial_output() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    kernel
+        .register_runtime_adapter(
+            "blocking",
+            Arc::new(BlockingAnswerAdapter {
+                answer: "checkpointed partial".to_string(),
+                sleep_for: Duration::from_secs(30),
+            }),
+        )
+        .await;
+
+    let session = open_session(&kernel, "restart-peer", SessionHistoryPolicy::Interactive).await;
+    let session_id = session.session_id;
+    let turn_kernel = kernel.clone();
+    let turn_task = tokio::spawn(async move {
+        turn_kernel
+            .turn_session(SessionTurnRequest {
+                session_id,
+                user_text: "long running".to_string(),
+                runtime_id: Some("blocking".to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await
+    });
+
+    wait_for_turn_checkpoint(&env.db_path(), session_id, "checkpointed partial").await;
+    turn_task.abort();
+    let _ = turn_task.await;
+    drop(kernel);
+
+    let rebooted = Kernel::new(&env.db_path()).await.expect("rebooted kernel");
+    let history = rebooted
+        .session_history(SessionHistoryRequest {
+            session_id,
+            limit: Some(12),
+        })
+        .await
+        .expect("history after restart");
+
+    assert_eq!(history.turns.len(), 1);
+    let turn = &history.turns[0];
+    assert_eq!(turn.status, SessionTurnStatus::Interrupted);
+    assert_eq!(turn.assistant_text, "checkpointed partial");
+    assert_eq!(turn.error_code.as_deref(), Some("runtime.interrupted"));
+    assert_eq!(
+        turn.error_text.as_deref(),
+        Some("turn interrupted by kernel restart")
+    );
+    assert!(turn.finished_at.is_some());
+
+    let pool = connect_pool(&env.db_path()).await;
+    let row = sqlx::query("SELECT turn_count FROM sessions WHERE session_id = ?1")
+        .bind(session_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("fetch session turn count");
+    let turn_count: i64 = row.get("turn_count");
+    assert_eq!(turn_count, 1);
+
+    rebooted
+        .register_runtime_adapter(
+            "capture",
+            Arc::new(CapturePromptAdapter {
+                prompts: Arc::new(Mutex::new(Vec::new())),
+                reply: "continued after restart".to_string(),
+            }),
+        )
+        .await;
+    let continued = rebooted
+        .run_session_action(
+            session_id,
+            SessionActionKind::ContinueLastPartial,
+            Some("capture".to_string()),
+        )
+        .await
+        .expect("continue after restart");
+    assert_eq!(continued.assistant_text, "continued after restart");
+}
+
+#[tokio::test]
+async fn interactive_history_carries_interrupted_partial_reply_forward() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let recorded_prompts = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "capture",
+            Arc::new(CapturePromptAdapter {
+                prompts: recorded_prompts.clone(),
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+
+    let session = open_session(
+        &kernel,
+        "interrupted-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+    insert_session_turn(
+        &env.db_path(),
+        session.session_id,
+        1,
+        SessionTurnStatus::Interrupted,
+        "original prompt",
+        "partial after crash",
+        Some("runtime.interrupted"),
+        Some("turn interrupted by kernel restart"),
+    )
+    .await;
+
+    let response = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "continue from that".to_string(),
+            runtime_id: Some("capture".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("follow-up turn");
+    assert_eq!(response.assistant_text, "captured");
+
+    let prompt = recorded_prompts.lock().expect("prompt lock")[0].clone();
+    assert!(prompt.contains("## Prior Turn 1"));
+    assert!(prompt.contains("original prompt"));
+    assert!(prompt
+        .contains("[Partial assistant reply; previous turn was interrupted before completion]"));
+    assert!(prompt.contains("partial after crash"));
+}
+
+#[tokio::test]
+async fn session_history_overfetches_usable_turns_past_zero_information_rows() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let session = open_session(&kernel, "repair-peer", SessionHistoryPolicy::Interactive).await;
+
+    insert_session_turn(
+        &env.db_path(),
+        session.session_id,
+        1,
+        SessionTurnStatus::Completed,
+        "first",
+        "alpha",
+        None,
+        None,
+    )
+    .await;
+    insert_session_turn(
+        &env.db_path(),
+        session.session_id,
+        2,
+        SessionTurnStatus::Failed,
+        "",
+        "",
+        None,
+        None,
+    )
+    .await;
+    insert_session_turn(
+        &env.db_path(),
+        session.session_id,
+        3,
+        SessionTurnStatus::Completed,
+        "third",
+        "gamma",
+        None,
+        None,
+    )
+    .await;
+    insert_session_turn(
+        &env.db_path(),
+        session.session_id,
+        4,
+        SessionTurnStatus::Cancelled,
+        "",
+        "",
+        None,
+        None,
+    )
+    .await;
+    insert_session_turn(
+        &env.db_path(),
+        session.session_id,
+        5,
+        SessionTurnStatus::Completed,
+        "fifth",
+        "omega",
+        None,
+        None,
+    )
+    .await;
+
+    let history = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: session.session_id,
+            limit: Some(2),
+        })
+        .await
+        .expect("history");
+
+    assert_eq!(history.turns.len(), 2);
+    assert_eq!(history.turns[0].display_user_text, "third");
+    assert_eq!(history.turns[1].display_user_text, "fifth");
+}
+
 async fn open_session(
     kernel: &Kernel,
     peer_id: &str,
@@ -361,6 +576,11 @@ struct PartialTimeoutAdapter {
 struct CapturePromptAdapter {
     prompts: Arc<Mutex<Vec<String>>>,
     reply: String,
+}
+
+struct BlockingAnswerAdapter {
+    answer: String,
+    sleep_for: Duration,
 }
 
 #[async_trait]
@@ -466,6 +686,57 @@ impl RuntimeAdapter for CapturePromptAdapter {
     }
 }
 
+#[async_trait]
+impl RuntimeAdapter for BlockingAnswerAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "blocking".to_string(),
+            version: "0.1".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        _input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("blocking-{}", Uuid::new_v4()),
+        })
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        let _ = events.send(RuntimeEvent::MessageDelta {
+            lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+            text: self.answer.clone(),
+        });
+        tokio::time::sleep(self.sleep_for).await;
+        Ok(RuntimeTurnResult::default())
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        events: RuntimeEventSender,
+    ) -> Result<()> {
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
+    }
+
+    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
+        Ok(())
+    }
+}
+
 struct TestEnv {
     temp_dir: TempDir,
 }
@@ -484,4 +755,65 @@ impl TestEnv {
     fn db_path(&self) -> PathBuf {
         self.path().join("lionclaw.db")
     }
+}
+
+async fn connect_pool(db_path: &std::path::Path) -> SqlitePool {
+    let db_url = format!("sqlite://{}", db_path.display());
+    SqlitePool::connect(&db_url).await.expect("connect db")
+}
+
+async fn insert_session_turn(
+    db_path: &std::path::Path,
+    session_id: Uuid,
+    sequence_no: i64,
+    status: SessionTurnStatus,
+    prompt_user_text: &str,
+    assistant_text: &str,
+    error_code: Option<&str>,
+    error_text: Option<&str>,
+) {
+    let pool = connect_pool(db_path).await;
+    sqlx::query(
+        "INSERT INTO session_turns \
+         (turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, runtime_id, started_at_ms, finished_at_ms) \
+         VALUES (?1, ?2, ?3, 'normal', ?4, ?5, ?6, ?7, ?8, ?9, 'mock', 1, CASE WHEN ?4 = 'running' THEN NULL ELSE 2 END)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(session_id.to_string())
+    .bind(sequence_no)
+    .bind(status.as_str())
+    .bind(prompt_user_text)
+    .bind(prompt_user_text)
+    .bind(assistant_text)
+    .bind(error_code)
+    .bind(error_text)
+    .execute(&pool)
+    .await
+    .expect("insert session turn");
+}
+
+async fn wait_for_turn_checkpoint(db_path: &std::path::Path, session_id: Uuid, expected: &str) {
+    let pool = connect_pool(db_path).await;
+    for _ in 0..40 {
+        let row = sqlx::query(
+            "SELECT assistant_text \
+             FROM session_turns \
+             WHERE session_id = ?1 \
+             ORDER BY sequence_no DESC \
+             LIMIT 1",
+        )
+        .bind(session_id.to_string())
+        .fetch_optional(&pool)
+        .await
+        .expect("query assistant text");
+        if row
+            .as_ref()
+            .map(|value| value.get::<String, _>("assistant_text"))
+            .is_some_and(|text| text == expected)
+        {
+            return;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    panic!("assistant checkpoint never reached expected value");
 }

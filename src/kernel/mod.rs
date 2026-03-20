@@ -8,6 +8,7 @@ pub mod policy;
 pub mod runtime;
 pub mod runtime_policy;
 pub mod selector;
+pub mod session_transcript;
 pub mod session_turns;
 pub mod sessions;
 pub mod skills;

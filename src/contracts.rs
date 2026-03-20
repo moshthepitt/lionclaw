@@ -141,6 +141,7 @@ pub enum SessionTurnStatus {
     Failed,
     TimedOut,
     Cancelled,
+    Interrupted,
 }
 
 impl SessionTurnStatus {
@@ -151,6 +152,7 @@ impl SessionTurnStatus {
             Self::Failed => "failed",
             Self::TimedOut => "timed_out",
             Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
         }
     }
 }
@@ -165,6 +167,7 @@ impl FromStr for SessionTurnStatus {
             "failed" => Ok(Self::Failed),
             "timed_out" => Ok(Self::TimedOut),
             "cancelled" => Ok(Self::Cancelled),
+            "interrupted" => Ok(Self::Interrupted),
             other => Err(format!("invalid session turn status '{}'", other)),
         }
     }

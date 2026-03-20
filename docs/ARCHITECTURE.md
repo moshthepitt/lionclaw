@@ -130,13 +130,15 @@ Queued channel turns emit machine-stable status/error codes through the same str
   - `conservative`: carry forward only a structured failure note
 - `session_turns` is the durable source of truth for prompt history. It records:
   - `kind = normal | retry | continue`
-  - `status = running | completed | failed | timed_out | cancelled`
+  - `status = running | completed | failed | timed_out | cancelled | interrupted`
   - `display_user_text`
   - `prompt_user_text`
   - `assistant_text`
   - `error_code`
   - `error_text`
   - `runtime_id`
+- answer-lane text is checkpointed while a turn is still running so restart reconciliation can preserve partial replies already emitted to the user
+- kernel bootstrap converts stale `running` session turns into durable `interrupted` turns before they can be reused
 - `lionclaw run` opens `local-cli` sessions with `history_policy=interactive`.
 - Recovery actions are kernel-owned:
   - `continue_last_partial`

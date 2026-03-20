@@ -47,6 +47,9 @@ use super::{
     },
     runtime_policy::{RuntimeExecutionContext, RuntimeExecutionPolicy, RuntimeExecutionRequest},
     selector::SkillSelector,
+    session_transcript::{
+        load_repaired_turns, render_turns_for_prompt, turns_to_history_views, TranscriptMode,
+    },
     session_turns::{NewSessionTurn, SessionTurnCompletion, SessionTurnRecord, SessionTurnStore},
     sessions::SessionStore,
     skills::{SkillInstallInput, SkillStore},
@@ -147,6 +150,25 @@ impl Kernel {
 
     async fn bootstrap(&self) {
         register_builtin_runtime_adapters(&self.runtime).await;
+        let reason = "turn interrupted by kernel restart";
+        if let Ok(interrupted_turns) = self.session_turns.interrupt_running_turns(reason).await {
+            for turn in &interrupted_turns {
+                let _ = self.sessions.record_turn(turn.session_id).await;
+            }
+            let _ = self
+                .audit
+                .append(
+                    "session.turn.reconciled",
+                    None,
+                    Some("kernel".to_string()),
+                    json!({
+                        "status": "interrupted",
+                        "count": interrupted_turns.len(),
+                        "reason": reason,
+                    }),
+                )
+                .await;
+        }
         let _ = self
             .channel_state
             .fail_running_turns("channel turn interrupted by restart")
@@ -215,13 +237,9 @@ impl Kernel {
 
         let limit = req.limit.unwrap_or(12).clamp(1, 100);
         let turns = self
-            .session_turns
-            .list_recent(session.session_id, limit)
+            .load_session_history_views(session.session_id, limit)
             .await
-            .map_err(internal)?
-            .into_iter()
-            .map(SessionTurnView::from)
-            .collect();
+            .map_err(internal)?;
 
         Ok(SessionHistoryResponse { turns })
     }
@@ -1461,77 +1479,6 @@ fn summarize_runtime_events(events: &[RuntimeEvent]) -> SessionTurnArtifacts {
     }
 }
 
-fn render_session_turn_for_prompt(
-    turn: &SessionTurnRecord,
-    history_policy: SessionHistoryPolicy,
-) -> String {
-    let mut section = format!("## Previous User Input\n\n{}", turn.prompt_user_text.trim());
-    match turn.status {
-        SessionTurnStatus::Completed => {
-            if !turn.assistant_text.trim().is_empty() {
-                section.push_str(&format!(
-                    "\n\n## Previous Assistant Reply\n\n{}",
-                    turn.assistant_text.trim()
-                ));
-            }
-        }
-        SessionTurnStatus::TimedOut | SessionTurnStatus::Failed | SessionTurnStatus::Cancelled => {
-            let failure_note = format_failure_note(turn.status, turn.error_text.as_deref());
-            match history_policy {
-                SessionHistoryPolicy::Interactive if !turn.assistant_text.trim().is_empty() => {
-                    section.push_str(&format!(
-                        "\n\n## Previous Assistant Reply\n\n{}\n\n{}",
-                        partial_marker(turn.status),
-                        turn.assistant_text.trim()
-                    ));
-                }
-                _ => {}
-            }
-            section.push_str(&format!("\n\n## Previous Turn Outcome\n\n{}", failure_note));
-        }
-        SessionTurnStatus::Running => {}
-    }
-
-    section
-}
-
-fn partial_marker(status: SessionTurnStatus) -> &'static str {
-    match status {
-        SessionTurnStatus::TimedOut => {
-            "[Partial assistant reply; previous turn timed out before completion]"
-        }
-        SessionTurnStatus::Failed => {
-            "[Partial assistant reply; previous turn failed before completion]"
-        }
-        SessionTurnStatus::Cancelled => {
-            "[Partial assistant reply; previous turn was cancelled before completion]"
-        }
-        _ => "",
-    }
-}
-
-fn format_failure_note(status: SessionTurnStatus, error_text: Option<&str>) -> String {
-    let reason = error_text.unwrap_or("no additional error text recorded");
-    match status {
-        SessionTurnStatus::TimedOut => format!(
-            "The previous assistant turn timed out before completion. Recorded error: {}",
-            reason
-        ),
-        SessionTurnStatus::Failed => format!(
-            "The previous assistant turn failed before completion. Recorded error: {}",
-            reason
-        ),
-        SessionTurnStatus::Cancelled => format!(
-            "The previous assistant turn was cancelled before completion. Recorded error: {}",
-            reason
-        ),
-        SessionTurnStatus::Completed => "The previous assistant turn completed.".to_string(),
-        SessionTurnStatus::Running => {
-            "The previous assistant turn is still marked running.".to_string()
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct ChannelStreamContext {
     channel_id: String,
@@ -1558,6 +1505,7 @@ type RuntimeEventSink = tokio::sync::mpsc::UnboundedSender<StreamEventDto>;
 
 struct RuntimeTurnExecution<'a> {
     adapter: Arc<dyn RuntimeAdapter>,
+    turn_id: Uuid,
     runtime_id: &'a str,
     session_id: Uuid,
     handle: &'a RuntimeSessionHandle,
@@ -1588,11 +1536,65 @@ struct SessionTurnArtifacts {
     saw_error: bool,
 }
 
+const ASSISTANT_CHECKPOINT_BYTES: usize = 256;
+const ASSISTANT_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Default)]
+struct AssistantCheckpointState {
+    assistant_text: String,
+    persisted_len: usize,
+    last_checkpoint_at: Option<Instant>,
+}
+
+impl AssistantCheckpointState {
+    fn observe(&mut self, event: &RuntimeEvent) {
+        if let RuntimeEvent::MessageDelta {
+            lane: RuntimeMessageLane::Answer,
+            text,
+        } = event
+        {
+            self.assistant_text.push_str(text);
+        }
+    }
+
+    fn seed(&mut self, assistant_text: String) {
+        self.assistant_text = assistant_text;
+        self.persisted_len = self.assistant_text.len();
+        self.last_checkpoint_at = if self.persisted_len == 0 {
+            None
+        } else {
+            Some(Instant::now())
+        };
+    }
+
+    fn checkpoint_due(&self) -> bool {
+        let pending_len = self.assistant_text.len();
+        if pending_len == self.persisted_len || pending_len == 0 {
+            return false;
+        }
+        if self.persisted_len == 0 {
+            return true;
+        }
+        if pending_len.saturating_sub(self.persisted_len) >= ASSISTANT_CHECKPOINT_BYTES {
+            return true;
+        }
+        self.last_checkpoint_at
+            .is_some_and(|instant| instant.elapsed() >= ASSISTANT_CHECKPOINT_INTERVAL)
+    }
+
+    fn mark_checkpointed(&mut self) {
+        self.persisted_len = self.assistant_text.len();
+        self.last_checkpoint_at = Some(Instant::now());
+    }
+}
+
 struct RuntimeCapabilityFollowupExecution<'a> {
     adapter: Arc<dyn RuntimeAdapter>,
+    turn_id: Uuid,
     runtime_id: &'a str,
     session_id: Uuid,
     handle: &'a RuntimeSessionHandle,
+    assistant_text: String,
     results: Vec<RuntimeCapabilityResult>,
     stream_context: Option<ChannelStreamContext>,
     event_sink: Option<RuntimeEventSink>,
@@ -1766,6 +1768,7 @@ impl Kernel {
         let turn_result = self
             .execute_runtime_turn(RuntimeTurnExecution {
                 adapter: adapter.clone(),
+                turn_id,
                 runtime_id: &runtime_id,
                 session_id: session.session_id,
                 handle: &handle,
@@ -1812,6 +1815,13 @@ impl Kernel {
         };
 
         let pre_followup_assistant = assistant_text_from_events(&runtime_turn.events);
+        if !pre_followup_assistant.is_empty() {
+            let _ = self
+                .session_turns
+                .checkpoint_assistant_text(turn_id, &pre_followup_assistant)
+                .await
+                .map_err(internal)?;
+        }
         let runtime_events_result = async {
             let mut runtime_events = runtime_turn.events;
             if !runtime_turn.result.capability_requests.is_empty() {
@@ -1828,9 +1838,11 @@ impl Kernel {
                 let followup_events = self
                     .execute_runtime_capability_followup(RuntimeCapabilityFollowupExecution {
                         adapter: adapter.clone(),
+                        turn_id,
                         runtime_id: &runtime_id,
                         session_id: session.session_id,
                         handle: &handle,
+                        assistant_text: pre_followup_assistant.clone(),
                         results: capability_results,
                         stream_context: channel_stream_context.clone(),
                         event_sink: sink.clone(),
@@ -2249,6 +2261,59 @@ impl Kernel {
         Ok(())
     }
 
+    async fn checkpoint_running_turn(
+        &self,
+        turn_id: Uuid,
+        checkpoints: &mut AssistantCheckpointState,
+    ) -> Result<(), KernelError> {
+        if !checkpoints.checkpoint_due() {
+            return Ok(());
+        }
+
+        let _ = self
+            .session_turns
+            .checkpoint_assistant_text(turn_id, &checkpoints.assistant_text)
+            .await
+            .map_err(internal)?;
+        checkpoints.mark_checkpointed();
+        Ok(())
+    }
+
+    async fn record_runtime_event(
+        &self,
+        turn_id: Uuid,
+        stream_context: &Option<ChannelStreamContext>,
+        event_sink: &Option<RuntimeEventSink>,
+        event: RuntimeEvent,
+        events: &mut Vec<RuntimeEvent>,
+        checkpoints: &mut AssistantCheckpointState,
+    ) -> Result<(), FailedRuntimeTurn> {
+        checkpoints.observe(&event);
+        self.checkpoint_running_turn(turn_id, checkpoints)
+            .await
+            .map_err(|err| FailedRuntimeTurn {
+                events: events.clone(),
+                status: SessionTurnStatus::Failed,
+                error_code: "runtime.error".to_string(),
+                error_text: err.to_string(),
+            })?;
+
+        if matches!(event, RuntimeEvent::Done) && stream_context.is_some() {
+            self.emit_local_stream_event(event_sink, &event);
+        } else {
+            self.emit_runtime_event(stream_context, event_sink, event.clone())
+                .await
+                .map_err(|err| FailedRuntimeTurn {
+                    events: events.clone(),
+                    status: SessionTurnStatus::Failed,
+                    error_code: "runtime.error".to_string(),
+                    error_text: err.to_string(),
+                })?;
+        }
+        events.push(event);
+        Ok(())
+    }
+
     fn peer_worker_key(channel_id: &str, peer_id: &str) -> String {
         format!("{channel_id}:{peer_id}")
     }
@@ -2651,18 +2716,14 @@ impl Kernel {
         session: &super::sessions::Session,
         limit: usize,
     ) -> anyhow::Result<Vec<String>> {
-        let turns = self
-            .session_turns
-            .list_recent(session.session_id, limit)
-            .await?;
-        let mut sections = Vec::new();
-        for turn in turns {
-            sections.push(render_session_turn_for_prompt(
-                &turn,
-                session.history_policy,
-            ));
-        }
-        Ok(sections)
+        let turns = load_repaired_turns(
+            &self.session_turns,
+            session.session_id,
+            limit,
+            TranscriptMode::Prompt(session.history_policy),
+        )
+        .await?;
+        Ok(render_turns_for_prompt(&turns, session.history_policy))
     }
 
     async fn read_skill_context(
@@ -2689,6 +2750,21 @@ impl Kernel {
             .as_ref()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()))
+    }
+
+    async fn load_session_history_views(
+        &self,
+        session_id: Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<SessionTurnView>> {
+        let turns = load_repaired_turns(
+            &self.session_turns,
+            session_id,
+            limit,
+            TranscriptMode::History,
+        )
+        .await?;
+        Ok(turns_to_history_views(turns))
     }
 
     async fn resolve_runtime_execution_context(
@@ -2759,6 +2835,7 @@ impl Kernel {
     ) -> Result<CollectedRuntimeTurn, FailedRuntimeTurn> {
         let RuntimeTurnExecution {
             adapter,
+            turn_id,
             runtime_id,
             session_id,
             handle,
@@ -2817,25 +2894,22 @@ impl Kernel {
         let hard_sleep = sleep(hard_timeout);
         tokio::pin!(hard_sleep);
         let mut events = Vec::new();
+        let mut checkpoints = AssistantCheckpointState::default();
 
         loop {
             tokio::select! {
                 maybe_event = event_rx.recv() => {
                     match maybe_event {
                         Some(event) => {
-                            if matches!(event, RuntimeEvent::Done) && stream_context.is_some() {
-                                self.emit_local_stream_event(&event_sink, &event);
-                            } else {
-                                self.emit_runtime_event(&stream_context, &event_sink, event.clone())
-                                    .await
-                                    .map_err(|err| FailedRuntimeTurn {
-                                        events: events.clone(),
-                                        status: SessionTurnStatus::Failed,
-                                        error_code: "runtime.error".to_string(),
-                                        error_text: err.to_string(),
-                                    })?;
-                            }
-                            events.push(event);
+                            self.record_runtime_event(
+                                turn_id,
+                                &stream_context,
+                                &event_sink,
+                                event,
+                                &mut events,
+                                &mut checkpoints,
+                            )
+                            .await?;
                             idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
                         }
                         None => {
@@ -2847,19 +2921,15 @@ impl Kernel {
                 }
                 output = &mut turn_task => {
                     while let Some(event) = event_rx.recv().await {
-                        if matches!(event, RuntimeEvent::Done) && stream_context.is_some() {
-                            self.emit_local_stream_event(&event_sink, &event);
-                        } else {
-                            self.emit_runtime_event(&stream_context, &event_sink, event.clone())
-                                .await
-                                .map_err(|err| FailedRuntimeTurn {
-                                    events: events.clone(),
-                                    status: SessionTurnStatus::Failed,
-                                    error_code: "runtime.error".to_string(),
-                                    error_text: err.to_string(),
-                                })?;
-                        }
-                        events.push(event);
+                        self.record_runtime_event(
+                            turn_id,
+                            &stream_context,
+                            &event_sink,
+                            event,
+                            &mut events,
+                            &mut checkpoints,
+                        )
+                        .await?;
                     }
                     return match output {
                         Ok(Ok(result)) => {
@@ -3115,9 +3185,11 @@ impl Kernel {
     ) -> Result<Vec<RuntimeEvent>, anyhow::Error> {
         let RuntimeCapabilityFollowupExecution {
             adapter,
+            turn_id,
             runtime_id,
             session_id,
             handle,
+            assistant_text,
             results,
             stream_context,
             event_sink,
@@ -3128,15 +3200,19 @@ impl Kernel {
             .await?;
 
         let mut events = Vec::new();
+        let mut checkpoints = AssistantCheckpointState::default();
+        checkpoints.seed(assistant_text);
         while let Some(event) = event_rx.recv().await {
-            if matches!(event, RuntimeEvent::Done) && stream_context.is_some() {
-                self.emit_local_stream_event(&event_sink, &event);
-            } else {
-                self.emit_runtime_event(&stream_context, &event_sink, event.clone())
-                    .await
-                    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-            }
-            events.push(event);
+            self.record_runtime_event(
+                turn_id,
+                &stream_context,
+                &event_sink,
+                event,
+                &mut events,
+                &mut checkpoints,
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!(err.error_text))?;
         }
 
         self.audit

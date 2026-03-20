@@ -50,6 +50,12 @@ pub struct SessionTurnCompletion {
     pub error_text: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct InterruptedSessionTurn {
+    pub turn_id: Uuid,
+    pub session_id: Uuid,
+}
+
 impl SessionTurnStore {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -126,6 +132,87 @@ impl SessionTurnStore {
         }
 
         self.get(turn_id).await
+    }
+
+    pub async fn checkpoint_assistant_text(
+        &self,
+        turn_id: Uuid,
+        assistant_text: &str,
+    ) -> Result<Option<SessionTurnRecord>> {
+        let updated = sqlx::query(
+            "UPDATE session_turns \
+             SET assistant_text = ?2 \
+             WHERE turn_id = ?1 AND status = ?3",
+        )
+        .bind(turn_id.to_string())
+        .bind(assistant_text)
+        .bind(SessionTurnStatus::Running.as_str())
+        .execute(&self.pool)
+        .await
+        .context("failed to checkpoint session turn assistant text")?;
+
+        if updated.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        self.get(turn_id).await
+    }
+
+    pub async fn interrupt_running_turns(
+        &self,
+        reason: &str,
+    ) -> Result<Vec<InterruptedSessionTurn>> {
+        let finished_at_ms = now_ms();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start interrupted session turn transaction")?;
+
+        let rows = sqlx::query(
+            "SELECT turn_id, session_id \
+             FROM session_turns \
+             WHERE status = ?1 \
+             ORDER BY started_at_ms ASC, turn_id ASC",
+        )
+        .bind(SessionTurnStatus::Running.as_str())
+        .fetch_all(&mut *tx)
+        .await
+        .context("failed to query running session turns")?;
+
+        sqlx::query(
+            "UPDATE session_turns \
+             SET status = ?1, error_code = ?2, error_text = ?3, finished_at_ms = ?4 \
+             WHERE status = ?5",
+        )
+        .bind(SessionTurnStatus::Interrupted.as_str())
+        .bind("runtime.interrupted")
+        .bind(reason)
+        .bind(finished_at_ms)
+        .bind(SessionTurnStatus::Running.as_str())
+        .execute(&mut *tx)
+        .await
+        .context("failed to interrupt running session turns")?;
+
+        tx.commit()
+            .await
+            .context("failed to commit interrupted session turn transaction")?;
+
+        rows.into_iter()
+            .map(|row| {
+                let turn_id_raw: String = row.get("turn_id");
+                let session_id_raw: String = row.get("session_id");
+                let turn_id = Uuid::parse_str(&turn_id_raw)
+                    .with_context(|| format!("invalid interrupted turn_id '{}'", turn_id_raw))?;
+                let session_id = Uuid::parse_str(&session_id_raw).with_context(|| {
+                    format!("invalid interrupted session_id '{}'", session_id_raw)
+                })?;
+                Ok(InterruptedSessionTurn {
+                    turn_id,
+                    session_id,
+                })
+            })
+            .collect()
     }
 
     pub async fn get(&self, turn_id: Uuid) -> Result<Option<SessionTurnRecord>> {

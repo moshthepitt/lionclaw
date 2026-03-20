@@ -85,7 +85,7 @@ impl SessionStore {
             "SELECT session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, turn_count \
              FROM sessions \
              WHERE channel_id = ?1 AND peer_id = ?2 \
-             ORDER BY created_at_ms DESC \
+             ORDER BY (last_turn_at_ms IS NOT NULL) DESC, COALESCE(last_turn_at_ms, created_at_ms) DESC, created_at_ms DESC \
              LIMIT 1",
         )
         .bind(channel_id)
