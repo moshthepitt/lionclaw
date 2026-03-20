@@ -272,6 +272,71 @@ async fn continue_and_retry_actions_create_durable_turns() {
     assert_eq!(history.turns[2].display_user_text, "/retry");
 }
 
+#[tokio::test]
+async fn continue_requires_interactive_history_policy() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            runtime_turn_idle_timeout: Duration::from_millis(50),
+            runtime_turn_hard_timeout: Duration::from_millis(200),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    kernel
+        .register_runtime_adapter(
+            "partial",
+            Arc::new(PartialTimeoutAdapter {
+                partial_text: "hidden partial".to_string(),
+                sleep_for: Duration::from_millis(120),
+            }),
+        )
+        .await;
+    kernel
+        .register_runtime_adapter(
+            "capture",
+            Arc::new(CapturePromptAdapter {
+                prompts: Arc::new(Mutex::new(Vec::new())),
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+
+    let session = open_session(
+        &kernel,
+        "conservative-action",
+        SessionHistoryPolicy::Conservative,
+    )
+    .await;
+
+    let _ = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "original prompt".to_string(),
+            runtime_id: Some("partial".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect_err("turn should time out");
+
+    let err = kernel
+        .run_session_action(
+            session.session_id,
+            SessionActionKind::ContinueLastPartial,
+            Some("capture".to_string()),
+        )
+        .await
+        .expect_err("continue should be rejected for conservative sessions");
+    assert!(
+        matches!(err, KernelError::BadRequest(message) if message.contains("interactive session history"))
+    );
+}
+
 async fn open_session(
     kernel: &Kernel,
     peer_id: &str,

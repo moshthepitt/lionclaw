@@ -344,6 +344,11 @@ impl Kernel {
 
         let execution = match action {
             SessionActionKind::ContinueLastPartial => {
+                if session.history_policy != SessionHistoryPolicy::Interactive {
+                    return Err(KernelError::BadRequest(
+                        "continue_last_partial requires interactive session history".to_string(),
+                    ));
+                }
                 let can_continue = latest_turn.status != SessionTurnStatus::Completed
                     && !latest_turn.assistant_text.trim().is_empty();
                 if !can_continue {
