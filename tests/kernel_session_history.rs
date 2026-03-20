@@ -446,13 +446,15 @@ async fn interactive_history_carries_interrupted_partial_reply_forward() {
     .await;
     insert_session_turn(
         &env.db_path(),
-        session.session_id,
-        1,
-        SessionTurnStatus::Interrupted,
-        "original prompt",
-        "partial after crash",
-        Some("runtime.interrupted"),
-        Some("turn interrupted by kernel restart"),
+        SessionTurnSeed {
+            session_id: session.session_id,
+            sequence_no: 1,
+            status: SessionTurnStatus::Interrupted,
+            prompt_user_text: "original prompt",
+            assistant_text: "partial after crash",
+            error_code: Some("runtime.interrupted"),
+            error_text: Some("turn interrupted by kernel restart"),
+        },
     )
     .await;
 
@@ -485,57 +487,67 @@ async fn session_history_overfetches_usable_turns_past_zero_information_rows() {
 
     insert_session_turn(
         &env.db_path(),
-        session.session_id,
-        1,
-        SessionTurnStatus::Completed,
-        "first",
-        "alpha",
-        None,
-        None,
+        SessionTurnSeed {
+            session_id: session.session_id,
+            sequence_no: 1,
+            status: SessionTurnStatus::Completed,
+            prompt_user_text: "first",
+            assistant_text: "alpha",
+            error_code: None,
+            error_text: None,
+        },
     )
     .await;
     insert_session_turn(
         &env.db_path(),
-        session.session_id,
-        2,
-        SessionTurnStatus::Failed,
-        "",
-        "",
-        None,
-        None,
+        SessionTurnSeed {
+            session_id: session.session_id,
+            sequence_no: 2,
+            status: SessionTurnStatus::Failed,
+            prompt_user_text: "",
+            assistant_text: "",
+            error_code: None,
+            error_text: None,
+        },
     )
     .await;
     insert_session_turn(
         &env.db_path(),
-        session.session_id,
-        3,
-        SessionTurnStatus::Completed,
-        "third",
-        "gamma",
-        None,
-        None,
+        SessionTurnSeed {
+            session_id: session.session_id,
+            sequence_no: 3,
+            status: SessionTurnStatus::Completed,
+            prompt_user_text: "third",
+            assistant_text: "gamma",
+            error_code: None,
+            error_text: None,
+        },
     )
     .await;
     insert_session_turn(
         &env.db_path(),
-        session.session_id,
-        4,
-        SessionTurnStatus::Cancelled,
-        "",
-        "",
-        None,
-        None,
+        SessionTurnSeed {
+            session_id: session.session_id,
+            sequence_no: 4,
+            status: SessionTurnStatus::Cancelled,
+            prompt_user_text: "",
+            assistant_text: "",
+            error_code: None,
+            error_text: None,
+        },
     )
     .await;
     insert_session_turn(
         &env.db_path(),
-        session.session_id,
-        5,
-        SessionTurnStatus::Completed,
-        "fifth",
-        "omega",
-        None,
-        None,
+        SessionTurnSeed {
+            session_id: session.session_id,
+            sequence_no: 5,
+            status: SessionTurnStatus::Completed,
+            prompt_user_text: "fifth",
+            assistant_text: "omega",
+            error_code: None,
+            error_text: None,
+        },
     )
     .await;
 
@@ -762,16 +774,17 @@ async fn connect_pool(db_path: &std::path::Path) -> SqlitePool {
     SqlitePool::connect(&db_url).await.expect("connect db")
 }
 
-async fn insert_session_turn(
-    db_path: &std::path::Path,
+struct SessionTurnSeed<'a> {
     session_id: Uuid,
     sequence_no: i64,
     status: SessionTurnStatus,
-    prompt_user_text: &str,
-    assistant_text: &str,
-    error_code: Option<&str>,
-    error_text: Option<&str>,
-) {
+    prompt_user_text: &'a str,
+    assistant_text: &'a str,
+    error_code: Option<&'a str>,
+    error_text: Option<&'a str>,
+}
+
+async fn insert_session_turn(db_path: &std::path::Path, seed: SessionTurnSeed<'_>) {
     let pool = connect_pool(db_path).await;
     sqlx::query(
         "INSERT INTO session_turns \
@@ -779,14 +792,14 @@ async fn insert_session_turn(
          VALUES (?1, ?2, ?3, 'normal', ?4, ?5, ?6, ?7, ?8, ?9, 'mock', 1, CASE WHEN ?4 = 'running' THEN NULL ELSE 2 END)",
     )
     .bind(Uuid::new_v4().to_string())
-    .bind(session_id.to_string())
-    .bind(sequence_no)
-    .bind(status.as_str())
-    .bind(prompt_user_text)
-    .bind(prompt_user_text)
-    .bind(assistant_text)
-    .bind(error_code)
-    .bind(error_text)
+    .bind(seed.session_id.to_string())
+    .bind(seed.sequence_no)
+    .bind(seed.status.as_str())
+    .bind(seed.prompt_user_text)
+    .bind(seed.prompt_user_text)
+    .bind(seed.assistant_text)
+    .bind(seed.error_code)
+    .bind(seed.error_text)
     .execute(&pool)
     .await
     .expect("insert session turn");
