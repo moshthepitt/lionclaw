@@ -351,6 +351,7 @@ async fn prepare_session_with_skill(
             channel_id: "local-cli".to_string(),
             peer_id: peer_id.to_string(),
             trust_tier: TrustTier::Main,
+            history_policy: None,
         })
         .await
         .expect("open session");

@@ -60,6 +60,7 @@ async fn channel_peer_must_be_approved_before_inbound_turn_executes() {
             channel_id: "local-cli".to_string(),
             peer_id: "seed".to_string(),
             trust_tier: TrustTier::Main,
+            history_policy: None,
         })
         .await
         .expect("seed session");

@@ -62,6 +62,7 @@ This may mean many processes (example: 13 channels plus the background service).
 From the operator side, LionClaw has one normal interactive path plus explicit service commands:
 
 - `lionclaw run [runtime]` (interactive local use)
+- `lionclaw run --continue-last-session [runtime]` (resume the latest local interactive session)
 - `lionclaw apply` (reconcile desired state)
 - `lionclaw service up` (start supervised stack + ensure auto-restart policy)
 - `lionclaw service down`
@@ -77,6 +78,13 @@ Normal user flow:
 1. `lionclaw onboard`
 2. `lionclaw runtime add codex --kind codex --bin codex`
 3. `lionclaw run codex`
+
+Inside `lionclaw run`, recovery stays command-first:
+
+- `/continue`
+- `/retry`
+- `/reset`
+- `/exit`
 
 Background channels remain an explicit service flow:
 

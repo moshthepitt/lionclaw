@@ -37,6 +37,8 @@ pub struct SessionOpenRequest {
     pub channel_id: String,
     pub peer_id: String,
     pub trust_tier: TrustTier,
+    #[serde(default)]
+    pub history_policy: Option<SessionHistoryPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +56,7 @@ pub struct SessionOpenResponse {
     pub channel_id: String,
     pub peer_id: String,
     pub trust_tier: TrustTier,
+    pub history_policy: SessionHistoryPolicy,
     pub created_at: DateTime<Utc>,
 }
 
@@ -68,6 +71,151 @@ pub struct SessionTurnRequest {
     pub runtime_timeout_ms: Option<u64>,
     #[serde(default)]
     pub runtime_env_passthrough: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionHistoryPolicy {
+    Interactive,
+    #[default]
+    Conservative,
+}
+
+impl SessionHistoryPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Conservative => "conservative",
+        }
+    }
+}
+
+impl FromStr for SessionHistoryPolicy {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "interactive" => Ok(Self::Interactive),
+            "conservative" => Ok(Self::Conservative),
+            other => Err(format!("invalid history policy '{}'", other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTurnKind {
+    Normal,
+    Retry,
+    Continue,
+}
+
+impl SessionTurnKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Retry => "retry",
+            Self::Continue => "continue",
+        }
+    }
+}
+
+impl FromStr for SessionTurnKind {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "normal" => Ok(Self::Normal),
+            "retry" => Ok(Self::Retry),
+            "continue" => Ok(Self::Continue),
+            other => Err(format!("invalid session turn kind '{}'", other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTurnStatus {
+    Running,
+    Completed,
+    Failed,
+    TimedOut,
+    Cancelled,
+}
+
+impl SessionTurnStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl FromStr for SessionTurnStatus {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "timed_out" => Ok(Self::TimedOut),
+            "cancelled" => Ok(Self::Cancelled),
+            other => Err(format!("invalid session turn status '{}'", other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTurnView {
+    pub turn_id: Uuid,
+    pub kind: SessionTurnKind,
+    pub status: SessionTurnStatus,
+    pub display_user_text: String,
+    pub prompt_user_text: String,
+    pub assistant_text: String,
+    pub error_code: Option<String>,
+    pub error_text: Option<String>,
+    pub runtime_id: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistoryRequest {
+    pub session_id: Uuid,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistoryResponse {
+    pub turns: Vec<SessionTurnView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionActionKind {
+    ContinueLastPartial,
+    RetryLastTurn,
+    ResetSession,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionActionRequest {
+    pub session_id: Uuid,
+    pub action: SessionActionKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionActionResponse {
+    pub session_id: Uuid,
+    #[serde(default)]
+    pub turn_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

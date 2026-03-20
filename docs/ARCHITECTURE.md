@@ -2,7 +2,8 @@
 
 ## Kernel Modules
 
-- `kernel.sessions`: session lifecycle and turn history metadata.
+- `kernel.sessions`: session lifecycle, history policy, and aggregate turn metadata.
+- `kernel.session_turns`: durable per-turn history, recovery state, and partial assistant output.
 - `kernel.skills`: installed skill registry and enable/disable state.
 - `kernel.selector`: turn-time skill relevance selection.
 - `kernel.policy`: capability grant/revoke and allow checks.
@@ -16,6 +17,8 @@
 ### Session
 
 - `POST /v0/sessions/open`
+- `POST /v0/sessions/history`
+- `POST /v0/sessions/action`
 - `POST /v0/sessions/turn`
 
 ### Skill
@@ -119,6 +122,27 @@ Queued channel turns emit machine-stable status/error codes through the same str
 - `runtime.completed`
 - `runtime.error`
 - `runtime.timeout`
+
+## Session Continuity
+
+- `sessions.history_policy` controls how incomplete turns are reused in future prompts:
+  - `interactive`: carry forward partial assistant output with an explicit marker
+  - `conservative`: carry forward only a structured failure note
+- `session_turns` is the durable source of truth for prompt history. It records:
+  - `kind = normal | retry | continue`
+  - `status = running | completed | failed | timed_out | cancelled`
+  - `display_user_text`
+  - `prompt_user_text`
+  - `assistant_text`
+  - `error_code`
+  - `error_text`
+  - `runtime_id`
+- `lionclaw run` opens `local-cli` sessions with `history_policy=interactive`.
+- Recovery actions are kernel-owned:
+  - `continue_last_partial`
+  - `retry_last_turn`
+  - `reset_session`
+- The default history window is the last 12 durable turns.
 
 ## Security Posture in v0
 

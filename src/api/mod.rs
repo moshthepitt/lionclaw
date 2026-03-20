@@ -18,7 +18,8 @@ use crate::{
         ChannelPeerListResponse, ChannelPeerResponse, ChannelStreamAckRequest,
         ChannelStreamAckResponse, ChannelStreamPullRequest, ChannelStreamPullResponse,
         DaemonInfoResponse, PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeRequest,
-        PolicyRevokeResponse, SessionOpenRequest, SessionOpenResponse, SessionTurnRequest,
+        PolicyRevokeResponse, SessionActionRequest, SessionActionResponse, SessionHistoryRequest,
+        SessionHistoryResponse, SessionOpenRequest, SessionOpenResponse, SessionTurnRequest,
         SessionTurnResponse, SkillInstallRequest, SkillInstallResponse, SkillListResponse,
         SkillToggleRequest, SkillToggleResponse,
     },
@@ -41,6 +42,8 @@ pub fn build_router(kernel: Arc<Kernel>, daemon_info: DaemonInfoResponse) -> Rou
         .route("/health", get(health))
         .route("/v0/daemon/info", get(daemon_info_endpoint))
         .route("/v0/sessions/open", post(open_session))
+        .route("/v0/sessions/history", post(session_history))
+        .route("/v0/sessions/action", post(session_action))
         .route("/v0/sessions/turn", post(turn_session))
         .route("/v0/skills/install", post(install_skill))
         .route("/v0/skills/list", get(list_skills))
@@ -81,6 +84,22 @@ async fn turn_session(
     Json(req): Json<SessionTurnRequest>,
 ) -> Result<Json<SessionTurnResponse>, ApiError> {
     let result = state.kernel.turn_session(req).await?;
+    Ok(Json(result))
+}
+
+async fn session_history(
+    State(state): State<ApiState>,
+    Json(req): Json<SessionHistoryRequest>,
+) -> Result<Json<SessionHistoryResponse>, ApiError> {
+    let result = state.kernel.session_history(req).await?;
+    Ok(Json(result))
+}
+
+async fn session_action(
+    State(state): State<ApiState>,
+    Json(req): Json<SessionActionRequest>,
+) -> Result<Json<SessionActionResponse>, ApiError> {
+    let result = state.kernel.session_action(req).await?;
     Ok(Json(result))
 }
 

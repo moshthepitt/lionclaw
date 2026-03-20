@@ -9,7 +9,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use tokio::{
-    sync::{Notify, RwLock},
+    sync::{Mutex, Notify, RwLock},
     time::{sleep, timeout, Instant},
 };
 use uuid::Uuid;
@@ -21,7 +21,9 @@ use crate::contracts::{
     ChannelPeerListResponse, ChannelPeerResponse, ChannelPeerView, ChannelStreamAckRequest,
     ChannelStreamAckResponse, ChannelStreamEventView, ChannelStreamPullRequest,
     ChannelStreamPullResponse, PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeResponse,
-    SessionOpenRequest, SessionOpenResponse, SessionTurnRequest, SessionTurnResponse,
+    SessionActionKind, SessionActionRequest, SessionActionResponse, SessionHistoryPolicy,
+    SessionHistoryRequest, SessionHistoryResponse, SessionOpenRequest, SessionOpenResponse,
+    SessionTurnKind, SessionTurnRequest, SessionTurnResponse, SessionTurnStatus, SessionTurnView,
     SkillInstallRequest, SkillInstallResponse, SkillListResponse, SkillToggleResponse, SkillView,
     StreamEventDto, StreamEventKindDto, StreamLaneDto, TrustTier,
 };
@@ -45,6 +47,7 @@ use super::{
     },
     runtime_policy::{RuntimeExecutionContext, RuntimeExecutionPolicy, RuntimeExecutionRequest},
     selector::SkillSelector,
+    session_turns::{NewSessionTurn, SessionTurnCompletion, SessionTurnRecord, SessionTurnStore},
     sessions::SessionStore,
     skills::{SkillInstallInput, SkillStore},
 };
@@ -73,6 +76,7 @@ impl Default for KernelOptions {
 #[derive(Clone)]
 pub struct Kernel {
     sessions: SessionStore,
+    session_turns: SessionTurnStore,
     skills: SkillStore,
     selector: SkillSelector,
     policy: PolicyStore,
@@ -82,6 +86,7 @@ pub struct Kernel {
     capability_broker: CapabilityBroker,
     channel_stream_notifiers: Arc<RwLock<HashMap<String, Arc<Notify>>>>,
     channel_turn_workers: Arc<RwLock<HashSet<String>>>,
+    session_locks: Arc<RwLock<HashMap<Uuid, Arc<Mutex<()>>>>>,
     runtime_turn_idle_timeout: Duration,
     runtime_turn_hard_timeout: Duration,
     runtime_execution_policy: RuntimeExecutionPolicy,
@@ -118,6 +123,7 @@ impl Kernel {
 
         let kernel = Self {
             sessions: SessionStore::new(pool.clone()),
+            session_turns: SessionTurnStore::new(pool.clone()),
             skills: SkillStore::new(pool.clone()),
             selector: SkillSelector::new(),
             policy: PolicyStore::new(pool.clone()),
@@ -127,6 +133,7 @@ impl Kernel {
             capability_broker,
             channel_stream_notifiers: Arc::new(RwLock::new(HashMap::new())),
             channel_turn_workers: Arc::new(RwLock::new(HashSet::new())),
+            session_locks: Arc::new(RwLock::new(HashMap::new())),
             runtime_turn_idle_timeout,
             runtime_turn_hard_timeout,
             runtime_execution_policy: options.runtime_execution_policy,
@@ -170,6 +177,7 @@ impl Kernel {
                 req.channel_id.trim().to_string(),
                 req.peer_id.trim().to_string(),
                 req.trust_tier,
+                req.history_policy.unwrap_or_default(),
             )
             .await
             .map_err(internal)?;
@@ -189,8 +197,202 @@ impl Kernel {
             channel_id: session.channel_id,
             peer_id: session.peer_id,
             trust_tier: session.trust_tier,
+            history_policy: session.history_policy,
             created_at: session.created_at,
         })
+    }
+
+    pub async fn session_history(
+        &self,
+        req: SessionHistoryRequest,
+    ) -> Result<SessionHistoryResponse, KernelError> {
+        let session = self
+            .sessions
+            .get(req.session_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("session not found".to_string()))?;
+
+        let limit = req.limit.unwrap_or(12).clamp(1, 100);
+        let turns = self
+            .session_turns
+            .list_recent(session.session_id, limit)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(SessionTurnView::from)
+            .collect();
+
+        Ok(SessionHistoryResponse { turns })
+    }
+
+    pub async fn find_latest_session_summary(
+        &self,
+        channel_id: &str,
+        peer_id: &str,
+    ) -> Result<Option<SessionOpenResponse>, KernelError> {
+        let Some(session) = self
+            .sessions
+            .find_latest_by_channel_peer(channel_id, peer_id)
+            .await
+            .map_err(internal)?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(SessionOpenResponse {
+            session_id: session.session_id,
+            channel_id: session.channel_id,
+            peer_id: session.peer_id,
+            trust_tier: session.trust_tier,
+            history_policy: session.history_policy,
+            created_at: session.created_at,
+        }))
+    }
+
+    pub async fn run_session_action(
+        &self,
+        session_id: Uuid,
+        action: SessionActionKind,
+        runtime_id_override: Option<String>,
+    ) -> Result<SessionTurnResponse, KernelError> {
+        self.run_session_action_with_sink(session_id, action, runtime_id_override, None)
+            .await
+    }
+
+    pub async fn run_session_action_streaming(
+        &self,
+        session_id: Uuid,
+        action: SessionActionKind,
+        runtime_id_override: Option<String>,
+        sink: RuntimeEventSink,
+    ) -> Result<SessionTurnResponse, KernelError> {
+        self.run_session_action_with_sink(session_id, action, runtime_id_override, Some(sink))
+            .await
+    }
+
+    pub async fn session_action(
+        &self,
+        req: SessionActionRequest,
+    ) -> Result<SessionActionResponse, KernelError> {
+        match req.action {
+            SessionActionKind::ResetSession => {
+                let session = self
+                    .sessions
+                    .get(req.session_id)
+                    .await
+                    .map_err(internal)?
+                    .ok_or_else(|| KernelError::NotFound("session not found".to_string()))?;
+                let reset = self
+                    .open_session(SessionOpenRequest {
+                        channel_id: session.channel_id,
+                        peer_id: session.peer_id,
+                        trust_tier: session.trust_tier,
+                        history_policy: Some(session.history_policy),
+                    })
+                    .await?;
+                Ok(SessionActionResponse {
+                    session_id: reset.session_id,
+                    turn_id: None,
+                })
+            }
+            SessionActionKind::ContinueLastPartial | SessionActionKind::RetryLastTurn => {
+                let response = self
+                    .run_session_action(req.session_id, req.action, None)
+                    .await?;
+                Ok(SessionActionResponse {
+                    session_id: response.session_id,
+                    turn_id: Some(response.turn_id),
+                })
+            }
+        }
+    }
+
+    async fn session_lock(&self, session_id: Uuid) -> Arc<Mutex<()>> {
+        if let Some(lock) = self.session_locks.read().await.get(&session_id).cloned() {
+            return lock;
+        }
+
+        let mut locks = self.session_locks.write().await;
+        locks
+            .entry(session_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn run_session_action_with_sink(
+        &self,
+        session_id: Uuid,
+        action: SessionActionKind,
+        runtime_id_override: Option<String>,
+        sink: Option<RuntimeEventSink>,
+    ) -> Result<SessionTurnResponse, KernelError> {
+        let session_lock = self.session_lock(session_id).await;
+        let _guard = session_lock.lock().await;
+        let session = self
+            .sessions
+            .get(session_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("session not found".to_string()))?;
+        let latest_turn = self
+            .session_turns
+            .latest(session_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::BadRequest("session has no prior turns".to_string()))?;
+
+        let execution = match action {
+            SessionActionKind::ContinueLastPartial => {
+                let can_continue = latest_turn.status != SessionTurnStatus::Completed
+                    && !latest_turn.assistant_text.trim().is_empty();
+                if !can_continue {
+                    return Err(KernelError::BadRequest(
+                        "latest turn has no partial assistant output to continue".to_string(),
+                    ));
+                }
+
+                SessionTurnExecution {
+                    turn_id: Uuid::new_v4(),
+                    kind: SessionTurnKind::Continue,
+                    display_user_text: "/continue".to_string(),
+                    prompt_user_text: "Continue your previous assistant reply from where it stopped. Do not restart from the beginning unless necessary.".to_string(),
+                    requested_runtime_id: Some(
+                        runtime_id_override
+                            .clone()
+                            .unwrap_or_else(|| latest_turn.runtime_id.clone()),
+                    ),
+                    runtime_working_dir: None,
+                    runtime_timeout_ms: None,
+                    runtime_env_passthrough: None,
+                    sink,
+                    audit_actor: "api".to_string(),
+                }
+            }
+            SessionActionKind::RetryLastTurn => SessionTurnExecution {
+                turn_id: Uuid::new_v4(),
+                kind: SessionTurnKind::Retry,
+                display_user_text: "/retry".to_string(),
+                prompt_user_text: latest_turn.prompt_user_text,
+                requested_runtime_id: Some(
+                    runtime_id_override
+                        .clone()
+                        .unwrap_or_else(|| latest_turn.runtime_id.clone()),
+                ),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+                sink,
+                audit_actor: "api".to_string(),
+            },
+            SessionActionKind::ResetSession => {
+                return Err(KernelError::BadRequest(
+                    "reset_session does not execute a follow-up turn".to_string(),
+                ));
+            }
+        };
+
+        self.execute_session_turn(&session, execution).await
     }
 
     pub async fn turn_session(
@@ -816,6 +1018,7 @@ impl Kernel {
                     channel_id.to_string(),
                     peer_id.to_string(),
                     peer.trust_tier.clone(),
+                    SessionHistoryPolicy::Conservative,
                 )
                 .await
                 .map_err(internal)?,
@@ -1215,6 +1418,115 @@ fn generate_pairing_code() -> String {
     format!("{:06}", number)
 }
 
+fn assistant_text_from_events(events: &[RuntimeEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text,
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn summarize_runtime_events(events: &[RuntimeEvent]) -> SessionTurnArtifacts {
+    let mut assistant_text = String::new();
+    let mut event_views = Vec::with_capacity(events.len());
+    let mut saw_error = false;
+    for event in events {
+        if let RuntimeEvent::MessageDelta {
+            lane: RuntimeMessageLane::Answer,
+            text,
+        } = event
+        {
+            assistant_text.push_str(text);
+        }
+        if matches!(event, RuntimeEvent::Error { .. }) {
+            saw_error = true;
+        }
+        event_views.push(to_stream_event_view(event.clone()));
+    }
+
+    SessionTurnArtifacts {
+        assistant_text,
+        event_views,
+        saw_error,
+    }
+}
+
+fn render_session_turn_for_prompt(
+    turn: &SessionTurnRecord,
+    history_policy: SessionHistoryPolicy,
+) -> String {
+    let mut section = format!("## Previous User Input\n\n{}", turn.prompt_user_text.trim());
+    match turn.status {
+        SessionTurnStatus::Completed => {
+            if !turn.assistant_text.trim().is_empty() {
+                section.push_str(&format!(
+                    "\n\n## Previous Assistant Reply\n\n{}",
+                    turn.assistant_text.trim()
+                ));
+            }
+        }
+        SessionTurnStatus::TimedOut | SessionTurnStatus::Failed | SessionTurnStatus::Cancelled => {
+            let failure_note = format_failure_note(turn.status, turn.error_text.as_deref());
+            match history_policy {
+                SessionHistoryPolicy::Interactive if !turn.assistant_text.trim().is_empty() => {
+                    section.push_str(&format!(
+                        "\n\n## Previous Assistant Reply\n\n{}\n\n{}",
+                        partial_marker(turn.status),
+                        turn.assistant_text.trim()
+                    ));
+                }
+                _ => {}
+            }
+            section.push_str(&format!("\n\n## Previous Turn Outcome\n\n{}", failure_note));
+        }
+        SessionTurnStatus::Running => {}
+    }
+
+    section
+}
+
+fn partial_marker(status: SessionTurnStatus) -> &'static str {
+    match status {
+        SessionTurnStatus::TimedOut => {
+            "[Partial assistant reply; previous turn timed out before completion]"
+        }
+        SessionTurnStatus::Failed => {
+            "[Partial assistant reply; previous turn failed before completion]"
+        }
+        SessionTurnStatus::Cancelled => {
+            "[Partial assistant reply; previous turn was cancelled before completion]"
+        }
+        _ => "",
+    }
+}
+
+fn format_failure_note(status: SessionTurnStatus, error_text: Option<&str>) -> String {
+    let reason = error_text.unwrap_or("no additional error text recorded");
+    match status {
+        SessionTurnStatus::TimedOut => format!(
+            "The previous assistant turn timed out before completion. Recorded error: {}",
+            reason
+        ),
+        SessionTurnStatus::Failed => format!(
+            "The previous assistant turn failed before completion. Recorded error: {}",
+            reason
+        ),
+        SessionTurnStatus::Cancelled => format!(
+            "The previous assistant turn was cancelled before completion. Recorded error: {}",
+            reason
+        ),
+        SessionTurnStatus::Completed => "The previous assistant turn completed.".to_string(),
+        SessionTurnStatus::Running => {
+            "The previous assistant turn is still marked running.".to_string()
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ChannelStreamContext {
     channel_id: String,
@@ -1227,6 +1539,14 @@ struct ChannelStreamContext {
 struct CollectedRuntimeTurn {
     events: Vec<RuntimeEvent>,
     result: RuntimeTurnResult,
+}
+
+#[derive(Debug)]
+struct FailedRuntimeTurn {
+    events: Vec<RuntimeEvent>,
+    status: SessionTurnStatus,
+    error_code: String,
+    error_text: String,
 }
 
 type RuntimeEventSink = tokio::sync::mpsc::UnboundedSender<StreamEventDto>;
@@ -1245,13 +1565,22 @@ struct RuntimeTurnExecution<'a> {
 
 struct SessionTurnExecution {
     turn_id: Uuid,
-    user_text: String,
+    kind: SessionTurnKind,
+    display_user_text: String,
+    prompt_user_text: String,
     requested_runtime_id: Option<String>,
     runtime_working_dir: Option<String>,
     runtime_timeout_ms: Option<u64>,
     runtime_env_passthrough: Option<Vec<String>>,
     sink: Option<RuntimeEventSink>,
     audit_actor: String,
+}
+
+#[derive(Debug)]
+struct SessionTurnArtifacts {
+    assistant_text: String,
+    event_views: Vec<StreamEventDto>,
+    saw_error: bool,
 }
 
 struct RuntimeCapabilityFollowupExecution<'a> {
@@ -1272,6 +1601,7 @@ struct RuntimeTurnAbortExecution<'a> {
     turn_task: &'a mut tokio::task::JoinHandle<Result<RuntimeTurnResult, anyhow::Error>>,
     stream_context: &'a Option<ChannelStreamContext>,
     event_sink: &'a Option<RuntimeEventSink>,
+    events: Vec<RuntimeEvent>,
     timeout_ms: u64,
     reason: String,
     timeout_kind: &'a str,
@@ -1294,11 +1624,13 @@ impl Kernel {
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("session not found".to_string()))?;
 
-        self.execute_session_turn(
-            &session,
+        self.execute_session_turn_serialized(
+            session,
             SessionTurnExecution {
                 turn_id: Uuid::new_v4(),
-                user_text: req.user_text,
+                kind: SessionTurnKind::Normal,
+                display_user_text: req.user_text.clone(),
+                prompt_user_text: req.user_text,
                 requested_runtime_id: req.runtime_id,
                 runtime_working_dir: req.runtime_working_dir,
                 runtime_timeout_ms: req.runtime_timeout_ms,
@@ -1310,6 +1642,16 @@ impl Kernel {
         .await
     }
 
+    async fn execute_session_turn_serialized(
+        &self,
+        session: super::sessions::Session,
+        execution: SessionTurnExecution,
+    ) -> Result<SessionTurnResponse, KernelError> {
+        let session_lock = self.session_lock(session.session_id).await;
+        let _guard = session_lock.lock().await;
+        self.execute_session_turn(&session, execution).await
+    }
+
     async fn execute_session_turn(
         &self,
         session: &super::sessions::Session,
@@ -1317,7 +1659,9 @@ impl Kernel {
     ) -> Result<SessionTurnResponse, KernelError> {
         let SessionTurnExecution {
             turn_id,
-            user_text,
+            kind,
+            display_user_text,
+            prompt_user_text,
             requested_runtime_id,
             runtime_working_dir,
             runtime_timeout_ms,
@@ -1326,7 +1670,7 @@ impl Kernel {
             audit_actor,
         } = execution;
         let enabled_skills = self.skills.list_enabled().await.map_err(internal)?;
-        let selected_skill_ids = self.selector.select(&user_text, &enabled_skills);
+        let selected_skill_ids = self.selector.select(&prompt_user_text, &enabled_skills);
         let session_scope = Scope::Session(session.session_id);
         let any_scope = Scope::Any;
 
@@ -1373,6 +1717,18 @@ impl Kernel {
                 ),
             )
             .await?;
+        let persisted_turn = self
+            .session_turns
+            .begin_turn(NewSessionTurn {
+                turn_id,
+                session_id: session.session_id,
+                kind,
+                display_user_text: display_user_text.clone(),
+                prompt_user_text: prompt_user_text.clone(),
+                runtime_id: runtime_id.clone(),
+            })
+            .await
+            .map_err(internal)?;
 
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
@@ -1382,7 +1738,22 @@ impl Kernel {
                 selected_skills: allowed_skills.clone(),
             })
             .await
-            .map_err(|err| KernelError::Runtime(err.to_string()))?;
+            .map_err(|err| KernelError::Runtime(err.to_string()));
+
+        let handle = match handle {
+            Ok(handle) => handle,
+            Err(err) => {
+                self.persist_failed_session_turn(
+                    session,
+                    &persisted_turn,
+                    String::new(),
+                    "runtime.error".to_string(),
+                    err.to_string(),
+                )
+                .await?;
+                return Err(err);
+            }
+        };
 
         let turn_result = self
             .execute_runtime_turn(RuntimeTurnExecution {
@@ -1395,7 +1766,7 @@ impl Kernel {
                 input: RuntimeTurnInput {
                     runtime_session_id: handle.runtime_session_id.clone(),
                     prompt: self
-                        .build_prompt_envelope(&user_text, &allowed_skills)
+                        .build_prompt_envelope(session, &prompt_user_text, &allowed_skills)
                         .await?,
                     selected_skills: allowed_skills.clone(),
                 },
@@ -1415,10 +1786,26 @@ impl Kernel {
                         &handle,
                     )
                     .await;
-                return Err(turn_err);
+                let assistant_text = assistant_text_from_events(&turn_err.events);
+                self.persist_failed_session_turn(
+                    session,
+                    &persisted_turn,
+                    assistant_text,
+                    turn_err.error_code.clone(),
+                    turn_err.error_text.clone(),
+                )
+                .await?;
+                return match turn_err.status {
+                    SessionTurnStatus::TimedOut => {
+                        Err(KernelError::RuntimeTimeout(turn_err.error_text))
+                    }
+                    SessionTurnStatus::Cancelled => Err(KernelError::Conflict(turn_err.error_text)),
+                    _ => Err(KernelError::Runtime(turn_err.error_text)),
+                };
             }
         };
 
+        let pre_followup_assistant = assistant_text_from_events(&runtime_turn.events);
         let runtime_events_result = async {
             let mut runtime_events = runtime_turn.events;
             if !runtime_turn.result.capability_requests.is_empty() {
@@ -1456,36 +1843,64 @@ impl Kernel {
             .await;
         let runtime_events = match (runtime_events_result, close_result) {
             (Ok(events), Ok(())) => events,
-            (Err(err), Ok(())) => return Err(err),
-            (Ok(_), Err(close_err)) => return Err(close_err),
-            (Err(err), Err(_)) => return Err(err),
+            (Err(err), Ok(())) => {
+                self.persist_failed_session_turn(
+                    session,
+                    &persisted_turn,
+                    pre_followup_assistant.clone(),
+                    "runtime.error".to_string(),
+                    err.to_string(),
+                )
+                .await?;
+                return Err(err);
+            }
+            (Ok(events), Err(close_err)) => {
+                let assistant_text = assistant_text_from_events(&events);
+                self.persist_failed_session_turn(
+                    session,
+                    &persisted_turn,
+                    assistant_text,
+                    "runtime.error".to_string(),
+                    close_err.to_string(),
+                )
+                .await?;
+                return Err(close_err);
+            }
+            (Err(err), Err(_)) => {
+                self.persist_failed_session_turn(
+                    session,
+                    &persisted_turn,
+                    pre_followup_assistant,
+                    "runtime.error".to_string(),
+                    err.to_string(),
+                )
+                .await?;
+                return Err(err);
+            }
         };
 
+        let artifacts = summarize_runtime_events(&runtime_events);
+        let _ = self
+            .session_turns
+            .complete_turn(
+                turn_id,
+                SessionTurnCompletion {
+                    status: SessionTurnStatus::Completed,
+                    assistant_text: artifacts.assistant_text.clone(),
+                    error_code: None,
+                    error_text: None,
+                },
+            )
+            .await
+            .map_err(internal)?;
         let _ = self
             .sessions
             .record_turn(session.session_id)
             .await
             .map_err(internal)?;
 
-        let mut assistant = String::new();
-        let mut event_views = Vec::with_capacity(runtime_events.len());
-        let mut saw_error = false;
-        for event in &runtime_events {
-            if let RuntimeEvent::MessageDelta {
-                lane: RuntimeMessageLane::Answer,
-                text,
-            } = event
-            {
-                assistant.push_str(text);
-            }
-            if matches!(event, RuntimeEvent::Error { .. }) {
-                saw_error = true;
-            }
-            event_views.push(to_stream_event_view(event.clone()));
-        }
-
         if let Some(stream_context) = &channel_stream_context {
-            if saw_error {
+            if artifacts.saw_error {
                 self.audit
                     .append(
                         "channel.turn.stream_error",
@@ -1501,13 +1916,13 @@ impl Kernel {
                     .map_err(internal)?;
             }
 
-            if !saw_error && !assistant.trim().is_empty() {
+            if !artifacts.saw_error && !artifacts.assistant_text.trim().is_empty() {
                 let message_id = self
                     .channel_state
                     .insert_outbound_message(
                         &stream_context.channel_id,
                         &stream_context.peer_id,
-                        &assistant,
+                        &artifacts.assistant_text,
                     )
                     .await
                     .map_err(internal)?;
@@ -1521,7 +1936,7 @@ impl Kernel {
                             "peer_id": stream_context.peer_id,
                             "message_id": message_id,
                             "turn_id": turn_id,
-                            "content_len": assistant.len(),
+                            "content_len": artifacts.assistant_text.len(),
                         }),
                     )
                     .await
@@ -1538,7 +1953,7 @@ impl Kernel {
                     "turn_id": turn_id,
                     "runtime_id": runtime_id,
                     "selected_skills": allowed_skills,
-                    "prompt_len": user_text.len(),
+                    "prompt_len": prompt_user_text.len(),
                     "runtime_working_dir": execution_context.working_dir,
                     "runtime_idle_timeout_ms": execution_context.idle_timeout.as_millis() as u64,
                     "runtime_hard_timeout_ms": execution_context.hard_timeout.as_millis() as u64,
@@ -1551,11 +1966,48 @@ impl Kernel {
         Ok(SessionTurnResponse {
             session_id: session.session_id,
             turn_id,
-            assistant_text: assistant,
+            assistant_text: artifacts.assistant_text,
             selected_skills: allowed_skills,
             runtime_id,
-            stream_events: event_views,
+            stream_events: artifacts.event_views,
         })
+    }
+
+    async fn persist_failed_session_turn(
+        &self,
+        session: &super::sessions::Session,
+        persisted_turn: &SessionTurnRecord,
+        assistant_text: String,
+        error_code: String,
+        error_text: String,
+    ) -> Result<(), KernelError> {
+        let status = if error_code == "runtime.timeout" {
+            SessionTurnStatus::TimedOut
+        } else if error_code == "runtime.cancelled" {
+            SessionTurnStatus::Cancelled
+        } else {
+            SessionTurnStatus::Failed
+        };
+
+        let _ = self
+            .session_turns
+            .complete_turn(
+                persisted_turn.turn_id,
+                SessionTurnCompletion {
+                    status,
+                    assistant_text,
+                    error_code: Some(error_code),
+                    error_text: Some(error_text),
+                },
+            )
+            .await
+            .map_err(internal)?;
+        let _ = self
+            .sessions
+            .record_turn(session.session_id)
+            .await
+            .map_err(internal)?;
+        Ok(())
     }
 
     fn resolve_runtime_id(
@@ -2026,11 +2478,13 @@ impl Kernel {
         };
 
         let result = self
-            .execute_session_turn(
-                &session,
+            .execute_session_turn_serialized(
+                session,
                 SessionTurnExecution {
                     turn_id: turn.turn_id,
-                    user_text: inbound_message.content,
+                    kind: SessionTurnKind::Normal,
+                    display_user_text: inbound_message.content.clone(),
+                    prompt_user_text: inbound_message.content,
                     requested_runtime_id: Some(turn.runtime_id.clone()),
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
@@ -2143,6 +2597,7 @@ impl Kernel {
 
     async fn build_prompt_envelope(
         &self,
+        session: &super::sessions::Session,
         user_text: &str,
         selected_skill_ids: &[String],
     ) -> Result<String, KernelError> {
@@ -2176,8 +2631,32 @@ impl Kernel {
             }
         }
 
+        let history_sections = self
+            .render_session_history_for_prompt(session, 12)
+            .await
+            .map_err(internal)?;
+        sections.extend(history_sections);
         sections.push(format!("## User Input\n\n{}", user_text.trim()));
         Ok(sections.join("\n\n"))
+    }
+
+    async fn render_session_history_for_prompt(
+        &self,
+        session: &super::sessions::Session,
+        limit: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        let turns = self
+            .session_turns
+            .list_recent(session.session_id, limit)
+            .await?;
+        let mut sections = Vec::new();
+        for turn in turns {
+            sections.push(render_session_turn_for_prompt(
+                &turn,
+                session.history_policy,
+            ));
+        }
+        Ok(sections)
     }
 
     async fn read_skill_context(
@@ -2271,7 +2750,7 @@ impl Kernel {
     async fn execute_runtime_turn(
         &self,
         execution: RuntimeTurnExecution<'_>,
-    ) -> Result<CollectedRuntimeTurn, KernelError> {
+    ) -> Result<CollectedRuntimeTurn, FailedRuntimeTurn> {
         let RuntimeTurnExecution {
             adapter,
             runtime_id,
@@ -2298,16 +2777,30 @@ impl Kernel {
                 }),
             )
             .await
-            .map_err(internal)?;
-        self.emit_runtime_event(
-            &stream_context,
-            &event_sink,
-            RuntimeEvent::Status {
-                code: Some("runtime.started".to_string()),
-                text: "runtime started".to_string(),
-            },
-        )
-        .await?;
+            .map_err(|err| FailedRuntimeTurn {
+                events: Vec::new(),
+                status: SessionTurnStatus::Failed,
+                error_code: "runtime.error".to_string(),
+                error_text: err.to_string(),
+            })?;
+        if let Err(err) = self
+            .emit_runtime_event(
+                &stream_context,
+                &event_sink,
+                RuntimeEvent::Status {
+                    code: Some("runtime.started".to_string()),
+                    text: "runtime started".to_string(),
+                },
+            )
+            .await
+        {
+            return Err(FailedRuntimeTurn {
+                events: Vec::new(),
+                status: SessionTurnStatus::Failed,
+                error_code: "runtime.error".to_string(),
+                error_text: err.to_string(),
+            });
+        }
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let adapter_for_task = adapter.clone();
@@ -2327,7 +2820,14 @@ impl Kernel {
                             if matches!(event, RuntimeEvent::Done) && stream_context.is_some() {
                                 self.emit_local_stream_event(&event_sink, &event);
                             } else {
-                                self.emit_runtime_event(&stream_context, &event_sink, event.clone()).await?;
+                                self.emit_runtime_event(&stream_context, &event_sink, event.clone())
+                                    .await
+                                    .map_err(|err| FailedRuntimeTurn {
+                                        events: events.clone(),
+                                        status: SessionTurnStatus::Failed,
+                                        error_code: "runtime.error".to_string(),
+                                        error_text: err.to_string(),
+                                    })?;
                             }
                             events.push(event);
                             idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
@@ -2344,7 +2844,14 @@ impl Kernel {
                         if matches!(event, RuntimeEvent::Done) && stream_context.is_some() {
                             self.emit_local_stream_event(&event_sink, &event);
                         } else {
-                            self.emit_runtime_event(&stream_context, &event_sink, event.clone()).await?;
+                            self.emit_runtime_event(&stream_context, &event_sink, event.clone())
+                                .await
+                                .map_err(|err| FailedRuntimeTurn {
+                                    events: events.clone(),
+                                    status: SessionTurnStatus::Failed,
+                                    error_code: "runtime.error".to_string(),
+                                    error_text: err.to_string(),
+                                })?;
                         }
                         events.push(event);
                     }
@@ -2363,7 +2870,12 @@ impl Kernel {
                                     }),
                                 )
                                 .await
-                                .map_err(internal)?;
+                                .map_err(|err| FailedRuntimeTurn {
+                                    events: events.clone(),
+                                    status: SessionTurnStatus::Failed,
+                                    error_code: "runtime.error".to_string(),
+                                    error_text: err.to_string(),
+                                })?;
                             self.emit_runtime_event(
                                 &stream_context,
                                 &event_sink,
@@ -2372,7 +2884,13 @@ impl Kernel {
                                     text: "runtime completed".to_string(),
                                 },
                             )
-                            .await?;
+                            .await
+                            .map_err(|err| FailedRuntimeTurn {
+                                events: events.clone(),
+                                status: SessionTurnStatus::Failed,
+                                error_code: "runtime.error".to_string(),
+                                error_text: err.to_string(),
+                            })?;
                             Ok(CollectedRuntimeTurn { events, result })
                         }
                         Ok(Err(err)) => {
@@ -2389,7 +2907,12 @@ impl Kernel {
                                     }),
                                 )
                                 .await
-                                .map_err(internal)?;
+                                .map_err(|audit_err| FailedRuntimeTurn {
+                                    events: events.clone(),
+                                    status: SessionTurnStatus::Failed,
+                                    error_code: "runtime.error".to_string(),
+                                    error_text: audit_err.to_string(),
+                                })?;
                             self.emit_runtime_event(
                                 &stream_context,
                                 &event_sink,
@@ -2398,8 +2921,19 @@ impl Kernel {
                                     text: message.clone(),
                                 },
                             )
-                            .await?;
-                            Err(KernelError::Runtime(message))
+                            .await
+                            .map_err(|emit_err| FailedRuntimeTurn {
+                                events: events.clone(),
+                                status: SessionTurnStatus::Failed,
+                                error_code: "runtime.error".to_string(),
+                                error_text: emit_err.to_string(),
+                            })?;
+                            Err(FailedRuntimeTurn {
+                                events,
+                                status: SessionTurnStatus::Failed,
+                                error_code: "runtime.error".to_string(),
+                                error_text: message,
+                            })
                         }
                         Err(err) => {
                             let message = format!("runtime turn task failed: {}", err);
@@ -2415,7 +2949,12 @@ impl Kernel {
                                     }),
                                 )
                                 .await
-                                .map_err(internal)?;
+                                .map_err(|audit_err| FailedRuntimeTurn {
+                                    events: events.clone(),
+                                    status: SessionTurnStatus::Failed,
+                                    error_code: "runtime.error".to_string(),
+                                    error_text: audit_err.to_string(),
+                                })?;
                             self.emit_runtime_event(
                                 &stream_context,
                                 &event_sink,
@@ -2424,8 +2963,19 @@ impl Kernel {
                                     text: message.clone(),
                                 },
                             )
-                            .await?;
-                            Err(KernelError::Runtime(message))
+                            .await
+                            .map_err(|emit_err| FailedRuntimeTurn {
+                                events: events.clone(),
+                                status: SessionTurnStatus::Failed,
+                                error_code: "runtime.error".to_string(),
+                                error_text: emit_err.to_string(),
+                            })?;
+                            Err(FailedRuntimeTurn {
+                                events,
+                                status: SessionTurnStatus::Failed,
+                                error_code: "runtime.error".to_string(),
+                                error_text: message,
+                            })
                         }
                     };
                 }
@@ -2440,6 +2990,7 @@ impl Kernel {
                             turn_task: &mut turn_task,
                             stream_context: &stream_context,
                             event_sink: &event_sink,
+                            events: events.clone(),
                             timeout_ms: idle_timeout_ms,
                             reason,
                             timeout_kind: "idle",
@@ -2457,6 +3008,7 @@ impl Kernel {
                             turn_task: &mut turn_task,
                             stream_context: &stream_context,
                             event_sink: &event_sink,
+                            events: events.clone(),
                             timeout_ms: hard_timeout_ms,
                             reason,
                             timeout_kind: "hard",
@@ -2470,7 +3022,7 @@ impl Kernel {
     async fn abort_runtime_turn(
         &self,
         execution: RuntimeTurnAbortExecution<'_>,
-    ) -> Result<CollectedRuntimeTurn, KernelError> {
+    ) -> Result<CollectedRuntimeTurn, FailedRuntimeTurn> {
         let RuntimeTurnAbortExecution {
             adapter,
             handle,
@@ -2479,6 +3031,7 @@ impl Kernel {
             turn_task,
             stream_context,
             event_sink,
+            events,
             timeout_ms,
             reason,
             timeout_kind,
@@ -2496,7 +3049,12 @@ impl Kernel {
                     }),
                 )
                 .await
-                .map_err(internal)?;
+                .map_err(|err| FailedRuntimeTurn {
+                    events: events.clone(),
+                    status: SessionTurnStatus::TimedOut,
+                    error_code: "runtime.timeout".to_string(),
+                    error_text: err.to_string(),
+                })?;
         }
 
         turn_task.abort();
@@ -2515,7 +3073,12 @@ impl Kernel {
                 }),
             )
             .await
-            .map_err(internal)?;
+            .map_err(|err| FailedRuntimeTurn {
+                events: events.clone(),
+                status: SessionTurnStatus::TimedOut,
+                error_code: "runtime.timeout".to_string(),
+                error_text: err.to_string(),
+            })?;
         self.emit_runtime_event(
             stream_context,
             event_sink,
@@ -2524,9 +3087,20 @@ impl Kernel {
                 text: reason.clone(),
             },
         )
-        .await?;
+        .await
+        .map_err(|err| FailedRuntimeTurn {
+            events: events.clone(),
+            status: SessionTurnStatus::TimedOut,
+            error_code: "runtime.timeout".to_string(),
+            error_text: err.to_string(),
+        })?;
 
-        Err(KernelError::RuntimeTimeout(reason))
+        Err(FailedRuntimeTurn {
+            events,
+            status: SessionTurnStatus::TimedOut,
+            error_code: "runtime.timeout".to_string(),
+            error_text: reason,
+        })
     }
 
     async fn execute_runtime_capability_followup(

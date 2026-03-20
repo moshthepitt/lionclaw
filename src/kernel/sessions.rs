@@ -6,7 +6,7 @@ use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::{
-    contracts::TrustTier,
+    contracts::{SessionHistoryPolicy, TrustTier},
     kernel::db::{ms_to_datetime, now_ms},
 };
 
@@ -16,6 +16,7 @@ pub struct Session {
     pub channel_id: String,
     pub peer_id: String,
     pub trust_tier: TrustTier,
+    pub history_policy: SessionHistoryPolicy,
     pub created_at: DateTime<Utc>,
     pub last_turn_at: Option<DateTime<Utc>>,
     pub turn_count: u64,
@@ -36,19 +37,21 @@ impl SessionStore {
         channel_id: String,
         peer_id: String,
         trust_tier: TrustTier,
+        history_policy: SessionHistoryPolicy,
     ) -> Result<Session> {
         let session_id = Uuid::new_v4();
         let created_at_ms = now_ms();
 
         sqlx::query(
             "INSERT INTO sessions \
-             (session_id, channel_id, peer_id, trust_tier, created_at_ms, last_turn_at_ms, turn_count) \
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0)",
+             (session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, turn_count) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 0)",
         )
         .bind(session_id.to_string())
         .bind(&channel_id)
         .bind(&peer_id)
         .bind(trust_tier.as_str())
+        .bind(history_policy.as_str())
         .bind(created_at_ms)
         .execute(&self.pool)
         .await
@@ -61,7 +64,7 @@ impl SessionStore {
 
     pub async fn get(&self, session_id: Uuid) -> Result<Option<Session>> {
         let row = sqlx::query(
-            "SELECT session_id, channel_id, peer_id, trust_tier, created_at_ms, last_turn_at_ms, turn_count \
+            "SELECT session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, turn_count \
              FROM sessions \
              WHERE session_id = ?1",
         )
@@ -79,7 +82,7 @@ impl SessionStore {
         peer_id: &str,
     ) -> Result<Option<Session>> {
         let row = sqlx::query(
-            "SELECT session_id, channel_id, peer_id, trust_tier, created_at_ms, last_turn_at_ms, turn_count \
+            "SELECT session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, turn_count \
              FROM sessions \
              WHERE channel_id = ?1 AND peer_id = ?2 \
              ORDER BY created_at_ms DESC \
@@ -118,6 +121,7 @@ impl SessionStore {
 fn map_session_row(row: SqliteRow) -> Result<Session> {
     let session_id_raw: String = row.get("session_id");
     let trust_tier_raw: String = row.get("trust_tier");
+    let history_policy_raw: String = row.get("history_policy");
     let created_at_ms: i64 = row.get("created_at_ms");
     let last_turn_at_ms: Option<i64> = row.get("last_turn_at_ms");
     let turn_count_raw: i64 = row.get("turn_count");
@@ -126,6 +130,8 @@ fn map_session_row(row: SqliteRow) -> Result<Session> {
         .with_context(|| format!("invalid uuid '{}'", session_id_raw))?;
     let trust_tier = TrustTier::from_str(&trust_tier_raw)
         .map_err(|err| anyhow!("invalid trust tier: {}", err))?;
+    let history_policy = SessionHistoryPolicy::from_str(&history_policy_raw)
+        .map_err(|err| anyhow!("invalid history policy: {}", err))?;
     let created_at = ms_to_datetime(created_at_ms)
         .ok_or_else(|| anyhow!("invalid created_at_ms '{}'", created_at_ms))?;
     let last_turn_at = last_turn_at_ms
@@ -141,6 +147,7 @@ fn map_session_row(row: SqliteRow) -> Result<Session> {
         channel_id: row.get("channel_id"),
         peer_id: row.get("peer_id"),
         trust_tier,
+        history_policy,
         created_at,
         last_turn_at,
         turn_count,

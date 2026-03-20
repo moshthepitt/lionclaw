@@ -56,6 +56,8 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct RunArgs {
+    #[arg(long)]
+    continue_last_session: bool,
     runtime: Option<String>,
 }
 
@@ -239,7 +241,7 @@ pub async fn run() -> Result<()> {
             );
         }
         Command::Run(args) => {
-            run_local(&home, args.runtime).await?;
+            run_local(&home, args.runtime, args.continue_last_session).await?;
         }
         Command::Runtime { command } => match command {
             RuntimeCommand::Add(args) => {

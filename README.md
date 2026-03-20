@@ -56,6 +56,19 @@ Use LionClaw interactively:
 ./target/debug/lionclaw run codex
 ```
 
+Continue the latest local session instead of starting fresh:
+
+```bash
+./target/debug/lionclaw run --continue-last-session codex
+```
+
+Inside the interactive REPL:
+
+- `/continue` resumes from a partial timed-out or failed reply
+- `/retry` reruns the previous prompt
+- `/reset` opens a fresh session
+- `/exit` leaves the REPL
+
 ## Channels and background mode
 
 When you want a real channel instead of the direct CLI path, install one as a skill.

@@ -38,6 +38,7 @@ async fn runtime_policy_allows_configured_execution_overrides() {
             channel_id: "local-cli".to_string(),
             peer_id: "runtime-policy-allow".to_string(),
             trust_tier: TrustTier::Main,
+            history_policy: None,
         })
         .await
         .expect("open session");
@@ -86,6 +87,7 @@ async fn runtime_policy_denies_unallowed_env_passthrough() {
             channel_id: "local-cli".to_string(),
             peer_id: "runtime-policy-deny".to_string(),
             trust_tier: TrustTier::Main,
+            history_policy: None,
         })
         .await
         .expect("open session");

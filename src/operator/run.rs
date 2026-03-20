@@ -1,12 +1,16 @@
-use std::io::{BufRead, Write};
+use std::{
+    future::Future,
+    io::{BufRead, Write},
+};
 
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
 use crate::{
     contracts::{
-        SessionOpenRequest, SessionTurnRequest, StreamEventDto, StreamEventKindDto, StreamLaneDto,
-        TrustTier,
+        SessionActionKind, SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest,
+        SessionOpenRequest, SessionTurnRequest, SessionTurnStatus, SessionTurnView, StreamEventDto,
+        StreamEventKindDto, StreamLaneDto, TrustTier,
     },
     home::LionClawHome,
     kernel::Kernel,
@@ -16,17 +20,29 @@ use crate::{
     },
 };
 
-pub async fn run_local(home: &LionClawHome, requested_runtime: Option<String>) -> Result<()> {
+pub async fn run_local(
+    home: &LionClawHome,
+    requested_runtime: Option<String>,
+    continue_last_session: bool,
+) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut input = stdin.lock();
     let mut output = stdout.lock();
-    run_local_with_io(home, requested_runtime, &mut input, &mut output).await
+    run_local_with_io(
+        home,
+        requested_runtime,
+        continue_last_session,
+        &mut input,
+        &mut output,
+    )
+    .await
 }
 
 pub(crate) async fn run_local_with_io<R: BufRead, W: Write>(
     home: &LionClawHome,
     requested_runtime: Option<String>,
+    continue_last_session: bool,
     input: &mut R,
     output: &mut W,
 ) -> Result<()> {
@@ -39,7 +55,16 @@ pub(crate) async fn run_local_with_io<R: BufRead, W: Write>(
     let kernel = open_kernel(home, &applied.config, Some(runtime_id.clone())).await?;
     let workspace = applied.config.daemon.workspace.clone();
     let peer_id = local_peer_id();
-    run_repl(&kernel, &runtime_id, &workspace, &peer_id, input, output).await
+    run_repl(
+        &kernel,
+        &runtime_id,
+        &workspace,
+        &peer_id,
+        continue_last_session,
+        input,
+        output,
+    )
+    .await
 }
 
 async fn run_repl<R: BufRead, W: Write>(
@@ -47,23 +72,24 @@ async fn run_repl<R: BufRead, W: Write>(
     runtime_id: &str,
     workspace: &str,
     peer_id: &str,
+    continue_last_session: bool,
     input: &mut R,
     output: &mut W,
 ) -> Result<()> {
-    let session = kernel
-        .open_session(SessionOpenRequest {
-            channel_id: "local-cli".to_string(),
-            peer_id: peer_id.to_string(),
-            trust_tier: TrustTier::Main,
-        })
+    let mut session_id = resolve_repl_session(kernel, peer_id, continue_last_session)
         .await
-        .map_err(kernel_to_anyhow)?;
+        .map_err(kernel_to_anyhow)?
+        .session_id;
 
     writeln!(
         output,
-        "LionClaw interactive mode\nruntime: {}\nworkspace: {}\nType /exit to quit.\n",
+        "LionClaw interactive mode\nruntime: {}\nworkspace: {}\nType /continue, /retry, /reset, or /exit.\n",
         runtime_id, workspace
     )?;
+
+    if continue_last_session {
+        render_session_history(kernel, session_id, output).await?;
+    }
 
     loop {
         write!(output, "you> ")?;
@@ -82,12 +108,42 @@ async fn run_repl<R: BufRead, W: Write>(
         if matches!(trimmed, "/exit" | "/quit") {
             break;
         }
-
-        if let Err(err) =
-            render_streaming_turn(kernel, session.session_id, runtime_id, trimmed, output).await
-        {
-            writeln!(output, "error: {}", err)?;
+        if trimmed == "/continue" {
+            render_session_action(
+                kernel,
+                session_id,
+                runtime_id,
+                SessionActionKind::ContinueLastPartial,
+                output,
+            )
+            .await?;
+            continue;
         }
+        if trimmed == "/retry" {
+            render_session_action(
+                kernel,
+                session_id,
+                runtime_id,
+                SessionActionKind::RetryLastTurn,
+                output,
+            )
+            .await?;
+            continue;
+        }
+        if trimmed == "/reset" {
+            let response = kernel
+                .session_action(SessionActionRequest {
+                    session_id,
+                    action: SessionActionKind::ResetSession,
+                })
+                .await
+                .map_err(kernel_to_anyhow)?;
+            session_id = response.session_id;
+            writeln!(output, "[status] opened a fresh session")?;
+            continue;
+        }
+
+        render_streaming_turn(kernel, session_id, runtime_id, trimmed, output).await?;
     }
 
     Ok(())
@@ -104,6 +160,109 @@ fn local_peer_id() -> String {
 
 fn kernel_to_anyhow(err: crate::kernel::KernelError) -> anyhow::Error {
     anyhow!(err.to_string())
+}
+
+async fn resolve_repl_session(
+    kernel: &Kernel,
+    peer_id: &str,
+    continue_last_session: bool,
+) -> Result<crate::contracts::SessionOpenResponse, crate::kernel::KernelError> {
+    if continue_last_session {
+        if let Some(session) = kernel
+            .find_latest_session_summary("local-cli", peer_id)
+            .await?
+        {
+            return Ok(session);
+        }
+    }
+
+    kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "local-cli".to_string(),
+            peer_id: peer_id.to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+}
+
+async fn render_session_history<W: Write>(
+    kernel: &Kernel,
+    session_id: uuid::Uuid,
+    output: &mut W,
+) -> Result<()> {
+    let history = kernel
+        .session_history(SessionHistoryRequest {
+            session_id,
+            limit: Some(12),
+        })
+        .await
+        .map_err(kernel_to_anyhow)?;
+
+    if history.turns.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(output, "Recent session history:")?;
+    for turn in history.turns {
+        render_session_history_turn(&turn, output)?;
+    }
+    writeln!(output)?;
+    Ok(())
+}
+
+async fn render_session_action<W: Write>(
+    kernel: &Kernel,
+    session_id: uuid::Uuid,
+    runtime_id: &str,
+    action: SessionActionKind,
+    output: &mut W,
+) -> Result<()> {
+    match action {
+        SessionActionKind::ContinueLastPartial => {
+            writeln!(output, "you> /continue")?;
+        }
+        SessionActionKind::RetryLastTurn => {
+            writeln!(output, "you> /retry")?;
+        }
+        SessionActionKind::ResetSession => {}
+    }
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let turn_future =
+        kernel.run_session_action_streaming(session_id, action, Some(runtime_id.to_string()), tx);
+    tokio::pin!(turn_future);
+    render_streaming_future(&mut turn_future, &mut rx, output).await
+}
+
+fn render_session_history_turn<W: Write>(turn: &SessionTurnView, output: &mut W) -> Result<()> {
+    writeln!(output, "you> {}", turn.display_user_text)?;
+    if matches!(
+        turn.status,
+        SessionTurnStatus::TimedOut | SessionTurnStatus::Failed | SessionTurnStatus::Cancelled
+    ) && !turn.assistant_text.trim().is_empty()
+    {
+        writeln!(output, "{}", partial_history_marker(turn.status))?;
+    }
+    if !turn.assistant_text.trim().is_empty() {
+        write_prefixed_lines(output, "lionclaw> ", &turn.assistant_text)?;
+    }
+    if let Some(error_text) = turn.error_text.as_deref() {
+        writeln!(output, "[error] {}", error_text)?;
+    }
+    Ok(())
+}
+
+fn partial_history_marker(status: SessionTurnStatus) -> &'static str {
+    match status {
+        SessionTurnStatus::TimedOut => {
+            "[partial] previous assistant reply timed out before completion"
+        }
+        SessionTurnStatus::Failed => "[partial] previous assistant reply failed before completion",
+        SessionTurnStatus::Cancelled => {
+            "[partial] previous assistant reply was cancelled before completion"
+        }
+        _ => "",
+    }
 }
 
 async fn render_streaming_turn<W: Write>(
@@ -124,17 +283,42 @@ async fn render_streaming_turn<W: Write>(
     };
     let turn_future = kernel.turn_session_streaming(turn_request, tx);
     tokio::pin!(turn_future);
+    render_streaming_future(&mut turn_future, &mut rx, output).await
+}
+
+async fn render_streaming_future<W, F>(
+    turn_future: &mut F,
+    rx: &mut mpsc::UnboundedReceiver<StreamEventDto>,
+    output: &mut W,
+) -> Result<()>
+where
+    W: Write,
+    F: Future<Output = Result<crate::contracts::SessionTurnResponse, crate::kernel::KernelError>>
+        + Unpin,
+{
+    let mut assistant_seen = false;
+    let mut error_seen = false;
+    let mut turn_error: Option<crate::kernel::KernelError> = None;
 
     loop {
         tokio::select! {
-            result = &mut turn_future => {
-                let _ = result.map_err(kernel_to_anyhow)?;
+            result = &mut *turn_future => {
+                match result {
+                    Ok(_) => {}
+                    Err(err) => turn_error = Some(err),
+                }
                 break;
             }
             maybe_event = rx.recv() => {
                 let Some(event) = maybe_event else {
                     continue;
                 };
+                if is_answer_delta(&event) {
+                    assistant_seen = true;
+                }
+                if matches!(event.kind, StreamEventKindDto::Error) {
+                    error_seen = true;
+                }
                 render_turn_event(&event, output)?;
                 output.flush()?;
             }
@@ -142,10 +326,48 @@ async fn render_streaming_turn<W: Write>(
     }
 
     while let Ok(event) = rx.try_recv() {
+        if is_answer_delta(&event) {
+            assistant_seen = true;
+        }
+        if matches!(event.kind, StreamEventKindDto::Error) {
+            error_seen = true;
+        }
         render_turn_event(&event, output)?;
     }
     output.flush()?;
+
+    if let Some(err) = turn_error {
+        if assistant_seen
+            && matches!(
+                err,
+                crate::kernel::KernelError::RuntimeTimeout(_)
+                    | crate::kernel::KernelError::Runtime(_)
+            )
+        {
+            writeln!(
+                output,
+                "Timed out. Partial output is shown above. Use /continue, /retry, or /reset."
+            )?;
+            output.flush()?;
+            return Ok(());
+        }
+        if !error_seen {
+            writeln!(output, "error: {}", err)?;
+            output.flush()?;
+        }
+    }
+
     Ok(())
+}
+
+fn is_answer_delta(event: &StreamEventDto) -> bool {
+    matches!(
+        (&event.kind, &event.lane),
+        (
+            StreamEventKindDto::MessageDelta,
+            Some(StreamLaneDto::Answer)
+        )
+    ) && event.text.as_deref().is_some_and(|text| !text.is_empty())
 }
 
 #[cfg(test)]
@@ -236,7 +458,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
         let mut output = Vec::new();
-        run_local_with_io(&home, None, &mut input, &mut output)
+        run_local_with_io(&home, None, false, &mut input, &mut output)
             .await
             .expect("run local");
 
@@ -255,6 +477,105 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             .expect("fetch count");
         let count: i64 = row.get("count");
         assert_eq!(count, 1, "run should create one kernel session");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_local_can_continue_last_session_history() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let stub = temp_dir.path().join("codex-stub.sh");
+        write_script(
+            &stub,
+            r#"#!/usr/bin/env bash
+cat >/dev/null
+echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from repl"}}'
+"#,
+        );
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: stub.to_string_lossy().to_string(),
+                model: None,
+                sandbox: "read-only".to_string(),
+                skip_git_repo_check: true,
+                ephemeral: true,
+            },
+        );
+        config.save(&home).await.expect("save config");
+
+        let mut first_input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut first_output = Vec::new();
+        run_local_with_io(&home, None, false, &mut first_input, &mut first_output)
+            .await
+            .expect("first run");
+
+        let mut second_input = Cursor::new(b"/exit\n".to_vec());
+        let mut second_output = Vec::new();
+        run_local_with_io(&home, None, true, &mut second_input, &mut second_output)
+            .await
+            .expect("second run");
+
+        let second_output = String::from_utf8(second_output).expect("utf8 output");
+        assert!(second_output.contains("Recent session history:"));
+        assert!(second_output.contains("you> hello"));
+        assert!(second_output.contains("lionclaw> hello from repl"));
+
+        let db_url = format!("sqlite://{}", home.db_path().display());
+        let pool = SqlitePool::connect(&db_url).await.expect("connect db");
+        let row = sqlx::query("SELECT COUNT(*) AS count FROM sessions")
+            .fetch_one(&pool)
+            .await
+            .expect("fetch count");
+        let count: i64 = row.get("count");
+        assert_eq!(count, 1, "continue mode should reuse the latest session");
+    }
+
+    #[tokio::test]
+    async fn run_local_reset_opens_a_fresh_session() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let stub = temp_dir.path().join("codex-stub.sh");
+        fs::write(&stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(&stub, permissions).expect("chmod");
+        }
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: stub.to_string_lossy().to_string(),
+                model: None,
+                sandbox: "read-only".to_string(),
+                skip_git_repo_check: true,
+                ephemeral: true,
+            },
+        );
+        config.save(&home).await.expect("save config");
+
+        let mut input = Cursor::new(b"/reset\n/exit\n".to_vec());
+        let mut output = Vec::new();
+        run_local_with_io(&home, None, false, &mut input, &mut output)
+            .await
+            .expect("run local");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("[status] opened a fresh session"));
+
+        let db_url = format!("sqlite://{}", home.db_path().display());
+        let pool = SqlitePool::connect(&db_url).await.expect("connect db");
+        let row = sqlx::query("SELECT COUNT(*) AS count FROM sessions")
+            .fetch_one(&pool)
+            .await
+            .expect("fetch count");
+        let count: i64 = row.get("count");
+        assert_eq!(count, 2, "reset should create a new session");
     }
 
     #[tokio::test]
@@ -285,7 +606,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
 
         let mut input = Cursor::new(b"/exit\n".to_vec());
         let mut output = Vec::new();
-        run_local_with_io(&home, None, &mut input, &mut output)
+        run_local_with_io(&home, None, false, &mut input, &mut output)
             .await
             .expect("run local");
 
@@ -299,7 +620,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let mut input = Cursor::new(Vec::<u8>::new());
         let mut output = Vec::new();
-        let err = run_local_with_io(&home, None, &mut input, &mut output)
+        let err = run_local_with_io(&home, None, false, &mut input, &mut output)
             .await
             .expect_err("missing runtime should error");
 
@@ -332,7 +653,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
 
         let mut input = Cursor::new(Vec::<u8>::new());
         let mut output = Vec::new();
-        let err = run_local_with_io(&home, None, &mut input, &mut output)
+        let err = run_local_with_io(&home, None, false, &mut input, &mut output)
             .await
             .expect_err("missing executable should error");
 

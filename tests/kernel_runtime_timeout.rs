@@ -52,6 +52,7 @@ async fn runtime_timeout_triggers_cancel_close_and_audit() {
             channel_id: "local-cli".to_string(),
             peer_id: "timeout-peer".to_string(),
             trust_tier: TrustTier::Main,
+            history_policy: None,
         })
         .await
         .expect("open session");
@@ -141,6 +142,7 @@ async fn runtime_activity_resets_idle_timeout() {
             channel_id: "local-cli".to_string(),
             peer_id: "chatty-peer".to_string(),
             trust_tier: TrustTier::Main,
+            history_policy: None,
         })
         .await
         .expect("open session");
