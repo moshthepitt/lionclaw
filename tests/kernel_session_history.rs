@@ -340,6 +340,64 @@ async fn continue_requires_interactive_history_policy() {
 }
 
 #[tokio::test]
+async fn retry_uses_repaired_latest_turn_instead_of_zero_information_tail() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let recorded_prompts = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "capture",
+            Arc::new(CapturePromptAdapter {
+                prompts: recorded_prompts.clone(),
+                reply: "retried".to_string(),
+            }),
+        )
+        .await;
+
+    let session = open_session(&kernel, "repair-action", SessionHistoryPolicy::Interactive).await;
+    insert_session_turn(
+        &env.db_path(),
+        SessionTurnSeed {
+            session_id: session.session_id,
+            sequence_no: 1,
+            status: SessionTurnStatus::Completed,
+            prompt_user_text: "real prompt",
+            assistant_text: "real answer",
+            error_code: None,
+            error_text: None,
+        },
+    )
+    .await;
+    insert_session_turn(
+        &env.db_path(),
+        SessionTurnSeed {
+            session_id: session.session_id,
+            sequence_no: 2,
+            status: SessionTurnStatus::Failed,
+            prompt_user_text: "",
+            assistant_text: "",
+            error_code: None,
+            error_text: None,
+        },
+    )
+    .await;
+
+    let response = kernel
+        .run_session_action(
+            session.session_id,
+            SessionActionKind::RetryLastTurn,
+            Some("capture".to_string()),
+        )
+        .await
+        .expect("retry action");
+    assert_eq!(response.assistant_text, "retried");
+
+    let prompt = recorded_prompts.lock().expect("prompt lock")[0].clone();
+    assert!(prompt.contains("real prompt"));
+    assert!(!prompt.contains("## Prior Turn 2"));
+}
+
+#[tokio::test]
 async fn kernel_restart_interrupts_running_turn_and_preserves_partial_output() {
     let env = TestEnv::new();
     let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");

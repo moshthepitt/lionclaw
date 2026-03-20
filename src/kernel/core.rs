@@ -353,12 +353,16 @@ impl Kernel {
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("session not found".to_string()))?;
-        let latest_turn = self
-            .session_turns
-            .latest(session_id)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| KernelError::BadRequest("session has no prior turns".to_string()))?;
+        let latest_turn = load_repaired_turns(
+            &self.session_turns,
+            session_id,
+            1,
+            TranscriptMode::Prompt(session.history_policy),
+        )
+        .await
+        .map_err(internal)?
+        .pop()
+        .ok_or_else(|| KernelError::BadRequest("session has no prior turns".to_string()))?;
 
         let execution = match action {
             SessionActionKind::ContinueLastPartial => {
