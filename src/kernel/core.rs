@@ -1717,6 +1717,9 @@ impl Kernel {
                 ),
             )
             .await?;
+        let prompt_envelope = self
+            .build_prompt_envelope(session, &prompt_user_text, &allowed_skills)
+            .await?;
         let persisted_turn = self
             .session_turns
             .begin_turn(NewSessionTurn {
@@ -1765,9 +1768,7 @@ impl Kernel {
                 hard_timeout: execution_context.hard_timeout,
                 input: RuntimeTurnInput {
                     runtime_session_id: handle.runtime_session_id.clone(),
-                    prompt: self
-                        .build_prompt_envelope(session, &prompt_user_text, &allowed_skills)
-                        .await?,
+                    prompt: prompt_envelope,
                     selected_skills: allowed_skills.clone(),
                 },
                 stream_context: channel_stream_context.clone(),
