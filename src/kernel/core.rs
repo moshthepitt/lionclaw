@@ -1698,6 +1698,32 @@ fn summarize_runtime_events(events: &[RuntimeEvent]) -> SessionTurnArtifacts {
     }
 }
 
+fn last_runtime_error(events: &[RuntimeEvent]) -> Option<(String, String)> {
+    events.iter().rev().find_map(|event| match event {
+        RuntimeEvent::Error { code, text } => Some((
+            code.clone().unwrap_or_else(|| "runtime.error".to_string()),
+            text.clone(),
+        )),
+        _ => None,
+    })
+}
+
+fn kernel_error_for_turn_status(status: SessionTurnStatus, message: String) -> KernelError {
+    match status {
+        SessionTurnStatus::TimedOut => KernelError::RuntimeTimeout(message),
+        SessionTurnStatus::Cancelled => KernelError::Conflict(message),
+        _ => KernelError::Runtime(message),
+    }
+}
+
+fn session_turn_status_for_error_code(error_code: &str) -> SessionTurnStatus {
+    match error_code {
+        "runtime.timeout" => SessionTurnStatus::TimedOut,
+        "runtime.cancelled" => SessionTurnStatus::Cancelled,
+        _ => SessionTurnStatus::Failed,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ChannelStreamContext {
     channel_id: String,
@@ -2037,13 +2063,10 @@ impl Kernel {
                     turn_err.error_text.clone(),
                 )
                 .await?;
-                return match turn_err.status {
-                    SessionTurnStatus::TimedOut => {
-                        Err(KernelError::RuntimeTimeout(turn_err.error_text))
-                    }
-                    SessionTurnStatus::Cancelled => Err(KernelError::Conflict(turn_err.error_text)),
-                    _ => Err(KernelError::Runtime(turn_err.error_text)),
-                };
+                return Err(kernel_error_for_turn_status(
+                    turn_err.status,
+                    turn_err.error_text,
+                ));
             }
         };
 
@@ -2131,6 +2154,18 @@ impl Kernel {
         };
 
         let artifacts = summarize_runtime_events(&runtime_events);
+        if let Some((error_code, error_text)) = last_runtime_error(&runtime_events) {
+            let status = session_turn_status_for_error_code(&error_code);
+            self.persist_failed_session_turn(
+                session,
+                &persisted_turn,
+                artifacts.assistant_text.clone(),
+                error_code,
+                error_text.clone(),
+            )
+            .await?;
+            return Err(kernel_error_for_turn_status(status, error_text));
+        }
         let _ = self
             .session_turns
             .complete_turn(
@@ -2232,13 +2267,7 @@ impl Kernel {
         error_code: String,
         error_text: String,
     ) -> Result<(), KernelError> {
-        let status = if error_code == "runtime.timeout" {
-            SessionTurnStatus::TimedOut
-        } else if error_code == "runtime.cancelled" {
-            SessionTurnStatus::Cancelled
-        } else {
-            SessionTurnStatus::Failed
-        };
+        let status = session_turn_status_for_error_code(&error_code);
 
         let _ = self
             .session_turns

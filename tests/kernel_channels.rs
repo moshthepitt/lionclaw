@@ -7,8 +7,8 @@ use lionclaw::{
         ChannelPeerApproveRequest, ChannelPeerBlockRequest, ChannelStreamAckRequest,
         ChannelStreamPullRequest, ChannelStreamStartMode, PolicyGrantRequest, SessionActionKind,
         SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery,
-        SessionOpenRequest, SessionTurnRequest, SkillInstallRequest, StreamEventKindDto,
-        StreamLaneDto, TrustTier,
+        SessionOpenRequest, SessionTurnRequest, SessionTurnStatus, SkillInstallRequest,
+        StreamEventKindDto, StreamLaneDto, TrustTier,
     },
     kernel::{
         runtime::{
@@ -1195,6 +1195,157 @@ impl RuntimeAdapter for TwoChunkAnswerAdapter {
     async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<(), anyhow::Error> {
         Ok(())
     }
+}
+
+struct PartialFailureAdapter {
+    partial: String,
+    message: String,
+}
+
+#[async_trait]
+impl RuntimeAdapter for PartialFailureAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "partial-failure".to_string(),
+            version: "test".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle, anyhow::Error> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("partial-failure:{}", input.session_id),
+        })
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        event_tx: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult, anyhow::Error> {
+        event_tx
+            .send(RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Reasoning,
+                text: "starting a partial reply before failure".to_string(),
+            })
+            .expect("send reasoning");
+        event_tx
+            .send(RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: self.partial.clone(),
+            })
+            .expect("send partial answer");
+        event_tx
+            .send(RuntimeEvent::Error {
+                code: Some("runtime.error".to_string()),
+                text: self.message.clone(),
+            })
+            .expect("send runtime error");
+        Ok(RuntimeTurnResult {
+            capability_requests: Vec::new(),
+        })
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        _event_tx: RuntimeEventSender,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn cancel(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn channel_runtime_error_event_persists_failed_turn_and_supports_continue() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    install_and_bind_channel(&kernel, "terminal", "failure-skill", "partial-failure").await;
+    kernel
+        .register_runtime_adapter(
+            "partial-failure",
+            std::sync::Arc::new(PartialFailureAdapter {
+                partial: "partial before fail".to_string(),
+                message: "adapter failed after partial output".to_string(),
+            }),
+        )
+        .await;
+
+    create_pending_peer(
+        &kernel,
+        "terminal",
+        "peer-failure",
+        "partial-failure",
+        7301,
+        "failure-7301",
+    )
+    .await;
+    approve_peer(&kernel, "terminal", "peer-failure").await;
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-failure".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open interactive channel session");
+
+    let queued = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-failure".to_string(),
+            text: "fail-case".to_string(),
+            session_id: Some(session.session_id),
+            update_id: Some(7302),
+            external_message_id: Some("failure-7302".to_string()),
+            runtime_id: Some("partial-failure".to_string()),
+        })
+        .await
+        .expect("queue failing turn");
+    assert_eq!(queued.session_id, Some(session.session_id));
+
+    wait_for_session_turn_count(&kernel, session.session_id, 1).await;
+    let history = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: session.session_id,
+            limit: Some(12),
+        })
+        .await
+        .expect("session history");
+    let latest_turn = history.turns.last().expect("latest turn");
+    assert_eq!(latest_turn.status, SessionTurnStatus::Failed);
+    assert_eq!(latest_turn.assistant_text, "partial before fail");
+    assert_eq!(latest_turn.error_code.as_deref(), Some("runtime.error"));
+    assert_eq!(
+        latest_turn.error_text.as_deref(),
+        Some("adapter failed after partial output")
+    );
+
+    let continued = kernel
+        .session_action(SessionActionRequest {
+            session_id: session.session_id,
+            action: SessionActionKind::ContinueLastPartial,
+        })
+        .await
+        .expect("continue should be allowed after partial failure");
+    assert_eq!(continued.session_id, session.session_id);
+    assert!(continued.turn_id.is_some());
 }
 
 struct SlowAnswerAdapter {
