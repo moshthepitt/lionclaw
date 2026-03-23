@@ -236,6 +236,7 @@ class TerminalChannelApp(App[None]):
         return True
 
     async def refresh_pairing_state(self) -> None:
+        previous_status = self.state.pairing.status
         try:
             peer_state = await self.api.fetch_peer_state()
         except Exception as err:  # noqa: BLE001
@@ -248,26 +249,30 @@ class TerminalChannelApp(App[None]):
             pairing_code=peer_state.pairing_code,
             trust_tier=peer_state.trust_tier,
         )
+
+        if previous_status != peer_state.status:
+            await self._handle_pairing_transition(previous_status, peer_state.status)
+
         self._render_views()
 
-    async def restore_latest_session(self) -> None:
+    async def restore_latest_session(self) -> bool:
         if self.state.pairing.status != "approved":
             self._initial_stream_start_after_sequence = None
-            return
+            return True
 
         try:
             snapshot = await self.api.fetch_latest_session(history_policy="interactive")
         except Exception as err:  # noqa: BLE001
             self.state.status_lines.append(f"[error] session restore failed: {err}")
-            self._render_views()
-            return
+            return False
 
         if snapshot.session is None:
             self._initial_stream_start_after_sequence = None
-            return
+            return True
 
         self.state.restore_session_history(snapshot.session.session_id, snapshot.turns)
         self._initial_stream_start_after_sequence = snapshot.resume_after_sequence
+        return True
 
     async def ensure_interactive_session_for_send(self) -> str | None:
         if self.state.active_session_id is not None:
@@ -317,6 +322,25 @@ class TerminalChannelApp(App[None]):
     async def _push_status(self, message: str) -> None:
         self.state.status_lines.append(f"[status] {message}")
         self._render_views()
+
+    async def _handle_pairing_transition(
+        self,
+        previous_status: str,
+        current_status: str,
+    ) -> None:
+        if current_status == "approved":
+            restored = await self.restore_latest_session()
+            if restored:
+                if self.state.active_session_id is None:
+                    self.state.clear_transient_view()
+                self.state.status_lines.clear()
+                self.state.status_lines.append("[status] peer approved")
+            return
+
+        if previous_status == "approved" and current_status == "blocked":
+            self.state.clear_pending_turn()
+            self.state.status_lines.clear()
+            self.state.status_lines.append("[error] peer blocked")
 
     def _render_views(self) -> None:
         self.query_one("#pairing-banner", Static).update(

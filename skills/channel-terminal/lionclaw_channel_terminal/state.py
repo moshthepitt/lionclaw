@@ -135,6 +135,17 @@ class ChannelViewState:
         self.active_answer_entry_by_turn = {}
         self.status_lines.clear()
 
+    def clear_transient_view(self) -> None:
+        self.transcript = []
+        self.reasoning_by_turn = {}
+        self.answer_started_by_turn = set()
+        self.latest_reasoning_turn_id = None
+        self.active_session_id = None
+        self.active_turn_id = None
+        self.pending_submission = False
+        self.restored_running_turn = False
+        self.active_answer_entry_by_turn = {}
+
     def apply_stream_event(self, event: StreamEvent) -> None:
         if event.peer_id != self.peer_id:
             return

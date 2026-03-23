@@ -3,12 +3,14 @@ import asyncio
 
 from lionclaw_channel_terminal.api import (
     InboundResponse,
+    PeerState,
     SessionActionResult,
+    SessionLatestSnapshot,
     SessionOpenResult,
     SessionTurnSnapshot,
 )
 from lionclaw_channel_terminal.app import AppConfig, TerminalChannelApp
-from lionclaw_channel_terminal.state import ChannelViewState, StreamEvent
+from lionclaw_channel_terminal.state import ChannelViewState, StreamEvent, TranscriptEntry
 
 
 class ChannelViewStateTests(unittest.TestCase):
@@ -236,6 +238,32 @@ class _FlakyStreamApi(_InteractiveApi):
         return None
 
 
+class _PairingRefreshApi(_InteractiveApi):
+    def __init__(
+        self,
+        peer_state: PeerState,
+        latest_snapshot: SessionLatestSnapshot | None = None,
+    ) -> None:
+        super().__init__()
+        self.peer_state = peer_state
+        self.latest_snapshot = latest_snapshot or SessionLatestSnapshot(
+            session=None,
+            turns=[],
+            resume_after_sequence=None,
+        )
+        self.fetch_latest_calls = 0
+
+    async def fetch_peer_state(self) -> PeerState:
+        return self.peer_state
+
+    async def fetch_latest_session(
+        self,
+        history_policy: str = "interactive",
+    ) -> SessionLatestSnapshot:
+        self.fetch_latest_calls += 1
+        return self.latest_snapshot
+
+
 def _make_app() -> TerminalChannelApp:
     return TerminalChannelApp(
         AppConfig(
@@ -336,6 +364,74 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
             await task
 
         self.assertEqual(api.pull_args[:2], [42, 42])
+
+    async def test_refresh_pairing_state_clears_pending_transient_view_after_approval(self):
+        app = _make_app()
+        api = _PairingRefreshApi(
+            peer_state=PeerState(status="approved", trust_tier="main"),
+        )
+        app.api = api
+        app._render_views = lambda: None  # type: ignore[method-assign]
+        app.state.set_pairing_state(status="pending", pairing_code="123456")
+        app.state.begin_submit("hello")
+        app.state.clear_pending_turn()
+        app.state.transcript.append(
+            TranscriptEntry(
+                role="assistant",
+                text="Pairing required. Approve this peer with code 123456.",
+            )
+        )
+        app.state.status_lines.append("[status] pairing pending")
+
+        await app.refresh_pairing_state()
+
+        self.assertEqual(api.fetch_latest_calls, 1)
+        self.assertEqual(app.state.pairing.status, "approved")
+        self.assertEqual(app.state.transcript_text(), "")
+        self.assertEqual(app.state.status_text(), "[status] peer approved")
+        self.assertIsNone(app.state.active_session_id)
+        self.assertFalse(app.state.input_disabled())
+
+    async def test_refresh_pairing_state_restores_latest_session_after_approval(self):
+        app = _make_app()
+        api = _PairingRefreshApi(
+            peer_state=PeerState(status="approved", trust_tier="main"),
+            latest_snapshot=SessionLatestSnapshot(
+                session=SessionOpenResult(
+                    session_id="session-1",
+                    channel_id="terminal",
+                    peer_id="mosh",
+                    trust_tier="main",
+                    history_policy="interactive",
+                ),
+                turns=[
+                    SessionTurnSnapshot(
+                        turn_id="turn-1",
+                        kind="normal",
+                        status="completed",
+                        display_user_text="restored question",
+                        assistant_text="restored answer",
+                        error_code=None,
+                        error_text=None,
+                    )
+                ],
+                resume_after_sequence=None,
+            ),
+        )
+        app.api = api
+        app._render_views = lambda: None  # type: ignore[method-assign]
+        app.state.set_pairing_state(status="pending", pairing_code="123456")
+        app.state.begin_submit("hello")
+        app.state.clear_pending_turn()
+        app.state.status_lines.append("[status] pairing pending")
+
+        await app.refresh_pairing_state()
+
+        self.assertEqual(app.state.active_session_id, "session-1")
+        transcript = app.state.transcript_text()
+        self.assertIn("you> restored question", transcript)
+        self.assertIn("lionclaw> restored answer", transcript)
+        self.assertEqual(app.state.status_text(), "[status] peer approved")
 
 
 if __name__ == "__main__":
