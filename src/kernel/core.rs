@@ -316,18 +316,28 @@ impl Kernel {
         .await
         .map_err(internal)?;
         let resume_after_sequence = match turns.last() {
-            Some(turn) if turn.status == SessionTurnStatus::Running => self
+            Some(turn) if turn.status == SessionTurnStatus::Running => match self
                 .channel_state
                 .get_turn(turn.turn_id)
                 .await
                 .map_err(internal)?
-                .and_then(|channel_turn| {
-                    if channel_turn.status == super::channel_state::ChannelTurnStatus::Running {
-                        channel_turn.answer_checkpoint_sequence
+            {
+                Some(channel_turn)
+                    if channel_turn.status == super::channel_state::ChannelTurnStatus::Running =>
+                {
+                    if let Some(sequence) = channel_turn.answer_checkpoint_sequence {
+                        Some(sequence)
                     } else {
-                        None
+                        Some(
+                            self.channel_state
+                                .current_stream_head(&channel_turn.channel_id)
+                                .await
+                                .map_err(internal)?,
+                        )
                     }
-                }),
+                }
+                _ => None,
+            },
             _ => None,
         };
 

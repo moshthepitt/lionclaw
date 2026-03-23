@@ -720,6 +720,85 @@ async fn latest_session_snapshot_returns_precise_resume_sequence() {
 }
 
 #[tokio::test]
+async fn latest_session_snapshot_uses_stream_head_before_first_answer_checkpoint() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    install_and_bind_channel(&kernel, "terminal", "resume-head-skill", "slow-answer").await;
+    kernel
+        .register_runtime_adapter(
+            "slow-answer",
+            std::sync::Arc::new(SlowAnswerAdapter {
+                answer: "later".to_string(),
+                delay: Duration::from_millis(400),
+            }),
+        )
+        .await;
+
+    create_pending_peer(
+        &kernel,
+        "terminal",
+        "peer-resume-head",
+        "slow-answer",
+        7251,
+        "resume-head-7251",
+    )
+    .await;
+    approve_peer(&kernel, "terminal", "peer-resume-head").await;
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-resume-head".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open interactive channel session");
+
+    kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-resume-head".to_string(),
+            text: "resume before answer".to_string(),
+            session_id: Some(session.session_id),
+            update_id: Some(7252),
+            external_message_id: Some("resume-head-7252".to_string()),
+            runtime_id: Some("slow-answer".to_string()),
+        })
+        .await
+        .expect("queue running turn");
+
+    let resume_after_sequence = wait_for_running_snapshot_without_answer(
+        &kernel,
+        "terminal",
+        "peer-resume-head",
+        session.session_id,
+    )
+    .await;
+
+    let resumed = kernel
+        .pull_channel_stream(ChannelStreamPullRequest {
+            channel_id: "terminal".to_string(),
+            consumer_id: "terminal-resume-head".to_string(),
+            start_mode: None,
+            start_after_sequence: Some(resume_after_sequence),
+            limit: Some(20),
+            wait_ms: Some(1_000),
+        })
+        .await
+        .expect("resume stream");
+    let answer_text = resumed
+        .events
+        .iter()
+        .filter(|event| {
+            event.kind == StreamEventKindDto::MessageDelta
+                && event.lane == Some(StreamLaneDto::Answer)
+        })
+        .filter_map(|event| event.text.as_deref())
+        .collect::<String>();
+    assert_eq!(answer_text, "later");
+}
+
+#[tokio::test]
 async fn channel_session_actions_return_immediately_and_respect_peer_blocking() {
     let env = TestEnv::new();
     let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
@@ -970,6 +1049,42 @@ async fn wait_for_latest_snapshot_resume(
         sleep(Duration::from_millis(25)).await;
     }
     panic!("timed out waiting for latest session resume sequence");
+}
+
+async fn wait_for_running_snapshot_without_answer(
+    kernel: &Kernel,
+    channel_id: &str,
+    peer_id: &str,
+    session_id: uuid::Uuid,
+) -> i64 {
+    for _ in 0..60 {
+        let snapshot = kernel
+            .latest_session_snapshot(SessionLatestQuery {
+                channel_id: channel_id.to_string(),
+                peer_id: peer_id.to_string(),
+                history_policy: Some(SessionHistoryPolicy::Interactive),
+            })
+            .await
+            .expect("latest session snapshot");
+        let history = kernel
+            .session_history(SessionHistoryRequest {
+                session_id,
+                limit: Some(12),
+            })
+            .await
+            .expect("session history");
+        let no_answer_yet = history.turns.last().is_some_and(|turn| {
+            turn.status == lionclaw::contracts::SessionTurnStatus::Running
+                && turn.assistant_text.is_empty()
+        });
+        if no_answer_yet {
+            if let Some(sequence) = snapshot.resume_after_sequence {
+                return sequence;
+            }
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for running snapshot without assistant checkpoint");
 }
 
 async fn wait_for_session_turn_count(kernel: &Kernel, session_id: uuid::Uuid, expected: usize) {
