@@ -422,6 +422,29 @@ description: channel tail skill
 }
 
 #[tokio::test]
+async fn channel_stream_rejects_tail_with_explicit_start_sequence() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    install_and_bind_channel(&kernel, "terminal", "tail-sequence-skill", "mock").await;
+
+    let err = kernel
+        .pull_channel_stream(ChannelStreamPullRequest {
+            channel_id: "terminal".to_string(),
+            consumer_id: "terminal-worker".to_string(),
+            start_mode: Some(ChannelStreamStartMode::Tail),
+            start_after_sequence: Some(12),
+            limit: Some(10),
+            wait_ms: Some(0),
+        })
+        .await
+        .expect_err("tail and start_after_sequence should be rejected");
+
+    assert!(
+        matches!(err, KernelError::BadRequest(message) if message.contains("start_after_sequence"))
+    );
+}
+
+#[tokio::test]
 async fn channel_stream_long_poll_wakes_for_new_events() {
     let env = TestEnv::new();
     let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");

@@ -144,7 +144,10 @@ class LionClawApi:
             },
         )
         response.raise_for_status()
-        return _parse_session_open_result(response.json())
+        opened = _parse_session_open_result(response.json())
+        if opened is None:
+            raise RuntimeError("session open response missing session payload")
+        return opened
 
     async def run_session_action(
         self,
