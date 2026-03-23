@@ -390,6 +390,12 @@ impl Kernel {
                         history_policy: Some(session.history_policy),
                     })
                     .await?;
+                let reset = self
+                    .sessions
+                    .touch_activity(reset.session_id)
+                    .await
+                    .map_err(internal)?
+                    .ok_or_else(|| KernelError::NotFound("session not found".to_string()))?;
                 Ok(SessionActionResponse {
                     session_id: reset.session_id,
                     turn_id: None,

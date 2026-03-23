@@ -8,8 +8,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use lionclaw::{
     contracts::{
-        SessionActionKind, SessionHistoryPolicy, SessionHistoryRequest, SessionOpenRequest,
-        SessionTurnKind, SessionTurnRequest, SessionTurnStatus, TrustTier,
+        SessionActionKind, SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery,
+        SessionOpenRequest, SessionTurnKind, SessionTurnRequest, SessionTurnStatus, TrustTier,
     },
     kernel::{
         runtime::{
@@ -620,6 +620,58 @@ async fn session_history_overfetches_usable_turns_past_zero_information_rows() {
     assert_eq!(history.turns.len(), 2);
     assert_eq!(history.turns[0].display_user_text, "third");
     assert_eq!(history.turns[1].display_user_text, "fifth");
+}
+
+#[tokio::test]
+async fn latest_session_snapshot_prefers_reset_session_without_turns() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    kernel
+        .register_runtime_adapter(
+            "capture",
+            Arc::new(CapturePromptAdapter {
+                prompts: Arc::new(Mutex::new(Vec::new())),
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+
+    let session = open_session(&kernel, "reset-peer", SessionHistoryPolicy::Interactive).await;
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "normal run".to_string(),
+            runtime_id: Some("capture".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("seed completed turn");
+
+    let reset = kernel
+        .session_action(lionclaw::contracts::SessionActionRequest {
+            session_id: session.session_id,
+            action: SessionActionKind::ResetSession,
+        })
+        .await
+        .expect("reset session");
+
+    let snapshot = kernel
+        .latest_session_snapshot(SessionLatestQuery {
+            channel_id: "local-cli".to_string(),
+            peer_id: "reset-peer".to_string(),
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("latest session snapshot");
+
+    assert_eq!(
+        snapshot.session.as_ref().map(|session| session.session_id),
+        Some(reset.session_id)
+    );
+    assert!(snapshot.turns.is_empty());
+    assert!(snapshot.resume_after_sequence.is_none());
 }
 
 async fn open_session(

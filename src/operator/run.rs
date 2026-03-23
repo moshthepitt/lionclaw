@@ -579,7 +579,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let db_url = format!("sqlite://{}", home.db_path().display());
         let pool = SqlitePool::connect(&db_url).await.expect("connect db");
         let first_session_row = sqlx::query(
-            "SELECT session_id, created_at_ms, last_turn_at_ms \
+            "SELECT session_id, created_at_ms, last_activity_at_ms \
              FROM sessions \
              ORDER BY created_at_ms ASC \
              LIMIT 1",
@@ -588,14 +588,14 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         .await
         .expect("fetch first session");
         let first_session_id: String = first_session_row.get("session_id");
-        let last_turn_at_ms: i64 = first_session_row
-            .get::<Option<i64>, _>("last_turn_at_ms")
-            .expect("last turn timestamp");
-        let newer_created_at_ms = last_turn_at_ms + 1_000;
+        let last_activity_at_ms: i64 = first_session_row
+            .get::<Option<i64>, _>("last_activity_at_ms")
+            .expect("last activity timestamp");
+        let newer_created_at_ms = last_activity_at_ms + 1_000;
         sqlx::query(
             "INSERT INTO sessions \
-             (session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, turn_count) \
-             VALUES (?1, 'local-cli', ?2, 'main', 'interactive', ?3, NULL, 0)",
+             (session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, last_activity_at_ms, turn_count) \
+             VALUES (?1, 'local-cli', ?2, 'main', 'interactive', ?3, NULL, NULL, 0)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(local_peer_id())
@@ -659,8 +659,8 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let session_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO sessions \
-             (session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, turn_count) \
-             VALUES (?1, 'local-cli', ?2, 'main', 'interactive', 1, 2, 1)",
+             (session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, last_activity_at_ms, turn_count) \
+             VALUES (?1, 'local-cli', ?2, 'main', 'interactive', 1, 2, 2, 1)",
         )
         .bind(session_id.to_string())
         .bind(&peer_id)

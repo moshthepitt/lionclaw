@@ -18,7 +18,7 @@ pub struct Session {
     pub trust_tier: TrustTier,
     pub history_policy: SessionHistoryPolicy,
     pub created_at: DateTime<Utc>,
-    pub last_turn_at: Option<DateTime<Utc>>,
+    pub last_activity_at: Option<DateTime<Utc>>,
     pub turn_count: u64,
 }
 
@@ -44,8 +44,8 @@ impl SessionStore {
 
         sqlx::query(
             "INSERT INTO sessions \
-             (session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, turn_count) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 0)",
+             (session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, last_activity_at_ms, turn_count) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, 0)",
         )
         .bind(session_id.to_string())
         .bind(&channel_id)
@@ -64,7 +64,7 @@ impl SessionStore {
 
     pub async fn get(&self, session_id: Uuid) -> Result<Option<Session>> {
         let row = sqlx::query(
-            "SELECT session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, turn_count \
+            "SELECT session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_activity_at_ms, turn_count \
              FROM sessions \
              WHERE session_id = ?1",
         )
@@ -92,10 +92,10 @@ impl SessionStore {
         history_policy: Option<SessionHistoryPolicy>,
     ) -> Result<Option<Session>> {
         let row = sqlx::query(
-            "SELECT session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, turn_count \
+            "SELECT session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_activity_at_ms, turn_count \
              FROM sessions \
              WHERE channel_id = ?1 AND peer_id = ?2 AND (?3 IS NULL OR history_policy = ?3) \
-             ORDER BY (last_turn_at_ms IS NOT NULL) DESC, COALESCE(last_turn_at_ms, created_at_ms) DESC, created_at_ms DESC \
+             ORDER BY (last_activity_at_ms IS NOT NULL) DESC, COALESCE(last_activity_at_ms, created_at_ms) DESC, created_at_ms DESC \
              LIMIT 1",
         )
         .bind(channel_id)
@@ -112,7 +112,7 @@ impl SessionStore {
         let now = now_ms();
         let updated = sqlx::query(
             "UPDATE sessions \
-             SET turn_count = turn_count + 1, last_turn_at_ms = ?2 \
+             SET turn_count = turn_count + 1, last_turn_at_ms = ?2, last_activity_at_ms = ?2 \
              WHERE session_id = ?1",
         )
         .bind(session_id.to_string())
@@ -127,6 +127,26 @@ impl SessionStore {
 
         self.get(session_id).await
     }
+
+    pub async fn touch_activity(&self, session_id: Uuid) -> Result<Option<Session>> {
+        let now = now_ms();
+        let updated = sqlx::query(
+            "UPDATE sessions \
+             SET last_activity_at_ms = ?2 \
+             WHERE session_id = ?1",
+        )
+        .bind(session_id.to_string())
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("failed to update session activity")?;
+
+        if updated.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        self.get(session_id).await
+    }
 }
 
 fn map_session_row(row: SqliteRow) -> Result<Session> {
@@ -134,7 +154,7 @@ fn map_session_row(row: SqliteRow) -> Result<Session> {
     let trust_tier_raw: String = row.get("trust_tier");
     let history_policy_raw: String = row.get("history_policy");
     let created_at_ms: i64 = row.get("created_at_ms");
-    let last_turn_at_ms: Option<i64> = row.get("last_turn_at_ms");
+    let last_activity_at_ms: Option<i64> = row.get("last_activity_at_ms");
     let turn_count_raw: i64 = row.get("turn_count");
 
     let session_id = Uuid::parse_str(&session_id_raw)
@@ -145,9 +165,9 @@ fn map_session_row(row: SqliteRow) -> Result<Session> {
         .map_err(|err| anyhow!("invalid history policy: {}", err))?;
     let created_at = ms_to_datetime(created_at_ms)
         .ok_or_else(|| anyhow!("invalid created_at_ms '{}'", created_at_ms))?;
-    let last_turn_at = last_turn_at_ms
+    let last_activity_at = last_activity_at_ms
         .map(|value| {
-            ms_to_datetime(value).ok_or_else(|| anyhow!("invalid last_turn_at_ms '{}'", value))
+            ms_to_datetime(value).ok_or_else(|| anyhow!("invalid last_activity_at_ms '{}'", value))
         })
         .transpose()?;
     let turn_count = u64::try_from(turn_count_raw)
@@ -160,7 +180,7 @@ fn map_session_row(row: SqliteRow) -> Result<Session> {
         trust_tier,
         history_policy,
         created_at,
-        last_turn_at,
+        last_activity_at,
         turn_count,
     })
 }
