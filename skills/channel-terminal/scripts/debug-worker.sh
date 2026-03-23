@@ -41,6 +41,7 @@ LIONCLAW_STREAM_WAIT_MS="${LIONCLAW_STREAM_WAIT_MS:-30000}"
 LIONCLAW_STREAM_START_MODE="${LIONCLAW_STREAM_START_MODE:-tail}"
 LIONCLAW_CONSUMER_ID="${LIONCLAW_CONSUMER_ID:-terminal:$LIONCLAW_CHANNEL_ID:$LIONCLAW_PEER_ID}"
 LIONCLAW_STREAM_RETRY_SECS="${LIONCLAW_STREAM_RETRY_SECS:-1}"
+LIONCLAW_SESSION_ID="${LIONCLAW_SESSION_ID:-}"
 
 WORKER_INSTANCE_ID="terminal-${LIONCLAW_CHANNEL_ID}-$$"
 inbound_sequence=0
@@ -120,13 +121,16 @@ send_inbound() {
     --arg peer_id "$LIONCLAW_PEER_ID" \
     --arg text "$text" \
     --arg external_message_id "$external_message_id" \
+    --arg session_id "$LIONCLAW_SESSION_ID" \
     --arg runtime_id "$LIONCLAW_RUNTIME_ID" \
     '{
       channel_id: $channel_id,
       peer_id: $peer_id,
       text: $text,
       external_message_id: $external_message_id
-    } + (if $runtime_id == "" then {} else { runtime_id: $runtime_id } end)'
+    }
+    + (if $session_id == "" then {} else { session_id: $session_id } end)
+    + (if $runtime_id == "" then {} else { runtime_id: $runtime_id } end)'
   )"
 
   response="$(lionclaw_post '/v0/channels/inbound' "$payload")" || return 1

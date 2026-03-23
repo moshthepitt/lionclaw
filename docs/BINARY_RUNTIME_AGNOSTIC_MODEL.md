@@ -101,7 +101,7 @@ Interactive channel skills stay explicit too:
 2. `lionclaw channel add terminal --launch interactive`
 3. `lionclaw channel attach terminal`
 
-Interactive channels are foreground-only. They attach to the current TTY, use ephemeral tail-only consumers, and are not managed by `lionclaw service up`.
+Interactive channels are foreground-only. They attach to the current TTY, restore the latest durable interactive session for that peer, resume any still-running answer stream from the last durable checkpoint, and are not managed by `lionclaw service up`.
 
 No manual API choreography should be required for normal usage or operator flows.
 

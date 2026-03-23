@@ -16,6 +16,7 @@ class StreamEvent:
     peer_id: str
     turn_id: str
     kind: EventKind
+    session_id: str | None = None
     lane: Lane | None = None
     code: str | None = None
     text: str | None = None
@@ -42,8 +43,10 @@ class ChannelViewState:
     reasoning_by_turn: dict[str, str] = field(default_factory=dict)
     answer_started_by_turn: set[str] = field(default_factory=set)
     latest_reasoning_turn_id: str | None = None
+    active_session_id: str | None = None
     active_turn_id: str | None = None
     pending_submission: bool = False
+    restored_running_turn: bool = False
     status_lines: deque[str] = field(default_factory=lambda: deque(maxlen=8))
     active_answer_entry_by_turn: dict[str, int] = field(default_factory=dict)
     pairing: PairingState = field(default_factory=PairingState)
@@ -55,26 +58,89 @@ class ChannelViewState:
         self.append_user_message(text)
         self.pending_submission = True
         self.active_turn_id = None
+        self.restored_running_turn = False
         self.latest_reasoning_turn_id = None
 
-    def mark_queued(self, turn_id: str) -> None:
+    def mark_queued(self, turn_id: str, session_id: str | None = None) -> None:
         self.pending_submission = False
         self.active_turn_id = turn_id
+        self.restored_running_turn = False
+        if session_id is not None:
+            self.active_session_id = session_id
         self.latest_reasoning_turn_id = turn_id
         self.reasoning_by_turn.pop(turn_id, None)
         self.answer_started_by_turn.discard(turn_id)
+        self.active_answer_entry_by_turn.pop(turn_id, None)
 
     def clear_pending_turn(self) -> None:
         self.pending_submission = False
         self.active_turn_id = None
+        self.restored_running_turn = False
 
     def mark_send_failed(self, message: str) -> None:
         self.clear_pending_turn()
         self.status_lines.append(f"send failed: {message}")
 
+    def restore_session_history(self, session_id: str, turns: list[object]) -> None:
+        self.transcript = []
+        self.reasoning_by_turn = {}
+        self.answer_started_by_turn = set()
+        self.latest_reasoning_turn_id = None
+        self.active_turn_id = None
+        self.pending_submission = False
+        self.restored_running_turn = False
+        self.active_answer_entry_by_turn = {}
+        self.active_session_id = session_id
+
+        for turn in turns:
+            turn_id = getattr(turn, "turn_id")
+            status = getattr(turn, "status")
+            display_user_text = getattr(turn, "display_user_text")
+            assistant_text = getattr(turn, "assistant_text") or ""
+            error_text = getattr(turn, "error_text")
+
+            self.transcript.append(
+                TranscriptEntry(role="user", text=display_user_text, turn_id=turn_id)
+            )
+            if assistant_text.strip():
+                assistant_index = len(self.transcript)
+                rendered_assistant = _render_history_assistant_text(status, assistant_text)
+                self.transcript.append(
+                    TranscriptEntry(
+                        role="assistant",
+                        text=rendered_assistant,
+                        turn_id=turn_id,
+                    )
+                )
+                self.answer_started_by_turn.add(turn_id)
+                if status == "running":
+                    self.active_answer_entry_by_turn[turn_id] = assistant_index
+            if error_text:
+                self.transcript.append(
+                    TranscriptEntry(role="error", text=error_text, turn_id=turn_id)
+                )
+            if status == "running":
+                self.active_turn_id = turn_id
+                self.restored_running_turn = True
+
+    def reset_for_new_session(self, session_id: str) -> None:
+        self.transcript = []
+        self.reasoning_by_turn = {}
+        self.answer_started_by_turn = set()
+        self.latest_reasoning_turn_id = None
+        self.active_session_id = session_id
+        self.active_turn_id = None
+        self.pending_submission = False
+        self.restored_running_turn = False
+        self.active_answer_entry_by_turn = {}
+        self.status_lines.clear()
+
     def apply_stream_event(self, event: StreamEvent) -> None:
         if event.peer_id != self.peer_id:
             return
+
+        if event.turn_id == self.active_turn_id:
+            self.restored_running_turn = False
 
         if event.kind == "message_delta" and event.lane == "answer" and event.text:
             self.answer_started_by_turn.add(event.turn_id)
@@ -101,6 +167,7 @@ class ChannelViewState:
             self.status_lines.append(_format_error_line(event.code, event.text))
             if event.turn_id == self.active_turn_id:
                 self.clear_pending_turn()
+                self.status_lines.append("[status] Use /continue, /retry, or /reset.")
             return
 
         if event.kind == "done":
@@ -108,6 +175,7 @@ class ChannelViewState:
             self.active_answer_entry_by_turn.pop(event.turn_id, None)
             if event.turn_id == self.active_turn_id:
                 self.active_turn_id = None
+                self.restored_running_turn = False
 
     def set_pairing_state(
         self,
@@ -138,11 +206,13 @@ class ChannelViewState:
 
         if self.active_turn_id is not None:
             content = self.reasoning_by_turn.get(self.active_turn_id, "")
-            if not content:
-                if self.active_turn_id in self.answer_started_by_turn:
-                    return "No pre-answer reasoning for this turn."
-                return "Waiting for reasoning for this turn..."
-            return "\n".join(_prefix_lines("thinking> ", content))
+            if content:
+                return "\n".join(_prefix_lines("thinking> ", content))
+            if self.restored_running_turn:
+                return ""
+            if self.active_turn_id in self.answer_started_by_turn:
+                return "No pre-answer reasoning for this turn."
+            return "Waiting for reasoning for this turn..."
 
         if not self.latest_reasoning_turn_id:
             return "No reasoning for the current turn yet."
@@ -216,3 +286,19 @@ def _format_error_line(code: str | None, text: str) -> str:
     if code:
         return f"[error] {code}: {text}"
     return f"[error] {text}"
+
+
+def _render_history_assistant_text(status: str, assistant_text: str) -> str:
+    marker = _partial_history_marker(status)
+    if not marker:
+        return assistant_text
+    return f"{marker}\n{assistant_text}"
+
+
+def _partial_history_marker(status: str) -> str:
+    return {
+        "timed_out": "[partial] previous assistant reply timed out before completion",
+        "failed": "[partial] previous assistant reply failed before completion",
+        "cancelled": "[partial] previous assistant reply was cancelled before completion",
+        "interrupted": "[partial] previous assistant reply was interrupted before completion",
+    }.get(status, "")

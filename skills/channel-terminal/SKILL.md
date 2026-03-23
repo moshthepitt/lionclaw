@@ -15,10 +15,12 @@ What you run:
 
 Under the hood, the worker:
 
-1. posts inbound text to `/v0/channels/inbound` and binds the returned `turn_id` when the message is queued,
-2. long-polls `/v0/channels/stream/pull`,
-3. renders typed outbound events in separate terminal regions,
-4. advances its consumer cursor through `/v0/channels/stream/ack`.
+1. restores the latest interactive session snapshot for `(channel_id, peer_id)`,
+2. posts inbound text to `/v0/channels/inbound` pinned to the chosen `session_id`,
+3. long-polls `/v0/channels/stream/pull`,
+4. renders typed outbound events in separate terminal regions,
+5. starts recovery actions through `/v0/sessions/action`,
+6. advances its consumer cursor through `/v0/channels/stream/ack`.
 
 ## Prerequisites
 
@@ -61,7 +63,15 @@ For repeated manual testing, you can use the repo helper:
 
 - LionClaw enforces pairing. The TUI shows pending pairing state and the exact approval command to run through `lionclaw channel pairing approve ...`.
 - The worker defaults to `channel_id=terminal` and `peer_id=$USER` (falling back to `$USERNAME` or `local-user`).
-- `channel attach` uses an ephemeral consumer id and `start_mode=tail`, so each attach session starts from the current stream head instead of replaying old output from previous sessions.
+- `channel attach` restores the latest `history_policy=interactive` session for that peer, renders the last 12 durable turns into the transcript, and resumes a still-running answer stream from the last durable checkpoint when one exists.
 - The TUI echoes your message immediately, shows a local pending state right away, and then follows live `queue.*` / `runtime.*` stream events for the active turn.
+- Slash commands are built into the TUI:
+  - `/continue`
+  - `/retry`
+  - `/reset`
+  - `/quit`
+  - `/exit`
+- The Transcript pane is durable session history plus live answer deltas.
+- The Thinking pane is live-only. It does not replay historical reasoning on attach.
 - Runtime selection normally comes from the running LionClaw service or `lionclaw channel attach <id> --runtime ...` when attach needs to start it. Attach only reuses a daemon when that daemon belongs to the same `LIONCLAW_HOME`.
 - A shell debug harness is available in `scripts/debug-worker.sh`.

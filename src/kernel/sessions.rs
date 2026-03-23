@@ -81,15 +81,26 @@ impl SessionStore {
         channel_id: &str,
         peer_id: &str,
     ) -> Result<Option<Session>> {
+        self.find_latest_by_channel_peer_and_policy(channel_id, peer_id, None)
+            .await
+    }
+
+    pub async fn find_latest_by_channel_peer_and_policy(
+        &self,
+        channel_id: &str,
+        peer_id: &str,
+        history_policy: Option<SessionHistoryPolicy>,
+    ) -> Result<Option<Session>> {
         let row = sqlx::query(
             "SELECT session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, turn_count \
              FROM sessions \
-             WHERE channel_id = ?1 AND peer_id = ?2 \
+             WHERE channel_id = ?1 AND peer_id = ?2 AND (?3 IS NULL OR history_policy = ?3) \
              ORDER BY (last_turn_at_ms IS NOT NULL) DESC, COALESCE(last_turn_at_ms, created_at_ms) DESC, created_at_ms DESC \
              LIMIT 1",
         )
         .bind(channel_id)
         .bind(peer_id)
+        .bind(history_policy.map(SessionHistoryPolicy::as_str))
         .fetch_optional(&self.pool)
         .await
         .context("failed to query latest session by channel and peer")?;

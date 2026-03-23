@@ -17,6 +17,7 @@
 ### Session
 
 - `POST /v0/sessions/open`
+- `GET /v0/sessions/latest`
 - `POST /v0/sessions/history`
 - `POST /v0/sessions/action`
 - `POST /v0/sessions/turn`
@@ -86,7 +87,7 @@ Runtime module layout:
 Channel bridge layout:
 
 - `kernel/channel_state.rs`: durable channel bindings/peers/offsets/messages + stream event/cursor storage.
-- `kernel/core.rs`: channel inbound processing, pairing/approval, and stream pull/ack APIs.
+- `kernel/core.rs`: channel inbound processing, pairing/approval, session snapshot lookup, and stream pull/ack APIs.
 - `api/mod.rs`: HTTP routes for external channel skill workers.
 
 Operator launch model:
@@ -107,10 +108,12 @@ Adding a new adapter:
 
 External channel skills integrate over HTTP only:
 
-1. `POST /v0/channels/inbound` to submit normalized inbound messages. For approved peers this queues a channel turn and returns an explicit outcome (`queued`, `duplicate`, `pairing_pending`, `peer_blocked`) plus `turn_id` when work was queued.
-2. `POST /v0/channels/stream/pull` to fetch typed outbound stream events for a consumer cursor.
-3. `POST /v0/channels/stream/ack` after a consumer has durably handled events through a sequence.
-4. `GET /v0/channels/peers` + approve/block endpoints for pairing trust management.
+1. `GET /v0/sessions/latest` to restore the latest repaired durable session snapshot for `(channel_id, peer_id)`.
+2. `POST /v0/channels/inbound` to submit normalized inbound messages. Skills may pin normal inbound to a chosen session by sending `session_id`. For approved peers this queues a channel turn and returns an explicit outcome (`queued`, `duplicate`, `pairing_pending`, `peer_blocked`) plus `turn_id` when work was queued.
+3. `POST /v0/sessions/action` to start `continue_last_partial`, `retry_last_turn`, or `reset_session` for a channel-backed session. `continue` and `retry` return immediately with a new `turn_id`; `reset` returns a fresh `session_id`.
+4. `POST /v0/channels/stream/pull` to fetch typed outbound stream events for a consumer cursor. A fresh consumer may start from an exact sequence by sending `start_after_sequence`.
+5. `POST /v0/channels/stream/ack` after a consumer has durably handled events through a sequence.
+6. `GET /v0/channels/peers` + approve/block endpoints for pairing trust management.
 
 Queued channel turns emit machine-stable status/error codes through the same stream contract. Kernel-generated lifecycle codes currently include:
 
@@ -138,6 +141,7 @@ Queued channel turns emit machine-stable status/error codes through the same str
   - `error_text`
   - `runtime_id`
 - answer-lane text is checkpointed while a turn is still running so restart reconciliation can preserve partial replies already emitted to the user
+- channel-backed running turns also persist `channel_turns.answer_checkpoint_sequence`, which is the exact stream sequence through which the durable assistant checkpoint is synchronized
 - kernel bootstrap converts stale `running` session turns into durable `interrupted` turns before they can be reused
 - `lionclaw run` opens `local-cli` sessions with `history_policy=interactive`.
 - Recovery actions are kernel-owned:
@@ -145,6 +149,7 @@ Queued channel turns emit machine-stable status/error codes through the same str
   - `retry_last_turn`
   - `reset_session`
 - The default history window is the last 12 durable turns.
+- Channel-backed session mutation APIs (`sessions/open`, `sessions/action`, direct session turns) remain gated by channel peer approval in the kernel.
 
 ## Security Posture in v0
 

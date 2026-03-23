@@ -1,6 +1,11 @@
 import unittest
 
-from lionclaw_channel_terminal.api import InboundResponse
+from lionclaw_channel_terminal.api import (
+    InboundResponse,
+    SessionActionResult,
+    SessionOpenResult,
+    SessionTurnSnapshot,
+)
 from lionclaw_channel_terminal.app import AppConfig, TerminalChannelApp
 from lionclaw_channel_terminal.state import ChannelViewState, StreamEvent
 
@@ -120,36 +125,117 @@ class ChannelViewStateTests(unittest.TestCase):
 
         self.assertNotIn("late reasoning", state.reasoning_text())
 
+    def test_restore_running_history_keeps_transcript_and_thinking_blank(self):
+        state = ChannelViewState(peer_id="mosh")
+        state.restore_session_history(
+            "session-1",
+            [
+                SessionTurnSnapshot(
+                    turn_id="turn-1",
+                    kind="normal",
+                    status="running",
+                    display_user_text="continue this",
+                    assistant_text="partial answer",
+                    error_code=None,
+                    error_text=None,
+                )
+            ],
+        )
+
+        self.assertEqual(state.active_session_id, "session-1")
+        self.assertEqual(state.active_turn_id, "turn-1")
+        self.assertIn("you> continue this", state.transcript_text())
+        self.assertIn("partial answer", state.transcript_text())
+        self.assertEqual(state.reasoning_text(), "")
+        self.assertTrue(state.input_disabled())
+
+    def test_restore_interrupted_history_renders_partial_marker_and_error(self):
+        state = ChannelViewState(peer_id="mosh")
+        state.restore_session_history(
+            "session-1",
+            [
+                SessionTurnSnapshot(
+                    turn_id="turn-1",
+                    kind="normal",
+                    status="interrupted",
+                    display_user_text="work on this",
+                    assistant_text="partial answer",
+                    error_code="runtime.interrupted",
+                    error_text="turn interrupted by kernel restart",
+                )
+            ],
+        )
+
+        transcript = state.transcript_text()
+        self.assertIn("[partial] previous assistant reply was interrupted", transcript)
+        self.assertIn("partial answer", transcript)
+        self.assertIn("error> turn interrupted by kernel restart", transcript)
+        self.assertFalse(state.input_disabled())
+
 
 class _FailingApi:
-    async def send_inbound(self, text: str) -> InboundResponse:
+    async def send_inbound(self, text: str, session_id: str | None = None) -> InboundResponse:
         raise RuntimeError("boom")
 
 
 class _SuccessfulApi:
     def __init__(self) -> None:
         self.sent_text: str | None = None
+        self.sent_session_id: str | None = None
 
-    async def send_inbound(self, text: str) -> InboundResponse:
+    async def send_inbound(self, text: str, session_id: str | None = None) -> InboundResponse:
         self.sent_text = text
+        self.sent_session_id = session_id
         return InboundResponse(outcome="queued", turn_id="turn-1", session_id="session-1")
+
+
+class _InteractiveApi(_SuccessfulApi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.open_calls = 0
+        self.action_calls: list[tuple[str, str]] = []
+
+    async def open_session(
+        self,
+        trust_tier: str,
+        history_policy: str = "interactive",
+    ) -> SessionOpenResult:
+        self.open_calls += 1
+        return SessionOpenResult(
+            session_id="session-opened",
+            channel_id="terminal",
+            peer_id="mosh",
+            trust_tier=trust_tier,
+            history_policy=history_policy,
+        )
+
+    async def run_session_action(self, session_id: str, action: str):
+        self.action_calls.append((session_id, action))
+        return SessionActionResult(
+            session_id="session-reset" if action == "reset_session" else session_id,
+            turn_id="turn-action" if action != "reset_session" else None,
+        )
+
+
+def _make_app() -> TerminalChannelApp:
+    return TerminalChannelApp(
+        AppConfig(
+            home="/tmp/lionclaw",
+            base_url="http://127.0.0.1:8979",
+            channel_id="terminal",
+            peer_id="mosh",
+            consumer_id="interactive:test",
+            stream_start_mode="tail",
+            stream_limit=50,
+            stream_wait_ms=0,
+            runtime_id=None,
+        )
+    )
 
 
 class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_submit_text_keeps_local_echo_when_send_fails(self):
-        app = TerminalChannelApp(
-            AppConfig(
-                home="/tmp/lionclaw",
-                base_url="http://127.0.0.1:8979",
-                channel_id="terminal",
-                peer_id="mosh",
-                consumer_id="interactive:test",
-                stream_start_mode="tail",
-                stream_limit=50,
-                stream_wait_ms=0,
-                runtime_id=None,
-            )
-        )
+        app = _make_app()
         app.api = _FailingApi()
         app._render_views = lambda: None  # type: ignore[method-assign]
 
@@ -161,19 +247,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(app.state.input_disabled())
 
     async def test_submit_text_binds_active_turn_after_success(self):
-        app = TerminalChannelApp(
-            AppConfig(
-                home="/tmp/lionclaw",
-                base_url="http://127.0.0.1:8979",
-                channel_id="terminal",
-                peer_id="mosh",
-                consumer_id="interactive:test",
-                stream_start_mode="tail",
-                stream_limit=50,
-                stream_wait_ms=0,
-                runtime_id=None,
-            )
-        )
+        app = _make_app()
         api = _SuccessfulApi()
         app.api = api
         app._render_views = lambda: None  # type: ignore[method-assign]
@@ -182,24 +256,14 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(accepted)
         self.assertEqual(api.sent_text, "hello")
+        self.assertIsNone(api.sent_session_id)
         self.assertIn("you> hello", app.state.transcript_text())
         self.assertEqual(app.state.active_turn_id, "turn-1")
+        self.assertEqual(app.state.active_session_id, "session-1")
         self.assertTrue(app.state.input_disabled())
 
     async def test_done_event_reenables_input(self):
-        app = TerminalChannelApp(
-            AppConfig(
-                home="/tmp/lionclaw",
-                base_url="http://127.0.0.1:8979",
-                channel_id="terminal",
-                peer_id="mosh",
-                consumer_id="interactive:test",
-                stream_start_mode="tail",
-                stream_limit=50,
-                stream_wait_ms=0,
-                runtime_id=None,
-            )
-        )
+        app = _make_app()
         app._render_views = lambda: None  # type: ignore[method-assign]
         app.state.begin_submit("hello")
         app.state.mark_queued("turn-1")
@@ -209,6 +273,35 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertFalse(app.state.input_disabled())
+
+    async def test_submit_text_opens_interactive_session_for_approved_peer(self):
+        app = _make_app()
+        api = _InteractiveApi()
+        app.api = api
+        app._render_views = lambda: None  # type: ignore[method-assign]
+        app.state.set_pairing_state(status="approved", trust_tier="main")
+
+        accepted = await app.submit_text("hello")
+
+        self.assertTrue(accepted)
+        self.assertEqual(api.open_calls, 1)
+        self.assertEqual(api.sent_session_id, "session-opened")
+        self.assertEqual(app.state.active_session_id, "session-1")
+
+    async def test_reset_swaps_to_fresh_session_and_clears_history(self):
+        app = _make_app()
+        api = _InteractiveApi()
+        app.api = api
+        app._render_views = lambda: None  # type: ignore[method-assign]
+        app.state.active_session_id = "session-1"
+        app.state.append_user_message("hello")
+
+        reset = await app.reset_session()
+
+        self.assertTrue(reset)
+        self.assertEqual(api.action_calls, [("session-1", "reset_session")])
+        self.assertEqual(app.state.active_session_id, "session-reset")
+        self.assertEqual(app.state.transcript_text(), "")
 
 
 if __name__ == "__main__":

@@ -239,6 +239,7 @@ pub struct ChannelTurnRecord {
     pub runtime_id: String,
     pub status: ChannelTurnStatus,
     pub last_error: Option<String>,
+    pub answer_checkpoint_sequence: Option<i64>,
     pub queued_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -713,8 +714,8 @@ impl ChannelStateStore {
         let queued_at_ms = now_ms();
         sqlx::query(
             "INSERT INTO channel_turns \
-             (turn_id, channel_id, peer_id, session_id, inbound_message_id, runtime_id, status, last_error, queued_at_ms, started_at_ms, finished_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, ?7, NULL, NULL)",
+             (turn_id, channel_id, peer_id, session_id, inbound_message_id, runtime_id, status, last_error, answer_checkpoint_sequence, queued_at_ms, started_at_ms, finished_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, NULL, ?7, NULL, NULL)",
         )
         .bind(turn_id.to_string())
         .bind(channel_id)
@@ -734,7 +735,7 @@ impl ChannelStateStore {
 
     pub async fn get_turn(&self, turn_id: Uuid) -> Result<Option<ChannelTurnRecord>> {
         let row = sqlx::query(
-            "SELECT turn_id, channel_id, peer_id, session_id, inbound_message_id, runtime_id, status, last_error, queued_at_ms, started_at_ms, finished_at_ms \
+            "SELECT turn_id, channel_id, peer_id, session_id, inbound_message_id, runtime_id, status, last_error, answer_checkpoint_sequence, queued_at_ms, started_at_ms, finished_at_ms \
              FROM channel_turns WHERE turn_id = ?1",
         )
         .bind(turn_id.to_string())
@@ -743,6 +744,25 @@ impl ChannelStateStore {
         .context("failed to query channel turn")?;
 
         row.map(map_turn_row).transpose()
+    }
+
+    pub async fn update_answer_checkpoint_sequence(
+        &self,
+        turn_id: Uuid,
+        sequence: i64,
+    ) -> Result<bool> {
+        let changed = sqlx::query(
+            "UPDATE channel_turns \
+             SET answer_checkpoint_sequence = ?2 \
+             WHERE turn_id = ?1 AND status = 'running'",
+        )
+        .bind(turn_id.to_string())
+        .bind(sequence)
+        .execute(&self.pool)
+        .await
+        .context("failed to update channel turn answer checkpoint sequence")?;
+
+        Ok(changed.rows_affected() > 0)
     }
 
     pub async fn claim_next_pending_turn(
@@ -771,7 +791,7 @@ impl ChannelStateStore {
         let started_at_ms = now_ms();
         let changed = sqlx::query(
             "UPDATE channel_turns \
-             SET status = 'running', started_at_ms = ?2, last_error = NULL \
+             SET status = 'running', started_at_ms = ?2, last_error = NULL, answer_checkpoint_sequence = NULL \
              WHERE turn_id = ?1 AND status = 'pending'",
         )
         .bind(&turn_id_raw)
@@ -1061,6 +1081,7 @@ fn map_turn_row(row: SqliteRow) -> Result<ChannelTurnRecord> {
         runtime_id: row.get("runtime_id"),
         status,
         last_error: row.get("last_error"),
+        answer_checkpoint_sequence: row.get("answer_checkpoint_sequence"),
         queued_at,
         started_at,
         finished_at,

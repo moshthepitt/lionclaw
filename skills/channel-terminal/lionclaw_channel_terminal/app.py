@@ -8,7 +8,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Input, RichLog, Static
 
-from lionclaw_channel_terminal.api import InboundResponse, LionClawApi
+from lionclaw_channel_terminal.api import LionClawApi
 from lionclaw_channel_terminal.state import ChannelViewState
 
 
@@ -99,6 +99,8 @@ class TerminalChannelApp(App[None]):
             stream_limit=config.stream_limit,
             stream_wait_ms=config.stream_wait_ms,
         )
+        self._initial_stream_start_after_sequence: int | None = None
+        self._first_stream_pull = True
 
     def compose(self) -> ComposeResult:
         yield Static(id="pairing-banner")
@@ -118,6 +120,7 @@ class TerminalChannelApp(App[None]):
         self.query_one("#thinking-pane", Vertical).border_title = "Thinking"
         self.query_one("#status-log", RichLog).border_title = "Status"
         await self.refresh_pairing_state()
+        await self.restore_latest_session()
         self._render_views()
         self.run_worker(self.stream_loop(), exclusive=False, group="stream")
         self.set_interval(2.0, self.refresh_pairing_state, pause=False)
@@ -132,6 +135,15 @@ class TerminalChannelApp(App[None]):
             return
         if text in {"/quit", "/exit"}:
             self.exit()
+            return
+        if text == "/continue":
+            await self.run_turn_action("/continue", "continue_last_partial")
+            return
+        if text == "/retry":
+            await self.run_turn_action("/retry", "retry_last_turn")
+            return
+        if text == "/reset":
+            await self.reset_session()
             return
         if self.state.input_disabled():
             await self._push_status(
@@ -152,15 +164,76 @@ class TerminalChannelApp(App[None]):
         self._render_views()
 
         try:
-            response = await self.api.send_inbound(text)
+            session_id = await self.ensure_interactive_session_for_send()
+            response = await self.api.send_inbound(text, session_id=session_id)
         except Exception as err:  # noqa: BLE001
             self.state.mark_send_failed(str(err))
             self._render_views()
             return False
 
-        accepted = self._apply_inbound_response(response)
+        accepted = self._apply_inbound_response(
+            response.outcome,
+            response.turn_id,
+            response.session_id,
+        )
         self._render_views()
         return accepted
+
+    async def run_turn_action(self, command: str, action: str) -> bool:
+        if self.state.input_disabled():
+            await self._push_status(
+                f"input disabled: {self.state.input_block_reason() or 'unavailable'}"
+            )
+            return False
+        if self.state.active_session_id is None:
+            await self._push_status("no active interactive session")
+            return False
+
+        self.state.begin_submit(command)
+        self._render_views()
+
+        try:
+            response = await self.api.run_session_action(self.state.active_session_id, action)
+        except Exception as err:  # noqa: BLE001
+            self.state.mark_send_failed(str(err))
+            self._render_views()
+            return False
+
+        if not response.turn_id:
+            self.state.mark_send_failed(f"action {action} did not start a turn")
+            self._render_views()
+            return False
+
+        self.state.mark_queued(response.turn_id, response.session_id)
+        self._render_views()
+        return True
+
+    async def reset_session(self) -> bool:
+        if self.state.input_disabled():
+            await self._push_status(
+                f"input disabled: {self.state.input_block_reason() or 'unavailable'}"
+            )
+            return False
+
+        try:
+            if self.state.active_session_id is None:
+                session_id = await self.open_interactive_session()
+                if session_id is None:
+                    return False
+                self.state.reset_for_new_session(session_id)
+            else:
+                response = await self.api.run_session_action(
+                    self.state.active_session_id,
+                    "reset_session",
+                )
+                self.state.reset_for_new_session(response.session_id)
+        except Exception as err:  # noqa: BLE001
+            await self._push_status(f"reset failed: {err}")
+            return False
+
+        self.state.status_lines.append("[status] opened a fresh session")
+        self._render_views()
+        return True
 
     async def refresh_pairing_state(self) -> None:
         try:
@@ -177,10 +250,54 @@ class TerminalChannelApp(App[None]):
         )
         self._render_views()
 
+    async def restore_latest_session(self) -> None:
+        if self.state.pairing.status != "approved":
+            self._initial_stream_start_after_sequence = None
+            return
+
+        try:
+            snapshot = await self.api.fetch_latest_session(history_policy="interactive")
+        except Exception as err:  # noqa: BLE001
+            self.state.status_lines.append(f"[error] session restore failed: {err}")
+            self._render_views()
+            return
+
+        if snapshot.session is None:
+            self._initial_stream_start_after_sequence = None
+            return
+
+        self.state.restore_session_history(snapshot.session.session_id, snapshot.turns)
+        self._initial_stream_start_after_sequence = snapshot.resume_after_sequence
+
+    async def ensure_interactive_session_for_send(self) -> str | None:
+        if self.state.active_session_id is not None:
+            return self.state.active_session_id
+        if self.state.pairing.status != "approved":
+            return None
+        return await self.open_interactive_session()
+
+    async def open_interactive_session(self) -> str | None:
+        if self.state.pairing.status != "approved":
+            await self._push_status("peer must be approved before opening an interactive session")
+            return None
+        trust_tier = self.state.pairing.trust_tier or "main"
+        session = await self.api.open_session(
+            trust_tier=trust_tier,
+            history_policy="interactive",
+        )
+        self.state.active_session_id = session.session_id
+        return session.session_id
+
     async def stream_loop(self) -> None:
         while True:
             try:
-                events, last_sequence = await self.api.pull_stream()
+                start_after_sequence = None
+                if self._first_stream_pull:
+                    start_after_sequence = self._initial_stream_start_after_sequence
+                    self._first_stream_pull = False
+                events, last_sequence = await self.api.pull_stream(
+                    start_after_sequence=start_after_sequence
+                )
                 for event in events:
                     self.state.apply_stream_event(event)
                 if last_sequence is not None:
@@ -212,24 +329,29 @@ class TerminalChannelApp(App[None]):
         for line in self.state.status_text().splitlines():
             status_log.write(line)
 
-    def _apply_inbound_response(self, response: InboundResponse) -> bool:
-        if response.outcome == "queued" and response.turn_id:
-            self.state.mark_queued(response.turn_id)
+    def _apply_inbound_response(
+        self,
+        outcome: str,
+        turn_id: str | None,
+        session_id: str | None,
+    ) -> bool:
+        if outcome == "queued" and turn_id:
+            self.state.mark_queued(turn_id, session_id)
             return True
-        if response.outcome == "pairing_pending":
+        if outcome == "pairing_pending":
             self.state.clear_pending_turn()
             self.state.status_lines.append("[status] pairing pending")
             return True
-        if response.outcome == "peer_blocked":
+        if outcome == "peer_blocked":
             self.state.clear_pending_turn()
             self.state.status_lines.append("[error] peer_blocked: peer is blocked")
             return False
-        if response.outcome == "duplicate":
+        if outcome == "duplicate":
             self.state.clear_pending_turn()
             self.state.status_lines.append("[status] duplicate: inbound ignored")
             return False
 
-        self.state.mark_send_failed(f"unexpected inbound outcome: {response.outcome}")
+        self.state.mark_send_failed(f"unexpected inbound outcome: {outcome}")
         return False
 
 

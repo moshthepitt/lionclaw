@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +20,39 @@ class InboundResponse:
     outcome: str
     turn_id: str | None = None
     session_id: str | None = None
+
+
+@dataclass(slots=True)
+class SessionOpenResult:
+    session_id: str
+    channel_id: str
+    peer_id: str
+    trust_tier: str
+    history_policy: str
+
+
+@dataclass(slots=True)
+class SessionActionResult:
+    session_id: str
+    turn_id: str | None = None
+
+
+@dataclass(slots=True)
+class SessionTurnSnapshot:
+    turn_id: str
+    kind: str
+    status: str
+    display_user_text: str
+    assistant_text: str
+    error_code: str | None
+    error_text: str | None
+
+
+@dataclass(slots=True)
+class SessionLatestSnapshot:
+    session: SessionOpenResult | None
+    turns: list[SessionTurnSnapshot]
+    resume_after_sequence: int | None
 
 
 class LionClawApi:
@@ -65,7 +99,73 @@ class LionClawApi:
             )
         return PeerState(status="unknown")
 
-    async def send_inbound(self, text: str) -> InboundResponse:
+    async def fetch_latest_session(
+        self,
+        history_policy: str = "interactive",
+    ) -> SessionLatestSnapshot:
+        params: dict[str, str] = {
+            "channel_id": self.channel_id,
+            "peer_id": self.peer_id,
+        }
+        if history_policy:
+            params["history_policy"] = history_policy
+        response = await self._client.get("/v0/sessions/latest", params=params)
+        response.raise_for_status()
+        payload = response.json()
+        return SessionLatestSnapshot(
+            session=_parse_session_open_result(payload.get("session")),
+            turns=[
+                SessionTurnSnapshot(
+                    turn_id=item["turn_id"],
+                    kind=item["kind"],
+                    status=item["status"],
+                    display_user_text=item["display_user_text"],
+                    assistant_text=item.get("assistant_text", ""),
+                    error_code=item.get("error_code"),
+                    error_text=item.get("error_text"),
+                )
+                for item in payload.get("turns", [])
+            ],
+            resume_after_sequence=payload.get("resume_after_sequence"),
+        )
+
+    async def open_session(
+        self,
+        trust_tier: str,
+        history_policy: str = "interactive",
+    ) -> SessionOpenResult:
+        response = await self._client.post(
+            "/v0/sessions/open",
+            json={
+                "channel_id": self.channel_id,
+                "peer_id": self.peer_id,
+                "trust_tier": trust_tier,
+                "history_policy": history_policy,
+            },
+        )
+        response.raise_for_status()
+        return _parse_session_open_result(response.json())
+
+    async def run_session_action(
+        self,
+        session_id: str,
+        action: str,
+    ) -> SessionActionResult:
+        response = await self._client.post(
+            "/v0/sessions/action",
+            json={
+                "session_id": session_id,
+                "action": action,
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        return SessionActionResult(
+            session_id=data["session_id"],
+            turn_id=data.get("turn_id"),
+        )
+
+    async def send_inbound(self, text: str, session_id: str | None = None) -> InboundResponse:
         external_message_id = f"terminal-inbound:{self.consumer_id}:{self._inbound_sequence}"
         payload: dict[str, Any] = {
             "channel_id": self.channel_id,
@@ -73,6 +173,8 @@ class LionClawApi:
             "text": text,
             "external_message_id": external_message_id,
         }
+        if session_id:
+            payload["session_id"] = session_id
         if self.runtime_id:
             payload["runtime_id"] = self.runtime_id
         response = await self._client.post("/v0/channels/inbound", json=payload)
@@ -85,17 +187,21 @@ class LionClawApi:
             session_id=data.get("session_id"),
         )
 
-    async def pull_stream(self) -> tuple[list[StreamEvent], int | None]:
-        response = await self._client.post(
-            "/v0/channels/stream/pull",
-            json={
-                "channel_id": self.channel_id,
-                "consumer_id": self.consumer_id,
-                "start_mode": self.start_mode,
-                "limit": self.stream_limit,
-                "wait_ms": self.stream_wait_ms,
-            },
-        )
+    async def pull_stream(
+        self,
+        start_after_sequence: int | None = None,
+    ) -> tuple[list[StreamEvent], int | None]:
+        payload: dict[str, Any] = {
+            "channel_id": self.channel_id,
+            "consumer_id": self.consumer_id,
+            "limit": self.stream_limit,
+            "wait_ms": self.stream_wait_ms,
+        }
+        if start_after_sequence is None:
+            payload["start_mode"] = self.start_mode
+        else:
+            payload["start_after_sequence"] = start_after_sequence
+        response = await self._client.post("/v0/channels/stream/pull", json=payload)
         response.raise_for_status()
         payload = response.json()
         events: list[StreamEvent] = []
@@ -104,6 +210,7 @@ class LionClawApi:
             event = StreamEvent(
                 sequence=item["sequence"],
                 peer_id=item.get("peer_id", ""),
+                session_id=item.get("session_id"),
                 turn_id=item["turn_id"],
                 kind=item["kind"],
                 lane=item.get("lane"),
@@ -124,3 +231,15 @@ class LionClawApi:
             },
         )
         response.raise_for_status()
+
+
+def _parse_session_open_result(payload: dict[str, Any] | None) -> SessionOpenResult | None:
+    if payload is None:
+        return None
+    return SessionOpenResult(
+        session_id=payload["session_id"],
+        channel_id=payload["channel_id"],
+        peer_id=payload["peer_id"],
+        trust_tier=payload["trust_tier"],
+        history_policy=payload["history_policy"],
+    )

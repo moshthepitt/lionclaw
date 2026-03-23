@@ -7,8 +7,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use lionclaw::{
     contracts::{
-        ChannelBindRequest, PolicyGrantRequest, SessionOpenRequest, SessionTurnRequest,
-        SkillInstallRequest, StreamEventKindDto, TrustTier,
+        ChannelBindRequest, ChannelPeerApproveRequest, PolicyGrantRequest, SessionOpenRequest,
+        SessionTurnRequest, SkillInstallRequest, StreamEventKindDto, TrustTier,
     },
     kernel::{
         policy::Capability,
@@ -17,7 +17,7 @@ use lionclaw::{
             RuntimeEvent, RuntimeEventSender, RuntimeSessionHandle, RuntimeSessionStartInput,
             RuntimeTurnInput, RuntimeTurnResult,
         },
-        Kernel,
+        InboundChannelText, Kernel,
     },
 };
 use serde_json::{json, Value};
@@ -189,6 +189,37 @@ async fn channel_send_capability_uses_session_channel_defaults() {
         })
         .await
         .expect("bind local-cli channel to skill");
+    let _ = kernel
+        .process_inbound_channel_text(InboundChannelText {
+            channel_id: "local-cli".to_string(),
+            peer_id: peer_id.to_string(),
+            text: "seed pairing".to_string(),
+            session_id: None,
+            runtime_id: Some("single-capability".to_string()),
+            update_id: Some(9101),
+            external_message_id: Some("cap-broker-9101".to_string()),
+        })
+        .await
+        .expect("seed pairing state");
+    let peers = kernel
+        .list_channel_peers(Some("local-cli".to_string()))
+        .await
+        .expect("list peers");
+    let pairing_code = peers
+        .peers
+        .iter()
+        .find(|peer| peer.peer_id == peer_id)
+        .and_then(|peer| peer.pairing_code.clone())
+        .expect("pending peer pairing code");
+    kernel
+        .approve_channel_peer(ChannelPeerApproveRequest {
+            channel_id: "local-cli".to_string(),
+            peer_id: peer_id.to_string(),
+            pairing_code,
+            trust_tier: Some(TrustTier::Main),
+        })
+        .await
+        .expect("approve peer");
     grant_capability(&kernel, &skill_id, "channel.send").await;
 
     let response = kernel

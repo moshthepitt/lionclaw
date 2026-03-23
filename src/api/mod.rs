@@ -19,9 +19,9 @@ use crate::{
         ChannelStreamAckResponse, ChannelStreamPullRequest, ChannelStreamPullResponse,
         DaemonInfoResponse, PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeRequest,
         PolicyRevokeResponse, SessionActionRequest, SessionActionResponse, SessionHistoryRequest,
-        SessionHistoryResponse, SessionOpenRequest, SessionOpenResponse, SessionTurnRequest,
-        SessionTurnResponse, SkillInstallRequest, SkillInstallResponse, SkillListResponse,
-        SkillToggleRequest, SkillToggleResponse,
+        SessionHistoryResponse, SessionLatestQuery, SessionLatestResponse, SessionOpenRequest,
+        SessionOpenResponse, SessionTurnRequest, SessionTurnResponse, SkillInstallRequest,
+        SkillInstallResponse, SkillListResponse, SkillToggleRequest, SkillToggleResponse,
     },
     kernel::{Kernel, KernelError},
 };
@@ -42,6 +42,7 @@ pub fn build_router(kernel: Arc<Kernel>, daemon_info: DaemonInfoResponse) -> Rou
         .route("/health", get(health))
         .route("/v0/daemon/info", get(daemon_info_endpoint))
         .route("/v0/sessions/open", post(open_session))
+        .route("/v0/sessions/latest", get(latest_session))
         .route("/v0/sessions/history", post(session_history))
         .route("/v0/sessions/action", post(session_action))
         .route("/v0/sessions/turn", post(turn_session))
@@ -92,6 +93,14 @@ async fn session_history(
     Json(req): Json<SessionHistoryRequest>,
 ) -> Result<Json<SessionHistoryResponse>, ApiError> {
     let result = state.kernel.session_history(req).await?;
+    Ok(Json(result))
+}
+
+async fn latest_session(
+    State(state): State<ApiState>,
+    Query(query): Query<SessionLatestQuery>,
+) -> Result<Json<SessionLatestResponse>, ApiError> {
+    let result = state.kernel.latest_session_snapshot(query).await?;
     Ok(Json(result))
 }
 

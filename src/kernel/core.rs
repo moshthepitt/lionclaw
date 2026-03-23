@@ -22,10 +22,11 @@ use crate::contracts::{
     ChannelStreamAckResponse, ChannelStreamEventView, ChannelStreamPullRequest,
     ChannelStreamPullResponse, PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeResponse,
     SessionActionKind, SessionActionRequest, SessionActionResponse, SessionHistoryPolicy,
-    SessionHistoryRequest, SessionHistoryResponse, SessionOpenRequest, SessionOpenResponse,
-    SessionTurnKind, SessionTurnRequest, SessionTurnResponse, SessionTurnStatus, SessionTurnView,
-    SkillInstallRequest, SkillInstallResponse, SkillListResponse, SkillToggleResponse, SkillView,
-    StreamEventDto, StreamEventKindDto, StreamLaneDto, TrustTier,
+    SessionHistoryRequest, SessionHistoryResponse, SessionLatestQuery, SessionLatestResponse,
+    SessionOpenRequest, SessionOpenResponse, SessionTurnKind, SessionTurnRequest,
+    SessionTurnResponse, SessionTurnStatus, SessionTurnView, SkillInstallRequest,
+    SkillInstallResponse, SkillListResponse, SkillToggleResponse, SkillView, StreamEventDto,
+    StreamEventKindDto, StreamLaneDto, TrustTier,
 };
 use crate::workspace::read_workspace_sections;
 
@@ -95,6 +96,17 @@ pub struct Kernel {
     runtime_execution_policy: RuntimeExecutionPolicy,
     default_runtime_id: Option<String>,
     workspace_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InboundChannelText {
+    pub channel_id: String,
+    pub peer_id: String,
+    pub text: String,
+    pub session_id: Option<Uuid>,
+    pub runtime_id: Option<String>,
+    pub update_id: Option<i64>,
+    pub external_message_id: Option<String>,
 }
 
 impl Kernel {
@@ -193,13 +205,20 @@ impl Kernel {
             ));
         }
 
+        let channel_id = req.channel_id.trim();
+        let peer_id = req.peer_id.trim();
+        let history_policy = req.history_policy.unwrap_or_default();
+        let trust_tier = self
+            .resolve_session_open_trust_tier(channel_id, peer_id, req.trust_tier)
+            .await?;
+
         let session = self
             .sessions
             .open(
-                req.channel_id.trim().to_string(),
-                req.peer_id.trim().to_string(),
-                req.trust_tier,
-                req.history_policy.unwrap_or_default(),
+                channel_id.to_string(),
+                peer_id.to_string(),
+                trust_tier,
+                history_policy,
             )
             .await
             .map_err(internal)?;
@@ -258,14 +277,65 @@ impl Kernel {
             return Ok(None);
         };
 
-        Ok(Some(SessionOpenResponse {
-            session_id: session.session_id,
-            channel_id: session.channel_id,
-            peer_id: session.peer_id,
-            trust_tier: session.trust_tier,
-            history_policy: session.history_policy,
-            created_at: session.created_at,
-        }))
+        Ok(Some(to_session_open_response(session)))
+    }
+
+    pub async fn latest_session_snapshot(
+        &self,
+        query: SessionLatestQuery,
+    ) -> Result<SessionLatestResponse, KernelError> {
+        if query.channel_id.trim().is_empty() || query.peer_id.trim().is_empty() {
+            return Err(KernelError::BadRequest(
+                "channel_id and peer_id are required".to_string(),
+            ));
+        }
+
+        let Some(session) = self
+            .sessions
+            .find_latest_by_channel_peer_and_policy(
+                query.channel_id.trim(),
+                query.peer_id.trim(),
+                query.history_policy,
+            )
+            .await
+            .map_err(internal)?
+        else {
+            return Ok(SessionLatestResponse {
+                session: None,
+                turns: Vec::new(),
+                resume_after_sequence: None,
+            });
+        };
+
+        let turns = load_repaired_turns(
+            &self.session_turns,
+            session.session_id,
+            12,
+            TranscriptMode::History,
+        )
+        .await
+        .map_err(internal)?;
+        let resume_after_sequence = match turns.last() {
+            Some(turn) if turn.status == SessionTurnStatus::Running => self
+                .channel_state
+                .get_turn(turn.turn_id)
+                .await
+                .map_err(internal)?
+                .and_then(|channel_turn| {
+                    if channel_turn.status == super::channel_state::ChannelTurnStatus::Running {
+                        channel_turn.answer_checkpoint_sequence
+                    } else {
+                        None
+                    }
+                }),
+            _ => None,
+        };
+
+        Ok(SessionLatestResponse {
+            session: Some(to_session_open_response(session)),
+            turns: turns_to_history_views(turns),
+            resume_after_sequence,
+        })
     }
 
     pub async fn run_session_action(
@@ -301,6 +371,7 @@ impl Kernel {
                     .await
                     .map_err(internal)?
                     .ok_or_else(|| KernelError::NotFound("session not found".to_string()))?;
+                self.require_session_mutation_access(&session).await?;
                 let reset = self
                     .open_session(SessionOpenRequest {
                         channel_id: session.channel_id,
@@ -315,12 +386,21 @@ impl Kernel {
                 })
             }
             SessionActionKind::ContinueLastPartial | SessionActionKind::RetryLastTurn => {
-                let response = self
-                    .run_session_action(req.session_id, req.action, None)
+                let session_lock = self.session_lock(req.session_id).await;
+                let guard = session_lock.clone().lock_owned().await;
+                let (session, execution) = self
+                    .prepare_session_action_execution(req.session_id, req.action, None, None)
                     .await?;
+                let response_session_id = session.session_id;
+                let turn_id = execution.turn_id;
+                let kernel = self.clone();
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    let _ = kernel.execute_session_turn(&session, execution).await;
+                });
                 Ok(SessionActionResponse {
-                    session_id: response.session_id,
-                    turn_id: Some(response.turn_id),
+                    session_id: response_session_id,
+                    turn_id: Some(turn_id),
                 })
             }
         }
@@ -338,6 +418,74 @@ impl Kernel {
             .clone()
     }
 
+    async fn resolve_session_open_trust_tier(
+        &self,
+        channel_id: &str,
+        peer_id: &str,
+        fallback: TrustTier,
+    ) -> Result<TrustTier, KernelError> {
+        let Some(binding) = self
+            .channel_state
+            .get_binding(channel_id)
+            .await
+            .map_err(internal)?
+        else {
+            return Ok(fallback);
+        };
+
+        if !binding.enabled {
+            return Err(KernelError::Conflict(format!(
+                "channel '{}' binding is disabled",
+                channel_id
+            )));
+        }
+        self.require_channel_peer_approved(channel_id, peer_id)
+            .await
+    }
+
+    async fn require_session_mutation_access(
+        &self,
+        session: &super::sessions::Session,
+    ) -> Result<(), KernelError> {
+        if self
+            .channel_state
+            .get_binding(&session.channel_id)
+            .await
+            .map_err(internal)?
+            .is_none()
+        {
+            return Ok(());
+        }
+
+        let _ = self
+            .require_channel_peer_approved(&session.channel_id, &session.peer_id)
+            .await?;
+        Ok(())
+    }
+
+    async fn require_channel_peer_approved(
+        &self,
+        channel_id: &str,
+        peer_id: &str,
+    ) -> Result<TrustTier, KernelError> {
+        self.require_active_channel_binding(channel_id).await?;
+        let peer = self
+            .channel_state
+            .get_peer(channel_id, peer_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::BadRequest("channel peer is not approved".to_string()))?;
+        match peer.status {
+            ChannelPeerStatus::Approved => Ok(peer.trust_tier),
+            ChannelPeerStatus::Pending => Err(KernelError::BadRequest(
+                "channel peer is pending approval".to_string(),
+            )),
+            ChannelPeerStatus::Blocked => {
+                Err(KernelError::Conflict("channel peer is blocked".to_string()))
+            }
+        }
+    }
+
     async fn run_session_action_with_sink(
         &self,
         session_id: Uuid,
@@ -347,12 +495,28 @@ impl Kernel {
     ) -> Result<SessionTurnResponse, KernelError> {
         let session_lock = self.session_lock(session_id).await;
         let _guard = session_lock.lock().await;
+        let (session, execution) = self
+            .prepare_session_action_execution(session_id, action, runtime_id_override, sink)
+            .await?;
+
+        self.execute_session_turn(&session, execution).await
+    }
+
+    async fn prepare_session_action_execution(
+        &self,
+        session_id: Uuid,
+        action: SessionActionKind,
+        runtime_id_override: Option<String>,
+        sink: Option<RuntimeEventSink>,
+    ) -> Result<(super::sessions::Session, SessionTurnExecution), KernelError> {
         let session = self
             .sessions
             .get(session_id)
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("session not found".to_string()))?;
+        self.require_session_mutation_access(&session).await?;
+
         let latest_turn = load_repaired_turns(
             &self.session_turns,
             session_id,
@@ -371,9 +535,9 @@ impl Kernel {
                         "continue_last_partial requires interactive session history".to_string(),
                     ));
                 }
-                let can_continue = latest_turn.status != SessionTurnStatus::Completed
-                    && !latest_turn.assistant_text.trim().is_empty();
-                if !can_continue {
+                if latest_turn.status == SessionTurnStatus::Completed
+                    || latest_turn.assistant_text.trim().is_empty()
+                {
                     return Err(KernelError::BadRequest(
                         "latest turn has no partial assistant output to continue".to_string(),
                     ));
@@ -419,7 +583,7 @@ impl Kernel {
             }
         };
 
-        self.execute_session_turn(&session, execution).await
+        Ok((session, execution))
     }
 
     pub async fn turn_session(
@@ -725,14 +889,15 @@ impl Kernel {
         &self,
         req: ChannelInboundRequest,
     ) -> Result<ChannelInboundResponse, KernelError> {
-        self.process_inbound_channel_text(
-            &req.channel_id,
-            &req.peer_id,
-            &req.text,
-            req.runtime_id,
-            req.update_id,
-            req.external_message_id,
-        )
+        self.process_inbound_channel_text(InboundChannelText {
+            channel_id: req.channel_id,
+            peer_id: req.peer_id,
+            text: req.text,
+            session_id: req.session_id,
+            runtime_id: req.runtime_id,
+            update_id: req.update_id,
+            external_message_id: req.external_message_id,
+        })
         .await
     }
 
@@ -749,6 +914,13 @@ impl Kernel {
         let channel_id = req.channel_id.trim();
         let consumer_id = req.consumer_id.trim();
         self.require_active_channel_binding(channel_id).await?;
+        if req.start_mode == Some(crate::contracts::ChannelStreamStartMode::Tail)
+            && req.start_after_sequence.is_some()
+        {
+            return Err(KernelError::BadRequest(
+                "start_after_sequence cannot be combined with start_mode=tail".to_string(),
+            ));
+        }
         let limit = req.limit.unwrap_or(50).clamp(1, 200);
         let wait_ms = req.wait_ms.unwrap_or(0).min(30_000);
         let after_sequence = self
@@ -757,6 +929,7 @@ impl Kernel {
                 consumer_id,
                 req.start_mode
                     .unwrap_or(crate::contracts::ChannelStreamStartMode::Resume),
+                req.start_after_sequence,
             )
             .await?;
         let events = self
@@ -867,24 +1040,29 @@ impl Kernel {
 
     pub async fn process_inbound_channel_text(
         &self,
-        channel_id: &str,
-        peer_id: &str,
-        text: &str,
-        runtime_id: Option<String>,
-        update_id: Option<i64>,
-        external_message_id: Option<String>,
+        req: InboundChannelText,
     ) -> Result<ChannelInboundResponse, KernelError> {
+        let InboundChannelText {
+            channel_id,
+            peer_id,
+            text,
+            session_id,
+            runtime_id,
+            update_id,
+            external_message_id,
+        } = req;
+
         if channel_id.trim().is_empty() || peer_id.trim().is_empty() || text.trim().is_empty() {
             return Err(KernelError::BadRequest(
                 "channel_id, peer_id and text are required".to_string(),
             ));
         }
 
-        self.require_active_channel_binding(channel_id).await?;
+        self.require_active_channel_binding(&channel_id).await?;
 
         let inserted = self
             .channel_state
-            .insert_inbound_message(channel_id, peer_id, external_message_id, update_id, text)
+            .insert_inbound_message(&channel_id, &peer_id, external_message_id, update_id, &text)
             .await
             .map_err(internal)?;
         let Some(inbound_message) = inserted else {
@@ -897,7 +1075,7 @@ impl Kernel {
 
         let peer = match self
             .channel_state
-            .get_peer(channel_id, peer_id)
+            .get_peer(&channel_id, &peer_id)
             .await
             .map_err(internal)?
         {
@@ -905,7 +1083,7 @@ impl Kernel {
             None => {
                 let pending = self
                     .channel_state
-                    .upsert_pending_peer(channel_id, peer_id, &generate_pairing_code())
+                    .upsert_pending_peer(&channel_id, &peer_id, &generate_pairing_code())
                     .await
                     .map_err(internal)?;
 
@@ -925,8 +1103,8 @@ impl Kernel {
 
                 let _ = self
                     .emit_channel_message(
-                        channel_id,
-                        peer_id,
+                        &channel_id,
+                        &peer_id,
                         None,
                         None,
                         &format!(
@@ -963,8 +1141,8 @@ impl Kernel {
             ChannelPeerStatus::Pending => {
                 let _ = self
                     .emit_channel_message(
-                        channel_id,
-                        peer_id,
+                        &channel_id,
+                        &peer_id,
                         None,
                         None,
                         &format!(
@@ -1032,26 +1210,42 @@ impl Kernel {
             .await
             .map_err(internal)?;
 
-        let session = match self
-            .sessions
-            .find_latest_by_channel_peer(channel_id, peer_id)
-            .await
-            .map_err(internal)?
-        {
-            Some(existing) => existing,
-            None => self
+        let session = match session_id {
+            Some(session_id) => {
+                let session = self
+                    .sessions
+                    .get(session_id)
+                    .await
+                    .map_err(internal)?
+                    .ok_or_else(|| KernelError::BadRequest("session_id not found".to_string()))?;
+                if session.channel_id != channel_id || session.peer_id != peer_id {
+                    return Err(KernelError::BadRequest(
+                        "session_id does not belong to this channel_id and peer_id".to_string(),
+                    ));
+                }
+                session
+            }
+            None => match self
                 .sessions
-                .open(
-                    channel_id.to_string(),
-                    peer_id.to_string(),
-                    peer.trust_tier.clone(),
-                    SessionHistoryPolicy::Conservative,
-                )
+                .find_latest_by_channel_peer(&channel_id, &peer_id)
                 .await
-                .map_err(internal)?,
+                .map_err(internal)?
+            {
+                Some(existing) => existing,
+                None => self
+                    .sessions
+                    .open(
+                        channel_id.clone(),
+                        peer_id.clone(),
+                        peer.trust_tier.clone(),
+                        SessionHistoryPolicy::Conservative,
+                    )
+                    .await
+                    .map_err(internal)?,
+            },
         };
         let resolved_channel_runtime_id = self
-            .resolve_channel_runtime_id(channel_id, runtime_id)
+            .resolve_channel_runtime_id(&channel_id, runtime_id)
             .await?;
         let runtime_id = self.resolve_runtime_id(resolved_channel_runtime_id.as_deref())?;
 
@@ -1059,8 +1253,8 @@ impl Kernel {
         self.channel_state
             .enqueue_turn(
                 turn_id,
-                channel_id,
-                peer_id,
+                &channel_id,
+                &peer_id,
                 session.session_id,
                 inbound_message.message_id,
                 &runtime_id,
@@ -1069,7 +1263,7 @@ impl Kernel {
             .map_err(internal)?;
 
         let stream_context = self
-            .channel_stream_context_for_session(session.session_id, channel_id, peer_id, turn_id)
+            .channel_stream_context_for_session(session.session_id, &channel_id, &peer_id, turn_id)
             .await?;
         if let Some(stream_context) = &stream_context {
             self.emit_runtime_event(
@@ -1099,7 +1293,7 @@ impl Kernel {
             .await
             .map_err(internal)?;
 
-        self.ensure_channel_turn_worker(channel_id, peer_id).await;
+        self.ensure_channel_turn_worker(&channel_id, &peer_id).await;
 
         Ok(ChannelInboundResponse {
             outcome: ChannelInboundOutcome::Queued,
@@ -1267,6 +1461,17 @@ fn to_channel_stream_event_view(event: ChannelStreamEventRecord) -> ChannelStrea
         code: event.code,
         text: event.text,
         created_at: event.created_at,
+    }
+}
+
+fn to_session_open_response(session: super::sessions::Session) -> SessionOpenResponse {
+    SessionOpenResponse {
+        session_id: session.session_id,
+        channel_id: session.channel_id,
+        peer_id: session.peer_id,
+        trust_tier: session.trust_tier,
+        history_policy: session.history_policy,
+        created_at: session.created_at,
     }
 }
 
@@ -1548,6 +1753,7 @@ struct AssistantCheckpointState {
     assistant_text: String,
     persisted_len: usize,
     last_checkpoint_at: Option<Instant>,
+    last_answer_sequence: Option<i64>,
 }
 
 impl AssistantCheckpointState {
@@ -1569,6 +1775,18 @@ impl AssistantCheckpointState {
         } else {
             Some(Instant::now())
         };
+    }
+
+    fn observe_sequence(&mut self, event: &RuntimeEvent, sequence: Option<i64>) {
+        if matches!(
+            event,
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                ..
+            }
+        ) {
+            self.last_answer_sequence = sequence;
+        }
     }
 
     fn checkpoint_due(&self) -> bool {
@@ -1634,6 +1852,7 @@ impl Kernel {
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("session not found".to_string()))?;
+        self.require_session_mutation_access(&session).await?;
 
         self.execute_session_turn_serialized(
             session,
@@ -2123,6 +2342,7 @@ impl Kernel {
         channel_id: &str,
         consumer_id: &str,
         start_mode: crate::contracts::ChannelStreamStartMode,
+        start_after_sequence: Option<i64>,
     ) -> Result<i64, KernelError> {
         if let Some(cursor) = self
             .channel_state
@@ -2133,9 +2353,10 @@ impl Kernel {
             return Ok(cursor);
         }
 
-        let initial_cursor = match start_mode {
-            crate::contracts::ChannelStreamStartMode::Resume => 0,
-            crate::contracts::ChannelStreamStartMode::Tail => self
+        let initial_cursor = match (start_after_sequence, start_mode) {
+            (Some(sequence), _) => sequence,
+            (None, crate::contracts::ChannelStreamStartMode::Resume) => 0,
+            (None, crate::contracts::ChannelStreamStartMode::Tail) => self
                 .channel_state
                 .current_stream_head(channel_id)
                 .await
@@ -2203,7 +2424,7 @@ impl Kernel {
         &self,
         context: &ChannelStreamContext,
         event: &RuntimeEvent,
-    ) -> Result<(), KernelError> {
+    ) -> Result<i64, KernelError> {
         let (kind, lane, code, text) = match event {
             RuntimeEvent::MessageDelta { lane, text } => (
                 ChannelStreamEventKind::MessageDelta,
@@ -2229,7 +2450,8 @@ impl Kernel {
             RuntimeEvent::Done => (ChannelStreamEventKind::Done, None, None, None),
         };
 
-        self.channel_state
+        let appended = self
+            .channel_state
             .append_stream_event(ChannelStreamEventInsert {
                 channel_id: &context.channel_id,
                 peer_id: &context.peer_id,
@@ -2243,7 +2465,7 @@ impl Kernel {
             .await
             .map_err(internal)?;
         self.notify_channel_stream(&context.channel_id).await;
-        Ok(())
+        Ok(appended.sequence)
     }
 
     fn emit_local_stream_event(&self, sink: &Option<RuntimeEventSink>, event: &RuntimeEvent) {
@@ -2257,17 +2479,20 @@ impl Kernel {
         stream_context: &Option<ChannelStreamContext>,
         sink: &Option<RuntimeEventSink>,
         event: RuntimeEvent,
-    ) -> Result<(), KernelError> {
-        if let Some(context) = stream_context {
-            self.append_stream_event(context, &event).await?;
-        }
+    ) -> Result<Option<i64>, KernelError> {
+        let appended_sequence = if let Some(context) = stream_context {
+            Some(self.append_stream_event(context, &event).await?)
+        } else {
+            None
+        };
         self.emit_local_stream_event(sink, &event);
-        Ok(())
+        Ok(appended_sequence)
     }
 
     async fn checkpoint_running_turn(
         &self,
         turn_id: Uuid,
+        stream_context: &Option<ChannelStreamContext>,
         checkpoints: &mut AssistantCheckpointState,
     ) -> Result<(), KernelError> {
         if !checkpoints.checkpoint_due() {
@@ -2279,6 +2504,15 @@ impl Kernel {
             .checkpoint_assistant_text(turn_id, &checkpoints.assistant_text)
             .await
             .map_err(internal)?;
+        if stream_context.is_some() {
+            if let Some(sequence) = checkpoints.last_answer_sequence {
+                let _ = self
+                    .channel_state
+                    .update_answer_checkpoint_sequence(turn_id, sequence)
+                    .await
+                    .map_err(internal)?;
+            }
+        }
         checkpoints.mark_checkpointed();
         Ok(())
     }
@@ -2293,17 +2527,9 @@ impl Kernel {
         checkpoints: &mut AssistantCheckpointState,
     ) -> Result<(), FailedRuntimeTurn> {
         checkpoints.observe(&event);
-        self.checkpoint_running_turn(turn_id, checkpoints)
-            .await
-            .map_err(|err| FailedRuntimeTurn {
-                events: events.clone(),
-                status: SessionTurnStatus::Failed,
-                error_code: "runtime.error".to_string(),
-                error_text: err.to_string(),
-            })?;
-
-        if matches!(event, RuntimeEvent::Done) && stream_context.is_some() {
+        let appended_sequence = if matches!(event, RuntimeEvent::Done) && stream_context.is_some() {
             self.emit_local_stream_event(event_sink, &event);
+            None
         } else {
             self.emit_runtime_event(stream_context, event_sink, event.clone())
                 .await
@@ -2312,8 +2538,17 @@ impl Kernel {
                     status: SessionTurnStatus::Failed,
                     error_code: "runtime.error".to_string(),
                     error_text: err.to_string(),
-                })?;
-        }
+                })?
+        };
+        checkpoints.observe_sequence(&event, appended_sequence);
+        self.checkpoint_running_turn(turn_id, stream_context, checkpoints)
+            .await
+            .map_err(|err| FailedRuntimeTurn {
+                events: events.clone(),
+                status: SessionTurnStatus::Failed,
+                error_code: "runtime.error".to_string(),
+                error_text: err.to_string(),
+            })?;
         events.push(event);
         Ok(())
     }

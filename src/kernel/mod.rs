@@ -13,6 +13,6 @@ pub mod session_turns;
 pub mod sessions;
 pub mod skills;
 
-pub use core::{Kernel, KernelOptions};
+pub use core::{InboundChannelText, Kernel, KernelOptions};
 pub use error::KernelError;
 pub use runtime_policy::{RuntimeExecutionPolicy, RuntimeExecutionRule};

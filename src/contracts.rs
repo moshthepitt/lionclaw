@@ -200,6 +200,23 @@ pub struct SessionHistoryResponse {
     pub turns: Vec<SessionTurnView>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionLatestQuery {
+    pub channel_id: String,
+    pub peer_id: String,
+    #[serde(default)]
+    pub history_policy: Option<SessionHistoryPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionLatestResponse {
+    #[serde(default)]
+    pub session: Option<SessionOpenResponse>,
+    pub turns: Vec<SessionTurnView>,
+    #[serde(default)]
+    pub resume_after_sequence: Option<i64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionActionKind {
@@ -451,6 +468,8 @@ pub struct ChannelInboundRequest {
     pub peer_id: String,
     pub text: String,
     #[serde(default)]
+    pub session_id: Option<Uuid>,
+    #[serde(default)]
     pub update_id: Option<i64>,
     #[serde(default)]
     pub external_message_id: Option<String>,
@@ -509,6 +528,8 @@ pub struct ChannelStreamPullRequest {
     pub consumer_id: String,
     #[serde(default)]
     pub start_mode: Option<ChannelStreamStartMode>,
+    #[serde(default)]
+    pub start_after_sequence: Option<i64>,
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
