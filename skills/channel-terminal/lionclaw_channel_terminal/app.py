@@ -291,13 +291,15 @@ class TerminalChannelApp(App[None]):
     async def stream_loop(self) -> None:
         while True:
             try:
-                start_after_sequence = None
-                if self._first_stream_pull:
-                    start_after_sequence = self._initial_stream_start_after_sequence
-                    self._first_stream_pull = False
+                start_after_sequence = (
+                    self._initial_stream_start_after_sequence
+                    if self._first_stream_pull
+                    else None
+                )
                 events, last_sequence = await self.api.pull_stream(
                     start_after_sequence=start_after_sequence
                 )
+                self._first_stream_pull = False
                 for event in events:
                     self.state.apply_stream_event(event)
                 if last_sequence is not None:

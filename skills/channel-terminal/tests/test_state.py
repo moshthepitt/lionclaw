@@ -1,4 +1,5 @@
 import unittest
+import asyncio
 
 from lionclaw_channel_terminal.api import (
     InboundResponse,
@@ -217,6 +218,24 @@ class _InteractiveApi(_SuccessfulApi):
         )
 
 
+class _FlakyStreamApi(_InteractiveApi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.pull_args: list[int | None] = []
+        self.second_pull_seen = asyncio.Event()
+
+    async def pull_stream(self, start_after_sequence: int | None = None):
+        self.pull_args.append(start_after_sequence)
+        if len(self.pull_args) == 1:
+            raise RuntimeError("stream boom")
+        self.second_pull_seen.set()
+        await asyncio.sleep(3600)
+        return [], None
+
+    async def ack_stream(self, through_sequence: int) -> None:
+        return None
+
+
 def _make_app() -> TerminalChannelApp:
     return TerminalChannelApp(
         AppConfig(
@@ -302,6 +321,21 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(api.action_calls, [("session-1", "reset_session")])
         self.assertEqual(app.state.active_session_id, "session-reset")
         self.assertEqual(app.state.transcript_text(), "")
+
+    async def test_stream_loop_retries_initial_resume_cursor_after_first_pull_failure(self):
+        app = _make_app()
+        api = _FlakyStreamApi()
+        app.api = api
+        app._render_views = lambda: None  # type: ignore[method-assign]
+        app._initial_stream_start_after_sequence = 42
+
+        task = asyncio.create_task(app.stream_loop())
+        await asyncio.wait_for(api.second_pull_seen.wait(), timeout=2)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(api.pull_args[:2], [42, 42])
 
 
 if __name__ == "__main__":
