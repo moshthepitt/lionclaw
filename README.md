@@ -156,3 +156,7 @@ Use these env vars for manual setup and migration:
 - [Binary Model](docs/BINARY_RUNTIME_AGNOSTIC_MODEL.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Scripts](scripts/README.md)
+
+## License
+
+MIT. See [LICENSE](LICENSE).
