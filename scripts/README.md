@@ -21,7 +21,7 @@ Run the same checks as GitHub CI:
 ./scripts/ci.sh
 ```
 
-Prerequisites:
+For channel-install scripts, prerequisites are:
 - LionClaw running (default `http://127.0.0.1:8979`)
 - `curl` and `jq`
 - A valid skill folder with `SKILL.md`
