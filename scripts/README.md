@@ -10,11 +10,17 @@ These scripts are here for the moments when you want direct control over install
 Use them when you mean it.
 
 ## Available scripts
+- `ci.sh`: runs the local CI gate, mirrors the GitHub Actions `ci` workflow, and is the preferred pre-push verification entrypoint.
 - `bootstrap-terminal-test.sh`: bootstraps or refreshes a manual terminal-channel test home, gives a fresh home its own loopback bind, configures the runtime and terminal channel, then attaches it in the current TTY.
 - `install-channel-skill.sh`: installs a channel skill, enables it, binds it to a channel, and optionally starts the channel worker. It uses `scripts/worker` when present and otherwise uses `scripts/worker.sh`.
 - `attach-terminal-test.sh`: rebuilds LionClaw, stops managed services for a specific `LIONCLAW_HOME`, and attaches the interactive terminal channel in the current TTY.
 
 ## Usage
+Run the same checks as GitHub CI:
+```bash
+./scripts/ci.sh
+```
+
 Prerequisites:
 - LionClaw running (default `http://127.0.0.1:8979`)
 - `curl` and `jq`
