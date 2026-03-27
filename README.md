@@ -1,23 +1,26 @@
 # LionClaw
 
-LionClaw is a local AI CLI for people who want power without handing the whole machine to a sprawling agent stack.
+LionClaw is a local AI CLI with one obvious daily path: `lionclaw run [runtime]`.
 
-## Why it exists
+It keeps policy, audit, state, and runtime control in a small trusted core.
+Channels, automation, and future capabilities stay outside that core as
+installable skills.
 
-Most agent tools make the wrong tradeoff.
+## Why people use it
 
-They either grow into sprawling always-on systems you do not understand, or they stay thin and leave the model sitting too close to your machine.
+Local AI gets more useful as it gains memory, channels, automation, and runtime
+control. Those capabilities should not all end up inside the part of the system
+you have to trust.
 
-LionClaw takes a harder line. Keep the trusted core small. Put policy, audit, state, and runtime control there. Push everything else outward.
+LionClaw gives you:
 
-That is the point of LionClaw:
+- one command for everyday work
+- durable local state for sessions, policy, audit, and channels
+- multiple runtimes behind one CLI
+- optional channels and background automation when you need them
 
-- one CLI you actually use
-- one small core you can reason about
-- everything beyond that core installed as a skill
-- background operation turned on only when you ask for it
-
-Channels are skills. Future capabilities are skills. The core is small on purpose.
+That boundary is the point of LionClaw: keep the trusted core small, and make
+everything beyond it a skill.
 
 ## What it does
 
@@ -71,9 +74,10 @@ Inside the interactive REPL:
 
 ## Channels and background mode
 
-When you want a real channel instead of the direct CLI path, install one as a skill.
+When you want LionClaw available through a channel instead of the direct CLI
+path, install a channel skill.
 
-For a local end-to-end test without Telegram, use the terminal channel skill:
+For a local channel in your current terminal, use the terminal channel skill:
 
 ```bash
 ./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e
@@ -98,7 +102,8 @@ To run multiple local terminal channels at once, register multiple interactive c
 ./target/debug/lionclaw channel attach terminal2
 ```
 
-Register a Telegram skill and channel:
+If you want a Telegram bot as a channel, register the Telegram skill and
+channel:
 
 ```bash
 ./target/debug/lionclaw skill add skills/channel-telegram --alias telegram
