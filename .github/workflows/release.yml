@@ -41,6 +41,7 @@ jobs:
         id: version
         env:
           EXPECTED_BRANCH: ${{ github.event.pull_request.head.ref }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
           set -euo pipefail
 
@@ -59,8 +60,9 @@ jobs:
             exit 1
           fi
 
-          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
-            echo "release tag '$TAG' already exists" >&2
+          TAG_SHA=$(git ls-remote --tags origin "refs/tags/$TAG" | awk 'NR==1 { print $1 }')
+          if [[ -n "$TAG_SHA" && "$TAG_SHA" != "$MERGE_SHA" ]]; then
+            echo "release tag '$TAG' already exists on a different commit" >&2
             exit 1
           fi
 
@@ -97,6 +99,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "release tag '${{ steps.version.outputs.tag }}' already exists; reusing it"
+            exit 0
+          fi
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag "${{ steps.version.outputs.tag }}" "${{ github.event.pull_request.merge_commit_sha }}"
@@ -108,9 +115,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          gh release create "${{ steps.version.outputs.tag }}" \
-            "dist/${{ steps.version.outputs.archive }}" \
-            "dist/SHA256SUMS" \
-            --title "${{ steps.version.outputs.tag }}" \
-            --generate-notes \
-            --verify-tag
+          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            gh release upload "${{ steps.version.outputs.tag }}" \
+              "dist/${{ steps.version.outputs.archive }}" \
+              "dist/SHA256SUMS" \
+              --clobber
+          else
+            gh release create "${{ steps.version.outputs.tag }}" \
+              "dist/${{ steps.version.outputs.archive }}" \
+              "dist/SHA256SUMS" \
+              --title "${{ steps.version.outputs.tag }}" \
+              --generate-notes \
+              --verify-tag
+          fi
