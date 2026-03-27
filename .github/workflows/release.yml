@@ -1,0 +1,116 @@
+name: release
+
+on:
+  pull_request:
+    types:
+      - closed
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    if: |
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'main' &&
+      startsWith(github.event.pull_request.head.ref, 'release/v') &&
+      contains(github.event.pull_request.labels.*.name, 'release')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Fetch tags
+        run: git fetch --tags --force
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+
+      - name: Resolve release version
+        id: version
+        env:
+          EXPECTED_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+
+          VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "lionclaw") | .version')
+          if [[ -z "$VERSION" || "$VERSION" == "null" ]]; then
+            echo "failed to determine LionClaw version from merged commit" >&2
+            exit 1
+          fi
+
+          TAG="v$VERSION"
+          BRANCH="release/v$VERSION"
+          ARCHIVE="lionclaw-v$VERSION-linux-x86_64.tar.gz"
+
+          if [[ "$EXPECTED_BRANCH" != "$BRANCH" ]]; then
+            echo "expected merged release branch '$BRANCH', got '$EXPECTED_BRANCH'" >&2
+            exit 1
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "release tag '$TAG' already exists" >&2
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Verify merged release commit
+        run: bash ./scripts/ci.sh
+
+      - name: Build release binaries
+        run: cargo build --release --bins
+
+      - name: Package release assets
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ steps.version.outputs.version }}"
+          RELEASE_DIR="dist/lionclaw-v$VERSION-linux-x86_64"
+          ARCHIVE="dist/${{ steps.version.outputs.archive }}"
+
+          mkdir -p "$RELEASE_DIR"
+          cp target/release/lionclaw "$RELEASE_DIR/"
+          cp target/release/lionclawd "$RELEASE_DIR/"
+          cp LICENSE "$RELEASE_DIR/"
+
+          tar -C dist -czf "$ARCHIVE" "lionclaw-v$VERSION-linux-x86_64"
+          (
+            cd dist
+            sha256sum "${{ steps.version.outputs.archive }}" > SHA256SUMS
+          )
+
+      - name: Create and push release tag
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.version.outputs.tag }}" "${{ github.event.pull_request.merge_commit_sha }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          gh release create "${{ steps.version.outputs.tag }}" \
+            "dist/${{ steps.version.outputs.archive }}" \
+            "dist/SHA256SUMS" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --generate-notes \
+            --verify-tag

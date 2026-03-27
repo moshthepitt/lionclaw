@@ -154,6 +154,7 @@ Use these env vars for manual setup and migration:
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Binary Model](docs/BINARY_RUNTIME_AGNOSTIC_MODEL.md)
+- [Release Process](docs/RELEASE.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Scripts](scripts/README.md)
 

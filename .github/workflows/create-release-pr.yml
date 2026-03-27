@@ -1,0 +1,134 @@
+name: Create Release PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      level:
+        description: SemVer level to bump
+        required: true
+        type: choice
+        options:
+          - major
+          - minor
+          - patch
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: release-prep-main
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  create-release-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+
+      - name: Verify main before bumping
+        run: bash ./scripts/ci.sh
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+
+      - name: Bump release version
+        id: version
+        run: |
+          set -euo pipefail
+          cargo set-version --bump "${{ inputs.level }}"
+
+          VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "lionclaw") | .version')
+          if [[ -z "$VERSION" || "$VERSION" == "null" ]]; then
+            echo "failed to determine LionClaw version after bump" >&2
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "branch=release/v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure release ref does not already exist
+        run: |
+          set -euo pipefail
+
+          if git ls-remote --exit-code --heads origin "${{ steps.version.outputs.branch }}" >/dev/null 2>&1; then
+            echo "release branch '${{ steps.version.outputs.branch }}' already exists" >&2
+            exit 1
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "release tag '${{ steps.version.outputs.tag }}' already exists" >&2
+            exit 1
+          fi
+
+      - name: Ensure release label exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if ! gh api "repos/${{ github.repository }}/labels/release" >/dev/null 2>&1; then
+            gh api \
+              --method POST \
+              "repos/${{ github.repository }}/labels" \
+              -f name=release \
+              -f color=0E8A16 \
+              -f description='Generated release PR'
+          fi
+
+      - name: Configure GitHub Actions bot
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create release branch and commit
+        run: |
+          set -euo pipefail
+
+          git checkout -b "${{ steps.version.outputs.branch }}"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: release ${{ steps.version.outputs.tag }}"
+          git push --set-upstream origin "${{ steps.version.outputs.branch }}"
+
+      - name: Open release pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          BODY_FILE=$(mktemp)
+          {
+            printf 'Prepare LionClaw release `%s`.\n\n' "${{ steps.version.outputs.tag }}"
+            printf -- '- SemVer bump: `%s`\n' "${{ inputs.level }}"
+            printf -- '- Version in `Cargo.toml`: `%s`\n' "${{ steps.version.outputs.version }}"
+            printf -- '- On merge, the `release` workflow will tag this commit and publish the GitHub Release with Linux binaries and checksums.\n'
+          } > "$BODY_FILE"
+
+          gh pr create \
+            --base main \
+            --head "${{ steps.version.outputs.branch }}" \
+            --title "chore: release ${{ steps.version.outputs.tag }}" \
+            --body-file "$BODY_FILE" \
+            --label release
+
+      - name: Trigger CI for the release branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run ci.yml --ref "${{ steps.version.outputs.branch }}"
