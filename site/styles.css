@@ -1,4 +1,7 @@
 :root {
+  --frame-width: 76ch;
+  --measure: 62ch;
+  --wide-measure: 68ch;
   --page-bg: #f4efe6;
   --page-bg-top: #ece2d0;
   --surface: #fbf8f2;
@@ -35,12 +38,17 @@ body {
 header,
 main,
 footer {
-  width: min(76ch, calc(100vw - 2.5rem));
+  width: min(var(--frame-width), calc(100vw - 2.5rem));
   margin: 0 auto;
 }
 
 header {
   padding: 2.1rem 0 2.25rem;
+}
+
+header > :not(.masthead),
+main > section > :not(.boundary-grid) {
+  max-width: var(--measure);
 }
 
 main {
@@ -53,9 +61,8 @@ footer {
 }
 
 .masthead {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: flex-end;
   gap: 1rem 2rem;
   margin-bottom: 2.35rem;
@@ -90,6 +97,7 @@ footer {
 nav {
   display: flex;
   flex-wrap: wrap;
+  justify-content: flex-end;
   align-items: center;
   gap: 0.8rem 1rem;
   margin: 0;
@@ -209,6 +217,7 @@ code {
 
 pre {
   width: 100%;
+  max-width: var(--wide-measure);
   overflow-x: auto;
   padding: 1rem 1.15rem;
   background: var(--surface);
@@ -227,6 +236,7 @@ pre code {
 }
 
 blockquote {
+  max-width: var(--wide-measure);
   padding: 0.9rem 1rem 0.9rem 1.1rem;
   background: var(--surface);
   border-left: 0.25rem solid var(--accent);
@@ -293,6 +303,8 @@ blockquote {
   }
 
   .masthead {
+    grid-template-columns: 1fr;
+    align-items: start;
     margin-bottom: 2rem;
     padding-bottom: 0.85rem;
   }
@@ -302,6 +314,7 @@ blockquote {
   }
 
   nav {
+    justify-content: flex-start;
     gap: 0.55rem 0.8rem;
     font-size: 0.72rem;
   }
