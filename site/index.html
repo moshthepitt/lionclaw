@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta
+      name="description"
+      content="LionClaw is a local AI CLI with a small trusted core, explicit policy, durable state, and skills outside the core."
+    >
+    <title>LionClaw</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header>
+      <div class="masthead">
+        <div class="brand-lockup">
+          <p class="brand-mark">LionClaw</p>
+          <p class="brand-meta">Local AI CLI</p>
+        </div>
+        <nav aria-label="Page">
+          <a href="#why">Why</a>
+          <a href="#run">What You Run</a>
+          <a href="#boundary">Core vs Skills</a>
+          <a href="#links">Links</a>
+        </nav>
+      </div>
+
+      <h1>Local AI. Small trusted core.</h1>
+      <p class="lede">
+        One CLI you actually use. One core you can reason about. Everything beyond
+        that core installed as a skill.
+      </p>
+
+      <pre><code>./target/debug/lionclaw onboard
+./target/debug/lionclaw runtime add codex --kind codex --bin codex
+./target/debug/lionclaw run codex</code></pre>
+
+      <p class="note">
+        The everyday path is simple: run LionClaw locally, keep policy and state in
+        the trusted core, and turn on channels or background work only when you ask.
+      </p>
+    </header>
+
+    <main>
+      <section id="why" aria-labelledby="why-heading">
+        <p class="section-label">Why LionClaw</p>
+        <h2 id="why-heading">Most agent tools make the wrong tradeoff.</h2>
+        <p>
+          They either grow into sprawling always-on systems you do not understand,
+          or they stay thin and leave the model sitting too close to your machine.
+        </p>
+        <p>
+          LionClaw takes a harder line. Keep the trusted core small. Put policy,
+          audit, state, and runtime control there. Push everything else outward.
+        </p>
+        <blockquote>
+          <p>
+            Channels are skills. Future capabilities are skills. The core is small
+            on purpose.
+          </p>
+        </blockquote>
+      </section>
+
+      <section id="run" aria-labelledby="run-heading">
+        <p class="section-label">What You Run</p>
+        <h2 id="run-heading">One obvious command path.</h2>
+        <p>
+          LionClaw is built around a direct local CLI path. You build the binaries,
+          onboard once, add a runtime, and use <code>lionclaw run</code> for normal
+          interactive work.
+        </p>
+
+        <pre><code>cargo build --bins
+./target/debug/lionclaw onboard
+./target/debug/lionclaw runtime add codex --kind codex --bin codex
+./target/debug/lionclaw run codex
+./target/debug/lionclaw run --continue-last-session codex</code></pre>
+
+        <p>
+          When you want a real channel instead of the direct CLI path, install one
+          as a skill. For a local end-to-end test without Telegram:
+        </p>
+
+        <pre><code>./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e</code></pre>
+      </section>
+
+      <section id="boundary" aria-labelledby="boundary-heading">
+        <p class="section-label">Core vs Skills</p>
+        <h2 id="boundary-heading">The boundary is the product.</h2>
+
+        <div class="boundary-grid">
+          <article class="boundary-card">
+            <h3>Trusted core</h3>
+            <ul>
+              <li>policy and audit</li>
+              <li>durable state for sessions, channels, and runtime control</li>
+              <li>one local entrypoint for interactive AI work</li>
+            </ul>
+          </article>
+
+          <article class="boundary-card">
+            <h3>Installed skills</h3>
+            <ul>
+              <li>channels such as terminal or Telegram</li>
+              <li>future capabilities added without inflating the core</li>
+              <li>background operation only when explicitly turned on</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section id="links" aria-labelledby="links-heading">
+        <p class="section-label">Read More</p>
+        <h2 id="links-heading">Docs, source, and current direction.</h2>
+        <ul class="link-list">
+          <li>
+            <a href="https://github.com/moshthepitt/lionclaw" target="_blank" rel="noopener noreferrer">
+              GitHub repository
+            </a>
+          </li>
+          <li>
+            <a href="https://github.com/moshthepitt/lionclaw/blob/main/README.md" target="_blank" rel="noopener noreferrer">
+              README
+            </a>
+          </li>
+          <li>
+            <a href="https://github.com/moshthepitt/lionclaw/blob/main/docs/ARCHITECTURE.md" target="_blank" rel="noopener noreferrer">
+              Architecture
+            </a>
+          </li>
+          <li>
+            <a href="https://github.com/moshthepitt/lionclaw/blob/main/docs/ROADMAP.md" target="_blank" rel="noopener noreferrer">
+              Roadmap
+            </a>
+          </li>
+        </ul>
+      </section>
+    </main>
+
+    <footer>
+      <p>Static HTML. No JavaScript. Small on purpose.</p>
+    </footer>
+  </body>
+</html>
