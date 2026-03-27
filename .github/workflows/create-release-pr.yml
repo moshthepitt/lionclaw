@@ -13,7 +13,6 @@ on:
           - patch
 
 permissions:
-  actions: write
   contents: write
   pull-requests: write
   issues: write
@@ -125,10 +124,3 @@ jobs:
             --title "chore: release ${{ steps.version.outputs.tag }}" \
             --body-file "$BODY_FILE" \
             --label release
-
-      - name: Trigger CI for the release branch
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          gh workflow run ci.yml --ref "${{ steps.version.outputs.branch }}"
