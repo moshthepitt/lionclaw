@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="light">
     <meta
       name="description"
-      content="LionClaw is a local AI CLI with a small trusted core, explicit policy, durable state, and skills outside the core."
+      content="LionClaw is a local AI CLI with a real boundary: one command for everyday work, a small trusted core, and optional skills for channels and automation."
     >
     <title>LionClaw</title>
     <link rel="stylesheet" href="styles.css">
@@ -26,10 +26,12 @@
         </nav>
       </div>
 
-      <h1>Local AI. Small trusted core.</h1>
+      <h1>Local AI with a real boundary.</h1>
       <p class="lede">
-        One CLI you actually use. One core you can reason about. Everything beyond
-        that core installed as a skill.
+        LionClaw gives you one command for everyday local AI work while keeping
+        policy, audit, state, and runtime control inside a small trusted core.
+        Channels and automation stay outside that core until you choose to add
+        them.
       </p>
 
       <pre><code>./target/debug/lionclaw onboard
@@ -37,38 +39,39 @@
 ./target/debug/lionclaw run codex</code></pre>
 
       <p class="note">
-        The everyday path is simple: run LionClaw locally, keep policy and state in
-        the trusted core, and turn on channels or background work only when you ask.
+        Start with the CLI. Add channels or background automation later as skills.
+        The trusted core stays small either way.
       </p>
     </header>
 
     <main>
       <section id="why" aria-labelledby="why-heading">
         <p class="section-label">Why LionClaw</p>
-        <h2 id="why-heading">Most agent tools make the wrong tradeoff.</h2>
+        <h2 id="why-heading">Keep the trusted core small as the system grows.</h2>
         <p>
-          They either grow into sprawling always-on systems you do not understand,
-          or they stay thin and leave the model sitting too close to your machine.
+          Local AI gets more useful as it gains memory, channels, automation, and
+          runtime control. Those capabilities do not all belong inside the part of
+          the system you have to trust.
         </p>
         <p>
-          LionClaw takes a harder line. Keep the trusted core small. Put policy,
-          audit, state, and runtime control there. Push everything else outward.
+          LionClaw keeps policy, audit, state, and runtime control in the core.
+          Channels and future capabilities stay outside it as skills, so the
+          everyday path stays simple while the boundary stays clear.
         </p>
         <blockquote>
           <p>
-            Channels are skills. Future capabilities are skills. The core is small
-            on purpose.
+            One command for daily work. Optional skills when you need more.
           </p>
         </blockquote>
       </section>
 
       <section id="run" aria-labelledby="run-heading">
-        <p class="section-label">What You Run</p>
-        <h2 id="run-heading">One obvious command path.</h2>
+        <p class="section-label">Start Here</p>
+        <h2 id="run-heading">Start with one command.</h2>
         <p>
-          LionClaw is built around a direct local CLI path. You build the binaries,
-          onboard once, add a runtime, and use <code>lionclaw run</code> for normal
-          interactive work.
+          Build the binaries, onboard once, add a runtime, and use
+          <code>lionclaw run</code> for normal interactive work. When you come back,
+          you can continue the latest session instead of starting over.
         </p>
 
         <pre><code>cargo build --bins
@@ -78,33 +81,31 @@
 ./target/debug/lionclaw run --continue-last-session codex</code></pre>
 
         <p>
-          When you want a real channel instead of the direct CLI path, install one
-          as a skill. For a local end-to-end test without Telegram:
+          Need channels or background automation later? Add them as skills. The CLI
+          path stays the default.
         </p>
-
-        <pre><code>./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e</code></pre>
       </section>
 
       <section id="boundary" aria-labelledby="boundary-heading">
-        <p class="section-label">Core vs Skills</p>
-        <h2 id="boundary-heading">The boundary is the product.</h2>
+        <p class="section-label">What Stays Trusted</p>
+        <h2 id="boundary-heading">The core stays small on purpose.</h2>
 
         <div class="boundary-grid">
           <article class="boundary-card">
             <h3>Trusted core</h3>
             <ul>
               <li>policy and audit</li>
-              <li>durable state for sessions, channels, and runtime control</li>
+              <li>durable state for sessions and runtime control</li>
               <li>one local entrypoint for interactive AI work</li>
             </ul>
           </article>
 
           <article class="boundary-card">
-            <h3>Installed skills</h3>
+            <h3>Optional skills</h3>
             <ul>
-              <li>channels such as terminal or Telegram</li>
-              <li>future capabilities added without inflating the core</li>
-              <li>background operation only when explicitly turned on</li>
+              <li>channels and automation you add later</li>
+              <li>future capabilities without inflating the core</li>
+              <li>background work only when explicitly turned on</li>
             </ul>
           </article>
         </div>
@@ -112,7 +113,7 @@
 
       <section id="links" aria-labelledby="links-heading">
         <p class="section-label">Read More</p>
-        <h2 id="links-heading">Docs, source, and current direction.</h2>
+        <h2 id="links-heading">Docs, source, and the current direction.</h2>
         <ul class="link-list">
           <li>
             <a href="https://github.com/moshthepitt/lionclaw" target="_blank" rel="noopener noreferrer">
