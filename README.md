@@ -1,65 +1,62 @@
 # LionClaw
 
-LionClaw is a local AI CLI for people who want power without handing the whole machine to a sprawling agent stack.
+Give yourself superpowers with a local AI orchestrator that can remember your
+work, take action, and stay under your control.
 
-## Why it exists
+LionClaw gives you a persistent assistant on your own machine while keeping
+policy, audit, state, and runtime control in a small trusted core. When you
+want the assistant to do more, you add installable skills instead of bloating
+the core.
 
-Most agent tools make the wrong tradeoff.
+## The Anatomy of a True Assistant
 
-They either grow into sprawling always-on systems you do not understand, or they stay thin and leave the model sitting too close to your machine.
+LionClaw is split into a rock-solid core and modular skills, giving you maximum
+capability without compromising your local machine.
 
-LionClaw takes a harder line. Keep the trusted core small. Put policy, audit, state, and runtime control there. Push everything else outward.
+### Command & Control (The Core)
 
-That is the point of LionClaw:
+The core is the central engine of LionClaw. It stores durable sessions,
+enforces policy, controls the runtime, and acts as the single local entry point
+for execution. Because that orchestrator stays small and isolated, the rest of
+the system can grow without turning the trusted boundary into a mess.
 
-- one CLI you actually use
-- one small core you can reason about
-- everything beyond that core installed as a skill
-- background operation turned on only when you ask for it
+### Real-World Action (The Skills)
 
-Channels are skills. Future capabilities are skills. The core is small on purpose.
+Skills are how your assistant gets its hands. Add the specific capabilities you
+need when you need them: channels, automation, file access, background jobs,
+and future integrations. The assistant becomes more useful without stuffing
+that complexity into the core.
 
-## What it does
+### Absolute Control (The Audit)
 
-LionClaw provides:
+LionClaw records a durable audit trail for the actions that pass through the
+core. You can inspect what the model executed, when it executed it, and why the
+system allowed it. No hidden background magic, no invisible sidecar doing work
+behind your back.
 
-- one local entrypoint for interactive AI work through `lionclaw run`
-- immutable installed skills under `~/.lionclaw/skills`
-- workspace identity files under `~/.lionclaw/workspaces/main`
-- durable state for sessions, policy, audit, and channels
-- multiple runtime adapters behind one CLI
-- explicit service management for background channels and automation
+## Spin Up Your Orchestrator
 
-## Quick start
-
-Build both binaries:
-
-```bash
-cargo build --bins
-```
-
-Initialize local state:
-
-```bash
-./target/debug/lionclaw onboard
-```
-
-Configure a runtime profile:
+LionClaw is built in Rust. Clone it, build it, and start your first persistent
+session in under 60 seconds.
 
 ```bash
-./target/debug/lionclaw runtime add codex --kind codex --bin codex
-```
+# 1. Build the core binaries
+git clone https://github.com/moshthepitt/lionclaw.git
+cd lionclaw
+cargo build --release
 
-Use LionClaw interactively:
+# 2. Initialize your local environment
+./target/release/lionclaw onboard
 
-```bash
-./target/debug/lionclaw run codex
+# 3. Attach a model and start executing
+./target/release/lionclaw runtime add codex --kind codex --bin codex
+./target/release/lionclaw run codex
 ```
 
 Continue the latest local session instead of starting fresh:
 
 ```bash
-./target/debug/lionclaw run --continue-last-session codex
+./target/release/lionclaw run --continue-last-session codex
 ```
 
 Inside the interactive REPL:
@@ -71,9 +68,10 @@ Inside the interactive REPL:
 
 ## Channels and background mode
 
-When you want a real channel instead of the direct CLI path, install one as a skill.
+When you want LionClaw available somewhere other than the direct CLI path,
+install a channel skill.
 
-For a local end-to-end test without Telegram, use the terminal channel skill:
+For a local channel in your current terminal, use the terminal channel skill:
 
 ```bash
 ./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e
@@ -84,9 +82,9 @@ That one command bootstraps a fresh test home on its own loopback bind, configur
 If you prefer the underlying manual steps, they are:
 
 ```bash
-./target/debug/lionclaw skill add skills/channel-terminal --alias terminal
-./target/debug/lionclaw channel add terminal --launch interactive
-./target/debug/lionclaw channel attach terminal --runtime codex
+./target/release/lionclaw skill add skills/channel-terminal --alias terminal
+./target/release/lionclaw channel add terminal --launch interactive
+./target/release/lionclaw channel attach terminal --runtime codex
 ```
 
 `channel attach` opens the worker in your current TTY. If needed, it starts LionClaw for you, restores the latest interactive terminal session for that peer, resumes any still-running answer stream from the last durable checkpoint, and prints the pairing code and approval command on first contact. It only reuses a daemon when that daemon belongs to the same `LIONCLAW_HOME`.
@@ -94,29 +92,29 @@ If you prefer the underlying manual steps, they are:
 To run multiple local terminal channels at once, register multiple interactive channels and attach each one in its own terminal:
 
 ```bash
-./target/debug/lionclaw channel add terminal2 --skill terminal --launch interactive
-./target/debug/lionclaw channel attach terminal2
+./target/release/lionclaw channel add terminal2 --skill terminal --launch interactive
+./target/release/lionclaw channel attach terminal2
 ```
 
-Register a Telegram skill and channel:
+If you want Telegram as a channel, register the Telegram skill and channel:
 
 ```bash
-./target/debug/lionclaw skill add skills/channel-telegram --alias telegram
-./target/debug/lionclaw channel add telegram
+./target/release/lionclaw skill add skills/channel-telegram --alias telegram
+./target/release/lionclaw channel add telegram
 ```
 
 When you want channels or automation running in the background, use service mode:
 
 ```bash
-TELEGRAM_BOT_TOKEN=... ./target/debug/lionclaw service up --runtime codex
+TELEGRAM_BOT_TOKEN=... ./target/release/lionclaw service up --runtime codex
 ```
 
 Then inspect or manage it with:
 
 ```bash
-./target/debug/lionclaw service status
-./target/debug/lionclaw channel pairing list
-./target/debug/lionclaw service logs
+./target/release/lionclaw service status
+./target/release/lionclaw channel pairing list
+./target/release/lionclaw service logs
 ```
 
 ## State layout
@@ -152,11 +150,13 @@ Use these env vars for manual setup and migration:
 
 ## Docs
 
-- [Architecture](docs/ARCHITECTURE.md)
-- [Binary Model](docs/BINARY_RUNTIME_AGNOSTIC_MODEL.md)
-- [Release Process](docs/RELEASE.md)
-- [Roadmap](docs/ROADMAP.md)
-- [Scripts](scripts/README.md)
+Dive deeper:
+
+- [Architecture](docs/ARCHITECTURE.md) - how the trusted core isolates state, policy, and runtime control
+- [Binary Model](docs/BINARY_RUNTIME_AGNOSTIC_MODEL.md) - the product and runtime model behind `lionclaw run`
+- [Release Process](docs/RELEASE.md) - how releases are prepared and published
+- [Roadmap](docs/ROADMAP.md) - what comes next, from channel skills to background automation
+- [Scripts](scripts/README.md) - helper scripts for local setup and testing
 
 ## License
 
