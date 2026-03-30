@@ -16,125 +16,112 @@
       <div class="masthead">
         <div class="brand-lockup">
           <p class="brand-mark">LionClaw</p>
-          <p class="brand-meta">Local AI CLI</p>
+          <p class="brand-meta">Personal super assistant</p>
         </div>
         <nav aria-label="Page">
           <a href="#why">Why</a>
-          <a href="#run">What You Run</a>
-          <a href="#boundary">Core vs Skills</a>
+          <a href="#start">Start</a>
           <a href="#links">Links</a>
         </nav>
       </div>
 
-      <h1>Local AI with a real boundary.</h1>
+      <h1>Give yourself superpowers.</h1>
       <p class="lede">
-        LionClaw gives you one command for everyday local AI work while keeping
-        policy, audit, state, and runtime control inside a small trusted core.
-        Channels and automation stay outside that core until you choose to add
-        them.
-      </p>
-
-      <pre><code>./target/debug/lionclaw onboard
-./target/debug/lionclaw runtime add codex --kind codex --bin codex
-./target/debug/lionclaw run codex</code></pre>
-
-      <p class="note">
-        Start with the CLI. Add channels or background automation later as skills.
-        The trusted core stays small either way.
+        Most AI is just a chat box you use to Google things. LionClaw is
+        different. It's a persistent, always-on AI that sits on your machine and
+        actually gets real work done. Start with a secure conversation, snap on
+        the skills you need, and turn your system into a high-leverage
+        assistant that executes tasks for you.
       </p>
     </header>
 
     <main>
       <section id="why" aria-labelledby="why-heading">
-        <p class="section-label">Why LionClaw</p>
-        <h2 id="why-heading">Keep the trusted core small as the system grows.</h2>
+        <p class="section-label">Why</p>
+        <h2 id="why-heading">The anatomy of a true assistant.</h2>
         <p>
-          Local AI gets more useful as it gains memory, channels, automation, and
-          runtime control. Those capabilities do not all belong inside the part of
-          the system you have to trust.
+          LionClaw is split into a rock-solid core and modular skills, giving
+          you maximum capability without compromising your local machine.
         </p>
         <p>
-          LionClaw keeps policy, audit, state, and runtime control in the core.
-          Channels and future capabilities stay outside it as skills, so the
-          everyday path stays simple while the boundary stays clear.
+          <strong>Command &amp; Control (The Core)</strong>
         </p>
-        <blockquote>
-          <p>
-            One command for daily work. Optional skills when you need more.
-          </p>
-        </blockquote>
-      </section>
-
-      <section id="run" aria-labelledby="run-heading">
-        <p class="section-label">Start Here</p>
-        <h2 id="run-heading">Start with one command.</h2>
         <p>
-          Build the binaries, onboard once, add a runtime, and use
-          <code>lionclaw run</code> for normal interactive work. When you come back,
-          you can continue the latest session instead of starting over.
+          The Core is the heavily guarded central engine of LionClaw. It stores
+          your persistent sessions, but more importantly, it enforces policy and
+          controls the runtime. It acts as a strict choke-point: logging every
+          single execution and dictating exactly what the AI is allowed to do.
+          By keeping this central orchestrator tiny and isolated, your system
+          can never be compromised by a rogue background task or a messy plugin.
         </p>
-
-        <pre><code>cargo build --bins
-./target/debug/lionclaw onboard
-./target/debug/lionclaw runtime add codex --kind codex --bin codex
-./target/debug/lionclaw run codex
-./target/debug/lionclaw run --continue-last-session codex</code></pre>
-
         <p>
-          Need channels or background automation later? Add them as skills. The CLI
-          path stays the default.
+          <strong>Real-World Action (The Skills)</strong>
+        </p>
+        <p>
+          This is where your AI gets its hands. Keep the core isolated, but
+          plug in specific, sandboxed skills when you need the AI to actually do
+          something, like read your local file system, push code, or trigger
+          webhooks.
+        </p>
+        <p>
+          <strong>Absolute Control (The Audit)</strong>
+        </p>
+        <p>
+          Because LionClaw forces all execution through a single local entry
+          point, there is zero hidden background magic. You get total
+          visibility and a durable audit trail of exactly what your model
+          executed, when, and why.
         </p>
       </section>
 
-      <section id="boundary" aria-labelledby="boundary-heading">
-        <p class="section-label">What Stays Trusted</p>
-        <h2 id="boundary-heading">The core stays small on purpose.</h2>
+      <section id="start" aria-labelledby="start-heading">
+        <p class="section-label">Quick Start</p>
+        <h2 id="start-heading">Spin up your orchestrator.</h2>
+        <p>
+          LionClaw is built in Rust. Clone it, build it, and start your first
+          persistent session in under 60 seconds.
+        </p>
 
-        <div class="boundary-grid">
-          <article class="boundary-card">
-            <h3>Trusted core</h3>
-            <ul>
-              <li>policy and audit</li>
-              <li>durable state for sessions and runtime control</li>
-              <li>one local entrypoint for interactive AI work</li>
-            </ul>
-          </article>
+        <pre><code># 1. Build the core binaries
+git clone https://github.com/moshthepitt/lionclaw.git
+cd lionclaw
+cargo build --release
 
-          <article class="boundary-card">
-            <h3>Optional skills</h3>
-            <ul>
-              <li>channels and automation you add later</li>
-              <li>future capabilities without inflating the core</li>
-              <li>background work only when explicitly turned on</li>
-            </ul>
-          </article>
-        </div>
+# 2. Initialize your local environment
+./target/release/lionclaw onboard
+
+# 3. Attach a model and start executing
+./target/release/lionclaw runtime add codex --kind codex --bin codex
+./target/release/lionclaw run codex</code></pre>
+
+        <p>
+          Start local. Add channels, automation, and new skills after the core
+          is up and running.
+        </p>
       </section>
 
       <section id="links" aria-labelledby="links-heading">
-        <p class="section-label">Read More</p>
-        <h2 id="links-heading">Docs, source, and the current direction.</h2>
-        <br/>
+        <p class="section-label">Next Steps</p>
+        <h2 id="links-heading">Dive deeper.</h2>
+        <p>
+          LionClaw is fully open-source. Read the docs to understand the trusted
+          core, or check the roadmap to see what skills we are building next.
+        </p>
         <ul class="link-list">
           <li>
             <a href="https://github.com/moshthepitt/lionclaw" target="_blank" rel="noopener noreferrer">
               GitHub repository
-            </a>
-          </li>
-          <li>
-            <a href="https://github.com/moshthepitt/lionclaw/blob/main/README.md" target="_blank" rel="noopener noreferrer">
-              README
-            </a>
+            </a> - Star the project, read the source, or contribute a new Skill.
           </li>
           <li>
             <a href="https://github.com/moshthepitt/lionclaw/blob/main/docs/ARCHITECTURE.md" target="_blank" rel="noopener noreferrer">
-              Architecture
-            </a>
+              The Architecture
+            </a> - A deep dive into how we isolate state, policy, and runtime control.
           </li>
           <li>
             <a href="https://github.com/moshthepitt/lionclaw/blob/main/docs/ROADMAP.md" target="_blank" rel="noopener noreferrer">
-              Roadmap
-            </a>
+              The Roadmap
+            </a> - See what's coming next, from new channel integrations to background daemon support.
           </li>
         </ul>
       </section>
