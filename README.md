@@ -98,10 +98,14 @@ Inspect or control jobs with:
 ./target/release/lionclaw job rm <job-id>
 ```
 
+`job run` works even when a job is paused. Pausing stops automatic firing; it
+does not block operator-triggered test runs.
+
 When LionClaw is running in the background, `lionclawd` ticks the scheduler
 every 30 seconds. Each scheduled run opens a fresh `scheduler` session, keeps
 job-scoped policy separate from normal interactive turns, stores the full turn
-history, and delivers only the final message to the configured channel.
+history, runs one scheduled job at a time, and delivers only the final message
+to the configured channel.
 
 ## Channels and background mode
 

@@ -44,8 +44,8 @@ use super::{
     db::Db,
     error::KernelError,
     jobs::{
-        compute_initial_next_run, ClaimedSchedulerJob, JobDeliveryTarget, JobSchedule, JobStore,
-        NewSchedulerJob, SchedulerJobDeliveryStatus, SchedulerJobRecord, SchedulerJobRunRecord,
+        compute_initial_next_run, JobDeliveryTarget, JobSchedule, JobStore, NewSchedulerJob,
+        SchedulerJobDeliveryStatus, SchedulerJobRecord, SchedulerJobRunRecord,
         SchedulerJobRunStatus, SchedulerJobTriggerKind,
     },
     policy::{Capability, PolicyStore, Scope},
@@ -56,7 +56,7 @@ use super::{
         BUILTIN_RUNTIME_MOCK,
     },
     runtime_policy::{RuntimeExecutionContext, RuntimeExecutionPolicy, RuntimeExecutionRequest},
-    scheduler::{SchedulerConfig, SchedulerRuntime},
+    scheduler::{SchedulerConfig, SchedulerEngine},
     selector::SkillSelector,
     session_transcript::{
         load_repaired_turns, render_turns_for_prompt, turns_to_history_views, TranscriptMode,
@@ -101,7 +101,7 @@ pub struct Kernel {
     channel_state: ChannelStateStore,
     audit: AuditLog,
     capability_broker: CapabilityBroker,
-    scheduler: SchedulerRuntime,
+    scheduler: SchedulerEngine,
     channel_stream_notifiers: Arc<RwLock<HashMap<String, Arc<Notify>>>>,
     channel_turn_workers: Arc<RwLock<HashSet<String>>>,
     session_locks: Arc<RwLock<HashMap<Uuid, Arc<Mutex<()>>>>>,
@@ -161,7 +161,7 @@ impl Kernel {
             channel_state: ChannelStateStore::new(pool.clone()),
             audit: AuditLog::new(pool),
             capability_broker,
-            scheduler: SchedulerRuntime::new(options.scheduler),
+            scheduler: SchedulerEngine::new(options.scheduler),
             channel_stream_notifiers: Arc::new(RwLock::new(HashMap::new())),
             channel_turn_workers: Arc::new(RwLock::new(HashSet::new())),
             session_locks: Arc::new(RwLock::new(HashMap::new())),
@@ -1703,10 +1703,10 @@ impl Kernel {
                 if existing.running_run_id.is_some() {
                     KernelError::Conflict("job is already running".to_string())
                 } else {
-                    KernelError::Conflict("job is disabled and cannot be run".to_string())
+                    KernelError::Conflict("job could not be claimed for manual run".to_string())
                 }
             })?;
-        let (job, run) = self.execute_claimed_scheduler_job(claimed).await?;
+        let (job, run) = self.scheduler.run_claimed_job(self, claimed).await?;
         Ok(JobManualRunResponse {
             job: to_job_view(job),
             run: to_job_run_view(run),
@@ -1714,284 +1714,52 @@ impl Kernel {
     }
 
     pub async fn scheduler_tick(&self) -> Result<JobTickResponse, KernelError> {
-        let owner = format!("scheduler:{}", Uuid::new_v4());
-        let lease_ttl = self
-            .scheduler
-            .config()
-            .tick_interval
-            .max(Duration::from_secs(60));
-        if !self
-            .jobs
-            .try_acquire_tick_lease(&owner, lease_ttl)
-            .await
-            .map_err(internal)?
-        {
-            return Ok(JobTickResponse { claimed_runs: 0 });
-        }
-
-        let claim_result = self
-            .jobs
-            .claim_due_jobs(
-                Utc::now(),
-                self.scheduler.config().max_concurrent_runs.max(1),
-                SchedulerJobTriggerKind::Schedule,
-            )
-            .await;
-        let release_result = self.jobs.release_tick_lease(&owner).await;
-
-        let claimed = claim_result.map_err(internal)?;
-        release_result.map_err(internal)?;
-
-        for claimed_job in &claimed {
-            self.audit
-                .append(
-                    "job.run.claimed",
-                    None,
-                    Some("scheduler".to_string()),
-                    json!({
-                        "job_id": claimed_job.job.job_id,
-                        "run_id": claimed_job.run.run_id,
-                        "trigger_kind": claimed_job.run.trigger_kind.as_str(),
-                    }),
-                )
-                .await
-                .map_err(internal)?;
-        }
-
-        let claimed_count = claimed.len();
-        for claimed_job in claimed {
-            if let Err(err) = self.execute_claimed_scheduler_job(claimed_job).await {
-                let _ = self
-                    .audit
-                    .append(
-                        "job.run.execution_failed",
-                        None,
-                        Some("scheduler".to_string()),
-                        json!({"error": err.to_string()}),
-                    )
-                    .await;
-            }
-        }
-
-        Ok(JobTickResponse {
-            claimed_runs: claimed_count,
-        })
+        self.scheduler.tick(self).await
     }
 
     pub async fn run_scheduler_loop(self: Arc<Self>) {
-        loop {
-            if let Err(err) = self.scheduler_tick().await {
-                let _ = self
-                    .audit
-                    .append(
-                        "scheduler.tick.failed",
-                        None,
-                        Some("kernel".to_string()),
-                        json!({"error": err.to_string()}),
-                    )
-                    .await;
-            }
-            sleep(self.scheduler.config().tick_interval).await;
-        }
+        let scheduler = self.scheduler.clone();
+        scheduler.run_loop(self).await;
     }
 
-    async fn execute_claimed_scheduler_job(
-        &self,
-        claimed: ClaimedSchedulerJob,
-    ) -> Result<(SchedulerJobRecord, SchedulerJobRunRecord), KernelError> {
-        let _permit = self
-            .scheduler
-            .semaphore()
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| KernelError::Runtime("scheduler has shut down".to_string()))?;
-
-        let job = claimed.job;
-        let mut current_run = claimed.run;
-        loop {
-            let opened = self
-                .open_session(SessionOpenRequest {
-                    channel_id: "scheduler".to_string(),
-                    peer_id: format!("job:{}", job.job_id),
-                    trust_tier: TrustTier::Main,
-                    history_policy: Some(SessionHistoryPolicy::Conservative),
-                })
-                .await?;
-            let session = self
-                .sessions
-                .get(opened.session_id)
-                .await
-                .map_err(internal)?
-                .ok_or_else(|| KernelError::NotFound("scheduled session not found".to_string()))?;
-            let turn_id = Uuid::new_v4();
-            let turn_result = self
-                .execute_session_turn_serialized(
-                    session.clone(),
-                    SessionTurnExecution {
-                        turn_id,
-                        kind: SessionTurnKind::Normal,
-                        display_user_text: job.prompt_text.clone(),
-                        prompt_user_text: job.prompt_text.clone(),
-                        requested_runtime_id: Some(job.runtime_id.clone()),
-                        runtime_working_dir: None,
-                        runtime_timeout_ms: None,
-                        runtime_env_passthrough: None,
-                        selected_skills: SelectedSkillMode::Explicit(job.skill_ids.clone()),
-                        default_policy_scope: Scope::Job(job.job_id),
-                        sink: None,
-                        audit_actor: "scheduler".to_string(),
-                    },
-                )
-                .await;
-
-            match turn_result {
-                Ok(response) => {
-                    let delivery_status = self
-                        .deliver_scheduled_job_result(&job, &response.assistant_text)
-                        .await;
-                    let updated_job = self
-                        .jobs
-                        .complete_run_success(
-                            current_run.run_id,
-                            response.session_id,
-                            response.turn_id,
-                            delivery_status,
-                        )
-                        .await
-                        .map_err(internal)?
-                        .ok_or_else(|| {
-                            KernelError::NotFound(
-                                "scheduled job disappeared during completion".to_string(),
-                            )
-                        })?;
-                    let final_run = self.latest_job_run(job.job_id).await?.ok_or_else(|| {
-                        KernelError::NotFound("scheduled job run disappeared".to_string())
-                    })?;
-                    self.audit
-                        .append(
-                            "job.run.completed",
-                            Some(response.session_id),
-                            Some("scheduler".to_string()),
-                            json!({
-                                "job_id": job.job_id,
-                                "run_id": final_run.run_id,
-                                "turn_id": response.turn_id,
-                                "delivery_status": delivery_status.as_str(),
-                            }),
-                        )
-                        .await
-                        .map_err(internal)?;
-                    return Ok((updated_job, final_run));
-                }
-                Err(err) => {
-                    if current_run.attempt_no <= job.retry_attempts {
-                        current_run = self
-                            .jobs
-                            .begin_retry_run(current_run.run_id, Utc::now())
-                            .await
-                            .map_err(internal)?
-                            .ok_or_else(|| {
-                                KernelError::Conflict(
-                                    "scheduled retry could not be started".to_string(),
-                                )
-                            })?;
-                        self.audit
-                            .append(
-                                "job.run.retry",
-                                Some(opened.session_id),
-                                Some("scheduler".to_string()),
-                                json!({
-                                    "job_id": job.job_id,
-                                    "run_id": current_run.run_id,
-                                    "attempt_no": current_run.attempt_no,
-                                }),
-                            )
-                            .await
-                            .map_err(internal)?;
-                        continue;
-                    }
-
-                    let failure_summary = format!("Scheduled job '{}' failed: {}", job.name, err);
-                    let delivery_status = self
-                        .deliver_scheduled_job_result(&job, &failure_summary)
-                        .await;
-                    let updated_job = self
-                        .jobs
-                        .complete_run_failure(
-                            current_run.run_id,
-                            Some(opened.session_id),
-                            Some(turn_id),
-                            &err.to_string(),
-                            SchedulerJobRunStatus::DeadLetter,
-                            delivery_status,
-                        )
-                        .await
-                        .map_err(internal)?
-                        .ok_or_else(|| {
-                            KernelError::NotFound(
-                                "scheduled job disappeared during failure completion".to_string(),
-                            )
-                        })?;
-                    let final_run = self.latest_job_run(job.job_id).await?.ok_or_else(|| {
-                        KernelError::NotFound("scheduled job run disappeared".to_string())
-                    })?;
-                    self.audit
-                        .append(
-                            "job.run.failed",
-                            Some(opened.session_id),
-                            Some("scheduler".to_string()),
-                            json!({
-                                "job_id": job.job_id,
-                                "run_id": final_run.run_id,
-                                "error": err.to_string(),
-                                "delivery_status": delivery_status.as_str(),
-                            }),
-                        )
-                        .await
-                        .map_err(internal)?;
-                    return Ok((updated_job, final_run));
-                }
-            }
-        }
+    pub(super) fn job_store(&self) -> &JobStore {
+        &self.jobs
     }
 
-    async fn latest_job_run(
+    pub(super) fn audit_log(&self) -> &AuditLog {
+        &self.audit
+    }
+
+    pub(super) async fn execute_scheduled_job_turn(
         &self,
-        job_id: Uuid,
-    ) -> Result<Option<SchedulerJobRunRecord>, KernelError> {
-        Ok(self
-            .jobs
-            .list_runs(job_id, 1)
+        session_id: Uuid,
+        turn_id: Uuid,
+        job: &SchedulerJobRecord,
+    ) -> Result<SessionTurnResponse, KernelError> {
+        let session = self
+            .sessions
+            .get(session_id)
             .await
             .map_err(internal)?
-            .into_iter()
-            .next())
-    }
-
-    async fn deliver_scheduled_job_result(
-        &self,
-        job: &SchedulerJobRecord,
-        content: &str,
-    ) -> SchedulerJobDeliveryStatus {
-        let Some(delivery) = &job.delivery else {
-            return SchedulerJobDeliveryStatus::NotRequested;
-        };
-        let text = if content.trim().is_empty() {
-            format!(
-                "Scheduled job '{}' completed with no assistant output.",
-                job.name
-            )
-        } else {
-            content.to_string()
-        };
-        match self
-            .emit_channel_message(&delivery.channel_id, &delivery.peer_id, None, None, &text)
-            .await
-        {
-            Ok(_) => SchedulerJobDeliveryStatus::Delivered,
-            Err(_) => SchedulerJobDeliveryStatus::Failed,
-        }
+            .ok_or_else(|| KernelError::NotFound("scheduled session not found".to_string()))?;
+        self.execute_session_turn_serialized(
+            session,
+            SessionTurnExecution {
+                turn_id,
+                kind: SessionTurnKind::Normal,
+                display_user_text: job.prompt_text.clone(),
+                prompt_user_text: job.prompt_text.clone(),
+                requested_runtime_id: Some(job.runtime_id.clone()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+                selected_skills: SelectedSkillMode::Explicit(job.skill_ids.clone()),
+                default_policy_scope: Scope::Job(job.job_id),
+                sink: None,
+                audit_actor: "scheduler".to_string(),
+            },
+        )
+        .await
     }
 
     pub async fn query_audit(
@@ -3336,7 +3104,7 @@ impl Kernel {
         format!("{channel_id}:{peer_id}")
     }
 
-    async fn emit_channel_message(
+    pub(super) async fn emit_channel_message(
         &self,
         channel_id: &str,
         peer_id: &str,

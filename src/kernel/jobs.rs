@@ -405,7 +405,15 @@ impl JobStore {
         for row in rows {
             let job = map_job_row(row)?;
             if let Some(claim) = self
-                .claim_job_run(job.job_id, trigger_kind, job.next_run_at, 1, true, now)
+                .claim_job_run(
+                    job.job_id,
+                    trigger_kind,
+                    job.next_run_at,
+                    1,
+                    true,
+                    true,
+                    now,
+                )
                 .await?
             {
                 claimed.push(claim);
@@ -426,6 +434,7 @@ impl JobStore {
             Some(now),
             1,
             false,
+            false,
             now,
         )
         .await
@@ -438,6 +447,7 @@ impl JobStore {
         scheduled_for: Option<DateTime<Utc>>,
         attempt_no: u32,
         advance_schedule: bool,
+        require_enabled: bool,
         now: DateTime<Utc>,
     ) -> Result<Option<ClaimedSchedulerJob>> {
         let mut tx = self
@@ -465,7 +475,7 @@ impl JobStore {
             return Ok(None);
         };
         let job = map_job_row(row)?;
-        if !job.enabled || job.running_run_id.is_some() {
+        if (require_enabled && !job.enabled) || job.running_run_id.is_some() {
             tx.commit()
                 .await
                 .context("failed to finish skipped claim transaction")?;

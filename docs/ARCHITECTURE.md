@@ -107,8 +107,8 @@ Channel bridge layout:
 Scheduler layout:
 
 - `kernel/jobs.rs`: typed schedules (`once`, `interval`, `cron`), job/run persistence, and lease-backed due-claiming.
-- `kernel/scheduler.rs`: scheduler config and runtime semaphore.
-- `kernel/core.rs`: job API methods, scheduler tick loop, scheduled session execution, and final-result channel delivery.
+- `kernel/scheduler.rs`: single-flight scheduler engine, lease coordination, scheduled session execution, and final-result channel delivery.
+- `kernel/core.rs`: thin job API/orchestration boundary that delegates scheduler execution.
 - `daemon.rs`: background scheduler loop inside `lionclawd`.
 
 Operator launch model:
@@ -175,7 +175,7 @@ Queued channel turns emit machine-stable status/error codes through the same str
 ## Scheduler Model
 
 - Time-based only in v1: `once`, anchored `interval`, and cron-with-timezone.
-- The scheduler is kernel-owned and daemon-driven. A single lease row prevents duplicate ticks.
+- The scheduler is kernel-owned, daemon-driven, and single-flight by design. A single lease row prevents duplicate or overlapping ticks.
 - Recurring jobs advance `next_run_at` before execution to avoid restart replay storms.
 - Interrupted one-shot jobs remain claimable; interrupted recurring jobs resume from the next future slot.
 - Every scheduled run opens a fresh synthetic session with:
@@ -185,6 +185,7 @@ Queued channel turns emit machine-stable status/error codes through the same str
 - Scheduled jobs use explicit attached skill ids. They do not use turn-time auto-selection.
 - Policy scope for scheduled work is `job:<job-id>`, separate from normal `session:<session-id>` checks.
 - Optional delivery sends the final result through the existing channel stream/outbox path without changing the latest interactive session for that peer.
+- Paused jobs are skipped by normal scheduler ticks but can still be run manually by the operator.
 
 ## Security Posture in v0
 

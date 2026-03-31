@@ -1,4 +1,10 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -6,20 +12,21 @@ use chrono::{Duration as ChronoDuration, Utc};
 use lionclaw::{
     contracts::{
         ChannelBindRequest, ChannelStreamPullRequest, ChannelStreamStartMode, JobCreateRequest,
-        JobRunsRequest, PolicyGrantRequest, SessionHistoryPolicy, SessionHistoryRequest,
-        SessionLatestQuery, SessionOpenRequest, SessionTurnRequest, SkillInstallRequest,
-        StreamEventKindDto, TrustTier,
+        JobRefRequest, JobRunsRequest, PolicyGrantRequest, SessionHistoryPolicy,
+        SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest, SessionTurnRequest,
+        SkillInstallRequest, StreamEventKindDto, TrustTier,
     },
     kernel::{
         runtime::{
             RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
-            RuntimeEventSender, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
-            RuntimeTurnResult,
+            RuntimeEventSender, RuntimeMessageLane, RuntimeSessionHandle, RuntimeSessionStartInput,
+            RuntimeTurnInput, RuntimeTurnResult,
         },
         InboundChannelText, Kernel, KernelOptions,
     },
 };
 use tempfile::TempDir;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -331,7 +338,164 @@ async fn scheduled_job_failure_delivers_summary_and_dead_letters() {
     }));
 }
 
+#[tokio::test]
+async fn paused_jobs_are_skipped_by_ticks_but_can_run_manually() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "paused brief".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "manual-only run".to_string(),
+            skill_ids: Vec::new(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create paused job");
+
+    kernel
+        .pause_job(created.job.job_id)
+        .await
+        .expect("pause job");
+
+    let tick = kernel.scheduler_tick().await.expect("run scheduler tick");
+    assert_eq!(tick.claimed_runs, 0);
+
+    let scheduled_runs = kernel
+        .list_job_runs(JobRunsRequest {
+            job_id: created.job.job_id,
+            limit: Some(5),
+        })
+        .await
+        .expect("list paused job runs")
+        .runs;
+    assert!(scheduled_runs.is_empty());
+
+    let manual = kernel
+        .run_job_now(JobRefRequest {
+            job_id: created.job.job_id,
+        })
+        .await
+        .expect("run paused job manually");
+    assert_eq!(
+        manual.run.status,
+        lionclaw::contracts::SchedulerJobRunStatusDto::Completed
+    );
+
+    let paused_job = kernel
+        .get_job(created.job.job_id)
+        .await
+        .expect("load paused job")
+        .job;
+    assert!(
+        !paused_job.enabled,
+        "manual runs must not implicitly re-enable paused jobs"
+    );
+    assert!(
+        paused_job.next_run_at.is_some(),
+        "manual runs must not rewrite the paused schedule"
+    );
+
+    let pause_audit = kernel
+        .query_audit(None, Some("job.pause".to_string()), None, Some(5))
+        .await
+        .expect("query pause audit");
+    assert!(pause_audit.events.iter().any(|event| {
+        event.details["job_id"].as_str() == Some(&created.job.job_id.to_string())
+    }));
+}
+
+#[tokio::test]
+async fn scheduler_ticks_are_single_flight_and_run_due_jobs_serially() {
+    let env = TestEnv::new();
+    let kernel = Arc::new(Kernel::new(&env.db_path()).await.expect("kernel init"));
+    let adapter = Arc::new(BlockingRuntimeAdapter::new());
+    kernel
+        .register_runtime_adapter("blocking", adapter.clone())
+        .await;
+
+    kernel
+        .create_job(JobCreateRequest {
+            name: "first due job".to_string(),
+            runtime_id: "blocking".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(2),
+            },
+            prompt_text: "first prompt".to_string(),
+            skill_ids: Vec::new(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create first job");
+    kernel
+        .create_job(JobCreateRequest {
+            name: "second due job".to_string(),
+            runtime_id: "blocking".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "second prompt".to_string(),
+            skill_ids: Vec::new(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create second job");
+
+    let kernel_for_tick = kernel.clone();
+    let first_tick =
+        tokio::spawn(async move { kernel_for_tick.scheduler_tick().await.expect("first tick") });
+
+    adapter.first_turn_started.notified().await;
+
+    let overlapping_tick = kernel.scheduler_tick().await.expect("overlapping tick");
+    assert_eq!(
+        overlapping_tick.claimed_runs, 0,
+        "the scheduler lease must stay held until the active tick finishes executing"
+    );
+
+    adapter.release_first_turn.notify_one();
+
+    let first_tick = first_tick.await.expect("join first tick");
+    assert_eq!(first_tick.claimed_runs, 2);
+    assert_eq!(
+        adapter.prompts(),
+        vec!["first prompt".to_string(), "second prompt".to_string()]
+    );
+}
+
 struct AlwaysFailRuntimeAdapter;
+
+struct BlockingRuntimeAdapter {
+    first_turn_started: Arc<Notify>,
+    release_first_turn: Arc<Notify>,
+    block_first_turn: AtomicBool,
+    prompts: Mutex<Vec<String>>,
+}
+
+impl BlockingRuntimeAdapter {
+    fn new() -> Self {
+        Self {
+            first_turn_started: Arc::new(Notify::new()),
+            release_first_turn: Arc::new(Notify::new()),
+            block_first_turn: AtomicBool::new(true),
+            prompts: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn prompts(&self) -> Vec<String> {
+        self.prompts.lock().expect("lock prompts").clone()
+    }
+}
 
 #[async_trait]
 impl RuntimeAdapter for AlwaysFailRuntimeAdapter {
@@ -362,6 +526,72 @@ impl RuntimeAdapter for AlwaysFailRuntimeAdapter {
             text: "intentional test failure".to_string(),
         });
         anyhow::bail!("intentional test failure")
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        _events: RuntimeEventSender,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for BlockingRuntimeAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "blocking".to_string(),
+            version: "0.1".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        _input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("blocking-{}", Uuid::new_v4()),
+        })
+    }
+
+    async fn turn(
+        &self,
+        input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        let observed_prompt = input
+            .prompt
+            .split("\n\n## User Input\n\n")
+            .last()
+            .unwrap_or(input.prompt.as_str())
+            .to_string();
+        self.prompts
+            .lock()
+            .expect("lock prompts")
+            .push(observed_prompt);
+
+        if self.block_first_turn.swap(false, Ordering::SeqCst) {
+            self.first_turn_started.notify_one();
+            self.release_first_turn.notified().await;
+        }
+
+        let _ = events.send(RuntimeEvent::MessageDelta {
+            lane: RuntimeMessageLane::Answer,
+            text: format!("[blocking] {}", input.prompt),
+        });
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(RuntimeTurnResult::default())
     }
 
     async fn resolve_capability_requests(
