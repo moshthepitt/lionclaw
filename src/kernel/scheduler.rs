@@ -76,17 +76,7 @@ impl SchedulerEngine {
                     .await;
                 claimed_runs += 1;
 
-                if let Err(err) = self.run_claimed_job(kernel, claimed_job).await {
-                    let _ = kernel
-                        .audit_log()
-                        .append(
-                            "job.run.execution_failed",
-                            None,
-                            Some("scheduler".to_string()),
-                            json!({"error": err.to_string()}),
-                        )
-                        .await;
-                }
+                let _ = self.run_claimed_job(kernel, claimed_job).await;
             }
 
             Ok(JobTickResponse { claimed_runs })
@@ -137,6 +127,19 @@ impl SchedulerEngine {
                         .interrupt_run(
                             current_run.run_id,
                             &format!("scheduled job execution failed unexpectedly: {err}"),
+                        )
+                        .await;
+                    let _ = kernel
+                        .audit_log()
+                        .append(
+                            "job.run.execution_failed",
+                            None,
+                            Some("scheduler".to_string()),
+                            json!({
+                                "job_id": job.job_id,
+                                "run_id": current_run.run_id,
+                                "error": err.to_string(),
+                            }),
                         )
                         .await;
                     return Err(err);
