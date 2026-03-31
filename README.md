@@ -66,6 +66,43 @@ Inside the interactive REPL:
 - `/reset` opens a fresh session
 - `/exit` leaves the REPL
 
+## One real recurring workflow
+
+LionClaw can now run time-based jobs in fresh isolated sessions and optionally
+deliver the final result back through a channel.
+
+For a local terminal briefing loop:
+
+```bash
+./target/release/lionclaw skill add skills/channel-terminal --alias terminal
+./target/release/lionclaw channel add terminal --launch interactive
+./target/release/lionclaw channel attach terminal --runtime codex
+
+./target/release/lionclaw job add daily-brief \
+  --runtime codex \
+  --schedule "every 1d" \
+  --prompt "Inspect the current workspace and send me a short engineering brief with risks, drift, and next steps." \
+  --deliver-channel terminal \
+  --deliver-peer mosh
+```
+
+Inspect or control jobs with:
+
+```bash
+./target/release/lionclaw job ls
+./target/release/lionclaw job show <job-id>
+./target/release/lionclaw job runs <job-id>
+./target/release/lionclaw job run <job-id>
+./target/release/lionclaw job pause <job-id>
+./target/release/lionclaw job resume <job-id>
+./target/release/lionclaw job rm <job-id>
+```
+
+When LionClaw is running in the background, `lionclawd` ticks the scheduler
+every 30 seconds. Each scheduled run opens a fresh `scheduler` session, keeps
+job-scoped policy separate from normal interactive turns, stores the full turn
+history, and delivers only the final message to the configured channel.
+
 ## Channels and background mode
 
 When you want LionClaw available somewhere other than the direct CLI path,

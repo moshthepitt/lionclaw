@@ -47,6 +47,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .await?,
     );
     register_configured_runtimes(&kernel, &operator_config).await?;
+    let scheduler_kernel = kernel.clone();
+    tokio::spawn(async move {
+        scheduler_kernel.run_scheduler_loop().await;
+    });
     let app = build_router(
         kernel,
         DaemonInfoResponse {

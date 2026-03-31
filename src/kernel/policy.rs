@@ -55,6 +55,7 @@ impl FromStr for Capability {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     Any,
+    Job(Uuid),
     Session(Uuid),
     Channel(String),
     Runtime(String),
@@ -65,6 +66,7 @@ impl Scope {
     pub fn as_str(&self) -> String {
         match self {
             Self::Any => "*".to_string(),
+            Self::Job(id) => format!("job:{}", id),
             Self::Session(id) => format!("session:{}", id),
             Self::Channel(id) => format!("channel:{}", id),
             Self::Runtime(id) => format!("runtime:{}", id),
@@ -83,6 +85,11 @@ impl FromStr for Scope {
         }
         if value == "*" {
             return Ok(Self::Any);
+        }
+        if let Some(rest) = value.strip_prefix("job:") {
+            return Uuid::parse_str(rest)
+                .map(Self::Job)
+                .map_err(|_| format!("invalid job scope '{}'", value));
         }
         if let Some(rest) = value.strip_prefix("session:") {
             return Uuid::parse_str(rest)
