@@ -345,6 +345,19 @@ impl JobStore {
         rows.into_iter().map(map_run_row).collect()
     }
 
+    pub async fn get_run(&self, run_id: Uuid) -> Result<Option<SchedulerJobRunRecord>> {
+        let row = sqlx::query(
+            "SELECT run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
+             status, session_id, turn_id, delivery_status, error_text \
+             FROM scheduler_job_runs WHERE run_id = ?1",
+        )
+        .bind(run_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load scheduler job run")?;
+        row.map(map_run_row).transpose()
+    }
+
     pub async fn try_acquire_tick_lease(&self, owner: &str, ttl: Duration) -> Result<bool> {
         let now = now_ms();
         let lease_expires = now + i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
@@ -361,6 +374,22 @@ impl JobStore {
         .execute(&self.pool)
         .await
         .context("failed to acquire scheduler tick lease")?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn renew_tick_lease(&self, owner: &str, ttl: Duration) -> Result<bool> {
+        let now = now_ms();
+        let lease_expires = now + i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
+        let result = sqlx::query(
+            "UPDATE scheduler_state \
+             SET lease_expires_at_ms = ?2 \
+             WHERE state_id = 1 AND lease_owner = ?1",
+        )
+        .bind(owner)
+        .bind(lease_expires)
+        .execute(&self.pool)
+        .await
+        .context("failed to renew scheduler tick lease")?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -872,6 +901,86 @@ impl JobStore {
         Ok(Some(map_job_row(updated_job_row)?))
     }
 
+    pub async fn interrupt_run(
+        &self,
+        run_id: Uuid,
+        error_text: &str,
+    ) -> Result<Option<SchedulerJobRunRecord>> {
+        let finished_at_ms = now_ms();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start interrupt scheduler run transaction")?;
+
+        let run_row = sqlx::query(
+            "SELECT run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
+             status, session_id, turn_id, delivery_status, error_text \
+             FROM scheduler_job_runs WHERE run_id = ?1",
+        )
+        .bind(run_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .context("failed to load scheduler run for interrupt")?;
+        let Some(run_row) = run_row else {
+            tx.commit()
+                .await
+                .context("failed to finish empty interrupt scheduler run transaction")?;
+            return Ok(None);
+        };
+
+        let run = map_run_row(run_row)?;
+        if run.status != SchedulerJobRunStatus::Running {
+            tx.commit()
+                .await
+                .context("failed to finish already-final scheduler run transaction")?;
+            return Ok(Some(run));
+        }
+
+        sqlx::query(
+            "UPDATE scheduler_job_runs \
+             SET finished_at_ms = ?2, status = ?3, error_text = ?4 \
+             WHERE run_id = ?1",
+        )
+        .bind(run_id.to_string())
+        .bind(finished_at_ms)
+        .bind(SchedulerJobRunStatus::Interrupted.as_str())
+        .bind(error_text)
+        .execute(&mut *tx)
+        .await
+        .context("failed to interrupt scheduler job run")?;
+
+        sqlx::query(
+            "UPDATE scheduler_jobs \
+             SET running_run_id = NULL, last_status = ?2, last_error = ?3, updated_at_ms = ?4 \
+             WHERE job_id = ?1 AND running_run_id = ?5",
+        )
+        .bind(run.job_id.to_string())
+        .bind(SchedulerJobRunStatus::Interrupted.as_str())
+        .bind(error_text)
+        .bind(finished_at_ms)
+        .bind(run_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .context("failed to clear interrupted scheduler job state")?;
+
+        let updated_run_row = sqlx::query(
+            "SELECT run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
+             status, session_id, turn_id, delivery_status, error_text \
+             FROM scheduler_job_runs WHERE run_id = ?1",
+        )
+        .bind(run_id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .context("failed to reload interrupted scheduler job run")?;
+
+        tx.commit()
+            .await
+            .context("failed to commit interrupted scheduler job run")?;
+
+        Ok(Some(map_run_row(updated_run_row)?))
+    }
+
     pub async fn interrupt_running_runs(
         &self,
         error_text: &str,
@@ -1375,5 +1484,79 @@ mod tests {
             .try_acquire_tick_lease("owner-b", Duration::from_secs(60))
             .await
             .expect("second owner acquires released lease"));
+    }
+
+    #[tokio::test]
+    async fn renewed_tick_lease_stays_owned_past_original_expiry() {
+        let store = new_store().await;
+
+        assert!(store
+            .try_acquire_tick_lease("owner-a", Duration::from_millis(80))
+            .await
+            .expect("acquire first lease"));
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(store
+            .renew_tick_lease("owner-a", Duration::from_millis(200))
+            .await
+            .expect("renew first lease"));
+
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        assert!(!store
+            .try_acquire_tick_lease("owner-b", Duration::from_millis(80))
+            .await
+            .expect("renewed lease should still block another owner"));
+    }
+
+    #[tokio::test]
+    async fn interrupt_run_reconciles_only_the_targeted_running_job() {
+        let store = new_store().await;
+        let job = store
+            .create_job(NewSchedulerJob {
+                name: "interrupt-target".to_string(),
+                runtime_id: "mock".to_string(),
+                schedule: JobSchedule::Once {
+                    run_at: Utc::now() - ChronoDuration::minutes(1),
+                },
+                prompt_text: "prompt".to_string(),
+                skill_ids: Vec::new(),
+                delivery: None,
+                retry_attempts: 0,
+            })
+            .await
+            .expect("create interrupt job");
+
+        let claimed = store
+            .claim_due_jobs(Utc::now(), 1, SchedulerJobTriggerKind::Schedule)
+            .await
+            .expect("claim interrupt job");
+        let run_id = claimed[0].run.run_id;
+
+        let interrupted = store
+            .interrupt_run(run_id, "unexpected scheduler failure")
+            .await
+            .expect("interrupt targeted run")
+            .expect("interrupted run");
+        assert_eq!(interrupted.run_id, run_id);
+        assert_eq!(interrupted.status, SchedulerJobRunStatus::Interrupted);
+        assert_eq!(
+            interrupted.error_text.as_deref(),
+            Some("unexpected scheduler failure")
+        );
+
+        let updated_job = store
+            .get_job(job.job_id)
+            .await
+            .expect("load updated job")
+            .expect("job should exist");
+        assert!(updated_job.running_run_id.is_none());
+        assert_eq!(
+            updated_job.last_status.as_deref(),
+            Some(SchedulerJobRunStatus::Interrupted.as_str())
+        );
+        assert_eq!(
+            updated_job.last_error.as_deref(),
+            Some("unexpected scheduler failure")
+        );
     }
 }
