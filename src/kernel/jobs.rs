@@ -400,12 +400,15 @@ impl JobStore {
         let Some(job) = self.get_job(job_id).await? else {
             return Ok(None);
         };
+        if job.enabled {
+            return Ok(Some(job));
+        }
         let next_run_at = compute_initial_next_run(&job.schedule, Utc::now())?;
         let now = now_ms();
         let updated = sqlx::query(
             "UPDATE scheduler_jobs \
              SET enabled = 1, next_run_at_ms = ?2, updated_at_ms = ?3 \
-             WHERE job_id = ?1 AND running_run_id IS NULL",
+             WHERE job_id = ?1 AND running_run_id IS NULL AND enabled = 0",
         )
         .bind(job_id.to_string())
         .bind(next_run_at.map(|value| value.timestamp_millis()))
@@ -1497,6 +1500,45 @@ mod tests {
                 .expect("list jobs after rollback")
                 .is_empty(),
             "failed grant creation must not leave a scheduler job behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_enabled_job_keeps_existing_schedule() {
+        let store = new_store().await;
+        let initial_run_at = Utc::now() + ChronoDuration::minutes(5);
+        let job = store
+            .create_job(NewSchedulerJob {
+                name: "resume-idempotent".to_string(),
+                runtime_id: "mock".to_string(),
+                schedule: JobSchedule::Once {
+                    run_at: initial_run_at,
+                },
+                prompt_text: "prompt".to_string(),
+                skill_ids: Vec::new(),
+                delivery: None,
+                retry_attempts: 0,
+            })
+            .await
+            .expect("create job");
+
+        let before = job
+            .next_run_at
+            .expect("enabled job should have a next run time");
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let resumed = store
+            .resume_job(job.job_id)
+            .await
+            .expect("resume enabled job")
+            .expect("job should still exist");
+
+        assert!(resumed.enabled);
+        assert_eq!(
+            resumed.next_run_at,
+            Some(before),
+            "resuming an already-enabled job must not shift its schedule"
         );
     }
 
