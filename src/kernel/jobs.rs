@@ -184,6 +184,16 @@ pub struct ClaimedSchedulerJob {
     pub run: SchedulerJobRunRecord,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct JobRunClaim {
+    trigger_kind: SchedulerJobTriggerKind,
+    scheduled_for: Option<DateTime<Utc>>,
+    attempt_no: u32,
+    advance_schedule: bool,
+    require_enabled: bool,
+    now: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 pub struct JobStore {
     pool: SqlitePool,
@@ -210,7 +220,7 @@ impl JobStore {
         let delivery_json = input
             .delivery
             .as_ref()
-            .map(|value| serde_json::to_string(value))
+            .map(serde_json::to_string)
             .transpose()
             .context("failed to encode job delivery target")?;
 
@@ -436,12 +446,14 @@ impl JobStore {
             if let Some(claim) = self
                 .claim_job_run(
                     job.job_id,
-                    trigger_kind,
-                    job.next_run_at,
-                    1,
-                    true,
-                    true,
-                    now,
+                    JobRunClaim {
+                        trigger_kind,
+                        scheduled_for: job.next_run_at,
+                        attempt_no: 1,
+                        advance_schedule: true,
+                        require_enabled: true,
+                        now,
+                    },
                 )
                 .await?
             {
@@ -459,12 +471,14 @@ impl JobStore {
     ) -> Result<Option<ClaimedSchedulerJob>> {
         self.claim_job_run(
             job_id,
-            SchedulerJobTriggerKind::Manual,
-            Some(now),
-            1,
-            false,
-            false,
-            now,
+            JobRunClaim {
+                trigger_kind: SchedulerJobTriggerKind::Manual,
+                scheduled_for: Some(now),
+                attempt_no: 1,
+                advance_schedule: false,
+                require_enabled: false,
+                now,
+            },
         )
         .await
     }
@@ -472,13 +486,16 @@ impl JobStore {
     async fn claim_job_run(
         &self,
         job_id: Uuid,
-        trigger_kind: SchedulerJobTriggerKind,
-        scheduled_for: Option<DateTime<Utc>>,
-        attempt_no: u32,
-        advance_schedule: bool,
-        require_enabled: bool,
-        now: DateTime<Utc>,
+        claim: JobRunClaim,
     ) -> Result<Option<ClaimedSchedulerJob>> {
+        let JobRunClaim {
+            trigger_kind,
+            scheduled_for,
+            attempt_no,
+            advance_schedule,
+            require_enabled,
+            now,
+        } = claim;
         let mut tx = self
             .pool
             .begin()
@@ -519,17 +536,31 @@ impl JobStore {
             job.next_run_at
         };
 
-        let updated = sqlx::query(
-            "UPDATE scheduler_jobs \
-             SET next_run_at_ms = ?2, running_run_id = ?3, updated_at_ms = ?4 \
-             WHERE job_id = ?1 AND running_run_id IS NULL",
-        )
-        .bind(job_id.to_string())
-        .bind(next_run_at.map(|value| value.timestamp_millis()))
-        .bind(run_id.to_string())
-        .bind(started_at_ms)
-        .execute(&mut *tx)
-        .await
+        let updated = if require_enabled {
+            sqlx::query(
+                "UPDATE scheduler_jobs \
+                 SET next_run_at_ms = ?2, running_run_id = ?3, updated_at_ms = ?4 \
+                 WHERE job_id = ?1 AND running_run_id IS NULL AND enabled = 1",
+            )
+            .bind(job_id.to_string())
+            .bind(next_run_at.map(|value| value.timestamp_millis()))
+            .bind(run_id.to_string())
+            .bind(started_at_ms)
+            .execute(&mut *tx)
+            .await
+        } else {
+            sqlx::query(
+                "UPDATE scheduler_jobs \
+                 SET next_run_at_ms = ?2, running_run_id = ?3, updated_at_ms = ?4 \
+                 WHERE job_id = ?1 AND running_run_id IS NULL",
+            )
+            .bind(job_id.to_string())
+            .bind(next_run_at.map(|value| value.timestamp_millis()))
+            .bind(run_id.to_string())
+            .bind(started_at_ms)
+            .execute(&mut *tx)
+            .await
+        }
         .context("failed to mark scheduler job running")?;
         if updated.rows_affected() == 0 {
             tx.commit()

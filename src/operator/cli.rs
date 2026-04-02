@@ -206,7 +206,7 @@ enum ChannelPairingCommand {
 
 #[derive(Debug, Subcommand)]
 enum JobCommand {
-    Add(JobAddArgs),
+    Add(Box<JobAddArgs>),
     Ls,
     Show(JobRefArgs),
     Pause(JobRefArgs),
@@ -489,6 +489,7 @@ pub async fn run() -> Result<()> {
             let kernel = open_kernel(&home, &applied.config, None).await?;
             match command {
                 JobCommand::Add(args) => {
+                    let args = *args;
                     let runtime_id = resolve_runtime_id(&applied.config, args.runtime.as_deref())?;
                     let prompt_text = load_job_prompt(args.prompt, args.prompt_file).await?;
                     let schedule = parse_job_schedule_spec(&args.schedule, args.tz.as_deref())?;
@@ -757,6 +758,61 @@ fn parse_job_duration_ms(raw: &str) -> Result<u64> {
         .ok_or_else(|| anyhow!("duration '{}' is too large", raw))
 }
 
+fn build_runtime_profile(
+    args: &RuntimeAddArgs,
+    executable: String,
+) -> Result<RuntimeProfileConfig> {
+    match args.kind.trim() {
+        "codex" => {
+            reject_opencode_only_flags(args)?;
+            Ok(RuntimeProfileConfig::Codex {
+                executable,
+                model: args.model.clone(),
+                sandbox: args.sandbox.clone(),
+                skip_git_repo_check: !args.no_skip_git_repo_check,
+                ephemeral: !args.no_ephemeral,
+            })
+        }
+        "opencode" => {
+            reject_codex_only_flags(args)?;
+            Ok(RuntimeProfileConfig::OpenCode {
+                executable,
+                format: args.format.clone(),
+                model: args.model.clone(),
+                agent: args.agent.clone(),
+                xdg_data_home: args.xdg_data_home.clone(),
+                continue_last_session: args.continue_last_session,
+            })
+        }
+        other => Err(anyhow!(
+            "unsupported runtime kind '{}'; expected 'codex' or 'opencode'",
+            other
+        )),
+    }
+}
+
+fn reject_opencode_only_flags(args: &RuntimeAddArgs) -> Result<()> {
+    if args.agent.is_some()
+        || args.xdg_data_home.is_some()
+        || args.continue_last_session
+        || args.format != "json"
+    {
+        return Err(anyhow!(
+            "opencode-specific flags are not valid for kind 'codex'"
+        ));
+    }
+    Ok(())
+}
+
+fn reject_codex_only_flags(args: &RuntimeAddArgs) -> Result<()> {
+    if args.no_skip_git_repo_check || args.no_ephemeral || args.sandbox != "read-only" {
+        return Err(anyhow!(
+            "codex-specific flags are not valid for kind 'opencode'"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,59 +890,4 @@ mod tests {
 
         assert_eq!(prompt, "repo status brief");
     }
-}
-
-fn build_runtime_profile(
-    args: &RuntimeAddArgs,
-    executable: String,
-) -> Result<RuntimeProfileConfig> {
-    match args.kind.trim() {
-        "codex" => {
-            reject_opencode_only_flags(args)?;
-            Ok(RuntimeProfileConfig::Codex {
-                executable,
-                model: args.model.clone(),
-                sandbox: args.sandbox.clone(),
-                skip_git_repo_check: !args.no_skip_git_repo_check,
-                ephemeral: !args.no_ephemeral,
-            })
-        }
-        "opencode" => {
-            reject_codex_only_flags(args)?;
-            Ok(RuntimeProfileConfig::OpenCode {
-                executable,
-                format: args.format.clone(),
-                model: args.model.clone(),
-                agent: args.agent.clone(),
-                xdg_data_home: args.xdg_data_home.clone(),
-                continue_last_session: args.continue_last_session,
-            })
-        }
-        other => Err(anyhow!(
-            "unsupported runtime kind '{}'; expected 'codex' or 'opencode'",
-            other
-        )),
-    }
-}
-
-fn reject_opencode_only_flags(args: &RuntimeAddArgs) -> Result<()> {
-    if args.agent.is_some()
-        || args.xdg_data_home.is_some()
-        || args.continue_last_session
-        || args.format != "json"
-    {
-        return Err(anyhow!(
-            "opencode-specific flags are not valid for kind 'codex'"
-        ));
-    }
-    Ok(())
-}
-
-fn reject_codex_only_flags(args: &RuntimeAddArgs) -> Result<()> {
-    if args.no_skip_git_repo_check || args.no_ephemeral || args.sandbox != "read-only" {
-        return Err(anyhow!(
-            "codex-specific flags are not valid for kind 'opencode'"
-        ));
-    }
-    Ok(())
 }

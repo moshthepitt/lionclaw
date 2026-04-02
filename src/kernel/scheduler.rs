@@ -120,7 +120,7 @@ impl SchedulerEngine {
                 Ok(AttemptOutcome::Retry(next_run)) => {
                     current_run = next_run;
                 }
-                Ok(AttemptOutcome::Finished(result)) => return Ok(result),
+                Ok(AttemptOutcome::Finished(result)) => return Ok(*result),
                 Err(err) => {
                     let _ = kernel
                         .job_store()
@@ -248,7 +248,7 @@ impl SchedulerEngine {
                         }),
                     )
                     .await;
-                Ok(AttemptOutcome::Finished((updated_job, final_run)))
+                Ok(AttemptOutcome::Finished(Box::new((updated_job, final_run))))
             }
             Err(err) => {
                 if current_run.attempt_no <= job.retry_attempts {
@@ -319,7 +319,7 @@ impl SchedulerEngine {
                         }),
                     )
                     .await;
-                Ok(AttemptOutcome::Finished((updated_job, final_run)))
+                Ok(AttemptOutcome::Finished(Box::new((updated_job, final_run))))
             }
         }
     }
@@ -360,7 +360,7 @@ struct TickLeaseRenewal {
 
 enum AttemptOutcome {
     Retry(SchedulerJobRunRecord),
-    Finished((SchedulerJobRecord, SchedulerJobRunRecord)),
+    Finished(Box<(SchedulerJobRecord, SchedulerJobRunRecord)>),
 }
 
 impl TickLeaseRenewal {

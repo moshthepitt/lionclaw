@@ -25,6 +25,7 @@ use lionclaw::{
         InboundChannelText, Kernel, KernelOptions,
     },
 };
+use sqlx::SqlitePool;
 use tempfile::TempDir;
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -412,6 +413,56 @@ async fn paused_jobs_are_skipped_by_ticks_but_can_run_manually() {
 }
 
 #[tokio::test]
+async fn removing_job_revokes_job_scoped_policy_grants() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let skill_id = install_enabled_skill(&kernel, "scheduler-remove-guard").await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "grant cleanup".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() + ChronoDuration::minutes(5),
+            },
+            prompt_text: "grant cleanup".to_string(),
+            skill_ids: vec![skill_id],
+            allow_capabilities: vec!["fs.read".to_string()],
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create cleanup job");
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    let scope = format!("job:{}", created.job.job_id);
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM policy_grants WHERE scope = ?1")
+        .bind(&scope)
+        .fetch_one(&pool)
+        .await
+        .expect("count job-scoped grants before delete");
+    assert_eq!(
+        before, 2,
+        "create_job should add skill.use and the allowed capability for the job scope"
+    );
+
+    let removed = kernel
+        .remove_job(created.job.job_id)
+        .await
+        .expect("remove cleanup job");
+    assert!(removed.removed);
+
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM policy_grants WHERE scope = ?1")
+        .bind(&scope)
+        .fetch_one(&pool)
+        .await
+        .expect("count job-scoped grants after delete");
+    assert_eq!(after, 0, "removing a job must revoke its scoped grants");
+}
+
+#[tokio::test]
 async fn scheduler_ticks_are_single_flight_and_run_due_jobs_serially() {
     let env = TestEnv::new();
     let kernel = Arc::new(Kernel::new(&env.db_path()).await.expect("kernel init"));
@@ -692,5 +743,9 @@ impl TestEnv {
 
     fn db_path(&self) -> PathBuf {
         self.temp_dir.path().join("lionclaw.db")
+    }
+
+    fn db_url(&self) -> String {
+        format!("sqlite://{}", self.db_path().display())
     }
 }

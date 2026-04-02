@@ -1655,12 +1655,20 @@ impl Kernel {
                 "job is running and cannot be removed".to_string(),
             ));
         }
+        let revoked_policy_grants = self
+            .policy
+            .revoke_scope(&Scope::Job(job_id))
+            .await
+            .map_err(internal)?;
         self.audit
             .append(
                 "job.remove",
                 None,
                 Some("api".to_string()),
-                json!({"job_id": job_id}),
+                json!({
+                    "job_id": job_id,
+                    "revoked_policy_grants": revoked_policy_grants,
+                }),
             )
             .await
             .map_err(internal)?;
@@ -2359,6 +2367,15 @@ struct RuntimeCapabilityFollowupExecution<'a> {
     event_sink: Option<RuntimeEventSink>,
 }
 
+struct RuntimeCapabilityEvaluation<'a> {
+    session_id: Uuid,
+    turn_id: Uuid,
+    session_channel_id: &'a str,
+    session_peer_id: &'a str,
+    default_policy_scope: &'a Scope,
+    allowed_skill_ids: &'a [String],
+}
+
 struct RuntimeTurnAbortExecution<'a> {
     adapter: &'a dyn RuntimeAdapter,
     handle: &'a RuntimeSessionHandle,
@@ -2590,12 +2607,14 @@ impl Kernel {
             if !runtime_turn.result.capability_requests.is_empty() {
                 let capability_results = self
                     .evaluate_capability_requests(
-                        session.session_id,
-                        turn_id,
-                        &session.channel_id,
-                        &session.peer_id,
-                        &default_policy_scope,
-                        &allowed_skills,
+                        RuntimeCapabilityEvaluation {
+                            session_id: session.session_id,
+                            turn_id,
+                            session_channel_id: &session.channel_id,
+                            session_peer_id: &session.peer_id,
+                            default_policy_scope: &default_policy_scope,
+                            allowed_skill_ids: &allowed_skills,
+                        },
                         runtime_turn.result.capability_requests,
                     )
                     .await?;
@@ -4085,14 +4104,17 @@ impl Kernel {
 
     async fn evaluate_capability_requests(
         &self,
-        session_id: uuid::Uuid,
-        turn_id: uuid::Uuid,
-        session_channel_id: &str,
-        session_peer_id: &str,
-        default_policy_scope: &Scope,
-        allowed_skill_ids: &[String],
+        evaluation: RuntimeCapabilityEvaluation<'_>,
         requests: Vec<RuntimeCapabilityRequest>,
     ) -> Result<Vec<RuntimeCapabilityResult>, KernelError> {
+        let RuntimeCapabilityEvaluation {
+            session_id,
+            turn_id,
+            session_channel_id,
+            session_peer_id,
+            default_policy_scope,
+            allowed_skill_ids,
+        } = evaluation;
         let any_scope = Scope::Any;
 
         let mut results = Vec::with_capacity(requests.len());
@@ -4121,7 +4143,11 @@ impl Kernel {
                 match request.scope.as_deref() {
                     Some(raw_scope) => match Scope::from_str(raw_scope) {
                         Ok(parsed) => {
-                            decision_scope = parsed;
+                            if parsed == *default_policy_scope {
+                                decision_scope = parsed;
+                            } else {
+                                reason = Some("runtime cannot override policy scope".to_string());
+                            }
                         }
                         Err(err) => {
                             reason = Some(format!("invalid scope from runtime: {}", err));

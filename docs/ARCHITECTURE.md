@@ -84,7 +84,7 @@
 Runtime adapters submit `RuntimeCapabilityRequest` items. Kernel flow:
 
 1. Validate requesting skill is selected for the turn.
-2. Evaluate policy for requested capability and scope.
+2. Evaluate policy for the requested capability against the kernel-selected scope. Runtime-supplied scope strings may restate that scope, but they cannot widen it to another job, session, channel, or runtime scope.
 3. If allowed, execute through kernel broker only.
 4. Return `RuntimeCapabilityResult` to adapter.
 5. Audit both request and result (`capability.request`, `capability.result`).

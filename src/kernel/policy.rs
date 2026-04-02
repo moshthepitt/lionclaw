@@ -213,6 +213,16 @@ impl PolicyStore {
         Ok(deleted.rows_affected() > 0)
     }
 
+    pub async fn revoke_scope(&self, scope: &Scope) -> Result<u64> {
+        let deleted = sqlx::query("DELETE FROM policy_grants WHERE scope = ?1")
+            .bind(scope.as_str())
+            .execute(&self.pool)
+            .await
+            .context("failed to revoke policy grants for scope")?;
+
+        Ok(deleted.rows_affected())
+    }
+
     pub async fn is_allowed(
         &self,
         skill_id: &str,
