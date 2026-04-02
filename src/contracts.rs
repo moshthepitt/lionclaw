@@ -393,6 +393,18 @@ pub enum SchedulerJobRunStatusDto {
     Interrupted,
 }
 
+impl SchedulerJobRunStatusDto {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::DeadLetter => "dead_letter",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SchedulerJobDeliveryStatusDto {
@@ -458,7 +470,7 @@ pub struct JobView {
     #[serde(default)]
     pub last_run_at: Option<DateTime<Utc>>,
     #[serde(default)]
-    pub last_status: Option<String>,
+    pub last_status: Option<SchedulerJobRunStatusDto>,
     #[serde(default)]
     pub last_error: Option<String>,
     pub consecutive_failures: u32,

@@ -76,7 +76,7 @@ impl SchedulerEngine {
                     .await;
                 claimed_runs += 1;
 
-                let _ = self.run_claimed_job(kernel, claimed_job).await;
+                self.run_claimed_job(kernel, claimed_job).await?;
             }
 
             Ok(JobTickResponse { claimed_runs })

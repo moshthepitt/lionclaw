@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
+use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::kernel::db::{ms_to_datetime, now_ms};
@@ -139,9 +139,31 @@ impl PolicyStore {
         scope: Scope,
         ttl_seconds: Option<i64>,
     ) -> Result<Grant> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start policy grant transaction")?;
+        let grant = self
+            .grant_in_tx(&mut tx, skill_id, capability, scope, ttl_seconds)
+            .await?;
+        tx.commit()
+            .await
+            .context("failed to commit policy grant transaction")?;
+        Ok(grant)
+    }
+
+    pub(crate) async fn grant_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        skill_id: String,
+        capability: Capability,
+        scope: Scope,
+        ttl_seconds: Option<i64>,
+    ) -> Result<Grant> {
         let skill_exists = sqlx::query("SELECT 1 FROM skills WHERE skill_id = ?1 LIMIT 1")
             .bind(&skill_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut **tx)
             .await
             .context("failed to validate skill existence for grant")?;
         if skill_exists.is_none() {
@@ -164,7 +186,7 @@ impl PolicyStore {
             .bind(&skill_id)
             .bind(capability_raw)
             .bind(&scope_raw)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut **tx)
             .await
             .context("failed to query existing non-expiring grant")?;
 
@@ -186,7 +208,7 @@ impl PolicyStore {
         .bind(&scope_raw)
         .bind(created_at_ms)
         .bind(expires_at_ms)
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await
         .context("failed to insert policy grant")?;
 
@@ -196,7 +218,7 @@ impl PolicyStore {
              WHERE grant_id = ?1",
         )
         .bind(grant_id.to_string())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut **tx)
         .await
         .context("failed to load inserted policy grant")?;
 
@@ -214,9 +236,26 @@ impl PolicyStore {
     }
 
     pub async fn revoke_scope(&self, scope: &Scope) -> Result<u64> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start policy scope revoke transaction")?;
+        let deleted = self.revoke_scope_in_tx(&mut tx, scope).await?;
+        tx.commit()
+            .await
+            .context("failed to commit policy scope revoke transaction")?;
+        Ok(deleted)
+    }
+
+    pub(crate) async fn revoke_scope_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        scope: &Scope,
+    ) -> Result<u64> {
         let deleted = sqlx::query("DELETE FROM policy_grants WHERE scope = ?1")
             .bind(scope.as_str())
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await
             .context("failed to revoke policy grants for scope")?;
 

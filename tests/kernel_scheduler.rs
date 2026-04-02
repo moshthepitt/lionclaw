@@ -61,7 +61,10 @@ async fn scheduled_job_tick_runs_in_fresh_scheduler_session() {
         .expect("load job")
         .job;
     assert!(!job.enabled);
-    assert_eq!(job.last_status.as_deref(), Some("completed"));
+    assert_eq!(
+        job.last_status,
+        Some(lionclaw::contracts::SchedulerJobRunStatusDto::Completed)
+    );
 
     let runs = kernel
         .list_job_runs(JobRunsRequest {
@@ -299,7 +302,10 @@ async fn scheduled_job_failure_delivers_summary_and_dead_letters() {
         .await
         .expect("load failing job")
         .job;
-    assert_eq!(job.last_status.as_deref(), Some("dead_letter"));
+    assert_eq!(
+        job.last_status,
+        Some(lionclaw::contracts::SchedulerJobRunStatusDto::DeadLetter)
+    );
     assert!(!job.enabled);
 
     let runs = kernel
@@ -460,6 +466,59 @@ async fn removing_job_revokes_job_scoped_policy_grants() {
         .await
         .expect("count job-scoped grants after delete");
     assert_eq!(after, 0, "removing a job must revoke its scoped grants");
+}
+
+#[tokio::test]
+async fn scheduler_tick_surfaces_unexpected_job_completion_failures() {
+    let env = TestEnv::new();
+    let kernel = Arc::new(Kernel::new(&env.db_path()).await.expect("kernel init"));
+    let adapter = Arc::new(BlockingRuntimeAdapter::new());
+    kernel
+        .register_runtime_adapter("blocking", adapter.clone())
+        .await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "corrupted completion".to_string(),
+            runtime_id: "blocking".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "complete after corruption".to_string(),
+            skill_ids: Vec::new(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create corrupted completion job");
+
+    let kernel_for_tick = kernel.clone();
+    let tick = tokio::spawn(async move { kernel_for_tick.scheduler_tick().await });
+
+    adapter.first_turn_started.notified().await;
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    sqlx::query("DELETE FROM scheduler_jobs WHERE job_id = ?1")
+        .bind(created.job.job_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("delete running job row");
+
+    adapter.release_first_turn.notify_one();
+
+    let err = tick
+        .await
+        .expect("join tick")
+        .expect_err("unexpected scheduler state corruption should fail the tick");
+    let message = err.to_string();
+    assert!(
+        message.contains("scheduled job disappeared during completion")
+            || message.contains("failed to load scheduler job for success"),
+        "unexpected tick failure should surface the completion error, got: {message}"
+    );
 }
 
 #[tokio::test]

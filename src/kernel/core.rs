@@ -1490,57 +1490,21 @@ impl Kernel {
 
         let created = self
             .jobs
-            .create_job(NewSchedulerJob {
-                name,
-                runtime_id,
-                schedule,
-                prompt_text,
-                skill_ids,
-                delivery,
-                retry_attempts,
-            })
+            .create_job_with_scope_grants(
+                &self.policy,
+                NewSchedulerJob {
+                    name,
+                    runtime_id,
+                    schedule,
+                    prompt_text,
+                    skill_ids,
+                    delivery,
+                    retry_attempts,
+                },
+                &allowed_capabilities,
+            )
             .await
             .map_err(internal)?;
-
-        let mut granted_policy_ids = Vec::new();
-        let grant_result = async {
-            for skill_id in &created.skill_ids {
-                let skill_use_grant = self
-                    .policy
-                    .grant(
-                        skill_id.clone(),
-                        Capability::SkillUse,
-                        Scope::Job(created.job_id),
-                        None,
-                    )
-                    .await
-                    .map_err(internal)?;
-                granted_policy_ids.push(skill_use_grant.grant_id);
-                for capability in &allowed_capabilities {
-                    let capability_grant = self
-                        .policy
-                        .grant(
-                            skill_id.clone(),
-                            *capability,
-                            Scope::Job(created.job_id),
-                            None,
-                        )
-                        .await
-                        .map_err(internal)?;
-                    granted_policy_ids.push(capability_grant.grant_id);
-                }
-            }
-            Ok::<(), KernelError>(())
-        }
-        .await;
-
-        if let Err(err) = grant_result {
-            let _ = self.jobs.delete_job(created.job_id).await;
-            for grant_id in granted_policy_ids {
-                let _ = self.policy.revoke(grant_id).await;
-            }
-            return Err(err);
-        }
 
         self.audit
             .append(
@@ -1649,17 +1613,16 @@ impl Kernel {
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("job not found".to_string()))?;
-        let removed = self.jobs.delete_job(job_id).await.map_err(internal)?;
-        if !removed {
+        let revoked_policy_grants = self
+            .jobs
+            .delete_job_with_scope_cleanup(&self.policy, job_id)
+            .await
+            .map_err(internal)?;
+        let Some(revoked_policy_grants) = revoked_policy_grants else {
             return Err(KernelError::Conflict(
                 "job is running and cannot be removed".to_string(),
             ));
-        }
-        let revoked_policy_grants = self
-            .policy
-            .revoke_scope(&Scope::Job(job_id))
-            .await
-            .map_err(internal)?;
+        };
         self.audit
             .append(
                 "job.remove",
@@ -1672,7 +1635,10 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
-        Ok(JobRemoveResponse { job_id, removed })
+        Ok(JobRemoveResponse {
+            job_id,
+            removed: true,
+        })
     }
 
     pub async fn list_job_runs(&self, req: JobRunsRequest) -> Result<JobRunsResponse, KernelError> {
@@ -1880,7 +1846,7 @@ fn to_job_view(job: SchedulerJobRecord) -> JobView {
         next_run_at: job.next_run_at,
         running_run_id: job.running_run_id,
         last_run_at: job.last_run_at,
-        last_status: job.last_status,
+        last_status: job.last_status.map(to_job_run_status_dto),
         last_error: job.last_error,
         consecutive_failures: job.consecutive_failures,
         created_at: job.created_at,
@@ -1902,13 +1868,7 @@ fn to_job_run_view(run: SchedulerJobRunRecord) -> JobRunView {
         scheduled_for: run.scheduled_for,
         started_at: run.started_at,
         finished_at: run.finished_at,
-        status: match run.status {
-            SchedulerJobRunStatus::Running => SchedulerJobRunStatusDto::Running,
-            SchedulerJobRunStatus::Completed => SchedulerJobRunStatusDto::Completed,
-            SchedulerJobRunStatus::Failed => SchedulerJobRunStatusDto::Failed,
-            SchedulerJobRunStatus::DeadLetter => SchedulerJobRunStatusDto::DeadLetter,
-            SchedulerJobRunStatus::Interrupted => SchedulerJobRunStatusDto::Interrupted,
-        },
+        status: to_job_run_status_dto(run.status),
         session_id: run.session_id,
         turn_id: run.turn_id,
         delivery_status: run.delivery_status.map(|status| match status {
@@ -1918,6 +1878,16 @@ fn to_job_run_view(run: SchedulerJobRunRecord) -> JobRunView {
             SchedulerJobDeliveryStatus::NotRequested => SchedulerJobDeliveryStatusDto::NotRequested,
         }),
         error_text: run.error_text,
+    }
+}
+
+fn to_job_run_status_dto(status: SchedulerJobRunStatus) -> SchedulerJobRunStatusDto {
+    match status {
+        SchedulerJobRunStatus::Running => SchedulerJobRunStatusDto::Running,
+        SchedulerJobRunStatus::Completed => SchedulerJobRunStatusDto::Completed,
+        SchedulerJobRunStatus::Failed => SchedulerJobRunStatusDto::Failed,
+        SchedulerJobRunStatus::DeadLetter => SchedulerJobRunStatusDto::DeadLetter,
+        SchedulerJobRunStatus::Interrupted => SchedulerJobRunStatusDto::Interrupted,
     }
 }
 

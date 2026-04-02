@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS scheduler_jobs (
     next_run_at_ms INTEGER,
     running_run_id TEXT,
     last_run_at_ms INTEGER,
-    last_status TEXT,
+    last_status TEXT CHECK (last_status IS NULL OR last_status IN ('running', 'completed', 'failed', 'dead_letter', 'interrupted')),
     last_error TEXT,
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     created_at_ms INTEGER NOT NULL,

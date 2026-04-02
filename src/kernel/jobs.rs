@@ -6,10 +6,13 @@ use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
-use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
+use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
-use crate::kernel::db::{ms_to_datetime, now_ms};
+use crate::kernel::{
+    db::{ms_to_datetime, now_ms},
+    policy::{Capability, PolicyStore, Scope},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -39,7 +42,7 @@ pub struct SchedulerJobRecord {
     pub next_run_at: Option<DateTime<Utc>>,
     pub running_run_id: Option<Uuid>,
     pub last_run_at: Option<DateTime<Utc>>,
-    pub last_status: Option<String>,
+    pub last_status: Option<SchedulerJobRunStatus>,
     pub last_error: Option<String>,
     pub consecutive_failures: u32,
     pub created_at: DateTime<Utc>,
@@ -209,6 +212,58 @@ impl JobStore {
     }
 
     pub async fn create_job(&self, input: NewSchedulerJob) -> Result<SchedulerJobRecord> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start create scheduler job transaction")?;
+        let created = self.insert_job_in_tx(&mut tx, input).await?;
+        tx.commit()
+            .await
+            .context("failed to commit create scheduler job transaction")?;
+        Ok(created)
+    }
+
+    pub async fn create_job_with_scope_grants(
+        &self,
+        policy: &PolicyStore,
+        input: NewSchedulerJob,
+        allowed_capabilities: &[Capability],
+    ) -> Result<SchedulerJobRecord> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start create scheduler job transaction")?;
+        let created = self.insert_job_in_tx(&mut tx, input).await?;
+        let scope = Scope::Job(created.job_id);
+        for skill_id in &created.skill_ids {
+            policy
+                .grant_in_tx(
+                    &mut tx,
+                    skill_id.clone(),
+                    Capability::SkillUse,
+                    scope.clone(),
+                    None,
+                )
+                .await?;
+            for capability in allowed_capabilities {
+                policy
+                    .grant_in_tx(&mut tx, skill_id.clone(), *capability, scope.clone(), None)
+                    .await?;
+            }
+        }
+        tx.commit()
+            .await
+            .context("failed to commit scheduler job and grant creation")?;
+        Ok(created)
+    }
+
+    async fn insert_job_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        input: NewSchedulerJob,
+    ) -> Result<SchedulerJobRecord> {
         let now = now_ms();
         let job_id = Uuid::new_v4();
         let next_run_at = compute_initial_next_run(&input.schedule, Utc::now())?;
@@ -242,11 +297,11 @@ impl JobStore {
         .bind(i64::from(input.retry_attempts))
         .bind(next_run_at.map(|value| value.timestamp_millis()))
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await
         .context("failed to insert scheduler job")?;
 
-        self.get_job(job_id)
+        self.get_job_in_tx(tx, job_id, "failed to reload scheduler job after insert")
             .await?
             .ok_or_else(|| anyhow!("scheduler job disappeared after insert"))
     }
@@ -267,26 +322,57 @@ impl JobStore {
     }
 
     pub async fn get_job(&self, job_id: Uuid) -> Result<Option<SchedulerJobRecord>> {
-        let row = sqlx::query(
-            "SELECT job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
-             skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
-             last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms \
-             FROM scheduler_jobs \
-             WHERE job_id = ?1",
-        )
-        .bind(job_id.to_string())
-        .fetch_optional(&self.pool)
-        .await
-        .context("failed to query scheduler job")?;
-
-        row.map(map_job_row).transpose()
+        self.get_job_optional_from_pool(job_id, "failed to query scheduler job")
+            .await
     }
 
     pub async fn delete_job(&self, job_id: Uuid) -> Result<bool> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start delete scheduler job transaction")?;
+        let removed = self.delete_job_in_tx(&mut tx, job_id).await?;
+        tx.commit()
+            .await
+            .context("failed to commit delete scheduler job transaction")?;
+        Ok(removed)
+    }
+
+    pub async fn delete_job_with_scope_cleanup(
+        &self,
+        policy: &PolicyStore,
+        job_id: Uuid,
+    ) -> Result<Option<u64>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start delete scheduler job transaction")?;
+        if !self.delete_job_in_tx(&mut tx, job_id).await? {
+            tx.commit()
+                .await
+                .context("failed to finish skipped scheduler job delete transaction")?;
+            return Ok(None);
+        }
+        let revoked = policy
+            .revoke_scope_in_tx(&mut tx, &Scope::Job(job_id))
+            .await?;
+        tx.commit()
+            .await
+            .context("failed to commit scheduler job delete and scope cleanup")?;
+        Ok(Some(revoked))
+    }
+
+    async fn delete_job_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        job_id: Uuid,
+    ) -> Result<bool> {
         let result =
             sqlx::query("DELETE FROM scheduler_jobs WHERE job_id = ?1 AND running_run_id IS NULL")
                 .bind(job_id.to_string())
-                .execute(&self.pool)
+                .execute(&mut **tx)
                 .await
                 .context("failed to delete scheduler job")?;
         Ok(result.rows_affected() > 0)
@@ -365,6 +451,66 @@ impl JobStore {
         .fetch_optional(&self.pool)
         .await
         .context("failed to load scheduler job run")?;
+        row.map(map_run_row).transpose()
+    }
+
+    async fn get_job_optional_from_pool(
+        &self,
+        job_id: Uuid,
+        context: &str,
+    ) -> Result<Option<SchedulerJobRecord>> {
+        let row = sqlx::query(
+            "SELECT job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
+             skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
+             last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms \
+             FROM scheduler_jobs \
+             WHERE job_id = ?1",
+        )
+        .bind(job_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| context.to_string())?;
+
+        row.map(map_job_row).transpose()
+    }
+
+    async fn get_job_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        job_id: Uuid,
+        context: &str,
+    ) -> Result<Option<SchedulerJobRecord>> {
+        let row = sqlx::query(
+            "SELECT job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
+             skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
+             last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms \
+             FROM scheduler_jobs \
+             WHERE job_id = ?1",
+        )
+        .bind(job_id.to_string())
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| context.to_string())?;
+
+        row.map(map_job_row).transpose()
+    }
+
+    async fn get_run_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        run_id: Uuid,
+        context: &str,
+    ) -> Result<Option<SchedulerJobRunRecord>> {
+        let row = sqlx::query(
+            "SELECT run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
+             status, session_id, turn_id, delivery_status, error_text \
+             FROM scheduler_job_runs WHERE run_id = ?1",
+        )
+        .bind(run_id.to_string())
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| context.to_string())?;
+
         row.map(map_run_row).transpose()
     }
 
@@ -502,25 +648,15 @@ impl JobStore {
             .await
             .context("failed to start claim scheduler job transaction")?;
 
-        let row = sqlx::query(
-            "SELECT job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
-             skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
-             last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms \
-             FROM scheduler_jobs \
-             WHERE job_id = ?1",
-        )
-        .bind(job_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await
-        .context("failed to load scheduler job for claim")?;
-
-        let Some(row) = row else {
+        let Some(job) = self
+            .get_job_in_tx(&mut tx, job_id, "failed to load scheduler job for claim")
+            .await?
+        else {
             tx.commit()
                 .await
                 .context("failed to finish empty claim transaction")?;
             return Ok(None);
         };
-        let job = map_job_row(row)?;
         if (require_enabled && !job.enabled) || job.running_run_id.is_some() {
             tx.commit()
                 .await
@@ -601,24 +737,17 @@ impl JobStore {
         .fetch_one(&mut *tx)
         .await
         .context("failed to load claimed scheduler job run")?;
-        let updated_job_row = sqlx::query(
-            "SELECT job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
-             skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
-             last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms \
-             FROM scheduler_jobs \
-             WHERE job_id = ?1",
-        )
-        .bind(job_id.to_string())
-        .fetch_one(&mut *tx)
-        .await
-        .context("failed to load claimed scheduler job")?;
+        let updated_job = self
+            .get_job_in_tx(&mut tx, job_id, "failed to load claimed scheduler job")
+            .await?
+            .ok_or_else(|| anyhow!("claimed scheduler job disappeared before commit"))?;
 
         tx.commit()
             .await
             .context("failed to commit scheduler job claim")?;
 
         Ok(Some(ClaimedSchedulerJob {
-            job: map_job_row(updated_job_row)?,
+            job: updated_job,
             run: map_run_row(run)?,
         }))
     }
@@ -634,33 +763,27 @@ impl JobStore {
             .await
             .context("failed to start retry run transaction")?;
 
-        let current_row = sqlx::query(
-            "SELECT run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
-             status, session_id, turn_id, delivery_status, error_text \
-             FROM scheduler_job_runs WHERE run_id = ?1",
-        )
-        .bind(current_run_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await
-        .context("failed to query current scheduler run")?;
-        let Some(current_row) = current_row else {
+        let Some(current) = self
+            .get_run_in_tx(
+                &mut tx,
+                current_run_id,
+                "failed to query current scheduler run",
+            )
+            .await?
+        else {
             tx.commit()
                 .await
                 .context("failed to finish empty retry transaction")?;
             return Ok(None);
         };
-        let current = map_run_row(current_row)?;
-        let job_row = sqlx::query(
-            "SELECT job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
-             skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
-             last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms \
-             FROM scheduler_jobs WHERE job_id = ?1",
-        )
-        .bind(current.job_id.to_string())
-        .fetch_one(&mut *tx)
-        .await
-        .context("failed to load scheduler job for retry")?;
-        let job = map_job_row(job_row)?;
+        let job = self
+            .get_job_in_tx(
+                &mut tx,
+                current.job_id,
+                "failed to load scheduler job for retry",
+            )
+            .await?
+            .ok_or_else(|| anyhow!("scheduler job disappeared before retry"))?;
         if current.status != SchedulerJobRunStatus::Running {
             tx.commit()
                 .await
@@ -747,33 +870,27 @@ impl JobStore {
             .await
             .context("failed to start complete scheduler run transaction")?;
 
-        let run_row = sqlx::query(
-            "SELECT run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
-             status, session_id, turn_id, delivery_status, error_text \
-             FROM scheduler_job_runs WHERE run_id = ?1",
-        )
-        .bind(run_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await
-        .context("failed to query scheduler run for completion")?;
-        let Some(run_row) = run_row else {
+        let Some(run) = self
+            .get_run_in_tx(
+                &mut tx,
+                run_id,
+                "failed to query scheduler run for completion",
+            )
+            .await?
+        else {
             tx.commit()
                 .await
                 .context("failed to finish empty complete transaction")?;
             return Ok(None);
         };
-        let run = map_run_row(run_row)?;
-        let job_row = sqlx::query(
-            "SELECT job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
-             skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
-             last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms \
-             FROM scheduler_jobs WHERE job_id = ?1",
-        )
-        .bind(run.job_id.to_string())
-        .fetch_one(&mut *tx)
-        .await
-        .context("failed to load scheduler job for success")?;
-        let job = map_job_row(job_row)?;
+        let job = self
+            .get_job_in_tx(
+                &mut tx,
+                run.job_id,
+                "failed to load scheduler job for success",
+            )
+            .await?
+            .ok_or_else(|| anyhow!("scheduler job disappeared before success completion"))?;
         let disable_one_shot = matches!(job.schedule, JobSchedule::Once { .. })
             && run.trigger_kind != SchedulerJobTriggerKind::Manual;
 
@@ -812,22 +929,20 @@ impl JobStore {
         .await
         .context("failed to finalize scheduler job state after success")?;
 
-        let updated_job_row = sqlx::query(
-            "SELECT job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
-             skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
-             last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms \
-             FROM scheduler_jobs WHERE job_id = ?1",
-        )
-        .bind(run.job_id.to_string())
-        .fetch_one(&mut *tx)
-        .await
-        .context("failed to reload scheduler job after success")?;
+        let updated_job = self
+            .get_job_in_tx(
+                &mut tx,
+                run.job_id,
+                "failed to reload scheduler job after success",
+            )
+            .await?
+            .ok_or_else(|| anyhow!("scheduler job disappeared after success"))?;
 
         tx.commit()
             .await
             .context("failed to commit successful scheduler job completion")?;
 
-        Ok(Some(map_job_row(updated_job_row)?))
+        Ok(Some(updated_job))
     }
 
     pub async fn complete_run_failure(
@@ -846,33 +961,23 @@ impl JobStore {
             .await
             .context("failed to start failed scheduler run transaction")?;
 
-        let run_row = sqlx::query(
-            "SELECT run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
-             status, session_id, turn_id, delivery_status, error_text \
-             FROM scheduler_job_runs WHERE run_id = ?1",
-        )
-        .bind(run_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await
-        .context("failed to query scheduler run for failure")?;
-        let Some(run_row) = run_row else {
+        let Some(run) = self
+            .get_run_in_tx(&mut tx, run_id, "failed to query scheduler run for failure")
+            .await?
+        else {
             tx.commit()
                 .await
                 .context("failed to finish empty failed transaction")?;
             return Ok(None);
         };
-        let run = map_run_row(run_row)?;
-        let job_row = sqlx::query(
-            "SELECT job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
-             skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
-             last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms \
-             FROM scheduler_jobs WHERE job_id = ?1",
-        )
-        .bind(run.job_id.to_string())
-        .fetch_one(&mut *tx)
-        .await
-        .context("failed to load scheduler job for failure")?;
-        let job = map_job_row(job_row)?;
+        let job = self
+            .get_job_in_tx(
+                &mut tx,
+                run.job_id,
+                "failed to load scheduler job for failure",
+            )
+            .await?
+            .ok_or_else(|| anyhow!("scheduler job disappeared before failure completion"))?;
         let disable_one_shot = matches!(job.schedule, JobSchedule::Once { .. })
             && run.trigger_kind != SchedulerJobTriggerKind::Manual
             && final_status == SchedulerJobRunStatus::DeadLetter;
@@ -914,22 +1019,20 @@ impl JobStore {
         .await
         .context("failed to finalize scheduler job state after failure")?;
 
-        let updated_job_row = sqlx::query(
-            "SELECT job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
-             skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
-             last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms \
-             FROM scheduler_jobs WHERE job_id = ?1",
-        )
-        .bind(run.job_id.to_string())
-        .fetch_one(&mut *tx)
-        .await
-        .context("failed to reload scheduler job after failure")?;
+        let updated_job = self
+            .get_job_in_tx(
+                &mut tx,
+                run.job_id,
+                "failed to reload scheduler job after failure",
+            )
+            .await?
+            .ok_or_else(|| anyhow!("scheduler job disappeared after failure"))?;
 
         tx.commit()
             .await
             .context("failed to commit failed scheduler job completion")?;
 
-        Ok(Some(map_job_row(updated_job_row)?))
+        Ok(Some(updated_job))
     }
 
     pub async fn interrupt_run(
@@ -944,23 +1047,19 @@ impl JobStore {
             .await
             .context("failed to start interrupt scheduler run transaction")?;
 
-        let run_row = sqlx::query(
-            "SELECT run_id, job_id, attempt_no, trigger_kind, scheduled_for_ms, started_at_ms, finished_at_ms, \
-             status, session_id, turn_id, delivery_status, error_text \
-             FROM scheduler_job_runs WHERE run_id = ?1",
-        )
-        .bind(run_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await
-        .context("failed to load scheduler run for interrupt")?;
-        let Some(run_row) = run_row else {
+        let Some(run) = self
+            .get_run_in_tx(
+                &mut tx,
+                run_id,
+                "failed to load scheduler run for interrupt",
+            )
+            .await?
+        else {
             tx.commit()
                 .await
                 .context("failed to finish empty interrupt scheduler run transaction")?;
             return Ok(None);
         };
-
-        let run = map_run_row(run_row)?;
         if run.status != SchedulerJobRunStatus::Running {
             tx.commit()
                 .await
@@ -1194,6 +1293,7 @@ fn map_job_row(row: SqliteRow) -> Result<SchedulerJobRecord> {
     let next_run_at_ms: Option<i64> = row.get("next_run_at_ms");
     let running_run_id_raw: Option<String> = row.get("running_run_id");
     let last_run_at_ms: Option<i64> = row.get("last_run_at_ms");
+    let last_status_raw: Option<String> = row.get("last_status");
     let consecutive_failures_raw: i64 = row.get("consecutive_failures");
     let created_at_ms: i64 = row.get("created_at_ms");
     let updated_at_ms: i64 = row.get("updated_at_ms");
@@ -1238,7 +1338,10 @@ fn map_job_row(row: SqliteRow) -> Result<SchedulerJobRecord> {
                 ms_to_datetime(value).ok_or_else(|| anyhow!("invalid last_run_at_ms '{}'", value))
             })
             .transpose()?,
-        last_status: row.get("last_status"),
+        last_status: last_status_raw
+            .as_deref()
+            .map(|value| SchedulerJobRunStatus::from_str(value).map_err(anyhow::Error::msg))
+            .transpose()?,
         last_error: row.get("last_error"),
         consecutive_failures: u32::try_from(consecutive_failures_raw).with_context(|| {
             format!(
@@ -1313,7 +1416,7 @@ fn map_run_row(row: SqliteRow) -> Result<SchedulerJobRunRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::db::Db;
+    use crate::kernel::{db::Db, policy::PolicyStore};
     use chrono::{Duration as ChronoDuration, TimeZone};
 
     fn dt(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
@@ -1325,6 +1428,12 @@ mod tests {
     async fn new_store() -> JobStore {
         let db = Db::connect_memory().await.expect("connect memory db");
         JobStore::new(db.pool())
+    }
+
+    async fn new_store_and_policy() -> (JobStore, PolicyStore) {
+        let db = Db::connect_memory().await.expect("connect memory db");
+        let pool = db.pool();
+        (JobStore::new(pool.clone()), PolicyStore::new(pool))
     }
 
     #[test]
@@ -1355,6 +1464,40 @@ mod tests {
         .expect("cron next run present");
 
         assert!(next > now);
+    }
+
+    #[tokio::test]
+    async fn create_job_with_scope_grants_rolls_back_on_grant_failure() {
+        let (store, policy) = new_store_and_policy().await;
+
+        let err = store
+            .create_job_with_scope_grants(
+                &policy,
+                NewSchedulerJob {
+                    name: "rollback".to_string(),
+                    runtime_id: "mock".to_string(),
+                    schedule: JobSchedule::Once {
+                        run_at: Utc::now() + ChronoDuration::minutes(1),
+                    },
+                    prompt_text: "prompt".to_string(),
+                    skill_ids: vec!["missing-skill".to_string()],
+                    delivery: None,
+                    retry_attempts: 1,
+                },
+                &[Capability::FsRead],
+            )
+            .await
+            .expect_err("grant failure should roll back job insert");
+
+        assert!(err.to_string().contains("skill 'missing-skill' not found"));
+        assert!(
+            store
+                .list_jobs()
+                .await
+                .expect("list jobs after rollback")
+                .is_empty(),
+            "failed grant creation must not leave a scheduler job behind"
+        );
     }
 
     #[tokio::test]
@@ -1582,8 +1725,8 @@ mod tests {
             .expect("job should exist");
         assert!(updated_job.running_run_id.is_none());
         assert_eq!(
-            updated_job.last_status.as_deref(),
-            Some(SchedulerJobRunStatus::Interrupted.as_str())
+            updated_job.last_status,
+            Some(SchedulerJobRunStatus::Interrupted)
         );
         assert_eq!(
             updated_job.last_error.as_deref(),

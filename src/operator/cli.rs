@@ -540,7 +540,9 @@ pub async fn run() -> Result<()> {
                             job.next_run_at
                                 .map(|value| value.to_rfc3339())
                                 .unwrap_or_else(|| "-".to_string()),
-                            job.last_status.unwrap_or_else(|| "-".to_string()),
+                            job.last_status
+                                .map(|value| value.as_str().to_string())
+                                .unwrap_or_else(|| "-".to_string()),
                         );
                     }
                 }
