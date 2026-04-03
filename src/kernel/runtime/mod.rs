@@ -103,9 +103,18 @@ pub enum RuntimeEvent {
 
 pub type RuntimeEventSender = mpsc::UnboundedSender<RuntimeEvent>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HiddenTurnSupport {
+    Unsupported,
+    SideEffectFree,
+}
+
 #[async_trait]
 pub trait RuntimeAdapter: Send + Sync {
     async fn info(&self) -> RuntimeAdapterInfo;
+    fn hidden_turn_support(&self) -> HiddenTurnSupport {
+        HiddenTurnSupport::Unsupported
+    }
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle>;
     async fn turn(
         &self,

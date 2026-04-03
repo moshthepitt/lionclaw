@@ -15,9 +15,9 @@ use lionclaw::{
     kernel::{
         policy::Capability,
         runtime::{
-            RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityRequest, RuntimeCapabilityResult,
-            RuntimeEvent, RuntimeEventSender, RuntimeMessageLane, RuntimeSessionHandle,
-            RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
+            HiddenTurnSupport, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityRequest,
+            RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender, RuntimeMessageLane,
+            RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
         },
         InboundChannelText, Kernel, KernelOptions,
     },
@@ -92,6 +92,7 @@ async fn prompt_loads_assistant_continuity_and_fs_read_uses_project_root() {
                 prompts: prompts.clone(),
                 capability_results: capability_results.clone(),
                 request_fs_read: true,
+                allow_hidden_compaction: false,
                 reply: "read complete".to_string(),
             }),
         )
@@ -270,6 +271,7 @@ async fn older_turns_are_compacted_into_prompt_context() {
                 prompts: prompts.clone(),
                 capability_results: Arc::new(Mutex::new(Vec::new())),
                 request_fs_read: false,
+                allow_hidden_compaction: true,
                 reply: "captured".to_string(),
             }),
         )
@@ -301,7 +303,8 @@ async fn older_turns_are_compacted_into_prompt_context() {
     assert!(last_prompt.contains("Compacted Prior Turns"));
     assert!(last_prompt.contains("Compacted Prior Turns 1-17"));
     assert!(last_prompt.contains("### Goal"));
-    assert!(last_prompt.contains("turn 0"));
+    assert!(last_prompt.contains("### Key Decisions"));
+    assert!(last_prompt.contains("Continuity stays file-backed under assistant home."));
     assert!(last_prompt.contains("### Next Steps"));
     assert!(last_prompt.contains("turn 16"));
     assert!(!last_prompt.contains("## Prior Turn 1\n\n### User\n\nturn 0"));
@@ -337,6 +340,7 @@ async fn continuity_surface_lists_searches_and_manages_proposals_and_loops() {
                 prompts: prompts.clone(),
                 capability_results: Arc::new(Mutex::new(Vec::new())),
                 request_fs_read: false,
+                allow_hidden_compaction: true,
                 reply: "captured".to_string(),
             }),
         )
@@ -408,6 +412,255 @@ async fn continuity_surface_lists_searches_and_manages_proposals_and_loops() {
         .await
         .expect("read memory");
     assert!(memory.contains("Prefers continuity module work to stay small and explicit."));
+}
+
+#[tokio::test]
+async fn unsafe_runtimes_do_not_receive_hidden_compaction_prompts() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "unsafe-capture",
+            Arc::new(CapturePromptAdapter {
+                prompts: prompts.clone(),
+                capability_results: Arc::new(Mutex::new(Vec::new())),
+                request_fs_read: false,
+                allow_hidden_compaction: false,
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+
+    let session = open_local_session(&kernel, "unsafe-compaction-peer").await;
+    for index in 0..18 {
+        kernel
+            .turn_session(SessionTurnRequest {
+                session_id: session.session_id,
+                user_text: format!("turn {}", index),
+                runtime_id: Some("unsafe-capture".to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await
+            .expect("turn succeeds");
+    }
+
+    let prompts = prompts.lock().expect("prompt lock");
+    assert!(!prompts
+        .iter()
+        .any(|prompt| prompt.contains("lionclaw_compaction_handoff_v1")));
+    let last_prompt = prompts.last().expect("last prompt");
+    assert!(last_prompt.contains("Compacted Prior Turns"));
+}
+
+#[tokio::test]
+async fn compaction_failures_are_audited_without_failing_completed_turns() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "capture",
+            Arc::new(CapturePromptAdapter {
+                prompts,
+                capability_results: Arc::new(Mutex::new(Vec::new())),
+                request_fs_read: false,
+                allow_hidden_compaction: true,
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+
+    let session = open_local_session(&kernel, "compaction-failure-peer").await;
+    for index in 0..12 {
+        kernel
+            .turn_session(SessionTurnRequest {
+                session_id: session.session_id,
+                user_text: format!("turn {}", index),
+                runtime_id: Some("capture".to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await
+            .expect("seed turn succeeds");
+    }
+
+    let proposals_dir = env.workspace_root().join("continuity/proposals/memory");
+    let mut permissions = std::fs::metadata(&proposals_dir)
+        .expect("proposals metadata")
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&proposals_dir, permissions).expect("freeze proposals dir");
+
+    let response = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "trigger compaction despite continuity write failure".to_string(),
+            runtime_id: Some("capture".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should still succeed");
+    assert_eq!(response.assistant_text, "captured");
+
+    let mut restore = std::fs::metadata(&proposals_dir)
+        .expect("proposals metadata")
+        .permissions();
+    restore.set_readonly(false);
+    std::fs::set_permissions(&proposals_dir, restore).expect("restore proposals dir");
+
+    let audit = kernel
+        .query_audit(
+            Some(session.session_id),
+            Some("session.compaction.failed".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query compaction failure audit");
+    assert_eq!(audit.events.len(), 1);
+    assert!(audit.events[0].details["error"]
+        .as_str()
+        .expect("error text")
+        .contains("failed"));
+}
+
+#[tokio::test]
+async fn continuity_mutations_are_audited() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let merged_path = env
+        .workspace_root()
+        .join("continuity/proposals/memory/merge-me.md");
+    let rejected_path = env
+        .workspace_root()
+        .join("continuity/proposals/memory/reject-me.md");
+    let loop_path = env
+        .workspace_root()
+        .join("continuity/open-loops/review-audit.md");
+    std::fs::write(
+        &merged_path,
+        format!(
+            "# Memory Proposal: Merge Me\n\n- Status: proposed\n- Proposed: {} UTC\n- Rationale: keep durable preference\n\n## Candidate Entries\n- Remember merged proposal\n",
+            Utc::now().to_rfc3339()
+        ),
+    )
+    .expect("write merged proposal");
+    std::fs::write(
+        &rejected_path,
+        format!(
+            "# Memory Proposal: Reject Me\n\n- Status: proposed\n- Proposed: {} UTC\n- Rationale: reject duplicate\n\n## Candidate Entries\n- Remember rejected proposal\n",
+            Utc::now().to_rfc3339()
+        ),
+    )
+    .expect("write rejected proposal");
+    std::fs::write(
+        &loop_path,
+        format!(
+            "# Review Audit Trail\n\n- Status: open\n- Updated: {} UTC\n- Summary: verify continuity audit coverage\n- Next Step: query the audit log\n",
+            Utc::now().to_rfc3339()
+        ),
+    )
+    .expect("write open loop");
+
+    kernel
+        .merge_continuity_memory_proposal(ContinuityPathRequest {
+            relative_path: "continuity/proposals/memory/merge-me.md".to_string(),
+        })
+        .await
+        .expect("merge proposal");
+    kernel
+        .reject_continuity_memory_proposal(ContinuityPathRequest {
+            relative_path: "continuity/proposals/memory/reject-me.md".to_string(),
+        })
+        .await
+        .expect("reject proposal");
+    kernel
+        .resolve_continuity_open_loop(ContinuityPathRequest {
+            relative_path: "continuity/open-loops/review-audit.md".to_string(),
+        })
+        .await
+        .expect("resolve open loop");
+
+    let merged = kernel
+        .query_audit(
+            None,
+            Some("continuity.memory_proposal.merged".to_string()),
+            None,
+            Some(5),
+        )
+        .await
+        .expect("query merge audit");
+    assert_eq!(merged.events.len(), 1);
+    assert_eq!(merged.events[0].actor.as_deref(), Some("api"));
+
+    let rejected = kernel
+        .query_audit(
+            None,
+            Some("continuity.memory_proposal.rejected".to_string()),
+            None,
+            Some(5),
+        )
+        .await
+        .expect("query reject audit");
+    assert_eq!(rejected.events.len(), 1);
+    assert_eq!(rejected.events[0].actor.as_deref(), Some("api"));
+
+    let resolved = kernel
+        .query_audit(
+            None,
+            Some("continuity.open_loop.resolved".to_string()),
+            None,
+            Some(5),
+        )
+        .await
+        .expect("query resolve audit");
+    assert_eq!(resolved.events.len(), 1);
+    assert_eq!(resolved.events[0].actor.as_deref(), Some("api"));
 }
 
 async fn install_enabled_skill(kernel: &Kernel, name: &str) -> String {
@@ -523,6 +776,7 @@ struct CapturePromptAdapter {
     prompts: Arc<Mutex<Vec<String>>>,
     capability_results: Arc<Mutex<Vec<Vec<RuntimeCapabilityResult>>>>,
     request_fs_read: bool,
+    allow_hidden_compaction: bool,
     reply: String,
 }
 
@@ -533,6 +787,14 @@ impl RuntimeAdapter for CapturePromptAdapter {
             id: "capture".to_string(),
             version: "0.1".to_string(),
             healthy: true,
+        }
+    }
+
+    fn hidden_turn_support(&self) -> HiddenTurnSupport {
+        if self.allow_hidden_compaction {
+            HiddenTurnSupport::SideEffectFree
+        } else {
+            HiddenTurnSupport::Unsupported
         }
     }
 
@@ -556,7 +818,8 @@ impl RuntimeAdapter for CapturePromptAdapter {
             .expect("prompt lock")
             .push(current_prompt.clone());
 
-        if input.selected_skills.is_empty()
+        if self.allow_hidden_compaction
+            && input.selected_skills.is_empty()
             && current_prompt.contains("lionclaw_compaction_handoff_v1")
         {
             let first_user = extract_compaction_user(&current_prompt, false);

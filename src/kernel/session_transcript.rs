@@ -305,7 +305,7 @@ pub fn merge_compaction_summary_updates(
     };
 
     let mut merged = current_state;
-    merged.goal = previous.goal.clone().or(merged.goal);
+    merged.goal = merged.goal.or_else(|| previous.goal.clone());
     merged.constraints_preferences = merge_unique_strings(
         previous.constraints_preferences.clone(),
         merged.constraints_preferences,
@@ -736,8 +736,9 @@ mod tests {
     use crate::contracts::{SessionHistoryPolicy, SessionTurnKind, SessionTurnStatus};
 
     use super::{
-        build_compaction_prompt, merge_compaction_summary_state, parse_compaction_summary_state,
-        render_compaction_summary, repair_turns, CompactionSummaryState, TranscriptMode,
+        build_compaction_prompt, merge_compaction_summary_state, merge_compaction_summary_updates,
+        parse_compaction_summary_state, render_compaction_summary, repair_turns,
+        CompactionSummaryState, TranscriptMode,
     };
     use crate::kernel::session_turns::SessionTurnRecord;
 
@@ -922,6 +923,25 @@ mod tests {
             .next_steps
             .iter()
             .any(|item| item.contains("prepare docs")));
+    }
+
+    #[test]
+    fn compaction_summary_updates_can_replace_stale_goal() {
+        let previous = CompactionSummaryState {
+            goal: Some("finish continuity substrate".to_string()),
+            ..CompactionSummaryState::default()
+        };
+        let current = CompactionSummaryState {
+            goal: Some("review the scheduler follow-up".to_string()),
+            ..CompactionSummaryState::default()
+        };
+
+        let merged = merge_compaction_summary_updates(Some(&previous), current);
+
+        assert_eq!(
+            merged.goal.as_deref(),
+            Some("review the scheduler follow-up")
+        );
     }
 
     #[test]

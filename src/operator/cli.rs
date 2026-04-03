@@ -582,9 +582,12 @@ pub async fn run() -> Result<()> {
                     }
                     ContinuityLoopCommand::Resolve(args) => {
                         let response = kernel
-                            .resolve_continuity_open_loop(ContinuityPathRequest {
-                                relative_path: args.relative_path,
-                            })
+                            .resolve_continuity_open_loop_with_actor(
+                                ContinuityPathRequest {
+                                    relative_path: args.relative_path,
+                                },
+                                "operator",
+                            )
                             .await?;
                         println!("resolved {}", response.archived_path);
                     }
@@ -602,9 +605,12 @@ pub async fn run() -> Result<()> {
                     }
                     ContinuityProposalCommand::Merge(args) => {
                         let response = kernel
-                            .merge_continuity_memory_proposal(ContinuityPathRequest {
-                                relative_path: args.relative_path,
-                            })
+                            .merge_continuity_memory_proposal_with_actor(
+                                ContinuityPathRequest {
+                                    relative_path: args.relative_path,
+                                },
+                                "operator",
+                            )
                             .await?;
                         println!(
                             "merged {} into {}",
@@ -616,9 +622,12 @@ pub async fn run() -> Result<()> {
                     }
                     ContinuityProposalCommand::Reject(args) => {
                         let response = kernel
-                            .reject_continuity_memory_proposal(ContinuityPathRequest {
-                                relative_path: args.relative_path,
-                            })
+                            .reject_continuity_memory_proposal_with_actor(
+                                ContinuityPathRequest {
+                                    relative_path: args.relative_path,
+                                },
+                                "operator",
+                            )
                             .await?;
                         println!("rejected {}", response.archived_path);
                     }

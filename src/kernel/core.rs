@@ -58,10 +58,10 @@ use super::{
     },
     policy::{Capability, PolicyStore, Scope},
     runtime::{
-        register_builtin_runtime_adapters, RuntimeAdapter, RuntimeCapabilityRequest,
-        RuntimeCapabilityResult, RuntimeEvent, RuntimeMessageLane, RuntimeRegistry,
-        RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
-        BUILTIN_RUNTIME_MOCK,
+        register_builtin_runtime_adapters, HiddenTurnSupport, RuntimeAdapter,
+        RuntimeCapabilityRequest, RuntimeCapabilityResult, RuntimeEvent, RuntimeMessageLane,
+        RuntimeRegistry, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
+        RuntimeTurnResult, BUILTIN_RUNTIME_MOCK,
     },
     runtime_policy::{RuntimeExecutionContext, RuntimeExecutionPolicy, RuntimeExecutionRequest},
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -1945,6 +1945,27 @@ impl Kernel {
         Ok(())
     }
 
+    async fn maybe_compact_session_transcript_best_effort(
+        &self,
+        session: &super::sessions::Session,
+    ) {
+        let error_text = match self.maybe_compact_session_transcript(session).await {
+            Ok(()) => return,
+            Err(err) => err.to_string(),
+        };
+        let _ = self
+            .audit
+            .append(
+                "session.compaction.failed",
+                Some(session.session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "error": error_text,
+                }),
+            )
+            .await;
+    }
+
     async fn refresh_active_continuity(&self) -> Result<(), KernelError> {
         let Some(layout) = &self.continuity else {
             return Ok(());
@@ -2033,6 +2054,39 @@ impl Kernel {
         Ok(())
     }
 
+    async fn refresh_active_continuity_best_effort(
+        &self,
+        failure_event_type: &str,
+        archived_path: &str,
+    ) {
+        if let Err(err) = self.refresh_active_continuity().await {
+            let _ = self
+                .audit
+                .append(
+                    failure_event_type,
+                    None,
+                    Some("kernel".to_string()),
+                    json!({
+                        "archived_path": archived_path,
+                        "error": err.to_string(),
+                    }),
+                )
+                .await;
+        }
+    }
+
+    async fn append_audit_event_best_effort(
+        &self,
+        event_type: &str,
+        actor: &str,
+        details: serde_json::Value,
+    ) {
+        let _ = self
+            .audit
+            .append(event_type, None, Some(actor.to_string()), details)
+            .await;
+    }
+
     async fn build_compaction_summary_state(
         &self,
         session_id: Uuid,
@@ -2068,6 +2122,12 @@ impl Kernel {
         let adapter = self.runtime.get(runtime_id).await.ok_or_else(|| {
             KernelError::NotFound(format!("runtime adapter '{}' not found", runtime_id))
         })?;
+        if adapter.hidden_turn_support() != HiddenTurnSupport::SideEffectFree {
+            return Err(KernelError::Runtime(format!(
+                "runtime '{}' does not support side-effect-free hidden compaction",
+                runtime_id
+            )));
+        }
         let execution_context = self
             .resolve_runtime_execution_context(
                 session_id,
@@ -2360,6 +2420,15 @@ impl Kernel {
         &self,
         req: ContinuityPathRequest,
     ) -> Result<ContinuityProposalActionResponse, KernelError> {
+        self.merge_continuity_memory_proposal_with_actor(req, "api")
+            .await
+    }
+
+    pub async fn merge_continuity_memory_proposal_with_actor(
+        &self,
+        req: ContinuityPathRequest,
+        actor: &str,
+    ) -> Result<ContinuityProposalActionResponse, KernelError> {
         let layout = self
             .continuity
             .as_ref()
@@ -2368,16 +2437,40 @@ impl Kernel {
             .merge_memory_proposal(&req.relative_path)
             .await
             .map_err(internal)?;
-        self.refresh_active_continuity().await?;
+        let archived_path = self.relative_workspace_path(&archived);
+        let memory_path = self.relative_workspace_path(&layout.memory_path());
+        self.refresh_active_continuity_best_effort(
+            "continuity.memory_proposal.refresh_failed",
+            &archived_path,
+        )
+        .await;
+        self.append_audit_event_best_effort(
+            "continuity.memory_proposal.merged",
+            actor,
+            json!({
+                "archived_path": archived_path,
+                "memory_path": memory_path,
+            }),
+        )
+        .await;
         Ok(ContinuityProposalActionResponse {
-            archived_path: self.relative_workspace_path(&archived),
-            memory_path: Some(self.relative_workspace_path(&layout.memory_path())),
+            archived_path,
+            memory_path: Some(memory_path),
         })
     }
 
     pub async fn reject_continuity_memory_proposal(
         &self,
         req: ContinuityPathRequest,
+    ) -> Result<ContinuityProposalActionResponse, KernelError> {
+        self.reject_continuity_memory_proposal_with_actor(req, "api")
+            .await
+    }
+
+    pub async fn reject_continuity_memory_proposal_with_actor(
+        &self,
+        req: ContinuityPathRequest,
+        actor: &str,
     ) -> Result<ContinuityProposalActionResponse, KernelError> {
         let layout = self
             .continuity
@@ -2387,9 +2480,22 @@ impl Kernel {
             .reject_memory_proposal(&req.relative_path)
             .await
             .map_err(internal)?;
-        self.refresh_active_continuity().await?;
+        let archived_path = self.relative_workspace_path(&archived);
+        self.refresh_active_continuity_best_effort(
+            "continuity.memory_proposal.refresh_failed",
+            &archived_path,
+        )
+        .await;
+        self.append_audit_event_best_effort(
+            "continuity.memory_proposal.rejected",
+            actor,
+            json!({
+                "archived_path": archived_path,
+            }),
+        )
+        .await;
         Ok(ContinuityProposalActionResponse {
-            archived_path: self.relative_workspace_path(&archived),
+            archived_path,
             memory_path: None,
         })
     }
@@ -2414,6 +2520,15 @@ impl Kernel {
         &self,
         req: ContinuityPathRequest,
     ) -> Result<ContinuityOpenLoopActionResponse, KernelError> {
+        self.resolve_continuity_open_loop_with_actor(req, "api")
+            .await
+    }
+
+    pub async fn resolve_continuity_open_loop_with_actor(
+        &self,
+        req: ContinuityPathRequest,
+        actor: &str,
+    ) -> Result<ContinuityOpenLoopActionResponse, KernelError> {
         let layout = self
             .continuity
             .as_ref()
@@ -2422,10 +2537,21 @@ impl Kernel {
             .resolve_open_loop(&req.relative_path)
             .await
             .map_err(internal)?;
-        self.refresh_active_continuity().await?;
-        Ok(ContinuityOpenLoopActionResponse {
-            archived_path: self.relative_workspace_path(&archived),
-        })
+        let archived_path = self.relative_workspace_path(&archived);
+        self.refresh_active_continuity_best_effort(
+            "continuity.open_loop.refresh_failed",
+            &archived_path,
+        )
+        .await;
+        self.append_audit_event_best_effort(
+            "continuity.open_loop.resolved",
+            actor,
+            json!({
+                "archived_path": archived_path,
+            }),
+        )
+        .await;
+        Ok(ContinuityOpenLoopActionResponse { archived_path })
     }
 }
 
@@ -3378,7 +3504,8 @@ impl Kernel {
             .record_turn(session.session_id)
             .await
             .map_err(internal)?;
-        self.maybe_compact_session_transcript(session).await?;
+        self.maybe_compact_session_transcript_best_effort(session)
+            .await;
 
         if let Some(stream_context) = &channel_stream_context {
             if artifacts.saw_error {
@@ -3482,14 +3609,26 @@ impl Kernel {
             .record_turn(session.session_id)
             .await
             .map_err(internal)?;
-        self.maybe_compact_session_transcript(session).await?;
-        self.record_session_failure_continuity(
-            session,
-            persisted_turn.turn_id,
-            status,
-            &error_text,
-        )
-        .await?;
+        self.maybe_compact_session_transcript_best_effort(session)
+            .await;
+        if let Err(err) = self
+            .record_session_failure_continuity(session, persisted_turn.turn_id, status, &error_text)
+            .await
+        {
+            let _ = self
+                .audit
+                .append(
+                    "session.failure_continuity.failed",
+                    Some(session.session_id),
+                    Some("kernel".to_string()),
+                    json!({
+                        "turn_id": persisted_turn.turn_id,
+                        "status": status.as_str(),
+                        "error": err.to_string(),
+                    }),
+                )
+                .await;
+        }
         Ok(())
     }
 

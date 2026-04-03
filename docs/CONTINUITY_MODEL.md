@@ -107,7 +107,7 @@ Prompt rendering follows the proven assistant pattern used by Hermes, IronClaw, 
 - recent raw turns kept intact
 - no ever-growing literal digest of all older turns in the prompt
 
-The handoff summary is core-owned, but it is updated using the configured runtime with a strict JSON schema and a deterministic fallback path. That keeps the core small while preserving a higher-quality continuation surface than a literal turn digest.
+The handoff summary is core-owned. When the active runtime explicitly supports side-effect-free hidden summarization, LionClaw updates that handoff through a strict JSON schema; otherwise it falls back to deterministic kernel-side compaction. That keeps the core small without introducing hidden side effects outside LionClaw's normal policy boundary.
 
 Before compaction is persisted, LionClaw performs a typed continuity flush so durable facts and active commitments can land in visible files rather than only in the transcript summary.
 
