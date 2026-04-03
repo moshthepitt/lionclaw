@@ -107,6 +107,25 @@ job-scoped policy separate from normal interactive turns, stores the full turn
 history, runs one scheduled job at a time, and delivers only the final message
 to the configured channel.
 
+## Visible continuity
+
+LionClaw keeps assistant continuity in the assistant home workspace instead of
+in a hidden memory store. The hot prompt path loads `MEMORY.md` and
+`continuity/ACTIVE.md`, while older context stays in daily notes, open-loop
+files, artifacts, and a bounded transcript handoff summary.
+
+Inspect and manage that continuity with:
+
+```bash
+./target/release/lionclaw continuity status
+./target/release/lionclaw continuity search "release"
+./target/release/lionclaw continuity get continuity/ACTIVE.md
+./target/release/lionclaw continuity proposals ls
+./target/release/lionclaw continuity proposals merge continuity/proposals/memory/<proposal>.md
+./target/release/lionclaw continuity loops ls
+./target/release/lionclaw continuity loops resolve continuity/open-loops/<loop>.md
+```
+
 ## Channels and background mode
 
 When you want LionClaw available somewhere other than the direct CLI path,

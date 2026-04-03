@@ -53,15 +53,23 @@ Implemented now:
   - failed session turns
 - scheduled outputs are recorded as artifact files
 - transcript compaction summaries are stored in SQLite and loaded separately from file memory
+- transcript compaction uses one structured persisted handoff summary plus the recent raw turn tail
+- compaction performs a typed continuity flush before summary persistence:
+  - memory proposals are written under `continuity/proposals/memory/...`
+  - open loops are upserted under `continuity/open-loops/...`
+- continuity has first-class kernel/operator/API surfaces for:
+  - status
+  - search
+  - get
+  - list/merge/reject memory proposals
+  - list/resolve open loops
 - prompt history uses one bounded compaction handoff summary plus the recent raw turn tail
 
 Not implemented yet:
 
-- memory search/index
-- `MEMORY.md` proposal/merge flow
-- inferred open loops
+- semantic/FTS continuity index
+- inferred open loops outside deterministic/kernel-flushed paths
 - continuity skill contract
-- operator-facing continuity commands
 
 ## Hot prompt context
 
@@ -95,9 +103,13 @@ LionClaw keeps:
 
 Prompt rendering follows the proven assistant pattern used by Hermes, IronClaw, and OpenClaw:
 
-- one bounded persisted handoff summary for compacted history
+- one bounded persisted structured handoff summary for compacted history
 - recent raw turns kept intact
 - no ever-growing literal digest of all older turns in the prompt
+
+The handoff summary is core-owned, but it is updated using the configured runtime with a strict JSON schema and a deterministic fallback path. That keeps the core small while preserving a higher-quality continuation surface than a literal turn digest.
+
+Before compaction is persisted, LionClaw performs a typed continuity flush so durable facts and active commitments can land in visible files rather than only in the transcript summary.
 
 This follows the proven split used by the stronger assistant systems:
 

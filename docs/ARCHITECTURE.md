@@ -12,7 +12,7 @@
 - `kernel.runtime`: runtime adapter contract and registry.
 - `kernel.scheduler`: due-job claiming, lease coordination, retry, and dispatch.
 - `kernel.channel_state`: durable channel bindings, peer trust state, inbound logs, queued channel turns, outbound transcript history, and append-only channel stream delivery state.
-- `kernel.continuity`: visible assistant-home continuity files, `ACTIVE.md` projection, daily notes, and artifact files.
+- `kernel.continuity`: visible assistant-home continuity files, `ACTIVE.md` projection, daily notes, artifacts, open loops, memory proposals, and continuity retrieval helpers.
 - `kernel.audit`: append-only audit event log persisted in SQLite.
 - `kernel.session_compactions`: persisted transcript compaction spans and summaries.
 
@@ -55,6 +55,17 @@
 - `POST /v0/jobs/remove`
 - `POST /v0/jobs/runs`
 - `POST /v0/jobs/tick`
+
+### Continuity
+
+- `GET /v0/continuity/status`
+- `POST /v0/continuity/get`
+- `POST /v0/continuity/search`
+- `GET /v0/continuity/proposals`
+- `POST /v0/continuity/proposals/merge`
+- `POST /v0/continuity/proposals/reject`
+- `GET /v0/continuity/loops`
+- `POST /v0/continuity/loops/resolve`
 
 ### Policy
 
@@ -103,9 +114,9 @@ Runtime module layout:
 Channel bridge layout:
 
 - `kernel/channel_state.rs`: durable channel bindings/peers/offsets/messages + stream event/cursor storage.
-- `kernel/continuity.rs`: assistant-home continuity layout and deterministic continuity projection.
-- `kernel/core.rs`: channel inbound processing, pairing/approval, session snapshot lookup, and stream pull/ack APIs.
-- `kernel/session_compactions.rs`: persisted transcript compaction summaries and ranges.
+- `kernel/continuity.rs`: assistant-home continuity layout, proposals/open loops/artifacts, and deterministic continuity projection/search helpers.
+- `kernel/core.rs`: channel inbound processing, pairing/approval, continuity APIs, session snapshot lookup, and stream pull/ack APIs.
+- `kernel/session_compactions.rs`: persisted structured transcript compaction summaries and ranges.
 - `api/mod.rs`: HTTP routes for external channel skill workers.
 
 Scheduler layout:
@@ -174,7 +185,7 @@ Queued channel turns emit machine-stable status/error codes through the same str
   - `retry_last_turn`
   - `reset_session`
 - The default history window is the last 12 durable turns.
-- Prompt rendering prepends one bounded persisted transcript compaction summary before the recent raw turns.
+- Prompt rendering prepends one bounded persisted structured transcript handoff summary before the recent raw turns.
 - Channel-backed session mutation APIs (`sessions/open`, `sessions/action`, direct session turns) remain gated by channel peer approval in the kernel.
 
 ## Assistant Continuity
@@ -186,6 +197,7 @@ Queued channel turns emit machine-stable status/error codes through the same str
   - `continuity/daily/...`
   - `continuity/open-loops/...`
   - `continuity/artifacts/...`
+  - `continuity/proposals/memory/...`
 - `MEMORY.md` is prompt-loaded but human-curated in v1.
 - `continuity/ACTIVE.md` is kernel-generated from deterministic state and existing continuity files.
 - Daily continuity notes are appended from deterministic kernel events such as:
@@ -193,8 +205,14 @@ Queued channel turns emit machine-stable status/error codes through the same str
   - scheduled job success/failure
   - failed turns
 - Scheduler artifacts are recorded under `continuity/artifacts/...`.
+- Memory proposals are written under `continuity/proposals/memory/...` and merged or rejected explicitly.
+- Open loops are written under `continuity/open-loops/...` and resolved explicitly.
 - Transcript compaction summaries are stored in SQLite separately from file-backed continuity.
-- Prompt history sees one bounded compaction handoff summary plus the recent raw tail.
+- Prompt history sees one bounded structured compaction handoff summary plus the recent raw tail.
+- Before a new compaction summary is persisted, the kernel flushes visible continuity artifacts:
+  - memory proposals
+  - open-loop updates
+  - a daily note entry when new continuity was promoted
 - Brokered filesystem access may target a different project/task root; continuity never follows that root.
 
 ## Scheduler Model

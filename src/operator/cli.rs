@@ -6,7 +6,10 @@ use clap::{Args, Parser, Subcommand};
 use cron::Schedule;
 
 use crate::{
-    contracts::{JobCreateRequest, JobRefRequest, JobRunsRequest, JobScheduleDto, TrustTier},
+    contracts::{
+        ContinuityPathRequest, ContinuitySearchRequest, JobCreateRequest, JobRefRequest,
+        JobRunsRequest, JobScheduleDto, TrustTier,
+    },
     home::LionClawHome,
     kernel::jobs::normalize_cron_expression,
     operator::{
@@ -55,6 +58,10 @@ enum Command {
     Channel {
         #[command(subcommand)]
         command: ChannelCommand,
+    },
+    Continuity {
+        #[command(subcommand)]
+        command: ContinuityCommand,
     },
     Job {
         #[command(subcommand)]
@@ -217,6 +224,34 @@ enum JobCommand {
     Tick,
 }
 
+#[derive(Debug, Subcommand)]
+enum ContinuityCommand {
+    Status,
+    Search(ContinuitySearchArgs),
+    Get(ContinuityPathArgs),
+    Loops {
+        #[command(subcommand)]
+        command: ContinuityLoopCommand,
+    },
+    Proposals {
+        #[command(subcommand)]
+        command: ContinuityProposalCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ContinuityLoopCommand {
+    Ls,
+    Resolve(ContinuityPathArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ContinuityProposalCommand {
+    Ls,
+    Merge(ContinuityPathArgs),
+    Reject(ContinuityPathArgs),
+}
+
 #[derive(Debug, Args)]
 struct PairingListArgs {
     #[arg(long)]
@@ -273,6 +308,18 @@ struct JobRunsArgs {
     job_id: String,
     #[arg(long, default_value_t = 20)]
     limit: usize,
+}
+
+#[derive(Debug, Args)]
+struct ContinuitySearchArgs {
+    query: String,
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+}
+
+#[derive(Debug, Args)]
+struct ContinuityPathArgs {
+    relative_path: String,
 }
 
 pub async fn run() -> Result<()> {
@@ -484,6 +531,100 @@ pub async fn run() -> Result<()> {
                 }
             },
         },
+        Command::Continuity { command } => {
+            let applied = apply(&home).await?;
+            let kernel = open_kernel(&home, &applied.config, None).await?;
+            match command {
+                ContinuityCommand::Status => {
+                    let status = kernel.continuity_status().await?;
+                    println!("memory={}", status.memory_path);
+                    println!("active={}", status.active_path);
+                    println!(
+                        "latest_daily={}",
+                        status.latest_daily_path.unwrap_or_else(|| "-".to_string())
+                    );
+                    println!("open_loops={}", status.open_loops.len());
+                    println!("memory_proposals={}", status.memory_proposals.len());
+                    println!("recent_artifacts={}", status.recent_artifacts.len());
+                }
+                ContinuityCommand::Search(args) => {
+                    let response = kernel
+                        .continuity_search(ContinuitySearchRequest {
+                            query: args.query,
+                            limit: Some(args.limit),
+                        })
+                        .await?;
+                    for item in response.matches {
+                        println!(
+                            "path={} title={} snippet={}",
+                            item.relative_path, item.title, item.snippet
+                        );
+                    }
+                }
+                ContinuityCommand::Get(args) => {
+                    let response = kernel
+                        .continuity_get(ContinuityPathRequest {
+                            relative_path: args.relative_path,
+                        })
+                        .await?;
+                    print!("{}", response.content);
+                }
+                ContinuityCommand::Loops { command } => match command {
+                    ContinuityLoopCommand::Ls => {
+                        for open_loop in kernel.list_continuity_open_loops().await?.loops {
+                            println!(
+                                "path={} title={} next_step={}",
+                                open_loop.relative_path,
+                                open_loop.title,
+                                open_loop.next_step.unwrap_or_else(|| "-".to_string())
+                            );
+                        }
+                    }
+                    ContinuityLoopCommand::Resolve(args) => {
+                        let response = kernel
+                            .resolve_continuity_open_loop(ContinuityPathRequest {
+                                relative_path: args.relative_path,
+                            })
+                            .await?;
+                        println!("resolved {}", response.archived_path);
+                    }
+                },
+                ContinuityCommand::Proposals { command } => match command {
+                    ContinuityProposalCommand::Ls => {
+                        for proposal in kernel.list_continuity_memory_proposals().await?.proposals {
+                            println!(
+                                "path={} title={} entries={}",
+                                proposal.relative_path,
+                                proposal.title,
+                                proposal.entries.len()
+                            );
+                        }
+                    }
+                    ContinuityProposalCommand::Merge(args) => {
+                        let response = kernel
+                            .merge_continuity_memory_proposal(ContinuityPathRequest {
+                                relative_path: args.relative_path,
+                            })
+                            .await?;
+                        println!(
+                            "merged {} into {}",
+                            response.archived_path,
+                            response
+                                .memory_path
+                                .unwrap_or_else(|| "MEMORY.md".to_string())
+                        );
+                    }
+                    ContinuityProposalCommand::Reject(args) => {
+                        let response = kernel
+                            .reject_continuity_memory_proposal(ContinuityPathRequest {
+                                relative_path: args.relative_path,
+                            })
+                            .await?;
+                        println!("rejected {}", response.archived_path);
+                    }
+                },
+            }
+        }
         Command::Job { command } => {
             let applied = apply(&home).await?;
             let kernel = open_kernel(&home, &applied.config, None).await?;

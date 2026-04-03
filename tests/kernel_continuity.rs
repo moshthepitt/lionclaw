@@ -8,8 +8,9 @@ use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use lionclaw::{
     contracts::{
-        ChannelBindRequest, JobCreateRequest, PolicyGrantRequest, SessionHistoryPolicy,
-        SessionOpenRequest, SessionTurnRequest, SkillInstallRequest, TrustTier,
+        ChannelBindRequest, ContinuityPathRequest, ContinuitySearchRequest, JobCreateRequest,
+        PolicyGrantRequest, SessionHistoryPolicy, SessionOpenRequest, SessionTurnRequest,
+        SkillInstallRequest, TrustTier,
     },
     kernel::{
         policy::Capability,
@@ -292,16 +293,121 @@ async fn older_turns_are_compacted_into_prompt_context() {
     let last_prompt = prompts
         .lock()
         .expect("prompt lock")
-        .last()
+        .iter()
+        .rev()
+        .find(|prompt| !prompt.contains("lionclaw_compaction_handoff_v1"))
         .cloned()
-        .unwrap();
+        .expect("last user-facing prompt");
     assert!(last_prompt.contains("Compacted Prior Turns"));
     assert!(last_prompt.contains("Compacted Prior Turns 1-17"));
-    assert!(last_prompt.contains("Total compacted turns: 17"));
-    assert!(last_prompt.contains("user: turn 0"));
-    assert!(last_prompt.contains("user: turn 9"));
-    assert!(!last_prompt.contains("user: turn 5"));
+    assert!(last_prompt.contains("### Goal"));
+    assert!(last_prompt.contains("turn 0"));
+    assert!(last_prompt.contains("### Next Steps"));
+    assert!(last_prompt.contains("turn 16"));
+    assert!(!last_prompt.contains("## Prior Turn 1\n\n### User\n\nturn 0"));
     assert!(last_prompt.contains("turn 29"));
+
+    let status = kernel.continuity_status().await.expect("continuity status");
+    assert!(!status.memory_proposals.is_empty());
+    assert!(!status.open_loops.is_empty());
+}
+
+#[tokio::test]
+async fn continuity_surface_lists_searches_and_manages_proposals_and_loops() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "capture",
+            Arc::new(CapturePromptAdapter {
+                prompts: prompts.clone(),
+                capability_results: Arc::new(Mutex::new(Vec::new())),
+                request_fs_read: false,
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+
+    let session = open_local_session(&kernel, "continuity-surface-peer").await;
+    for index in 0..18 {
+        kernel
+            .turn_session(SessionTurnRequest {
+                session_id: session.session_id,
+                user_text: format!("review turn {} in src/kernel/continuity.rs", index),
+                runtime_id: Some("capture".to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await
+            .expect("turn succeeds");
+    }
+
+    let proposals = kernel
+        .list_continuity_memory_proposals()
+        .await
+        .expect("list proposals");
+    assert_eq!(proposals.proposals.len(), 1);
+
+    let loops = kernel
+        .list_continuity_open_loops()
+        .await
+        .expect("list loops");
+    assert_eq!(loops.loops.len(), 1);
+
+    let search = kernel
+        .continuity_search(ContinuitySearchRequest {
+            query: "continuity module".to_string(),
+            limit: Some(10),
+        })
+        .await
+        .expect("search continuity");
+    assert!(!search.matches.is_empty());
+
+    let proposal_path = proposals.proposals[0].relative_path.clone();
+    let proposal = kernel
+        .continuity_get(ContinuityPathRequest {
+            relative_path: proposal_path.clone(),
+        })
+        .await
+        .expect("get proposal");
+    assert!(proposal.content.contains("Memory Proposal"));
+
+    let merge = kernel
+        .merge_continuity_memory_proposal(ContinuityPathRequest {
+            relative_path: proposal_path,
+        })
+        .await
+        .expect("merge proposal");
+    assert!(merge.archived_path.contains("archive/merged"));
+
+    let loop_path = loops.loops[0].relative_path.clone();
+    let resolved = kernel
+        .resolve_continuity_open_loop(ContinuityPathRequest {
+            relative_path: loop_path,
+        })
+        .await
+        .expect("resolve loop");
+    assert!(resolved.archived_path.contains("open-loops/archive"));
+
+    let memory = tokio::fs::read_to_string(env.workspace_root().join("MEMORY.md"))
+        .await
+        .expect("read memory");
+    assert!(memory.contains("Prefers continuity module work to stay small and explicit."));
 }
 
 async fn install_enabled_skill(kernel: &Kernel, name: &str) -> String {
@@ -444,7 +550,45 @@ impl RuntimeAdapter for CapturePromptAdapter {
         input: RuntimeTurnInput,
         events: RuntimeEventSender,
     ) -> Result<RuntimeTurnResult> {
-        self.prompts.lock().expect("prompt lock").push(input.prompt);
+        let current_prompt = input.prompt;
+        self.prompts
+            .lock()
+            .expect("prompt lock")
+            .push(current_prompt.clone());
+
+        if input.selected_skills.is_empty()
+            && current_prompt.contains("lionclaw_compaction_handoff_v1")
+        {
+            let first_user = extract_compaction_user(&current_prompt, false);
+            let last_user = extract_compaction_user(&current_prompt, true);
+            let _ = events.send(RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: json!({
+                    "goal": first_user,
+                    "constraints_preferences": ["Keep the core small and explicit."],
+                    "progress_done": ["Compacted prior transcript state into a structured handoff."],
+                    "progress_in_progress": [],
+                    "progress_blocked": [],
+                    "key_decisions": ["Continuity stays file-backed under assistant home."],
+                    "relevant_files": ["src/kernel/continuity.rs"],
+                    "next_steps": [last_user],
+                    "critical_context": ["Use the handoff summary plus the recent raw tail to continue."],
+                    "memory_proposals": [{
+                        "title": "Continuity Product Preferences",
+                        "rationale": "durable product preference surfaced during compaction",
+                        "entries": ["Prefers continuity module work to stay small and explicit."]
+                    }],
+                    "open_loops": [{
+                        "title": "Follow up on continuity surface",
+                        "summary": "Need to review continuity product commands and proposal flow.",
+                        "next_step": last_user
+                    }]
+                })
+                .to_string(),
+            });
+            let _ = events.send(RuntimeEvent::Done);
+            return Ok(RuntimeTurnResult::default());
+        }
 
         if self.request_fs_read {
             let skill_id = input
@@ -495,6 +639,24 @@ impl RuntimeAdapter for CapturePromptAdapter {
 
     async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
         Ok(())
+    }
+}
+
+fn extract_compaction_user(prompt: &str, last: bool) -> String {
+    let users = prompt
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("User: "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if users.is_empty() {
+        return "continue the session".to_string();
+    }
+    if last {
+        users.last().cloned().unwrap()
+    } else {
+        users.first().cloned().unwrap()
     }
 }
 

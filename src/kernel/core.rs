@@ -20,7 +20,11 @@ use crate::contracts::{
     ChannelListResponse, ChannelPeerApproveRequest, ChannelPeerBlockRequest,
     ChannelPeerListResponse, ChannelPeerResponse, ChannelPeerView, ChannelStreamAckRequest,
     ChannelStreamAckResponse, ChannelStreamEventView, ChannelStreamPullRequest,
-    ChannelStreamPullResponse, JobCreateRequest, JobCreateResponse, JobDeliveryTargetDto,
+    ChannelStreamPullResponse, ContinuityGetResponse, ContinuityMemoryProposalView,
+    ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse, ContinuityOpenLoopView,
+    ContinuityPathRequest, ContinuityProposalActionResponse, ContinuityProposalListResponse,
+    ContinuitySearchMatchView, ContinuitySearchRequest, ContinuitySearchResponse,
+    ContinuityStatusResponse, JobCreateRequest, JobCreateResponse, JobDeliveryTargetDto,
     JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest, JobRemoveResponse,
     JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto, JobTickResponse,
     JobToggleResponse, JobView, PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeResponse,
@@ -41,7 +45,10 @@ use super::{
         ChannelPeerStatus, ChannelStateStore, ChannelStreamEventInsert, ChannelStreamEventKind,
         ChannelStreamEventRecord, ChannelTurnRecord, StreamMessageLane as ChannelStreamLane,
     },
-    continuity::{ActiveContinuitySnapshot, ContinuityArtifact, ContinuityEvent, ContinuityLayout},
+    continuity::{
+        ActiveContinuitySnapshot, ContinuityArtifact, ContinuityEvent, ContinuityLayout,
+        ContinuityMemoryProposalDraft, ContinuityOpenLoopDraft,
+    },
     db::Db,
     error::KernelError,
     jobs::{
@@ -61,8 +68,10 @@ use super::{
     selector::SkillSelector,
     session_compactions::SessionCompactionStore,
     session_transcript::{
-        load_repaired_turns, merge_compaction_summary_state, render_compaction_summary,
-        render_turns_for_prompt, turns_to_history_views, TranscriptMode, COMPACTION_RAW_KEEP,
+        build_compaction_prompt, load_repaired_turns, merge_compaction_summary_state,
+        merge_compaction_summary_updates, parse_compaction_summary_state,
+        render_compaction_summary, render_turns_for_prompt, turns_to_history_views,
+        CompactionSummaryState, TranscriptMode, COMPACTION_RAW_KEEP,
     },
     session_turns::{NewSessionTurn, SessionTurnCompletion, SessionTurnRecord, SessionTurnStore},
     sessions::SessionStore,
@@ -1889,7 +1898,20 @@ impl Kernel {
         let previous_summary_state = previous_compaction
             .as_ref()
             .map(|record| record.summary_state.clone());
-        let summary_state = merge_compaction_summary_state(previous_summary_state.as_ref(), &turns);
+        let runtime_id = turns
+            .last()
+            .map(|turn| turn.runtime_id.as_str())
+            .unwrap_or(BUILTIN_RUNTIME_MOCK);
+        let summary_state = self
+            .build_compaction_summary_state(
+                session.session_id,
+                runtime_id,
+                previous_summary_state.as_ref(),
+                &turns,
+            )
+            .await?;
+        self.flush_compaction_continuity(session, &summary_state)
+            .await?;
         let summary_text =
             render_compaction_summary(start_sequence_no, through_sequence_no, &summary_state);
         if summary_text.trim().is_empty() {
@@ -1976,7 +1998,19 @@ impl Kernel {
             .await
             .map_err(internal)?
             .into_iter()
-            .map(|open_loop| open_loop.title)
+            .map(|open_loop| match open_loop.next_step {
+                Some(next_step) if !next_step.trim().is_empty() => {
+                    format!("{} (next: {})", open_loop.title, next_step.trim())
+                }
+                _ => open_loop.title,
+            })
+            .collect::<Vec<_>>();
+        let pending_proposals = layout
+            .list_memory_proposals(5)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(|proposal| proposal.title)
             .collect::<Vec<_>>();
         let recent_outputs = layout
             .list_recent_artifacts(5)
@@ -1991,10 +2025,183 @@ impl Kernel {
                 matters_today,
                 open_loops,
                 pending_approvals,
+                pending_proposals,
                 recent_outputs,
             })
             .await
             .map_err(internal)?;
+        Ok(())
+    }
+
+    async fn build_compaction_summary_state(
+        &self,
+        session_id: Uuid,
+        runtime_id: &str,
+        previous_summary_state: Option<&CompactionSummaryState>,
+        turns: &[SessionTurnRecord],
+    ) -> Result<CompactionSummaryState, KernelError> {
+        let fallback = merge_compaction_summary_state(previous_summary_state, turns);
+        let prompt = build_compaction_prompt(previous_summary_state, turns);
+        let assistant_text = match self
+            .run_hidden_compaction_turn(session_id, runtime_id, prompt)
+            .await
+        {
+            Ok(text) => text,
+            Err(_) => return Ok(fallback),
+        };
+
+        match parse_compaction_summary_state(&assistant_text) {
+            Ok(summary_state) => Ok(merge_compaction_summary_updates(
+                previous_summary_state,
+                summary_state,
+            )),
+            Err(_) => Ok(fallback),
+        }
+    }
+
+    async fn run_hidden_compaction_turn(
+        &self,
+        session_id: Uuid,
+        runtime_id: &str,
+        prompt: String,
+    ) -> Result<String, KernelError> {
+        let adapter = self.runtime.get(runtime_id).await.ok_or_else(|| {
+            KernelError::NotFound(format!("runtime adapter '{}' not found", runtime_id))
+        })?;
+        let execution_context = self
+            .resolve_runtime_execution_context(
+                session_id,
+                runtime_id,
+                RuntimeExecutionRequest::new(None, Vec::new(), Some(30_000)),
+            )
+            .await?;
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: execution_context.working_dir,
+                environment: execution_context.environment,
+                selected_skills: Vec::new(),
+            })
+            .await
+            .map_err(|err| KernelError::Runtime(err.to_string()))?;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let turn_outcome = timeout(
+            execution_context.hard_timeout,
+            adapter.turn(
+                RuntimeTurnInput {
+                    runtime_session_id: handle.runtime_session_id.clone(),
+                    prompt,
+                    selected_skills: Vec::new(),
+                },
+                event_tx,
+            ),
+        )
+        .await;
+
+        let outcome = match turn_outcome {
+            Ok(Ok(result)) => {
+                if !result.capability_requests.is_empty() {
+                    Err(KernelError::Runtime(
+                        "compaction summarizer requested capabilities".to_string(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Ok(Err(err)) => Err(KernelError::Runtime(err.to_string())),
+            Err(_) => {
+                let _ = adapter
+                    .cancel(&handle, Some("compaction summarizer timed out".to_string()))
+                    .await;
+                Err(KernelError::RuntimeTimeout(
+                    "compaction summarizer timed out".to_string(),
+                ))
+            }
+        };
+
+        let mut events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            events.push(event);
+        }
+        let close_result = adapter.close(&handle).await;
+        outcome?;
+        close_result.map_err(|err| KernelError::Runtime(err.to_string()))?;
+        Ok(assistant_text_from_events(&events))
+    }
+
+    async fn flush_compaction_continuity(
+        &self,
+        session: &super::sessions::Session,
+        summary_state: &CompactionSummaryState,
+    ) -> Result<(), KernelError> {
+        let Some(layout) = &self.continuity else {
+            return Ok(());
+        };
+
+        let mut proposal_paths = Vec::new();
+        for proposal in &summary_state.memory_proposals {
+            if let Some(path) = layout
+                .record_memory_proposal(&ContinuityMemoryProposalDraft {
+                    title: proposal.title.clone(),
+                    rationale: proposal.rationale.clone(),
+                    entries: proposal.entries.clone(),
+                    source: Some(format!("session:{}", session.session_id)),
+                })
+                .await
+                .map_err(internal)?
+            {
+                proposal_paths.push(self.relative_workspace_path(&path));
+            }
+        }
+
+        let mut loop_paths = Vec::new();
+        for open_loop in &summary_state.open_loops {
+            if let Some(path) = layout
+                .upsert_open_loop(&ContinuityOpenLoopDraft {
+                    title: open_loop.title.clone(),
+                    summary: open_loop.summary.clone(),
+                    next_step: open_loop.next_step.clone(),
+                    source: Some(format!("session:{}", session.session_id)),
+                })
+                .await
+                .map_err(internal)?
+            {
+                loop_paths.push(self.relative_workspace_path(&path));
+            }
+        }
+
+        if proposal_paths.is_empty() && loop_paths.is_empty() {
+            return Ok(());
+        }
+
+        let mut details = vec![format!("session {}", session.session_id)];
+        if !proposal_paths.is_empty() {
+            details.push(format!("memory proposals {}", proposal_paths.join(", ")));
+        }
+        if !loop_paths.is_empty() {
+            details.push(format!("open loops {}", loop_paths.join(", ")));
+        }
+        layout
+            .append_daily_event(ContinuityEvent {
+                at: Utc::now(),
+                title: "Continuity flush before transcript compaction".to_string(),
+                details,
+            })
+            .await
+            .map_err(internal)?;
+        self.refresh_active_continuity().await?;
+        let _ = self
+            .audit
+            .append(
+                "session.compaction.flush",
+                Some(session.session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "memory_proposal_count": proposal_paths.len(),
+                    "open_loop_count": loop_paths.len(),
+                }),
+            )
+            .await;
         Ok(())
     }
 
@@ -2064,6 +2271,162 @@ impl Kernel {
 
         Ok(AuditQueryResponse { events })
     }
+
+    pub async fn continuity_status(&self) -> Result<ContinuityStatusResponse, KernelError> {
+        let layout = self
+            .continuity
+            .as_ref()
+            .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let status = layout.status().await.map_err(internal)?;
+        Ok(ContinuityStatusResponse {
+            memory_path: status.memory_path,
+            active_path: status.active_path,
+            latest_daily_path: status.latest_daily_path,
+            open_loops: status
+                .open_loops
+                .into_iter()
+                .map(to_continuity_open_loop_view)
+                .collect(),
+            recent_artifacts: status
+                .recent_artifacts
+                .into_iter()
+                .map(to_continuity_artifact_view)
+                .collect(),
+            memory_proposals: status
+                .memory_proposals
+                .into_iter()
+                .map(to_continuity_memory_proposal_view)
+                .collect(),
+        })
+    }
+
+    pub async fn continuity_search(
+        &self,
+        req: ContinuitySearchRequest,
+    ) -> Result<ContinuitySearchResponse, KernelError> {
+        let layout = self
+            .continuity
+            .as_ref()
+            .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let limit = req.limit.unwrap_or(10).max(1).min(100);
+        let matches = layout.search(&req.query, limit).await.map_err(internal)?;
+        Ok(ContinuitySearchResponse {
+            matches: matches
+                .into_iter()
+                .map(|item| ContinuitySearchMatchView {
+                    title: item.title,
+                    relative_path: item.relative_path,
+                    snippet: item.snippet,
+                })
+                .collect(),
+        })
+    }
+
+    pub async fn continuity_get(
+        &self,
+        req: ContinuityPathRequest,
+    ) -> Result<ContinuityGetResponse, KernelError> {
+        let layout = self
+            .continuity
+            .as_ref()
+            .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let content = layout
+            .read_relative(&req.relative_path)
+            .await
+            .map_err(internal)?;
+        Ok(ContinuityGetResponse {
+            relative_path: req.relative_path,
+            content,
+        })
+    }
+
+    pub async fn list_continuity_memory_proposals(
+        &self,
+    ) -> Result<ContinuityProposalListResponse, KernelError> {
+        let layout = self
+            .continuity
+            .as_ref()
+            .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let proposals = layout.list_memory_proposals(100).await.map_err(internal)?;
+        Ok(ContinuityProposalListResponse {
+            proposals: proposals
+                .into_iter()
+                .map(to_continuity_memory_proposal_view)
+                .collect(),
+        })
+    }
+
+    pub async fn merge_continuity_memory_proposal(
+        &self,
+        req: ContinuityPathRequest,
+    ) -> Result<ContinuityProposalActionResponse, KernelError> {
+        let layout = self
+            .continuity
+            .as_ref()
+            .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let archived = layout
+            .merge_memory_proposal(&req.relative_path)
+            .await
+            .map_err(internal)?;
+        self.refresh_active_continuity().await?;
+        Ok(ContinuityProposalActionResponse {
+            archived_path: self.relative_workspace_path(&archived),
+            memory_path: Some(self.relative_workspace_path(&layout.memory_path())),
+        })
+    }
+
+    pub async fn reject_continuity_memory_proposal(
+        &self,
+        req: ContinuityPathRequest,
+    ) -> Result<ContinuityProposalActionResponse, KernelError> {
+        let layout = self
+            .continuity
+            .as_ref()
+            .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let archived = layout
+            .reject_memory_proposal(&req.relative_path)
+            .await
+            .map_err(internal)?;
+        self.refresh_active_continuity().await?;
+        Ok(ContinuityProposalActionResponse {
+            archived_path: self.relative_workspace_path(&archived),
+            memory_path: None,
+        })
+    }
+
+    pub async fn list_continuity_open_loops(
+        &self,
+    ) -> Result<ContinuityOpenLoopListResponse, KernelError> {
+        let layout = self
+            .continuity
+            .as_ref()
+            .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let loops = layout.list_active_open_loops().await.map_err(internal)?;
+        Ok(ContinuityOpenLoopListResponse {
+            loops: loops
+                .into_iter()
+                .map(to_continuity_open_loop_view)
+                .collect(),
+        })
+    }
+
+    pub async fn resolve_continuity_open_loop(
+        &self,
+        req: ContinuityPathRequest,
+    ) -> Result<ContinuityOpenLoopActionResponse, KernelError> {
+        let layout = self
+            .continuity
+            .as_ref()
+            .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let archived = layout
+            .resolve_open_loop(&req.relative_path)
+            .await
+            .map_err(internal)?;
+        self.refresh_active_continuity().await?;
+        Ok(ContinuityOpenLoopActionResponse {
+            archived_path: self.relative_workspace_path(&archived),
+        })
+    }
 }
 
 fn to_skill_view(skill: super::skills::SkillRecord) -> SkillView {
@@ -2132,6 +2495,37 @@ fn to_session_open_response(session: super::sessions::Session) -> SessionOpenRes
         trust_tier: session.trust_tier,
         history_policy: session.history_policy,
         created_at: session.created_at,
+    }
+}
+
+fn to_continuity_open_loop_view(
+    open_loop: super::continuity::ContinuityOpenLoop,
+) -> ContinuityOpenLoopView {
+    ContinuityOpenLoopView {
+        title: open_loop.title,
+        relative_path: open_loop.relative_path,
+        summary: open_loop.summary,
+        next_step: open_loop.next_step,
+    }
+}
+
+fn to_continuity_artifact_view(
+    artifact: super::continuity::ContinuityArtifactSummary,
+) -> crate::contracts::ContinuityArtifactView {
+    crate::contracts::ContinuityArtifactView {
+        title: artifact.title,
+        relative_path: artifact.relative_path,
+    }
+}
+
+fn to_continuity_memory_proposal_view(
+    proposal: super::continuity::ContinuityMemoryProposal,
+) -> ContinuityMemoryProposalView {
+    ContinuityMemoryProposalView {
+        title: proposal.title,
+        relative_path: proposal.relative_path,
+        rationale: proposal.rationale,
+        entries: proposal.entries,
     }
 }
 

@@ -17,6 +17,9 @@ use crate::{
         ChannelPeerApproveRequest, ChannelPeerBlockRequest, ChannelPeerListParams,
         ChannelPeerListResponse, ChannelPeerResponse, ChannelStreamAckRequest,
         ChannelStreamAckResponse, ChannelStreamPullRequest, ChannelStreamPullResponse,
+        ContinuityGetResponse, ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse,
+        ContinuityPathRequest, ContinuityProposalActionResponse, ContinuityProposalListResponse,
+        ContinuitySearchRequest, ContinuitySearchResponse, ContinuityStatusResponse,
         DaemonInfoResponse, JobCreateRequest, JobCreateResponse, JobGetResponse, JobListResponse,
         JobManualRunResponse, JobRefRequest, JobRemoveResponse, JobRunsRequest, JobRunsResponse,
         JobTickResponse, JobToggleResponse, PolicyGrantRequest, PolicyGrantResponse,
@@ -72,6 +75,23 @@ pub fn build_router(kernel: Arc<Kernel>, daemon_info: DaemonInfoResponse) -> Rou
         .route("/v0/jobs/remove", post(remove_job))
         .route("/v0/jobs/runs", post(list_job_runs))
         .route("/v0/jobs/tick", post(tick_jobs))
+        .route("/v0/continuity/status", get(continuity_status))
+        .route("/v0/continuity/get", post(continuity_get))
+        .route("/v0/continuity/search", post(continuity_search))
+        .route("/v0/continuity/proposals", get(list_continuity_proposals))
+        .route(
+            "/v0/continuity/proposals/merge",
+            post(merge_continuity_proposal),
+        )
+        .route(
+            "/v0/continuity/proposals/reject",
+            post(reject_continuity_proposal),
+        )
+        .route("/v0/continuity/loops", get(list_continuity_loops))
+        .route(
+            "/v0/continuity/loops/resolve",
+            post(resolve_continuity_loop),
+        )
         .route("/v0/audit/query", get(query_audit))
         .with_state(state)
 }
@@ -295,6 +315,67 @@ async fn list_job_runs(
 
 async fn tick_jobs(State(state): State<ApiState>) -> Result<Json<JobTickResponse>, ApiError> {
     let result = state.kernel.scheduler_tick().await?;
+    Ok(Json(result))
+}
+
+async fn continuity_status(
+    State(state): State<ApiState>,
+) -> Result<Json<ContinuityStatusResponse>, ApiError> {
+    let result = state.kernel.continuity_status().await?;
+    Ok(Json(result))
+}
+
+async fn continuity_get(
+    State(state): State<ApiState>,
+    Json(req): Json<ContinuityPathRequest>,
+) -> Result<Json<ContinuityGetResponse>, ApiError> {
+    let result = state.kernel.continuity_get(req).await?;
+    Ok(Json(result))
+}
+
+async fn continuity_search(
+    State(state): State<ApiState>,
+    Json(req): Json<ContinuitySearchRequest>,
+) -> Result<Json<ContinuitySearchResponse>, ApiError> {
+    let result = state.kernel.continuity_search(req).await?;
+    Ok(Json(result))
+}
+
+async fn list_continuity_proposals(
+    State(state): State<ApiState>,
+) -> Result<Json<ContinuityProposalListResponse>, ApiError> {
+    let result = state.kernel.list_continuity_memory_proposals().await?;
+    Ok(Json(result))
+}
+
+async fn merge_continuity_proposal(
+    State(state): State<ApiState>,
+    Json(req): Json<ContinuityPathRequest>,
+) -> Result<Json<ContinuityProposalActionResponse>, ApiError> {
+    let result = state.kernel.merge_continuity_memory_proposal(req).await?;
+    Ok(Json(result))
+}
+
+async fn reject_continuity_proposal(
+    State(state): State<ApiState>,
+    Json(req): Json<ContinuityPathRequest>,
+) -> Result<Json<ContinuityProposalActionResponse>, ApiError> {
+    let result = state.kernel.reject_continuity_memory_proposal(req).await?;
+    Ok(Json(result))
+}
+
+async fn list_continuity_loops(
+    State(state): State<ApiState>,
+) -> Result<Json<ContinuityOpenLoopListResponse>, ApiError> {
+    let result = state.kernel.list_continuity_open_loops().await?;
+    Ok(Json(result))
+}
+
+async fn resolve_continuity_loop(
+    State(state): State<ApiState>,
+    Json(req): Json<ContinuityPathRequest>,
+) -> Result<Json<ContinuityOpenLoopActionResponse>, ApiError> {
+    let result = state.kernel.resolve_continuity_open_loop(req).await?;
     Ok(Json(result))
 }
 
