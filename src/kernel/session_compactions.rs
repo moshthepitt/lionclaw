@@ -64,6 +64,11 @@ impl SessionCompactionStore {
     ) -> Result<SessionCompactionRecord> {
         let compaction_id = Uuid::new_v4();
         let created_at_ms = now_ms();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start session compaction transaction")?;
         sqlx::query(
             "INSERT INTO session_compactions \
              (compaction_id, session_id, start_sequence_no, through_sequence_no, summary_text, created_at_ms) \
@@ -75,9 +80,23 @@ impl SessionCompactionStore {
         .bind(i64::try_from(through_sequence_no).context("through_sequence_no is too large")?)
         .bind(summary_text)
         .bind(created_at_ms)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .context("failed to insert session compaction")?;
+
+        sqlx::query(
+            "DELETE FROM session_compactions \
+             WHERE session_id = ?1 AND compaction_id != ?2",
+        )
+        .bind(session_id.to_string())
+        .bind(compaction_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .context("failed to prune superseded session compactions")?;
+
+        tx.commit()
+            .await
+            .context("failed to commit session compaction transaction")?;
 
         self.get(compaction_id)
             .await?
@@ -141,4 +160,49 @@ fn map_compaction_row(row: SqliteRow) -> Result<SessionCompactionRecord> {
         created_at: ms_to_datetime(created_at_ms)
             .ok_or_else(|| anyhow!("invalid created_at_ms '{}'", created_at_ms))?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+    use uuid::Uuid;
+
+    use super::SessionCompactionStore;
+    use crate::kernel::db::Db;
+
+    #[tokio::test]
+    async fn insert_prunes_superseded_compactions_for_session() {
+        let temp_dir = tempdir().expect("temp dir");
+        let db = Db::connect_file(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("db connect");
+        let store = SessionCompactionStore::new(db.pool());
+        let session_id = Uuid::new_v4();
+
+        let first = store
+            .insert(session_id, 1, 5, "first".to_string())
+            .await
+            .expect("insert first");
+        let second = store
+            .insert(session_id, 1, 10, "second".to_string())
+            .await
+            .expect("insert second");
+
+        assert!(store
+            .get(first.compaction_id)
+            .await
+            .expect("get first")
+            .is_none());
+        let latest = store
+            .latest(session_id)
+            .await
+            .expect("latest")
+            .expect("record");
+        assert_eq!(latest.compaction_id, second.compaction_id);
+        assert_eq!(latest.summary_text, "second");
+        assert_eq!(
+            store.list_recent(session_id, 10).await.expect("list").len(),
+            1
+        );
+    }
 }
