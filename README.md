@@ -195,6 +195,7 @@ Dive deeper:
 
 - [Architecture](docs/ARCHITECTURE.md) - how the trusted core isolates state, policy, and runtime control
 - [Binary Model](docs/BINARY_RUNTIME_AGNOSTIC_MODEL.md) - the product and runtime model behind `lionclaw run`
+- [Continuity Model](docs/CONTINUITY_MODEL.md) - how LionClaw keeps visible assistant continuity without hidden memory state
 - [Release Process](docs/RELEASE.md) - how releases are prepared and published
 - [Roadmap](docs/ROADMAP.md) - what comes next, from channel skills to background automation
 - [Scripts](scripts/README.md) - helper scripts for local setup and testing

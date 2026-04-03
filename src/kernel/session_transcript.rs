@@ -11,6 +11,7 @@ const HISTORY_OVERFETCH_MULTIPLIER: usize = 3;
 const HISTORY_OVERFETCH_CAP: usize = 100;
 const INTERRUPTED_ERROR_CODE: &str = "runtime.interrupted";
 const INTERRUPTED_ERROR_TEXT: &str = "turn interrupted by kernel restart";
+pub const COMPACTION_RAW_KEEP: u64 = 12;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TranscriptMode {
@@ -94,6 +95,62 @@ pub fn render_turns_for_prompt(
         .iter()
         .map(|turn| render_turn_for_prompt(turn, history_policy))
         .collect()
+}
+
+pub fn render_compaction_delta(turns: &[SessionTurnRecord]) -> String {
+    if turns.is_empty() {
+        return String::new();
+    }
+
+    let start = turns
+        .first()
+        .map(|turn| turn.sequence_no)
+        .unwrap_or_default();
+    let end = turns
+        .last()
+        .map(|turn| turn.sequence_no)
+        .unwrap_or_default();
+    let mut lines = vec![format!("## Compacted Prior Turns {}-{}", start, end)];
+
+    for turn in turns {
+        let user = truncate_for_compaction(&turn.prompt_user_text, 120);
+        let outcome = match turn.status {
+            SessionTurnStatus::Completed => {
+                let assistant = truncate_for_compaction(&turn.assistant_text, 160);
+                if assistant.is_empty() {
+                    "completed".to_string()
+                } else {
+                    format!("completed; assistant: {}", assistant)
+                }
+            }
+            SessionTurnStatus::TimedOut
+            | SessionTurnStatus::Failed
+            | SessionTurnStatus::Cancelled
+            | SessionTurnStatus::Interrupted => format!(
+                "{}; {}",
+                turn.status.as_str(),
+                truncate_for_compaction(
+                    turn.error_text
+                        .as_deref()
+                        .unwrap_or("no additional error text recorded"),
+                    120
+                )
+            ),
+            SessionTurnStatus::Running => "running".to_string(),
+        };
+        lines.push(format!(
+            "- Turn {}: user: {}; outcome: {}",
+            turn.sequence_no,
+            if user.is_empty() {
+                "<empty>"
+            } else {
+                user.as_str()
+            },
+            outcome
+        ));
+    }
+
+    lines.join("\n")
 }
 
 pub fn partial_marker(status: SessionTurnStatus) -> &'static str {
@@ -180,6 +237,19 @@ fn render_turn_for_prompt(
     }
 
     sections.join("\n\n")
+}
+
+fn truncate_for_compaction(value: &str, max_chars: usize) -> String {
+    let single_line = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.chars().count() <= max_chars {
+        single_line
+    } else {
+        single_line
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>()
+            + "…"
+    }
 }
 
 #[cfg(test)]

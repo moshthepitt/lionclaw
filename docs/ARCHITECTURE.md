@@ -12,7 +12,9 @@
 - `kernel.runtime`: runtime adapter contract and registry.
 - `kernel.scheduler`: due-job claiming, lease coordination, retry, and dispatch.
 - `kernel.channel_state`: durable channel bindings, peer trust state, inbound logs, queued channel turns, outbound transcript history, and append-only channel stream delivery state.
+- `kernel.continuity`: visible assistant-home continuity files, `ACTIVE.md` projection, daily notes, and artifact files.
 - `kernel.audit`: append-only audit event log persisted in SQLite.
+- `kernel.session_compactions`: persisted transcript compaction spans and summaries.
 
 ## API Contracts
 
@@ -101,7 +103,9 @@ Runtime module layout:
 Channel bridge layout:
 
 - `kernel/channel_state.rs`: durable channel bindings/peers/offsets/messages + stream event/cursor storage.
+- `kernel/continuity.rs`: assistant-home continuity layout and deterministic continuity projection.
 - `kernel/core.rs`: channel inbound processing, pairing/approval, session snapshot lookup, and stream pull/ack APIs.
+- `kernel/session_compactions.rs`: persisted transcript compaction summaries and ranges.
 - `api/mod.rs`: HTTP routes for external channel skill workers.
 
 Scheduler layout:
@@ -170,7 +174,27 @@ Queued channel turns emit machine-stable status/error codes through the same str
   - `retry_last_turn`
   - `reset_session`
 - The default history window is the last 12 durable turns.
+- Prompt rendering may prepend a bounded number of persisted transcript compaction summaries before the recent raw turns.
 - Channel-backed session mutation APIs (`sessions/open`, `sessions/action`, direct session turns) remain gated by channel peer approval in the kernel.
+
+## Assistant Continuity
+
+- Continuity lives under the assistant home workspace inside `LIONCLAW_HOME/workspaces/<daemon.workspace>/`.
+- The assistant home workspace contains:
+  - `MEMORY.md`
+  - `continuity/ACTIVE.md`
+  - `continuity/daily/...`
+  - `continuity/open-loops/...`
+  - `continuity/artifacts/...`
+- `MEMORY.md` is prompt-loaded but human-curated in v1.
+- `continuity/ACTIVE.md` is kernel-generated from deterministic state and existing continuity files.
+- Daily continuity notes are appended from deterministic kernel events such as:
+  - pending pairing
+  - scheduled job success/failure
+  - failed turns
+- Scheduler artifacts are recorded under `continuity/artifacts/...`.
+- Transcript compaction summaries are stored in SQLite separately from file-backed continuity.
+- Brokered filesystem access may target a different project/task root; continuity never follows that root.
 
 ## Scheduler Model
 

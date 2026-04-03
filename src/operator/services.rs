@@ -60,10 +60,6 @@ pub fn render_daemon_unit(
             runtime_id.to_string(),
         ),
         ("LIONCLAW_WORKSPACE".to_string(), workspace.to_string()),
-        (
-            "LIONCLAW_WORKSPACE_ROOT".to_string(),
-            home.workspace_dir(workspace).display().to_string(),
-        ),
     ];
     env_lines.extend(extra_env.iter().cloned());
     let env_content = env_lines

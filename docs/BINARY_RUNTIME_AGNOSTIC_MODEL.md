@@ -15,7 +15,7 @@ Not a repo ritual. Not a source-checkout trick. Not a one-runtime wrapper preten
 1. LionClaw is runtime-agnostic. `codex`, `claude-code`, `opencode`, and future runtimes are adapter choices, not product identity.
 2. Everything beyond the small core is a skill. Channels are one important case, not the exception.
 3. Runtime is selected at invocation (`lionclaw run` or `lionclaw service up`), not during `lionclaw channel add`.
-4. Identity/persona is runtime-independent and comes from workspace files (`IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md`).
+4. Identity/persona is runtime-independent and comes from assistant-home workspace files plus small hot continuity files (`IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md`, `MEMORY.md`, `continuity/ACTIVE.md`).
 5. Anthropic `SKILL.md` is the skill instruction standard.
 6. Security controls live in kernel policy, sandboxing, and audit, never in prompt-only logic.
 
@@ -56,6 +56,8 @@ or delivery surface.
 ### 2. Assistant home workspace
 
 `~/.lionclaw/workspaces/main/` is the default assistant home workspace.
+
+This is distinct from any optional project/task workspace root used for brokered filesystem access.
 
 This is the assistant's durable life context. It is where LionClaw keeps the
 runtime-independent identity files that shape prompt assembly and future
@@ -105,9 +107,11 @@ scheduled job configuration.
 Per turn, LionClaw composes a runtime-agnostic prompt envelope from:
 
 1. kernel safety/system sections,
-2. workspace identity files (`IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md`),
+2. assistant-home identity and hot continuity files (`IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md`, `MEMORY.md`, `continuity/ACTIVE.md`),
 3. selected skill context (`SKILL.md` source from installed snapshots),
 4. current user/channel input.
+
+Brokered filesystem actions may target a separate project/task root. Prompt identity and continuity do not follow that root.
 
 Adapters receive the assembled envelope; they do not own persona.
 

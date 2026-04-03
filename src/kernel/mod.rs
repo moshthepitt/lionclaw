@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod capability_broker;
 pub mod channel_state;
+pub mod continuity;
 pub mod core;
 pub mod db;
 pub mod error;
@@ -10,6 +11,7 @@ pub mod runtime;
 pub mod runtime_policy;
 pub mod scheduler;
 pub mod selector;
+pub mod session_compactions;
 pub mod session_transcript;
 pub mod session_turns;
 pub mod sessions;

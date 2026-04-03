@@ -271,6 +271,44 @@ impl SessionTurnStore {
         turns.reverse();
         Ok(turns)
     }
+
+    pub async fn list_sequence_range(
+        &self,
+        session_id: Uuid,
+        start_after_sequence_no: u64,
+        through_sequence_no: u64,
+    ) -> Result<Vec<SessionTurnRecord>> {
+        let rows = sqlx::query(
+            "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, runtime_id, started_at_ms, finished_at_ms \
+             FROM session_turns \
+             WHERE session_id = ?1 AND sequence_no > ?2 AND sequence_no <= ?3 \
+             ORDER BY sequence_no ASC",
+        )
+        .bind(session_id.to_string())
+        .bind(i64::try_from(start_after_sequence_no).context("start_after_sequence_no is too large")?)
+        .bind(i64::try_from(through_sequence_no).context("through_sequence_no is too large")?)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to query session turn sequence range")?;
+
+        rows.into_iter().map(map_session_turn_row).collect()
+    }
+
+    pub async fn list_recent_failures(&self, limit: usize) -> Result<Vec<SessionTurnRecord>> {
+        let rows = sqlx::query(
+            "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, runtime_id, started_at_ms, finished_at_ms \
+             FROM session_turns \
+             WHERE status IN ('failed', 'timed_out', 'cancelled', 'interrupted') \
+             ORDER BY started_at_ms DESC, turn_id DESC \
+             LIMIT ?1",
+        )
+        .bind(i64::try_from(limit).context("session failure limit is too large")?)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to query recent session failures")?;
+
+        rows.into_iter().map(map_session_turn_row).collect()
+    }
 }
 
 impl From<SessionTurnRecord> for SessionTurnView {

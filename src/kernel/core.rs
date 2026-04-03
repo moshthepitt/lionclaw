@@ -41,6 +41,7 @@ use super::{
         ChannelPeerStatus, ChannelStateStore, ChannelStreamEventInsert, ChannelStreamEventKind,
         ChannelStreamEventRecord, ChannelTurnRecord, StreamMessageLane as ChannelStreamLane,
     },
+    continuity::{ActiveContinuitySnapshot, ContinuityArtifact, ContinuityEvent, ContinuityLayout},
     db::Db,
     error::KernelError,
     jobs::{
@@ -58,8 +59,10 @@ use super::{
     runtime_policy::{RuntimeExecutionContext, RuntimeExecutionPolicy, RuntimeExecutionRequest},
     scheduler::{SchedulerConfig, SchedulerEngine},
     selector::SkillSelector,
+    session_compactions::SessionCompactionStore,
     session_transcript::{
-        load_repaired_turns, render_turns_for_prompt, turns_to_history_views, TranscriptMode,
+        load_repaired_turns, render_compaction_delta, render_turns_for_prompt,
+        turns_to_history_views, TranscriptMode, COMPACTION_RAW_KEEP,
     },
     session_turns::{NewSessionTurn, SessionTurnCompletion, SessionTurnRecord, SessionTurnStore},
     sessions::SessionStore,
@@ -73,6 +76,7 @@ pub struct KernelOptions {
     pub runtime_execution_policy: RuntimeExecutionPolicy,
     pub default_runtime_id: Option<String>,
     pub workspace_root: Option<PathBuf>,
+    pub project_workspace_root: Option<PathBuf>,
     pub scheduler: SchedulerConfig,
 }
 
@@ -84,6 +88,7 @@ impl Default for KernelOptions {
             runtime_execution_policy: RuntimeExecutionPolicy::default(),
             default_runtime_id: Some(BUILTIN_RUNTIME_MOCK.to_string()),
             workspace_root: None,
+            project_workspace_root: None,
             scheduler: SchedulerConfig::default(),
         }
     }
@@ -93,6 +98,7 @@ impl Default for KernelOptions {
 pub struct Kernel {
     sessions: SessionStore,
     session_turns: SessionTurnStore,
+    session_compactions: SessionCompactionStore,
     skills: SkillStore,
     selector: SkillSelector,
     policy: PolicyStore,
@@ -110,6 +116,7 @@ pub struct Kernel {
     runtime_execution_policy: RuntimeExecutionPolicy,
     default_runtime_id: Option<String>,
     workspace_root: Option<PathBuf>,
+    continuity: Option<ContinuityLayout>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,15 +151,20 @@ impl Kernel {
                 .runtime_turn_hard_timeout
                 .max(runtime_turn_idle_timeout)
         };
-        let capability_broker = if let Some(workspace_root) = options.workspace_root.clone() {
-            CapabilityBroker::new(workspace_root)
-        } else {
-            CapabilityBroker::default()
-        };
+        let capability_broker =
+            if let Some(project_workspace_root) = options.project_workspace_root.clone() {
+                CapabilityBroker::new(project_workspace_root)
+            } else if let Some(workspace_root) = options.workspace_root.clone() {
+                CapabilityBroker::new(workspace_root)
+            } else {
+                CapabilityBroker::default()
+            };
+        let continuity = options.workspace_root.clone().map(ContinuityLayout::new);
 
         let kernel = Self {
             sessions: SessionStore::new(pool.clone()),
             session_turns: SessionTurnStore::new(pool.clone()),
+            session_compactions: SessionCompactionStore::new(pool.clone()),
             skills: SkillStore::new(pool.clone()),
             selector: SkillSelector::new(),
             policy: PolicyStore::new(pool.clone()),
@@ -170,6 +182,7 @@ impl Kernel {
             runtime_execution_policy: options.runtime_execution_policy,
             default_runtime_id: options.default_runtime_id,
             workspace_root: options.workspace_root,
+            continuity,
         };
 
         kernel.bootstrap().await;
@@ -178,6 +191,9 @@ impl Kernel {
 
     async fn bootstrap(&self) {
         register_builtin_runtime_adapters(&self.runtime).await;
+        if let Some(layout) = &self.continuity {
+            let _ = layout.ensure_base_layout().await;
+        }
         let reason = "turn interrupted by kernel restart";
         if let Ok(interrupted_turns) = self.session_turns.interrupt_running_turns(reason).await {
             for turn in &interrupted_turns {
@@ -205,6 +221,7 @@ impl Kernel {
             .jobs
             .interrupt_running_runs("scheduled job interrupted by kernel restart")
             .await;
+        let _ = self.refresh_active_continuity().await;
     }
 
     pub async fn register_runtime_adapter(
@@ -882,6 +899,7 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
+        self.refresh_active_continuity().await?;
 
         Ok(ChannelPeerResponse {
             peer: to_channel_peer_view(approved),
@@ -919,6 +937,7 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
+        self.refresh_active_continuity().await?;
 
         Ok(ChannelPeerResponse {
             peer: to_channel_peer_view(blocked),
@@ -1140,6 +1159,9 @@ impl Kernel {
                     )
                     .await
                     .map_err(internal)?;
+                let _ = self
+                    .record_pairing_pending_continuity(&channel_id, &peer_id, &pending.pairing_code)
+                    .await;
 
                 let _ = self
                     .emit_channel_message(
@@ -1522,6 +1544,7 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
+        self.refresh_active_continuity().await?;
 
         Ok(JobCreateResponse {
             job: to_job_view(created),
@@ -1574,6 +1597,7 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
+        self.refresh_active_continuity().await?;
         Ok(JobToggleResponse {
             job: to_job_view(job),
         })
@@ -1602,6 +1626,7 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
+        self.refresh_active_continuity().await?;
         Ok(JobToggleResponse {
             job: to_job_view(job),
         })
@@ -1635,6 +1660,7 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
+        self.refresh_active_continuity().await?;
         Ok(JobRemoveResponse {
             job_id,
             removed: true,
@@ -1702,6 +1728,271 @@ impl Kernel {
 
     pub(super) fn audit_log(&self) -> &AuditLog {
         &self.audit
+    }
+
+    pub(super) async fn record_scheduler_continuity_success(
+        &self,
+        job: &SchedulerJobRecord,
+        run: &SchedulerJobRunRecord,
+        assistant_text: &str,
+    ) -> Result<(), KernelError> {
+        let Some(layout) = &self.continuity else {
+            return Ok(());
+        };
+
+        let artifact_path = layout
+            .record_artifact(ContinuityArtifact {
+                at: Utc::now(),
+                slug: format!("{}-{}", job.name, run.run_id),
+                title: format!("Scheduled Output: {}", job.name),
+                kind: "scheduler_job_output".to_string(),
+                summary: Some(format!("run {}", run.run_id)),
+                source: Some(format!("job:{} run:{}", job.job_id, run.run_id)),
+                body: assistant_text.to_string(),
+            })
+            .await
+            .map_err(internal)?;
+        layout
+            .append_daily_event(ContinuityEvent {
+                at: Utc::now(),
+                title: format!("Scheduled job '{}' completed", job.name),
+                details: vec![
+                    format!("run {}", run.run_id),
+                    format!("artifact {}", self.relative_workspace_path(&artifact_path)),
+                ],
+            })
+            .await
+            .map_err(internal)?;
+        self.refresh_active_continuity().await?;
+        Ok(())
+    }
+
+    pub(super) async fn record_scheduler_continuity_failure(
+        &self,
+        job: &SchedulerJobRecord,
+        run: &SchedulerJobRunRecord,
+        error: &str,
+    ) -> Result<(), KernelError> {
+        let Some(layout) = &self.continuity else {
+            return Ok(());
+        };
+
+        layout
+            .append_daily_event(ContinuityEvent {
+                at: Utc::now(),
+                title: format!("Scheduled job '{}' failed", job.name),
+                details: vec![format!("run {}", run.run_id), error.trim().to_string()],
+            })
+            .await
+            .map_err(internal)?;
+        self.refresh_active_continuity().await?;
+        Ok(())
+    }
+
+    async fn record_pairing_pending_continuity(
+        &self,
+        channel_id: &str,
+        peer_id: &str,
+        pairing_code: &str,
+    ) -> Result<(), KernelError> {
+        let Some(layout) = &self.continuity else {
+            return Ok(());
+        };
+
+        layout
+            .append_daily_event(ContinuityEvent {
+                at: Utc::now(),
+                title: format!("Pairing required for {}/{}", channel_id, peer_id),
+                details: vec![format!("pairing code {}", pairing_code)],
+            })
+            .await
+            .map_err(internal)?;
+        self.refresh_active_continuity().await?;
+        Ok(())
+    }
+
+    async fn record_session_failure_continuity(
+        &self,
+        session: &super::sessions::Session,
+        turn_id: Uuid,
+        status: SessionTurnStatus,
+        error_text: &str,
+    ) -> Result<(), KernelError> {
+        let Some(layout) = &self.continuity else {
+            return Ok(());
+        };
+
+        layout
+            .append_daily_event(ContinuityEvent {
+                at: Utc::now(),
+                title: format!(
+                    "Session turn failed for {}/{}",
+                    session.channel_id, session.peer_id
+                ),
+                details: vec![
+                    format!("turn {}", turn_id),
+                    format!("status {}", status.as_str()),
+                    error_text.trim().to_string(),
+                ],
+            })
+            .await
+            .map_err(internal)?;
+        self.refresh_active_continuity().await?;
+        Ok(())
+    }
+
+    async fn maybe_compact_session_transcript(
+        &self,
+        session: &super::sessions::Session,
+    ) -> Result<(), KernelError> {
+        let Some(latest_turn) = self
+            .session_turns
+            .latest(session.session_id)
+            .await
+            .map_err(internal)?
+        else {
+            return Ok(());
+        };
+
+        if latest_turn.sequence_no <= COMPACTION_RAW_KEEP {
+            return Ok(());
+        }
+
+        let through_sequence_no = latest_turn.sequence_no.saturating_sub(COMPACTION_RAW_KEEP);
+        let already_compacted = self
+            .session_compactions
+            .latest_through_sequence(session.session_id)
+            .await
+            .map_err(internal)?;
+        if through_sequence_no <= already_compacted {
+            return Ok(());
+        }
+
+        let turns = self
+            .session_turns
+            .list_sequence_range(session.session_id, already_compacted, through_sequence_no)
+            .await
+            .map_err(internal)?;
+        if turns.is_empty() {
+            return Ok(());
+        }
+
+        let summary_text = render_compaction_delta(&turns);
+        if summary_text.trim().is_empty() {
+            return Ok(());
+        }
+
+        let record = self
+            .session_compactions
+            .insert(
+                session.session_id,
+                turns
+                    .first()
+                    .map(|turn| turn.sequence_no)
+                    .unwrap_or(already_compacted + 1),
+                through_sequence_no,
+                summary_text,
+            )
+            .await
+            .map_err(internal)?;
+        let _ = self
+            .audit
+            .append(
+                "session.compacted",
+                Some(session.session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "compaction_id": record.compaction_id,
+                    "start_sequence_no": record.start_sequence_no,
+                    "through_sequence_no": record.through_sequence_no,
+                }),
+            )
+            .await;
+        Ok(())
+    }
+
+    async fn refresh_active_continuity(&self) -> Result<(), KernelError> {
+        let Some(layout) = &self.continuity else {
+            return Ok(());
+        };
+
+        let pending_approvals = self
+            .channel_state
+            .list_peers(None)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .filter(|peer| peer.status == ChannelPeerStatus::Pending)
+            .map(|peer| format!("{}/{}", peer.channel_id, peer.peer_id))
+            .collect::<Vec<_>>();
+
+        let mut matters_today = Vec::new();
+        for job in self
+            .jobs
+            .list_jobs()
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .filter(|job| {
+                matches!(
+                    job.last_status,
+                    Some(SchedulerJobRunStatus::Failed)
+                        | Some(SchedulerJobRunStatus::DeadLetter)
+                        | Some(SchedulerJobRunStatus::Interrupted)
+                )
+            })
+        {
+            let error = job.last_error.as_deref().unwrap_or("no error recorded");
+            matters_today.push(format!("Job '{}' needs attention: {}", job.name, error));
+        }
+        for turn in self
+            .session_turns
+            .list_recent_failures(5)
+            .await
+            .map_err(internal)?
+        {
+            matters_today.push(format!(
+                "Session {} turn {} {}",
+                turn.session_id,
+                turn.sequence_no,
+                turn.status.as_str()
+            ));
+        }
+
+        let open_loops = layout
+            .list_active_open_loops()
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(|open_loop| open_loop.title)
+            .collect::<Vec<_>>();
+        let recent_outputs = layout
+            .list_recent_artifacts(5)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(|artifact| format!("{} ({})", artifact.title, artifact.relative_path))
+            .collect::<Vec<_>>();
+
+        layout
+            .write_active(&ActiveContinuitySnapshot {
+                matters_today,
+                open_loops,
+                pending_approvals,
+                recent_outputs,
+            })
+            .await
+            .map_err(internal)?;
+        Ok(())
+    }
+
+    fn relative_workspace_path(&self, path: &Path) -> String {
+        self.workspace_root
+            .as_ref()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string()
     }
 
     pub(super) async fn execute_scheduled_job_turn(
@@ -2681,6 +2972,7 @@ impl Kernel {
             .record_turn(session.session_id)
             .await
             .map_err(internal)?;
+        self.maybe_compact_session_transcript(session).await?;
 
         if let Some(stream_context) = &channel_stream_context {
             if artifacts.saw_error {
@@ -2774,7 +3066,7 @@ impl Kernel {
                     status,
                     assistant_text,
                     error_code: Some(error_code),
-                    error_text: Some(error_text),
+                    error_text: Some(error_text.clone()),
                 },
             )
             .await
@@ -2784,6 +3076,14 @@ impl Kernel {
             .record_turn(session.session_id)
             .await
             .map_err(internal)?;
+        self.maybe_compact_session_transcript(session).await?;
+        self.record_session_failure_continuity(
+            session,
+            persisted_turn.turn_id,
+            status,
+            &error_text,
+        )
+        .await?;
         Ok(())
     }
 
@@ -3493,6 +3793,14 @@ impl Kernel {
         session: &super::sessions::Session,
         limit: usize,
     ) -> anyhow::Result<Vec<String>> {
+        let mut sections = self
+            .session_compactions
+            .list_recent(session.session_id, 2)
+            .await?
+            .into_iter()
+            .map(|record| record.summary_text)
+            .filter(|summary| !summary.trim().is_empty())
+            .collect::<Vec<_>>();
         let turns = load_repaired_turns(
             &self.session_turns,
             session.session_id,
@@ -3500,7 +3808,8 @@ impl Kernel {
             TranscriptMode::Prompt(session.history_policy),
         )
         .await?;
-        Ok(render_turns_for_prompt(&turns, session.history_policy))
+        sections.extend(render_turns_for_prompt(&turns, session.history_policy));
+        Ok(sections)
     }
 
     async fn read_skill_context(

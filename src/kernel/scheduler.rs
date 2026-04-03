@@ -248,6 +248,9 @@ impl SchedulerEngine {
                         }),
                     )
                     .await;
+                let _ = kernel
+                    .record_scheduler_continuity_success(job, &final_run, &response.assistant_text)
+                    .await;
                 Ok(AttemptOutcome::Finished(Box::new((updated_job, final_run))))
             }
             Err(err) => {
@@ -318,6 +321,9 @@ impl SchedulerEngine {
                             "delivery_status": delivery_status.as_str(),
                         }),
                     )
+                    .await;
+                let _ = kernel
+                    .record_scheduler_continuity_failure(job, &final_run, &err.to_string())
                     .await;
                 Ok(AttemptOutcome::Finished(Box::new((updated_job, final_run))))
             }

@@ -2,6 +2,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use crate::kernel::continuity::{continuity_prompt_sections, ContinuityLayout};
+
 pub const IDENTITY_FILE: &str = "IDENTITY.md";
 pub const SOUL_FILE: &str = "SOUL.md";
 pub const AGENTS_FILE: &str = "AGENTS.md";
@@ -25,6 +27,9 @@ pub async fn bootstrap_workspace(workspace_root: &Path) -> Result<()> {
     ensure_file(workspace_root.join(SOUL_FILE), SOUL_TEMPLATE).await?;
     ensure_file(workspace_root.join(AGENTS_FILE), AGENTS_TEMPLATE).await?;
     ensure_file(workspace_root.join(USER_FILE), USER_TEMPLATE).await?;
+    ContinuityLayout::new(workspace_root)
+        .ensure_base_layout()
+        .await?;
 
     Ok(())
 }
@@ -43,6 +48,19 @@ pub async fn read_workspace_sections(workspace_root: &Path) -> Result<Vec<(Strin
             .await
             .with_context(|| format!("failed to read {}", path.display()))?;
         sections.push((file_name.to_string(), content));
+    }
+
+    for (label, path) in continuity_prompt_sections(workspace_root) {
+        if !tokio::fs::try_exists(&path)
+            .await
+            .with_context(|| format!("failed to stat {}", path.display()))?
+        {
+            continue;
+        }
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        sections.push((label, content));
     }
 
     Ok(sections)

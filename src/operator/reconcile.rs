@@ -688,11 +688,17 @@ pub(crate) async fn open_kernel(
     config: &OperatorConfig,
     default_runtime_id: Option<String>,
 ) -> Result<Kernel> {
+    let workspace_root = config.workspace_root(home);
+    let project_workspace_root = std::env::var("LIONCLAW_WORKSPACE_ROOT")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root.clone());
     let kernel = Kernel::new_with_options(
         &home.db_path(),
         KernelOptions {
             default_runtime_id: default_runtime_id.or_else(|| config.defaults.runtime.clone()),
-            workspace_root: Some(config.workspace_root(home)),
+            workspace_root: Some(workspace_root),
+            project_workspace_root: Some(project_workspace_root),
             ..KernelOptions::default()
         },
     )
@@ -890,6 +896,7 @@ mod tests {
             KernelOptions {
                 default_runtime_id: None,
                 workspace_root: Some(home.workspace_dir("main")),
+                project_workspace_root: Some(home.workspace_dir("main")),
                 ..KernelOptions::default()
             },
         )
