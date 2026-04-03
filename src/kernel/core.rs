@@ -49,6 +49,7 @@ use super::{
         ActiveContinuitySnapshot, ContinuityArtifact, ContinuityEvent, ContinuityLayout,
         ContinuityMemoryProposalDraft, ContinuityOpenLoopDraft,
     },
+    continuity_index::ContinuityIndexStore,
     db::Db,
     error::KernelError,
     jobs::{
@@ -168,7 +169,12 @@ impl Kernel {
             } else {
                 CapabilityBroker::default()
             };
-        let continuity = options.workspace_root.clone().map(ContinuityLayout::new);
+        let continuity = options.workspace_root.clone().map(|workspace_root| {
+            ContinuityLayout::with_index_store(
+                workspace_root,
+                Some(ContinuityIndexStore::new(pool.clone())),
+            )
+        });
 
         let kernel = Self {
             sessions: SessionStore::new(pool.clone()),

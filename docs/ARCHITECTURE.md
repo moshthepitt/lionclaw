@@ -114,7 +114,8 @@ Runtime module layout:
 Channel bridge layout:
 
 - `kernel/channel_state.rs`: durable channel bindings/peers/offsets/messages + stream event/cursor storage.
-- `kernel/continuity.rs`: assistant-home continuity layout, proposals/open loops/artifacts, and deterministic continuity projection/search helpers.
+- `kernel/continuity.rs`: assistant-home continuity layout, proposals/open loops/artifacts, indexed search integration, and deterministic continuity projection helpers.
+- `kernel/continuity_index.rs`: derived SQLite FTS index for assistant-home continuity files.
 - `kernel/core.rs`: channel inbound processing, pairing/approval, continuity APIs, session snapshot lookup, and stream pull/ack APIs.
 - `kernel/session_compactions.rs`: persisted structured transcript compaction summaries and ranges.
 - `api/mod.rs`: HTTP routes for external channel skill workers.
@@ -207,12 +208,19 @@ Queued channel turns emit machine-stable status/error codes through the same str
 - Scheduler artifacts are recorded under `continuity/artifacts/...`.
 - Memory proposals are written under `continuity/proposals/memory/...` and merged or rejected explicitly.
 - Open loops are written under `continuity/open-loops/...` and resolved explicitly.
+- Continuity search uses a derived SQLite FTS index in `lionclaw.db`; the Markdown files remain the canonical source of truth.
 - Transcript compaction summaries are stored in SQLite separately from file-backed continuity.
 - Prompt history sees one bounded structured compaction handoff summary plus the recent raw tail.
 - Before a new compaction summary is persisted, the kernel flushes visible continuity artifacts:
   - memory proposals
   - open-loop updates
   - a daily note entry when new continuity was promoted
+- When hidden semantic summarization is unavailable, deterministic kernel compaction still extracts:
+  - current goal
+  - constraints and preferences
+  - durable memory proposals
+  - open loops
+  - recent files, decisions, and next steps
 - Brokered filesystem access may target a different project/task root; continuity never follows that root.
 
 ## Scheduler Model

@@ -59,15 +59,20 @@ Implemented now:
   - open loops are upserted under `continuity/open-loops/...`
 - continuity has first-class kernel/operator/API surfaces for:
   - status
-  - search
+  - indexed search
   - get
   - list/merge/reject memory proposals
   - list/resolve open loops
 - prompt history uses one bounded compaction handoff summary plus the recent raw turn tail
+- deterministic kernel-side compaction extracts:
+  - current goal
+  - constraints and preferences
+  - durable memory proposals
+  - open loops
+  - recent decisions, files, and next steps
 
 Not implemented yet:
 
-- semantic/FTS continuity index
 - inferred open loops outside deterministic/kernel-flushed paths
 - continuity skill contract
 
@@ -108,6 +113,8 @@ Prompt rendering follows the proven assistant pattern used by Hermes, IronClaw, 
 - no ever-growing literal digest of all older turns in the prompt
 
 The handoff summary is core-owned. When the active runtime explicitly supports side-effect-free hidden summarization, LionClaw updates that handoff through a strict JSON schema; otherwise it falls back to deterministic kernel-side compaction. That keeps the core small without introducing hidden side effects outside LionClaw's normal policy boundary.
+
+Continuity search is backed by a derived SQLite FTS index inside `lionclaw.db`. The canonical source of truth remains the assistant-home Markdown files; the index is rebuilt from and synchronized with those files so search stays fast without introducing a second memory authority plane.
 
 Before compaction is persisted, LionClaw performs a typed continuity flush so durable facts and active commitments can land in visible files rather than only in the transcript summary.
 

@@ -62,6 +62,20 @@ pub struct CompactionOpenLoop {
     pub next_step: String,
 }
 
+#[derive(Debug, Default)]
+struct TurnSignals {
+    goal: Option<String>,
+    constraints_preferences: Vec<String>,
+    progress_done: Vec<String>,
+    progress_blocked: Vec<String>,
+    relevant_files: Vec<String>,
+    key_decisions: Vec<String>,
+    next_steps: Vec<String>,
+    critical_context: Vec<String>,
+    memory_proposals: Vec<CompactionMemoryProposal>,
+    open_loops: Vec<CompactionOpenLoop>,
+}
+
 pub async fn load_repaired_turns(
     store: &SessionTurnStore,
     session_id: Uuid,
@@ -145,47 +159,53 @@ pub fn merge_compaction_summary_state(
     turns: &[SessionTurnRecord],
 ) -> CompactionSummaryState {
     let mut state = previous_state.cloned().unwrap_or_default();
-    if state
-        .goal
-        .as_deref()
-        .is_none_or(|value| value.trim().is_empty())
-    {
-        state.goal = turns
-            .iter()
-            .find_map(|turn| compact_line(&turn.prompt_user_text, COMPACTION_MAX_ITEM_LEN));
-    }
-
-    let (mut done, mut failures, mut files, mut decisions, mut next_steps, mut critical) =
-        collect_turn_signals(turns);
-
-    state.progress_done =
-        merge_unique_strings(state.progress_done, done.split_off(0), COMPACTION_LIST_KEEP);
+    let signals = collect_turn_signals(turns);
+    state.goal = signals.goal.or_else(|| state.goal.clone());
+    state.constraints_preferences = merge_unique_strings(
+        state.constraints_preferences,
+        signals.constraints_preferences,
+        COMPACTION_LIST_KEEP,
+    );
+    state.progress_done = merge_unique_strings(
+        state.progress_done,
+        signals.progress_done,
+        COMPACTION_LIST_KEEP,
+    );
     state.progress_blocked = merge_unique_strings(
         state.progress_blocked,
-        failures.split_off(0),
+        signals.progress_blocked,
         COMPACTION_LIST_KEEP,
     );
     state.relevant_files = merge_unique_strings(
         state.relevant_files,
-        files.split_off(0),
+        signals.relevant_files,
         COMPACTION_LIST_KEEP,
     );
     state.key_decisions = merge_unique_strings(
         state.key_decisions,
-        decisions.split_off(0),
+        signals.key_decisions,
         COMPACTION_LIST_KEEP,
     );
-    state.next_steps = merge_unique_strings(
-        state.next_steps,
-        next_steps.split_off(0),
-        COMPACTION_LIST_KEEP,
-    );
+    state.next_steps =
+        merge_unique_strings(state.next_steps, signals.next_steps, COMPACTION_LIST_KEEP);
     state.critical_context = merge_unique_strings(
         state.critical_context,
-        critical.split_off(0),
+        signals.critical_context,
         COMPACTION_LIST_KEEP,
     );
+    state.memory_proposals =
+        merge_unique_memory_proposals(state.memory_proposals, signals.memory_proposals);
+    state.open_loops = merge_unique_open_loops(state.open_loops, signals.open_loops);
 
+    state.progress_in_progress = merge_unique_strings(
+        state.progress_in_progress,
+        state
+            .open_loops
+            .iter()
+            .map(|open_loop| format!("{} (next: {})", open_loop.title, open_loop.next_step))
+            .collect(),
+        COMPACTION_LIST_KEEP,
+    );
     if state.progress_in_progress.is_empty() {
         state.progress_in_progress = state.next_steps.clone();
     }
@@ -235,6 +255,8 @@ pub fn render_compaction_summary(
     push_string_section(&mut lines, "Relevant Files", &state.relevant_files);
     push_string_section(&mut lines, "Next Steps", &state.next_steps);
     push_string_section(&mut lines, "Critical Context", &state.critical_context);
+    push_memory_proposal_section(&mut lines, &state.memory_proposals);
+    push_open_loop_section(&mut lines, &state.open_loops);
 
     lines.join("\n")
 }
@@ -496,32 +518,57 @@ fn push_string_section(lines: &mut Vec<String>, title: &str, values: &[String]) 
     }
 }
 
-fn collect_turn_signals(
-    turns: &[SessionTurnRecord],
-) -> (
-    Vec<String>,
-    Vec<String>,
-    Vec<String>,
-    Vec<String>,
-    Vec<String>,
-    Vec<String>,
-) {
+fn push_memory_proposal_section(lines: &mut Vec<String>, proposals: &[CompactionMemoryProposal]) {
+    if proposals.is_empty() {
+        return;
+    }
+    lines.push(String::new());
+    lines.push("### Memory Proposals".to_string());
+    for proposal in proposals {
+        lines.push(format!(
+            "- {}: {}",
+            proposal.title,
+            proposal.entries.join("; ")
+        ));
+    }
+}
+
+fn push_open_loop_section(lines: &mut Vec<String>, open_loops: &[CompactionOpenLoop]) {
+    if open_loops.is_empty() {
+        return;
+    }
+    lines.push(String::new());
+    lines.push("### Open Loops".to_string());
+    for open_loop in open_loops {
+        lines.push(format!(
+            "- {}: {} (next: {})",
+            open_loop.title, open_loop.summary, open_loop.next_step
+        ));
+    }
+}
+
+fn collect_turn_signals(turns: &[SessionTurnRecord]) -> TurnSignals {
     let mut done = Vec::new();
     let mut failures = Vec::new();
     let mut files = BTreeSet::new();
     let mut decisions = Vec::new();
     let mut next_steps = Vec::new();
     let mut critical = Vec::new();
+    let mut constraints = Vec::new();
+    let mut open_loops = Vec::new();
 
     for turn in turns {
         collect_file_candidates(&turn.prompt_user_text, &mut files);
         collect_file_candidates(&turn.assistant_text, &mut files);
+        constraints.extend(extract_preference_candidates(&turn.prompt_user_text));
         match turn.status {
             SessionTurnStatus::Completed => {
                 if let Some(line) = compact_line(&turn.prompt_user_text, COMPACTION_MAX_ITEM_LEN) {
                     done.push(line);
                 }
-                if let Some(line) = compact_line(&turn.assistant_text, COMPACTION_MAX_ITEM_LEN) {
+                if let Some(line) = compact_line(&turn.assistant_text, COMPACTION_MAX_ITEM_LEN)
+                    .filter(|line| line.len() > 12 && !line.eq_ignore_ascii_case("captured"))
+                {
                     decisions.push(line);
                 }
             }
@@ -539,6 +586,9 @@ fn collect_turn_signals(
                 ) {
                     failures.push(line);
                 }
+                if let Some(open_loop) = failure_open_loop(turn) {
+                    open_loops.push(open_loop);
+                }
             }
             SessionTurnStatus::Running => {}
         }
@@ -547,6 +597,9 @@ fn collect_turn_signals(
     if let Some(last_turn) = turns.last() {
         if let Some(line) = compact_line(&last_turn.prompt_user_text, COMPACTION_MAX_ITEM_LEN) {
             next_steps.push(line);
+        }
+        if let Some(open_loop) = trailing_open_loop(last_turn) {
+            open_loops.push(open_loop);
         }
         if matches!(
             last_turn.status,
@@ -564,14 +617,34 @@ fn collect_turn_signals(
         }
     }
 
-    (
-        keep_tail(done, COMPACTION_LIST_KEEP),
-        keep_tail(failures, COMPACTION_LIST_KEEP),
-        files.into_iter().take(COMPACTION_LIST_KEEP).collect(),
-        keep_tail(decisions, COMPACTION_LIST_KEEP),
-        keep_tail(next_steps, COMPACTION_LIST_KEEP),
-        keep_tail(critical, COMPACTION_LIST_KEEP),
-    )
+    let goal = turns
+        .iter()
+        .rev()
+        .find_map(|turn| compact_line(&turn.prompt_user_text, COMPACTION_MAX_ITEM_LEN));
+    let constraints_preferences = normalize_lines(&constraints, COMPACTION_LIST_KEEP);
+    let memory_proposals = if constraints_preferences.is_empty() {
+        Vec::new()
+    } else {
+        vec![CompactionMemoryProposal {
+            title: "Working Preferences".to_string(),
+            rationale: "durable preferences and constraints captured during the session"
+                .to_string(),
+            entries: constraints_preferences.clone(),
+        }]
+    };
+
+    TurnSignals {
+        goal,
+        constraints_preferences,
+        progress_done: keep_tail(done, COMPACTION_LIST_KEEP),
+        progress_blocked: keep_tail(failures, COMPACTION_LIST_KEEP),
+        relevant_files: files.into_iter().take(COMPACTION_LIST_KEEP).collect(),
+        key_decisions: keep_tail(decisions, COMPACTION_LIST_KEEP),
+        next_steps: keep_tail(next_steps, COMPACTION_LIST_KEEP),
+        critical_context: keep_tail(critical, COMPACTION_LIST_KEEP),
+        memory_proposals,
+        open_loops: merge_unique_open_loops(Vec::new(), open_loops),
+    }
 }
 
 fn collect_file_candidates(text: &str, files: &mut BTreeSet<String>) {
@@ -592,6 +665,69 @@ fn collect_file_candidates(text: &str, files: &mut BTreeSet<String>) {
             files.insert(candidate.to_string());
         }
     }
+}
+
+fn extract_preference_candidates(text: &str) -> Vec<String> {
+    const MARKERS: [&str; 10] = [
+        "prefer ", "always ", "never ", "avoid ", "must ", "should ", "keep ", "do not ", "don't ",
+        "no ",
+    ];
+
+    text.lines()
+        .flat_map(|line| line.split(['.', ';']))
+        .filter_map(|segment| {
+            let normalized = segment.split_whitespace().collect::<Vec<_>>().join(" ");
+            let lower = normalized.to_ascii_lowercase();
+            if MARKERS.iter().any(|marker| lower.contains(marker)) {
+                compact_line(&normalized, COMPACTION_MAX_ITEM_LEN)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn failure_open_loop(turn: &SessionTurnRecord) -> Option<CompactionOpenLoop> {
+    let title = compact_line(&turn.prompt_user_text, 80)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Resolve blocked work".to_string());
+    let summary = compact_line(
+        &format_failure_note(turn.status, turn.error_text.as_deref()),
+        COMPACTION_MAX_ITEM_LEN,
+    )?;
+    let next_step = compact_line(&turn.prompt_user_text, COMPACTION_MAX_ITEM_LEN)?;
+    Some(CompactionOpenLoop {
+        title,
+        summary,
+        next_step,
+    })
+}
+
+fn trailing_open_loop(turn: &SessionTurnRecord) -> Option<CompactionOpenLoop> {
+    let next_step = compact_line(&turn.prompt_user_text, COMPACTION_MAX_ITEM_LEN)?;
+    if next_step.is_empty() {
+        return None;
+    }
+    let title = compact_line(&turn.prompt_user_text, 80)?;
+    let summary = if matches!(
+        turn.status,
+        SessionTurnStatus::TimedOut
+            | SessionTurnStatus::Failed
+            | SessionTurnStatus::Cancelled
+            | SessionTurnStatus::Interrupted
+    ) {
+        compact_line(
+            &format_failure_note(turn.status, turn.error_text.as_deref()),
+            COMPACTION_MAX_ITEM_LEN,
+        )?
+    } else {
+        "Recent compacted turns left follow-up work visible.".to_string()
+    };
+    Some(CompactionOpenLoop {
+        title,
+        summary,
+        next_step,
+    })
 }
 
 fn normalize_lines(values: &[String], limit: usize) -> Vec<String> {
@@ -844,8 +980,16 @@ mod tests {
             relevant_files: vec!["src/kernel/continuity.rs".to_string()],
             next_steps: vec!["Run cargo test.".to_string()],
             critical_context: vec!["Assistant home workspace is the continuity root.".to_string()],
-            memory_proposals: Vec::new(),
-            open_loops: Vec::new(),
+            memory_proposals: vec![super::CompactionMemoryProposal {
+                title: "Working Preferences".to_string(),
+                rationale: "durable preference".to_string(),
+                entries: vec!["Keep the core small.".to_string()],
+            }],
+            open_loops: vec![super::CompactionOpenLoop {
+                title: "Run cargo test".to_string(),
+                summary: "Recent compacted turns left follow-up work visible.".to_string(),
+                next_step: "Run cargo test.".to_string(),
+            }],
         };
 
         let rendered = render_compaction_summary(1, 12, &state);
@@ -853,6 +997,8 @@ mod tests {
         assert!(rendered.contains("### Goal"));
         assert!(rendered.contains("### Key Decisions"));
         assert!(rendered.contains("Continuity stays file-backed."));
+        assert!(rendered.contains("### Memory Proposals"));
+        assert!(rendered.contains("### Open Loops"));
     }
 
     #[test]
@@ -923,6 +1069,48 @@ mod tests {
             .next_steps
             .iter()
             .any(|item| item.contains("prepare docs")));
+    }
+
+    #[test]
+    fn fallback_merge_extracts_preferences_memory_and_open_loops() {
+        let merged = merge_compaction_summary_state(
+            None,
+            &[
+                turn(
+                    1,
+                    Uuid::new_v4(),
+                    SessionTurnStatus::Completed,
+                    "keep the core small and prefer visible continuity files",
+                    "updated src/kernel/continuity.rs to stay explicit",
+                    None,
+                ),
+                turn(
+                    2,
+                    Uuid::new_v4(),
+                    SessionTurnStatus::Failed,
+                    "review the continuity search path",
+                    "",
+                    Some("fts query failed"),
+                ),
+            ],
+        );
+
+        assert_eq!(
+            merged.goal.as_deref(),
+            Some("review the continuity search path")
+        );
+        assert!(merged
+            .constraints_preferences
+            .iter()
+            .any(|item| item.contains("keep the core small")));
+        assert!(!merged.memory_proposals.is_empty());
+        assert!(merged.memory_proposals.iter().any(|proposal| proposal
+            .entries
+            .iter()
+            .any(|entry| entry.contains("visible continuity files"))));
+        assert!(merged.open_loops.iter().any(|open_loop| open_loop
+            .title
+            .contains("review the continuity search path")));
     }
 
     #[test]

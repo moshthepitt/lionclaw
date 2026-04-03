@@ -112,7 +112,8 @@ to the configured channel.
 LionClaw keeps assistant continuity in the assistant home workspace instead of
 in a hidden memory store. The hot prompt path loads `MEMORY.md` and
 `continuity/ACTIVE.md`, while older context stays in daily notes, open-loop
-files, artifacts, and a bounded transcript handoff summary.
+files, artifacts, and a bounded transcript handoff summary. Continuity search
+is indexed in `lionclaw.db`, but the Markdown files remain the source of truth.
 
 Inspect and manage that continuity with:
 

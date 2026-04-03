@@ -408,6 +408,30 @@ async fn continuity_surface_lists_searches_and_manages_proposals_and_loops() {
         .expect("resolve loop");
     assert!(resolved.archived_path.contains("open-loops/archive"));
 
+    let memory_search = kernel
+        .continuity_search(ContinuitySearchRequest {
+            query: "stay small explicit".to_string(),
+            limit: Some(10),
+        })
+        .await
+        .expect("search merged memory");
+    assert!(memory_search
+        .matches
+        .iter()
+        .any(|item| item.relative_path == "MEMORY.md"));
+
+    let archived_loop_search = kernel
+        .continuity_search(ContinuitySearchRequest {
+            query: "review turn".to_string(),
+            limit: Some(10),
+        })
+        .await
+        .expect("search archived loop");
+    assert!(archived_loop_search
+        .matches
+        .iter()
+        .any(|item| item.relative_path == resolved.archived_path));
+
     let memory = tokio::fs::read_to_string(env.workspace_root().join("MEMORY.md"))
         .await
         .expect("read memory");

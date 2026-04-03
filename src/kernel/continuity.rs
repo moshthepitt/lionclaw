@@ -2,11 +2,14 @@ use std::{
     collections::{BTreeSet, VecDeque},
     path::{Component, Path, PathBuf},
     sync::Arc,
+    time::UNIX_EPOCH,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Datelike, Utc};
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex};
+
+use super::continuity_index::{ContinuityIndexStore, ContinuityIndexedDocument};
 
 pub const MEMORY_FILE: &str = "MEMORY.md";
 pub const CONTINUITY_DIR: &str = "continuity";
@@ -28,6 +31,7 @@ const ACTIVE_TEMPLATE: &str =
 #[derive(Debug, Clone)]
 pub struct ContinuityLayout {
     workspace_root: PathBuf,
+    index_store: Option<ContinuityIndexStore>,
     daily_note_lock: Arc<Mutex<()>>,
     proposal_lock: Arc<Mutex<()>>,
     open_loop_lock: Arc<Mutex<()>>,
@@ -117,8 +121,16 @@ pub struct ContinuityStatus {
 
 impl ContinuityLayout {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        Self::with_index_store(workspace_root, None)
+    }
+
+    pub fn with_index_store(
+        workspace_root: impl Into<PathBuf>,
+        index_store: Option<ContinuityIndexStore>,
+    ) -> Self {
         Self {
             workspace_root: workspace_root.into(),
+            index_store,
             daily_note_lock: Arc::new(Mutex::new(())),
             proposal_lock: Arc::new(Mutex::new(())),
             open_loop_lock: Arc::new(Mutex::new(())),
@@ -195,6 +207,7 @@ impl ContinuityLayout {
 
         ensure_file(self.memory_path(), MEMORY_TEMPLATE).await?;
         ensure_file(self.active_path(), ACTIVE_TEMPLATE).await?;
+        self.rebuild_index().await?;
         Ok(())
     }
 
@@ -243,6 +256,7 @@ impl ContinuityLayout {
         file.flush()
             .await
             .with_context(|| format!("failed to flush {}", path.display()))?;
+        self.sync_index_path(&path).await?;
         Ok(path)
     }
 
@@ -280,6 +294,7 @@ impl ContinuityLayout {
         tokio::fs::write(&path, content)
             .await
             .with_context(|| format!("failed to write {}", path.display()))?;
+        self.sync_index_path(&path).await?;
         Ok(path)
     }
 
@@ -338,6 +353,7 @@ impl ContinuityLayout {
         tokio::fs::write(&path, content)
             .await
             .with_context(|| format!("failed to write {}", path.display()))?;
+        self.sync_index_path(&path).await?;
         Ok(Some(path))
     }
 
@@ -367,6 +383,8 @@ impl ContinuityLayout {
         tokio::fs::rename(&source, &target)
             .await
             .with_context(|| format!("failed to archive {}", source.display()))?;
+        self.remove_index_path(&source).await?;
+        self.sync_index_path(&target).await?;
         Ok(target)
     }
 
@@ -429,6 +447,7 @@ impl ContinuityLayout {
         tokio::fs::write(&path, content)
             .await
             .with_context(|| format!("failed to write {}", path.display()))?;
+        self.sync_index_path(&path).await?;
         Ok(Some(path))
     }
 
@@ -437,8 +456,8 @@ impl ContinuityLayout {
         limit: usize,
     ) -> Result<Vec<ContinuityMemoryProposal>> {
         let mut files = list_markdown_files(&self.memory_proposals_dir()).await?;
-        files.sort();
         files.retain(|path| is_direct_child(path, &self.memory_proposals_dir()));
+        files = sort_paths_by_modified_desc(files).await?;
 
         let mut proposals = Vec::new();
         for path in files.into_iter().take(limit) {
@@ -459,6 +478,7 @@ impl ContinuityLayout {
             .with_context(|| format!("failed to read {}", path.display()))?;
         let proposal = parse_memory_proposal(&self.workspace_root, &path, &content);
         append_memory_entries(self.memory_path(), &proposal.entries).await?;
+        self.sync_index_path(&self.memory_path()).await?;
         let archived = self.archive_memory_proposal(&path, MERGED_DIR).await?;
         Ok(archived)
     }
@@ -498,13 +518,14 @@ impl ContinuityLayout {
         tokio::fs::write(self.active_path(), sections.join("\n\n") + "\n")
             .await
             .with_context(|| format!("failed to write {}", self.active_path().display()))?;
+        self.sync_index_path(&self.active_path()).await?;
         Ok(())
     }
 
     pub async fn list_active_open_loops(&self) -> Result<Vec<ContinuityOpenLoop>> {
         let mut files = list_markdown_files(&self.open_loops_dir()).await?;
-        files.sort();
         files.retain(|path| is_direct_child(path, &self.open_loops_dir()));
+        files = sort_paths_by_modified_desc(files).await?;
 
         let mut loops = Vec::new();
         for path in files {
@@ -527,8 +548,7 @@ impl ContinuityLayout {
         limit: usize,
     ) -> Result<Vec<ContinuityArtifactSummary>> {
         let mut files = list_markdown_files(&self.artifacts_dir()).await?;
-        files.sort();
-        files.reverse();
+        files = sort_paths_by_modified_desc(files).await?;
 
         let mut artifacts = Vec::new();
         for path in files.into_iter().take(limit) {
@@ -561,9 +581,23 @@ impl ContinuityLayout {
             bail!("continuity search query cannot be empty");
         }
 
+        if let Some(index_store) = &self.index_store {
+            let indexed = index_store.search(&needle, limit).await?;
+            if !indexed.is_empty() {
+                return Ok(indexed
+                    .into_iter()
+                    .map(|item| ContinuitySearchMatch {
+                        relative_path: item.relative_path,
+                        title: item.title,
+                        snippet: item.snippet,
+                    })
+                    .collect());
+            }
+        }
+
         let mut paths = vec![self.memory_path()];
         paths.extend(list_markdown_files(&self.continuity_dir()).await?);
-        paths.sort();
+        paths = sort_paths_by_modified_desc(paths).await?;
 
         let mut matches = Vec::new();
         for path in paths {
@@ -649,16 +683,74 @@ impl ContinuityLayout {
         tokio::fs::rename(source, &target)
             .await
             .with_context(|| format!("failed to archive {}", source.display()))?;
+        self.remove_index_path(source).await?;
+        self.sync_index_path(&target).await?;
         Ok(target)
     }
 
     async fn latest_daily_note_path(&self) -> Result<Option<String>> {
         let mut files = list_markdown_files(&self.daily_dir()).await?;
-        files.sort();
+        files = sort_paths_by_modified_desc(files).await?;
         Ok(files
             .into_iter()
-            .last()
+            .next()
             .map(|path| relative_path(&self.workspace_root, &path)))
+    }
+
+    async fn rebuild_index(&self) -> Result<()> {
+        let Some(index_store) = &self.index_store else {
+            return Ok(());
+        };
+        let mut paths = vec![self.memory_path()];
+        paths.extend(list_markdown_files(&self.continuity_dir()).await?);
+        let mut documents = Vec::new();
+        for path in paths {
+            if !tokio::fs::try_exists(&path)
+                .await
+                .with_context(|| format!("failed to stat {}", path.display()))?
+            {
+                continue;
+            }
+            documents.push(self.read_index_document(&path).await?);
+        }
+        index_store.replace_all(&documents).await
+    }
+
+    async fn sync_index_path(&self, path: &Path) -> Result<()> {
+        let Some(index_store) = &self.index_store else {
+            return Ok(());
+        };
+        if !tokio::fs::try_exists(path)
+            .await
+            .with_context(|| format!("failed to stat {}", path.display()))?
+        {
+            self.remove_index_path(path).await?;
+            return Ok(());
+        }
+        let document = self.read_index_document(path).await?;
+        index_store.upsert(&document).await
+    }
+
+    async fn remove_index_path(&self, path: &Path) -> Result<()> {
+        let Some(index_store) = &self.index_store else {
+            return Ok(());
+        };
+        index_store
+            .remove(&relative_path(&self.workspace_root, path))
+            .await
+    }
+
+    async fn read_index_document(&self, path: &Path) -> Result<ContinuityIndexedDocument> {
+        let body = tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let title = extract_heading(&body).unwrap_or_else(|| stem_fallback(path));
+        Ok(ContinuityIndexedDocument {
+            relative_path: relative_path(&self.workspace_root, path),
+            title,
+            body,
+            updated_at_ms: file_updated_at_ms(path).await?,
+        })
     }
 
     fn resolve_relative_file(&self, relative_path: &str) -> Result<PathBuf> {
@@ -740,6 +832,28 @@ async fn append_memory_entries(path: PathBuf, entries: &[String]) -> Result<()> 
     tokio::fs::write(&path, content)
         .await
         .with_context(|| format!("failed to write {}", path.display()))
+}
+
+async fn file_updated_at_ms(path: &Path) -> Result<i64> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    let modified = metadata
+        .modified()
+        .with_context(|| format!("failed to read mtime for {}", path.display()))?;
+    let duration = modified
+        .duration_since(UNIX_EPOCH)
+        .with_context(|| format!("mtime for {} is before unix epoch", path.display()))?;
+    i64::try_from(duration.as_millis()).context("mtime is too large to fit in i64")
+}
+
+async fn sort_paths_by_modified_desc(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    let mut dated = Vec::with_capacity(paths.len());
+    for path in paths {
+        dated.push((file_updated_at_ms(&path).await?, path));
+    }
+    dated.sort_by(|left, right| right.cmp(left));
+    Ok(dated.into_iter().map(|(_, path)| path).collect())
 }
 
 async fn list_markdown_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -974,11 +1088,13 @@ fn replace_or_insert_metadata(
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
+    use tempfile::tempdir;
 
     use super::{
         continuity_prompt_sections, ActiveContinuitySnapshot, ContinuityArtifact, ContinuityEvent,
         ContinuityLayout, ContinuityMemoryProposalDraft, ContinuityOpenLoopDraft,
     };
+    use crate::kernel::{continuity_index::ContinuityIndexStore, db::Db};
 
     #[tokio::test]
     async fn continuity_layout_bootstraps_expected_files() {
@@ -1252,5 +1368,79 @@ mod tests {
             .expect("upsert loop");
         assert!(first_loop.is_some());
         assert!(second_loop.is_none());
+    }
+
+    #[tokio::test]
+    async fn indexed_search_tracks_archived_and_merged_files() {
+        let temp_dir = tempdir().expect("temp dir");
+        let db = Db::connect_file(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("db connect");
+        let layout = ContinuityLayout::with_index_store(
+            temp_dir.path().join("workspace"),
+            Some(ContinuityIndexStore::new(db.pool())),
+        );
+        layout.ensure_base_layout().await.expect("bootstrap");
+
+        let proposal_path = layout
+            .record_memory_proposal(&ContinuityMemoryProposalDraft {
+                title: "Release Preference".to_string(),
+                rationale: "durable preference".to_string(),
+                entries: vec!["Prefer brief release notes.".to_string()],
+                source: None,
+            })
+            .await
+            .expect("record proposal")
+            .expect("proposal path");
+        let open_loop_path = layout
+            .upsert_open_loop(&ContinuityOpenLoopDraft {
+                title: "Review Continuity Search".to_string(),
+                summary: "Need to verify indexed continuity search".to_string(),
+                next_step: "Search for continuity".to_string(),
+                source: None,
+            })
+            .await
+            .expect("upsert loop")
+            .expect("loop path");
+
+        assert!(!layout
+            .search("indexed continuity", 10)
+            .await
+            .expect("search")
+            .is_empty());
+
+        let proposal_relative = proposal_path
+            .strip_prefix(layout.workspace_root())
+            .expect("proposal relative")
+            .to_string_lossy()
+            .to_string();
+        layout
+            .merge_memory_proposal(&proposal_relative)
+            .await
+            .expect("merge proposal");
+        let loop_relative = open_loop_path
+            .strip_prefix(layout.workspace_root())
+            .expect("loop relative")
+            .to_string_lossy()
+            .to_string();
+        layout
+            .resolve_open_loop(&loop_relative)
+            .await
+            .expect("resolve loop");
+
+        let memory_hits = layout
+            .search("brief release notes", 10)
+            .await
+            .expect("search memory");
+        assert!(memory_hits
+            .iter()
+            .any(|item| item.relative_path == "MEMORY.md"));
+        let loop_hits = layout
+            .search("indexed continuity search", 10)
+            .await
+            .expect("search loop");
+        assert!(loop_hits
+            .iter()
+            .any(|item| item.relative_path.contains("open-loops/archive")));
     }
 }
