@@ -1,10 +1,12 @@
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Utc};
+use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex};
 
 pub const MEMORY_FILE: &str = "MEMORY.md";
 pub const CONTINUITY_DIR: &str = "continuity";
@@ -22,6 +24,7 @@ const ACTIVE_TEMPLATE: &str =
 #[derive(Debug, Clone)]
 pub struct ContinuityLayout {
     workspace_root: PathBuf,
+    daily_note_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -66,6 +69,7 @@ impl ContinuityLayout {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
         Self {
             workspace_root: workspace_root.into(),
+            daily_note_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -123,6 +127,7 @@ impl ContinuityLayout {
     }
 
     pub async fn append_daily_event(&self, event: ContinuityEvent) -> Result<PathBuf> {
+        let _guard = self.daily_note_lock.lock().await;
         let path = self.daily_note_path(event.at);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -144,20 +149,28 @@ impl ContinuityLayout {
         }
         entry.push('\n');
 
-        let mut existing = if tokio::fs::try_exists(&path)
+        let exists = tokio::fs::try_exists(&path)
             .await
-            .with_context(|| format!("failed to stat {}", path.display()))?
-        {
-            tokio::fs::read_to_string(&path)
-                .await
-                .with_context(|| format!("failed to read {}", path.display()))?
-        } else {
-            format!("# Daily Continuity {}\n\n", event.at.format("%Y-%m-%d"))
-        };
-        existing.push_str(&entry);
-        tokio::fs::write(&path, existing)
+            .with_context(|| format!("failed to stat {}", path.display()))?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
             .await
-            .with_context(|| format!("failed to write {}", path.display()))?;
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        if !exists {
+            file.write_all(
+                format!("# Daily Continuity {}\n\n", event.at.format("%Y-%m-%d")).as_bytes(),
+            )
+            .await
+            .with_context(|| format!("failed to initialize {}", path.display()))?;
+        }
+        file.write_all(entry.as_bytes())
+            .await
+            .with_context(|| format!("failed to append {}", path.display()))?;
+        file.flush()
+            .await
+            .with_context(|| format!("failed to flush {}", path.display()))?;
         Ok(path)
     }
 
@@ -468,5 +481,57 @@ mod tests {
         assert!(artifact_content.contains("scheduler_job_output"));
         assert!(active_content.contains("What Matters Today"));
         assert!(active_content.contains("Pending Approvals"));
+    }
+
+    #[tokio::test]
+    async fn append_daily_event_preserves_concurrent_entries() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let layout = ContinuityLayout::new(temp_dir.path().join("workspace"));
+        layout.ensure_base_layout().await.expect("bootstrap");
+
+        let at = Utc.with_ymd_and_hms(2026, 4, 3, 9, 30, 0).unwrap();
+        let first = {
+            let layout = layout.clone();
+            tokio::spawn(async move {
+                layout
+                    .append_daily_event(ContinuityEvent {
+                        at,
+                        title: "First event".to_string(),
+                        details: vec!["alpha".to_string()],
+                    })
+                    .await
+                    .expect("append first")
+            })
+        };
+        let second = {
+            let layout = layout.clone();
+            tokio::spawn(async move {
+                layout
+                    .append_daily_event(ContinuityEvent {
+                        at,
+                        title: "Second event".to_string(),
+                        details: vec!["beta".to_string()],
+                    })
+                    .await
+                    .expect("append second")
+            })
+        };
+
+        let daily_path = first.await.expect("join first");
+        second.await.expect("join second");
+
+        let daily_content = tokio::fs::read_to_string(daily_path)
+            .await
+            .expect("read daily");
+        assert_eq!(
+            daily_content
+                .matches("# Daily Continuity 2026-04-03")
+                .count(),
+            1
+        );
+        assert!(daily_content.contains("First event"));
+        assert!(daily_content.contains("Second event"));
+        assert!(daily_content.contains("alpha"));
+        assert!(daily_content.contains("beta"));
     }
 }

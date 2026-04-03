@@ -61,7 +61,7 @@ use super::{
     selector::SkillSelector,
     session_compactions::SessionCompactionStore,
     session_transcript::{
-        load_repaired_turns, render_compaction_delta, render_turns_for_prompt,
+        load_repaired_turns, render_compaction_summary, render_turns_for_prompt,
         turns_to_history_views, TranscriptMode, COMPACTION_RAW_KEEP,
     },
     session_turns::{NewSessionTurn, SessionTurnCompletion, SessionTurnRecord, SessionTurnStore},
@@ -1859,11 +1859,15 @@ impl Kernel {
         }
 
         let through_sequence_no = latest_turn.sequence_no.saturating_sub(COMPACTION_RAW_KEEP);
-        let already_compacted = self
+        let previous_compaction = self
             .session_compactions
-            .latest_through_sequence(session.session_id)
+            .latest(session.session_id)
             .await
             .map_err(internal)?;
+        let already_compacted = previous_compaction
+            .as_ref()
+            .map(|record| record.through_sequence_no)
+            .unwrap_or(0);
         if through_sequence_no <= already_compacted {
             return Ok(());
         }
@@ -1877,7 +1881,19 @@ impl Kernel {
             return Ok(());
         }
 
-        let summary_text = render_compaction_delta(&turns);
+        let start_sequence_no = previous_compaction
+            .as_ref()
+            .map(|record| record.start_sequence_no)
+            .or_else(|| turns.first().map(|turn| turn.sequence_no))
+            .unwrap_or(already_compacted + 1);
+        let summary_text = render_compaction_summary(
+            start_sequence_no,
+            through_sequence_no,
+            previous_compaction
+                .as_ref()
+                .map(|record| record.summary_text.as_str()),
+            &turns,
+        );
         if summary_text.trim().is_empty() {
             return Ok(());
         }
@@ -1886,10 +1902,7 @@ impl Kernel {
             .session_compactions
             .insert(
                 session.session_id,
-                turns
-                    .first()
-                    .map(|turn| turn.sequence_no)
-                    .unwrap_or(already_compacted + 1),
+                start_sequence_no,
                 through_sequence_no,
                 summary_text,
             )
@@ -3795,7 +3808,7 @@ impl Kernel {
     ) -> anyhow::Result<Vec<String>> {
         let mut sections = self
             .session_compactions
-            .list_recent(session.session_id, 2)
+            .latest(session.session_id)
             .await?
             .into_iter()
             .map(|record| record.summary_text)

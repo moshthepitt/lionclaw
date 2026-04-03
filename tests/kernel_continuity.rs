@@ -275,7 +275,7 @@ async fn older_turns_are_compacted_into_prompt_context() {
         .await;
 
     let session = open_local_session(&kernel, "compaction-peer").await;
-    for index in 0..15 {
+    for index in 0..30 {
         kernel
             .turn_session(SessionTurnRequest {
                 session_id: session.session_id,
@@ -296,6 +296,9 @@ async fn older_turns_are_compacted_into_prompt_context() {
         .cloned()
         .unwrap();
     assert!(last_prompt.contains("Compacted Prior Turns"));
+    assert!(last_prompt.contains("user: turn 0"));
+    assert!(last_prompt.contains("user: turn 10"));
+    assert!(last_prompt.contains("turn 29"));
 }
 
 async fn install_enabled_skill(kernel: &Kernel, name: &str) -> String {

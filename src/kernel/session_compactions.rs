@@ -39,6 +39,22 @@ impl SessionCompactionStore {
         u64::try_from(raw).context("invalid latest through_sequence_no")
     }
 
+    pub async fn latest(&self, session_id: Uuid) -> Result<Option<SessionCompactionRecord>> {
+        let row = sqlx::query(
+            "SELECT compaction_id, session_id, start_sequence_no, through_sequence_no, summary_text, created_at_ms \
+             FROM session_compactions \
+             WHERE session_id = ?1 \
+             ORDER BY through_sequence_no DESC, compaction_id DESC \
+             LIMIT 1",
+        )
+        .bind(session_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query latest session compaction record")?;
+
+        row.map(map_compaction_row).transpose()
+    }
+
     pub async fn insert(
         &self,
         session_id: Uuid,

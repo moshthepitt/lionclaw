@@ -153,6 +153,31 @@ pub fn render_compaction_delta(turns: &[SessionTurnRecord]) -> String {
     lines.join("\n")
 }
 
+pub fn render_compaction_summary(
+    start_sequence_no: u64,
+    through_sequence_no: u64,
+    previous_summary: Option<&str>,
+    turns: &[SessionTurnRecord],
+) -> String {
+    let delta = render_compaction_delta(turns);
+    if delta.trim().is_empty() {
+        return String::new();
+    }
+
+    let mut lines = vec![format!(
+        "## Compacted Prior Turns {}-{}",
+        start_sequence_no, through_sequence_no
+    )];
+    lines.extend(
+        previous_summary
+            .into_iter()
+            .flat_map(strip_compaction_heading)
+            .chain(strip_compaction_heading(&delta))
+            .filter(|line| !line.trim().is_empty()),
+    );
+    lines.join("\n")
+}
+
 pub fn partial_marker(status: SessionTurnStatus) -> &'static str {
     match status {
         SessionTurnStatus::TimedOut => {
@@ -252,6 +277,20 @@ fn truncate_for_compaction(value: &str, max_chars: usize) -> String {
     }
 }
 
+fn strip_compaction_heading(summary: &str) -> Vec<String> {
+    summary
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if index == 0 && line.trim_start().starts_with("## Compacted Prior Turns ") {
+                None
+            } else {
+                Some(line.to_string())
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -259,7 +298,7 @@ mod tests {
 
     use crate::contracts::{SessionHistoryPolicy, SessionTurnKind, SessionTurnStatus};
 
-    use super::{repair_turns, TranscriptMode};
+    use super::{render_compaction_summary, repair_turns, TranscriptMode};
     use crate::kernel::session_turns::SessionTurnRecord;
 
     fn turn(
@@ -350,5 +389,52 @@ mod tests {
             repaired[0].error_text.as_deref(),
             Some("turn interrupted by kernel restart")
         );
+    }
+
+    #[test]
+    fn compaction_summary_preserves_prior_compacted_turns() {
+        let first_summary = render_compaction_summary(
+            1,
+            2,
+            None,
+            &[
+                turn(
+                    1,
+                    Uuid::new_v4(),
+                    SessionTurnStatus::Completed,
+                    "turn 0",
+                    "assistant 0",
+                    None,
+                ),
+                turn(
+                    2,
+                    Uuid::new_v4(),
+                    SessionTurnStatus::Completed,
+                    "turn 1",
+                    "assistant 1",
+                    None,
+                ),
+            ],
+        );
+
+        let merged = render_compaction_summary(
+            1,
+            3,
+            Some(&first_summary),
+            &[turn(
+                3,
+                Uuid::new_v4(),
+                SessionTurnStatus::Completed,
+                "turn 2",
+                "assistant 2",
+                None,
+            )],
+        );
+
+        assert!(merged.contains("## Compacted Prior Turns 1-3"));
+        assert!(merged.contains("user: turn 0"));
+        assert!(merged.contains("user: turn 1"));
+        assert!(merged.contains("user: turn 2"));
+        assert_eq!(merged.matches("## Compacted Prior Turns").count(), 1);
     }
 }
