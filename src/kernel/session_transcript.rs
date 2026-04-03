@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::contracts::{SessionHistoryPolicy, SessionTurnStatus, SessionTurnView};
@@ -12,11 +13,31 @@ const HISTORY_OVERFETCH_CAP: usize = 100;
 const INTERRUPTED_ERROR_CODE: &str = "runtime.interrupted";
 const INTERRUPTED_ERROR_TEXT: &str = "turn interrupted by kernel restart";
 pub const COMPACTION_RAW_KEEP: u64 = 12;
+const COMPACTION_OLDEST_KEEP: usize = 2;
+const COMPACTION_FAILURE_KEEP: usize = 4;
+const COMPACTION_RECENT_KEEP: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TranscriptMode {
     Prompt(SessionHistoryPolicy),
     History,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CompactionSummaryState {
+    #[serde(default)]
+    pub oldest_anchors: Vec<CompactionTurnDigest>,
+    #[serde(default)]
+    pub notable_failures: Vec<CompactionTurnDigest>,
+    #[serde(default)]
+    pub recent_turns: Vec<CompactionTurnDigest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompactionTurnDigest {
+    pub sequence_no: u64,
+    pub user: String,
+    pub outcome: String,
 }
 
 pub async fn load_repaired_turns(
@@ -97,83 +118,105 @@ pub fn render_turns_for_prompt(
         .collect()
 }
 
-pub fn render_compaction_delta(turns: &[SessionTurnRecord]) -> String {
-    if turns.is_empty() {
-        return String::new();
+pub fn merge_compaction_summary_state(
+    previous_state: Option<&CompactionSummaryState>,
+    turns: &[SessionTurnRecord],
+) -> CompactionSummaryState {
+    let turn_summaries = turns
+        .iter()
+        .map(summarize_turn_for_compaction)
+        .collect::<Vec<_>>();
+    let failure_summaries = turns
+        .iter()
+        .filter(|turn| {
+            matches!(
+                turn.status,
+                SessionTurnStatus::TimedOut
+                    | SessionTurnStatus::Failed
+                    | SessionTurnStatus::Cancelled
+                    | SessionTurnStatus::Interrupted
+            )
+        })
+        .map(summarize_turn_for_compaction)
+        .collect::<Vec<_>>();
+
+    let mut oldest_anchors = previous_state
+        .map(|state| state.oldest_anchors.clone())
+        .unwrap_or_default();
+    if oldest_anchors.len() < COMPACTION_OLDEST_KEEP {
+        oldest_anchors.extend(
+            turn_summaries
+                .iter()
+                .cloned()
+                .take(COMPACTION_OLDEST_KEEP.saturating_sub(oldest_anchors.len())),
+        );
     }
 
-    let start = turns
-        .first()
-        .map(|turn| turn.sequence_no)
+    let mut notable_failures = previous_state
+        .map(|state| state.notable_failures.clone())
         .unwrap_or_default();
-    let end = turns
-        .last()
-        .map(|turn| turn.sequence_no)
-        .unwrap_or_default();
-    let mut lines = vec![format!("## Compacted Prior Turns {}-{}", start, end)];
+    notable_failures.extend(failure_summaries);
+    notable_failures = keep_tail(notable_failures, COMPACTION_FAILURE_KEEP);
 
-    for turn in turns {
-        let user = truncate_for_compaction(&turn.prompt_user_text, 120);
-        let outcome = match turn.status {
-            SessionTurnStatus::Completed => {
-                let assistant = truncate_for_compaction(&turn.assistant_text, 160);
-                if assistant.is_empty() {
-                    "completed".to_string()
-                } else {
-                    format!("completed; assistant: {}", assistant)
-                }
-            }
-            SessionTurnStatus::TimedOut
-            | SessionTurnStatus::Failed
-            | SessionTurnStatus::Cancelled
-            | SessionTurnStatus::Interrupted => format!(
-                "{}; {}",
-                turn.status.as_str(),
-                truncate_for_compaction(
-                    turn.error_text
-                        .as_deref()
-                        .unwrap_or("no additional error text recorded"),
-                    120
-                )
-            ),
-            SessionTurnStatus::Running => "running".to_string(),
-        };
-        lines.push(format!(
-            "- Turn {}: user: {}; outcome: {}",
-            turn.sequence_no,
-            if user.is_empty() {
-                "<empty>"
-            } else {
-                user.as_str()
-            },
-            outcome
-        ));
+    let mut recent_turns = previous_state
+        .map(|state| state.recent_turns.clone())
+        .unwrap_or_default();
+    recent_turns.extend(turn_summaries);
+    recent_turns = keep_tail(recent_turns, COMPACTION_RECENT_KEEP);
+
+    CompactionSummaryState {
+        oldest_anchors,
+        notable_failures,
+        recent_turns,
     }
-
-    lines.join("\n")
 }
 
 pub fn render_compaction_summary(
     start_sequence_no: u64,
     through_sequence_no: u64,
-    previous_summary: Option<&str>,
-    turns: &[SessionTurnRecord],
+    state: &CompactionSummaryState,
 ) -> String {
-    let delta = render_compaction_delta(turns);
-    if delta.trim().is_empty() {
+    if start_sequence_no == 0 || through_sequence_no < start_sequence_no {
         return String::new();
     }
 
-    let mut lines = vec![format!(
-        "## Compacted Prior Turns {}-{}",
-        start_sequence_no, through_sequence_no
-    )];
-    lines.extend(
-        previous_summary
-            .into_iter()
-            .flat_map(strip_compaction_heading)
-            .chain(strip_compaction_heading(&delta))
-            .filter(|line| !line.trim().is_empty()),
+    let mut lines = vec![
+        format!(
+            "## Compacted Prior Turns {}-{}",
+            start_sequence_no, through_sequence_no
+        ),
+        format!(
+            "- Total compacted turns: {}",
+            through_sequence_no - start_sequence_no + 1
+        ),
+        "- This is a bounded handoff summary of compacted turns. Recent raw turns remain below."
+            .to_string(),
+    ];
+
+    push_compaction_section(&mut lines, "Oldest Anchors", state.oldest_anchors.iter());
+    push_compaction_section(
+        &mut lines,
+        "Notable Failures",
+        state.notable_failures.iter().filter(|digest| {
+            !state
+                .oldest_anchors
+                .iter()
+                .any(|anchor| anchor.sequence_no == digest.sequence_no)
+        }),
+    );
+    push_compaction_section(
+        &mut lines,
+        "Recent Compacted Turns",
+        state.recent_turns.iter().filter(|digest| {
+            !state
+                .oldest_anchors
+                .iter()
+                .any(|anchor| anchor.sequence_no == digest.sequence_no)
+                && !state
+                    .notable_failures
+                    .iter()
+                    .any(|failure| failure.sequence_no == digest.sequence_no)
+        }),
     );
     lines.join("\n")
 }
@@ -277,18 +320,70 @@ fn truncate_for_compaction(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn strip_compaction_heading(summary: &str) -> Vec<String> {
-    summary
-        .lines()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            if index == 0 && line.trim_start().starts_with("## Compacted Prior Turns ") {
-                None
+fn summarize_turn_for_compaction(turn: &SessionTurnRecord) -> CompactionTurnDigest {
+    let user = truncate_for_compaction(&turn.prompt_user_text, 120);
+    let outcome = match turn.status {
+        SessionTurnStatus::Completed => {
+            let assistant = truncate_for_compaction(&turn.assistant_text, 160);
+            if assistant.is_empty() {
+                "completed".to_string()
             } else {
-                Some(line.to_string())
+                format!("completed; assistant: {}", assistant)
             }
-        })
-        .collect()
+        }
+        SessionTurnStatus::TimedOut
+        | SessionTurnStatus::Failed
+        | SessionTurnStatus::Cancelled
+        | SessionTurnStatus::Interrupted => format!(
+            "{}; {}",
+            turn.status.as_str(),
+            truncate_for_compaction(
+                turn.error_text
+                    .as_deref()
+                    .unwrap_or("no additional error text recorded"),
+                120
+            )
+        ),
+        SessionTurnStatus::Running => "running".to_string(),
+    };
+
+    CompactionTurnDigest {
+        sequence_no: turn.sequence_no,
+        user: if user.is_empty() {
+            "<empty>".to_string()
+        } else {
+            user
+        },
+        outcome,
+    }
+}
+
+fn keep_tail<T>(mut items: Vec<T>, limit: usize) -> Vec<T> {
+    if items.len() > limit {
+        let keep_from = items.len() - limit;
+        items.drain(0..keep_from);
+    }
+    items
+}
+
+fn push_compaction_section<'a>(
+    lines: &mut Vec<String>,
+    title: &str,
+    digests: impl Iterator<Item = &'a CompactionTurnDigest>,
+) {
+    let digests = digests.collect::<Vec<_>>();
+    if digests.is_empty() {
+        return;
+    }
+
+    lines.push(String::new());
+    lines.push(format!("### {}", title));
+    for digest in digests {
+        lines.push(format!(
+            "- Turn {}: user: {}; outcome: {}",
+            digest.sequence_no, digest.user, digest.outcome
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -393,9 +488,7 @@ mod tests {
 
     #[test]
     fn compaction_summary_preserves_prior_compacted_turns() {
-        let first_summary = render_compaction_summary(
-            1,
-            2,
+        let first_state = super::merge_compaction_summary_state(
             None,
             &[
                 turn(
@@ -414,27 +507,103 @@ mod tests {
                     "assistant 1",
                     None,
                 ),
+                turn(
+                    3,
+                    Uuid::new_v4(),
+                    SessionTurnStatus::Completed,
+                    "turn 2",
+                    "assistant 2",
+                    None,
+                ),
+                turn(
+                    4,
+                    Uuid::new_v4(),
+                    SessionTurnStatus::Completed,
+                    "turn 3",
+                    "assistant 3",
+                    None,
+                ),
             ],
         );
 
-        let merged = render_compaction_summary(
-            1,
-            3,
-            Some(&first_summary),
-            &[turn(
-                3,
-                Uuid::new_v4(),
-                SessionTurnStatus::Completed,
-                "turn 2",
-                "assistant 2",
-                None,
-            )],
+        let merged_state = super::merge_compaction_summary_state(
+            Some(&first_state),
+            &[
+                turn(
+                    5,
+                    Uuid::new_v4(),
+                    SessionTurnStatus::Completed,
+                    "turn 4",
+                    "assistant 4",
+                    None,
+                ),
+                turn(
+                    6,
+                    Uuid::new_v4(),
+                    SessionTurnStatus::Completed,
+                    "turn 5",
+                    "assistant 5",
+                    None,
+                ),
+                turn(
+                    7,
+                    Uuid::new_v4(),
+                    SessionTurnStatus::Completed,
+                    "turn 6",
+                    "assistant 6",
+                    None,
+                ),
+                turn(
+                    8,
+                    Uuid::new_v4(),
+                    SessionTurnStatus::Failed,
+                    "turn 7",
+                    "",
+                    Some("boom"),
+                ),
+                turn(
+                    9,
+                    Uuid::new_v4(),
+                    SessionTurnStatus::Completed,
+                    "turn 8",
+                    "assistant 8",
+                    None,
+                ),
+                turn(
+                    10,
+                    Uuid::new_v4(),
+                    SessionTurnStatus::Completed,
+                    "turn 9",
+                    "assistant 9",
+                    None,
+                ),
+                turn(
+                    11,
+                    Uuid::new_v4(),
+                    SessionTurnStatus::Completed,
+                    "turn 10",
+                    "assistant 10",
+                    None,
+                ),
+                turn(
+                    12,
+                    Uuid::new_v4(),
+                    SessionTurnStatus::Completed,
+                    "turn 11",
+                    "assistant 11",
+                    None,
+                ),
+            ],
         );
+        let merged = render_compaction_summary(1, 12, &merged_state);
 
-        assert!(merged.contains("## Compacted Prior Turns 1-3"));
+        assert!(merged.contains("## Compacted Prior Turns 1-12"));
+        assert!(merged.contains("Total compacted turns: 12"));
         assert!(merged.contains("user: turn 0"));
         assert!(merged.contains("user: turn 1"));
-        assert!(merged.contains("user: turn 2"));
+        assert!(merged.contains("user: turn 11"));
+        assert!(merged.contains("failed; boom"));
+        assert!(!merged.contains("user: turn 2"));
         assert_eq!(merged.matches("## Compacted Prior Turns").count(), 1);
     }
 }

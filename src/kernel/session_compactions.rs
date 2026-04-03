@@ -4,6 +4,7 @@ use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::kernel::db::{ms_to_datetime, now_ms};
+use crate::kernel::session_transcript::CompactionSummaryState;
 
 #[derive(Debug, Clone)]
 pub struct SessionCompactionRecord {
@@ -12,6 +13,7 @@ pub struct SessionCompactionRecord {
     pub start_sequence_no: u64,
     pub through_sequence_no: u64,
     pub summary_text: String,
+    pub summary_state: CompactionSummaryState,
     pub created_at: DateTime<Utc>,
 }
 
@@ -41,7 +43,7 @@ impl SessionCompactionStore {
 
     pub async fn latest(&self, session_id: Uuid) -> Result<Option<SessionCompactionRecord>> {
         let row = sqlx::query(
-            "SELECT compaction_id, session_id, start_sequence_no, through_sequence_no, summary_text, created_at_ms \
+            "SELECT compaction_id, session_id, start_sequence_no, through_sequence_no, summary_text, summary_state_json, created_at_ms \
              FROM session_compactions \
              WHERE session_id = ?1 \
              ORDER BY through_sequence_no DESC, compaction_id DESC \
@@ -61,9 +63,12 @@ impl SessionCompactionStore {
         start_sequence_no: u64,
         through_sequence_no: u64,
         summary_text: String,
+        summary_state: &CompactionSummaryState,
     ) -> Result<SessionCompactionRecord> {
         let compaction_id = Uuid::new_v4();
         let created_at_ms = now_ms();
+        let summary_state_json = serde_json::to_string(summary_state)
+            .context("failed to serialize session compaction summary state")?;
         let mut tx = self
             .pool
             .begin()
@@ -71,14 +76,15 @@ impl SessionCompactionStore {
             .context("failed to start session compaction transaction")?;
         sqlx::query(
             "INSERT INTO session_compactions \
-             (compaction_id, session_id, start_sequence_no, through_sequence_no, summary_text, created_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (compaction_id, session_id, start_sequence_no, through_sequence_no, summary_text, summary_state_json, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .bind(compaction_id.to_string())
         .bind(session_id.to_string())
         .bind(i64::try_from(start_sequence_no).context("start_sequence_no is too large")?)
         .bind(i64::try_from(through_sequence_no).context("through_sequence_no is too large")?)
         .bind(summary_text)
+        .bind(summary_state_json)
         .bind(created_at_ms)
         .execute(&mut *tx)
         .await
@@ -105,7 +111,7 @@ impl SessionCompactionStore {
 
     pub async fn get(&self, compaction_id: Uuid) -> Result<Option<SessionCompactionRecord>> {
         let row = sqlx::query(
-            "SELECT compaction_id, session_id, start_sequence_no, through_sequence_no, summary_text, created_at_ms \
+            "SELECT compaction_id, session_id, start_sequence_no, through_sequence_no, summary_text, summary_state_json, created_at_ms \
              FROM session_compactions \
              WHERE compaction_id = ?1",
         )
@@ -123,7 +129,7 @@ impl SessionCompactionStore {
         limit: usize,
     ) -> Result<Vec<SessionCompactionRecord>> {
         let rows = sqlx::query(
-            "SELECT compaction_id, session_id, start_sequence_no, through_sequence_no, summary_text, created_at_ms \
+            "SELECT compaction_id, session_id, start_sequence_no, through_sequence_no, summary_text, summary_state_json, created_at_ms \
              FROM session_compactions \
              WHERE session_id = ?1 \
              ORDER BY through_sequence_no DESC, compaction_id DESC \
@@ -144,6 +150,7 @@ fn map_compaction_row(row: SqliteRow) -> Result<SessionCompactionRecord> {
     let session_id_raw: String = row.get("session_id");
     let start_sequence_no_raw: i64 = row.get("start_sequence_no");
     let through_sequence_no_raw: i64 = row.get("through_sequence_no");
+    let summary_state_json: String = row.get("summary_state_json");
     let created_at_ms: i64 = row.get("created_at_ms");
 
     Ok(SessionCompactionRecord {
@@ -157,6 +164,12 @@ fn map_compaction_row(row: SqliteRow) -> Result<SessionCompactionRecord> {
             format!("invalid through_sequence_no '{}'", through_sequence_no_raw)
         })?,
         summary_text: row.get("summary_text"),
+        summary_state: serde_json::from_str(&summary_state_json).with_context(|| {
+            format!(
+                "invalid session compaction summary_state_json '{}'",
+                summary_state_json
+            )
+        })?,
         created_at: ms_to_datetime(created_at_ms)
             .ok_or_else(|| anyhow!("invalid created_at_ms '{}'", created_at_ms))?,
     })
@@ -169,6 +182,7 @@ mod tests {
 
     use super::SessionCompactionStore;
     use crate::kernel::db::Db;
+    use crate::kernel::session_transcript::CompactionSummaryState;
 
     #[tokio::test]
     async fn insert_prunes_superseded_compactions_for_session() {
@@ -180,11 +194,23 @@ mod tests {
         let session_id = Uuid::new_v4();
 
         let first = store
-            .insert(session_id, 1, 5, "first".to_string())
+            .insert(
+                session_id,
+                1,
+                5,
+                "first".to_string(),
+                &CompactionSummaryState::default(),
+            )
             .await
             .expect("insert first");
         let second = store
-            .insert(session_id, 1, 10, "second".to_string())
+            .insert(
+                session_id,
+                1,
+                10,
+                "second".to_string(),
+                &CompactionSummaryState::default(),
+            )
             .await
             .expect("insert second");
 
@@ -200,6 +226,7 @@ mod tests {
             .expect("record");
         assert_eq!(latest.compaction_id, second.compaction_id);
         assert_eq!(latest.summary_text, "second");
+        assert_eq!(latest.summary_state, CompactionSummaryState::default());
         assert_eq!(
             store.list_recent(session_id, 10).await.expect("list").len(),
             1

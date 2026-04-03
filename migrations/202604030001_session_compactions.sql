@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS session_compactions (
     start_sequence_no INTEGER NOT NULL,
     through_sequence_no INTEGER NOT NULL,
     summary_text TEXT NOT NULL,
+    summary_state_json TEXT NOT NULL,
     created_at_ms INTEGER NOT NULL
 );
 

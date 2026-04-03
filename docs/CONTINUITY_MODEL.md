@@ -53,6 +53,7 @@ Implemented now:
   - failed session turns
 - scheduled outputs are recorded as artifact files
 - transcript compaction summaries are stored in SQLite and loaded separately from file memory
+- prompt history uses one bounded compaction handoff summary plus the recent raw turn tail
 
 Not implemented yet:
 
@@ -91,6 +92,12 @@ LionClaw keeps:
 - full raw turn history in SQLite
 - compacted transcript summaries in SQLite
 - visible continuity files in the assistant home workspace
+
+Prompt rendering follows the proven assistant pattern used by Hermes, IronClaw, and OpenClaw:
+
+- one bounded persisted handoff summary for compacted history
+- recent raw turns kept intact
+- no ever-growing literal digest of all older turns in the prompt
 
 This follows the proven split used by the stronger assistant systems:
 

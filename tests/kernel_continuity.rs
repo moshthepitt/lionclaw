@@ -296,8 +296,11 @@ async fn older_turns_are_compacted_into_prompt_context() {
         .cloned()
         .unwrap();
     assert!(last_prompt.contains("Compacted Prior Turns"));
+    assert!(last_prompt.contains("Compacted Prior Turns 1-17"));
+    assert!(last_prompt.contains("Total compacted turns: 17"));
     assert!(last_prompt.contains("user: turn 0"));
-    assert!(last_prompt.contains("user: turn 10"));
+    assert!(last_prompt.contains("user: turn 9"));
+    assert!(!last_prompt.contains("user: turn 5"));
     assert!(last_prompt.contains("turn 29"));
 }
 

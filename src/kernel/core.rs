@@ -61,8 +61,8 @@ use super::{
     selector::SkillSelector,
     session_compactions::SessionCompactionStore,
     session_transcript::{
-        load_repaired_turns, render_compaction_summary, render_turns_for_prompt,
-        turns_to_history_views, TranscriptMode, COMPACTION_RAW_KEEP,
+        load_repaired_turns, merge_compaction_summary_state, render_compaction_summary,
+        render_turns_for_prompt, turns_to_history_views, TranscriptMode, COMPACTION_RAW_KEEP,
     },
     session_turns::{NewSessionTurn, SessionTurnCompletion, SessionTurnRecord, SessionTurnStore},
     sessions::SessionStore,
@@ -1886,14 +1886,12 @@ impl Kernel {
             .map(|record| record.start_sequence_no)
             .or_else(|| turns.first().map(|turn| turn.sequence_no))
             .unwrap_or(already_compacted + 1);
-        let summary_text = render_compaction_summary(
-            start_sequence_no,
-            through_sequence_no,
-            previous_compaction
-                .as_ref()
-                .map(|record| record.summary_text.as_str()),
-            &turns,
-        );
+        let previous_summary_state = previous_compaction
+            .as_ref()
+            .map(|record| record.summary_state.clone());
+        let summary_state = merge_compaction_summary_state(previous_summary_state.as_ref(), &turns);
+        let summary_text =
+            render_compaction_summary(start_sequence_no, through_sequence_no, &summary_state);
         if summary_text.trim().is_empty() {
             return Ok(());
         }
@@ -1905,6 +1903,7 @@ impl Kernel {
                 start_sequence_no,
                 through_sequence_no,
                 summary_text,
+                &summary_state,
             )
             .await
             .map_err(internal)?;
@@ -3806,14 +3805,17 @@ impl Kernel {
         session: &super::sessions::Session,
         limit: usize,
     ) -> anyhow::Result<Vec<String>> {
-        let mut sections = self
-            .session_compactions
-            .latest(session.session_id)
-            .await?
-            .into_iter()
-            .map(|record| record.summary_text)
-            .filter(|summary| !summary.trim().is_empty())
-            .collect::<Vec<_>>();
+        let mut sections = Vec::new();
+        if let Some(record) = self.session_compactions.latest(session.session_id).await? {
+            let summary_text = render_compaction_summary(
+                record.start_sequence_no,
+                record.through_sequence_no,
+                &record.summary_state,
+            );
+            if !summary_text.trim().is_empty() {
+                sections.push(summary_text);
+            }
+        }
         let turns = load_repaired_turns(
             &self.session_turns,
             session.session_id,

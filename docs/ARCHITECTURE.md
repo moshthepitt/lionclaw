@@ -174,7 +174,7 @@ Queued channel turns emit machine-stable status/error codes through the same str
   - `retry_last_turn`
   - `reset_session`
 - The default history window is the last 12 durable turns.
-- Prompt rendering may prepend a bounded number of persisted transcript compaction summaries before the recent raw turns.
+- Prompt rendering prepends one bounded persisted transcript compaction summary before the recent raw turns.
 - Channel-backed session mutation APIs (`sessions/open`, `sessions/action`, direct session turns) remain gated by channel peer approval in the kernel.
 
 ## Assistant Continuity
@@ -194,6 +194,7 @@ Queued channel turns emit machine-stable status/error codes through the same str
   - failed turns
 - Scheduler artifacts are recorded under `continuity/artifacts/...`.
 - Transcript compaction summaries are stored in SQLite separately from file-backed continuity.
+- Prompt history sees one bounded compaction handoff summary plus the recent raw tail.
 - Brokered filesystem access may target a different project/task root; continuity never follows that root.
 
 ## Scheduler Model
