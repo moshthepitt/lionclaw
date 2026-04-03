@@ -582,6 +582,7 @@ impl ContinuityLayout {
         }
 
         if let Some(index_store) = &self.index_store {
+            self.rebuild_index().await?;
             let indexed = index_store.search(&needle, limit).await?;
             if !indexed.is_empty() {
                 return Ok(indexed
@@ -1442,5 +1443,51 @@ mod tests {
         assert!(loop_hits
             .iter()
             .any(|item| item.relative_path.contains("open-loops/archive")));
+    }
+
+    #[tokio::test]
+    async fn indexed_search_reflects_manual_file_edits_without_restart() {
+        let temp_dir = tempdir().expect("temp dir");
+        let db = Db::connect_file(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("db connect");
+        let layout = ContinuityLayout::with_index_store(
+            temp_dir.path().join("workspace"),
+            Some(ContinuityIndexStore::new(db.pool())),
+        );
+        layout.ensure_base_layout().await.expect("bootstrap");
+
+        tokio::fs::write(
+            layout.memory_path(),
+            "# Memory\n\n## Entries\n- Prefer concise reviews.\n",
+        )
+        .await
+        .expect("write memory v1");
+        let first_hits = layout
+            .search("concise reviews", 10)
+            .await
+            .expect("search first edit");
+        assert!(first_hits
+            .iter()
+            .any(|item| item.relative_path == "MEMORY.md"));
+
+        tokio::fs::write(
+            layout.memory_path(),
+            "# Memory\n\n## Entries\n- Prefer exhaustive reviews.\n",
+        )
+        .await
+        .expect("write memory v2");
+        assert!(layout
+            .search("concise reviews", 10)
+            .await
+            .expect("search stale phrase")
+            .is_empty());
+        let second_hits = layout
+            .search("exhaustive reviews", 10)
+            .await
+            .expect("search second edit");
+        assert!(second_hits
+            .iter()
+            .any(|item| item.relative_path == "MEMORY.md"));
     }
 }
