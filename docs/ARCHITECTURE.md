@@ -7,8 +7,10 @@
 - `kernel.skills`: installed skill registry and enable/disable state.
 - `kernel.selector`: turn-time skill relevance selection.
 - `kernel.policy`: capability grant/revoke and allow checks.
+- `kernel.jobs`: scheduled job definitions, run records, and SQLite persistence.
 - `kernel.capability_broker`: brokered capability execution (`fs`, `net`, `secret`, `channel.send`, `scheduler`).
 - `kernel.runtime`: runtime adapter contract and registry.
+- `kernel.scheduler`: due-job claiming, lease coordination, retry, and dispatch.
 - `kernel.channel_state`: durable channel bindings, peer trust state, inbound logs, queued channel turns, outbound transcript history, and append-only channel stream delivery state.
 - `kernel.audit`: append-only audit event log persisted in SQLite.
 
@@ -40,6 +42,18 @@
 - `POST /v0/channels/stream/pull`
 - `POST /v0/channels/stream/ack`
 
+### Job
+
+- `POST /v0/jobs/create`
+- `GET /v0/jobs/list`
+- `POST /v0/jobs/get`
+- `POST /v0/jobs/pause`
+- `POST /v0/jobs/resume`
+- `POST /v0/jobs/run`
+- `POST /v0/jobs/remove`
+- `POST /v0/jobs/runs`
+- `POST /v0/jobs/tick`
+
 ### Policy
 
 - `POST /v0/policy/grant`
@@ -70,7 +84,7 @@
 Runtime adapters submit `RuntimeCapabilityRequest` items. Kernel flow:
 
 1. Validate requesting skill is selected for the turn.
-2. Evaluate policy for requested capability and scope.
+2. Evaluate policy for the requested capability against the kernel-selected scope. Runtime-supplied scope strings may restate that scope, but they cannot widen it to another job, session, channel, or runtime scope.
 3. If allowed, execute through kernel broker only.
 4. Return `RuntimeCapabilityResult` to adapter.
 5. Audit both request and result (`capability.request`, `capability.result`).
@@ -89,6 +103,13 @@ Channel bridge layout:
 - `kernel/channel_state.rs`: durable channel bindings/peers/offsets/messages + stream event/cursor storage.
 - `kernel/core.rs`: channel inbound processing, pairing/approval, session snapshot lookup, and stream pull/ack APIs.
 - `api/mod.rs`: HTTP routes for external channel skill workers.
+
+Scheduler layout:
+
+- `kernel/jobs.rs`: typed schedules (`once`, `interval`, `cron`), job/run persistence, and lease-backed due-claiming.
+- `kernel/scheduler.rs`: single-flight scheduler engine, lease coordination, scheduled session execution, and final-result channel delivery.
+- `kernel/core.rs`: thin job API/orchestration boundary that delegates scheduler execution.
+- `daemon.rs`: background scheduler loop inside `lionclawd`.
 
 Operator launch model:
 
@@ -150,6 +171,21 @@ Queued channel turns emit machine-stable status/error codes through the same str
   - `reset_session`
 - The default history window is the last 12 durable turns.
 - Channel-backed session mutation APIs (`sessions/open`, `sessions/action`, direct session turns) remain gated by channel peer approval in the kernel.
+
+## Scheduler Model
+
+- Time-based only in v1: `once`, anchored `interval`, and cron-with-timezone.
+- The scheduler is kernel-owned, daemon-driven, and single-flight by design. A single lease row prevents duplicate or overlapping ticks.
+- Recurring jobs advance `next_run_at` before execution to avoid restart replay storms.
+- Interrupted one-shot jobs remain claimable; interrupted recurring jobs resume from the next future slot.
+- Every scheduled run opens a fresh synthetic session with:
+  - `channel_id = "scheduler"`
+  - `peer_id = "job:<job-id>"`
+  - `history_policy = conservative`
+- Scheduled jobs use explicit attached skill ids. They do not use turn-time auto-selection.
+- Policy scope for scheduled work is `job:<job-id>`, separate from normal `session:<session-id>` checks.
+- Optional delivery sends the final result through the existing channel stream/outbox path without changing the latest interactive session for that peer.
+- Paused jobs are skipped by normal scheduler ticks but can still be run manually by the operator.
 
 ## Security Posture in v0
 

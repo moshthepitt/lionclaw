@@ -370,6 +370,179 @@ pub struct PolicyRevokeResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JobScheduleDto {
+    Once { run_at: DateTime<Utc> },
+    Interval { every_ms: u64, anchor_ms: i64 },
+    Cron { expr: String, timezone: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobDeliveryTargetDto {
+    pub channel_id: String,
+    pub peer_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerJobRunStatusDto {
+    Running,
+    Completed,
+    Failed,
+    DeadLetter,
+    Interrupted,
+}
+
+impl SchedulerJobRunStatusDto {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::DeadLetter => "dead_letter",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerJobDeliveryStatusDto {
+    Pending,
+    Delivered,
+    Failed,
+    NotRequested,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerJobTriggerKindDto {
+    Schedule,
+    Manual,
+    Retry,
+    Recovery,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobCreateRequest {
+    pub name: String,
+    pub runtime_id: String,
+    pub schedule: JobScheduleDto,
+    pub prompt_text: String,
+    #[serde(default)]
+    pub skill_ids: Vec<String>,
+    #[serde(default)]
+    pub allow_capabilities: Vec<String>,
+    #[serde(default)]
+    pub delivery: Option<JobDeliveryTargetDto>,
+    #[serde(default)]
+    pub retry_attempts: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRefRequest {
+    pub job_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRunsRequest {
+    pub job_id: Uuid,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobView {
+    pub job_id: Uuid,
+    pub name: String,
+    pub enabled: bool,
+    pub runtime_id: String,
+    pub schedule: JobScheduleDto,
+    pub prompt_text: String,
+    pub skill_ids: Vec<String>,
+    #[serde(default)]
+    pub delivery: Option<JobDeliveryTargetDto>,
+    pub retry_attempts: u32,
+    #[serde(default)]
+    pub next_run_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub running_run_id: Option<Uuid>,
+    #[serde(default)]
+    pub last_run_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_status: Option<SchedulerJobRunStatusDto>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    pub consecutive_failures: u32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobCreateResponse {
+    pub job: JobView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobGetResponse {
+    pub job: JobView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobListResponse {
+    pub jobs: Vec<JobView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobToggleResponse {
+    pub job: JobView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRemoveResponse {
+    pub job_id: Uuid,
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRunView {
+    pub run_id: Uuid,
+    pub job_id: Uuid,
+    pub attempt_no: u32,
+    pub trigger_kind: SchedulerJobTriggerKindDto,
+    #[serde(default)]
+    pub scheduled_for: Option<DateTime<Utc>>,
+    pub started_at: DateTime<Utc>,
+    #[serde(default)]
+    pub finished_at: Option<DateTime<Utc>>,
+    pub status: SchedulerJobRunStatusDto,
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+    #[serde(default)]
+    pub turn_id: Option<Uuid>,
+    #[serde(default)]
+    pub delivery_status: Option<SchedulerJobDeliveryStatusDto>,
+    #[serde(default)]
+    pub error_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRunsResponse {
+    pub runs: Vec<JobRunView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobManualRunResponse {
+    pub job: JobView,
+    pub run: JobRunView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobTickResponse {
+    pub claimed_runs: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEventView {
     pub event_id: Uuid,
     pub event_type: String,

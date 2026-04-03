@@ -5,10 +5,11 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::{Duration as ChronoDuration, Utc};
 use lionclaw::{
     contracts::{
-        ChannelBindRequest, ChannelPeerApproveRequest, PolicyGrantRequest, SessionOpenRequest,
-        SessionTurnRequest, SkillInstallRequest, StreamEventKindDto, TrustTier,
+        ChannelBindRequest, ChannelPeerApproveRequest, JobCreateRequest, PolicyGrantRequest,
+        SessionOpenRequest, SessionTurnRequest, SkillInstallRequest, StreamEventKindDto, TrustTier,
     },
     kernel::{
         policy::Capability,
@@ -159,6 +160,75 @@ async fn invalid_capability_payload_is_denied_by_broker() {
 }
 
 #[tokio::test]
+async fn runtime_cannot_override_kernel_selected_scope() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let (session_id, skill_id) = prepare_session_with_skill(
+        &kernel,
+        "peer-cap-broker-scope",
+        "broker-scope-guard",
+        "Capability broker scope guard skill",
+    )
+    .await;
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "scope guard".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() + ChronoDuration::minutes(10),
+            },
+            prompt_text: "scheduled scope guard".to_string(),
+            skill_ids: vec![skill_id.clone()],
+            allow_capabilities: vec!["fs.read".to_string()],
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create scoped job");
+
+    kernel
+        .register_runtime_adapter(
+            "single-capability",
+            Arc::new(SingleCapabilityRuntimeAdapter::with_scope(
+                Capability::FsRead,
+                format!("job:{}", created.job.job_id),
+                json!({"path": "README.md"}),
+            )),
+        )
+        .await;
+
+    let response = kernel
+        .turn_session(SessionTurnRequest {
+            session_id,
+            user_text: "attempt a scoped capability override".to_string(),
+            runtime_id: Some("single-capability".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete with denied capability result");
+
+    assert!(
+        response.stream_events.iter().any(|event| {
+            event.kind == StreamEventKindDto::Status
+                && event
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("capability:req-1:denied"))
+        }),
+        "scope override should be denied"
+    );
+
+    let details = latest_capability_result(&kernel, session_id).await;
+    assert_eq!(details["allowed"].as_bool(), Some(false));
+    assert_eq!(
+        details["reason"].as_str(),
+        Some("runtime cannot override policy scope")
+    );
+}
+
+#[tokio::test]
 async fn channel_send_capability_uses_session_channel_defaults() {
     let env = TestEnv::new();
     let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
@@ -272,6 +342,7 @@ async fn channel_send_capability_uses_session_channel_defaults() {
 
 struct SingleCapabilityRuntimeAdapter {
     capability: Capability,
+    scope: Option<String>,
     payload: Value,
 }
 
@@ -279,6 +350,15 @@ impl SingleCapabilityRuntimeAdapter {
     fn new(capability: Capability, payload: Value) -> Self {
         Self {
             capability,
+            scope: None,
+            payload,
+        }
+    }
+
+    fn with_scope(capability: Capability, scope: String, payload: Value) -> Self {
+        Self {
+            capability,
+            scope: Some(scope),
             payload,
         }
     }
@@ -319,7 +399,7 @@ impl RuntimeAdapter for SingleCapabilityRuntimeAdapter {
                 request_id: "req-1".to_string(),
                 skill_id: skill_id.clone(),
                 capability: self.capability,
-                scope: None,
+                scope: self.scope.clone(),
                 payload: self.payload.clone(),
             });
         } else {

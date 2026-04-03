@@ -20,7 +20,11 @@ use crate::contracts::{
     ChannelListResponse, ChannelPeerApproveRequest, ChannelPeerBlockRequest,
     ChannelPeerListResponse, ChannelPeerResponse, ChannelPeerView, ChannelStreamAckRequest,
     ChannelStreamAckResponse, ChannelStreamEventView, ChannelStreamPullRequest,
-    ChannelStreamPullResponse, PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeResponse,
+    ChannelStreamPullResponse, JobCreateRequest, JobCreateResponse, JobDeliveryTargetDto,
+    JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest, JobRemoveResponse,
+    JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto, JobTickResponse,
+    JobToggleResponse, JobView, PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeResponse,
+    SchedulerJobDeliveryStatusDto, SchedulerJobRunStatusDto, SchedulerJobTriggerKindDto,
     SessionActionKind, SessionActionRequest, SessionActionResponse, SessionHistoryPolicy,
     SessionHistoryRequest, SessionHistoryResponse, SessionLatestQuery, SessionLatestResponse,
     SessionOpenRequest, SessionOpenResponse, SessionTurnKind, SessionTurnRequest,
@@ -39,6 +43,11 @@ use super::{
     },
     db::Db,
     error::KernelError,
+    jobs::{
+        compute_initial_next_run, JobDeliveryTarget, JobSchedule, JobStore, NewSchedulerJob,
+        SchedulerJobDeliveryStatus, SchedulerJobRecord, SchedulerJobRunRecord,
+        SchedulerJobRunStatus, SchedulerJobTriggerKind,
+    },
     policy::{Capability, PolicyStore, Scope},
     runtime::{
         register_builtin_runtime_adapters, RuntimeAdapter, RuntimeCapabilityRequest,
@@ -47,6 +56,7 @@ use super::{
         BUILTIN_RUNTIME_MOCK,
     },
     runtime_policy::{RuntimeExecutionContext, RuntimeExecutionPolicy, RuntimeExecutionRequest},
+    scheduler::{SchedulerConfig, SchedulerEngine},
     selector::SkillSelector,
     session_transcript::{
         load_repaired_turns, render_turns_for_prompt, turns_to_history_views, TranscriptMode,
@@ -63,6 +73,7 @@ pub struct KernelOptions {
     pub runtime_execution_policy: RuntimeExecutionPolicy,
     pub default_runtime_id: Option<String>,
     pub workspace_root: Option<PathBuf>,
+    pub scheduler: SchedulerConfig,
 }
 
 impl Default for KernelOptions {
@@ -73,6 +84,7 @@ impl Default for KernelOptions {
             runtime_execution_policy: RuntimeExecutionPolicy::default(),
             default_runtime_id: Some(BUILTIN_RUNTIME_MOCK.to_string()),
             workspace_root: None,
+            scheduler: SchedulerConfig::default(),
         }
     }
 }
@@ -84,10 +96,12 @@ pub struct Kernel {
     skills: SkillStore,
     selector: SkillSelector,
     policy: PolicyStore,
+    jobs: JobStore,
     runtime: RuntimeRegistry,
     channel_state: ChannelStateStore,
     audit: AuditLog,
     capability_broker: CapabilityBroker,
+    scheduler: SchedulerEngine,
     channel_stream_notifiers: Arc<RwLock<HashMap<String, Arc<Notify>>>>,
     channel_turn_workers: Arc<RwLock<HashSet<String>>>,
     session_locks: Arc<RwLock<HashMap<Uuid, Arc<Mutex<()>>>>>,
@@ -142,10 +156,12 @@ impl Kernel {
             skills: SkillStore::new(pool.clone()),
             selector: SkillSelector::new(),
             policy: PolicyStore::new(pool.clone()),
+            jobs: JobStore::new(pool.clone()),
             runtime,
             channel_state: ChannelStateStore::new(pool.clone()),
             audit: AuditLog::new(pool),
             capability_broker,
+            scheduler: SchedulerEngine::new(options.scheduler),
             channel_stream_notifiers: Arc::new(RwLock::new(HashMap::new())),
             channel_turn_workers: Arc::new(RwLock::new(HashSet::new())),
             session_locks: Arc::new(RwLock::new(HashMap::new())),
@@ -184,6 +200,10 @@ impl Kernel {
         let _ = self
             .channel_state
             .fail_running_turns("channel turn interrupted by restart")
+            .await;
+        let _ = self
+            .jobs
+            .interrupt_running_runs("scheduled job interrupted by kernel restart")
             .await;
     }
 
@@ -572,6 +592,8 @@ impl Kernel {
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
                     runtime_env_passthrough: None,
+                    selected_skills: SelectedSkillMode::Auto,
+                    default_policy_scope: Scope::Session(session_id),
                     sink,
                     audit_actor: "api".to_string(),
                 }
@@ -589,6 +611,8 @@ impl Kernel {
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
                 runtime_env_passthrough: None,
+                selected_skills: SelectedSkillMode::Auto,
+                default_policy_scope: Scope::Session(session_id),
                 sink,
                 audit_actor: "api".to_string(),
             },
@@ -1395,6 +1419,323 @@ impl Kernel {
         Ok(PolicyRevokeResponse { grant_id, revoked })
     }
 
+    pub async fn create_job(
+        &self,
+        req: JobCreateRequest,
+    ) -> Result<JobCreateResponse, KernelError> {
+        let name = req.name.trim().to_string();
+        if name.is_empty() {
+            return Err(KernelError::BadRequest("job name is required".to_string()));
+        }
+        let runtime_id = req.runtime_id.trim().to_string();
+        if runtime_id.is_empty() {
+            return Err(KernelError::BadRequest(
+                "runtime_id is required".to_string(),
+            ));
+        }
+        let prompt_text = req.prompt_text.trim().to_string();
+        if prompt_text.is_empty() {
+            return Err(KernelError::BadRequest(
+                "prompt_text is required".to_string(),
+            ));
+        }
+        if let Some(delivery) = &req.delivery {
+            if delivery.channel_id.trim().is_empty() || delivery.peer_id.trim().is_empty() {
+                return Err(KernelError::BadRequest(
+                    "delivery channel_id and peer_id are required".to_string(),
+                ));
+            }
+        }
+
+        if self.runtime.get(&runtime_id).await.is_none() {
+            return Err(KernelError::NotFound(format!(
+                "runtime adapter '{}' not found",
+                runtime_id
+            )));
+        }
+
+        let schedule = job_schedule_from_dto(req.schedule)
+            .map_err(|err| KernelError::BadRequest(err.to_string()))?;
+        let retry_attempts = req.retry_attempts.unwrap_or(1);
+        let mut skill_ids = req.skill_ids;
+        skill_ids.sort();
+        skill_ids.dedup();
+        let delivery = req
+            .delivery
+            .map(job_delivery_from_dto)
+            .transpose()
+            .map_err(|err| KernelError::BadRequest(err.to_string()))?;
+
+        for skill_id in &skill_ids {
+            if self.skills.get(skill_id).await.map_err(internal)?.is_none() {
+                return Err(KernelError::NotFound(format!(
+                    "skill '{}' not found",
+                    skill_id
+                )));
+            }
+        }
+
+        let mut allowed_capabilities = Vec::new();
+        for raw in req.allow_capabilities {
+            let capability = Capability::from_str(&raw).map_err(|err| {
+                KernelError::BadRequest(format!("invalid capability '{}': {}", raw, err))
+            })?;
+            if capability == Capability::SchedulerRun {
+                return Err(KernelError::BadRequest(
+                    "scheduler.run cannot be granted to scheduled jobs".to_string(),
+                ));
+            }
+            allowed_capabilities.push(capability);
+        }
+
+        let created = self
+            .jobs
+            .create_job_with_scope_grants(
+                &self.policy,
+                NewSchedulerJob {
+                    name,
+                    runtime_id,
+                    schedule,
+                    prompt_text,
+                    skill_ids,
+                    delivery,
+                    retry_attempts,
+                },
+                &allowed_capabilities,
+            )
+            .await
+            .map_err(internal)?;
+
+        self.audit
+            .append(
+                "job.create",
+                None,
+                Some("api".to_string()),
+                json!({
+                    "job_id": created.job_id,
+                    "name": created.name,
+                    "runtime_id": created.runtime_id,
+                    "skill_ids": created.skill_ids,
+                    "retry_attempts": created.retry_attempts,
+                    "delivery": created.delivery,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+
+        Ok(JobCreateResponse {
+            job: to_job_view(created),
+        })
+    }
+
+    pub async fn list_jobs(&self) -> Result<JobListResponse, KernelError> {
+        let jobs = self
+            .jobs
+            .list_jobs()
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(to_job_view)
+            .collect();
+        Ok(JobListResponse { jobs })
+    }
+
+    pub async fn get_job(&self, job_id: Uuid) -> Result<JobGetResponse, KernelError> {
+        let job = self
+            .jobs
+            .get_job(job_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("job not found".to_string()))?;
+        Ok(JobGetResponse {
+            job: to_job_view(job),
+        })
+    }
+
+    pub async fn pause_job(&self, job_id: Uuid) -> Result<JobToggleResponse, KernelError> {
+        let existing = self
+            .jobs
+            .get_job(job_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("job not found".to_string()))?;
+        let job = self
+            .jobs
+            .pause_job(job_id)
+            .await
+            .map_err(internal)?
+            .unwrap_or(existing);
+        self.audit
+            .append(
+                "job.pause",
+                None,
+                Some("api".to_string()),
+                json!({"job_id": job_id}),
+            )
+            .await
+            .map_err(internal)?;
+        Ok(JobToggleResponse {
+            job: to_job_view(job),
+        })
+    }
+
+    pub async fn resume_job(&self, job_id: Uuid) -> Result<JobToggleResponse, KernelError> {
+        self.jobs
+            .get_job(job_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("job not found".to_string()))?;
+        let job = self
+            .jobs
+            .resume_job(job_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                KernelError::Conflict("job is running and cannot be resumed".to_string())
+            })?;
+        self.audit
+            .append(
+                "job.resume",
+                None,
+                Some("api".to_string()),
+                json!({"job_id": job_id}),
+            )
+            .await
+            .map_err(internal)?;
+        Ok(JobToggleResponse {
+            job: to_job_view(job),
+        })
+    }
+
+    pub async fn remove_job(&self, job_id: Uuid) -> Result<JobRemoveResponse, KernelError> {
+        self.jobs
+            .get_job(job_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("job not found".to_string()))?;
+        let revoked_policy_grants = self
+            .jobs
+            .delete_job_with_scope_cleanup(&self.policy, job_id)
+            .await
+            .map_err(internal)?;
+        let Some(revoked_policy_grants) = revoked_policy_grants else {
+            return Err(KernelError::Conflict(
+                "job is running and cannot be removed".to_string(),
+            ));
+        };
+        self.audit
+            .append(
+                "job.remove",
+                None,
+                Some("api".to_string()),
+                json!({
+                    "job_id": job_id,
+                    "revoked_policy_grants": revoked_policy_grants,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+        Ok(JobRemoveResponse {
+            job_id,
+            removed: true,
+        })
+    }
+
+    pub async fn list_job_runs(&self, req: JobRunsRequest) -> Result<JobRunsResponse, KernelError> {
+        self.jobs
+            .get_job(req.job_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("job not found".to_string()))?;
+        let runs = self
+            .jobs
+            .list_runs(req.job_id, req.limit.unwrap_or(20).clamp(1, 100))
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(to_job_run_view)
+            .collect();
+        Ok(JobRunsResponse { runs })
+    }
+
+    pub async fn run_job_now(
+        &self,
+        req: JobRefRequest,
+    ) -> Result<JobManualRunResponse, KernelError> {
+        let existing = self
+            .jobs
+            .get_job(req.job_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("job not found".to_string()))?;
+        let claimed = self
+            .jobs
+            .claim_manual_run(req.job_id, Utc::now())
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                if existing.running_run_id.is_some() {
+                    KernelError::Conflict("job is already running".to_string())
+                } else {
+                    KernelError::Conflict("job could not be claimed for manual run".to_string())
+                }
+            })?;
+        let (job, run) = self.scheduler.run_claimed_job(self, claimed).await?;
+        Ok(JobManualRunResponse {
+            job: to_job_view(job),
+            run: to_job_run_view(run),
+        })
+    }
+
+    pub async fn scheduler_tick(&self) -> Result<JobTickResponse, KernelError> {
+        self.scheduler.tick(self).await
+    }
+
+    pub async fn run_scheduler_loop(self: Arc<Self>) {
+        let scheduler = self.scheduler.clone();
+        scheduler.run_loop(self).await;
+    }
+
+    pub(super) fn job_store(&self) -> &JobStore {
+        &self.jobs
+    }
+
+    pub(super) fn audit_log(&self) -> &AuditLog {
+        &self.audit
+    }
+
+    pub(super) async fn execute_scheduled_job_turn(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+        job: &SchedulerJobRecord,
+    ) -> Result<SessionTurnResponse, KernelError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("scheduled session not found".to_string()))?;
+        self.execute_session_turn_serialized(
+            session,
+            SessionTurnExecution {
+                turn_id,
+                kind: SessionTurnKind::Normal,
+                display_user_text: job.prompt_text.clone(),
+                prompt_user_text: job.prompt_text.clone(),
+                requested_runtime_id: Some(job.runtime_id.clone()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+                selected_skills: SelectedSkillMode::Explicit(job.skill_ids.clone()),
+                default_policy_scope: Scope::Job(job.job_id),
+                sink: None,
+                audit_actor: "scheduler".to_string(),
+            },
+        )
+        .await
+    }
+
     pub async fn query_audit(
         &self,
         session_id: Option<uuid::Uuid>,
@@ -1488,6 +1829,131 @@ fn to_session_open_response(session: super::sessions::Session) -> SessionOpenRes
         trust_tier: session.trust_tier,
         history_policy: session.history_policy,
         created_at: session.created_at,
+    }
+}
+
+fn to_job_view(job: SchedulerJobRecord) -> JobView {
+    JobView {
+        job_id: job.job_id,
+        name: job.name,
+        enabled: job.enabled,
+        runtime_id: job.runtime_id,
+        schedule: to_job_schedule_dto(job.schedule),
+        prompt_text: job.prompt_text,
+        skill_ids: job.skill_ids,
+        delivery: job.delivery.map(to_job_delivery_dto),
+        retry_attempts: job.retry_attempts,
+        next_run_at: job.next_run_at,
+        running_run_id: job.running_run_id,
+        last_run_at: job.last_run_at,
+        last_status: job.last_status.map(to_job_run_status_dto),
+        last_error: job.last_error,
+        consecutive_failures: job.consecutive_failures,
+        created_at: job.created_at,
+        updated_at: job.updated_at,
+    }
+}
+
+fn to_job_run_view(run: SchedulerJobRunRecord) -> JobRunView {
+    JobRunView {
+        run_id: run.run_id,
+        job_id: run.job_id,
+        attempt_no: run.attempt_no,
+        trigger_kind: match run.trigger_kind {
+            SchedulerJobTriggerKind::Schedule => SchedulerJobTriggerKindDto::Schedule,
+            SchedulerJobTriggerKind::Manual => SchedulerJobTriggerKindDto::Manual,
+            SchedulerJobTriggerKind::Retry => SchedulerJobTriggerKindDto::Retry,
+            SchedulerJobTriggerKind::Recovery => SchedulerJobTriggerKindDto::Recovery,
+        },
+        scheduled_for: run.scheduled_for,
+        started_at: run.started_at,
+        finished_at: run.finished_at,
+        status: to_job_run_status_dto(run.status),
+        session_id: run.session_id,
+        turn_id: run.turn_id,
+        delivery_status: run.delivery_status.map(|status| match status {
+            SchedulerJobDeliveryStatus::Pending => SchedulerJobDeliveryStatusDto::Pending,
+            SchedulerJobDeliveryStatus::Delivered => SchedulerJobDeliveryStatusDto::Delivered,
+            SchedulerJobDeliveryStatus::Failed => SchedulerJobDeliveryStatusDto::Failed,
+            SchedulerJobDeliveryStatus::NotRequested => SchedulerJobDeliveryStatusDto::NotRequested,
+        }),
+        error_text: run.error_text,
+    }
+}
+
+fn to_job_run_status_dto(status: SchedulerJobRunStatus) -> SchedulerJobRunStatusDto {
+    match status {
+        SchedulerJobRunStatus::Running => SchedulerJobRunStatusDto::Running,
+        SchedulerJobRunStatus::Completed => SchedulerJobRunStatusDto::Completed,
+        SchedulerJobRunStatus::Failed => SchedulerJobRunStatusDto::Failed,
+        SchedulerJobRunStatus::DeadLetter => SchedulerJobRunStatusDto::DeadLetter,
+        SchedulerJobRunStatus::Interrupted => SchedulerJobRunStatusDto::Interrupted,
+    }
+}
+
+fn job_schedule_from_dto(dto: JobScheduleDto) -> anyhow::Result<JobSchedule> {
+    let schedule = match dto {
+        JobScheduleDto::Once { run_at } => JobSchedule::Once { run_at },
+        JobScheduleDto::Interval {
+            every_ms,
+            anchor_ms,
+        } => {
+            if every_ms == 0 {
+                return Err(anyhow::anyhow!(
+                    "interval every_ms must be greater than zero"
+                ));
+            }
+            JobSchedule::Interval {
+                every_ms,
+                anchor_ms,
+            }
+        }
+        JobScheduleDto::Cron { expr, timezone } => {
+            if expr.trim().is_empty() {
+                return Err(anyhow::anyhow!("cron expr is required"));
+            }
+            if timezone.trim().is_empty() {
+                return Err(anyhow::anyhow!("cron timezone is required"));
+            }
+            JobSchedule::Cron { expr, timezone }
+        }
+    };
+    compute_initial_next_run(&schedule, Utc::now())?;
+    Ok(schedule)
+}
+
+fn to_job_schedule_dto(schedule: JobSchedule) -> JobScheduleDto {
+    match schedule {
+        JobSchedule::Once { run_at } => JobScheduleDto::Once { run_at },
+        JobSchedule::Interval {
+            every_ms,
+            anchor_ms,
+        } => JobScheduleDto::Interval {
+            every_ms,
+            anchor_ms,
+        },
+        JobSchedule::Cron { expr, timezone } => JobScheduleDto::Cron { expr, timezone },
+    }
+}
+
+fn job_delivery_from_dto(delivery: JobDeliveryTargetDto) -> anyhow::Result<JobDeliveryTarget> {
+    let channel_id = delivery.channel_id.trim().to_string();
+    let peer_id = delivery.peer_id.trim().to_string();
+    if channel_id.is_empty() || peer_id.is_empty() {
+        return Err(anyhow::anyhow!(
+            "delivery channel_id and peer_id are required"
+        ));
+    }
+    Ok(JobDeliveryTarget {
+        channel_id,
+        peer_id,
+    })
+}
+
+fn to_job_delivery_dto(delivery: JobDeliveryTarget) -> JobDeliveryTargetDto {
+    JobDeliveryTargetDto {
+        channel_id: delivery.channel_id,
+        peer_id: delivery.peer_id,
     }
 }
 
@@ -1776,8 +2242,15 @@ struct SessionTurnExecution {
     runtime_working_dir: Option<String>,
     runtime_timeout_ms: Option<u64>,
     runtime_env_passthrough: Option<Vec<String>>,
+    selected_skills: SelectedSkillMode,
+    default_policy_scope: Scope,
     sink: Option<RuntimeEventSink>,
     audit_actor: String,
+}
+
+enum SelectedSkillMode {
+    Auto,
+    Explicit(Vec<String>),
 }
 
 #[derive(Debug)]
@@ -1864,6 +2337,15 @@ struct RuntimeCapabilityFollowupExecution<'a> {
     event_sink: Option<RuntimeEventSink>,
 }
 
+struct RuntimeCapabilityEvaluation<'a> {
+    session_id: Uuid,
+    turn_id: Uuid,
+    session_channel_id: &'a str,
+    session_peer_id: &'a str,
+    default_policy_scope: &'a Scope,
+    allowed_skill_ids: &'a [String],
+}
+
 struct RuntimeTurnAbortExecution<'a> {
     adapter: &'a dyn RuntimeAdapter,
     handle: &'a RuntimeSessionHandle,
@@ -1907,6 +2389,8 @@ impl Kernel {
                 runtime_working_dir: req.runtime_working_dir,
                 runtime_timeout_ms: req.runtime_timeout_ms,
                 runtime_env_passthrough: req.runtime_env_passthrough,
+                selected_skills: SelectedSkillMode::Auto,
+                default_policy_scope: Scope::Session(req.session_id),
                 sink,
                 audit_actor: "api".to_string(),
             },
@@ -1938,19 +2422,23 @@ impl Kernel {
             runtime_working_dir,
             runtime_timeout_ms,
             runtime_env_passthrough,
+            selected_skills,
+            default_policy_scope,
             sink,
             audit_actor,
         } = execution;
         let enabled_skills = self.skills.list_enabled().await.map_err(internal)?;
-        let selected_skill_ids = self.selector.select(&prompt_user_text, &enabled_skills);
-        let session_scope = Scope::Session(session.session_id);
+        let selected_skill_ids = match selected_skills {
+            SelectedSkillMode::Auto => self.selector.select(&prompt_user_text, &enabled_skills),
+            SelectedSkillMode::Explicit(skill_ids) => skill_ids,
+        };
         let any_scope = Scope::Any;
 
         let mut allowed_skills = Vec::new();
         for skill_id in selected_skill_ids {
-            let allowed_for_session = self
+            let allowed_for_scope = self
                 .policy
-                .is_allowed(&skill_id, Capability::SkillUse, &session_scope)
+                .is_allowed(&skill_id, Capability::SkillUse, &default_policy_scope)
                 .await
                 .map_err(internal)?;
             let allowed_globally = self
@@ -1959,7 +2447,7 @@ impl Kernel {
                 .await
                 .map_err(internal)?;
 
-            if allowed_for_session || allowed_globally {
+            if allowed_for_scope || allowed_globally {
                 allowed_skills.push(skill_id);
             }
         }
@@ -2089,11 +2577,14 @@ impl Kernel {
             if !runtime_turn.result.capability_requests.is_empty() {
                 let capability_results = self
                     .evaluate_capability_requests(
-                        session.session_id,
-                        turn_id,
-                        &session.channel_id,
-                        &session.peer_id,
-                        &allowed_skills,
+                        RuntimeCapabilityEvaluation {
+                            session_id: session.session_id,
+                            turn_id,
+                            session_channel_id: &session.channel_id,
+                            session_peer_id: &session.peer_id,
+                            default_policy_scope: &default_policy_scope,
+                            allowed_skill_ids: &allowed_skills,
+                        },
                         runtime_turn.result.capability_requests,
                     )
                     .await?;
@@ -2602,7 +3093,7 @@ impl Kernel {
         format!("{channel_id}:{peer_id}")
     }
 
-    async fn emit_channel_message(
+    pub(super) async fn emit_channel_message(
         &self,
         channel_id: &str,
         peer_id: &str,
@@ -2844,6 +3335,8 @@ impl Kernel {
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
                     runtime_env_passthrough: None,
+                    selected_skills: SelectedSkillMode::Auto,
+                    default_policy_scope: Scope::Session(turn.session_id),
                     sink: None,
                     audit_actor: "kernel".to_string(),
                 },
@@ -3581,14 +4074,17 @@ impl Kernel {
 
     async fn evaluate_capability_requests(
         &self,
-        session_id: uuid::Uuid,
-        turn_id: uuid::Uuid,
-        session_channel_id: &str,
-        session_peer_id: &str,
-        allowed_skill_ids: &[String],
+        evaluation: RuntimeCapabilityEvaluation<'_>,
         requests: Vec<RuntimeCapabilityRequest>,
     ) -> Result<Vec<RuntimeCapabilityResult>, KernelError> {
-        let session_scope = Scope::Session(session_id);
+        let RuntimeCapabilityEvaluation {
+            session_id,
+            turn_id,
+            session_channel_id,
+            session_peer_id,
+            default_policy_scope,
+            allowed_skill_ids,
+        } = evaluation;
         let any_scope = Scope::Any;
 
         let mut results = Vec::with_capacity(requests.len());
@@ -3600,9 +4096,9 @@ impl Kernel {
             let requested_scope_raw = request
                 .scope
                 .clone()
-                .unwrap_or_else(|| session_scope.as_str());
+                .unwrap_or_else(|| default_policy_scope.as_str());
 
-            let mut decision_scope = session_scope.clone();
+            let mut decision_scope = default_policy_scope.clone();
             let mut policy_allowed = false;
             let mut allowed = false;
             let mut executed = false;
@@ -3617,14 +4113,18 @@ impl Kernel {
                 match request.scope.as_deref() {
                     Some(raw_scope) => match Scope::from_str(raw_scope) {
                         Ok(parsed) => {
-                            decision_scope = parsed;
+                            if parsed == *default_policy_scope {
+                                decision_scope = parsed;
+                            } else {
+                                reason = Some("runtime cannot override policy scope".to_string());
+                            }
                         }
                         Err(err) => {
                             reason = Some(format!("invalid scope from runtime: {}", err));
                         }
                     },
                     None => {
-                        decision_scope = session_scope.clone();
+                        decision_scope = default_policy_scope.clone();
                     }
                 }
             }

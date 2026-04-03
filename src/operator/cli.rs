@@ -1,21 +1,25 @@
 use std::str::FromStr;
 
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use clap::{Args, Parser, Subcommand};
+use cron::Schedule;
 
 use crate::{
-    contracts::TrustTier,
+    contracts::{JobCreateRequest, JobRefRequest, JobRunsRequest, JobScheduleDto, TrustTier},
     home::LionClawHome,
+    kernel::jobs::normalize_cron_expression,
     operator::{
         attach::attach_channel,
         config::{
             derive_skill_alias, normalize_executable, ChannelLaunchMode, OperatorConfig,
             RuntimeProfileConfig,
         },
+        lockfile::OperatorLockfile,
         reconcile::{
-            add_channel, add_skill, apply, down, logs, onboard, pairing_approve, pairing_block,
-            pairing_list, remove_channel, remove_skill, resolve_stack_binaries, status, up,
-            OnboardBindSelection,
+            add_channel, add_skill, apply, down, logs, onboard, open_kernel, pairing_approve,
+            pairing_block, pairing_list, remove_channel, remove_skill, resolve_stack_binaries,
+            status, up, OnboardBindSelection,
         },
         run::run_local,
         runtime::resolve_runtime_id,
@@ -51,6 +55,10 @@ enum Command {
     Channel {
         #[command(subcommand)]
         command: ChannelCommand,
+    },
+    Job {
+        #[command(subcommand)]
+        command: JobCommand,
     },
 }
 
@@ -196,6 +204,19 @@ enum ChannelPairingCommand {
     Block(PairingBlockArgs),
 }
 
+#[derive(Debug, Subcommand)]
+enum JobCommand {
+    Add(Box<JobAddArgs>),
+    Ls,
+    Show(JobRefArgs),
+    Pause(JobRefArgs),
+    Resume(JobRefArgs),
+    Run(JobRefArgs),
+    Rm(JobRefArgs),
+    Runs(JobRunsArgs),
+    Tick,
+}
+
 #[derive(Debug, Args)]
 struct PairingListArgs {
     #[arg(long)]
@@ -215,6 +236,43 @@ struct PairingApproveArgs {
 struct PairingBlockArgs {
     channel_id: String,
     peer_id: String,
+}
+
+#[derive(Debug, Args)]
+struct JobAddArgs {
+    name: String,
+    #[arg(long)]
+    schedule: String,
+    #[arg(long)]
+    tz: Option<String>,
+    #[arg(long)]
+    prompt: Option<String>,
+    #[arg(long = "prompt-file")]
+    prompt_file: Option<String>,
+    #[arg(long)]
+    runtime: Option<String>,
+    #[arg(long = "skill")]
+    skills: Vec<String>,
+    #[arg(long = "allow")]
+    allow_capabilities: Vec<String>,
+    #[arg(long = "deliver-channel")]
+    deliver_channel: Option<String>,
+    #[arg(long = "deliver-peer")]
+    deliver_peer: Option<String>,
+    #[arg(long = "retry-attempts")]
+    retry_attempts: Option<u32>,
+}
+
+#[derive(Debug, Args)]
+struct JobRefArgs {
+    job_id: String,
+}
+
+#[derive(Debug, Args)]
+struct JobRunsArgs {
+    job_id: String,
+    #[arg(long, default_value_t = 20)]
+    limit: usize,
 }
 
 pub async fn run() -> Result<()> {
@@ -426,6 +484,160 @@ pub async fn run() -> Result<()> {
                 }
             },
         },
+        Command::Job { command } => {
+            let applied = apply(&home).await?;
+            let kernel = open_kernel(&home, &applied.config, None).await?;
+            match command {
+                JobCommand::Add(args) => {
+                    let args = *args;
+                    let runtime_id = resolve_runtime_id(&applied.config, args.runtime.as_deref())?;
+                    let prompt_text = load_job_prompt(args.prompt, args.prompt_file).await?;
+                    let schedule = parse_job_schedule_spec(&args.schedule, args.tz.as_deref())?;
+                    let delivery = match (args.deliver_channel, args.deliver_peer) {
+                        (None, None) => None,
+                        (Some(channel_id), Some(peer_id)) => {
+                            Some(crate::contracts::JobDeliveryTargetDto {
+                                channel_id,
+                                peer_id,
+                            })
+                        }
+                        _ => {
+                            return Err(anyhow!(
+                                "--deliver-channel and --deliver-peer must be provided together"
+                            ));
+                        }
+                    };
+                    let skill_ids = resolve_job_skill_ids(&applied.lockfile, &args.skills)?;
+                    let response = kernel
+                        .create_job(JobCreateRequest {
+                            name: args.name,
+                            runtime_id,
+                            schedule,
+                            prompt_text,
+                            skill_ids,
+                            allow_capabilities: args.allow_capabilities,
+                            delivery,
+                            retry_attempts: args.retry_attempts,
+                        })
+                        .await?;
+                    println!(
+                        "created job {} next_run_at={}",
+                        response.job.job_id,
+                        response
+                            .job
+                            .next_run_at
+                            .map(|value| value.to_rfc3339())
+                            .unwrap_or_else(|| "-".to_string())
+                    );
+                }
+                JobCommand::Ls => {
+                    for job in kernel.list_jobs().await?.jobs {
+                        println!(
+                            "job={} enabled={} runtime={} next_run_at={} status={}",
+                            job.job_id,
+                            job.enabled,
+                            job.runtime_id,
+                            job.next_run_at
+                                .map(|value| value.to_rfc3339())
+                                .unwrap_or_else(|| "-".to_string()),
+                            job.last_status
+                                .map(|value| value.as_str().to_string())
+                                .unwrap_or_else(|| "-".to_string()),
+                        );
+                    }
+                }
+                JobCommand::Show(args) => {
+                    let job_id = parse_job_id(&args.job_id)?;
+                    let job = kernel.get_job(job_id).await?.job;
+                    println!("job={}", job.job_id);
+                    println!("name={}", job.name);
+                    println!("enabled={}", job.enabled);
+                    println!("runtime={}", job.runtime_id);
+                    println!(
+                        "next_run_at={}",
+                        job.next_run_at
+                            .map(|value| value.to_rfc3339())
+                            .unwrap_or_else(|| "-".to_string())
+                    );
+                    println!(
+                        "delivery={}",
+                        job.delivery
+                            .map(|value| format!("{}:{}", value.channel_id, value.peer_id))
+                            .unwrap_or_else(|| "-".to_string())
+                    );
+                }
+                JobCommand::Pause(args) => {
+                    let job_id = parse_job_id(&args.job_id)?;
+                    let response = kernel.pause_job(job_id).await?;
+                    println!("paused {}", response.job.job_id);
+                }
+                JobCommand::Resume(args) => {
+                    let job_id = parse_job_id(&args.job_id)?;
+                    let response = kernel.resume_job(job_id).await?;
+                    println!(
+                        "resumed {} next_run_at={}",
+                        response.job.job_id,
+                        response
+                            .job
+                            .next_run_at
+                            .map(|value| value.to_rfc3339())
+                            .unwrap_or_else(|| "-".to_string())
+                    );
+                }
+                JobCommand::Run(args) => {
+                    let job_id = parse_job_id(&args.job_id)?;
+                    let response = kernel.run_job_now(JobRefRequest { job_id }).await?;
+                    println!(
+                        "ran {} run={} status={:?}",
+                        response.job.job_id, response.run.run_id, response.run.status
+                    );
+                }
+                JobCommand::Rm(args) => {
+                    let job_id = parse_job_id(&args.job_id)?;
+                    let response = kernel.remove_job(job_id).await?;
+                    println!(
+                        "{} {}",
+                        if response.removed {
+                            "removed"
+                        } else {
+                            "left unchanged"
+                        },
+                        response.job_id
+                    );
+                }
+                JobCommand::Runs(args) => {
+                    let job_id = parse_job_id(&args.job_id)?;
+                    for run in kernel
+                        .list_job_runs(JobRunsRequest {
+                            job_id,
+                            limit: Some(args.limit),
+                        })
+                        .await?
+                        .runs
+                    {
+                        println!(
+                            "run={} attempt={} trigger={:?} status={:?} started_at={} session={} turn={} error={}",
+                            run.run_id,
+                            run.attempt_no,
+                            run.trigger_kind,
+                            run.status,
+                            run.started_at.to_rfc3339(),
+                            run.session_id
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "-".to_string()),
+                            run.turn_id
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "-".to_string()),
+                            run.error_text.unwrap_or_else(|| "-".to_string()),
+                        );
+                    }
+                }
+                JobCommand::Tick => {
+                    let response = kernel.scheduler_tick().await?;
+                    println!("claimed {} scheduled runs", response.claimed_runs);
+                }
+            }
+        }
     }
 
     Ok(())
@@ -440,6 +652,112 @@ fn parse_onboard_bind(raw: &str) -> Result<OnboardBindSelection> {
         return Ok(OnboardBindSelection::Auto);
     }
     Ok(OnboardBindSelection::Explicit(bind.to_string()))
+}
+
+async fn load_job_prompt(prompt: Option<String>, prompt_file: Option<String>) -> Result<String> {
+    match (prompt, prompt_file) {
+        (Some(text), None) => {
+            let trimmed = text.trim().to_string();
+            if trimmed.is_empty() {
+                return Err(anyhow!("--prompt cannot be empty"));
+            }
+            Ok(trimmed)
+        }
+        (None, Some(path)) => {
+            let content = tokio::fs::read_to_string(&path).await?;
+            let trimmed = content.trim().to_string();
+            if trimmed.is_empty() {
+                return Err(anyhow!("--prompt-file cannot be empty"));
+            }
+            Ok(trimmed)
+        }
+        (Some(_), Some(_)) => Err(anyhow!("use either --prompt or --prompt-file, not both")),
+        (None, None) => Err(anyhow!("either --prompt or --prompt-file is required")),
+    }
+}
+
+fn resolve_job_skill_ids(lockfile: &OperatorLockfile, requested: &[String]) -> Result<Vec<String>> {
+    let mut resolved = Vec::new();
+    for raw in requested {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("--skill cannot be empty"));
+        }
+        let skill_id = lockfile
+            .find_skill(trimmed)
+            .map(|skill| skill.skill_id.clone())
+            .unwrap_or_else(|| trimmed.to_string());
+        if !resolved.iter().any(|value| value == &skill_id) {
+            resolved.push(skill_id);
+        }
+    }
+    Ok(resolved)
+}
+
+fn parse_job_id(raw: &str) -> Result<uuid::Uuid> {
+    uuid::Uuid::parse_str(raw.trim()).map_err(|_| anyhow!("invalid job id '{}'", raw))
+}
+
+fn parse_job_schedule_spec(raw: &str, timezone: Option<&str>) -> Result<JobScheduleDto> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(anyhow!("--schedule requires a value"));
+    }
+
+    if let Some(rest) = value.strip_prefix("every ") {
+        let every_ms = parse_job_duration_ms(rest)?;
+        return Ok(JobScheduleDto::Interval {
+            every_ms,
+            anchor_ms: Utc::now().timestamp_millis(),
+        });
+    }
+
+    if let Ok(delay_ms) = parse_job_duration_ms(value) {
+        let run_at =
+            Utc::now() + ChronoDuration::milliseconds(i64::try_from(delay_ms).unwrap_or(i64::MAX));
+        return Ok(JobScheduleDto::Once { run_at });
+    }
+
+    if value.contains('T') || value.chars().take(4).all(|ch| ch.is_ascii_digit()) {
+        if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+            return Ok(JobScheduleDto::Once {
+                run_at: parsed.with_timezone(&Utc),
+            });
+        }
+        if let Ok(parsed) = NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S") {
+            return Ok(JobScheduleDto::Once {
+                run_at: DateTime::<Utc>::from_naive_utc_and_offset(parsed, Utc),
+            });
+        }
+    }
+
+    Schedule::from_str(&normalize_cron_expression(value)?)?;
+    Ok(JobScheduleDto::Cron {
+        expr: value.to_string(),
+        timezone: timezone.unwrap_or("UTC").to_string(),
+    })
+}
+
+fn parse_job_duration_ms(raw: &str) -> Result<u64> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    let split_at = trimmed
+        .find(|ch: char| !ch.is_ascii_digit())
+        .ok_or_else(|| anyhow!("invalid duration '{}'", raw))?;
+    let (number, unit) = trimmed.split_at(split_at);
+    let value = number
+        .parse::<u64>()
+        .map_err(|_| anyhow!("invalid duration '{}'", raw))?;
+    let multiplier = match unit {
+        "ms" => 1_u64,
+        "s" | "sec" | "secs" | "second" | "seconds" => 1_000,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60_000,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600_000,
+        "d" | "day" | "days" => 86_400_000,
+        _ => return Err(anyhow!("invalid duration unit '{}'", raw)),
+    };
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow!("duration '{}' is too large", raw))
 }
 
 fn build_runtime_profile(
@@ -495,4 +813,83 @@ fn reject_codex_only_flags(args: &RuntimeAddArgs) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn parses_duration_schedule_as_once() {
+        let before = Utc::now();
+        let schedule = parse_job_schedule_spec("30m", None).expect("parse once schedule");
+        let after = Utc::now();
+
+        let JobScheduleDto::Once { run_at } = schedule else {
+            panic!("expected once schedule");
+        };
+        assert!(run_at >= before + ChronoDuration::minutes(30));
+        assert!(run_at <= after + ChronoDuration::minutes(30) + ChronoDuration::seconds(1));
+    }
+
+    #[test]
+    fn parses_interval_schedule() {
+        let schedule = parse_job_schedule_spec("every 30m", None).expect("parse interval schedule");
+
+        let JobScheduleDto::Interval {
+            every_ms,
+            anchor_ms,
+        } = schedule
+        else {
+            panic!("expected interval schedule");
+        };
+        assert_eq!(every_ms, 30 * 60 * 1000);
+        assert!(anchor_ms > 0);
+    }
+
+    #[test]
+    fn parses_cron_schedule_with_timezone() {
+        let schedule = parse_job_schedule_spec("*/5 * * * *", Some("America/New_York"))
+            .expect("parse cron schedule");
+
+        assert!(matches!(
+            schedule,
+            JobScheduleDto::Cron {
+                expr,
+                timezone
+            } if expr == "*/5 * * * *" && timezone == "America/New_York"
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_schedule() {
+        assert!(parse_job_schedule_spec("not-a-schedule", None).is_err());
+    }
+
+    #[tokio::test]
+    async fn load_job_prompt_rejects_both_sources() {
+        let file = NamedTempFile::new().expect("create prompt file");
+        let err = load_job_prompt(
+            Some("inline".to_string()),
+            Some(file.path().display().to_string()),
+        )
+        .await
+        .expect_err("expected prompt source conflict");
+
+        assert!(err.to_string().contains("either --prompt or --prompt-file"));
+    }
+
+    #[tokio::test]
+    async fn load_job_prompt_reads_prompt_file() {
+        let file = NamedTempFile::new().expect("create prompt file");
+        std::fs::write(file.path(), "  repo status brief  ").expect("write prompt file");
+
+        let prompt = load_job_prompt(None, Some(file.path().display().to_string()))
+            .await
+            .expect("load prompt file");
+
+        assert_eq!(prompt, "repo status brief");
+    }
 }

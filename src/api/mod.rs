@@ -17,11 +17,14 @@ use crate::{
         ChannelPeerApproveRequest, ChannelPeerBlockRequest, ChannelPeerListParams,
         ChannelPeerListResponse, ChannelPeerResponse, ChannelStreamAckRequest,
         ChannelStreamAckResponse, ChannelStreamPullRequest, ChannelStreamPullResponse,
-        DaemonInfoResponse, PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeRequest,
-        PolicyRevokeResponse, SessionActionRequest, SessionActionResponse, SessionHistoryRequest,
-        SessionHistoryResponse, SessionLatestQuery, SessionLatestResponse, SessionOpenRequest,
-        SessionOpenResponse, SessionTurnRequest, SessionTurnResponse, SkillInstallRequest,
-        SkillInstallResponse, SkillListResponse, SkillToggleRequest, SkillToggleResponse,
+        DaemonInfoResponse, JobCreateRequest, JobCreateResponse, JobGetResponse, JobListResponse,
+        JobManualRunResponse, JobRefRequest, JobRemoveResponse, JobRunsRequest, JobRunsResponse,
+        JobTickResponse, JobToggleResponse, PolicyGrantRequest, PolicyGrantResponse,
+        PolicyRevokeRequest, PolicyRevokeResponse, SessionActionRequest, SessionActionResponse,
+        SessionHistoryRequest, SessionHistoryResponse, SessionLatestQuery, SessionLatestResponse,
+        SessionOpenRequest, SessionOpenResponse, SessionTurnRequest, SessionTurnResponse,
+        SkillInstallRequest, SkillInstallResponse, SkillListResponse, SkillToggleRequest,
+        SkillToggleResponse,
     },
     kernel::{Kernel, KernelError},
 };
@@ -60,6 +63,15 @@ pub fn build_router(kernel: Arc<Kernel>, daemon_info: DaemonInfoResponse) -> Rou
         .route("/v0/channels/stream/ack", post(channel_stream_ack))
         .route("/v0/policy/grant", post(grant_policy))
         .route("/v0/policy/revoke", post(revoke_policy))
+        .route("/v0/jobs/create", post(create_job))
+        .route("/v0/jobs/list", get(list_jobs))
+        .route("/v0/jobs/get", post(get_job))
+        .route("/v0/jobs/pause", post(pause_job))
+        .route("/v0/jobs/resume", post(resume_job))
+        .route("/v0/jobs/run", post(run_job))
+        .route("/v0/jobs/remove", post(remove_job))
+        .route("/v0/jobs/runs", post(list_job_runs))
+        .route("/v0/jobs/tick", post(tick_jobs))
         .route("/v0/audit/query", get(query_audit))
         .with_state(state)
 }
@@ -217,6 +229,72 @@ async fn revoke_policy(
     Json(req): Json<PolicyRevokeRequest>,
 ) -> Result<Json<PolicyRevokeResponse>, ApiError> {
     let result = state.kernel.revoke_policy(req.grant_id).await?;
+    Ok(Json(result))
+}
+
+async fn create_job(
+    State(state): State<ApiState>,
+    Json(req): Json<JobCreateRequest>,
+) -> Result<Json<JobCreateResponse>, ApiError> {
+    let result = state.kernel.create_job(req).await?;
+    Ok(Json(result))
+}
+
+async fn list_jobs(State(state): State<ApiState>) -> Result<Json<JobListResponse>, ApiError> {
+    let result = state.kernel.list_jobs().await?;
+    Ok(Json(result))
+}
+
+async fn get_job(
+    State(state): State<ApiState>,
+    Json(req): Json<JobRefRequest>,
+) -> Result<Json<JobGetResponse>, ApiError> {
+    let result = state.kernel.get_job(req.job_id).await?;
+    Ok(Json(result))
+}
+
+async fn pause_job(
+    State(state): State<ApiState>,
+    Json(req): Json<JobRefRequest>,
+) -> Result<Json<JobToggleResponse>, ApiError> {
+    let result = state.kernel.pause_job(req.job_id).await?;
+    Ok(Json(result))
+}
+
+async fn resume_job(
+    State(state): State<ApiState>,
+    Json(req): Json<JobRefRequest>,
+) -> Result<Json<JobToggleResponse>, ApiError> {
+    let result = state.kernel.resume_job(req.job_id).await?;
+    Ok(Json(result))
+}
+
+async fn run_job(
+    State(state): State<ApiState>,
+    Json(req): Json<JobRefRequest>,
+) -> Result<Json<JobManualRunResponse>, ApiError> {
+    let result = state.kernel.run_job_now(req).await?;
+    Ok(Json(result))
+}
+
+async fn remove_job(
+    State(state): State<ApiState>,
+    Json(req): Json<JobRefRequest>,
+) -> Result<Json<JobRemoveResponse>, ApiError> {
+    let result = state.kernel.remove_job(req.job_id).await?;
+    Ok(Json(result))
+}
+
+async fn list_job_runs(
+    State(state): State<ApiState>,
+    Json(req): Json<JobRunsRequest>,
+) -> Result<Json<JobRunsResponse>, ApiError> {
+    let result = state.kernel.list_job_runs(req).await?;
+    Ok(Json(result))
+}
+
+async fn tick_jobs(State(state): State<ApiState>) -> Result<Json<JobTickResponse>, ApiError> {
+    let result = state.kernel.scheduler_tick().await?;
     Ok(Json(result))
 }
 

@@ -53,10 +53,10 @@ To claim "NanoClaw-level runnable", LionClaw must support all items below:
 
 Goal: replace skeleton persistence and stringly policy with durable, typed controls.
 
-- [ ] Add SQLite persistence layer for sessions, turns, skills, policy grants, and audit events.
-- [ ] Add migrations and startup schema checks.
-- [ ] Replace in-memory stores with repository traits backed by SQLite.
-- [ ] Add typed capability enum and typed scope model (remove free-form strings where possible).
+- [x] Add SQLite persistence layer for sessions, turns, skills, policy grants, and audit events.
+- [x] Add migrations and startup schema checks.
+- [x] Replace in-memory stores with repository traits backed by SQLite.
+- [x] Add typed capability enum and typed scope model (remove free-form strings where possible).
 - [ ] Enforce policy checks for all privileged operations, not only `skill.use`.
 - [ ] Add policy expiration cleanup and deterministic evaluation ordering.
 - [ ] Add idempotent request handling for install/enable/disable/grant/revoke endpoints.
@@ -131,14 +131,14 @@ Goal: deliver practical assistant workflows while preserving core minimalism.
 - [ ] Add inbound message trust classification (`main`, `trusted`, `untrusted`).
 - [ ] Add pairing/allowlist flow for unknown inbound peers.
 - [ ] Add outbound policy checks (`channel.send`) with human approval hooks.
-- [ ] Add scheduler service for recurring jobs with per-job capability scope.
-- [ ] Add retries, dead-letter storage, and job audit trail.
-- [ ] Add local web or CLI controls for channel and scheduler operations.
+- [x] Add scheduler service for recurring jobs with per-job capability scope.
+- [x] Add retries, dead-letter storage, and job audit trail.
+- [x] Add CLI controls for channel and scheduler operations.
 
 Exit criteria:
 - [ ] End-to-end flow: inbound message -> selected skills -> runtime -> outbound reply.
 - [ ] Untrusted channel traffic is isolated by stricter policy profile.
-- [ ] Scheduler jobs cannot escalate privileges beyond explicit grants.
+- [x] Scheduler jobs cannot escalate privileges beyond explicit grants.
 
 ## P6 - Sandbox, Secrets, and Egress Hardening
 
