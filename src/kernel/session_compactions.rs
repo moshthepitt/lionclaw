@@ -4,7 +4,7 @@ use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::kernel::db::{ms_to_datetime, now_ms};
-use crate::kernel::session_transcript::CompactionSummaryState;
+use crate::kernel::session_transcript::{render_compaction_summary, CompactionSummaryState};
 
 #[derive(Debug, Clone)]
 pub struct SessionCompactionRecord {
@@ -142,6 +142,36 @@ impl SessionCompactionStore {
         .context("failed to list session compactions")?;
 
         rows.into_iter().map(map_compaction_row).collect()
+    }
+
+    pub async fn replace_latest_summary_state(
+        &self,
+        session_id: Uuid,
+        summary_state: &CompactionSummaryState,
+    ) -> Result<Option<SessionCompactionRecord>> {
+        let Some(record) = self.latest(session_id).await? else {
+            return Ok(None);
+        };
+        let summary_text = render_compaction_summary(
+            record.start_sequence_no,
+            record.through_sequence_no,
+            summary_state,
+        );
+        let summary_state_json = serde_json::to_string(summary_state)
+            .context("failed to serialize updated session compaction summary state")?;
+        sqlx::query(
+            "UPDATE session_compactions \
+             SET summary_text = ?2, summary_state_json = ?3 \
+             WHERE compaction_id = ?1",
+        )
+        .bind(record.compaction_id.to_string())
+        .bind(summary_text)
+        .bind(summary_state_json)
+        .execute(&self.pool)
+        .await
+        .context("failed to update latest session compaction summary state")?;
+
+        self.get(record.compaction_id).await
     }
 }
 

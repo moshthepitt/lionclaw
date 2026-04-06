@@ -69,10 +69,11 @@ use super::{
     selector::SkillSelector,
     session_compactions::SessionCompactionStore,
     session_transcript::{
-        build_compaction_prompt, load_repaired_turns, merge_compaction_summary_state,
-        merge_compaction_summary_updates, parse_compaction_summary_state,
-        render_compaction_summary, render_turns_for_prompt, turns_to_history_views,
-        CompactionSummaryState, TranscriptMode, COMPACTION_RAW_KEEP,
+        build_compaction_prompt, dismiss_memory_proposal_in_summary_state, load_repaired_turns,
+        merge_compaction_summary_state, merge_compaction_summary_updates,
+        parse_compaction_summary_state, render_compaction_summary, render_turns_for_prompt,
+        resolve_open_loop_in_summary_state, turns_to_history_views, CompactionSummaryState,
+        TranscriptMode, COMPACTION_RAW_KEEP,
     },
     session_turns::{NewSessionTurn, SessionTurnCompletion, SessionTurnRecord, SessionTurnStore},
     sessions::SessionStore,
@@ -2439,10 +2440,19 @@ impl Kernel {
             .continuity
             .as_ref()
             .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let metadata = layout
+            .memory_proposal_metadata(&req.relative_path)
+            .await
+            .map_err(internal)?;
         let archived = layout
             .merge_memory_proposal(&req.relative_path)
             .await
             .map_err(internal)?;
+        self.remove_memory_proposal_from_session_compaction(
+            metadata.source.as_deref(),
+            &metadata.title,
+        )
+        .await?;
         let archived_path = self.relative_workspace_path(&archived);
         let memory_path = self.relative_workspace_path(&layout.memory_path());
         self.refresh_active_continuity_best_effort(
@@ -2482,10 +2492,19 @@ impl Kernel {
             .continuity
             .as_ref()
             .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let metadata = layout
+            .memory_proposal_metadata(&req.relative_path)
+            .await
+            .map_err(internal)?;
         let archived = layout
             .reject_memory_proposal(&req.relative_path)
             .await
             .map_err(internal)?;
+        self.remove_memory_proposal_from_session_compaction(
+            metadata.source.as_deref(),
+            &metadata.title,
+        )
+        .await?;
         let archived_path = self.relative_workspace_path(&archived);
         self.refresh_active_continuity_best_effort(
             "continuity.memory_proposal.refresh_failed",
@@ -2539,10 +2558,16 @@ impl Kernel {
             .continuity
             .as_ref()
             .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let metadata = layout
+            .open_loop_metadata(&req.relative_path)
+            .await
+            .map_err(internal)?;
         let archived = layout
             .resolve_open_loop(&req.relative_path)
             .await
             .map_err(internal)?;
+        self.remove_open_loop_from_session_compaction(metadata.source.as_deref(), &metadata.title)
+            .await?;
         let archived_path = self.relative_workspace_path(&archived);
         self.refresh_active_continuity_best_effort(
             "continuity.open_loop.refresh_failed",
@@ -2558,6 +2583,58 @@ impl Kernel {
         )
         .await;
         Ok(ContinuityOpenLoopActionResponse { archived_path })
+    }
+
+    async fn remove_memory_proposal_from_session_compaction(
+        &self,
+        source: Option<&str>,
+        title: &str,
+    ) -> Result<(), KernelError> {
+        let Some(session_id) = parse_session_source(source) else {
+            return Ok(());
+        };
+        let Some(mut record) = self
+            .session_compactions
+            .latest(session_id)
+            .await
+            .map_err(internal)?
+        else {
+            return Ok(());
+        };
+        if !dismiss_memory_proposal_in_summary_state(&mut record.summary_state, title) {
+            return Ok(());
+        }
+        self.session_compactions
+            .replace_latest_summary_state(session_id, &record.summary_state)
+            .await
+            .map_err(internal)?;
+        Ok(())
+    }
+
+    async fn remove_open_loop_from_session_compaction(
+        &self,
+        source: Option<&str>,
+        title: &str,
+    ) -> Result<(), KernelError> {
+        let Some(session_id) = parse_session_source(source) else {
+            return Ok(());
+        };
+        let Some(mut record) = self
+            .session_compactions
+            .latest(session_id)
+            .await
+            .map_err(internal)?
+        else {
+            return Ok(());
+        };
+        if !resolve_open_loop_in_summary_state(&mut record.summary_state, title) {
+            return Ok(());
+        }
+        self.session_compactions
+            .replace_latest_summary_state(session_id, &record.summary_state)
+            .await
+            .map_err(internal)?;
+        Ok(())
     }
 }
 
@@ -2648,6 +2725,12 @@ fn to_continuity_artifact_view(
         title: artifact.title,
         relative_path: artifact.relative_path,
     }
+}
+
+fn parse_session_source(source: Option<&str>) -> Option<Uuid> {
+    let raw = source?.trim();
+    let session_id = raw.strip_prefix("session:")?;
+    Uuid::parse_str(session_id).ok()
 }
 
 fn to_continuity_memory_proposal_view(

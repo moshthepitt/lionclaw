@@ -687,6 +687,168 @@ async fn continuity_mutations_are_audited() {
     assert_eq!(resolved.events[0].actor.as_deref(), Some("api"));
 }
 
+#[tokio::test]
+async fn merged_and_resolved_items_do_not_reappear_after_later_compaction() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "capture",
+            Arc::new(CapturePromptAdapter {
+                prompts,
+                capability_results: Arc::new(Mutex::new(Vec::new())),
+                request_fs_read: false,
+                allow_hidden_compaction: true,
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+
+    let session = open_local_session(&kernel, "continuity-resurrection-peer").await;
+    for index in 0..18 {
+        kernel
+            .turn_session(SessionTurnRequest {
+                session_id: session.session_id,
+                user_text: format!("seed turn {}", index),
+                runtime_id: Some("capture".to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await
+            .expect("seed turn succeeds");
+    }
+
+    let proposals = kernel
+        .list_continuity_memory_proposals()
+        .await
+        .expect("list proposals");
+    assert_eq!(proposals.proposals.len(), 1);
+    let loops = kernel
+        .list_continuity_open_loops()
+        .await
+        .expect("list loops");
+    assert_eq!(loops.loops.len(), 1);
+
+    kernel
+        .merge_continuity_memory_proposal(ContinuityPathRequest {
+            relative_path: proposals.proposals[0].relative_path.clone(),
+        })
+        .await
+        .expect("merge proposal");
+    kernel
+        .resolve_continuity_open_loop(ContinuityPathRequest {
+            relative_path: loops.loops[0].relative_path.clone(),
+        })
+        .await
+        .expect("resolve loop");
+
+    for index in 18..36 {
+        kernel
+            .turn_session(SessionTurnRequest {
+                session_id: session.session_id,
+                user_text: format!("follow-up turn {}", index),
+                runtime_id: Some("capture".to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await
+            .expect("follow-up turn succeeds");
+    }
+
+    let proposals = kernel
+        .list_continuity_memory_proposals()
+        .await
+        .expect("list proposals after follow-up");
+    assert!(proposals.proposals.is_empty());
+
+    let loops = kernel
+        .list_continuity_open_loops()
+        .await
+        .expect("list loops after follow-up");
+    assert!(loops.loops.is_empty());
+
+    let active = tokio::fs::read_to_string(env.workspace_root().join("continuity/ACTIVE.md"))
+        .await
+        .expect("read active");
+    assert!(!active.contains("Continuity Product Preferences"));
+    assert!(!active.contains("Follow up on continuity surface"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn continuity_get_rejects_symlink_escape_outside_canonical_roots() {
+    use std::os::unix::fs::symlink;
+
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let outside = env.temp_dir.path().join("outside-secret.txt");
+    std::fs::write(&outside, "secret").expect("write outside file");
+
+    std::fs::create_dir_all(env.workspace_root().join("continuity/artifacts"))
+        .expect("create artifacts dir");
+    let escaped = env
+        .workspace_root()
+        .join("continuity/artifacts/escape-secret.md");
+    symlink(&outside, &escaped).expect("create symlink");
+
+    let err = kernel
+        .continuity_get(ContinuityPathRequest {
+            relative_path: "continuity/artifacts/escape-secret.md".to_string(),
+        })
+        .await
+        .expect_err("symlink escape should fail");
+    let message = err.to_string();
+    assert!(
+        message.contains("outside canonical continuity files"),
+        "unexpected error: {message}"
+    );
+
+    let memory_path = env.workspace_root().join("MEMORY.md");
+    std::fs::remove_file(&memory_path).expect("remove memory file");
+    symlink(&outside, &memory_path).expect("link memory file");
+
+    let err = kernel
+        .continuity_get(ContinuityPathRequest {
+            relative_path: "MEMORY.md".to_string(),
+        })
+        .await
+        .expect_err("memory symlink escape should fail");
+    let message = err.to_string();
+    assert!(
+        message.contains("outside canonical continuity files"),
+        "unexpected error: {message}"
+    );
+}
+
 async fn install_enabled_skill(kernel: &Kernel, name: &str) -> String {
     let skill = kernel
         .install_skill(SkillInstallRequest {

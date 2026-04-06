@@ -103,6 +103,12 @@ pub struct ContinuityMemoryProposal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuityItemMetadata {
+    pub title: String,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContinuitySearchMatch {
     pub relative_path: String,
     pub title: String,
@@ -620,10 +626,38 @@ impl ContinuityLayout {
     }
 
     pub async fn read_relative(&self, relative_path: &str) -> Result<String> {
-        let path = self.resolve_relative_file(relative_path)?;
+        let path = self.resolve_canonical_read_path(relative_path)?;
         tokio::fs::read_to_string(&path)
             .await
             .with_context(|| format!("failed to read {}", path.display()))
+    }
+
+    pub async fn memory_proposal_metadata(
+        &self,
+        relative_path: &str,
+    ) -> Result<ContinuityItemMetadata> {
+        let path = self.resolve_relative_file(relative_path)?;
+        ensure_path_is_under(&path, &self.memory_proposals_dir())?;
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let proposal = parse_memory_proposal(&self.workspace_root, &path, &content);
+        Ok(ContinuityItemMetadata {
+            title: proposal.title,
+            source: metadata_value(&content, "Source"),
+        })
+    }
+
+    pub async fn open_loop_metadata(&self, relative_path: &str) -> Result<ContinuityItemMetadata> {
+        let path = self.resolve_relative_file(relative_path)?;
+        ensure_path_is_under(&path, &self.open_loops_dir())?;
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Ok(ContinuityItemMetadata {
+            title: extract_heading(&content).unwrap_or_else(|| stem_fallback(&path)),
+            source: metadata_value(&content, "Source"),
+        })
     }
 
     fn daily_note_path(&self, at: DateTime<Utc>) -> PathBuf {
@@ -773,6 +807,31 @@ impl ContinuityLayout {
             }
         }
         Ok(self.workspace_root.join(requested))
+    }
+
+    fn resolve_canonical_read_path(&self, relative_path: &str) -> Result<PathBuf> {
+        let path = self.resolve_relative_file(relative_path)?;
+        let canonical_path = path
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+        let canonical_workspace = self
+            .workspace_root
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize {}", self.workspace_root.display()))?;
+        let expected_memory = canonical_workspace.join("MEMORY.md");
+        if canonical_path == expected_memory {
+            return Ok(canonical_path);
+        }
+
+        let expected_continuity = canonical_workspace.join("continuity");
+        if canonical_path.starts_with(&expected_continuity) {
+            Ok(canonical_path)
+        } else {
+            bail!(
+                "continuity path '{}' is outside canonical continuity files",
+                relative_path
+            );
+        }
     }
 }
 
@@ -1024,9 +1083,16 @@ fn is_direct_child(path: &Path, root: &Path) -> bool {
 }
 
 fn ensure_path_is_under(path: &Path, root: &Path) -> Result<()> {
-    let canonical_root = root
+    let root_parent = root
+        .parent()
+        .ok_or_else(|| anyhow!("root '{}' has no parent", root.display()))?;
+    let canonical_root_parent = root_parent
         .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", root.display()))?;
+        .with_context(|| format!("failed to canonicalize {}", root_parent.display()))?;
+    let root_name = root
+        .file_name()
+        .ok_or_else(|| anyhow!("root '{}' has no file name", root.display()))?;
+    let canonical_root = canonical_root_parent.join(root_name);
     let canonical_path = path
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", path.display()))?;
