@@ -782,16 +782,20 @@ impl ContinuityLayout {
         if requested.is_absolute() {
             bail!("continuity path must be relative to assistant home");
         }
+        let mut normalized = PathBuf::new();
         for component in requested.components() {
             match component {
-                Component::Normal(_) => {}
+                Component::Normal(value) => normalized.push(value),
                 Component::CurDir => {}
                 Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                     bail!("continuity path '{}' is invalid", trimmed);
                 }
             }
         }
-        Ok(requested.to_path_buf())
+        if normalized.as_os_str().is_empty() {
+            bail!("continuity path '{}' is invalid", trimmed);
+        }
+        Ok(normalized)
     }
 
     fn resolve_canonical_read_path(&self, relative_path: &str) -> Result<PathBuf> {
@@ -1815,6 +1819,63 @@ mod tests {
             .await
             .expect_err("archived loop resolve should fail");
         assert!(err.to_string().contains("not an active child"));
+    }
+
+    #[tokio::test]
+    async fn relative_paths_normalize_curdir_components_for_active_actions() {
+        let temp_dir = tempdir().expect("temp dir");
+        let layout = ContinuityLayout::new(temp_dir.path().join("workspace"));
+        layout.ensure_base_layout().await.expect("bootstrap");
+
+        let proposal_path = layout
+            .record_memory_proposal(&ContinuityMemoryProposalDraft {
+                title: "Normalized Proposal".to_string(),
+                rationale: "proposal".to_string(),
+                entries: vec!["entry".to_string()],
+                source: None,
+            })
+            .await
+            .expect("record proposal")
+            .expect("proposal path");
+        let proposal_relative = format!(
+            "./{}",
+            proposal_path
+                .strip_prefix(layout.workspace_root())
+                .expect("proposal relative")
+                .to_string_lossy()
+        );
+        layout
+            .merge_memory_proposal(&proposal_relative)
+            .await
+            .expect("merge normalized proposal path");
+
+        let loop_path = layout
+            .upsert_open_loop(&ContinuityOpenLoopDraft {
+                title: "Normalized Loop".to_string(),
+                summary: "summary".to_string(),
+                next_step: "next".to_string(),
+                source: None,
+            })
+            .await
+            .expect("record loop")
+            .expect("loop path");
+        let loop_relative = format!(
+            "./{}",
+            loop_path
+                .strip_prefix(layout.workspace_root())
+                .expect("loop relative")
+                .to_string_lossy()
+        );
+        layout
+            .resolve_open_loop(&loop_relative)
+            .await
+            .expect("resolve normalized loop path");
+
+        let memory = layout
+            .read_relative("./MEMORY.md")
+            .await
+            .expect("read normalized memory path");
+        assert!(memory.contains("entry"));
     }
 
     #[cfg(unix)]
