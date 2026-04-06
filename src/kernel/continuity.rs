@@ -105,7 +105,6 @@ pub struct ContinuityMemoryProposal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContinuityItemMetadata {
     pub title: String,
-    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,9 +191,7 @@ impl ContinuityLayout {
     }
 
     pub async fn ensure_base_layout(&self) -> Result<()> {
-        tokio::fs::create_dir_all(&self.workspace_root)
-            .await
-            .with_context(|| format!("failed to create {}", self.workspace_root.display()))?;
+        self.ensure_directory_path(&self.workspace_root).await?;
         for dir in [
             self.continuity_dir(),
             self.daily_dir(),
@@ -206,13 +203,13 @@ impl ContinuityLayout {
             self.archived_memory_proposals_dir(MERGED_DIR),
             self.archived_memory_proposals_dir(REJECTED_DIR),
         ] {
-            tokio::fs::create_dir_all(&dir)
-                .await
-                .with_context(|| format!("failed to create {}", dir.display()))?;
+            self.ensure_directory_path(&dir).await?;
         }
 
-        ensure_file(self.memory_path(), MEMORY_TEMPLATE).await?;
-        ensure_file(self.active_path(), ACTIVE_TEMPLATE).await?;
+        self.ensure_file(&self.memory_path(), MEMORY_TEMPLATE)
+            .await?;
+        self.ensure_file(&self.active_path(), ACTIVE_TEMPLATE)
+            .await?;
         self.rebuild_index().await?;
         Ok(())
     }
@@ -220,11 +217,7 @@ impl ContinuityLayout {
     pub async fn append_daily_event(&self, event: ContinuityEvent) -> Result<PathBuf> {
         let _guard = self.daily_note_lock.lock().await;
         let path = self.daily_note_path(event.at);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
+        self.prepare_write_path(&path).await?;
 
         let mut entry = format!(
             "## {} UTC - {}\n",
@@ -268,11 +261,7 @@ impl ContinuityLayout {
 
     pub async fn record_artifact(&self, artifact: ContinuityArtifact) -> Result<PathBuf> {
         let path = self.artifact_path(artifact.at, &artifact.slug);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
+        self.prepare_write_path(&path).await?;
 
         let mut content = format!("# {}\n\n", artifact.title.trim());
         content.push_str(&format!("- Kind: {}\n", artifact.kind.trim()));
@@ -310,10 +299,13 @@ impl ContinuityLayout {
     ) -> Result<Option<PathBuf>> {
         let _guard = self.open_loop_lock.lock().await;
         let path = self.open_loop_path(&loop_draft.title);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("failed to create {}", parent.display()))?;
+        self.prepare_write_path(&path).await?;
+        let archived_path = self.open_loops_archive_dir().join(
+            path.file_name()
+                .ok_or_else(|| anyhow!("invalid open loop path"))?,
+        );
+        if self.path_exists_canonically(&archived_path).await? {
+            return Ok(None);
         }
 
         if let Ok(existing) = tokio::fs::read_to_string(&path).await {
@@ -383,6 +375,7 @@ impl ContinuityLayout {
                 .file_name()
                 .ok_or_else(|| anyhow!("invalid open loop path"))?,
         );
+        self.prepare_write_path(&target).await?;
         tokio::fs::write(&source, &content)
             .await
             .with_context(|| format!("failed to update {}", source.display()))?;
@@ -412,10 +405,26 @@ impl ContinuityLayout {
 
         let _guard = self.proposal_lock.lock().await;
         let path = self.memory_proposal_path(&proposal.title);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("failed to create {}", parent.display()))?;
+        self.prepare_write_path(&path).await?;
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| anyhow!("invalid proposal path"))?;
+        if self
+            .path_exists_canonically(
+                &self
+                    .archived_memory_proposals_dir(MERGED_DIR)
+                    .join(file_name),
+            )
+            .await?
+            || self
+                .path_exists_canonically(
+                    &self
+                        .archived_memory_proposals_dir(REJECTED_DIR)
+                        .join(file_name),
+                )
+                .await?
+        {
+            return Ok(None);
         }
 
         let mut content = format!("# Memory Proposal: {}\n\n", proposal.title.trim());
@@ -483,7 +492,7 @@ impl ContinuityLayout {
             .await
             .with_context(|| format!("failed to read {}", path.display()))?;
         let proposal = parse_memory_proposal(&self.workspace_root, &path, &content);
-        append_memory_entries(self.memory_path(), &proposal.entries).await?;
+        self.append_memory_entries(&proposal.entries).await?;
         self.sync_index_path(&self.memory_path()).await?;
         let archived = self.archive_memory_proposal(&path, MERGED_DIR).await?;
         Ok(archived)
@@ -497,6 +506,7 @@ impl ContinuityLayout {
     }
 
     pub async fn write_active(&self, snapshot: &ActiveContinuitySnapshot) -> Result<()> {
+        self.prepare_write_path(&self.active_path()).await?;
         let mut sections = vec!["# Active Context".to_string()];
         if snapshot.matters_today.is_empty()
             && snapshot.open_loops.is_empty()
@@ -644,7 +654,6 @@ impl ContinuityLayout {
         let proposal = parse_memory_proposal(&self.workspace_root, &path, &content);
         Ok(ContinuityItemMetadata {
             title: proposal.title,
-            source: metadata_value(&content, "Source"),
         })
     }
 
@@ -656,7 +665,6 @@ impl ContinuityLayout {
             .with_context(|| format!("failed to read {}", path.display()))?;
         Ok(ContinuityItemMetadata {
             title: extract_heading(&content).unwrap_or_else(|| stem_fallback(&path)),
-            source: metadata_value(&content, "Source"),
         })
     }
 
@@ -712,6 +720,7 @@ impl ContinuityLayout {
                 .file_name()
                 .ok_or_else(|| anyhow!("invalid proposal path"))?,
         );
+        self.prepare_write_path(&target).await?;
         tokio::fs::write(source, &content)
             .await
             .with_context(|| format!("failed to update {}", source.display()))?;
@@ -815,6 +824,119 @@ impl ContinuityLayout {
         self.ensure_canonical_continuity_path(&path)
     }
 
+    async fn ensure_directory_path(&self, dir: &Path) -> Result<PathBuf> {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+        let canonical_dir = dir
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize {}", dir.display()))?;
+        let expected_dir = self.expected_canonical_path(dir)?;
+        if canonical_dir == expected_dir {
+            Ok(canonical_dir)
+        } else {
+            bail!(
+                "continuity path '{}' is outside canonical continuity files",
+                dir.display()
+            );
+        }
+    }
+
+    async fn prepare_write_path(&self, path: &Path) -> Result<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("path '{}' has no parent", path.display()))?;
+        self.ensure_directory_path(parent).await?;
+        if self.path_exists_canonically(path).await? {
+            let canonical_path = path
+                .canonicalize()
+                .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+            let expected_path = self.expected_canonical_path(path)?;
+            if canonical_path != expected_path {
+                bail!(
+                    "continuity path '{}' is outside canonical continuity files",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn path_exists_canonically(&self, path: &Path) -> Result<bool> {
+        if !tokio::fs::try_exists(path)
+            .await
+            .with_context(|| format!("failed to stat {}", path.display()))?
+        {
+            return Ok(false);
+        }
+        let canonical_path = path
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+        let expected_path = self.expected_canonical_path(path)?;
+        if canonical_path == expected_path {
+            Ok(true)
+        } else {
+            bail!(
+                "continuity path '{}' is outside canonical continuity files",
+                path.display()
+            );
+        }
+    }
+
+    async fn ensure_file(&self, path: &Path, content: &str) -> Result<()> {
+        self.prepare_write_path(path).await?;
+        match tokio::fs::try_exists(path).await {
+            Ok(true) => Ok(()),
+            Ok(false) => tokio::fs::write(path, content)
+                .await
+                .with_context(|| format!("failed to write {}", path.display())),
+            Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
+        }
+    }
+
+    async fn append_memory_entries(&self, entries: &[String]) -> Result<()> {
+        let path = self.memory_path();
+        self.prepare_write_path(&path).await?;
+        let existing = tokio::fs::read_to_string(&path)
+            .await
+            .unwrap_or_else(|_| MEMORY_TEMPLATE.to_string());
+        let mut deduped_existing = BTreeSet::new();
+        for line in existing.lines() {
+            let trimmed = line.trim();
+            if let Some(entry) = trimmed.strip_prefix("- ") {
+                deduped_existing.insert(entry.trim().to_string());
+            }
+        }
+
+        let new_entries = entries
+            .iter()
+            .map(|entry| entry.trim())
+            .filter(|entry| !entry.is_empty())
+            .filter(|entry| !deduped_existing.contains(*entry))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if new_entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut content = existing;
+        if !content.contains("## Entries") {
+            if !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str("\n## Entries\n");
+        }
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        for entry in new_entries {
+            content.push_str(&format!("- {}\n", entry));
+        }
+        tokio::fs::write(&path, content)
+            .await
+            .with_context(|| format!("failed to write {}", path.display()))
+    }
+
     fn ensure_canonical_continuity_path(&self, path: &Path) -> Result<PathBuf> {
         let canonical_path = path
             .canonicalize()
@@ -838,6 +960,17 @@ impl ContinuityLayout {
             );
         }
     }
+
+    fn expected_canonical_path(&self, path: &Path) -> Result<PathBuf> {
+        let canonical_workspace = self
+            .workspace_root
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize {}", self.workspace_root.display()))?;
+        let relative = path
+            .strip_prefix(&self.workspace_root)
+            .with_context(|| format!("path '{}' is outside workspace root", path.display()))?;
+        Ok(canonical_workspace.join(relative))
+    }
 }
 
 pub fn continuity_prompt_sections(workspace_root: &Path) -> Vec<(String, PathBuf)> {
@@ -846,57 +979,6 @@ pub fn continuity_prompt_sections(workspace_root: &Path) -> Vec<(String, PathBuf
         ("MEMORY.md".to_string(), layout.memory_path()),
         ("continuity/ACTIVE.md".to_string(), layout.active_path()),
     ]
-}
-
-async fn ensure_file(path: PathBuf, content: &str) -> Result<()> {
-    match tokio::fs::try_exists(&path).await {
-        Ok(true) => Ok(()),
-        Ok(false) => tokio::fs::write(&path, content)
-            .await
-            .with_context(|| format!("failed to write {}", path.display())),
-        Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
-    }
-}
-
-async fn append_memory_entries(path: PathBuf, entries: &[String]) -> Result<()> {
-    let existing = tokio::fs::read_to_string(&path)
-        .await
-        .unwrap_or_else(|_| MEMORY_TEMPLATE.to_string());
-    let mut deduped_existing = BTreeSet::new();
-    for line in existing.lines() {
-        let trimmed = line.trim();
-        if let Some(entry) = trimmed.strip_prefix("- ") {
-            deduped_existing.insert(entry.trim().to_string());
-        }
-    }
-
-    let new_entries = entries
-        .iter()
-        .map(|entry| entry.trim())
-        .filter(|entry| !entry.is_empty())
-        .filter(|entry| !deduped_existing.contains(*entry))
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    if new_entries.is_empty() {
-        return Ok(());
-    }
-
-    let mut content = existing;
-    if !content.contains("## Entries") {
-        if !content.ends_with('\n') {
-            content.push('\n');
-        }
-        content.push_str("\n## Entries\n");
-    }
-    if !content.ends_with('\n') {
-        content.push('\n');
-    }
-    for entry in new_entries {
-        content.push_str(&format!("- {}\n", entry));
-    }
-    tokio::fs::write(&path, content)
-        .await
-        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 async fn file_updated_at_ms(path: &Path) -> Result<i64> {
@@ -1575,5 +1657,132 @@ mod tests {
         assert!(second_hits
             .iter()
             .any(|item| item.relative_path == "MEMORY.md"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_paths_reject_symlinked_roots() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let layout = ContinuityLayout::new(temp_dir.path().join("workspace"));
+        layout.ensure_base_layout().await.expect("bootstrap");
+
+        let outside_daily = temp_dir.path().join("outside-daily");
+        let outside_artifacts = temp_dir.path().join("outside-artifacts");
+        let outside_loops = temp_dir.path().join("outside-loops");
+        let outside_proposals = temp_dir.path().join("outside-proposals");
+        let outside_memory = temp_dir.path().join("outside-memory.md");
+        let outside_active = temp_dir.path().join("outside-active.md");
+        std::fs::create_dir_all(&outside_daily).expect("create outside daily");
+        std::fs::create_dir_all(&outside_artifacts).expect("create outside artifacts");
+        std::fs::create_dir_all(&outside_loops).expect("create outside loops");
+        std::fs::create_dir_all(&outside_proposals).expect("create outside proposals");
+        std::fs::write(&outside_memory, "outside memory\n").expect("write outside memory");
+        std::fs::write(&outside_active, "outside active\n").expect("write outside active");
+
+        let daily_dir = layout.daily_dir();
+        std::fs::remove_dir_all(&daily_dir).expect("remove daily dir");
+        symlink(&outside_daily, &daily_dir).expect("symlink daily dir");
+        let err = layout
+            .append_daily_event(ContinuityEvent {
+                at: Utc::now(),
+                title: "escape".to_string(),
+                details: Vec::new(),
+            })
+            .await
+            .expect_err("daily append should fail");
+        assert!(err
+            .to_string()
+            .contains("outside canonical continuity files"));
+
+        let artifacts_dir = layout.artifacts_dir();
+        std::fs::remove_dir_all(&artifacts_dir).expect("remove artifacts dir");
+        symlink(&outside_artifacts, &artifacts_dir).expect("symlink artifacts dir");
+        let err = layout
+            .record_artifact(ContinuityArtifact {
+                at: Utc::now(),
+                slug: "escape".to_string(),
+                title: "Escape".to_string(),
+                kind: "test".to_string(),
+                summary: None,
+                source: None,
+                body: "body".to_string(),
+            })
+            .await
+            .expect_err("artifact write should fail");
+        assert!(err
+            .to_string()
+            .contains("outside canonical continuity files"));
+
+        let loops_dir = layout.open_loops_dir();
+        std::fs::remove_dir_all(&loops_dir).expect("remove loops dir");
+        symlink(&outside_loops, &loops_dir).expect("symlink loops dir");
+        let err = layout
+            .upsert_open_loop(&ContinuityOpenLoopDraft {
+                title: "Escape Loop".to_string(),
+                summary: "summary".to_string(),
+                next_step: "next".to_string(),
+                source: None,
+            })
+            .await
+            .expect_err("open loop write should fail");
+        assert!(err
+            .to_string()
+            .contains("outside canonical continuity files"));
+
+        let proposals_dir = layout.memory_proposals_dir();
+        std::fs::remove_dir_all(&proposals_dir).expect("remove proposals dir");
+        symlink(&outside_proposals, &proposals_dir).expect("symlink proposals dir");
+        let err = layout
+            .record_memory_proposal(&ContinuityMemoryProposalDraft {
+                title: "Escape Proposal".to_string(),
+                rationale: "rationale".to_string(),
+                entries: vec!["entry".to_string()],
+                source: None,
+            })
+            .await
+            .expect_err("proposal write should fail");
+        assert!(err
+            .to_string()
+            .contains("outside canonical continuity files"));
+
+        std::fs::remove_file(&proposals_dir).expect("remove proposal symlink");
+        std::fs::create_dir_all(&proposals_dir).expect("restore proposal dir");
+        let proposal_path = layout
+            .record_memory_proposal(&ContinuityMemoryProposalDraft {
+                title: "Memory Escape".to_string(),
+                rationale: "rationale".to_string(),
+                entries: vec!["entry".to_string()],
+                source: None,
+            })
+            .await
+            .expect("record proposal")
+            .expect("proposal path");
+
+        std::fs::remove_file(layout.memory_path()).expect("remove memory");
+        symlink(&outside_memory, layout.memory_path()).expect("symlink memory");
+        let relative = proposal_path
+            .strip_prefix(layout.workspace_root())
+            .expect("proposal relative")
+            .to_string_lossy()
+            .to_string();
+        let err = layout
+            .merge_memory_proposal(&relative)
+            .await
+            .expect_err("memory merge should fail");
+        assert!(err
+            .to_string()
+            .contains("outside canonical continuity files"));
+
+        std::fs::remove_file(layout.active_path()).expect("remove active");
+        symlink(&outside_active, layout.active_path()).expect("symlink active");
+        let err = layout
+            .write_active(&ActiveContinuitySnapshot::default())
+            .await
+            .expect_err("active write should fail");
+        assert!(err
+            .to_string()
+            .contains("outside canonical continuity files"));
     }
 }

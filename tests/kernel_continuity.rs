@@ -790,6 +790,115 @@ async fn merged_and_resolved_items_do_not_reappear_after_later_compaction() {
     assert!(!active.contains("Follow up on continuity surface"));
 }
 
+#[tokio::test]
+async fn merged_and_resolved_items_do_not_reappear_from_other_sessions() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    kernel
+        .register_runtime_adapter(
+            "capture",
+            Arc::new(CapturePromptAdapter {
+                prompts: Arc::new(Mutex::new(Vec::new())),
+                capability_results: Arc::new(Mutex::new(Vec::new())),
+                request_fs_read: false,
+                allow_hidden_compaction: true,
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+
+    let first = open_local_session(&kernel, "continuity-global-first").await;
+    let second = open_local_session(&kernel, "continuity-global-second").await;
+    for index in 0..18 {
+        kernel
+            .turn_session(SessionTurnRequest {
+                session_id: first.session_id,
+                user_text: format!("first session turn {}", index),
+                runtime_id: Some("capture".to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await
+            .expect("first session seed turn succeeds");
+        kernel
+            .turn_session(SessionTurnRequest {
+                session_id: second.session_id,
+                user_text: format!("second session turn {}", index),
+                runtime_id: Some("capture".to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await
+            .expect("second session seed turn succeeds");
+    }
+
+    let proposals = kernel
+        .list_continuity_memory_proposals()
+        .await
+        .expect("list proposals");
+    let loops = kernel
+        .list_continuity_open_loops()
+        .await
+        .expect("list loops");
+    assert_eq!(proposals.proposals.len(), 1);
+    assert_eq!(loops.loops.len(), 1);
+
+    kernel
+        .merge_continuity_memory_proposal(ContinuityPathRequest {
+            relative_path: proposals.proposals[0].relative_path.clone(),
+        })
+        .await
+        .expect("merge proposal");
+    kernel
+        .resolve_continuity_open_loop(ContinuityPathRequest {
+            relative_path: loops.loops[0].relative_path.clone(),
+        })
+        .await
+        .expect("resolve loop");
+
+    for index in 18..36 {
+        kernel
+            .turn_session(SessionTurnRequest {
+                session_id: second.session_id,
+                user_text: format!("second session follow-up turn {}", index),
+                runtime_id: Some("capture".to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await
+            .expect("second session follow-up turn succeeds");
+    }
+
+    assert!(kernel
+        .list_continuity_memory_proposals()
+        .await
+        .expect("list proposals after follow-up")
+        .proposals
+        .is_empty());
+    assert!(kernel
+        .list_continuity_open_loops()
+        .await
+        .expect("list loops after follow-up")
+        .loops
+        .is_empty());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn continuity_get_rejects_symlink_escape_outside_canonical_roots() {

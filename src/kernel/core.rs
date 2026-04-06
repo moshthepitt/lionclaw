@@ -2448,11 +2448,8 @@ impl Kernel {
             .merge_memory_proposal(&req.relative_path)
             .await
             .map_err(internal)?;
-        self.remove_memory_proposal_from_session_compaction(
-            metadata.source.as_deref(),
-            &metadata.title,
-        )
-        .await?;
+        self.remove_memory_proposal_from_all_compactions(&metadata.title)
+            .await?;
         let archived_path = self.relative_workspace_path(&archived);
         let memory_path = self.relative_workspace_path(&layout.memory_path());
         self.refresh_active_continuity_best_effort(
@@ -2500,11 +2497,8 @@ impl Kernel {
             .reject_memory_proposal(&req.relative_path)
             .await
             .map_err(internal)?;
-        self.remove_memory_proposal_from_session_compaction(
-            metadata.source.as_deref(),
-            &metadata.title,
-        )
-        .await?;
+        self.remove_memory_proposal_from_all_compactions(&metadata.title)
+            .await?;
         let archived_path = self.relative_workspace_path(&archived);
         self.refresh_active_continuity_best_effort(
             "continuity.memory_proposal.refresh_failed",
@@ -2566,7 +2560,7 @@ impl Kernel {
             .resolve_open_loop(&req.relative_path)
             .await
             .map_err(internal)?;
-        self.remove_open_loop_from_session_compaction(metadata.source.as_deref(), &metadata.title)
+        self.remove_open_loop_from_all_compactions(&metadata.title)
             .await?;
         let archived_path = self.relative_workspace_path(&archived);
         self.refresh_active_continuity_best_effort(
@@ -2585,55 +2579,42 @@ impl Kernel {
         Ok(ContinuityOpenLoopActionResponse { archived_path })
     }
 
-    async fn remove_memory_proposal_from_session_compaction(
+    async fn remove_memory_proposal_from_all_compactions(
         &self,
-        source: Option<&str>,
         title: &str,
     ) -> Result<(), KernelError> {
-        let Some(session_id) = parse_session_source(source) else {
-            return Ok(());
-        };
-        let Some(mut record) = self
+        for mut record in self
             .session_compactions
-            .latest(session_id)
+            .list_all()
             .await
             .map_err(internal)?
-        else {
-            return Ok(());
-        };
-        if !dismiss_memory_proposal_in_summary_state(&mut record.summary_state, title) {
-            return Ok(());
+        {
+            if !dismiss_memory_proposal_in_summary_state(&mut record.summary_state, title) {
+                continue;
+            }
+            self.session_compactions
+                .replace_latest_summary_state(record.session_id, &record.summary_state)
+                .await
+                .map_err(internal)?;
         }
-        self.session_compactions
-            .replace_latest_summary_state(session_id, &record.summary_state)
-            .await
-            .map_err(internal)?;
         Ok(())
     }
 
-    async fn remove_open_loop_from_session_compaction(
-        &self,
-        source: Option<&str>,
-        title: &str,
-    ) -> Result<(), KernelError> {
-        let Some(session_id) = parse_session_source(source) else {
-            return Ok(());
-        };
-        let Some(mut record) = self
+    async fn remove_open_loop_from_all_compactions(&self, title: &str) -> Result<(), KernelError> {
+        for mut record in self
             .session_compactions
-            .latest(session_id)
+            .list_all()
             .await
             .map_err(internal)?
-        else {
-            return Ok(());
-        };
-        if !resolve_open_loop_in_summary_state(&mut record.summary_state, title) {
-            return Ok(());
+        {
+            if !resolve_open_loop_in_summary_state(&mut record.summary_state, title) {
+                continue;
+            }
+            self.session_compactions
+                .replace_latest_summary_state(record.session_id, &record.summary_state)
+                .await
+                .map_err(internal)?;
         }
-        self.session_compactions
-            .replace_latest_summary_state(session_id, &record.summary_state)
-            .await
-            .map_err(internal)?;
         Ok(())
     }
 }
@@ -2725,12 +2706,6 @@ fn to_continuity_artifact_view(
         title: artifact.title,
         relative_path: artifact.relative_path,
     }
-}
-
-fn parse_session_source(source: Option<&str>) -> Option<Uuid> {
-    let raw = source?.trim();
-    let session_id = raw.strip_prefix("session:")?;
-    Uuid::parse_str(session_id).ok()
 }
 
 fn to_continuity_memory_proposal_view(

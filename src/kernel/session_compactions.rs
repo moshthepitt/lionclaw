@@ -144,6 +144,19 @@ impl SessionCompactionStore {
         rows.into_iter().map(map_compaction_row).collect()
     }
 
+    pub async fn list_all(&self) -> Result<Vec<SessionCompactionRecord>> {
+        let rows = sqlx::query(
+            "SELECT compaction_id, session_id, start_sequence_no, through_sequence_no, summary_text, summary_state_json, created_at_ms \
+             FROM session_compactions \
+             ORDER BY session_id ASC, through_sequence_no DESC, compaction_id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list all session compactions")?;
+
+        rows.into_iter().map(map_compaction_row).collect()
+    }
+
     pub async fn replace_latest_summary_state(
         &self,
         session_id: Uuid,
