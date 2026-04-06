@@ -126,7 +126,7 @@ async fn insert_document(
 
 fn build_match_query(query: &str) -> Option<String> {
     let tokens = query
-        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .map(|token| format!("{token}*"))
@@ -194,5 +194,14 @@ mod tests {
             store.search("compact", 10).await.expect("search new").len(),
             1
         );
+
+        let hyphenated = store
+            .search("open-loops", 10)
+            .await
+            .expect("search hyphenated token");
+        assert!(!hyphenated.is_empty());
+        assert!(hyphenated
+            .iter()
+            .any(|item| item.relative_path == "continuity/open-loops/review-audit.md"));
     }
 }
