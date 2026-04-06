@@ -249,13 +249,13 @@ impl ContinuityFs {
         relative_root: &Path,
         files: &mut Vec<PathBuf>,
     ) -> Result<()> {
-        let mut dir = Dir::read_from(dir_file).with_context(|| {
+        let dir = Dir::read_from(dir_file).with_context(|| {
             format!(
                 "failed to read {}",
                 self.absolute_path(relative_root).display()
             )
         })?;
-        while let Some(entry) = dir.next() {
+        for entry in dir {
             let entry = entry.with_context(|| {
                 format!(
                     "failed to iterate {}",

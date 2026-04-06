@@ -1062,7 +1062,6 @@ mod tests {
                 summary: "Recent compacted turns left follow-up work visible.".to_string(),
                 next_step: "Run cargo test.".to_string(),
             }],
-            ..CompactionSummaryState::default()
         };
 
         let rendered = render_compaction_summary(1, 12, &state);

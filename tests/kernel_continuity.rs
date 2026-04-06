@@ -611,6 +611,11 @@ async fn compaction_failures_are_audited_without_failing_completed_turns() {
     let mut permissions = std::fs::metadata(&proposals_dir)
         .expect("proposals metadata")
         .permissions();
+    #[cfg(unix)]
+    let original_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.mode()
+    };
     permissions.set_readonly(true);
     std::fs::set_permissions(&proposals_dir, permissions).expect("freeze proposals dir");
 
@@ -630,6 +635,12 @@ async fn compaction_failures_are_audited_without_failing_completed_turns() {
     let mut restore = std::fs::metadata(&proposals_dir)
         .expect("proposals metadata")
         .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        restore.set_mode(original_mode);
+    }
+    #[cfg(not(unix))]
     restore.set_readonly(false);
     std::fs::set_permissions(&proposals_dir, restore).expect("restore proposals dir");
 

@@ -2375,7 +2375,7 @@ impl Kernel {
             .continuity
             .as_ref()
             .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
-        let limit = req.limit.unwrap_or(10).max(1).min(100);
+        let limit = req.limit.unwrap_or(10).clamp(1, 100);
         let matches = layout.search(&req.query, limit).await.map_err(internal)?;
         Ok(ContinuitySearchResponse {
             matches: matches
