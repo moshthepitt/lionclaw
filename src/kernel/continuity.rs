@@ -191,7 +191,7 @@ impl ContinuityLayout {
     }
 
     pub async fn ensure_base_layout(&self) -> Result<()> {
-        self.ensure_directory_path(&self.workspace_root).await?;
+        self.ensure_workspace_root().await?;
         for dir in [
             self.continuity_dir(),
             self.daily_dir(),
@@ -838,6 +838,25 @@ impl ContinuityLayout {
             bail!(
                 "continuity path '{}' is outside canonical continuity files",
                 dir.display()
+            );
+        }
+    }
+
+    async fn ensure_workspace_root(&self) -> Result<PathBuf> {
+        tokio::fs::create_dir_all(&self.workspace_root)
+            .await
+            .with_context(|| format!("failed to create {}", self.workspace_root.display()))?;
+        let canonical_root = self
+            .workspace_root
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize {}", self.workspace_root.display()))?;
+        let expected_root = expected_canonical_root(&self.workspace_root)?;
+        if canonical_root == expected_root {
+            Ok(canonical_root)
+        } else {
+            bail!(
+                "continuity workspace root '{}' is outside assistant home",
+                self.workspace_root.display()
             );
         }
     }
@@ -1784,5 +1803,24 @@ mod tests {
         assert!(err
             .to_string()
             .contains("outside canonical continuity files"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bootstrap_rejects_symlinked_workspace_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let outside = temp_dir.path().join("outside-workspace");
+        std::fs::create_dir_all(&outside).expect("create outside workspace");
+        let workspace = temp_dir.path().join("workspace");
+        symlink(&outside, &workspace).expect("symlink workspace");
+
+        let layout = ContinuityLayout::new(&workspace);
+        let err = layout
+            .ensure_base_layout()
+            .await
+            .expect_err("symlinked workspace root should fail");
+        assert!(err.to_string().contains("continuity workspace root"));
     }
 }
