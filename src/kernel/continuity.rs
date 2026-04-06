@@ -379,7 +379,7 @@ impl ContinuityLayout {
         let _guard = self.open_loop_lock.lock().await;
         let fs = self.fs().await?;
         let source = self.resolve_relative_file(relative_path)?;
-        ensure_relative_path_is_under(&source, &self.open_loops_rel_dir())?;
+        ensure_relative_path_is_direct_child(&source, &self.open_loops_rel_dir())?;
         let mut content = fs.read_to_string(&source)?;
         content = replace_or_insert_metadata(
             &content,
@@ -485,7 +485,7 @@ impl ContinuityLayout {
         let _guard = self.proposal_lock.lock().await;
         let fs = self.fs().await?;
         let path = self.resolve_relative_file(relative_path)?;
-        ensure_relative_path_is_under(&path, &self.memory_proposals_rel_dir())?;
+        ensure_relative_path_is_direct_child(&path, &self.memory_proposals_rel_dir())?;
         let content = fs.read_to_string(&path)?;
         let proposal =
             parse_memory_proposal(&self.workspace_root, &fs.absolute_path(&path), &content);
@@ -498,7 +498,7 @@ impl ContinuityLayout {
     pub async fn reject_memory_proposal(&self, relative_path: &str) -> Result<PathBuf> {
         let _guard = self.proposal_lock.lock().await;
         let path = self.resolve_relative_file(relative_path)?;
-        ensure_relative_path_is_under(&path, &self.memory_proposals_rel_dir())?;
+        ensure_relative_path_is_direct_child(&path, &self.memory_proposals_rel_dir())?;
         self.archive_memory_proposal(&path, REJECTED_DIR).await
     }
 
@@ -639,7 +639,7 @@ impl ContinuityLayout {
     ) -> Result<ContinuityItemMetadata> {
         let fs = self.fs().await?;
         let path = self.resolve_relative_file(relative_path)?;
-        ensure_relative_path_is_under(&path, &self.memory_proposals_rel_dir())?;
+        ensure_relative_path_is_direct_child(&path, &self.memory_proposals_rel_dir())?;
         let content = fs.read_to_string(&path)?;
         let proposal =
             parse_memory_proposal(&self.workspace_root, &fs.absolute_path(&path), &content);
@@ -651,7 +651,7 @@ impl ContinuityLayout {
     pub async fn open_loop_metadata(&self, relative_path: &str) -> Result<ContinuityItemMetadata> {
         let fs = self.fs().await?;
         let path = self.resolve_relative_file(relative_path)?;
-        ensure_relative_path_is_under(&path, &self.open_loops_rel_dir())?;
+        ensure_relative_path_is_direct_child(&path, &self.open_loops_rel_dir())?;
         let content = fs.read_to_string(&path)?;
         Ok(ContinuityItemMetadata {
             title: extract_heading(&content).unwrap_or_else(|| stem_fallback(&path)),
@@ -856,7 +856,7 @@ impl ContinuityLayout {
             ("MEMORY.md".to_string(), self.memory_rel_path()),
             ("continuity/ACTIVE.md".to_string(), self.active_rel_path()),
         ] {
-            if let Ok(content) = fs.read_to_string(&path) {
+            if let Some(content) = fs.read_to_string_if_exists(&path)? {
                 sections.push((label, content));
             }
         }
@@ -1041,11 +1041,15 @@ fn is_direct_child(path: &Path, root: &Path) -> bool {
     path.parent().is_some_and(|parent| parent == root)
 }
 
-fn ensure_relative_path_is_under(path: &Path, root: &Path) -> Result<()> {
-    if path == root || path.starts_with(root) {
+fn ensure_relative_path_is_direct_child(path: &Path, root: &Path) -> Result<()> {
+    if is_direct_child(path, root) {
         Ok(())
     } else {
-        bail!("path '{}' is outside '{}'", path.display(), root.display());
+        bail!(
+            "path '{}' is not an active child of '{}'",
+            path.display(),
+            root.display()
+        );
     }
 }
 
@@ -1742,6 +1746,97 @@ mod tests {
         assert!(second_hits
             .iter()
             .any(|item| item.relative_path == "MEMORY.md"));
+    }
+
+    #[tokio::test]
+    async fn archived_actions_are_rejected_for_active_only_surfaces() {
+        let temp_dir = tempdir().expect("temp dir");
+        let layout = ContinuityLayout::new(temp_dir.path().join("workspace"));
+        layout.ensure_base_layout().await.expect("bootstrap");
+
+        let proposal_path = layout
+            .record_memory_proposal(&ContinuityMemoryProposalDraft {
+                title: "Archive Me".to_string(),
+                rationale: "proposal".to_string(),
+                entries: vec!["entry".to_string()],
+                source: None,
+            })
+            .await
+            .expect("record proposal")
+            .expect("proposal path");
+        let proposal_relative = proposal_path
+            .strip_prefix(layout.workspace_root())
+            .expect("proposal relative")
+            .to_string_lossy()
+            .to_string();
+        let archived_proposal = layout
+            .merge_memory_proposal(&proposal_relative)
+            .await
+            .expect("merge proposal");
+        let archived_proposal_relative = archived_proposal
+            .strip_prefix(layout.workspace_root())
+            .expect("archived proposal relative")
+            .to_string_lossy()
+            .to_string();
+
+        let err = layout
+            .merge_memory_proposal(&archived_proposal_relative)
+            .await
+            .expect_err("archived proposal merge should fail");
+        assert!(err.to_string().contains("not an active child"));
+
+        let loop_path = layout
+            .upsert_open_loop(&ContinuityOpenLoopDraft {
+                title: "Archive Loop".to_string(),
+                summary: "summary".to_string(),
+                next_step: "next".to_string(),
+                source: None,
+            })
+            .await
+            .expect("record loop")
+            .expect("loop path");
+        let loop_relative = loop_path
+            .strip_prefix(layout.workspace_root())
+            .expect("loop relative")
+            .to_string_lossy()
+            .to_string();
+        let archived_loop = layout
+            .resolve_open_loop(&loop_relative)
+            .await
+            .expect("resolve loop");
+        let archived_loop_relative = archived_loop
+            .strip_prefix(layout.workspace_root())
+            .expect("archived loop relative")
+            .to_string_lossy()
+            .to_string();
+
+        let err = layout
+            .resolve_open_loop(&archived_loop_relative)
+            .await
+            .expect_err("archived loop resolve should fail");
+        assert!(err.to_string().contains("not an active child"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_prompt_sections_surfaces_non_missing_read_failures() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let layout = ContinuityLayout::new(temp_dir.path().join("workspace"));
+        layout.ensure_base_layout().await.expect("bootstrap");
+
+        let outside = temp_dir.path().join("outside-active.md");
+        std::fs::write(&outside, "outside\n").expect("write outside file");
+        std::fs::remove_file(layout.active_path()).expect("remove active");
+        symlink(&outside, layout.active_path()).expect("symlink active");
+
+        let err = layout
+            .read_prompt_sections()
+            .await
+            .expect_err("symlinked active should fail");
+        let message = err.to_string();
+        assert!(message.contains("failed to open") || message.contains("not a regular file"));
     }
 
     #[cfg(unix)]
