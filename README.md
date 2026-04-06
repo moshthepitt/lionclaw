@@ -8,6 +8,10 @@ policy, audit, state, and runtime control in a small trusted core. When you
 want the assistant to do more, you add installable skills instead of bloating
 the core.
 
+LionClaw currently supports Unix-like systems only. The trusted filesystem and
+service assumptions in the current kernel target Linux/macOS-style Unix
+environments; Windows support is out of scope for now.
+
 ## The Anatomy of a True Assistant
 
 LionClaw is split into a rock-solid core and modular skills, giving you maximum

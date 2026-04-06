@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::contracts::{SessionHistoryPolicy, SessionTurnStatus, SessionTurnView};
 
+use super::continuity::normalized_title_key;
 use super::session_turns::{SessionTurnRecord, SessionTurnStore};
 
 const HISTORY_OVERFETCH_MULTIPLIER: usize = 3;
@@ -396,13 +397,13 @@ pub fn remove_memory_proposal_from_summary_state(
     state: &mut CompactionSummaryState,
     title: &str,
 ) -> bool {
-    let Some(normalized_title) = compact_line(title, COMPACTION_MAX_ITEM_LEN) else {
+    let Some(normalized_title) = normalized_summary_title_key(title) else {
         return false;
     };
     let original_len = state.memory_proposals.len();
-    state
-        .memory_proposals
-        .retain(|proposal| proposal.title != normalized_title);
+    state.memory_proposals.retain(|proposal| {
+        normalized_summary_title_key(&proposal.title).as_deref() != Some(normalized_title.as_str())
+    });
     let changed = state.memory_proposals.len() != original_len;
     normalize_compaction_summary_state(state);
     changed
@@ -412,20 +413,18 @@ pub fn remove_open_loop_from_summary_state(
     state: &mut CompactionSummaryState,
     title: &str,
 ) -> bool {
-    let Some(normalized_title) = compact_line(title, COMPACTION_MAX_ITEM_LEN) else {
+    let Some(normalized_title) = normalized_summary_title_key(title) else {
         return false;
     };
     let original_len = state.open_loops.len();
-    state
-        .open_loops
-        .retain(|open_loop| open_loop.title != normalized_title);
+    state.open_loops.retain(|open_loop| {
+        normalized_summary_title_key(&open_loop.title).as_deref() != Some(normalized_title.as_str())
+    });
     let mut changed = state.open_loops.len() != original_len;
     let in_progress_len = state.progress_in_progress.len();
     state.progress_in_progress.retain(|entry| {
-        !entry.trim().eq(&normalized_title)
-            && !entry
-                .trim()
-                .starts_with(&format!("{} (next:", normalized_title))
+        normalized_summary_title_key(progress_entry_title(entry)).as_deref()
+            != Some(normalized_title.as_str())
     });
     changed |= state.progress_in_progress.len() != in_progress_len;
     normalize_compaction_summary_state(state);
@@ -843,7 +842,10 @@ fn merge_unique_memory_proposals(
     let mut seen = BTreeSet::new();
     let mut merged = Vec::new();
     for proposal in current.into_iter().chain(previous) {
-        if !seen.insert(proposal.title.clone()) {
+        let Some(key) = normalized_summary_title_key(&proposal.title) else {
+            continue;
+        };
+        if !seen.insert(key) {
             continue;
         }
         merged.push(proposal);
@@ -858,7 +860,10 @@ fn merge_unique_open_loops(
     let mut seen = BTreeSet::new();
     let mut merged = Vec::new();
     for open_loop in current.into_iter().chain(previous) {
-        if !seen.insert(open_loop.title.clone()) {
+        let Some(key) = normalized_summary_title_key(&open_loop.title) else {
+            continue;
+        };
+        if !seen.insert(key) {
             continue;
         }
         merged.push(open_loop);
@@ -872,6 +877,24 @@ fn keep_tail<T>(mut items: Vec<T>, limit: usize) -> Vec<T> {
         items.drain(0..keep_from);
     }
     items
+}
+
+fn normalized_summary_title_key(title: &str) -> Option<String> {
+    let compacted = compact_line(title, COMPACTION_MAX_ITEM_LEN)?;
+    let normalized = normalized_title_key(&compacted);
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn progress_entry_title(entry: &str) -> &str {
+    entry
+        .split_once(" (next:")
+        .map(|(title, _)| title)
+        .unwrap_or(entry)
+        .trim()
 }
 
 fn serialize_turn_for_compaction(turn: &SessionTurnRecord) -> String {
@@ -1247,5 +1270,37 @@ mod tests {
 
         assert_eq!(merged.memory_proposals.len(), 1);
         assert_eq!(merged.open_loops.len(), 1);
+    }
+
+    #[test]
+    fn removal_uses_normalized_title_identity() {
+        let mut state = CompactionSummaryState {
+            memory_proposals: vec![super::CompactionMemoryProposal {
+                title: "Working Preferences".to_string(),
+                rationale: "durable preference".to_string(),
+                entries: vec!["Keep the core small.".to_string()],
+            }],
+            open_loops: vec![super::CompactionOpenLoop {
+                title: "Follow Up On Continuity Surface".to_string(),
+                summary: "Need to verify case-insensitive cleanup.".to_string(),
+                next_step: "Run cleanup".to_string(),
+            }],
+            progress_in_progress: vec![
+                "follow up on continuity surface (next: Run cleanup)".to_string()
+            ],
+            ..CompactionSummaryState::default()
+        };
+
+        assert!(remove_memory_proposal_from_summary_state(
+            &mut state,
+            "working preferences"
+        ));
+        assert!(remove_open_loop_from_summary_state(
+            &mut state,
+            "follow up on continuity surface"
+        ));
+        assert!(state.memory_proposals.is_empty());
+        assert!(state.open_loops.is_empty());
+        assert!(state.progress_in_progress.is_empty());
     }
 }

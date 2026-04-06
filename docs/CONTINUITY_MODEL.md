@@ -9,6 +9,9 @@ The goal is not hidden "AI memory." The goal is durable assistant continuity tha
 - stays small in the prompt hot path
 - keeps transcript compaction separate from long-term memory
 
+The current continuity security boundary is Unix-only. Descriptor-rooted
+assistant-home filesystem hardening assumes Linux/macOS-style Unix behavior.
+
 ## Roots
 
 LionClaw has two different roots:
@@ -86,6 +89,7 @@ Implemented now:
   - writes do not rely on check-then-open pathname validation
   - symlinked roots or subtree components are rejected for directory traversal
   - symlinked leaf files are replaced in-place rather than followed outside assistant home
+- the rest of the hot assistant-home prompt surface (`IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md`) is read and bootstrapped through the same rooted workspace boundary rather than plain pathname I/O
 
 Not implemented yet:
 

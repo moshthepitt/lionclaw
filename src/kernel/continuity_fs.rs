@@ -26,19 +26,21 @@ pub struct ContinuityFs {
 
 impl ContinuityFs {
     pub fn bootstrap(workspace_root: &Path) -> Result<Self> {
+        Self::open_workspace_root(workspace_root, true)
+    }
+
+    pub fn open_existing(workspace_root: &Path) -> Result<Self> {
+        Self::open_workspace_root(workspace_root, false)
+    }
+
+    fn open_workspace_root(workspace_root: &Path, create: bool) -> Result<Self> {
         let parent = workspace_root.parent().ok_or_else(|| {
             anyhow!(
                 "workspace root '{}' has no parent",
                 workspace_root.display()
             )
         })?;
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-        let canonical_parent = parent
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", parent.display()))?;
-        let parent_dir = File::open(&canonical_parent)
-            .with_context(|| format!("failed to open {}", canonical_parent.display()))?;
+        let parent_dir = open_directory_path(parent, create)?;
         let root_name = workspace_root.file_name().ok_or_else(|| {
             anyhow!(
                 "workspace root '{}' has no file name",
@@ -46,11 +48,13 @@ impl ContinuityFs {
             )
         })?;
 
-        match mkdirat(&parent_dir, root_name, DIR_MODE) {
-            Ok(()) | Err(Errno::EXIST) => {}
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to create {}", workspace_root.display()))
+        if create {
+            match mkdirat(&parent_dir, root_name, DIR_MODE) {
+                Ok(()) | Err(Errno::EXIST) => {}
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("failed to create {}", workspace_root.display()))
+                }
             }
         }
 
@@ -66,6 +70,14 @@ impl ContinuityFs {
             root_path: workspace_root.to_path_buf(),
             root_dir: Arc::new(File::from(root_fd)),
         })
+    }
+
+    pub fn read_to_string_if_exists(&self, relative: &Path) -> Result<Option<String>> {
+        match self.read_to_string(relative) {
+            Ok(content) => Ok(Some(content)),
+            Err(err) if is_not_found(&err) => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 
     pub fn root_path(&self) -> &Path {
@@ -432,6 +444,44 @@ fn normalize_relative_path(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
+fn open_directory_path(path: &Path, create: bool) -> Result<File> {
+    let mut current = if path.is_absolute() {
+        File::open("/").context("failed to open filesystem root")?
+    } else {
+        File::open(".").context("failed to open current working directory")?
+    };
+
+    for component in path.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            Component::ParentDir | Component::Prefix(_) => {
+                bail!("directory path '{}' is invalid", path.display())
+            }
+        };
+
+        if create {
+            match mkdirat(&current, name, DIR_MODE) {
+                Ok(()) | Err(Errno::EXIST) => {}
+                Err(err) => {
+                    return Err(err).with_context(|| format!("failed to create {}", path.display()))
+                }
+            }
+        }
+
+        let next = openat(
+            &current,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("failed to open {}", path.display()))?;
+        current = File::from(next);
+    }
+
+    Ok(current)
+}
+
 fn is_not_found(err: &anyhow::Error) -> bool {
     matches!(err.downcast_ref::<Errno>(), Some(&Errno::NOENT))
 }
@@ -456,6 +506,19 @@ mod tests {
         std::fs::create_dir_all(&outside).expect("create outside");
         let workspace = temp_dir.path().join("workspace");
         symlink(&outside, &workspace).expect("symlink workspace");
+
+        let err = ContinuityFs::bootstrap(&workspace).expect_err("bootstrap should fail");
+        assert!(err.to_string().contains("failed to open"));
+    }
+
+    #[test]
+    fn bootstrap_rejects_symlinked_workspace_parent() {
+        let temp_dir = tempdir().expect("temp dir");
+        let outside_parent = temp_dir.path().join("outside-parent");
+        std::fs::create_dir_all(&outside_parent).expect("create outside parent");
+        let linked_parent = temp_dir.path().join("linked-parent");
+        symlink(&outside_parent, &linked_parent).expect("symlink parent");
+        let workspace = linked_parent.join("workspace");
 
         let err = ContinuityFs::bootstrap(&workspace).expect_err("bootstrap should fail");
         assert!(err.to_string().contains("failed to open"));

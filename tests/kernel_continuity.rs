@@ -137,6 +137,63 @@ async fn prompt_loads_assistant_continuity_and_fs_read_uses_project_root() {
 }
 
 #[tokio::test]
+async fn prompt_loading_rejects_symlinked_identity_files() {
+    use std::os::unix::fs::symlink;
+
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+
+    let outside = env.temp_dir.path().join("outside-soul.md");
+    std::fs::write(&outside, "# Outside Soul\n").expect("write outside file");
+    std::fs::remove_file(env.workspace_root().join("SOUL.md")).expect("remove soul file");
+    symlink(&outside, env.workspace_root().join("SOUL.md")).expect("symlink soul file");
+
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "capture-boundary",
+            Arc::new(CapturePromptAdapter {
+                prompts,
+                capability_results: Arc::new(Mutex::new(Vec::new())),
+                request_fs_read: false,
+                allow_hidden_compaction: false,
+                emit_compaction_continuity: false,
+                reply: "ok".to_string(),
+            }),
+        )
+        .await;
+
+    let session = open_local_session(&kernel, "prompt-boundary-peer").await;
+    let err = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "hello".to_string(),
+            runtime_id: Some("capture-boundary".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect_err("turn should fail");
+
+    let message = err.to_string();
+    assert!(message.contains("failed to open") || message.contains("not a regular file"));
+}
+
+#[tokio::test]
 async fn pairing_and_failed_turn_update_active_and_daily_continuity() {
     let env = TestEnv::new();
     bootstrap_workspace(&env.workspace_root())

@@ -972,7 +972,7 @@ fn sanitize_slug(slug: &str) -> String {
     normalized.trim_matches('-').to_string()
 }
 
-fn normalized_title_key(title: &str) -> String {
+pub(crate) fn normalized_title_key(title: &str) -> String {
     title
         .split_whitespace()
         .collect::<Vec<_>>()

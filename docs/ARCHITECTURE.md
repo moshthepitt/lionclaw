@@ -1,5 +1,9 @@
 # LionClaw Architecture (v0)
 
+LionClaw currently targets Unix-like systems only. The kernel's trusted
+filesystem boundary and service assumptions are designed for Linux/macOS-style
+Unix environments.
+
 ## Kernel Modules
 
 - `kernel.sessions`: session lifecycle, history policy, and aggregate turn metadata.
@@ -13,7 +17,7 @@
 - `kernel.scheduler`: due-job claiming, lease coordination, retry, and dispatch.
 - `kernel.channel_state`: durable channel bindings, peer trust state, inbound logs, queued channel turns, outbound transcript history, and append-only channel stream delivery state.
 - `kernel.continuity`: visible assistant-home continuity files, `ACTIVE.md` projection, daily notes, artifacts, open loops, memory proposals, and continuity retrieval helpers.
-- `kernel.continuity_fs`: descriptor-rooted Unix continuity filesystem helper for assistant-home reads/writes.
+- `kernel.continuity_fs`: descriptor-rooted Unix filesystem helper for assistant-home continuity and hot workspace-file reads/writes.
 - `kernel.audit`: append-only audit event log persisted in SQLite.
 - `kernel.session_compactions`: persisted transcript compaction spans and summaries.
 
