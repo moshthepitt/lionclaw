@@ -944,10 +944,10 @@ mod tests {
 
     use super::{
         build_compaction_prompt, merge_compaction_summary_state, merge_compaction_summary_updates,
-        merge_unique_memory_proposals, merge_unique_open_loops,
-        parse_compaction_summary_state, remove_memory_proposal_from_summary_state,
-        remove_open_loop_from_summary_state, render_compaction_summary, repair_turns,
-        CompactionSummaryState, TranscriptMode, COMPACTION_LIST_KEEP,
+        merge_unique_memory_proposals, merge_unique_open_loops, parse_compaction_summary_state,
+        remove_memory_proposal_from_summary_state, remove_open_loop_from_summary_state,
+        render_compaction_summary, repair_turns, CompactionSummaryState, TranscriptMode,
+        COMPACTION_LIST_KEEP,
     };
     use crate::kernel::session_turns::SessionTurnRecord;
 
