@@ -13,6 +13,7 @@
 - `kernel.scheduler`: due-job claiming, lease coordination, retry, and dispatch.
 - `kernel.channel_state`: durable channel bindings, peer trust state, inbound logs, queued channel turns, outbound transcript history, and append-only channel stream delivery state.
 - `kernel.continuity`: visible assistant-home continuity files, `ACTIVE.md` projection, daily notes, artifacts, open loops, memory proposals, and continuity retrieval helpers.
+- `kernel.continuity_fs`: descriptor-rooted Unix continuity filesystem helper for assistant-home reads/writes.
 - `kernel.audit`: append-only audit event log persisted in SQLite.
 - `kernel.session_compactions`: persisted transcript compaction spans and summaries.
 
@@ -208,13 +209,19 @@ Queued channel turns emit machine-stable status/error codes through the same str
 - Scheduler artifacts are recorded under `continuity/artifacts/...`.
 - Memory proposals are written under `continuity/proposals/memory/...` and merged or rejected explicitly.
 - Open loops are written under `continuity/open-loops/...` and resolved explicitly.
+- Active proposal/open-loop files use deterministic title-keyed filenames of the form `"{slug}--{uuid-v5}.md"`.
+- Archives are historical records only; they do not suppress future active items with the same title.
 - Continuity search uses a derived SQLite FTS index in `lionclaw.db`; the Markdown files remain the canonical source of truth.
 - Transcript compaction summaries are stored in SQLite separately from file-backed continuity.
 - Prompt history sees one bounded structured compaction handoff summary plus the recent raw tail.
+- Active continuity state has two authorities only:
+  - canonical active Markdown files under assistant home
+  - each session's latest persisted compaction summary state
 - Before a new compaction summary is persisted, the kernel flushes visible continuity artifacts:
   - memory proposals
   - open-loop updates
   - a daily note entry when new continuity was promoted
+- Continuity reads and writes are rooted in the assistant home workspace through descriptor-based Unix filesystem operations rather than pathname preflight checks.
 - When hidden semantic summarization is unavailable, deterministic kernel compaction still extracts:
   - current goal
   - constraints and preferences

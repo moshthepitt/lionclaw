@@ -1,14 +1,15 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::BTreeSet,
     path::{Component, Path, PathBuf},
     sync::Arc,
-    time::UNIX_EPOCH,
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Datelike, Utc};
-use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex};
+use tokio::sync::Mutex;
+use uuid::Uuid;
 
+use super::continuity_fs::ContinuityFs;
 use super::continuity_index::{ContinuityIndexStore, ContinuityIndexedDocument};
 
 pub const MEMORY_FILE: &str = "MEMORY.md";
@@ -32,6 +33,7 @@ const ACTIVE_TEMPLATE: &str =
 pub struct ContinuityLayout {
     workspace_root: PathBuf,
     index_store: Option<ContinuityIndexStore>,
+    fs: Arc<Mutex<Option<Arc<ContinuityFs>>>>,
     daily_note_lock: Arc<Mutex<()>>,
     proposal_lock: Arc<Mutex<()>>,
     open_loop_lock: Arc<Mutex<()>>,
@@ -136,6 +138,7 @@ impl ContinuityLayout {
         Self {
             workspace_root: workspace_root.into(),
             index_store,
+            fs: Arc::new(Mutex::new(None)),
             daily_note_lock: Arc::new(Mutex::new(())),
             proposal_lock: Arc::new(Mutex::new(())),
             open_loop_lock: Arc::new(Mutex::new(())),
@@ -147,77 +150,119 @@ impl ContinuityLayout {
     }
 
     pub fn memory_path(&self) -> PathBuf {
-        self.workspace_root.join(MEMORY_FILE)
+        self.workspace_root.join(self.memory_rel_path())
     }
 
     pub fn continuity_dir(&self) -> PathBuf {
-        self.workspace_root.join(CONTINUITY_DIR)
+        self.workspace_root.join(self.continuity_rel_dir())
     }
 
     pub fn active_path(&self) -> PathBuf {
-        self.continuity_dir().join(ACTIVE_FILE)
+        self.workspace_root.join(self.active_rel_path())
     }
 
+    #[cfg(test)]
     fn daily_dir(&self) -> PathBuf {
-        self.continuity_dir().join(DAILY_DIR)
+        self.workspace_root.join(self.daily_rel_dir())
     }
 
+    #[cfg(test)]
     fn open_loops_dir(&self) -> PathBuf {
-        self.continuity_dir().join(OPEN_LOOPS_DIR)
+        self.workspace_root.join(self.open_loops_rel_dir())
     }
 
-    fn open_loops_archive_dir(&self) -> PathBuf {
-        self.open_loops_dir().join(ARCHIVE_DIR)
-    }
-
+    #[cfg(test)]
     fn artifacts_dir(&self) -> PathBuf {
-        self.continuity_dir().join(ARTIFACTS_DIR)
+        self.workspace_root.join(self.artifacts_rel_dir())
     }
 
-    fn rollups_dir(&self) -> PathBuf {
-        self.continuity_dir().join(ROLLUPS_DIR)
-    }
-
-    fn proposals_dir(&self) -> PathBuf {
-        self.continuity_dir().join(PROPOSALS_DIR)
-    }
-
+    #[cfg(test)]
     fn memory_proposals_dir(&self) -> PathBuf {
-        self.proposals_dir().join(MEMORY_PROPOSALS_DIR)
+        self.workspace_root.join(self.memory_proposals_rel_dir())
     }
 
-    fn archived_memory_proposals_dir(&self, status: &str) -> PathBuf {
-        self.memory_proposals_dir().join(ARCHIVE_DIR).join(status)
+    fn memory_rel_path(&self) -> PathBuf {
+        PathBuf::from(MEMORY_FILE)
+    }
+
+    fn continuity_rel_dir(&self) -> PathBuf {
+        PathBuf::from(CONTINUITY_DIR)
+    }
+
+    fn active_rel_path(&self) -> PathBuf {
+        self.continuity_rel_dir().join(ACTIVE_FILE)
+    }
+
+    fn daily_rel_dir(&self) -> PathBuf {
+        self.continuity_rel_dir().join(DAILY_DIR)
+    }
+
+    fn open_loops_rel_dir(&self) -> PathBuf {
+        self.continuity_rel_dir().join(OPEN_LOOPS_DIR)
+    }
+
+    fn open_loops_archive_rel_dir(&self) -> PathBuf {
+        self.open_loops_rel_dir().join(ARCHIVE_DIR)
+    }
+
+    fn artifacts_rel_dir(&self) -> PathBuf {
+        self.continuity_rel_dir().join(ARTIFACTS_DIR)
+    }
+
+    fn rollups_rel_dir(&self) -> PathBuf {
+        self.continuity_rel_dir().join(ROLLUPS_DIR)
+    }
+
+    fn proposals_rel_dir(&self) -> PathBuf {
+        self.continuity_rel_dir().join(PROPOSALS_DIR)
+    }
+
+    fn memory_proposals_rel_dir(&self) -> PathBuf {
+        self.proposals_rel_dir().join(MEMORY_PROPOSALS_DIR)
+    }
+
+    fn archived_memory_proposals_rel_dir(&self, status: &str) -> PathBuf {
+        self.memory_proposals_rel_dir()
+            .join(ARCHIVE_DIR)
+            .join(status)
+    }
+
+    async fn fs(&self) -> Result<Arc<ContinuityFs>> {
+        let mut guard = self.fs.lock().await;
+        if guard.is_none() {
+            *guard = Some(Arc::new(ContinuityFs::bootstrap(&self.workspace_root)?));
+        }
+        Ok(Arc::clone(
+            guard.as_ref().expect("continuity fs initialized"),
+        ))
     }
 
     pub async fn ensure_base_layout(&self) -> Result<()> {
-        self.ensure_workspace_root().await?;
+        let fs = self.fs().await?;
         for dir in [
-            self.continuity_dir(),
-            self.daily_dir(),
-            self.open_loops_dir(),
-            self.open_loops_archive_dir(),
-            self.artifacts_dir(),
-            self.rollups_dir(),
-            self.memory_proposals_dir(),
-            self.archived_memory_proposals_dir(MERGED_DIR),
-            self.archived_memory_proposals_dir(REJECTED_DIR),
+            self.continuity_rel_dir(),
+            self.daily_rel_dir(),
+            self.open_loops_rel_dir(),
+            self.open_loops_archive_rel_dir(),
+            self.artifacts_rel_dir(),
+            self.rollups_rel_dir(),
+            self.memory_proposals_rel_dir(),
+            self.archived_memory_proposals_rel_dir(MERGED_DIR),
+            self.archived_memory_proposals_rel_dir(REJECTED_DIR),
         ] {
-            self.ensure_directory_path(&dir).await?;
+            fs.create_dir_all(&dir)?;
         }
 
-        self.ensure_file(&self.memory_path(), MEMORY_TEMPLATE)
-            .await?;
-        self.ensure_file(&self.active_path(), ACTIVE_TEMPLATE)
-            .await?;
+        fs.ensure_file(&self.memory_rel_path(), MEMORY_TEMPLATE)?;
+        fs.ensure_file(&self.active_rel_path(), ACTIVE_TEMPLATE)?;
         self.rebuild_index().await?;
         Ok(())
     }
 
     pub async fn append_daily_event(&self, event: ContinuityEvent) -> Result<PathBuf> {
         let _guard = self.daily_note_lock.lock().await;
-        let path = self.daily_note_path(event.at);
-        self.prepare_write_path(&path).await?;
+        let fs = self.fs().await?;
+        let relative = self.daily_note_path(event.at);
 
         let mut entry = format!(
             "## {} UTC - {}\n",
@@ -233,35 +278,21 @@ impl ContinuityLayout {
         }
         entry.push('\n');
 
-        let exists = tokio::fs::try_exists(&path)
-            .await
-            .with_context(|| format!("failed to stat {}", path.display()))?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await
-            .with_context(|| format!("failed to open {}", path.display()))?;
-        if !exists {
-            file.write_all(
-                format!("# Daily Continuity {}\n\n", event.at.format("%Y-%m-%d")).as_bytes(),
-            )
-            .await
-            .with_context(|| format!("failed to initialize {}", path.display()))?;
-        }
-        file.write_all(entry.as_bytes())
-            .await
-            .with_context(|| format!("failed to append {}", path.display()))?;
-        file.flush()
-            .await
-            .with_context(|| format!("failed to flush {}", path.display()))?;
-        self.sync_index_path(&path).await?;
-        Ok(path)
+        fs.append_string_with_header(
+            &relative,
+            Some(&format!(
+                "# Daily Continuity {}\n\n",
+                event.at.format("%Y-%m-%d")
+            )),
+            &entry,
+        )?;
+        self.sync_index_relative(&relative).await?;
+        Ok(fs.absolute_path(&relative))
     }
 
     pub async fn record_artifact(&self, artifact: ContinuityArtifact) -> Result<PathBuf> {
-        let path = self.artifact_path(artifact.at, &artifact.slug);
-        self.prepare_write_path(&path).await?;
+        let fs = self.fs().await?;
+        let relative = self.artifact_path(artifact.at, &artifact.slug);
 
         let mut content = format!("# {}\n\n", artifact.title.trim());
         content.push_str(&format!("- Kind: {}\n", artifact.kind.trim()));
@@ -286,11 +317,9 @@ impl ContinuityLayout {
         content.push_str(artifact.body.trim());
         content.push('\n');
 
-        tokio::fs::write(&path, content)
-            .await
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        self.sync_index_path(&path).await?;
-        Ok(path)
+        fs.write_string(&relative, &content)?;
+        self.sync_index_relative(&relative).await?;
+        Ok(fs.absolute_path(&relative))
     }
 
     pub async fn upsert_open_loop(
@@ -298,17 +327,10 @@ impl ContinuityLayout {
         loop_draft: &ContinuityOpenLoopDraft,
     ) -> Result<Option<PathBuf>> {
         let _guard = self.open_loop_lock.lock().await;
-        let path = self.open_loop_path(&loop_draft.title);
-        self.prepare_write_path(&path).await?;
-        let archived_path = self.open_loops_archive_dir().join(
-            path.file_name()
-                .ok_or_else(|| anyhow!("invalid open loop path"))?,
-        );
-        if self.path_exists_canonically(&archived_path).await? {
-            return Ok(None);
-        }
+        let fs = self.fs().await?;
+        let relative = self.open_loop_path(&loop_draft.title);
 
-        if let Ok(existing) = tokio::fs::read_to_string(&path).await {
+        if let Ok(existing) = fs.read_to_string(&relative) {
             let same_title =
                 extract_heading(&existing).unwrap_or_default().trim() == loop_draft.title.trim();
             let same_summary = metadata_value(&existing, "Summary")
@@ -348,20 +370,17 @@ impl ContinuityLayout {
         }
         content.push('\n');
 
-        tokio::fs::write(&path, content)
-            .await
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        self.sync_index_path(&path).await?;
-        Ok(Some(path))
+        fs.write_string(&relative, &content)?;
+        self.sync_index_relative(&relative).await?;
+        Ok(Some(fs.absolute_path(&relative)))
     }
 
     pub async fn resolve_open_loop(&self, relative_path: &str) -> Result<PathBuf> {
         let _guard = self.open_loop_lock.lock().await;
+        let fs = self.fs().await?;
         let source = self.resolve_relative_file(relative_path)?;
-        ensure_path_is_under(&source, &self.open_loops_dir())?;
-        let mut content = tokio::fs::read_to_string(&source)
-            .await
-            .with_context(|| format!("failed to read {}", source.display()))?;
+        ensure_relative_path_is_under(&source, &self.open_loops_rel_dir())?;
+        let mut content = fs.read_to_string(&source)?;
         content = replace_or_insert_metadata(
             &content,
             "Status",
@@ -370,21 +389,14 @@ impl ContinuityLayout {
             format!("{} UTC", Utc::now().to_rfc3339()),
         );
 
-        let target = self.open_loops_archive_dir().join(
-            source
-                .file_name()
-                .ok_or_else(|| anyhow!("invalid open loop path"))?,
-        );
-        self.prepare_write_path(&target).await?;
-        tokio::fs::write(&source, &content)
-            .await
-            .with_context(|| format!("failed to update {}", source.display()))?;
-        tokio::fs::rename(&source, &target)
-            .await
-            .with_context(|| format!("failed to archive {}", source.display()))?;
-        self.remove_index_path(&source).await?;
-        self.sync_index_path(&target).await?;
-        Ok(target)
+        let target = self
+            .open_loops_archive_rel_dir()
+            .join(archive_file_name(&source)?);
+        fs.write_string(&source, &content)?;
+        fs.rename(&source, &target)?;
+        self.remove_index_relative(&source).await?;
+        self.sync_index_relative(&target).await?;
+        Ok(fs.absolute_path(&target))
     }
 
     pub async fn record_memory_proposal(
@@ -404,28 +416,8 @@ impl ContinuityLayout {
         }
 
         let _guard = self.proposal_lock.lock().await;
-        let path = self.memory_proposal_path(&proposal.title);
-        self.prepare_write_path(&path).await?;
-        let file_name = path
-            .file_name()
-            .ok_or_else(|| anyhow!("invalid proposal path"))?;
-        if self
-            .path_exists_canonically(
-                &self
-                    .archived_memory_proposals_dir(MERGED_DIR)
-                    .join(file_name),
-            )
-            .await?
-            || self
-                .path_exists_canonically(
-                    &self
-                        .archived_memory_proposals_dir(REJECTED_DIR)
-                        .join(file_name),
-                )
-                .await?
-        {
-            return Ok(None);
-        }
+        let fs = self.fs().await?;
+        let relative = self.memory_proposal_path(&proposal.title);
 
         let mut content = format!("# Memory Proposal: {}\n\n", proposal.title.trim());
         content.push_str("- Status: proposed\n");
@@ -447,9 +439,13 @@ impl ContinuityLayout {
         }
         content.push('\n');
 
-        let existing = tokio::fs::read_to_string(&path).await.ok();
+        let existing = fs.read_to_string(&relative).ok();
         if let Some(existing) = existing {
-            let parsed = parse_memory_proposal(&self.workspace_root, &path, &existing);
+            let parsed = parse_memory_proposal(
+                &self.workspace_root,
+                &fs.absolute_path(&relative),
+                &existing,
+            );
             let same_title = parsed.title.trim() == proposal.title.trim();
             let same_rationale =
                 parsed.rationale.unwrap_or_default().trim() == proposal.rationale.trim();
@@ -459,41 +455,42 @@ impl ContinuityLayout {
             }
         }
 
-        tokio::fs::write(&path, content)
-            .await
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        self.sync_index_path(&path).await?;
-        Ok(Some(path))
+        fs.write_string(&relative, &content)?;
+        self.sync_index_relative(&relative).await?;
+        Ok(Some(fs.absolute_path(&relative)))
     }
 
     pub async fn list_memory_proposals(
         &self,
         limit: usize,
     ) -> Result<Vec<ContinuityMemoryProposal>> {
-        let mut files = list_markdown_files(&self.memory_proposals_dir()).await?;
-        files.retain(|path| is_direct_child(path, &self.memory_proposals_dir()));
-        files = sort_paths_by_modified_desc(files).await?;
+        let fs = self.fs().await?;
+        let mut files = fs.list_markdown_files(&self.memory_proposals_rel_dir())?;
+        files.retain(|path| is_direct_child(path, &self.memory_proposals_rel_dir()));
+        files = self.sort_relative_paths_by_modified_desc(files).await?;
 
         let mut proposals = Vec::new();
         for path in files.into_iter().take(limit) {
-            let content = tokio::fs::read_to_string(&path)
-                .await
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            proposals.push(parse_memory_proposal(&self.workspace_root, &path, &content));
+            let content = fs.read_to_string(&path)?;
+            proposals.push(parse_memory_proposal(
+                &self.workspace_root,
+                &fs.absolute_path(&path),
+                &content,
+            ));
         }
         Ok(proposals)
     }
 
     pub async fn merge_memory_proposal(&self, relative_path: &str) -> Result<PathBuf> {
         let _guard = self.proposal_lock.lock().await;
+        let fs = self.fs().await?;
         let path = self.resolve_relative_file(relative_path)?;
-        ensure_path_is_under(&path, &self.memory_proposals_dir())?;
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let proposal = parse_memory_proposal(&self.workspace_root, &path, &content);
+        ensure_relative_path_is_under(&path, &self.memory_proposals_rel_dir())?;
+        let content = fs.read_to_string(&path)?;
+        let proposal =
+            parse_memory_proposal(&self.workspace_root, &fs.absolute_path(&path), &content);
         self.append_memory_entries(&proposal.entries).await?;
-        self.sync_index_path(&self.memory_path()).await?;
+        self.sync_index_relative(&self.memory_rel_path()).await?;
         let archived = self.archive_memory_proposal(&path, MERGED_DIR).await?;
         Ok(archived)
     }
@@ -501,12 +498,12 @@ impl ContinuityLayout {
     pub async fn reject_memory_proposal(&self, relative_path: &str) -> Result<PathBuf> {
         let _guard = self.proposal_lock.lock().await;
         let path = self.resolve_relative_file(relative_path)?;
-        ensure_path_is_under(&path, &self.memory_proposals_dir())?;
+        ensure_relative_path_is_under(&path, &self.memory_proposals_rel_dir())?;
         self.archive_memory_proposal(&path, REJECTED_DIR).await
     }
 
     pub async fn write_active(&self, snapshot: &ActiveContinuitySnapshot) -> Result<()> {
-        self.prepare_write_path(&self.active_path()).await?;
+        let fs = self.fs().await?;
         let mut sections = vec!["# Active Context".to_string()];
         if snapshot.matters_today.is_empty()
             && snapshot.open_loops.is_empty()
@@ -531,27 +528,24 @@ impl ContinuityLayout {
             push_list_section(&mut sections, "Recent Outputs", &snapshot.recent_outputs);
         }
 
-        tokio::fs::write(self.active_path(), sections.join("\n\n") + "\n")
-            .await
-            .with_context(|| format!("failed to write {}", self.active_path().display()))?;
-        self.sync_index_path(&self.active_path()).await?;
+        fs.write_string(&self.active_rel_path(), &(sections.join("\n\n") + "\n"))?;
+        self.sync_index_relative(&self.active_rel_path()).await?;
         Ok(())
     }
 
     pub async fn list_active_open_loops(&self) -> Result<Vec<ContinuityOpenLoop>> {
-        let mut files = list_markdown_files(&self.open_loops_dir()).await?;
-        files.retain(|path| is_direct_child(path, &self.open_loops_dir()));
-        files = sort_paths_by_modified_desc(files).await?;
+        let fs = self.fs().await?;
+        let mut files = fs.list_markdown_files(&self.open_loops_rel_dir())?;
+        files.retain(|path| is_direct_child(path, &self.open_loops_rel_dir()));
+        files = self.sort_relative_paths_by_modified_desc(files).await?;
 
         let mut loops = Vec::new();
         for path in files {
-            let content = tokio::fs::read_to_string(&path)
-                .await
-                .with_context(|| format!("failed to read {}", path.display()))?;
+            let content = fs.read_to_string(&path)?;
             let title = extract_heading(&content).unwrap_or_else(|| stem_fallback(&path));
             loops.push(ContinuityOpenLoop {
                 title,
-                relative_path: relative_path(&self.workspace_root, &path),
+                relative_path: path.to_string_lossy().to_string(),
                 summary: metadata_value(&content, "Summary"),
                 next_step: metadata_value(&content, "Next Step"),
             });
@@ -563,17 +557,16 @@ impl ContinuityLayout {
         &self,
         limit: usize,
     ) -> Result<Vec<ContinuityArtifactSummary>> {
-        let mut files = list_markdown_files(&self.artifacts_dir()).await?;
-        files = sort_paths_by_modified_desc(files).await?;
+        let fs = self.fs().await?;
+        let mut files = fs.list_markdown_files(&self.artifacts_rel_dir())?;
+        files = self.sort_relative_paths_by_modified_desc(files).await?;
 
         let mut artifacts = Vec::new();
         for path in files.into_iter().take(limit) {
-            let content = tokio::fs::read_to_string(&path)
-                .await
-                .with_context(|| format!("failed to read {}", path.display()))?;
+            let content = fs.read_to_string(&path)?;
             artifacts.push(ContinuityArtifactSummary {
                 title: extract_heading(&content).unwrap_or_else(|| stem_fallback(&path)),
-                relative_path: relative_path(&self.workspace_root, &path),
+                relative_path: path.to_string_lossy().to_string(),
             });
         }
         Ok(artifacts)
@@ -582,8 +575,8 @@ impl ContinuityLayout {
     pub async fn status(&self) -> Result<ContinuityStatus> {
         let latest_daily_path = self.latest_daily_note_path().await?;
         Ok(ContinuityStatus {
-            memory_path: relative_path(&self.workspace_root, &self.memory_path()),
-            active_path: relative_path(&self.workspace_root, &self.active_path()),
+            memory_path: self.memory_rel_path().to_string_lossy().to_string(),
+            active_path: self.active_rel_path().to_string_lossy().to_string(),
             latest_daily_path,
             open_loops: self.list_active_open_loops().await?,
             recent_artifacts: self.list_recent_artifacts(5).await?,
@@ -612,19 +605,18 @@ impl ContinuityLayout {
             }
         }
 
-        let mut paths = vec![self.ensure_canonical_continuity_path(&self.memory_path())?];
-        paths.extend(list_markdown_files(&self.continuity_dir()).await?);
-        paths = sort_paths_by_modified_desc(paths).await?;
+        let fs = self.fs().await?;
+        let mut paths = vec![self.memory_rel_path()];
+        paths.extend(fs.list_markdown_files(&self.continuity_rel_dir())?);
+        paths = self.sort_relative_paths_by_modified_desc(paths).await?;
 
         let mut matches = Vec::new();
         for path in paths {
-            let content = tokio::fs::read_to_string(&path)
-                .await
-                .with_context(|| format!("failed to read {}", path.display()))?;
+            let content = fs.read_to_string(&path)?;
             if let Some(snippet) = search_snippet(&content, &needle) {
                 matches.push(ContinuitySearchMatch {
                     title: extract_heading(&content).unwrap_or_else(|| stem_fallback(&path)),
-                    relative_path: relative_path(&self.workspace_root, &path),
+                    relative_path: path.to_string_lossy().to_string(),
                     snippet,
                 });
             }
@@ -636,40 +628,38 @@ impl ContinuityLayout {
     }
 
     pub async fn read_relative(&self, relative_path: &str) -> Result<String> {
+        let fs = self.fs().await?;
         let path = self.resolve_canonical_read_path(relative_path)?;
-        tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("failed to read {}", path.display()))
+        fs.read_to_string(&path)
     }
 
     pub async fn memory_proposal_metadata(
         &self,
         relative_path: &str,
     ) -> Result<ContinuityItemMetadata> {
+        let fs = self.fs().await?;
         let path = self.resolve_relative_file(relative_path)?;
-        ensure_path_is_under(&path, &self.memory_proposals_dir())?;
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let proposal = parse_memory_proposal(&self.workspace_root, &path, &content);
+        ensure_relative_path_is_under(&path, &self.memory_proposals_rel_dir())?;
+        let content = fs.read_to_string(&path)?;
+        let proposal =
+            parse_memory_proposal(&self.workspace_root, &fs.absolute_path(&path), &content);
         Ok(ContinuityItemMetadata {
             title: proposal.title,
         })
     }
 
     pub async fn open_loop_metadata(&self, relative_path: &str) -> Result<ContinuityItemMetadata> {
+        let fs = self.fs().await?;
         let path = self.resolve_relative_file(relative_path)?;
-        ensure_path_is_under(&path, &self.open_loops_dir())?;
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("failed to read {}", path.display()))?;
+        ensure_relative_path_is_under(&path, &self.open_loops_rel_dir())?;
+        let content = fs.read_to_string(&path)?;
         Ok(ContinuityItemMetadata {
             title: extract_heading(&content).unwrap_or_else(|| stem_fallback(&path)),
         })
     }
 
     fn daily_note_path(&self, at: DateTime<Utc>) -> PathBuf {
-        self.daily_dir()
+        self.daily_rel_dir()
             .join(format!("{:04}", at.year()))
             .join(format!("{:02}", at.month()))
             .join(format!(
@@ -681,7 +671,7 @@ impl ContinuityLayout {
     }
 
     fn artifact_path(&self, at: DateTime<Utc>, slug: &str) -> PathBuf {
-        self.artifacts_dir()
+        self.artifacts_rel_dir()
             .join(format!("{:04}", at.year()))
             .join(format!("{:02}", at.month()))
             .join(format!(
@@ -694,19 +684,16 @@ impl ContinuityLayout {
     }
 
     fn open_loop_path(&self, title: &str) -> PathBuf {
-        self.open_loops_dir()
-            .join(format!("{}.md", sanitize_slug(title)))
+        self.open_loops_rel_dir().join(title_file_name(title))
     }
 
     fn memory_proposal_path(&self, title: &str) -> PathBuf {
-        self.memory_proposals_dir()
-            .join(format!("{}.md", sanitize_slug(title)))
+        self.memory_proposals_rel_dir().join(title_file_name(title))
     }
 
     async fn archive_memory_proposal(&self, source: &Path, status: &str) -> Result<PathBuf> {
-        let mut content = tokio::fs::read_to_string(source)
-            .await
-            .with_context(|| format!("failed to read {}", source.display()))?;
+        let fs = self.fs().await?;
+        let mut content = fs.read_to_string(source)?;
         content = replace_or_insert_metadata(
             &content,
             "Status",
@@ -715,86 +702,74 @@ impl ContinuityLayout {
             format!("{} UTC", Utc::now().to_rfc3339()),
         );
 
-        let target = self.archived_memory_proposals_dir(status).join(
-            source
-                .file_name()
-                .ok_or_else(|| anyhow!("invalid proposal path"))?,
-        );
-        self.prepare_write_path(&target).await?;
-        tokio::fs::write(source, &content)
-            .await
-            .with_context(|| format!("failed to update {}", source.display()))?;
-        tokio::fs::rename(source, &target)
-            .await
-            .with_context(|| format!("failed to archive {}", source.display()))?;
-        self.remove_index_path(source).await?;
-        self.sync_index_path(&target).await?;
-        Ok(target)
+        let target = self
+            .archived_memory_proposals_rel_dir(status)
+            .join(archive_file_name(source)?);
+        fs.write_string(source, &content)?;
+        fs.rename(source, &target)?;
+        self.remove_index_relative(source).await?;
+        self.sync_index_relative(&target).await?;
+        Ok(fs.absolute_path(&target))
     }
 
     async fn latest_daily_note_path(&self) -> Result<Option<String>> {
-        let mut files = list_markdown_files(&self.daily_dir()).await?;
-        files = sort_paths_by_modified_desc(files).await?;
+        let fs = self.fs().await?;
+        let mut files = fs.list_markdown_files(&self.daily_rel_dir())?;
+        files = self.sort_relative_paths_by_modified_desc(files).await?;
         Ok(files
             .into_iter()
             .next()
-            .map(|path| relative_path(&self.workspace_root, &path)))
+            .map(|path| path.to_string_lossy().to_string()))
     }
 
     async fn rebuild_index(&self) -> Result<()> {
         let Some(index_store) = &self.index_store else {
             return Ok(());
         };
-        let mut paths = vec![self.ensure_canonical_continuity_path(&self.memory_path())?];
-        paths.extend(list_markdown_files(&self.continuity_dir()).await?);
+        let fs = self.fs().await?;
+        let mut paths = vec![self.memory_rel_path()];
+        paths.extend(fs.list_markdown_files(&self.continuity_rel_dir())?);
         let mut documents = Vec::new();
         for path in paths {
-            if !tokio::fs::try_exists(&path)
-                .await
-                .with_context(|| format!("failed to stat {}", path.display()))?
-            {
-                continue;
-            }
             documents.push(self.read_index_document(&path).await?);
         }
         index_store.replace_all(&documents).await
     }
 
-    async fn sync_index_path(&self, path: &Path) -> Result<()> {
+    async fn sync_index_relative(&self, path: &Path) -> Result<()> {
         let Some(index_store) = &self.index_store else {
             return Ok(());
         };
-        if !tokio::fs::try_exists(path)
-            .await
-            .with_context(|| format!("failed to stat {}", path.display()))?
-        {
-            self.remove_index_path(path).await?;
-            return Ok(());
+        let fs = self.fs().await?;
+        if let Err(err) = fs.read_to_string(path) {
+            if err.downcast_ref::<std::io::Error>().is_some()
+                || err.downcast_ref::<rustix::io::Errno>().is_some()
+            {
+                self.remove_index_relative(path).await?;
+                return Ok(());
+            }
+            return Err(err);
         }
         let document = self.read_index_document(path).await?;
         index_store.upsert(&document).await
     }
 
-    async fn remove_index_path(&self, path: &Path) -> Result<()> {
+    async fn remove_index_relative(&self, path: &Path) -> Result<()> {
         let Some(index_store) = &self.index_store else {
             return Ok(());
         };
-        index_store
-            .remove(&relative_path(&self.workspace_root, path))
-            .await
+        index_store.remove(&path.to_string_lossy()).await
     }
 
     async fn read_index_document(&self, path: &Path) -> Result<ContinuityIndexedDocument> {
-        let canonical_path = self.ensure_canonical_continuity_path(path)?;
-        let body = tokio::fs::read_to_string(&canonical_path)
-            .await
-            .with_context(|| format!("failed to read {}", canonical_path.display()))?;
-        let title = extract_heading(&body).unwrap_or_else(|| stem_fallback(&canonical_path));
+        let fs = self.fs().await?;
+        let body = fs.read_to_string(path)?;
+        let title = extract_heading(&body).unwrap_or_else(|| stem_fallback(path));
         Ok(ContinuityIndexedDocument {
-            relative_path: relative_path(&self.workspace_root, &canonical_path),
+            relative_path: path.to_string_lossy().to_string(),
             title,
             body,
-            updated_at_ms: file_updated_at_ms(&canonical_path).await?,
+            updated_at_ms: fs.modified_at_ms(path)?,
         })
     }
 
@@ -816,108 +791,26 @@ impl ContinuityLayout {
                 }
             }
         }
-        Ok(self.workspace_root.join(requested))
+        Ok(requested.to_path_buf())
     }
 
     fn resolve_canonical_read_path(&self, relative_path: &str) -> Result<PathBuf> {
         let path = self.resolve_relative_file(relative_path)?;
-        self.ensure_canonical_continuity_path(&path)
-    }
-
-    async fn ensure_directory_path(&self, dir: &Path) -> Result<PathBuf> {
-        tokio::fs::create_dir_all(dir)
-            .await
-            .with_context(|| format!("failed to create {}", dir.display()))?;
-        let canonical_dir = dir
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", dir.display()))?;
-        let expected_dir = self.expected_canonical_path(dir)?;
-        if canonical_dir == expected_dir {
-            Ok(canonical_dir)
+        if path == self.memory_rel_path() || path.starts_with(self.continuity_rel_dir()) {
+            Ok(path)
         } else {
             bail!(
                 "continuity path '{}' is outside canonical continuity files",
-                dir.display()
+                relative_path
             );
-        }
-    }
-
-    async fn ensure_workspace_root(&self) -> Result<PathBuf> {
-        tokio::fs::create_dir_all(&self.workspace_root)
-            .await
-            .with_context(|| format!("failed to create {}", self.workspace_root.display()))?;
-        let canonical_root = self
-            .workspace_root
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", self.workspace_root.display()))?;
-        let expected_root = expected_canonical_root(&self.workspace_root)?;
-        if canonical_root == expected_root {
-            Ok(canonical_root)
-        } else {
-            bail!(
-                "continuity workspace root '{}' is outside assistant home",
-                self.workspace_root.display()
-            );
-        }
-    }
-
-    async fn prepare_write_path(&self, path: &Path) -> Result<()> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow!("path '{}' has no parent", path.display()))?;
-        self.ensure_directory_path(parent).await?;
-        if self.path_exists_canonically(path).await? {
-            let canonical_path = path
-                .canonicalize()
-                .with_context(|| format!("failed to canonicalize {}", path.display()))?;
-            let expected_path = self.expected_canonical_path(path)?;
-            if canonical_path != expected_path {
-                bail!(
-                    "continuity path '{}' is outside canonical continuity files",
-                    path.display()
-                );
-            }
-        }
-        Ok(())
-    }
-
-    async fn path_exists_canonically(&self, path: &Path) -> Result<bool> {
-        if !tokio::fs::try_exists(path)
-            .await
-            .with_context(|| format!("failed to stat {}", path.display()))?
-        {
-            return Ok(false);
-        }
-        let canonical_path = path
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", path.display()))?;
-        let expected_path = self.expected_canonical_path(path)?;
-        if canonical_path == expected_path {
-            Ok(true)
-        } else {
-            bail!(
-                "continuity path '{}' is outside canonical continuity files",
-                path.display()
-            );
-        }
-    }
-
-    async fn ensure_file(&self, path: &Path, content: &str) -> Result<()> {
-        self.prepare_write_path(path).await?;
-        match tokio::fs::try_exists(path).await {
-            Ok(true) => Ok(()),
-            Ok(false) => tokio::fs::write(path, content)
-                .await
-                .with_context(|| format!("failed to write {}", path.display())),
-            Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
         }
     }
 
     async fn append_memory_entries(&self, entries: &[String]) -> Result<()> {
-        let path = self.memory_path();
-        self.prepare_write_path(&path).await?;
-        let existing = tokio::fs::read_to_string(&path)
-            .await
+        let fs = self.fs().await?;
+        let path = self.memory_rel_path();
+        let existing = fs
+            .read_to_string(&path)
             .unwrap_or_else(|_| MEMORY_TEMPLATE.to_string());
         let mut deduped_existing = BTreeSet::new();
         for line in existing.lines() {
@@ -951,120 +844,37 @@ impl ContinuityLayout {
         for entry in new_entries {
             content.push_str(&format!("- {}\n", entry));
         }
-        tokio::fs::write(&path, content)
-            .await
-            .with_context(|| format!("failed to write {}", path.display()))
-    }
-
-    fn ensure_canonical_continuity_path(&self, path: &Path) -> Result<PathBuf> {
-        let canonical_path = path
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", path.display()))?;
-        let canonical_workspace = self
-            .workspace_root
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", self.workspace_root.display()))?;
-        let expected_memory = canonical_workspace.join("MEMORY.md");
-        if canonical_path == expected_memory {
-            return Ok(canonical_path);
-        }
-
-        let expected_continuity = canonical_workspace.join("continuity");
-        if canonical_path.starts_with(&expected_continuity) {
-            Ok(canonical_path)
-        } else {
-            bail!(
-                "continuity path '{}' is outside canonical continuity files",
-                path.display()
-            );
-        }
-    }
-
-    fn expected_canonical_path(&self, path: &Path) -> Result<PathBuf> {
-        let canonical_workspace = self
-            .workspace_root
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", self.workspace_root.display()))?;
-        let relative = path
-            .strip_prefix(&self.workspace_root)
-            .with_context(|| format!("path '{}' is outside workspace root", path.display()))?;
-        Ok(canonical_workspace.join(relative))
+        fs.write_string(&path, &content)
     }
 }
 
-pub fn continuity_prompt_sections(workspace_root: &Path) -> Vec<(String, PathBuf)> {
-    let layout = ContinuityLayout::new(workspace_root);
-    vec![
-        ("MEMORY.md".to_string(), layout.memory_path()),
-        ("continuity/ACTIVE.md".to_string(), layout.active_path()),
-    ]
-}
-
-async fn file_updated_at_ms(path: &Path) -> Result<i64> {
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .with_context(|| format!("failed to stat {}", path.display()))?;
-    let modified = metadata
-        .modified()
-        .with_context(|| format!("failed to read mtime for {}", path.display()))?;
-    let duration = modified
-        .duration_since(UNIX_EPOCH)
-        .with_context(|| format!("mtime for {} is before unix epoch", path.display()))?;
-    i64::try_from(duration.as_millis()).context("mtime is too large to fit in i64")
-}
-
-async fn sort_paths_by_modified_desc(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
-    let mut dated = Vec::with_capacity(paths.len());
-    for path in paths {
-        dated.push((file_updated_at_ms(&path).await?, path));
-    }
-    dated.sort_by(|left, right| right.cmp(left));
-    Ok(dated.into_iter().map(|(_, path)| path).collect())
-}
-
-async fn list_markdown_files(root: &Path) -> Result<Vec<PathBuf>> {
-    if !tokio::fs::try_exists(root)
-        .await
-        .with_context(|| format!("failed to stat {}", root.display()))?
-    {
-        return Ok(Vec::new());
-    }
-
-    let expected_root = expected_canonical_root(root)?;
-    let canonical_root = root
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", root.display()))?;
-    if canonical_root != expected_root {
-        bail!(
-            "continuity root '{}' is outside assistant home",
-            root.display()
-        );
-    }
-
-    let mut pending = VecDeque::from([expected_root]);
-    let mut files = Vec::new();
-    while let Some(dir) = pending.pop_front() {
-        let mut entries = tokio::fs::read_dir(&dir)
-            .await
-            .with_context(|| format!("failed to read {}", dir.display()))?;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .with_context(|| format!("failed to iterate {}", dir.display()))?
-        {
-            let path = entry.path();
-            let file_type = entry
-                .file_type()
-                .await
-                .with_context(|| format!("failed to stat {}", path.display()))?;
-            if file_type.is_dir() {
-                pending.push_back(path);
-            } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "md") {
-                files.push(path);
+impl ContinuityLayout {
+    pub async fn read_prompt_sections(&self) -> Result<Vec<(String, String)>> {
+        let fs = self.fs().await?;
+        let mut sections = Vec::new();
+        for (label, path) in [
+            ("MEMORY.md".to_string(), self.memory_rel_path()),
+            ("continuity/ACTIVE.md".to_string(), self.active_rel_path()),
+        ] {
+            if let Ok(content) = fs.read_to_string(&path) {
+                sections.push((label, content));
             }
         }
+        Ok(sections)
     }
-    Ok(files)
+
+    async fn sort_relative_paths_by_modified_desc(
+        &self,
+        paths: Vec<PathBuf>,
+    ) -> Result<Vec<PathBuf>> {
+        let fs = self.fs().await?;
+        let mut dated = Vec::with_capacity(paths.len());
+        for path in paths {
+            dated.push((fs.modified_at_ms(&path)?, path));
+        }
+        dated.sort_by(|left, right| right.cmp(left));
+        Ok(dated.into_iter().map(|(_, path)| path).collect())
+    }
 }
 
 fn push_list_section(sections: &mut Vec<String>, title: &str, items: &[String]) {
@@ -1162,6 +972,38 @@ fn sanitize_slug(slug: &str) -> String {
     normalized.trim_matches('-').to_string()
 }
 
+fn normalized_title_key(title: &str) -> String {
+    title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn title_file_name(title: &str) -> String {
+    let normalized = normalized_title_key(title);
+    let slug = sanitize_slug(&normalized);
+    let slug = if slug.is_empty() {
+        "item"
+    } else {
+        slug.as_str()
+    };
+    let key = Uuid::new_v5(
+        &Uuid::from_u128(0x5f026ae9551b4d3ea511f0f2d74cf241),
+        normalized.as_bytes(),
+    );
+    format!("{}--{}.md", slug, key)
+}
+
+fn archive_file_name(source: &Path) -> Result<String> {
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("continuity archive path '{}' is invalid", source.display()))?;
+    Ok(format!("{}--{}.md", stem, Uuid::new_v4()))
+}
+
 fn dedupe_lines(values: &[&str]) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut deduped = Vec::new();
@@ -1199,29 +1041,12 @@ fn is_direct_child(path: &Path, root: &Path) -> bool {
     path.parent().is_some_and(|parent| parent == root)
 }
 
-fn ensure_path_is_under(path: &Path, root: &Path) -> Result<()> {
-    let canonical_root = expected_canonical_root(root)?;
-    let canonical_path = path
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", path.display()))?;
-    if canonical_path == canonical_root || canonical_path.starts_with(&canonical_root) {
+fn ensure_relative_path_is_under(path: &Path, root: &Path) -> Result<()> {
+    if path == root || path.starts_with(root) {
         Ok(())
     } else {
         bail!("path '{}' is outside '{}'", path.display(), root.display());
     }
-}
-
-fn expected_canonical_root(root: &Path) -> Result<PathBuf> {
-    let root_parent = root
-        .parent()
-        .ok_or_else(|| anyhow!("root '{}' has no parent", root.display()))?;
-    let canonical_root_parent = root_parent
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", root_parent.display()))?;
-    let root_name = root
-        .file_name()
-        .ok_or_else(|| anyhow!("root '{}' has no file name", root.display()))?;
-    Ok(canonical_root_parent.join(root_name))
 }
 
 fn replace_or_insert_metadata(
@@ -1279,8 +1104,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        continuity_prompt_sections, ActiveContinuitySnapshot, ContinuityArtifact, ContinuityEvent,
-        ContinuityLayout, ContinuityMemoryProposalDraft, ContinuityOpenLoopDraft,
+        title_file_name, ActiveContinuitySnapshot, ContinuityArtifact, ContinuityEvent,
+        ContinuityLayout, ContinuityMemoryProposalDraft, ContinuityOpenLoopDraft, MERGED_DIR,
     };
     use crate::kernel::{continuity_index::ContinuityIndexStore, db::Db};
 
@@ -1298,7 +1123,10 @@ mod tests {
         assert!(layout.continuity_dir().join("artifacts").exists());
         assert!(layout.continuity_dir().join("proposals/memory").exists());
 
-        let prompt_sections = continuity_prompt_sections(layout.workspace_root());
+        let prompt_sections = layout
+            .read_prompt_sections()
+            .await
+            .expect("prompt sections");
         assert_eq!(prompt_sections.len(), 2);
     }
 
@@ -1451,6 +1279,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_same_title_archives_preserve_history() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let layout = ContinuityLayout::new(temp_dir.path().join("workspace"));
+        layout.ensure_base_layout().await.expect("bootstrap");
+
+        let merged_archive_dir = layout
+            .workspace_root()
+            .join(layout.archived_memory_proposals_rel_dir(MERGED_DIR));
+        let loop_archive_dir = layout
+            .workspace_root()
+            .join(layout.open_loops_archive_rel_dir());
+
+        let first_proposal = layout
+            .record_memory_proposal(&ContinuityMemoryProposalDraft {
+                title: "Release Preferences".to_string(),
+                rationale: "first".to_string(),
+                entries: vec!["Keep releases small.".to_string()],
+                source: Some("session:first".to_string()),
+            })
+            .await
+            .expect("record first proposal")
+            .expect("first proposal path");
+        let first_proposal_relative = first_proposal
+            .strip_prefix(layout.workspace_root())
+            .expect("first proposal relative")
+            .to_string_lossy()
+            .to_string();
+        let first_merged = layout
+            .merge_memory_proposal(&first_proposal_relative)
+            .await
+            .expect("merge first proposal");
+
+        let second_proposal = layout
+            .record_memory_proposal(&ContinuityMemoryProposalDraft {
+                title: "Release Preferences".to_string(),
+                rationale: "second".to_string(),
+                entries: vec!["Verify release notes before tagging.".to_string()],
+                source: Some("session:second".to_string()),
+            })
+            .await
+            .expect("record second proposal")
+            .expect("second proposal path");
+        let second_proposal_relative = second_proposal
+            .strip_prefix(layout.workspace_root())
+            .expect("second proposal relative")
+            .to_string_lossy()
+            .to_string();
+        let second_merged = layout
+            .merge_memory_proposal(&second_proposal_relative)
+            .await
+            .expect("merge second proposal");
+
+        assert_ne!(first_merged, second_merged);
+        assert_eq!(
+            std::fs::read_dir(&merged_archive_dir)
+                .expect("read merged archive dir")
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "md"))
+                .count(),
+            2
+        );
+
+        let first_loop = layout
+            .upsert_open_loop(&ContinuityOpenLoopDraft {
+                title: "Follow Up On Release Checklist".to_string(),
+                summary: "first summary".to_string(),
+                next_step: "first next step".to_string(),
+                source: Some("session:first".to_string()),
+            })
+            .await
+            .expect("upsert first loop")
+            .expect("first loop path");
+        let first_loop_relative = first_loop
+            .strip_prefix(layout.workspace_root())
+            .expect("first loop relative")
+            .to_string_lossy()
+            .to_string();
+        let first_resolved = layout
+            .resolve_open_loop(&first_loop_relative)
+            .await
+            .expect("resolve first loop");
+
+        let second_loop = layout
+            .upsert_open_loop(&ContinuityOpenLoopDraft {
+                title: "Follow Up On Release Checklist".to_string(),
+                summary: "second summary".to_string(),
+                next_step: "second next step".to_string(),
+                source: Some("session:second".to_string()),
+            })
+            .await
+            .expect("upsert second loop")
+            .expect("second loop path");
+        let second_loop_relative = second_loop
+            .strip_prefix(layout.workspace_root())
+            .expect("second loop relative")
+            .to_string_lossy()
+            .to_string();
+        let second_resolved = layout
+            .resolve_open_loop(&second_loop_relative)
+            .await
+            .expect("resolve second loop");
+
+        assert_ne!(first_resolved, second_resolved);
+        assert_eq!(
+            std::fs::read_dir(&loop_archive_dir)
+                .expect("read loop archive dir")
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "md"))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn open_loops_status_and_search_are_visible() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let layout = ContinuityLayout::new(temp_dir.path().join("workspace"));
@@ -1556,6 +1498,130 @@ mod tests {
             .expect("upsert loop");
         assert!(first_loop.is_some());
         assert!(second_loop.is_none());
+    }
+
+    #[tokio::test]
+    async fn archived_items_are_history_only_and_same_title_items_can_reappear() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let layout = ContinuityLayout::new(temp_dir.path().join("workspace"));
+        layout.ensure_base_layout().await.expect("bootstrap");
+
+        let proposal_path = layout
+            .record_memory_proposal(&ContinuityMemoryProposalDraft {
+                title: "Release Preferences".to_string(),
+                rationale: "durable preference".to_string(),
+                entries: vec!["Keep releases concise.".to_string()],
+                source: Some("session:1".to_string()),
+            })
+            .await
+            .expect("record proposal")
+            .expect("proposal path");
+        let proposal_relative = proposal_path
+            .strip_prefix(layout.workspace_root())
+            .expect("proposal relative")
+            .to_string_lossy()
+            .to_string();
+        let archived_proposal = layout
+            .merge_memory_proposal(&proposal_relative)
+            .await
+            .expect("merge proposal");
+        let recreated_proposal = layout
+            .record_memory_proposal(&ContinuityMemoryProposalDraft {
+                title: "Release Preferences".to_string(),
+                rationale: "fresh preference".to_string(),
+                entries: vec!["Keep releases even shorter.".to_string()],
+                source: Some("session:2".to_string()),
+            })
+            .await
+            .expect("recreate proposal")
+            .expect("recreated proposal path");
+        assert_ne!(
+            archived_proposal.file_name(),
+            recreated_proposal.file_name()
+        );
+        assert_eq!(
+            recreated_proposal
+                .file_name()
+                .and_then(|value| value.to_str()),
+            Some(title_file_name("Release Preferences").as_str()),
+            "same title should map back to the canonical active filename"
+        );
+
+        let loop_path = layout
+            .upsert_open_loop(&ContinuityOpenLoopDraft {
+                title: "Follow Up On Release Checklist".to_string(),
+                summary: "Need the final review.".to_string(),
+                next_step: "Review release checklist".to_string(),
+                source: Some("session:1".to_string()),
+            })
+            .await
+            .expect("record open loop")
+            .expect("open loop path");
+        let loop_relative = loop_path
+            .strip_prefix(layout.workspace_root())
+            .expect("loop relative")
+            .to_string_lossy()
+            .to_string();
+        let archived_loop = layout
+            .resolve_open_loop(&loop_relative)
+            .await
+            .expect("resolve loop");
+        let recreated_loop = layout
+            .upsert_open_loop(&ContinuityOpenLoopDraft {
+                title: "Follow Up On Release Checklist".to_string(),
+                summary: "Need a second pass.".to_string(),
+                next_step: "Run the release review again".to_string(),
+                source: Some("session:2".to_string()),
+            })
+            .await
+            .expect("recreate open loop")
+            .expect("recreated loop path");
+        assert_ne!(archived_loop.file_name(), recreated_loop.file_name());
+        assert_eq!(
+            recreated_loop.file_name().and_then(|value| value.to_str()),
+            Some(title_file_name("Follow Up On Release Checklist").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn different_titles_with_same_slug_get_distinct_canonical_files() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let layout = ContinuityLayout::new(temp_dir.path().join("workspace"));
+        layout.ensure_base_layout().await.expect("bootstrap");
+
+        let first = layout
+            .record_memory_proposal(&ContinuityMemoryProposalDraft {
+                title: "Release/Checklist".to_string(),
+                rationale: "first".to_string(),
+                entries: vec!["First entry.".to_string()],
+                source: None,
+            })
+            .await
+            .expect("record first")
+            .expect("first path");
+        let second = layout
+            .record_memory_proposal(&ContinuityMemoryProposalDraft {
+                title: "Release Checklist".to_string(),
+                rationale: "second".to_string(),
+                entries: vec!["Second entry.".to_string()],
+                source: None,
+            })
+            .await
+            .expect("record second")
+            .expect("second path");
+
+        assert_ne!(first, second);
+        assert!(first
+            .file_name()
+            .expect("first file")
+            .to_string_lossy()
+            .starts_with("release-checklist--"));
+        assert!(second
+            .file_name()
+            .expect("second file")
+            .to_string_lossy()
+            .starts_with("release-checklist--"));
+        assert_ne!(first.file_name(), second.file_name());
     }
 
     #[tokio::test]
@@ -1711,9 +1777,7 @@ mod tests {
             })
             .await
             .expect_err("daily append should fail");
-        assert!(err
-            .to_string()
-            .contains("outside canonical continuity files"));
+        assert!(err.to_string().contains("failed to open"));
 
         let artifacts_dir = layout.artifacts_dir();
         std::fs::remove_dir_all(&artifacts_dir).expect("remove artifacts dir");
@@ -1730,9 +1794,7 @@ mod tests {
             })
             .await
             .expect_err("artifact write should fail");
-        assert!(err
-            .to_string()
-            .contains("outside canonical continuity files"));
+        assert!(err.to_string().contains("failed to open"));
 
         let loops_dir = layout.open_loops_dir();
         std::fs::remove_dir_all(&loops_dir).expect("remove loops dir");
@@ -1746,9 +1808,7 @@ mod tests {
             })
             .await
             .expect_err("open loop write should fail");
-        assert!(err
-            .to_string()
-            .contains("outside canonical continuity files"));
+        assert!(err.to_string().contains("failed to open"));
 
         let proposals_dir = layout.memory_proposals_dir();
         std::fs::remove_dir_all(&proposals_dir).expect("remove proposals dir");
@@ -1762,9 +1822,7 @@ mod tests {
             })
             .await
             .expect_err("proposal write should fail");
-        assert!(err
-            .to_string()
-            .contains("outside canonical continuity files"));
+        assert!(err.to_string().contains("failed to open"));
 
         std::fs::remove_file(&proposals_dir).expect("remove proposal symlink");
         std::fs::create_dir_all(&proposals_dir).expect("restore proposal dir");
@@ -1786,23 +1844,34 @@ mod tests {
             .expect("proposal relative")
             .to_string_lossy()
             .to_string();
-        let err = layout
+        let archived = layout
             .merge_memory_proposal(&relative)
             .await
-            .expect_err("memory merge should fail");
-        assert!(err
-            .to_string()
-            .contains("outside canonical continuity files"));
+            .expect("memory merge should replace symlink leaf");
+        assert!(archived.exists());
+        assert_eq!(
+            std::fs::read_to_string(&outside_memory).expect("read outside memory"),
+            "outside memory\n"
+        );
+        assert!(!std::fs::symlink_metadata(layout.memory_path())
+            .expect("memory metadata")
+            .file_type()
+            .is_symlink());
 
         std::fs::remove_file(layout.active_path()).expect("remove active");
         symlink(&outside_active, layout.active_path()).expect("symlink active");
-        let err = layout
+        layout
             .write_active(&ActiveContinuitySnapshot::default())
             .await
-            .expect_err("active write should fail");
-        assert!(err
-            .to_string()
-            .contains("outside canonical continuity files"));
+            .expect("active write should replace symlink leaf");
+        assert_eq!(
+            std::fs::read_to_string(&outside_active).expect("read outside active"),
+            "outside active\n"
+        );
+        assert!(!std::fs::symlink_metadata(layout.active_path())
+            .expect("active metadata")
+            .file_type()
+            .is_symlink());
     }
 
     #[cfg(unix)]
@@ -1821,6 +1890,6 @@ mod tests {
             .ensure_base_layout()
             .await
             .expect_err("symlinked workspace root should fail");
-        assert!(err.to_string().contains("continuity workspace root"));
+        assert!(err.to_string().contains("failed to open"));
     }
 }

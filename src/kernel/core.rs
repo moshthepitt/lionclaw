@@ -69,11 +69,11 @@ use super::{
     selector::SkillSelector,
     session_compactions::SessionCompactionStore,
     session_transcript::{
-        build_compaction_prompt, dismiss_memory_proposal_in_summary_state, load_repaired_turns,
-        merge_compaction_summary_state, merge_compaction_summary_updates,
-        parse_compaction_summary_state, render_compaction_summary, render_turns_for_prompt,
-        resolve_open_loop_in_summary_state, turns_to_history_views, CompactionSummaryState,
-        TranscriptMode, COMPACTION_RAW_KEEP,
+        build_compaction_prompt, load_repaired_turns, merge_compaction_summary_state,
+        merge_compaction_summary_updates, parse_compaction_summary_state,
+        remove_memory_proposal_from_summary_state, remove_open_loop_from_summary_state,
+        render_compaction_summary, render_turns_for_prompt, turns_to_history_views,
+        CompactionSummaryState, TranscriptMode, COMPACTION_RAW_KEEP,
     },
     session_turns::{NewSessionTurn, SessionTurnCompletion, SessionTurnRecord, SessionTurnStore},
     sessions::SessionStore,
@@ -2589,7 +2589,7 @@ impl Kernel {
             .await
             .map_err(internal)?
         {
-            if !dismiss_memory_proposal_in_summary_state(&mut record.summary_state, title) {
+            if !remove_memory_proposal_from_summary_state(&mut record.summary_state, title) {
                 continue;
             }
             self.session_compactions
@@ -2607,7 +2607,7 @@ impl Kernel {
             .await
             .map_err(internal)?
         {
-            if !resolve_open_loop_in_summary_state(&mut record.summary_state, title) {
+            if !remove_open_loop_from_summary_state(&mut record.summary_state, title) {
                 continue;
             }
             self.session_compactions

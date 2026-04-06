@@ -93,6 +93,7 @@ async fn prompt_loads_assistant_continuity_and_fs_read_uses_project_root() {
                 capability_results: capability_results.clone(),
                 request_fs_read: true,
                 allow_hidden_compaction: false,
+                emit_compaction_continuity: false,
                 reply: "read complete".to_string(),
             }),
         )
@@ -272,6 +273,7 @@ async fn older_turns_are_compacted_into_prompt_context() {
                 capability_results: Arc::new(Mutex::new(Vec::new())),
                 request_fs_read: false,
                 allow_hidden_compaction: true,
+                emit_compaction_continuity: true,
                 reply: "captured".to_string(),
             }),
         )
@@ -282,7 +284,7 @@ async fn older_turns_are_compacted_into_prompt_context() {
         kernel
             .turn_session(SessionTurnRequest {
                 session_id: session.session_id,
-                user_text: format!("turn {}", index),
+                user_text: format!("continuity-marker turn {}", index),
                 runtime_id: Some("capture".to_string()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
@@ -341,6 +343,7 @@ async fn continuity_surface_lists_searches_and_manages_proposals_and_loops() {
                 capability_results: Arc::new(Mutex::new(Vec::new())),
                 request_fs_read: false,
                 allow_hidden_compaction: true,
+                emit_compaction_continuity: true,
                 reply: "captured".to_string(),
             }),
         )
@@ -351,7 +354,10 @@ async fn continuity_surface_lists_searches_and_manages_proposals_and_loops() {
         kernel
             .turn_session(SessionTurnRequest {
                 session_id: session.session_id,
-                user_text: format!("review turn {} in src/kernel/continuity.rs", index),
+                user_text: format!(
+                    "continuity-marker review turn {} in src/kernel/continuity.rs",
+                    index
+                ),
                 runtime_id: Some("capture".to_string()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
@@ -464,6 +470,7 @@ async fn unsafe_runtimes_do_not_receive_hidden_compaction_prompts() {
                 capability_results: Arc::new(Mutex::new(Vec::new())),
                 request_fs_read: false,
                 allow_hidden_compaction: false,
+                emit_compaction_continuity: false,
                 reply: "captured".to_string(),
             }),
         )
@@ -518,6 +525,7 @@ async fn compaction_failures_are_audited_without_failing_completed_turns() {
                 capability_results: Arc::new(Mutex::new(Vec::new())),
                 request_fs_read: false,
                 allow_hidden_compaction: true,
+                emit_compaction_continuity: true,
                 reply: "captured".to_string(),
             }),
         )
@@ -528,7 +536,11 @@ async fn compaction_failures_are_audited_without_failing_completed_turns() {
         kernel
             .turn_session(SessionTurnRequest {
                 session_id: session.session_id,
-                user_text: format!("turn {}", index),
+                user_text: if index == 0 {
+                    "continuity-marker turn 0".to_string()
+                } else {
+                    format!("turn {}", index)
+                },
                 runtime_id: Some("capture".to_string()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
@@ -688,7 +700,7 @@ async fn continuity_mutations_are_audited() {
 }
 
 #[tokio::test]
-async fn merged_and_resolved_items_do_not_reappear_after_later_compaction() {
+async fn merged_and_resolved_items_do_not_reappear_without_new_reintroduction() {
     let env = TestEnv::new();
     bootstrap_workspace(&env.workspace_root())
         .await
@@ -713,17 +725,35 @@ async fn merged_and_resolved_items_do_not_reappear_after_later_compaction() {
                 capability_results: Arc::new(Mutex::new(Vec::new())),
                 request_fs_read: false,
                 allow_hidden_compaction: true,
+                emit_compaction_continuity: true,
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+    kernel
+        .register_runtime_adapter(
+            "capture-empty",
+            Arc::new(CapturePromptAdapter {
+                prompts: Arc::new(Mutex::new(Vec::new())),
+                capability_results: Arc::new(Mutex::new(Vec::new())),
+                request_fs_read: false,
+                allow_hidden_compaction: true,
+                emit_compaction_continuity: false,
                 reply: "captured".to_string(),
             }),
         )
         .await;
 
     let session = open_local_session(&kernel, "continuity-resurrection-peer").await;
-    for index in 0..18 {
+    for index in 0..13 {
         kernel
             .turn_session(SessionTurnRequest {
                 session_id: session.session_id,
-                user_text: format!("seed turn {}", index),
+                user_text: if index == 0 {
+                    "continuity-marker seed turn 0".to_string()
+                } else {
+                    format!("seed turn {}", index)
+                },
                 runtime_id: Some("capture".to_string()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
@@ -757,12 +787,12 @@ async fn merged_and_resolved_items_do_not_reappear_after_later_compaction() {
         .await
         .expect("resolve loop");
 
-    for index in 18..36 {
+    for index in 13..26 {
         kernel
             .turn_session(SessionTurnRequest {
                 session_id: session.session_id,
                 user_text: format!("follow-up turn {}", index),
-                runtime_id: Some("capture".to_string()),
+                runtime_id: Some("capture-empty".to_string()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
                 runtime_env_passthrough: None,
@@ -815,6 +845,20 @@ async fn merged_and_resolved_items_do_not_reappear_from_other_sessions() {
                 capability_results: Arc::new(Mutex::new(Vec::new())),
                 request_fs_read: false,
                 allow_hidden_compaction: true,
+                emit_compaction_continuity: true,
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+    kernel
+        .register_runtime_adapter(
+            "capture-empty",
+            Arc::new(CapturePromptAdapter {
+                prompts: Arc::new(Mutex::new(Vec::new())),
+                capability_results: Arc::new(Mutex::new(Vec::new())),
+                request_fs_read: false,
+                allow_hidden_compaction: true,
+                emit_compaction_continuity: false,
                 reply: "captured".to_string(),
             }),
         )
@@ -822,11 +866,15 @@ async fn merged_and_resolved_items_do_not_reappear_from_other_sessions() {
 
     let first = open_local_session(&kernel, "continuity-global-first").await;
     let second = open_local_session(&kernel, "continuity-global-second").await;
-    for index in 0..18 {
+    for index in 0..13 {
         kernel
             .turn_session(SessionTurnRequest {
                 session_id: first.session_id,
-                user_text: format!("first session turn {}", index),
+                user_text: if index == 0 {
+                    "continuity-marker first session turn 0".to_string()
+                } else {
+                    format!("first session turn {}", index)
+                },
                 runtime_id: Some("capture".to_string()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
@@ -837,7 +885,11 @@ async fn merged_and_resolved_items_do_not_reappear_from_other_sessions() {
         kernel
             .turn_session(SessionTurnRequest {
                 session_id: second.session_id,
-                user_text: format!("second session turn {}", index),
+                user_text: if index == 0 {
+                    "continuity-marker second session turn 0".to_string()
+                } else {
+                    format!("second session turn {}", index)
+                },
                 runtime_id: Some("capture".to_string()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
@@ -871,12 +923,12 @@ async fn merged_and_resolved_items_do_not_reappear_from_other_sessions() {
         .await
         .expect("resolve loop");
 
-    for index in 18..36 {
+    for index in 13..26 {
         kernel
             .turn_session(SessionTurnRequest {
                 session_id: second.session_id,
                 user_text: format!("second session follow-up turn {}", index),
-                runtime_id: Some("capture".to_string()),
+                runtime_id: Some("capture-empty".to_string()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
                 runtime_env_passthrough: None,
@@ -897,6 +949,118 @@ async fn merged_and_resolved_items_do_not_reappear_from_other_sessions() {
         .expect("list loops after follow-up")
         .loops
         .is_empty());
+}
+
+#[tokio::test]
+async fn merged_and_resolved_items_can_reappear_when_later_compaction_reintroduces_them() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    kernel
+        .register_runtime_adapter(
+            "capture",
+            Arc::new(CapturePromptAdapter {
+                prompts: Arc::new(Mutex::new(Vec::new())),
+                capability_results: Arc::new(Mutex::new(Vec::new())),
+                request_fs_read: false,
+                allow_hidden_compaction: true,
+                emit_compaction_continuity: true,
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+
+    let session = open_local_session(&kernel, "continuity-reintroduce-peer").await;
+    for index in 0..13 {
+        kernel
+            .turn_session(SessionTurnRequest {
+                session_id: session.session_id,
+                user_text: if index == 0 {
+                    "continuity-marker seed turn 0".to_string()
+                } else {
+                    format!("seed turn {}", index)
+                },
+                runtime_id: Some("capture".to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await
+            .expect("seed turn succeeds");
+    }
+
+    let proposal_path = kernel
+        .list_continuity_memory_proposals()
+        .await
+        .expect("list proposals")
+        .proposals[0]
+        .relative_path
+        .clone();
+    let loop_path = kernel
+        .list_continuity_open_loops()
+        .await
+        .expect("list loops")
+        .loops[0]
+        .relative_path
+        .clone();
+
+    kernel
+        .merge_continuity_memory_proposal(ContinuityPathRequest {
+            relative_path: proposal_path,
+        })
+        .await
+        .expect("merge proposal");
+    kernel
+        .resolve_continuity_open_loop(ContinuityPathRequest {
+            relative_path: loop_path,
+        })
+        .await
+        .expect("resolve loop");
+
+    for index in 13..30 {
+        kernel
+            .turn_session(SessionTurnRequest {
+                session_id: session.session_id,
+                user_text: format!("continuity-marker reintroduce turn {}", index),
+                runtime_id: Some("capture".to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await
+            .expect("reintroduce turn succeeds");
+    }
+
+    assert_eq!(
+        kernel
+            .list_continuity_memory_proposals()
+            .await
+            .expect("list proposals after reintroduction")
+            .proposals
+            .len(),
+        1
+    );
+    assert_eq!(
+        kernel
+            .list_continuity_open_loops()
+            .await
+            .expect("list loops after reintroduction")
+            .loops
+            .len(),
+        1
+    );
 }
 
 #[cfg(unix)]
@@ -937,7 +1101,7 @@ async fn continuity_get_rejects_symlink_escape_outside_canonical_roots() {
         .expect_err("symlink escape should fail");
     let message = err.to_string();
     assert!(
-        message.contains("outside canonical continuity files"),
+        message.contains("failed to open") || message.contains("is a symlink"),
         "unexpected error: {message}"
     );
 
@@ -953,7 +1117,7 @@ async fn continuity_get_rejects_symlink_escape_outside_canonical_roots() {
         .expect_err("memory symlink escape should fail");
     let message = err.to_string();
     assert!(
-        message.contains("outside canonical continuity files"),
+        message.contains("failed to open") || message.contains("is a symlink"),
         "unexpected error: {message}"
     );
 
@@ -966,7 +1130,7 @@ async fn continuity_get_rejects_symlink_escape_outside_canonical_roots() {
         .expect_err("memory symlink should also break continuity search");
     let message = err.to_string();
     assert!(
-        message.contains("outside canonical continuity files"),
+        message.contains("failed to open") || message.contains("is a symlink"),
         "unexpected error: {message}"
     );
 }
@@ -1009,7 +1173,7 @@ async fn continuity_lists_reject_symlinked_continuity_roots() {
         .expect_err("symlinked open-loops dir should fail");
     let message = err.to_string();
     assert!(
-        message.contains("outside assistant home"),
+        message.contains("failed to open"),
         "unexpected error: {message}"
     );
 }
@@ -1128,6 +1292,7 @@ struct CapturePromptAdapter {
     capability_results: Arc<Mutex<Vec<Vec<RuntimeCapabilityResult>>>>,
     request_fs_read: bool,
     allow_hidden_compaction: bool,
+    emit_compaction_continuity: bool,
     reply: String,
 }
 
@@ -1175,6 +1340,26 @@ impl RuntimeAdapter for CapturePromptAdapter {
         {
             let first_user = extract_compaction_user(&current_prompt, false);
             let last_user = extract_compaction_user(&current_prompt, true);
+            let emit_continuity =
+                self.emit_compaction_continuity && last_user.contains("continuity-marker");
+            let memory_proposals = if emit_continuity {
+                vec![json!({
+                    "title": "Continuity Product Preferences",
+                    "rationale": "durable product preference surfaced during compaction",
+                    "entries": ["Prefers continuity module work to stay small and explicit."]
+                })]
+            } else {
+                Vec::new()
+            };
+            let open_loops = if emit_continuity {
+                vec![json!({
+                    "title": "Follow up on continuity surface",
+                    "summary": "Need to review continuity product commands and proposal flow.",
+                    "next_step": last_user
+                })]
+            } else {
+                Vec::new()
+            };
             let _ = events.send(RuntimeEvent::MessageDelta {
                 lane: RuntimeMessageLane::Answer,
                 text: json!({
@@ -1187,16 +1372,8 @@ impl RuntimeAdapter for CapturePromptAdapter {
                     "relevant_files": ["src/kernel/continuity.rs"],
                     "next_steps": [last_user],
                     "critical_context": ["Use the handoff summary plus the recent raw tail to continue."],
-                    "memory_proposals": [{
-                        "title": "Continuity Product Preferences",
-                        "rationale": "durable product preference surfaced during compaction",
-                        "entries": ["Prefers continuity module work to stay small and explicit."]
-                    }],
-                    "open_loops": [{
-                        "title": "Follow up on continuity surface",
-                        "summary": "Need to review continuity product commands and proposal flow.",
-                        "next_step": last_user
-                    }]
+                    "memory_proposals": memory_proposals,
+                    "open_loops": open_loops
                 })
                 .to_string(),
             });

@@ -46,10 +46,6 @@ pub struct CompactionSummaryState {
     pub memory_proposals: Vec<CompactionMemoryProposal>,
     #[serde(default)]
     pub open_loops: Vec<CompactionOpenLoop>,
-    #[serde(default)]
-    pub dismissed_memory_proposal_titles: Vec<String>,
-    #[serde(default)]
-    pub resolved_open_loop_titles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -213,7 +209,6 @@ pub fn merge_compaction_summary_state(
     if state.progress_in_progress.is_empty() {
         state.progress_in_progress = state.next_steps.clone();
     }
-    apply_summary_tombstones(&mut state);
     state
 }
 
@@ -301,6 +296,7 @@ pub fn build_compaction_prompt(
             "Rules:\n",
             "- Keep every string concise and factual.\n",
             "- Preserve durable context needed to continue the work.\n",
+            "- memory_proposals and open_loops must describe the full current active set after these turns, not just new deltas.\n",
             "- relevant_files must only include explicit file paths from the transcript.\n",
             "- memory_proposals must only contain durable facts, preferences, or conventions suitable for MEMORY.md.\n",
             "- open_loops must only contain active commitments or blockers that should remain visible.\n",
@@ -373,18 +369,8 @@ pub fn merge_compaction_summary_updates(
         merged.critical_context,
         COMPACTION_LIST_KEEP,
     );
-    merged.memory_proposals =
-        merge_unique_memory_proposals(previous.memory_proposals.clone(), merged.memory_proposals);
-    merged.open_loops = merge_unique_open_loops(previous.open_loops.clone(), merged.open_loops);
-    merged.dismissed_memory_proposal_titles = merge_unique_strings_unbounded(
-        previous.dismissed_memory_proposal_titles.clone(),
-        merged.dismissed_memory_proposal_titles,
-    );
-    merged.resolved_open_loop_titles = merge_unique_strings_unbounded(
-        previous.resolved_open_loop_titles.clone(),
-        merged.resolved_open_loop_titles,
-    );
-    apply_summary_tombstones(&mut merged);
+    merged.memory_proposals = normalize_memory_proposals(&merged.memory_proposals);
+    merged.open_loops = normalize_open_loops(&merged.open_loops);
     merged
 }
 
@@ -402,71 +388,38 @@ pub fn normalize_compaction_summary_state(state: &mut CompactionSummaryState) {
     state.relevant_files = normalize_lines(&state.relevant_files, COMPACTION_LIST_KEEP);
     state.next_steps = normalize_lines(&state.next_steps, COMPACTION_LIST_KEEP);
     state.critical_context = normalize_lines(&state.critical_context, COMPACTION_LIST_KEEP);
-    state.memory_proposals = state
-        .memory_proposals
-        .iter()
-        .filter_map(normalize_memory_proposal)
-        .take(COMPACTION_LIST_KEEP)
-        .collect();
-    state.open_loops = state
-        .open_loops
-        .iter()
-        .filter_map(normalize_open_loop)
-        .take(COMPACTION_LIST_KEEP)
-        .collect();
-    state.dismissed_memory_proposal_titles =
-        normalize_lines_unbounded(&state.dismissed_memory_proposal_titles);
-    state.resolved_open_loop_titles = normalize_lines_unbounded(&state.resolved_open_loop_titles);
-    apply_summary_tombstones(state);
+    state.memory_proposals = normalize_memory_proposals(&state.memory_proposals);
+    state.open_loops = normalize_open_loops(&state.open_loops);
 }
 
-pub fn dismiss_memory_proposal_in_summary_state(
+pub fn remove_memory_proposal_from_summary_state(
     state: &mut CompactionSummaryState,
     title: &str,
 ) -> bool {
     let Some(normalized_title) = compact_line(title, COMPACTION_MAX_ITEM_LEN) else {
         return false;
     };
-    let mut changed = false;
-    if !state
-        .dismissed_memory_proposal_titles
-        .iter()
-        .any(|value| value == &normalized_title)
-    {
-        state
-            .dismissed_memory_proposal_titles
-            .push(normalized_title.clone());
-        changed = true;
-    }
     let original_len = state.memory_proposals.len();
     state
         .memory_proposals
         .retain(|proposal| proposal.title != normalized_title);
-    changed |= state.memory_proposals.len() != original_len;
+    let changed = state.memory_proposals.len() != original_len;
     normalize_compaction_summary_state(state);
     changed
 }
 
-pub fn resolve_open_loop_in_summary_state(state: &mut CompactionSummaryState, title: &str) -> bool {
+pub fn remove_open_loop_from_summary_state(
+    state: &mut CompactionSummaryState,
+    title: &str,
+) -> bool {
     let Some(normalized_title) = compact_line(title, COMPACTION_MAX_ITEM_LEN) else {
         return false;
     };
-    let mut changed = false;
-    if !state
-        .resolved_open_loop_titles
-        .iter()
-        .any(|value| value == &normalized_title)
-    {
-        state
-            .resolved_open_loop_titles
-            .push(normalized_title.clone());
-        changed = true;
-    }
     let original_len = state.open_loops.len();
     state
         .open_loops
         .retain(|open_loop| open_loop.title != normalized_title);
-    changed |= state.open_loops.len() != original_len;
+    let mut changed = state.open_loops.len() != original_len;
     let in_progress_len = state.progress_in_progress.len();
     state.progress_in_progress.retain(|entry| {
         !entry.trim().eq(&normalized_title)
@@ -825,8 +778,22 @@ fn normalize_lines(values: &[String], limit: usize) -> Vec<String> {
     normalized
 }
 
-fn normalize_lines_unbounded(values: &[String]) -> Vec<String> {
-    normalize_lines(values, usize::MAX)
+fn normalize_memory_proposals(
+    values: &[CompactionMemoryProposal],
+) -> Vec<CompactionMemoryProposal> {
+    values
+        .iter()
+        .filter_map(normalize_memory_proposal)
+        .take(COMPACTION_LIST_KEEP)
+        .collect()
+}
+
+fn normalize_open_loops(values: &[CompactionOpenLoop]) -> Vec<CompactionOpenLoop> {
+    values
+        .iter()
+        .filter_map(normalize_open_loop)
+        .take(COMPACTION_LIST_KEEP)
+        .collect()
 }
 
 fn normalize_memory_proposal(
@@ -899,34 +866,6 @@ fn merge_unique_open_loops(
     keep_tail(merged, COMPACTION_LIST_KEEP)
 }
 
-fn merge_unique_strings_unbounded(previous: Vec<String>, current: Vec<String>) -> Vec<String> {
-    merge_unique_strings(previous, current, usize::MAX)
-}
-
-fn apply_summary_tombstones(state: &mut CompactionSummaryState) {
-    if !state.dismissed_memory_proposal_titles.is_empty() {
-        state.memory_proposals.retain(|proposal| {
-            !state
-                .dismissed_memory_proposal_titles
-                .iter()
-                .any(|title| title == &proposal.title)
-        });
-    }
-    if !state.resolved_open_loop_titles.is_empty() {
-        state.open_loops.retain(|open_loop| {
-            !state
-                .resolved_open_loop_titles
-                .iter()
-                .any(|title| title == &open_loop.title)
-        });
-        state.progress_in_progress.retain(|entry| {
-            !state.resolved_open_loop_titles.iter().any(|title| {
-                entry.trim().eq(title) || entry.trim().starts_with(&format!("{title} (next:"))
-            })
-        });
-    }
-}
-
 fn keep_tail<T>(mut items: Vec<T>, limit: usize) -> Vec<T> {
     if items.len() > limit {
         let keep_from = items.len() - limit;
@@ -981,10 +920,10 @@ mod tests {
     use crate::contracts::{SessionHistoryPolicy, SessionTurnKind, SessionTurnStatus};
 
     use super::{
-        build_compaction_prompt, dismiss_memory_proposal_in_summary_state,
-        merge_compaction_summary_state, merge_compaction_summary_updates,
-        parse_compaction_summary_state, render_compaction_summary, repair_turns,
-        resolve_open_loop_in_summary_state, CompactionSummaryState, TranscriptMode,
+        build_compaction_prompt, merge_compaction_summary_state, merge_compaction_summary_updates,
+        parse_compaction_summary_state, remove_memory_proposal_from_summary_state,
+        remove_open_loop_from_summary_state, render_compaction_summary, repair_turns,
+        CompactionSummaryState, TranscriptMode,
     };
     use crate::kernel::session_turns::SessionTurnRecord;
 
@@ -1263,7 +1202,7 @@ mod tests {
     }
 
     #[test]
-    fn dismissed_proposals_and_resolved_loops_do_not_survive_future_merges() {
+    fn removed_proposals_and_loops_can_reappear_in_later_current_snapshots() {
         let mut state = CompactionSummaryState {
             memory_proposals: vec![super::CompactionMemoryProposal {
                 title: "Working Preferences".to_string(),
@@ -1278,11 +1217,11 @@ mod tests {
             ..CompactionSummaryState::default()
         };
 
-        assert!(dismiss_memory_proposal_in_summary_state(
+        assert!(remove_memory_proposal_from_summary_state(
             &mut state,
             "Working Preferences"
         ));
-        assert!(resolve_open_loop_in_summary_state(
+        assert!(remove_open_loop_from_summary_state(
             &mut state,
             "Review continuity search"
         ));
@@ -1306,7 +1245,7 @@ mod tests {
             },
         );
 
-        assert!(merged.memory_proposals.is_empty());
-        assert!(merged.open_loops.is_empty());
+        assert_eq!(merged.memory_proposals.len(), 1);
+        assert_eq!(merged.open_loops.len(), 1);
     }
 }

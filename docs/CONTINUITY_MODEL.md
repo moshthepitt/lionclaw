@@ -57,6 +57,10 @@ Implemented now:
 - compaction performs a typed continuity flush before summary persistence:
   - memory proposals are written under `continuity/proposals/memory/...`
   - open loops are upserted under `continuity/open-loops/...`
+- active proposals and open loops use deterministic title-keyed filenames:
+  - `"{slug}--{uuid-v5}.md"`
+  - same title maps back to the same active file
+  - different titles that normalize to the same slug still get distinct files
 - continuity has first-class kernel/operator/API surfaces for:
   - status
   - indexed search
@@ -70,6 +74,18 @@ Implemented now:
   - durable memory proposals
   - open loops
   - recent decisions, files, and next steps
+- continuity archives are historical records only:
+  - merged/rejected proposals move under `continuity/proposals/memory/archive/...`
+  - resolved loops move under `continuity/open-loops/archive/...`
+  - archive presence does not suppress future active items with the same title
+  - repeated same-title archive actions keep distinct history entries instead of overwriting older ones
+- active continuity state has only two authorities:
+  - canonical active Markdown files under assistant home
+  - each session's latest persisted compaction summary state
+- continuity file I/O is rooted in the assistant home workspace through descriptor-based Unix filesystem operations
+  - writes do not rely on check-then-open pathname validation
+  - symlinked roots or subtree components are rejected for directory traversal
+  - symlinked leaf files are replaced in-place rather than followed outside assistant home
 
 Not implemented yet:
 
@@ -95,6 +111,7 @@ Not auto-loaded:
 - artifact history
 - rollups
 - archived loop material
+- archived proposal material
 
 ## Compaction
 
