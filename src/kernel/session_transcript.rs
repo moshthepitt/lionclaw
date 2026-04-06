@@ -841,7 +841,7 @@ fn merge_unique_memory_proposals(
 ) -> Vec<CompactionMemoryProposal> {
     let mut seen = BTreeSet::new();
     let mut merged = Vec::new();
-    for proposal in current.into_iter().chain(previous) {
+    for proposal in previous.into_iter().chain(current) {
         let Some(key) = normalized_summary_title_key(&proposal.title) else {
             continue;
         };
@@ -859,7 +859,7 @@ fn merge_unique_open_loops(
 ) -> Vec<CompactionOpenLoop> {
     let mut seen = BTreeSet::new();
     let mut merged = Vec::new();
-    for open_loop in current.into_iter().chain(previous) {
+    for open_loop in previous.into_iter().chain(current) {
         let Some(key) = normalized_summary_title_key(&open_loop.title) else {
             continue;
         };
@@ -944,9 +944,10 @@ mod tests {
 
     use super::{
         build_compaction_prompt, merge_compaction_summary_state, merge_compaction_summary_updates,
+        merge_unique_memory_proposals, merge_unique_open_loops,
         parse_compaction_summary_state, remove_memory_proposal_from_summary_state,
         remove_open_loop_from_summary_state, render_compaction_summary, repair_turns,
-        CompactionSummaryState, TranscriptMode,
+        CompactionSummaryState, TranscriptMode, COMPACTION_LIST_KEEP,
     };
     use crate::kernel::session_turns::SessionTurnRecord;
 
@@ -1301,5 +1302,54 @@ mod tests {
         assert!(state.memory_proposals.is_empty());
         assert!(state.open_loops.is_empty());
         assert!(state.progress_in_progress.is_empty());
+    }
+
+    #[test]
+    fn merge_keeps_newest_capped_memory_proposals_and_open_loops() {
+        let previous_proposals = (0..COMPACTION_LIST_KEEP)
+            .map(|index| super::CompactionMemoryProposal {
+                title: format!("Proposal {}", index),
+                rationale: "existing".to_string(),
+                entries: vec![format!("entry {}", index)],
+            })
+            .collect::<Vec<_>>();
+        let merged_proposals = merge_unique_memory_proposals(
+            previous_proposals,
+            vec![super::CompactionMemoryProposal {
+                title: "Newest Proposal".to_string(),
+                rationale: "new".to_string(),
+                entries: vec!["latest entry".to_string()],
+            }],
+        );
+        assert_eq!(merged_proposals.len(), COMPACTION_LIST_KEEP);
+        assert!(merged_proposals
+            .iter()
+            .any(|proposal| proposal.title == "Newest Proposal"));
+        assert!(!merged_proposals
+            .iter()
+            .any(|proposal| proposal.title == "Proposal 0"));
+
+        let previous_loops = (0..COMPACTION_LIST_KEEP)
+            .map(|index| super::CompactionOpenLoop {
+                title: format!("Loop {}", index),
+                summary: format!("summary {}", index),
+                next_step: format!("next {}", index),
+            })
+            .collect::<Vec<_>>();
+        let merged_loops = merge_unique_open_loops(
+            previous_loops,
+            vec![super::CompactionOpenLoop {
+                title: "Newest Loop".to_string(),
+                summary: "new summary".to_string(),
+                next_step: "new next".to_string(),
+            }],
+        );
+        assert_eq!(merged_loops.len(), COMPACTION_LIST_KEEP);
+        assert!(merged_loops
+            .iter()
+            .any(|open_loop| open_loop.title == "Newest Loop"));
+        assert!(!merged_loops
+            .iter()
+            .any(|open_loop| open_loop.title == "Loop 0"));
     }
 }
