@@ -847,6 +847,62 @@ async fn continuity_get_rejects_symlink_escape_outside_canonical_roots() {
         message.contains("outside canonical continuity files"),
         "unexpected error: {message}"
     );
+
+    let err = kernel
+        .continuity_search(ContinuitySearchRequest {
+            query: "secret".to_string(),
+            limit: Some(10),
+        })
+        .await
+        .expect_err("memory symlink should also break continuity search");
+    let message = err.to_string();
+    assert!(
+        message.contains("outside canonical continuity files"),
+        "unexpected error: {message}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn continuity_lists_reject_symlinked_continuity_roots() {
+    use std::os::unix::fs::symlink;
+
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let outside = env.temp_dir.path().join("outside-open-loops");
+    std::fs::create_dir_all(&outside).expect("create outside loop dir");
+    std::fs::write(
+        outside.join("escape.md"),
+        "# Escape Loop\n\n- Status: open\n- Summary: outside\n- Next Step: outside\n",
+    )
+    .expect("write outside loop");
+
+    let open_loops = env.workspace_root().join("continuity/open-loops");
+    std::fs::remove_dir_all(&open_loops).expect("remove open-loops dir");
+    symlink(&outside, &open_loops).expect("link open-loops dir");
+
+    let err = kernel
+        .list_continuity_open_loops()
+        .await
+        .expect_err("symlinked open-loops dir should fail");
+    let message = err.to_string();
+    assert!(
+        message.contains("outside assistant home"),
+        "unexpected error: {message}"
+    );
 }
 
 async fn install_enabled_skill(kernel: &Kernel, name: &str) -> String {

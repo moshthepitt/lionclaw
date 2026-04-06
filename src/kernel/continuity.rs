@@ -602,7 +602,7 @@ impl ContinuityLayout {
             }
         }
 
-        let mut paths = vec![self.memory_path()];
+        let mut paths = vec![self.ensure_canonical_continuity_path(&self.memory_path())?];
         paths.extend(list_markdown_files(&self.continuity_dir()).await?);
         paths = sort_paths_by_modified_desc(paths).await?;
 
@@ -736,7 +736,7 @@ impl ContinuityLayout {
         let Some(index_store) = &self.index_store else {
             return Ok(());
         };
-        let mut paths = vec![self.memory_path()];
+        let mut paths = vec![self.ensure_canonical_continuity_path(&self.memory_path())?];
         paths.extend(list_markdown_files(&self.continuity_dir()).await?);
         let mut documents = Vec::new();
         for path in paths {
@@ -776,15 +776,16 @@ impl ContinuityLayout {
     }
 
     async fn read_index_document(&self, path: &Path) -> Result<ContinuityIndexedDocument> {
-        let body = tokio::fs::read_to_string(path)
+        let canonical_path = self.ensure_canonical_continuity_path(path)?;
+        let body = tokio::fs::read_to_string(&canonical_path)
             .await
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let title = extract_heading(&body).unwrap_or_else(|| stem_fallback(path));
+            .with_context(|| format!("failed to read {}", canonical_path.display()))?;
+        let title = extract_heading(&body).unwrap_or_else(|| stem_fallback(&canonical_path));
         Ok(ContinuityIndexedDocument {
-            relative_path: relative_path(&self.workspace_root, path),
+            relative_path: relative_path(&self.workspace_root, &canonical_path),
             title,
             body,
-            updated_at_ms: file_updated_at_ms(path).await?,
+            updated_at_ms: file_updated_at_ms(&canonical_path).await?,
         })
     }
 
@@ -811,6 +812,10 @@ impl ContinuityLayout {
 
     fn resolve_canonical_read_path(&self, relative_path: &str) -> Result<PathBuf> {
         let path = self.resolve_relative_file(relative_path)?;
+        self.ensure_canonical_continuity_path(&path)
+    }
+
+    fn ensure_canonical_continuity_path(&self, path: &Path) -> Result<PathBuf> {
         let canonical_path = path
             .canonicalize()
             .with_context(|| format!("failed to canonicalize {}", path.display()))?;
@@ -829,7 +834,7 @@ impl ContinuityLayout {
         } else {
             bail!(
                 "continuity path '{}' is outside canonical continuity files",
-                relative_path
+                path.display()
             );
         }
     }
@@ -924,7 +929,18 @@ async fn list_markdown_files(root: &Path) -> Result<Vec<PathBuf>> {
         return Ok(Vec::new());
     }
 
-    let mut pending = VecDeque::from([root.to_path_buf()]);
+    let expected_root = expected_canonical_root(root)?;
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", root.display()))?;
+    if canonical_root != expected_root {
+        bail!(
+            "continuity root '{}' is outside assistant home",
+            root.display()
+        );
+    }
+
+    let mut pending = VecDeque::from([expected_root]);
     let mut files = Vec::new();
     while let Some(dir) = pending.pop_front() {
         let mut entries = tokio::fs::read_dir(&dir)
@@ -1083,6 +1099,18 @@ fn is_direct_child(path: &Path, root: &Path) -> bool {
 }
 
 fn ensure_path_is_under(path: &Path, root: &Path) -> Result<()> {
+    let canonical_root = expected_canonical_root(root)?;
+    let canonical_path = path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+    if canonical_path == canonical_root || canonical_path.starts_with(&canonical_root) {
+        Ok(())
+    } else {
+        bail!("path '{}' is outside '{}'", path.display(), root.display());
+    }
+}
+
+fn expected_canonical_root(root: &Path) -> Result<PathBuf> {
     let root_parent = root
         .parent()
         .ok_or_else(|| anyhow!("root '{}' has no parent", root.display()))?;
@@ -1092,15 +1120,7 @@ fn ensure_path_is_under(path: &Path, root: &Path) -> Result<()> {
     let root_name = root
         .file_name()
         .ok_or_else(|| anyhow!("root '{}' has no file name", root.display()))?;
-    let canonical_root = canonical_root_parent.join(root_name);
-    let canonical_path = path
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", path.display()))?;
-    if canonical_path == canonical_root || canonical_path.starts_with(&canonical_root) {
-        Ok(())
-    } else {
-        bail!("path '{}' is outside '{}'", path.display(), root.display());
-    }
+    Ok(canonical_root_parent.join(root_name))
 }
 
 fn replace_or_insert_metadata(
