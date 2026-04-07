@@ -28,6 +28,47 @@ use sqlx::{Row, SqlitePool};
 use tempfile::TempDir;
 use uuid::Uuid;
 
+fn normalized_title_key(title: &str) -> String {
+    title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn sanitize_slug(slug: &str) -> String {
+    let mut normalized = slug
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while normalized.contains("--") {
+        normalized = normalized.replace("--", "-");
+    }
+    normalized.trim_matches('-').to_string()
+}
+
+fn managed_title_file_name(title: &str) -> String {
+    let normalized = normalized_title_key(title);
+    let slug = sanitize_slug(&normalized);
+    let slug = if slug.is_empty() {
+        "item"
+    } else {
+        slug.as_str()
+    };
+    let key = Uuid::new_v5(
+        &Uuid::from_u128(0x5f026ae9551b4d3ea511f0f2d74cf241),
+        normalized.as_bytes(),
+    );
+    format!("{slug}--{key}.md")
+}
+
 #[tokio::test]
 async fn prompt_loads_assistant_continuity_and_fs_read_uses_project_root() {
     let env = TestEnv::new();
@@ -43,10 +84,14 @@ async fn prompt_loads_assistant_continuity_and_fs_read_uses_project_root() {
     tokio::fs::create_dir_all(env.workspace_root().join("continuity/open-loops"))
         .await
         .expect("create assistant open-loops dir");
+    let assistant_open_loop_key = managed_title_file_name("Assistant Open Loop");
     tokio::fs::write(
         env.workspace_root()
-            .join("continuity/open-loops/assistant-follow-up.md"),
-        "# Assistant Open Loop\n\nStatus: open\n",
+            .join("continuity/open-loops")
+            .join(&assistant_open_loop_key),
+        format!(
+            "# Assistant Open Loop\n\n- Status: open\n- Key: {assistant_open_loop_key}\n- Summary: remember the assistant follow-up\n- Next Step: keep it visible\n"
+        ),
     )
     .await
     .expect("write assistant open loop");
@@ -1062,6 +1107,49 @@ async fn continuity_search_does_not_short_circuit_mixed_unicode_queries_to_lossy
 }
 
 #[tokio::test]
+async fn continuity_search_tolerates_missing_memory_file() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    tokio::fs::write(
+        env.workspace_root()
+            .join("continuity/open-loops")
+            .join("review-audit.md"),
+        "# Review Audit\n\n- Summary: Need release review before shipping.\n",
+    )
+    .await
+    .expect("write continuity file");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    tokio::fs::remove_file(env.workspace_root().join("MEMORY.md"))
+        .await
+        .expect("remove memory");
+
+    let search = kernel
+        .continuity_search(ContinuitySearchRequest {
+            query: "release review".to_string(),
+            limit: Some(10),
+        })
+        .await
+        .expect("search without memory");
+
+    assert!(search
+        .matches
+        .iter()
+        .any(|item| item.relative_path == "continuity/open-loops/review-audit.md"));
+}
+
+#[tokio::test]
 async fn unsafe_runtimes_do_not_receive_hidden_compaction_prompts() {
     let env = TestEnv::new();
     bootstrap_workspace(&env.workspace_root())
@@ -1237,55 +1325,61 @@ async fn continuity_mutations_are_audited() {
     .await
     .expect("kernel init");
 
+    let merged_key = managed_title_file_name("Merge Me");
+    let rejected_key = managed_title_file_name("Reject Me");
+    let loop_key = managed_title_file_name("Review Audit Trail");
     let merged_path = env
         .workspace_root()
-        .join("continuity/proposals/memory/merge-me.md");
+        .join("continuity/proposals/memory")
+        .join(&merged_key);
     let rejected_path = env
         .workspace_root()
-        .join("continuity/proposals/memory/reject-me.md");
+        .join("continuity/proposals/memory")
+        .join(&rejected_key);
     let loop_path = env
         .workspace_root()
-        .join("continuity/open-loops/review-audit.md");
+        .join("continuity/open-loops")
+        .join(&loop_key);
     std::fs::write(
         &merged_path,
         format!(
-            "# Memory Proposal: Merge Me\n\n- Status: proposed\n- Proposed: {} UTC\n- Rationale: keep durable preference\n\n## Candidate Entries\n- Remember merged proposal\n",
-            Utc::now().to_rfc3339()
+            "# Memory Proposal: Merge Me\n\n- Status: proposed\n- Key: {merged_key}\n- Proposed: {} UTC\n- Rationale: keep durable preference\n\n## Candidate Entries\n- Remember merged proposal\n",
+            Utc::now().to_rfc3339(),
         ),
     )
     .expect("write merged proposal");
     std::fs::write(
         &rejected_path,
         format!(
-            "# Memory Proposal: Reject Me\n\n- Status: proposed\n- Proposed: {} UTC\n- Rationale: reject duplicate\n\n## Candidate Entries\n- Remember rejected proposal\n",
-            Utc::now().to_rfc3339()
+            "# Memory Proposal: Reject Me\n\n- Status: proposed\n- Key: {rejected_key}\n- Proposed: {} UTC\n- Rationale: reject duplicate\n\n## Candidate Entries\n- Remember rejected proposal\n",
+            Utc::now().to_rfc3339(),
         ),
     )
     .expect("write rejected proposal");
     std::fs::write(
         &loop_path,
         format!(
-            "# Review Audit Trail\n\n- Status: open\n- Updated: {} UTC\n- Summary: verify continuity audit coverage\n- Next Step: query the audit log\n",
-            Utc::now().to_rfc3339()
+            "# Review Audit Trail\n\n- Status: open\n- Key: {loop_key}\n- Updated: {} UTC\n- Summary: verify continuity audit coverage\n- Next Step: query the audit log\n",
+            Utc::now().to_rfc3339(),
         ),
     )
     .expect("write open loop");
 
     kernel
         .merge_continuity_memory_proposal(ContinuityPathRequest {
-            relative_path: "continuity/proposals/memory/merge-me.md".to_string(),
+            relative_path: format!("continuity/proposals/memory/{merged_key}"),
         })
         .await
         .expect("merge proposal");
     kernel
         .reject_continuity_memory_proposal(ContinuityPathRequest {
-            relative_path: "continuity/proposals/memory/reject-me.md".to_string(),
+            relative_path: format!("continuity/proposals/memory/{rejected_key}"),
         })
         .await
         .expect("reject proposal");
     kernel
         .resolve_continuity_open_loop(ContinuityPathRequest {
-            relative_path: "continuity/open-loops/review-audit.md".to_string(),
+            relative_path: format!("continuity/open-loops/{loop_key}"),
         })
         .await
         .expect("resolve open loop");
@@ -1401,6 +1495,39 @@ async fn merged_and_resolved_items_do_not_reappear_without_new_reintroduction() 
         .await
         .expect("list loops");
     assert_eq!(loops.loops.len(), 1);
+
+    let proposal_path = env
+        .workspace_root()
+        .join(&proposals.proposals[0].relative_path);
+    let proposal_key = proposal_path
+        .file_name()
+        .expect("proposal file name")
+        .to_string_lossy()
+        .to_string();
+    tokio::fs::write(
+        &proposal_path,
+        format!(
+            "# Memory Proposal: Renamed In Content\n\n- Status: proposed\n- Key: {proposal_key}\n- Proposed: {} UTC\n- Rationale: edited before merge\n\n## Candidate Entries\n- Prefers continuity module work to stay small and explicit.\n",
+            Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .expect("edit proposal content");
+    let loop_path = env.workspace_root().join(&loops.loops[0].relative_path);
+    let loop_key = loop_path
+        .file_name()
+        .expect("loop file name")
+        .to_string_lossy()
+        .to_string();
+    tokio::fs::write(
+        &loop_path,
+        format!(
+            "# Renamed In Content\n\n- Status: open\n- Key: {loop_key}\n- Updated: {} UTC\n- Summary: edited before resolve\n- Next Step: Run continuity search\n",
+            Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .expect("edit loop content");
 
     kernel
         .merge_continuity_memory_proposal(ContinuityPathRequest {

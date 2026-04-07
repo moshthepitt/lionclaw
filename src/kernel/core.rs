@@ -2600,7 +2600,7 @@ impl Kernel {
             .merge_memory_proposal(&req.relative_path)
             .await
             .map_err(internal)?;
-        self.remove_memory_proposal_from_all_compactions(&metadata.title)
+        self.remove_memory_proposal_from_all_compactions(&metadata.cleanup_key)
             .await?;
         let archived_path = self.relative_workspace_path(&archived);
         let memory_path = self.relative_workspace_path(&layout.memory_path());
@@ -2654,7 +2654,7 @@ impl Kernel {
             .reject_memory_proposal(&req.relative_path)
             .await
             .map_err(internal)?;
-        self.remove_memory_proposal_from_all_compactions(&metadata.title)
+        self.remove_memory_proposal_from_all_compactions(&metadata.cleanup_key)
             .await?;
         let archived_path = self.relative_workspace_path(&archived);
         self.refresh_active_continuity_after_commit_best_effort(
@@ -2721,7 +2721,7 @@ impl Kernel {
             .resolve_open_loop(&req.relative_path)
             .await
             .map_err(internal)?;
-        self.remove_open_loop_from_all_compactions(&metadata.title)
+        self.remove_open_loop_from_all_compactions(&metadata.cleanup_key)
             .await?;
         let archived_path = self.relative_workspace_path(&archived);
         self.refresh_active_continuity_after_commit_best_effort(
@@ -2746,23 +2746,29 @@ impl Kernel {
 
     async fn remove_memory_proposal_from_all_compactions(
         &self,
-        title: &str,
+        cleanup_key: &str,
     ) -> Result<(), KernelError> {
         self.remove_summary_title_from_all_compactions(
-            title,
+            cleanup_key,
             remove_memory_proposal_from_summary_state,
         )
         .await
     }
 
-    async fn remove_open_loop_from_all_compactions(&self, title: &str) -> Result<(), KernelError> {
-        self.remove_summary_title_from_all_compactions(title, remove_open_loop_from_summary_state)
-            .await
+    async fn remove_open_loop_from_all_compactions(
+        &self,
+        cleanup_key: &str,
+    ) -> Result<(), KernelError> {
+        self.remove_summary_title_from_all_compactions(
+            cleanup_key,
+            remove_open_loop_from_summary_state,
+        )
+        .await
     }
 
     async fn remove_summary_title_from_all_compactions(
         &self,
-        title: &str,
+        cleanup_key: &str,
         remove_from_summary_state: fn(&mut CompactionSummaryState, &str) -> bool,
     ) -> Result<(), KernelError> {
         for session_id in self
@@ -2781,7 +2787,7 @@ impl Kernel {
             else {
                 continue;
             };
-            if !remove_from_summary_state(&mut record.summary_state, title) {
+            if !remove_from_summary_state(&mut record.summary_state, cleanup_key) {
                 continue;
             }
             let _ = self
@@ -2800,6 +2806,7 @@ mod tests {
     use tokio::time::{sleep, Duration};
 
     use super::*;
+    use crate::kernel::continuity::title_file_name;
     use crate::kernel::session_transcript::{CompactionMemoryProposal, CompactionOpenLoop};
 
     #[tokio::test]
@@ -2899,7 +2906,9 @@ mod tests {
         let remove_kernel = kernel.clone();
         let remove_task = tokio::spawn(async move {
             remove_kernel
-                .remove_memory_proposal_from_all_compactions("working preferences")
+                .remove_memory_proposal_from_all_compactions(&title_file_name(
+                    "working preferences",
+                ))
                 .await
         });
         sleep(Duration::from_millis(20)).await;
@@ -2964,7 +2973,7 @@ mod tests {
         let remove_kernel = kernel.clone();
         let remove_task = tokio::spawn(async move {
             remove_kernel
-                .remove_open_loop_from_all_compactions("review continuity search")
+                .remove_open_loop_from_all_compactions(&title_file_name("review continuity search"))
                 .await
         });
         sleep(Duration::from_millis(20)).await;

@@ -64,6 +64,8 @@ Implemented now:
   - `"{slug}--{uuid-v5}.md"`
   - same title maps back to the same active file
   - different titles that normalize to the same slug still get distinct files
+  - the managed active filename is the stable identity for merge/reject/resolve cleanup
+  - content edits are supported, but active-file renames are not part of the managed continuity contract
 - continuity has first-class kernel/operator/API surfaces for:
   - status
   - indexed search
@@ -143,6 +145,11 @@ Prompt rendering follows the proven assistant pattern used by Hermes, IronClaw, 
 The handoff summary is core-owned. When the active runtime explicitly supports side-effect-free hidden summarization, LionClaw updates that handoff through a strict JSON schema; otherwise it falls back to deterministic kernel-side compaction. That keeps the core small without introducing hidden side effects outside LionClaw's normal policy boundary.
 
 Continuity search is backed by a derived SQLite FTS index inside `lionclaw.db`. The canonical source of truth remains the assistant-home Markdown files; the index is rebuilt from and synchronized with those files so search stays fast without introducing a second memory authority plane.
+
+Read-only continuity enumeration paths tolerate per-file `ENOENT` churn. If
+`MEMORY.md` or another continuity file disappears between listing and read,
+LionClaw skips that file, continues from the remaining canonical files, and
+still surfaces real boundary or permission failures.
 
 Before compaction is persisted, LionClaw performs a typed continuity flush so durable facts and active commitments can land in visible files rather than only in the transcript summary.
 

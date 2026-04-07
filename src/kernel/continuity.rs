@@ -9,7 +9,7 @@ use chrono::{DateTime, Datelike, Utc};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use super::continuity_fs::ContinuityFs;
+use super::continuity_fs::{is_not_found_error, ContinuityFs};
 use super::continuity_index::{ContinuityIndexStore, ContinuityIndexedDocument};
 
 pub const MEMORY_FILE: &str = "MEMORY.md";
@@ -107,6 +107,7 @@ pub struct ContinuityMemoryProposal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContinuityItemMetadata {
     pub title: String,
+    pub cleanup_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,6 +330,7 @@ impl ContinuityLayout {
         let _guard = self.open_loop_lock.lock().await;
         let fs = self.fs().await?;
         let relative = self.open_loop_path(&loop_draft.title);
+        let cleanup_key = path_file_name(&relative)?;
 
         if let Ok(existing) = fs.read_to_string(&relative) {
             let same_title =
@@ -353,6 +355,7 @@ impl ContinuityLayout {
         let updated_at = Utc::now();
         let mut content = format!("# {}\n\n", loop_draft.title.trim());
         content.push_str("- Status: open\n");
+        content.push_str(&format!("- Key: {}\n", cleanup_key));
         content.push_str(&format!("- Updated: {} UTC\n", updated_at.to_rfc3339()));
         if let Some(source) = loop_draft
             .source
@@ -381,6 +384,7 @@ impl ContinuityLayout {
         let source = self.resolve_relative_file(relative_path)?;
         ensure_relative_path_is_direct_child(&source, &self.open_loops_rel_dir())?;
         let mut content = fs.read_to_string(&source)?;
+        enforce_managed_active_key(&source, &content)?;
         content = replace_or_insert_metadata(
             &content,
             "Status",
@@ -418,9 +422,11 @@ impl ContinuityLayout {
         let _guard = self.proposal_lock.lock().await;
         let fs = self.fs().await?;
         let relative = self.memory_proposal_path(&proposal.title);
+        let cleanup_key = path_file_name(&relative)?;
 
         let mut content = format!("# Memory Proposal: {}\n\n", proposal.title.trim());
         content.push_str("- Status: proposed\n");
+        content.push_str(&format!("- Key: {}\n", cleanup_key));
         content.push_str(&format!("- Proposed: {} UTC\n", Utc::now().to_rfc3339()));
         if let Some(source) = proposal
             .source
@@ -471,7 +477,12 @@ impl ContinuityLayout {
 
         let mut proposals = Vec::new();
         for path in files.into_iter().take(limit) {
-            let content = fs.read_to_string(&path)?;
+            let Some(content) = fs.read_to_string_if_exists(&path)? else {
+                continue;
+            };
+            if !managed_active_key_matches_path(&path, &content) {
+                continue;
+            }
             proposals.push(parse_memory_proposal(
                 &self.workspace_root,
                 &fs.absolute_path(&path),
@@ -487,6 +498,7 @@ impl ContinuityLayout {
         let path = self.resolve_relative_file(relative_path)?;
         ensure_relative_path_is_direct_child(&path, &self.memory_proposals_rel_dir())?;
         let content = fs.read_to_string(&path)?;
+        enforce_managed_active_key(&path, &content)?;
         let proposal =
             parse_memory_proposal(&self.workspace_root, &fs.absolute_path(&path), &content);
         self.append_memory_entries(&proposal.entries).await?;
@@ -497,8 +509,11 @@ impl ContinuityLayout {
 
     pub async fn reject_memory_proposal(&self, relative_path: &str) -> Result<PathBuf> {
         let _guard = self.proposal_lock.lock().await;
+        let fs = self.fs().await?;
         let path = self.resolve_relative_file(relative_path)?;
         ensure_relative_path_is_direct_child(&path, &self.memory_proposals_rel_dir())?;
+        let content = fs.read_to_string(&path)?;
+        enforce_managed_active_key(&path, &content)?;
         self.archive_memory_proposal(&path, REJECTED_DIR).await
     }
 
@@ -541,7 +556,12 @@ impl ContinuityLayout {
 
         let mut loops = Vec::new();
         for path in files {
-            let content = fs.read_to_string(&path)?;
+            let Some(content) = fs.read_to_string_if_exists(&path)? else {
+                continue;
+            };
+            if !managed_active_key_matches_path(&path, &content) {
+                continue;
+            }
             let title = extract_heading(&content).unwrap_or_else(|| stem_fallback(&path));
             loops.push(ContinuityOpenLoop {
                 title,
@@ -563,7 +583,9 @@ impl ContinuityLayout {
 
         let mut artifacts = Vec::new();
         for path in files.into_iter().take(limit) {
-            let content = fs.read_to_string(&path)?;
+            let Some(content) = fs.read_to_string_if_exists(&path)? else {
+                continue;
+            };
             artifacts.push(ContinuityArtifactSummary {
                 title: extract_heading(&content).unwrap_or_else(|| stem_fallback(&path)),
                 relative_path: path.to_string_lossy().to_string(),
@@ -614,7 +636,9 @@ impl ContinuityLayout {
 
         let mut matches = Vec::new();
         for path in paths {
-            let content = fs.read_to_string(&path)?;
+            let Some(content) = fs.read_to_string_if_exists(&path)? else {
+                continue;
+            };
             if let Some(snippet) = search_snippet(&content, &needle) {
                 matches.push(ContinuitySearchMatch {
                     title: extract_heading(&content).unwrap_or_else(|| stem_fallback(&path)),
@@ -643,10 +667,12 @@ impl ContinuityLayout {
         let path = self.resolve_relative_file(relative_path)?;
         ensure_relative_path_is_direct_child(&path, &self.memory_proposals_rel_dir())?;
         let content = fs.read_to_string(&path)?;
+        let cleanup_key = enforce_managed_active_key(&path, &content)?;
         let proposal =
             parse_memory_proposal(&self.workspace_root, &fs.absolute_path(&path), &content);
         Ok(ContinuityItemMetadata {
             title: proposal.title,
+            cleanup_key,
         })
     }
 
@@ -655,8 +681,10 @@ impl ContinuityLayout {
         let path = self.resolve_relative_file(relative_path)?;
         ensure_relative_path_is_direct_child(&path, &self.open_loops_rel_dir())?;
         let content = fs.read_to_string(&path)?;
+        let cleanup_key = enforce_managed_active_key(&path, &content)?;
         Ok(ContinuityItemMetadata {
             title: extract_heading(&content).unwrap_or_else(|| stem_fallback(&path)),
+            cleanup_key,
         })
     }
 
@@ -733,7 +761,9 @@ impl ContinuityLayout {
         paths.extend(fs.list_markdown_files(&self.continuity_rel_dir())?);
         let mut documents = Vec::new();
         for path in paths {
-            documents.push(self.read_index_document(&path).await?);
+            if let Some(document) = self.read_index_document_if_exists(&path).await? {
+                documents.push(document);
+            }
         }
         index_store.replace_all(&documents).await
     }
@@ -742,18 +772,13 @@ impl ContinuityLayout {
         let Some(index_store) = &self.index_store else {
             return Ok(());
         };
-        let fs = self.fs().await?;
-        if let Err(err) = fs.read_to_string(path) {
-            if err.downcast_ref::<std::io::Error>().is_some()
-                || err.downcast_ref::<rustix::io::Errno>().is_some()
-            {
+        match self.read_index_document_if_exists(path).await? {
+            Some(document) => index_store.upsert(&document).await,
+            None => {
                 self.remove_index_relative(path).await?;
-                return Ok(());
+                Ok(())
             }
-            return Err(err);
         }
-        let document = self.read_index_document(path).await?;
-        index_store.upsert(&document).await
     }
 
     async fn remove_index_relative(&self, path: &Path) -> Result<()> {
@@ -763,16 +788,26 @@ impl ContinuityLayout {
         index_store.remove(&path.to_string_lossy()).await
     }
 
-    async fn read_index_document(&self, path: &Path) -> Result<ContinuityIndexedDocument> {
+    async fn read_index_document_if_exists(
+        &self,
+        path: &Path,
+    ) -> Result<Option<ContinuityIndexedDocument>> {
         let fs = self.fs().await?;
-        let body = fs.read_to_string(path)?;
+        let Some(body) = fs.read_to_string_if_exists(path)? else {
+            return Ok(None);
+        };
+        let updated_at_ms = match fs.modified_at_ms(path) {
+            Ok(updated_at_ms) => updated_at_ms,
+            Err(err) if is_not_found_error(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        };
         let title = extract_heading(&body).unwrap_or_else(|| stem_fallback(path));
-        Ok(ContinuityIndexedDocument {
+        Ok(Some(ContinuityIndexedDocument {
             relative_path: path.to_string_lossy().to_string(),
             title,
             body,
-            updated_at_ms: fs.modified_at_ms(path)?,
-        })
+            updated_at_ms,
+        }))
     }
 
     fn resolve_relative_file(&self, relative_path: &str) -> Result<PathBuf> {
@@ -876,7 +911,11 @@ impl ContinuityLayout {
         let fs = self.fs().await?;
         let mut dated = Vec::with_capacity(paths.len());
         for path in paths {
-            dated.push((fs.modified_at_ms(&path)?, path));
+            match fs.modified_at_ms(&path) {
+                Ok(updated_at_ms) => dated.push((updated_at_ms, path)),
+                Err(err) if is_not_found_error(&err) => continue,
+                Err(err) => return Err(err),
+            }
         }
         dated.sort_by(|left, right| right.cmp(left));
         Ok(dated.into_iter().map(|(_, path)| path).collect())
@@ -947,6 +986,40 @@ fn parse_memory_proposal(root: &Path, path: &Path, content: &str) -> ContinuityM
     }
 }
 
+fn managed_item_key(content: &str) -> Option<String> {
+    metadata_value(content, "Key")
+}
+
+fn path_file_name(path: &Path) -> Result<String> {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow!("continuity path '{}' has no file name", path.display()))
+}
+
+fn managed_active_key_matches_path(path: &Path, content: &str) -> bool {
+    managed_item_key(content)
+        .and_then(|key| path_file_name(path).ok().map(|actual| key == actual))
+        .unwrap_or(false)
+}
+
+fn enforce_managed_active_key(path: &Path, content: &str) -> Result<String> {
+    let actual = path_file_name(path)?;
+    let expected = managed_item_key(content).ok_or_else(|| {
+        anyhow!(
+            "managed continuity file '{}' is missing Key metadata",
+            path.display()
+        )
+    })?;
+    if expected != actual {
+        bail!(
+            "managed continuity file '{}' does not match its canonical key",
+            path.display()
+        );
+    }
+    Ok(expected)
+}
+
 fn relative_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -987,7 +1060,7 @@ pub(crate) fn normalized_title_key(title: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn title_file_name(title: &str) -> String {
+pub(crate) fn title_file_name(title: &str) -> String {
     let normalized = normalized_title_key(title);
     let slug = sanitize_slug(&normalized);
     let slug = if slug.is_empty() {
@@ -1932,12 +2005,13 @@ mod tests {
         let layout = ContinuityLayout::new(temp_dir.path().join("workspace"));
         layout.ensure_base_layout().await.expect("bootstrap");
 
-        let proposal_path = layout
-            .memory_proposals_dir()
-            .join(title_file_name("Manual Proposal"));
+        let proposal_key = title_file_name("Manual Proposal");
+        let proposal_path = layout.memory_proposals_dir().join(&proposal_key);
         std::fs::write(
             &proposal_path,
-            "# Memory Proposal: Manual Proposal\n- Status: proposed\n- Rationale: manual\n",
+            format!(
+                "# Memory Proposal: Manual Proposal\n- Status: proposed\n- Key: {proposal_key}\n- Rationale: manual\n"
+            ),
         )
         .expect("write headingless proposal");
         let proposal_relative = proposal_path
@@ -1954,10 +2028,13 @@ mod tests {
         assert!(archived_proposal_content.contains("- Status: merged"));
         assert!(archived_proposal_content.contains("- Proposed: "));
 
-        let open_loop_path = layout.open_loops_dir().join(title_file_name("Manual Loop"));
+        let open_loop_key = title_file_name("Manual Loop");
+        let open_loop_path = layout.open_loops_dir().join(&open_loop_key);
         std::fs::write(
             &open_loop_path,
-            "# Manual Loop\n- Status: open\n- Summary: manual summary\n- Next Step: manual next\n",
+            format!(
+                "# Manual Loop\n- Status: open\n- Key: {open_loop_key}\n- Summary: manual summary\n- Next Step: manual next\n"
+            ),
         )
         .expect("write headingless loop");
         let loop_relative = open_loop_path
@@ -2030,6 +2107,103 @@ mod tests {
             .await
             .expect("read normalized memory path");
         assert!(memory.contains("entry"));
+    }
+
+    #[tokio::test]
+    async fn renamed_active_managed_files_are_hidden_and_actions_reject_them() {
+        let temp_dir = tempdir().expect("temp dir");
+        let layout = ContinuityLayout::new(temp_dir.path().join("workspace"));
+        layout.ensure_base_layout().await.expect("bootstrap");
+
+        let proposal_path = layout
+            .record_memory_proposal(&ContinuityMemoryProposalDraft {
+                title: "Managed Proposal".to_string(),
+                rationale: "proposal".to_string(),
+                entries: vec!["entry".to_string()],
+                source: None,
+            })
+            .await
+            .expect("record proposal")
+            .expect("proposal path");
+        let renamed_proposal = proposal_path.with_file_name("renamed-proposal.md");
+        std::fs::rename(&proposal_path, &renamed_proposal).expect("rename proposal");
+        assert!(layout
+            .list_memory_proposals(10)
+            .await
+            .expect("list proposals")
+            .is_empty());
+        let renamed_proposal_relative = renamed_proposal
+            .strip_prefix(layout.workspace_root())
+            .expect("proposal relative")
+            .to_string_lossy()
+            .to_string();
+        let err = layout
+            .merge_memory_proposal(&renamed_proposal_relative)
+            .await
+            .expect_err("renamed proposal should be rejected");
+        assert!(err.to_string().contains("does not match its canonical key"));
+
+        let loop_path = layout
+            .upsert_open_loop(&ContinuityOpenLoopDraft {
+                title: "Managed Loop".to_string(),
+                summary: "summary".to_string(),
+                next_step: "next".to_string(),
+                source: None,
+            })
+            .await
+            .expect("record loop")
+            .expect("loop path");
+        let renamed_loop = loop_path.with_file_name("renamed-loop.md");
+        std::fs::rename(&loop_path, &renamed_loop).expect("rename loop");
+        assert!(layout
+            .list_active_open_loops()
+            .await
+            .expect("list loops")
+            .is_empty());
+        let renamed_loop_relative = renamed_loop
+            .strip_prefix(layout.workspace_root())
+            .expect("loop relative")
+            .to_string_lossy()
+            .to_string();
+        let err = layout
+            .resolve_open_loop(&renamed_loop_relative)
+            .await
+            .expect_err("renamed loop should be rejected");
+        assert!(err.to_string().contains("does not match its canonical key"));
+    }
+
+    #[tokio::test]
+    async fn indexed_search_and_rebuild_skip_missing_memory_file() {
+        let temp_dir = tempdir().expect("temp dir");
+        let db = Db::connect_file(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("db connect");
+        let layout = ContinuityLayout::with_index_store(
+            temp_dir.path().join("workspace"),
+            Some(ContinuityIndexStore::new(db.pool())),
+        );
+        layout.ensure_base_layout().await.expect("bootstrap");
+        layout
+            .record_artifact(ContinuityArtifact {
+                at: Utc::now(),
+                slug: "release-brief".to_string(),
+                title: "Release Brief".to_string(),
+                kind: "test".to_string(),
+                summary: Some("release artifact".to_string()),
+                source: None,
+                body: "Need release review follow-up.".to_string(),
+            })
+            .await
+            .expect("record artifact");
+
+        std::fs::remove_file(layout.memory_path()).expect("remove memory");
+
+        layout.rebuild_index().await.expect("rebuild index");
+        let hits = layout.search("release review", 10).await.expect("search");
+        assert!(hits
+            .iter()
+            .any(|item| item.relative_path.contains("continuity/artifacts/")));
+        assert!(!hits.iter().any(|item| item.relative_path == "MEMORY.md"));
     }
 
     #[cfg(unix)]

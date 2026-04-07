@@ -75,7 +75,7 @@ impl ContinuityFs {
     pub fn read_to_string_if_exists(&self, relative: &Path) -> Result<Option<String>> {
         match self.read_to_string(relative) {
             Ok(content) => Ok(Some(content)),
-            Err(err) if is_not_found(&err) => Ok(None),
+            Err(err) if is_not_found_error(&err) => Ok(None),
             Err(err) => Err(err),
         }
     }
@@ -91,7 +91,7 @@ impl ContinuityFs {
     pub fn ensure_file(&self, relative: &Path, content: &str) -> Result<()> {
         match self.read_to_string(relative) {
             Ok(_) => Ok(()),
-            Err(err) if is_not_found(&err) => self.write_string(relative, content),
+            Err(err) if is_not_found_error(&err) => self.write_string(relative, content),
             Err(err) => Err(err),
         }
     }
@@ -482,7 +482,7 @@ fn open_directory_path(path: &Path, create: bool) -> Result<File> {
     Ok(current)
 }
 
-fn is_not_found(err: &anyhow::Error) -> bool {
+pub(crate) fn is_not_found_error(err: &anyhow::Error) -> bool {
     matches!(err.downcast_ref::<Errno>(), Some(&Errno::NOENT))
 }
 

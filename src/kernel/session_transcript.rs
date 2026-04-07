@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::contracts::{SessionHistoryPolicy, SessionTurnStatus, SessionTurnView};
 
-use super::continuity::normalized_title_key;
+use super::continuity::{normalized_title_key, title_file_name};
 use super::session_turns::{SessionTurnRecord, SessionTurnStore};
 
 const HISTORY_OVERFETCH_MULTIPLIER: usize = 3;
@@ -395,15 +395,15 @@ pub fn normalize_compaction_summary_state(state: &mut CompactionSummaryState) {
 
 pub fn remove_memory_proposal_from_summary_state(
     state: &mut CompactionSummaryState,
-    title: &str,
+    cleanup_key: &str,
 ) -> bool {
-    let Some(normalized_title) = normalized_summary_title_key(title) else {
+    if cleanup_key.trim().is_empty() {
         return false;
-    };
+    }
     let original_len = state.memory_proposals.len();
-    state.memory_proposals.retain(|proposal| {
-        normalized_summary_title_key(&proposal.title).as_deref() != Some(normalized_title.as_str())
-    });
+    state
+        .memory_proposals
+        .retain(|proposal| title_file_name(&proposal.title) != cleanup_key);
     let changed = state.memory_proposals.len() != original_len;
     normalize_compaction_summary_state(state);
     changed
@@ -411,21 +411,20 @@ pub fn remove_memory_proposal_from_summary_state(
 
 pub fn remove_open_loop_from_summary_state(
     state: &mut CompactionSummaryState,
-    title: &str,
+    cleanup_key: &str,
 ) -> bool {
-    let Some(normalized_title) = normalized_summary_title_key(title) else {
+    if cleanup_key.trim().is_empty() {
         return false;
-    };
+    }
     let original_len = state.open_loops.len();
-    state.open_loops.retain(|open_loop| {
-        normalized_summary_title_key(&open_loop.title).as_deref() != Some(normalized_title.as_str())
-    });
+    state
+        .open_loops
+        .retain(|open_loop| title_file_name(&open_loop.title) != cleanup_key);
     let mut changed = state.open_loops.len() != original_len;
     let in_progress_len = state.progress_in_progress.len();
-    state.progress_in_progress.retain(|entry| {
-        normalized_summary_title_key(progress_entry_title(entry)).as_deref()
-            != Some(normalized_title.as_str())
-    });
+    state
+        .progress_in_progress
+        .retain(|entry| title_file_name(progress_entry_title(entry)) != cleanup_key);
     changed |= state.progress_in_progress.len() != in_progress_len;
     normalize_compaction_summary_state(state);
     changed
@@ -954,8 +953,8 @@ mod tests {
         merge_unique_memory_proposals, merge_unique_open_loops, normalize_memory_proposals,
         normalize_open_loops, parse_compaction_summary_state,
         remove_memory_proposal_from_summary_state, remove_open_loop_from_summary_state,
-        render_compaction_summary, repair_turns, CompactionSummaryState, TranscriptMode,
-        COMPACTION_LIST_KEEP,
+        render_compaction_summary, repair_turns, title_file_name, CompactionSummaryState,
+        TranscriptMode, COMPACTION_LIST_KEEP,
     };
     use crate::kernel::session_turns::SessionTurnRecord;
 
@@ -1250,11 +1249,11 @@ mod tests {
 
         assert!(remove_memory_proposal_from_summary_state(
             &mut state,
-            "Working Preferences"
+            &title_file_name("Working Preferences")
         ));
         assert!(remove_open_loop_from_summary_state(
             &mut state,
-            "Review continuity search"
+            &title_file_name("Review continuity search")
         ));
         assert!(state.memory_proposals.is_empty());
         assert!(state.open_loops.is_empty());
@@ -1301,11 +1300,11 @@ mod tests {
 
         assert!(remove_memory_proposal_from_summary_state(
             &mut state,
-            "working preferences"
+            &title_file_name("working preferences")
         ));
         assert!(remove_open_loop_from_summary_state(
             &mut state,
-            "follow up on continuity surface"
+            &title_file_name("follow up on continuity surface")
         ));
         assert!(state.memory_proposals.is_empty());
         assert!(state.open_loops.is_empty());

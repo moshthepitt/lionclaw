@@ -214,11 +214,13 @@ Queued channel turns emit machine-stable status/error codes through the same str
 - Memory proposals are written under `continuity/proposals/memory/...` and merged or rejected explicitly.
 - Open loops are written under `continuity/open-loops/...` and resolved explicitly.
 - Active proposal/open-loop files use deterministic title-keyed filenames of the form `"{slug}--{uuid-v5}.md"`.
+- The managed active filename is the stable identity for proposal/open-loop cleanup; content edits are supported, but active-file renames are outside the managed continuity contract.
 - Archives are historical records only; they do not suppress future active items with the same title.
 - Continuity-adjacent API mutations treat SQLite state plus audit as the authoritative commit boundary.
 - `continuity/ACTIVE.md` refresh is a derived post-commit projection; snapshot rebuilds are serialized in the kernel, and failures are audited as `continuity.refresh_failed` instead of turning committed mutations into outward API failures.
 - The hot `ACTIVE.md` projection uses bounded, purpose-shaped queries for pending peers, attention jobs, and recent failed turns instead of broad list-and-filter scans.
 - Continuity search uses a derived SQLite FTS index in `lionclaw.db`; the Markdown files remain the canonical source of truth.
+- Read-only continuity enumeration and index-rebuild paths skip per-file `ENOENT` churn and continue from remaining canonical files, while still surfacing real boundary and permission failures.
 - Transcript compaction summaries are stored in SQLite separately from file-backed continuity.
 - Prompt history sees one bounded structured compaction handoff summary plus the recent raw tail.
 - Active continuity state has two authorities only:
