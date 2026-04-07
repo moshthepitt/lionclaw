@@ -9,7 +9,7 @@ use chrono::{DateTime, Datelike, Utc};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use super::continuity_fs::{is_not_found_error, ContinuityFs};
+use super::continuity_fs::{is_not_found_error, is_replaceable_leaf_error, ContinuityFs};
 use super::continuity_index::{ContinuityIndexStore, ContinuityIndexedDocument};
 
 pub const MEMORY_FILE: &str = "MEMORY.md";
@@ -850,9 +850,11 @@ impl ContinuityLayout {
     async fn append_memory_entries(&self, entries: &[String]) -> Result<()> {
         let fs = self.fs().await?;
         let path = self.memory_rel_path();
-        let existing = fs
-            .read_to_string(&path)
-            .unwrap_or_else(|_| MEMORY_TEMPLATE.to_string());
+        let existing = match fs.read_to_string(&path) {
+            Ok(existing) => existing,
+            Err(err) if is_replaceable_leaf_error(&err) => MEMORY_TEMPLATE.to_string(),
+            Err(err) => return Err(err),
+        };
         let mut deduped_existing = BTreeSet::new();
         for line in existing.lines() {
             let trimmed = line.trim();
@@ -2226,6 +2228,50 @@ mod tests {
             .expect_err("symlinked active should fail");
         let message = err.to_string();
         assert!(message.contains("failed to open") || message.contains("not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn merge_memory_proposal_surfaces_unreadable_memory_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let layout = ContinuityLayout::new(temp_dir.path().join("workspace"));
+        layout.ensure_base_layout().await.expect("bootstrap");
+
+        let proposal_path = layout
+            .record_memory_proposal(&ContinuityMemoryProposalDraft {
+                title: "Unreadable Memory Proposal".to_string(),
+                rationale: "proposal".to_string(),
+                entries: vec!["entry".to_string()],
+                source: None,
+            })
+            .await
+            .expect("record proposal")
+            .expect("proposal path");
+        let proposal_relative = proposal_path
+            .strip_prefix(layout.workspace_root())
+            .expect("proposal relative")
+            .to_string_lossy()
+            .to_string();
+
+        let mut permissions = std::fs::metadata(layout.memory_path())
+            .expect("memory metadata")
+            .permissions();
+        permissions.set_mode(0o000);
+        std::fs::set_permissions(layout.memory_path(), permissions).expect("set unreadable mode");
+
+        let err = layout
+            .merge_memory_proposal(&proposal_relative)
+            .await
+            .expect_err("merge should surface unreadable memory");
+        let message = err.to_string();
+        assert!(
+            message.contains("failed to open")
+                || message.contains("failed to read")
+                || message.contains("Permission denied"),
+            "unexpected error: {message}"
+        );
     }
 
     #[cfg(unix)]

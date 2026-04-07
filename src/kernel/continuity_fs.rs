@@ -486,6 +486,10 @@ pub(crate) fn is_not_found_error(err: &anyhow::Error) -> bool {
     matches!(err.downcast_ref::<Errno>(), Some(&Errno::NOENT))
 }
 
+pub(crate) fn is_replaceable_leaf_error(err: &anyhow::Error) -> bool {
+    is_not_found_error(err) || matches!(err.downcast_ref::<Errno>(), Some(&Errno::LOOP))
+}
+
 fn os_string_from_dir_entry(entry: &rustix::fs::DirEntry) -> OsString {
     OsString::from_vec(entry.file_name().to_bytes().to_vec())
 }
