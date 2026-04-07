@@ -884,9 +884,15 @@ impl Kernel {
         let pairing_code = req.pairing_code.trim().to_string();
         let trust_tier = req.trust_tier.unwrap_or(TrustTier::Main);
 
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin()
+            .await
+            .map_err(|err| internal(err.into()))?;
         let peer = self
             .channel_state
-            .get_peer(&channel_id, &peer_id)
+            .get_peer_in_tx(&mut tx, &channel_id, &peer_id)
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("channel peer not found".to_string()))?;
@@ -897,13 +903,14 @@ impl Kernel {
 
         let approved = self
             .channel_state
-            .approve_peer(&channel_id, &peer_id, trust_tier)
+            .approve_peer_in_tx(&mut tx, &channel_id, &peer_id, trust_tier)
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("channel peer not found".to_string()))?;
 
         self.audit
-            .append(
+            .append_in_tx(
+                &mut tx,
                 "channel.peer.approved",
                 None,
                 Some("api".to_string()),
@@ -915,7 +922,18 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
-        self.refresh_active_continuity().await?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "channel.peer.approved",
+            None,
+            "api",
+            json!({
+                "channel_id": approved.channel_id,
+                "peer_id": approved.peer_id,
+                "trust_tier": approved.trust_tier.as_str(),
+            }),
+        )
+        .await;
 
         Ok(ChannelPeerResponse {
             peer: to_channel_peer_view(approved),
@@ -934,15 +952,22 @@ impl Kernel {
 
         let channel_id = req.channel_id.trim().to_string();
         let peer_id = req.peer_id.trim().to_string();
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin()
+            .await
+            .map_err(|err| internal(err.into()))?;
         let blocked = self
             .channel_state
-            .block_peer(&channel_id, &peer_id)
+            .block_peer_in_tx(&mut tx, &channel_id, &peer_id)
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("channel peer not found".to_string()))?;
 
         self.audit
-            .append(
+            .append_in_tx(
+                &mut tx,
                 "channel.peer.blocked",
                 None,
                 Some("api".to_string()),
@@ -953,7 +978,17 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
-        self.refresh_active_continuity().await?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "channel.peer.blocked",
+            None,
+            "api",
+            json!({
+                "channel_id": blocked.channel_id,
+                "peer_id": blocked.peer_id,
+            }),
+        )
+        .await;
 
         Ok(ChannelPeerResponse {
             peer: to_channel_peer_view(blocked),
@@ -1526,9 +1561,16 @@ impl Kernel {
             allowed_capabilities.push(capability);
         }
 
+        let mut tx = self
+            .jobs
+            .pool()
+            .begin()
+            .await
+            .map_err(|err| internal(err.into()))?;
         let created = self
             .jobs
-            .create_job_with_scope_grants(
+            .create_job_with_scope_grants_in_tx(
+                &mut tx,
                 &self.policy,
                 NewSchedulerJob {
                     name,
@@ -1545,7 +1587,8 @@ impl Kernel {
             .map_err(internal)?;
 
         self.audit
-            .append(
+            .append_in_tx(
+                &mut tx,
                 "job.create",
                 None,
                 Some("api".to_string()),
@@ -1560,7 +1603,18 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
-        self.refresh_active_continuity().await?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "job.create",
+            None,
+            "api",
+            json!({
+                "job_id": created.job_id,
+                "name": created.name,
+                "runtime_id": created.runtime_id,
+            }),
+        )
+        .await;
 
         Ok(JobCreateResponse {
             job: to_job_view(created),
@@ -1592,20 +1646,21 @@ impl Kernel {
     }
 
     pub async fn pause_job(&self, job_id: Uuid) -> Result<JobToggleResponse, KernelError> {
-        let existing = self
+        let mut tx = self
             .jobs
-            .get_job(job_id)
+            .pool()
+            .begin()
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let job = self
+            .jobs
+            .pause_job_in_tx(&mut tx, job_id)
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("job not found".to_string()))?;
-        let job = self
-            .jobs
-            .pause_job(job_id)
-            .await
-            .map_err(internal)?
-            .unwrap_or(existing);
         self.audit
-            .append(
+            .append_in_tx(
+                &mut tx,
                 "job.pause",
                 None,
                 Some("api".to_string()),
@@ -1613,28 +1668,48 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
-        self.refresh_active_continuity().await?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "job.pause",
+            None,
+            "api",
+            json!({"job_id": job_id}),
+        )
+        .await;
         Ok(JobToggleResponse {
             job: to_job_view(job),
         })
     }
 
     pub async fn resume_job(&self, job_id: Uuid) -> Result<JobToggleResponse, KernelError> {
-        self.jobs
-            .get_job(job_id)
+        let mut tx = self
+            .jobs
+            .pool()
+            .begin()
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let existing = self
+            .jobs
+            .get_job_in_tx(&mut tx, job_id, "failed to query scheduler job")
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("job not found".to_string()))?;
+        if existing.enabled {
+            return Err(KernelError::Conflict(
+                "job is running and cannot be resumed".to_string(),
+            ));
+        }
         let job = self
             .jobs
-            .resume_job(job_id)
+            .resume_job_in_tx(&mut tx, job_id)
             .await
             .map_err(internal)?
             .ok_or_else(|| {
                 KernelError::Conflict("job is running and cannot be resumed".to_string())
             })?;
         self.audit
-            .append(
+            .append_in_tx(
+                &mut tx,
                 "job.resume",
                 None,
                 Some("api".to_string()),
@@ -1642,21 +1717,34 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
-        self.refresh_active_continuity().await?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "job.resume",
+            None,
+            "api",
+            json!({"job_id": job_id}),
+        )
+        .await;
         Ok(JobToggleResponse {
             job: to_job_view(job),
         })
     }
 
     pub async fn remove_job(&self, job_id: Uuid) -> Result<JobRemoveResponse, KernelError> {
+        let mut tx = self
+            .jobs
+            .pool()
+            .begin()
+            .await
+            .map_err(|err| internal(err.into()))?;
         self.jobs
-            .get_job(job_id)
+            .get_job_in_tx(&mut tx, job_id, "failed to query scheduler job")
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("job not found".to_string()))?;
         let revoked_policy_grants = self
             .jobs
-            .delete_job_with_scope_cleanup(&self.policy, job_id)
+            .delete_job_with_scope_cleanup_in_tx(&mut tx, &self.policy, job_id)
             .await
             .map_err(internal)?;
         let Some(revoked_policy_grants) = revoked_policy_grants else {
@@ -1665,7 +1753,8 @@ impl Kernel {
             ));
         };
         self.audit
-            .append(
+            .append_in_tx(
+                &mut tx,
                 "job.remove",
                 None,
                 Some("api".to_string()),
@@ -1676,7 +1765,17 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
-        self.refresh_active_continuity().await?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "job.remove",
+            None,
+            "api",
+            json!({
+                "job_id": job_id,
+                "revoked_policy_grants": revoked_policy_grants,
+            }),
+        )
+        .await;
         Ok(JobRemoveResponse {
             job_id,
             removed: true,
@@ -1779,7 +1878,16 @@ impl Kernel {
             })
             .await
             .map_err(internal)?;
-        self.refresh_active_continuity().await?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "scheduler.job.completed",
+            None,
+            "kernel",
+            json!({
+                "job_id": job.job_id,
+                "run_id": run.run_id,
+            }),
+        )
+        .await;
         Ok(())
     }
 
@@ -1801,7 +1909,16 @@ impl Kernel {
             })
             .await
             .map_err(internal)?;
-        self.refresh_active_continuity().await?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "scheduler.job.failed",
+            None,
+            "kernel",
+            json!({
+                "job_id": job.job_id,
+                "run_id": run.run_id,
+            }),
+        )
+        .await;
         Ok(())
     }
 
@@ -1823,7 +1940,16 @@ impl Kernel {
             })
             .await
             .map_err(internal)?;
-        self.refresh_active_continuity().await?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "channel.peer.pairing_pending",
+            None,
+            "kernel",
+            json!({
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+            }),
+        )
+        .await;
         Ok(())
     }
 
@@ -1853,7 +1979,16 @@ impl Kernel {
             })
             .await
             .map_err(internal)?;
-        self.refresh_active_continuity().await?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "session.failure_continuity",
+            Some(session.session_id),
+            "kernel",
+            json!({
+                "turn_id": turn_id,
+                "status": status.as_str(),
+            }),
+        )
+        .await;
         Ok(())
     }
 
@@ -2061,22 +2196,35 @@ impl Kernel {
         Ok(())
     }
 
-    async fn refresh_active_continuity_best_effort(
+    async fn refresh_active_continuity_after_commit_best_effort(
         &self,
-        failure_event_type: &str,
-        archived_path: &str,
+        source_action: &str,
+        session_id: Option<Uuid>,
+        actor: &str,
+        details: serde_json::Value,
     ) {
         if let Err(err) = self.refresh_active_continuity().await {
+            let mut details = details;
+            match &mut details {
+                serde_json::Value::Object(map) => {
+                    map.insert("source_action".to_string(), json!(source_action));
+                    map.insert("error".to_string(), json!(err.to_string()));
+                }
+                _ => {
+                    details = json!({
+                        "source_action": source_action,
+                        "details": details,
+                        "error": err.to_string(),
+                    });
+                }
+            }
             let _ = self
                 .audit
                 .append(
-                    failure_event_type,
-                    None,
-                    Some("kernel".to_string()),
-                    json!({
-                        "archived_path": archived_path,
-                        "error": err.to_string(),
-                    }),
+                    "continuity.refresh_failed",
+                    session_id,
+                    Some(actor.to_string()),
+                    details,
                 )
                 .await;
         }
@@ -2256,7 +2404,16 @@ impl Kernel {
             })
             .await
             .map_err(internal)?;
-        self.refresh_active_continuity().await?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "session.compaction.flush",
+            Some(session.session_id),
+            "kernel",
+            json!({
+                "memory_proposal_count": proposal_paths.len(),
+                "open_loop_count": loop_paths.len(),
+            }),
+        )
+        .await;
         let _ = self
             .audit
             .append(
@@ -2452,9 +2609,14 @@ impl Kernel {
             .await?;
         let archived_path = self.relative_workspace_path(&archived);
         let memory_path = self.relative_workspace_path(&layout.memory_path());
-        self.refresh_active_continuity_best_effort(
-            "continuity.memory_proposal.refresh_failed",
-            &archived_path,
+        self.refresh_active_continuity_after_commit_best_effort(
+            "continuity.memory_proposal.merged",
+            None,
+            actor,
+            json!({
+                "archived_path": archived_path,
+                "memory_path": memory_path,
+            }),
         )
         .await;
         self.append_audit_event_best_effort(
@@ -2500,9 +2662,13 @@ impl Kernel {
         self.remove_memory_proposal_from_all_compactions(&metadata.title)
             .await?;
         let archived_path = self.relative_workspace_path(&archived);
-        self.refresh_active_continuity_best_effort(
-            "continuity.memory_proposal.refresh_failed",
-            &archived_path,
+        self.refresh_active_continuity_after_commit_best_effort(
+            "continuity.memory_proposal.rejected",
+            None,
+            actor,
+            json!({
+                "archived_path": archived_path,
+            }),
         )
         .await;
         self.append_audit_event_best_effort(
@@ -2563,9 +2729,13 @@ impl Kernel {
         self.remove_open_loop_from_all_compactions(&metadata.title)
             .await?;
         let archived_path = self.relative_workspace_path(&archived);
-        self.refresh_active_continuity_best_effort(
-            "continuity.open_loop.refresh_failed",
-            &archived_path,
+        self.refresh_active_continuity_after_commit_best_effort(
+            "continuity.open_loop.resolved",
+            None,
+            actor,
+            json!({
+                "archived_path": archived_path,
+            }),
         )
         .await;
         self.append_audit_event_best_effort(

@@ -90,6 +90,11 @@ Implemented now:
   - symlinked roots or subtree components are rejected for directory traversal
   - symlinked leaf files are replaced in-place rather than followed outside assistant home
 - the rest of the hot assistant-home prompt surface (`IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md`) is read and bootstrapped through the same rooted workspace boundary rather than plain pathname I/O
+- for continuity-adjacent API mutations backed by SQLite, authoritative state and audit commit atomically in one transaction
+- `continuity/ACTIVE.md` refresh is derived state:
+  - it runs after committed mutations
+  - refresh failure is audited as `continuity.refresh_failed`
+  - refresh failure does not flip an already-committed mutation into an outward API error
 
 Not implemented yet:
 

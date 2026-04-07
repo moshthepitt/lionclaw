@@ -3,7 +3,7 @@ use std::str::FromStr;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
+use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -255,6 +255,10 @@ impl ChannelStateStore {
         Self { pool }
     }
 
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     pub async fn upsert_binding(
         &self,
         channel_id: &str,
@@ -374,6 +378,27 @@ impl ChannelStateStore {
         peer_id: &str,
         trust_tier: TrustTier,
     ) -> Result<Option<ChannelPeerRecord>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start approve channel peer transaction")?;
+        let approved = self
+            .approve_peer_in_tx(&mut tx, channel_id, peer_id, trust_tier)
+            .await?;
+        tx.commit()
+            .await
+            .context("failed to commit approve channel peer transaction")?;
+        Ok(approved)
+    }
+
+    pub(crate) async fn approve_peer_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        channel_id: &str,
+        peer_id: &str,
+        trust_tier: TrustTier,
+    ) -> Result<Option<ChannelPeerRecord>> {
         let now = now_ms();
         let changed = sqlx::query(
             "UPDATE channel_peers \
@@ -384,7 +409,7 @@ impl ChannelStateStore {
         .bind(peer_id)
         .bind(trust_tier.as_str())
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await
         .context("failed to approve channel peer")?;
 
@@ -392,11 +417,29 @@ impl ChannelStateStore {
             return Ok(None);
         }
 
-        self.get_peer(channel_id, peer_id).await
+        self.get_peer_in_tx(tx, channel_id, peer_id).await
     }
 
     pub async fn block_peer(
         &self,
+        channel_id: &str,
+        peer_id: &str,
+    ) -> Result<Option<ChannelPeerRecord>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start block channel peer transaction")?;
+        let blocked = self.block_peer_in_tx(&mut tx, channel_id, peer_id).await?;
+        tx.commit()
+            .await
+            .context("failed to commit block channel peer transaction")?;
+        Ok(blocked)
+    }
+
+    pub(crate) async fn block_peer_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
         channel_id: &str,
         peer_id: &str,
     ) -> Result<Option<ChannelPeerRecord>> {
@@ -409,7 +452,7 @@ impl ChannelStateStore {
         .bind(channel_id)
         .bind(peer_id)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await
         .context("failed to block channel peer")?;
 
@@ -417,7 +460,7 @@ impl ChannelStateStore {
             return Ok(None);
         }
 
-        self.get_peer(channel_id, peer_id).await
+        self.get_peer_in_tx(tx, channel_id, peer_id).await
     }
 
     pub async fn list_peers(&self, channel_id: Option<&str>) -> Result<Vec<ChannelPeerRecord>> {
@@ -433,6 +476,25 @@ impl ChannelStateStore {
         .context("failed to list channel peers")?;
 
         rows.into_iter().map(map_peer_row).collect()
+    }
+
+    pub(crate) async fn get_peer_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        channel_id: &str,
+        peer_id: &str,
+    ) -> Result<Option<ChannelPeerRecord>> {
+        let row = sqlx::query(
+            "SELECT channel_id, peer_id, status, trust_tier, pairing_code, first_seen_ms, updated_at_ms \
+             FROM channel_peers WHERE channel_id = ?1 AND peer_id = ?2",
+        )
+        .bind(channel_id)
+        .bind(peer_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .context("failed to query channel peer")?;
+
+        row.map(map_peer_row).transpose()
     }
 
     pub async fn get_offset(&self, channel_id: &str) -> Result<i64> {

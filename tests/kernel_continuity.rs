@@ -8,9 +8,9 @@ use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use lionclaw::{
     contracts::{
-        ChannelBindRequest, ContinuityPathRequest, ContinuitySearchRequest, JobCreateRequest,
-        PolicyGrantRequest, SessionHistoryPolicy, SessionOpenRequest, SessionTurnRequest,
-        SkillInstallRequest, TrustTier,
+        ChannelBindRequest, ChannelPeerApproveRequest, ContinuityPathRequest,
+        ContinuitySearchRequest, JobCreateRequest, PolicyGrantRequest, SessionHistoryPolicy,
+        SessionOpenRequest, SessionTurnRequest, SkillInstallRequest, TrustTier,
     },
     kernel::{
         policy::Capability,
@@ -24,6 +24,7 @@ use lionclaw::{
     workspace::bootstrap_workspace,
 };
 use serde_json::json;
+use sqlx::SqlitePool;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -302,6 +303,289 @@ async fn scheduler_success_records_artifact_and_updates_active_in_home_workspace
     assert!(artifacts.contains("Scheduled Output: daily brief"));
     assert!(artifacts.contains(&created.job.job_id.to_string()));
     assert!(!env.project_root().join("continuity").exists());
+}
+
+#[tokio::test]
+async fn create_job_rolls_back_when_audit_append_fails() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    sqlx::query("DROP TABLE audit_events")
+        .execute(&pool)
+        .await
+        .expect("drop audit_events");
+
+    let err = kernel
+        .create_job(JobCreateRequest {
+            name: "audit rollback create".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() + ChronoDuration::minutes(5),
+            },
+            prompt_text: "job should not persist".to_string(),
+            skill_ids: Vec::new(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect_err("create_job should fail when audit append fails");
+    assert!(err.to_string().contains("failed to append audit event"));
+
+    let jobs = kernel.list_jobs().await.expect("list jobs after rollback");
+    assert!(jobs.jobs.is_empty(), "job row should roll back with audit");
+}
+
+#[tokio::test]
+async fn approve_channel_peer_rolls_back_when_audit_append_fails() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+    install_and_bind_channel(&kernel, "terminal").await;
+
+    let pairing_code = seed_pending_peer(&kernel, "terminal", "alice").await;
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    sqlx::query("DROP TABLE audit_events")
+        .execute(&pool)
+        .await
+        .expect("drop audit_events");
+
+    let err = kernel
+        .approve_channel_peer(ChannelPeerApproveRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "alice".to_string(),
+            pairing_code,
+            trust_tier: Some(TrustTier::Main),
+        })
+        .await
+        .expect_err("approve should fail when audit append fails");
+    assert!(err.to_string().contains("failed to append audit event"));
+
+    let peers = kernel
+        .list_channel_peers(Some("terminal".to_string()))
+        .await
+        .expect("list peers after rollback");
+    let alice = peers
+        .peers
+        .iter()
+        .find(|peer| peer.peer_id == "alice")
+        .expect("alice peer");
+    assert_eq!(alice.status, "pending");
+}
+
+#[tokio::test]
+async fn pause_job_rolls_back_when_audit_append_fails() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "audit rollback pause".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() + ChronoDuration::minutes(5),
+            },
+            prompt_text: "job should stay enabled".to_string(),
+            skill_ids: Vec::new(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create job");
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    sqlx::query("DROP TABLE audit_events")
+        .execute(&pool)
+        .await
+        .expect("drop audit_events");
+
+    let err = kernel
+        .pause_job(created.job.job_id)
+        .await
+        .expect_err("pause should fail when audit append fails");
+    assert!(err.to_string().contains("failed to append audit event"));
+
+    let job = kernel
+        .get_job(created.job.job_id)
+        .await
+        .expect("get job after rollback");
+    assert!(job.job.enabled, "job should remain enabled");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn create_job_succeeds_when_active_continuity_refresh_fails() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    break_active_continuity_refresh(&env);
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "refresh best effort create".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() + ChronoDuration::minutes(5),
+            },
+            prompt_text: "refresh failure should not fail create".to_string(),
+            skill_ids: Vec::new(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create should still succeed");
+
+    let job = kernel
+        .get_job(created.job.job_id)
+        .await
+        .expect("get created job");
+    assert_eq!(job.job.job_id, created.job.job_id);
+
+    assert_refresh_failure_event(&kernel, "job.create", "api").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn approve_channel_peer_succeeds_when_active_continuity_refresh_fails() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+    install_and_bind_channel(&kernel, "terminal").await;
+
+    let pairing_code = seed_pending_peer(&kernel, "terminal", "alice").await;
+    break_active_continuity_refresh(&env);
+
+    let response = kernel
+        .approve_channel_peer(ChannelPeerApproveRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "alice".to_string(),
+            pairing_code,
+            trust_tier: Some(TrustTier::Main),
+        })
+        .await
+        .expect("approve should still succeed");
+    assert_eq!(response.peer.status, "approved");
+
+    assert_refresh_failure_event(&kernel, "channel.peer.approved", "api").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pairing_pending_continuity_succeeds_when_active_refresh_fails() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+    install_and_bind_channel(&kernel, "terminal").await;
+
+    break_active_continuity_refresh(&env);
+
+    kernel
+        .process_inbound_channel_text(InboundChannelText {
+            channel_id: "terminal".to_string(),
+            peer_id: "alice".to_string(),
+            text: "hello".to_string(),
+            session_id: None,
+            runtime_id: Some("mock".to_string()),
+            update_id: Some(1),
+            external_message_id: Some("pairing-refresh-failure".to_string()),
+        })
+        .await
+        .expect("pending peer should still be recorded");
+
+    let peers = kernel
+        .list_channel_peers(Some("terminal".to_string()))
+        .await
+        .expect("list channel peers");
+    let alice = peers
+        .peers
+        .iter()
+        .find(|peer| peer.peer_id == "alice")
+        .expect("alice peer");
+    assert_eq!(alice.status, "pending");
+
+    let daily = read_all_markdown(env.workspace_root().join("continuity/daily"));
+    assert!(daily.contains("Pairing required for terminal/alice"));
+
+    assert_refresh_failure_event(&kernel, "channel.peer.pairing_pending", "kernel").await;
 }
 
 #[tokio::test]
@@ -1346,6 +1630,10 @@ impl TestEnv {
         self.temp_dir.path().join("lionclaw.db")
     }
 
+    fn db_url(&self) -> String {
+        format!("sqlite://{}", self.db_path().display())
+    }
+
     fn workspace_root(&self) -> PathBuf {
         self.temp_dir.path().join("home-workspace")
     }
@@ -1353,6 +1641,59 @@ impl TestEnv {
     fn project_root(&self) -> PathBuf {
         self.temp_dir.path().join("project-root")
     }
+}
+
+async fn seed_pending_peer(kernel: &Kernel, channel_id: &str, peer_id: &str) -> String {
+    kernel
+        .process_inbound_channel_text(InboundChannelText {
+            channel_id: channel_id.to_string(),
+            peer_id: peer_id.to_string(),
+            text: "seed approval".to_string(),
+            session_id: None,
+            runtime_id: Some("mock".to_string()),
+            update_id: Some(1),
+            external_message_id: Some(format!("seed-{channel_id}-{peer_id}")),
+        })
+        .await
+        .expect("seed pending peer");
+    let peers = kernel
+        .list_channel_peers(Some(channel_id.to_string()))
+        .await
+        .expect("list channel peers");
+    peers
+        .peers
+        .iter()
+        .find(|peer| peer.peer_id == peer_id)
+        .and_then(|peer| peer.pairing_code.clone())
+        .expect("pairing code")
+}
+
+async fn assert_refresh_failure_event(kernel: &Kernel, source_action: &str, actor: &str) {
+    let audit = kernel
+        .query_audit(
+            None,
+            Some("continuity.refresh_failed".to_string()),
+            None,
+            Some(20),
+        )
+        .await
+        .expect("query refresh failure audit");
+    let event = audit
+        .events
+        .iter()
+        .find(|event| {
+            event.actor.as_deref() == Some(actor)
+                && event.details["source_action"].as_str() == Some(source_action)
+        })
+        .unwrap_or_else(|| panic!("missing refresh failure audit for {source_action}"));
+    assert!(event.details["error"].as_str().is_some());
+}
+
+#[cfg(unix)]
+fn break_active_continuity_refresh(env: &TestEnv) {
+    let active = env.workspace_root().join("continuity/ACTIVE.md");
+    std::fs::remove_file(&active).expect("remove active");
+    std::fs::create_dir(&active).expect("replace active file with directory");
 }
 
 struct CapturePromptAdapter {

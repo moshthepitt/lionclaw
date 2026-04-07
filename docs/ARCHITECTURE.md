@@ -215,6 +215,8 @@ Queued channel turns emit machine-stable status/error codes through the same str
 - Open loops are written under `continuity/open-loops/...` and resolved explicitly.
 - Active proposal/open-loop files use deterministic title-keyed filenames of the form `"{slug}--{uuid-v5}.md"`.
 - Archives are historical records only; they do not suppress future active items with the same title.
+- Continuity-adjacent API mutations treat SQLite state plus audit as the authoritative commit boundary.
+- `continuity/ACTIVE.md` refresh is a derived post-commit projection; failures are audited as `continuity.refresh_failed` instead of turning committed mutations into outward API failures.
 - Continuity search uses a derived SQLite FTS index in `lionclaw.db`; the Markdown files remain the canonical source of truth.
 - Transcript compaction summaries are stored in SQLite separately from file-backed continuity.
 - Prompt history sees one bounded structured compaction handoff summary plus the recent raw tail.

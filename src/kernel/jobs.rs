@@ -235,12 +235,28 @@ impl JobStore {
             .begin()
             .await
             .context("failed to start create scheduler job transaction")?;
-        let created = self.insert_job_in_tx(&mut tx, input).await?;
+        let created = self
+            .create_job_with_scope_grants_in_tx(&mut tx, policy, input, allowed_capabilities)
+            .await?;
+        tx.commit()
+            .await
+            .context("failed to commit scheduler job and grant creation")?;
+        Ok(created)
+    }
+
+    pub(crate) async fn create_job_with_scope_grants_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        policy: &PolicyStore,
+        input: NewSchedulerJob,
+        allowed_capabilities: &[Capability],
+    ) -> Result<SchedulerJobRecord> {
+        let created = self.insert_job_in_tx(tx, input).await?;
         let scope = Scope::Job(created.job_id);
         for skill_id in &created.skill_ids {
             policy
                 .grant_in_tx(
-                    &mut tx,
+                    tx,
                     skill_id.clone(),
                     Capability::SkillUse,
                     scope.clone(),
@@ -249,13 +265,10 @@ impl JobStore {
                 .await?;
             for capability in allowed_capabilities {
                 policy
-                    .grant_in_tx(&mut tx, skill_id.clone(), *capability, scope.clone(), None)
+                    .grant_in_tx(tx, skill_id.clone(), *capability, scope.clone(), None)
                     .await?;
             }
         }
-        tx.commit()
-            .await
-            .context("failed to commit scheduler job and grant creation")?;
         Ok(created)
     }
 
@@ -349,18 +362,31 @@ impl JobStore {
             .begin()
             .await
             .context("failed to start delete scheduler job transaction")?;
-        if !self.delete_job_in_tx(&mut tx, job_id).await? {
+        let revoked = self
+            .delete_job_with_scope_cleanup_in_tx(&mut tx, policy, job_id)
+            .await?;
+        if revoked.is_none() {
             tx.commit()
                 .await
                 .context("failed to finish skipped scheduler job delete transaction")?;
             return Ok(None);
         }
-        let revoked = policy
-            .revoke_scope_in_tx(&mut tx, &Scope::Job(job_id))
-            .await?;
         tx.commit()
             .await
             .context("failed to commit scheduler job delete and scope cleanup")?;
+        Ok(revoked)
+    }
+
+    pub(crate) async fn delete_job_with_scope_cleanup_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        policy: &PolicyStore,
+        job_id: Uuid,
+    ) -> Result<Option<u64>> {
+        if !self.delete_job_in_tx(tx, job_id).await? {
+            return Ok(None);
+        }
+        let revoked = policy.revoke_scope_in_tx(tx, &Scope::Job(job_id)).await?;
         Ok(Some(revoked))
     }
 
@@ -379,6 +405,23 @@ impl JobStore {
     }
 
     pub async fn pause_job(&self, job_id: Uuid) -> Result<Option<SchedulerJobRecord>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start pause scheduler job transaction")?;
+        let job = self.pause_job_in_tx(&mut tx, job_id).await?;
+        tx.commit()
+            .await
+            .context("failed to commit pause scheduler job transaction")?;
+        Ok(job)
+    }
+
+    pub(crate) async fn pause_job_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        job_id: Uuid,
+    ) -> Result<Option<SchedulerJobRecord>> {
         let now = now_ms();
         let updated = sqlx::query(
             "UPDATE scheduler_jobs \
@@ -387,17 +430,38 @@ impl JobStore {
         )
         .bind(job_id.to_string())
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await
         .context("failed to pause scheduler job")?;
         if updated.rows_affected() == 0 {
             return Ok(None);
         }
-        self.get_job(job_id).await
+        self.get_job_in_tx(tx, job_id, "failed to reload paused scheduler job")
+            .await
     }
 
     pub async fn resume_job(&self, job_id: Uuid) -> Result<Option<SchedulerJobRecord>> {
-        let Some(job) = self.get_job(job_id).await? else {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start resume scheduler job transaction")?;
+        let job = self.resume_job_in_tx(&mut tx, job_id).await?;
+        tx.commit()
+            .await
+            .context("failed to commit resume scheduler job transaction")?;
+        Ok(job)
+    }
+
+    pub(crate) async fn resume_job_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        job_id: Uuid,
+    ) -> Result<Option<SchedulerJobRecord>> {
+        let Some(job) = self
+            .get_job_in_tx(tx, job_id, "failed to query scheduler job")
+            .await?
+        else {
             return Ok(None);
         };
         if job.enabled {
@@ -413,13 +477,14 @@ impl JobStore {
         .bind(job_id.to_string())
         .bind(next_run_at.map(|value| value.timestamp_millis()))
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await
         .context("failed to resume scheduler job")?;
         if updated.rows_affected() == 0 {
             return Ok(None);
         }
-        self.get_job(job_id).await
+        self.get_job_in_tx(tx, job_id, "failed to reload resumed scheduler job")
+            .await
     }
 
     pub async fn list_runs(
@@ -477,7 +542,7 @@ impl JobStore {
         row.map(map_job_row).transpose()
     }
 
-    async fn get_job_in_tx(
+    pub(crate) async fn get_job_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
         job_id: Uuid,
