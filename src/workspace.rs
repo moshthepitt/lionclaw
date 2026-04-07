@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+
+use crate::kernel::{continuity::ContinuityLayout, continuity_fs::ContinuityFs};
 
 pub const IDENTITY_FILE: &str = "IDENTITY.md";
 pub const SOUL_FILE: &str = "SOUL.md";
@@ -17,43 +19,76 @@ const USER_TEMPLATE: &str =
     "# User\n\nCapture operator-specific goals, preferences, and environment notes here.\n";
 
 pub async fn bootstrap_workspace(workspace_root: &Path) -> Result<()> {
-    tokio::fs::create_dir_all(workspace_root)
-        .await
-        .with_context(|| format!("failed to create {}", workspace_root.display()))?;
-
-    ensure_file(workspace_root.join(IDENTITY_FILE), IDENTITY_TEMPLATE).await?;
-    ensure_file(workspace_root.join(SOUL_FILE), SOUL_TEMPLATE).await?;
-    ensure_file(workspace_root.join(AGENTS_FILE), AGENTS_TEMPLATE).await?;
-    ensure_file(workspace_root.join(USER_FILE), USER_TEMPLATE).await?;
+    let fs = ContinuityFs::bootstrap(workspace_root)?;
+    fs.ensure_file(Path::new(IDENTITY_FILE), IDENTITY_TEMPLATE)?;
+    fs.ensure_file(Path::new(SOUL_FILE), SOUL_TEMPLATE)?;
+    fs.ensure_file(Path::new(AGENTS_FILE), AGENTS_TEMPLATE)?;
+    fs.ensure_file(Path::new(USER_FILE), USER_TEMPLATE)?;
+    ContinuityLayout::new(workspace_root)
+        .ensure_base_layout()
+        .await?;
 
     Ok(())
 }
 
 pub async fn read_workspace_sections(workspace_root: &Path) -> Result<Vec<(String, String)>> {
+    let fs = ContinuityFs::open_existing(workspace_root)?;
     let mut sections = Vec::new();
     for file_name in [IDENTITY_FILE, SOUL_FILE, AGENTS_FILE, USER_FILE] {
-        let path = workspace_root.join(file_name);
-        if !tokio::fs::try_exists(&path)
-            .await
-            .with_context(|| format!("failed to stat {}", path.display()))?
-        {
-            continue;
+        if let Some(content) = fs.read_to_string_if_exists(Path::new(file_name))? {
+            sections.push((file_name.to_string(), content));
         }
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        sections.push((file_name.to_string(), content));
+    }
+
+    for (label, content) in ContinuityLayout::new(workspace_root)
+        .read_prompt_sections()
+        .await?
+    {
+        sections.push((label, content));
     }
 
     Ok(sections)
 }
 
-async fn ensure_file(path: std::path::PathBuf, content: &str) -> Result<()> {
-    match tokio::fs::try_exists(&path).await {
-        Ok(true) => Ok(()),
-        Ok(false) => tokio::fs::write(&path, content)
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use tempfile::tempdir;
+
+    use super::{bootstrap_workspace, read_workspace_sections, SOUL_FILE};
+
+    #[tokio::test]
+    async fn bootstrap_workspace_rejects_symlinked_root() {
+        let temp_dir = tempdir().expect("temp dir");
+        let outside = temp_dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        let workspace = temp_dir.path().join("workspace");
+        symlink(&outside, &workspace).expect("symlink workspace");
+
+        let err = bootstrap_workspace(&workspace)
             .await
-            .with_context(|| format!("failed to write {}", path.display())),
-        Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
+            .expect_err("bootstrap should fail");
+        assert!(err.to_string().contains("failed to open"));
+    }
+
+    #[tokio::test]
+    async fn read_workspace_sections_rejects_symlinked_identity_file() {
+        let temp_dir = tempdir().expect("temp dir");
+        let workspace = temp_dir.path().join("workspace");
+        bootstrap_workspace(&workspace)
+            .await
+            .expect("bootstrap workspace");
+
+        let outside = temp_dir.path().join("outside.md");
+        std::fs::write(&outside, "# Outside\n").expect("write outside file");
+        std::fs::remove_file(workspace.join(SOUL_FILE)).expect("remove soul file");
+        symlink(&outside, workspace.join(SOUL_FILE)).expect("symlink soul file");
+
+        let err = read_workspace_sections(&workspace)
+            .await
+            .expect_err("read workspace sections should fail");
+        let message = err.to_string();
+        assert!(message.contains("failed to open") || message.contains("not a regular file"));
     }
 }

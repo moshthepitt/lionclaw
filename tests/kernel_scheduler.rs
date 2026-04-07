@@ -24,6 +24,7 @@ use lionclaw::{
         },
         InboundChannelText, Kernel, KernelOptions,
     },
+    workspace::bootstrap_workspace,
 };
 use sqlx::SqlitePool;
 use tempfile::TempDir;
@@ -116,10 +117,14 @@ async fn scheduled_job_tick_runs_in_fresh_scheduler_session() {
 #[tokio::test]
 async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactive_session() {
     let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap assistant workspace");
     let kernel = Kernel::new_with_options(
         &env.db_path(),
         KernelOptions {
-            workspace_root: Some(std::env::current_dir().expect("current dir")),
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(std::env::current_dir().expect("current dir")),
             ..KernelOptions::default()
         },
     )
@@ -806,5 +811,9 @@ impl TestEnv {
 
     fn db_url(&self) -> String {
         format!("sqlite://{}", self.db_path().display())
+    }
+
+    fn workspace_root(&self) -> PathBuf {
+        self.temp_dir.path().join("workspace")
     }
 }

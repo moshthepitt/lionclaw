@@ -15,7 +15,7 @@ Not a repo ritual. Not a source-checkout trick. Not a one-runtime wrapper preten
 1. LionClaw is runtime-agnostic. `codex`, `claude-code`, `opencode`, and future runtimes are adapter choices, not product identity.
 2. Everything beyond the small core is a skill. Channels are one important case, not the exception.
 3. Runtime is selected at invocation (`lionclaw run` or `lionclaw service up`), not during `lionclaw channel add`.
-4. Identity/persona is runtime-independent and comes from workspace files (`IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md`).
+4. Identity/persona is runtime-independent and comes from assistant-home workspace files plus small hot continuity files (`IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md`, `MEMORY.md`, `continuity/ACTIVE.md`).
 5. Anthropic `SKILL.md` is the skill instruction standard.
 6. Security controls live in kernel policy, sandboxing, and audit, never in prompt-only logic.
 
@@ -32,14 +32,86 @@ LionClaw uses `~/.lionclaw` as canonical state:
 
 No runtime flow should depend on repository-relative paths.
 
+## Home model (pinned terms)
+
+LionClaw uses the word "home" in three different layers. Keep them separate.
+
+### 1. Instance home
+
+`LIONCLAW_HOME` is the installation and state root for one LionClaw instance.
+
+It owns:
+
+- SQLite database
+- operator config
+- installed skill snapshots
+- runtime cache artifacts
+- logs
+- generated service files
+- machine-owned `config/home-id`
+
+This is infrastructure state. It is not the assistant's personality, memory,
+or delivery surface.
+
+### 2. Assistant home workspace
+
+`~/.lionclaw/workspaces/main/` is the default assistant home workspace.
+
+This is distinct from any optional project/task workspace root used for brokered filesystem access.
+
+This is the assistant's durable life context. It is where LionClaw keeps the
+runtime-independent identity files that shape prompt assembly and future
+assistant continuity:
+
+- `IDENTITY.md`
+- `SOUL.md`
+- `AGENTS.md`
+- `USER.md`
+
+These files describe who LionClaw is, how it should behave, and who it serves.
+They are product context, not capability grants.
+
+External repos, project directories, or other local trees are not the same
+thing as the assistant home workspace. They may be attached as explicit local
+context for a session or skill, but they should not replace the assistant's
+stable home context.
+
+### 3. Home channel
+
+LionClaw should eventually have one explicit default return path for proactive
+assistant output: the home channel.
+
+Conceptually this is a `{channel_id, peer_id}` pair used as the assistant's
+default delivery destination for background work. It is a product-level anchor,
+not a transport implementation detail.
+
+Important: this is a pinned design direction, not a first-class user-facing
+feature yet. Current delivery remains explicit per channel interaction or per
+scheduled job configuration.
+
+## Home model invariants
+
+1. `LIONCLAW_HOME` remains machine-owned installation state.
+2. `workspaces/main` is the default assistant home workspace unless explicitly
+   overridden by future product features.
+3. Assistant identity lives in workspace files, not in runtime-specific
+   configuration.
+4. `SOUL.md` shapes tone and stance, but never overrides kernel policy.
+5. Channels remain external skills even when one of them becomes the configured
+   home channel.
+6. The assistant must have one clear default place to return results, but that
+   default should be explicit rather than inferred from "last contact".
+
 ## Identity and prompt envelope
 
 Per turn, LionClaw composes a runtime-agnostic prompt envelope from:
 
 1. kernel safety/system sections,
-2. workspace identity files (`IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md`),
+2. assistant-home identity and hot continuity files (`IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md`, `MEMORY.md`, `continuity/ACTIVE.md`),
 3. selected skill context (`SKILL.md` source from installed snapshots),
 4. current user/channel input.
+
+Brokered filesystem actions may target a separate project/task root. Prompt identity and continuity do not follow that root.
 
 Adapters receive the assembled envelope; they do not own persona.
 

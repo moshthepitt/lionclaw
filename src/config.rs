@@ -14,6 +14,7 @@ pub struct Config {
     pub runtime_turn_hard_timeout_ms: u64,
     pub default_runtime_id: Option<String>,
     pub workspace_root: PathBuf,
+    pub project_workspace_root: Option<PathBuf>,
 }
 
 impl Config {
@@ -53,9 +54,10 @@ impl Config {
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| DEFAULT_WORKSPACE.to_string());
 
-        let workspace_root = std::env::var("LIONCLAW_WORKSPACE_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home.workspace_dir(&workspace_name));
+        let workspace_root = home.workspace_dir(&workspace_name);
+        let project_workspace_root = std::env::var("LIONCLAW_WORKSPACE_ROOT")
+            .ok()
+            .map(PathBuf::from);
 
         Self {
             bind_addr,
@@ -65,6 +67,7 @@ impl Config {
             runtime_turn_hard_timeout_ms,
             default_runtime_id,
             workspace_root,
+            project_workspace_root,
         }
     }
 }

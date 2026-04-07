@@ -78,6 +78,7 @@ Goal: real runtime support with kernel-owned execution boundaries.
 - [x] Route all side effects through kernel brokers (fs/net/secret/channel/send/scheduler).
 - [ ] Add runtime health, timeout, cancellation, and backpressure controls.
 - [x] Add per-runtime working directory and environment isolation policy.
+- [ ] Add semantic transcript compaction on real runtime paths through the side-effect-free hidden summarization contract.
 
 Exit criteria:
 - [ ] Same API flow works across all three adapters.

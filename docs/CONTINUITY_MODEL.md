@@ -1,0 +1,160 @@
+# Continuity Model
+
+LionClaw continuity is visible, local, and file-backed.
+
+The goal is not hidden "AI memory." The goal is durable assistant continuity that:
+
+- lives under `LIONCLAW_HOME`
+- is readable and editable without special tooling
+- stays small in the prompt hot path
+- keeps transcript compaction separate from long-term memory
+
+The current continuity security boundary is Unix-only. Descriptor-rooted
+assistant-home filesystem hardening assumes Linux/macOS-style Unix behavior.
+
+## Roots
+
+LionClaw has two different roots:
+
+- `LIONCLAW_HOME/workspaces/<daemon.workspace>`: the assistant home workspace
+- optional project/task workspace root: the filesystem root used for brokered `fs.read` / `fs.write`
+
+Continuity always lives in the assistant home workspace.
+
+That means:
+
+- prompt identity and continuity are loaded from the assistant home workspace
+- scheduler artifacts and daily notes are written to the assistant home workspace
+- brokered filesystem actions may target a different project/task root
+
+By default, when no separate project root is configured, both roles point at the same workspace.
+
+## Layout
+
+The assistant home workspace contains:
+
+- `IDENTITY.md`
+- `SOUL.md`
+- `AGENTS.md`
+- `USER.md`
+- `MEMORY.md`
+- `continuity/ACTIVE.md`
+- `continuity/daily/...`
+- `continuity/open-loops/...`
+- `continuity/artifacts/...`
+- `continuity/rollups/...`
+
+## Current v1 behavior
+
+Implemented now:
+
+- `MEMORY.md` is bootstrapped and auto-loaded into prompts
+- `continuity/ACTIVE.md` is kernel-generated from deterministic state
+- deterministic daily continuity entries are written for:
+  - pending channel pairing
+  - scheduled job success/failure
+  - failed session turns
+- scheduled outputs are recorded as artifact files
+- transcript compaction summaries are stored in SQLite and loaded separately from file memory
+- transcript compaction uses one structured persisted handoff summary plus the recent raw turn tail
+- compaction performs a typed continuity flush before summary persistence:
+  - memory proposals are written under `continuity/proposals/memory/...`
+  - open loops are upserted under `continuity/open-loops/...`
+- active proposals and open loops use deterministic title-keyed filenames:
+  - `"{slug}--{uuid-v5}.md"`
+  - same title maps back to the same active file
+  - different titles that normalize to the same slug still get distinct files
+  - the managed active filename is the stable identity for merge/reject/resolve cleanup
+  - content edits are supported, but active-file renames are not part of the managed continuity contract
+- continuity has first-class kernel/operator/API surfaces for:
+  - status
+  - indexed search
+  - get
+  - list/merge/reject memory proposals
+  - list/resolve open loops
+- prompt history uses one bounded compaction handoff summary plus the recent raw turn tail
+- deterministic kernel-side compaction extracts:
+  - current goal
+  - constraints and preferences
+  - durable memory proposals
+  - open loops
+  - recent decisions, files, and next steps
+- continuity archives are historical records only:
+  - merged/rejected proposals move under `continuity/proposals/memory/archive/...`
+  - resolved loops move under `continuity/open-loops/archive/...`
+  - archive presence does not suppress future active items with the same title
+  - repeated same-title archive actions keep distinct history entries instead of overwriting older ones
+- active continuity state has only two authorities:
+  - canonical active Markdown files under assistant home
+  - each session's latest persisted compaction summary state
+- continuity file I/O is rooted in the assistant home workspace through descriptor-based Unix filesystem operations
+  - writes do not rely on check-then-open pathname validation
+  - symlinked roots or subtree components are rejected for directory traversal
+  - symlinked leaf files are replaced in-place rather than followed outside assistant home
+- the rest of the hot assistant-home prompt surface (`IDENTITY.md`, `SOUL.md`, `AGENTS.md`, `USER.md`) is read and bootstrapped through the same rooted workspace boundary rather than plain pathname I/O
+- for continuity-adjacent API mutations backed by SQLite, authoritative state and audit commit atomically in one transaction
+- `continuity/ACTIVE.md` refresh is derived state:
+  - it runs after committed mutations
+  - snapshot rebuilds are serialized in the kernel so an older refresh cannot overwrite a newer active view
+  - its global slices are built from bounded, purpose-specific store queries rather than full-table scans
+  - refresh failure is audited as `continuity.refresh_failed`
+  - refresh failure does not flip an already-committed mutation into an outward API error
+
+Not implemented yet:
+
+- inferred open loops outside deterministic/kernel-flushed paths
+- continuity skill contract
+
+## Hot prompt context
+
+The prompt hot path stays intentionally small.
+
+Auto-loaded:
+
+- `IDENTITY.md`
+- `SOUL.md`
+- `AGENTS.md`
+- `USER.md`
+- `MEMORY.md`
+- `continuity/ACTIVE.md`
+
+Not auto-loaded:
+
+- old daily files
+- artifact history
+- rollups
+- archived loop material
+- archived proposal material
+
+## Compaction
+
+Transcript compaction is a core lifecycle, not a memory skill.
+
+LionClaw keeps:
+
+- full raw turn history in SQLite
+- compacted transcript summaries in SQLite
+- visible continuity files in the assistant home workspace
+
+Prompt rendering follows the proven assistant pattern used by Hermes, IronClaw, and OpenClaw:
+
+- one bounded persisted structured handoff summary for compacted history
+- recent raw turns kept intact
+- no ever-growing literal digest of all older turns in the prompt
+
+The handoff summary is core-owned. When the active runtime explicitly supports side-effect-free hidden summarization, LionClaw updates that handoff through a strict JSON schema; otherwise it falls back to deterministic kernel-side compaction. That keeps the core small without introducing hidden side effects outside LionClaw's normal policy boundary.
+
+Continuity search is backed by a derived SQLite FTS index inside `lionclaw.db`. The canonical source of truth remains the assistant-home Markdown files; the index is rebuilt from and synchronized with those files so search stays fast without introducing a second memory authority plane.
+
+Read-only continuity enumeration paths tolerate per-file `ENOENT` churn. If
+`MEMORY.md` or another continuity file disappears between listing and read,
+LionClaw skips that file, continues from the remaining canonical files, and
+still surfaces real boundary or permission failures.
+
+Before compaction is persisted, LionClaw performs a typed continuity flush so durable facts and active commitments can land in visible files rather than only in the transcript summary.
+
+This follows the proven split used by the stronger assistant systems:
+
+- bounded hot memory files
+- separate transcript compression
+- no hidden memory database as the canonical source of truth

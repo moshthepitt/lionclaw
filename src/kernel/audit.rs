@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::kernel::db::{datetime_to_ms, ms_to_datetime, now_ms};
@@ -33,24 +33,48 @@ impl AuditLog {
         actor: Option<String>,
         details: Value,
     ) -> Result<()> {
-        let event_id = Uuid::new_v4();
-        let event_type = event_type.into();
-        let details_json =
-            serde_json::to_string(&details).context("failed to encode audit details")?;
-        let timestamp_ms = now_ms();
+        let prepared = PreparedAuditEvent::new(event_type, session_id, actor, details)?;
 
         sqlx::query(
             "INSERT INTO audit_events \
              (event_id, event_type, session_id, actor, details_json, timestamp_ms) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
-        .bind(event_id.to_string())
-        .bind(&event_type)
-        .bind(session_id.map(|value| value.to_string()))
-        .bind(actor)
-        .bind(details_json)
-        .bind(timestamp_ms)
+        .bind(prepared.event_id)
+        .bind(prepared.event_type)
+        .bind(prepared.session_id)
+        .bind(prepared.actor)
+        .bind(prepared.details_json)
+        .bind(prepared.timestamp_ms)
         .execute(&self.pool)
+        .await
+        .context("failed to append audit event")?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn append_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        event_type: impl Into<String>,
+        session_id: Option<Uuid>,
+        actor: Option<String>,
+        details: Value,
+    ) -> Result<()> {
+        let prepared = PreparedAuditEvent::new(event_type, session_id, actor, details)?;
+
+        sqlx::query(
+            "INSERT INTO audit_events \
+             (event_id, event_type, session_id, actor, details_json, timestamp_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(prepared.event_id)
+        .bind(prepared.event_type)
+        .bind(prepared.session_id)
+        .bind(prepared.actor)
+        .bind(prepared.details_json)
+        .bind(prepared.timestamp_ms)
+        .execute(&mut **tx)
         .await
         .context("failed to append audit event")?;
 
@@ -115,5 +139,33 @@ impl AuditLog {
                 })
             })
             .collect()
+    }
+}
+
+struct PreparedAuditEvent {
+    event_id: String,
+    event_type: String,
+    session_id: Option<String>,
+    actor: Option<String>,
+    details_json: String,
+    timestamp_ms: i64,
+}
+
+impl PreparedAuditEvent {
+    fn new(
+        event_type: impl Into<String>,
+        session_id: Option<Uuid>,
+        actor: Option<String>,
+        details: Value,
+    ) -> Result<Self> {
+        Ok(Self {
+            event_id: Uuid::new_v4().to_string(),
+            event_type: event_type.into(),
+            session_id: session_id.map(|value| value.to_string()),
+            actor,
+            details_json: serde_json::to_string(&details)
+                .context("failed to encode audit details")?,
+            timestamp_ms: now_ms(),
+        })
     }
 }

@@ -1,5 +1,9 @@
 # LionClaw Architecture (v0)
 
+LionClaw currently targets Unix-like systems only. The kernel's trusted
+filesystem boundary and service assumptions are designed for Linux/macOS-style
+Unix environments.
+
 ## Kernel Modules
 
 - `kernel.sessions`: session lifecycle, history policy, and aggregate turn metadata.
@@ -12,7 +16,10 @@
 - `kernel.runtime`: runtime adapter contract and registry.
 - `kernel.scheduler`: due-job claiming, lease coordination, retry, and dispatch.
 - `kernel.channel_state`: durable channel bindings, peer trust state, inbound logs, queued channel turns, outbound transcript history, and append-only channel stream delivery state.
+- `kernel.continuity`: visible assistant-home continuity files, `ACTIVE.md` projection, daily notes, artifacts, open loops, memory proposals, and continuity retrieval helpers.
+- `kernel.continuity_fs`: descriptor-rooted Unix filesystem helper for assistant-home continuity and hot workspace-file reads/writes.
 - `kernel.audit`: append-only audit event log persisted in SQLite.
+- `kernel.session_compactions`: persisted transcript compaction spans and summaries.
 
 ## API Contracts
 
@@ -53,6 +60,17 @@
 - `POST /v0/jobs/remove`
 - `POST /v0/jobs/runs`
 - `POST /v0/jobs/tick`
+
+### Continuity
+
+- `GET /v0/continuity/status`
+- `POST /v0/continuity/get`
+- `POST /v0/continuity/search`
+- `GET /v0/continuity/proposals`
+- `POST /v0/continuity/proposals/merge`
+- `POST /v0/continuity/proposals/reject`
+- `GET /v0/continuity/loops`
+- `POST /v0/continuity/loops/resolve`
 
 ### Policy
 
@@ -101,7 +119,10 @@ Runtime module layout:
 Channel bridge layout:
 
 - `kernel/channel_state.rs`: durable channel bindings/peers/offsets/messages + stream event/cursor storage.
-- `kernel/core.rs`: channel inbound processing, pairing/approval, session snapshot lookup, and stream pull/ack APIs.
+- `kernel/continuity.rs`: assistant-home continuity layout, proposals/open loops/artifacts, indexed search integration, and deterministic continuity projection helpers.
+- `kernel/continuity_index.rs`: derived SQLite FTS index for assistant-home continuity files.
+- `kernel/core.rs`: channel inbound processing, pairing/approval, continuity APIs, session snapshot lookup, and stream pull/ack APIs.
+- `kernel/session_compactions.rs`: persisted structured transcript compaction summaries and ranges.
 - `api/mod.rs`: HTTP routes for external channel skill workers.
 
 Scheduler layout:
@@ -170,7 +191,53 @@ Queued channel turns emit machine-stable status/error codes through the same str
   - `retry_last_turn`
   - `reset_session`
 - The default history window is the last 12 durable turns.
+- Prompt rendering prepends one bounded persisted structured transcript handoff summary before the recent raw turns.
 - Channel-backed session mutation APIs (`sessions/open`, `sessions/action`, direct session turns) remain gated by channel peer approval in the kernel.
+
+## Assistant Continuity
+
+- Continuity lives under the assistant home workspace inside `LIONCLAW_HOME/workspaces/<daemon.workspace>/`.
+- The assistant home workspace contains:
+  - `MEMORY.md`
+  - `continuity/ACTIVE.md`
+  - `continuity/daily/...`
+  - `continuity/open-loops/...`
+  - `continuity/artifacts/...`
+  - `continuity/proposals/memory/...`
+- `MEMORY.md` is prompt-loaded but human-curated in v1.
+- `continuity/ACTIVE.md` is kernel-generated from deterministic state and existing continuity files.
+- Daily continuity notes are appended from deterministic kernel events such as:
+  - pending pairing
+  - scheduled job success/failure
+  - failed turns
+- Scheduler artifacts are recorded under `continuity/artifacts/...`.
+- Memory proposals are written under `continuity/proposals/memory/...` and merged or rejected explicitly.
+- Open loops are written under `continuity/open-loops/...` and resolved explicitly.
+- Active proposal/open-loop files use deterministic title-keyed filenames of the form `"{slug}--{uuid-v5}.md"`.
+- The managed active filename is the stable identity for proposal/open-loop cleanup; content edits are supported, but active-file renames are outside the managed continuity contract.
+- Archives are historical records only; they do not suppress future active items with the same title.
+- Continuity-adjacent API mutations treat SQLite state plus audit as the authoritative commit boundary.
+- `continuity/ACTIVE.md` refresh is a derived post-commit projection; snapshot rebuilds are serialized in the kernel, and failures are audited as `continuity.refresh_failed` instead of turning committed mutations into outward API failures.
+- The hot `ACTIVE.md` projection uses bounded, purpose-shaped queries for pending peers, attention jobs, and recent failed turns instead of broad list-and-filter scans.
+- Continuity search uses a derived SQLite FTS index in `lionclaw.db`; the Markdown files remain the canonical source of truth.
+- Read-only continuity enumeration and index-rebuild paths skip per-file `ENOENT` churn and continue from remaining canonical files, while still surfacing real boundary and permission failures.
+- Transcript compaction summaries are stored in SQLite separately from file-backed continuity.
+- Prompt history sees one bounded structured compaction handoff summary plus the recent raw tail.
+- Active continuity state has two authorities only:
+  - canonical active Markdown files under assistant home
+  - each session's latest persisted compaction summary state
+- Before a new compaction summary is persisted, the kernel flushes visible continuity artifacts:
+  - memory proposals
+  - open-loop updates
+  - a daily note entry when new continuity was promoted
+- Continuity reads and writes are rooted in the assistant home workspace through descriptor-based Unix filesystem operations rather than pathname preflight checks.
+- When hidden semantic summarization is unavailable, deterministic kernel compaction still extracts:
+  - current goal
+  - constraints and preferences
+  - durable memory proposals
+  - open loops
+  - recent files, decisions, and next steps
+- Brokered filesystem access may target a different project/task root; continuity never follows that root.
 
 ## Scheduler Model
 

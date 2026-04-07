@@ -566,6 +566,95 @@ pub struct AuditQueryParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuityArtifactView {
+    pub title: String,
+    pub relative_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuityOpenLoopView {
+    pub title: String,
+    pub relative_path: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub next_step: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuityMemoryProposalView {
+    pub title: String,
+    pub relative_path: String,
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub entries: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuitySearchMatchView {
+    pub title: String,
+    pub relative_path: String,
+    pub snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuityStatusResponse {
+    pub memory_path: String,
+    pub active_path: String,
+    #[serde(default)]
+    pub latest_daily_path: Option<String>,
+    pub open_loops: Vec<ContinuityOpenLoopView>,
+    pub recent_artifacts: Vec<ContinuityArtifactView>,
+    pub memory_proposals: Vec<ContinuityMemoryProposalView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuitySearchRequest {
+    pub query: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuitySearchResponse {
+    pub matches: Vec<ContinuitySearchMatchView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuityPathRequest {
+    pub relative_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuityGetResponse {
+    pub relative_path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuityProposalListResponse {
+    pub proposals: Vec<ContinuityMemoryProposalView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuityProposalActionResponse {
+    pub archived_path: String,
+    #[serde(default)]
+    pub memory_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuityOpenLoopListResponse {
+    pub loops: Vec<ContinuityOpenLoopView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuityOpenLoopActionResponse {
+    pub archived_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelBindRequest {
     pub channel_id: String,
     pub skill_id: String,

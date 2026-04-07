@@ -8,6 +8,10 @@ policy, audit, state, and runtime control in a small trusted core. When you
 want the assistant to do more, you add installable skills instead of bloating
 the core.
 
+LionClaw currently supports Unix-like systems only. The trusted filesystem and
+service assumptions in the current kernel target Linux/macOS-style Unix
+environments; Windows support is out of scope for now.
+
 ## The Anatomy of a True Assistant
 
 LionClaw is split into a rock-solid core and modular skills, giving you maximum
@@ -107,6 +111,26 @@ job-scoped policy separate from normal interactive turns, stores the full turn
 history, runs one scheduled job at a time, and delivers only the final message
 to the configured channel.
 
+## Visible continuity
+
+LionClaw keeps assistant continuity in the assistant home workspace instead of
+in a hidden memory store. The hot prompt path loads `MEMORY.md` and
+`continuity/ACTIVE.md`, while older context stays in daily notes, open-loop
+files, artifacts, and a bounded transcript handoff summary. Continuity search
+is indexed in `lionclaw.db`, but the Markdown files remain the source of truth.
+
+Inspect and manage that continuity with:
+
+```bash
+./target/release/lionclaw continuity status
+./target/release/lionclaw continuity search "release"
+./target/release/lionclaw continuity get continuity/ACTIVE.md
+./target/release/lionclaw continuity proposals ls
+./target/release/lionclaw continuity proposals merge continuity/proposals/memory/<proposal>.md
+./target/release/lionclaw continuity loops ls
+./target/release/lionclaw continuity loops resolve continuity/open-loops/<loop>.md
+```
+
 ## Channels and background mode
 
 When you want LionClaw available somewhere other than the direct CLI path,
@@ -195,6 +219,7 @@ Dive deeper:
 
 - [Architecture](docs/ARCHITECTURE.md) - how the trusted core isolates state, policy, and runtime control
 - [Binary Model](docs/BINARY_RUNTIME_AGNOSTIC_MODEL.md) - the product and runtime model behind `lionclaw run`
+- [Continuity Model](docs/CONTINUITY_MODEL.md) - how LionClaw keeps visible assistant continuity without hidden memory state
 - [Release Process](docs/RELEASE.md) - how releases are prepared and published
 - [Roadmap](docs/ROADMAP.md) - what comes next, from channel skills to background automation
 - [Scripts](scripts/README.md) - helper scripts for local setup and testing

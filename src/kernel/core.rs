@@ -20,7 +20,11 @@ use crate::contracts::{
     ChannelListResponse, ChannelPeerApproveRequest, ChannelPeerBlockRequest,
     ChannelPeerListResponse, ChannelPeerResponse, ChannelPeerView, ChannelStreamAckRequest,
     ChannelStreamAckResponse, ChannelStreamEventView, ChannelStreamPullRequest,
-    ChannelStreamPullResponse, JobCreateRequest, JobCreateResponse, JobDeliveryTargetDto,
+    ChannelStreamPullResponse, ContinuityGetResponse, ContinuityMemoryProposalView,
+    ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse, ContinuityOpenLoopView,
+    ContinuityPathRequest, ContinuityProposalActionResponse, ContinuityProposalListResponse,
+    ContinuitySearchMatchView, ContinuitySearchRequest, ContinuitySearchResponse,
+    ContinuityStatusResponse, JobCreateRequest, JobCreateResponse, JobDeliveryTargetDto,
     JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest, JobRemoveResponse,
     JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto, JobTickResponse,
     JobToggleResponse, JobView, PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeResponse,
@@ -41,6 +45,11 @@ use super::{
         ChannelPeerStatus, ChannelStateStore, ChannelStreamEventInsert, ChannelStreamEventKind,
         ChannelStreamEventRecord, ChannelTurnRecord, StreamMessageLane as ChannelStreamLane,
     },
+    continuity::{
+        ActiveContinuitySnapshot, ContinuityArtifact, ContinuityEvent, ContinuityLayout,
+        ContinuityMemoryProposalDraft, ContinuityOpenLoopDraft,
+    },
+    continuity_index::ContinuityIndexStore,
     db::Db,
     error::KernelError,
     jobs::{
@@ -50,21 +59,28 @@ use super::{
     },
     policy::{Capability, PolicyStore, Scope},
     runtime::{
-        register_builtin_runtime_adapters, RuntimeAdapter, RuntimeCapabilityRequest,
-        RuntimeCapabilityResult, RuntimeEvent, RuntimeMessageLane, RuntimeRegistry,
-        RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
-        BUILTIN_RUNTIME_MOCK,
+        register_builtin_runtime_adapters, HiddenTurnSupport, RuntimeAdapter,
+        RuntimeCapabilityRequest, RuntimeCapabilityResult, RuntimeEvent, RuntimeMessageLane,
+        RuntimeRegistry, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
+        RuntimeTurnResult, BUILTIN_RUNTIME_MOCK,
     },
     runtime_policy::{RuntimeExecutionContext, RuntimeExecutionPolicy, RuntimeExecutionRequest},
     scheduler::{SchedulerConfig, SchedulerEngine},
     selector::SkillSelector,
+    session_compactions::SessionCompactionStore,
     session_transcript::{
-        load_repaired_turns, render_turns_for_prompt, turns_to_history_views, TranscriptMode,
+        build_compaction_prompt, load_repaired_turns, merge_compaction_summary_state,
+        merge_compaction_summary_updates, parse_compaction_summary_state,
+        remove_memory_proposal_from_summary_state, remove_open_loop_from_summary_state,
+        render_compaction_summary, render_turns_for_prompt, turns_to_history_views,
+        CompactionSummaryState, TranscriptMode, COMPACTION_RAW_KEEP,
     },
     session_turns::{NewSessionTurn, SessionTurnCompletion, SessionTurnRecord, SessionTurnStore},
     sessions::SessionStore,
     skills::{SkillInstallInput, SkillStore},
 };
+
+const ACTIVE_GLOBAL_SLICE_LIMIT: usize = 5;
 
 #[derive(Debug, Clone)]
 pub struct KernelOptions {
@@ -73,6 +89,7 @@ pub struct KernelOptions {
     pub runtime_execution_policy: RuntimeExecutionPolicy,
     pub default_runtime_id: Option<String>,
     pub workspace_root: Option<PathBuf>,
+    pub project_workspace_root: Option<PathBuf>,
     pub scheduler: SchedulerConfig,
 }
 
@@ -84,6 +101,7 @@ impl Default for KernelOptions {
             runtime_execution_policy: RuntimeExecutionPolicy::default(),
             default_runtime_id: Some(BUILTIN_RUNTIME_MOCK.to_string()),
             workspace_root: None,
+            project_workspace_root: None,
             scheduler: SchedulerConfig::default(),
         }
     }
@@ -93,6 +111,7 @@ impl Default for KernelOptions {
 pub struct Kernel {
     sessions: SessionStore,
     session_turns: SessionTurnStore,
+    session_compactions: SessionCompactionStore,
     skills: SkillStore,
     selector: SkillSelector,
     policy: PolicyStore,
@@ -105,11 +124,13 @@ pub struct Kernel {
     channel_stream_notifiers: Arc<RwLock<HashMap<String, Arc<Notify>>>>,
     channel_turn_workers: Arc<RwLock<HashSet<String>>>,
     session_locks: Arc<RwLock<HashMap<Uuid, Arc<Mutex<()>>>>>,
+    active_continuity_refresh_lock: Arc<Mutex<()>>,
     runtime_turn_idle_timeout: Duration,
     runtime_turn_hard_timeout: Duration,
     runtime_execution_policy: RuntimeExecutionPolicy,
     default_runtime_id: Option<String>,
     workspace_root: Option<PathBuf>,
+    continuity: Option<ContinuityLayout>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,15 +165,25 @@ impl Kernel {
                 .runtime_turn_hard_timeout
                 .max(runtime_turn_idle_timeout)
         };
-        let capability_broker = if let Some(workspace_root) = options.workspace_root.clone() {
-            CapabilityBroker::new(workspace_root)
-        } else {
-            CapabilityBroker::default()
-        };
+        let capability_broker =
+            if let Some(project_workspace_root) = options.project_workspace_root.clone() {
+                CapabilityBroker::new(project_workspace_root)
+            } else if let Some(workspace_root) = options.workspace_root.clone() {
+                CapabilityBroker::new(workspace_root)
+            } else {
+                CapabilityBroker::default()
+            };
+        let continuity = options.workspace_root.clone().map(|workspace_root| {
+            ContinuityLayout::with_index_store(
+                workspace_root,
+                Some(ContinuityIndexStore::new(pool.clone())),
+            )
+        });
 
         let kernel = Self {
             sessions: SessionStore::new(pool.clone()),
             session_turns: SessionTurnStore::new(pool.clone()),
+            session_compactions: SessionCompactionStore::new(pool.clone()),
             skills: SkillStore::new(pool.clone()),
             selector: SkillSelector::new(),
             policy: PolicyStore::new(pool.clone()),
@@ -165,11 +196,13 @@ impl Kernel {
             channel_stream_notifiers: Arc::new(RwLock::new(HashMap::new())),
             channel_turn_workers: Arc::new(RwLock::new(HashSet::new())),
             session_locks: Arc::new(RwLock::new(HashMap::new())),
+            active_continuity_refresh_lock: Arc::new(Mutex::new(())),
             runtime_turn_idle_timeout,
             runtime_turn_hard_timeout,
             runtime_execution_policy: options.runtime_execution_policy,
             default_runtime_id: options.default_runtime_id,
             workspace_root: options.workspace_root,
+            continuity,
         };
 
         kernel.bootstrap().await;
@@ -178,6 +211,9 @@ impl Kernel {
 
     async fn bootstrap(&self) {
         register_builtin_runtime_adapters(&self.runtime).await;
+        if let Some(layout) = &self.continuity {
+            let _ = layout.ensure_base_layout().await;
+        }
         let reason = "turn interrupted by kernel restart";
         if let Ok(interrupted_turns) = self.session_turns.interrupt_running_turns(reason).await {
             for turn in &interrupted_turns {
@@ -205,6 +241,7 @@ impl Kernel {
             .jobs
             .interrupt_running_runs("scheduled job interrupted by kernel restart")
             .await;
+        let _ = self.refresh_active_continuity().await;
     }
 
     pub async fn register_runtime_adapter(
@@ -851,9 +888,15 @@ impl Kernel {
         let pairing_code = req.pairing_code.trim().to_string();
         let trust_tier = req.trust_tier.unwrap_or(TrustTier::Main);
 
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin()
+            .await
+            .map_err(|err| internal(err.into()))?;
         let peer = self
             .channel_state
-            .get_peer(&channel_id, &peer_id)
+            .get_peer_in_tx(&mut tx, &channel_id, &peer_id)
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("channel peer not found".to_string()))?;
@@ -864,13 +907,14 @@ impl Kernel {
 
         let approved = self
             .channel_state
-            .approve_peer(&channel_id, &peer_id, trust_tier)
+            .approve_peer_in_tx(&mut tx, &channel_id, &peer_id, trust_tier)
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("channel peer not found".to_string()))?;
 
         self.audit
-            .append(
+            .append_in_tx(
+                &mut tx,
                 "channel.peer.approved",
                 None,
                 Some("api".to_string()),
@@ -882,6 +926,18 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "channel.peer.approved",
+            None,
+            "api",
+            json!({
+                "channel_id": approved.channel_id,
+                "peer_id": approved.peer_id,
+                "trust_tier": approved.trust_tier.as_str(),
+            }),
+        )
+        .await;
 
         Ok(ChannelPeerResponse {
             peer: to_channel_peer_view(approved),
@@ -900,15 +956,22 @@ impl Kernel {
 
         let channel_id = req.channel_id.trim().to_string();
         let peer_id = req.peer_id.trim().to_string();
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin()
+            .await
+            .map_err(|err| internal(err.into()))?;
         let blocked = self
             .channel_state
-            .block_peer(&channel_id, &peer_id)
+            .block_peer_in_tx(&mut tx, &channel_id, &peer_id)
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("channel peer not found".to_string()))?;
 
         self.audit
-            .append(
+            .append_in_tx(
+                &mut tx,
                 "channel.peer.blocked",
                 None,
                 Some("api".to_string()),
@@ -919,6 +982,17 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "channel.peer.blocked",
+            None,
+            "api",
+            json!({
+                "channel_id": blocked.channel_id,
+                "peer_id": blocked.peer_id,
+            }),
+        )
+        .await;
 
         Ok(ChannelPeerResponse {
             peer: to_channel_peer_view(blocked),
@@ -1140,6 +1214,9 @@ impl Kernel {
                     )
                     .await
                     .map_err(internal)?;
+                let _ = self
+                    .record_pairing_pending_continuity(&channel_id, &peer_id, &pending.pairing_code)
+                    .await;
 
                 let _ = self
                     .emit_channel_message(
@@ -1488,9 +1565,16 @@ impl Kernel {
             allowed_capabilities.push(capability);
         }
 
+        let mut tx = self
+            .jobs
+            .pool()
+            .begin()
+            .await
+            .map_err(|err| internal(err.into()))?;
         let created = self
             .jobs
-            .create_job_with_scope_grants(
+            .create_job_with_scope_grants_in_tx(
+                &mut tx,
                 &self.policy,
                 NewSchedulerJob {
                     name,
@@ -1507,7 +1591,8 @@ impl Kernel {
             .map_err(internal)?;
 
         self.audit
-            .append(
+            .append_in_tx(
+                &mut tx,
                 "job.create",
                 None,
                 Some("api".to_string()),
@@ -1522,6 +1607,18 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "job.create",
+            None,
+            "api",
+            json!({
+                "job_id": created.job_id,
+                "name": created.name,
+                "runtime_id": created.runtime_id,
+            }),
+        )
+        .await;
 
         Ok(JobCreateResponse {
             job: to_job_view(created),
@@ -1553,20 +1650,21 @@ impl Kernel {
     }
 
     pub async fn pause_job(&self, job_id: Uuid) -> Result<JobToggleResponse, KernelError> {
-        let existing = self
+        let mut tx = self
             .jobs
-            .get_job(job_id)
+            .pool()
+            .begin()
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let job = self
+            .jobs
+            .pause_job_in_tx(&mut tx, job_id)
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("job not found".to_string()))?;
-        let job = self
-            .jobs
-            .pause_job(job_id)
-            .await
-            .map_err(internal)?
-            .unwrap_or(existing);
         self.audit
-            .append(
+            .append_in_tx(
+                &mut tx,
                 "job.pause",
                 None,
                 Some("api".to_string()),
@@ -1574,27 +1672,48 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "job.pause",
+            None,
+            "api",
+            json!({"job_id": job_id}),
+        )
+        .await;
         Ok(JobToggleResponse {
             job: to_job_view(job),
         })
     }
 
     pub async fn resume_job(&self, job_id: Uuid) -> Result<JobToggleResponse, KernelError> {
-        self.jobs
-            .get_job(job_id)
+        let mut tx = self
+            .jobs
+            .pool()
+            .begin()
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let existing = self
+            .jobs
+            .get_job_in_tx(&mut tx, job_id, "failed to query scheduler job")
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("job not found".to_string()))?;
+        if existing.enabled {
+            return Err(KernelError::Conflict(
+                "job is running and cannot be resumed".to_string(),
+            ));
+        }
         let job = self
             .jobs
-            .resume_job(job_id)
+            .resume_job_in_tx(&mut tx, job_id)
             .await
             .map_err(internal)?
             .ok_or_else(|| {
                 KernelError::Conflict("job is running and cannot be resumed".to_string())
             })?;
         self.audit
-            .append(
+            .append_in_tx(
+                &mut tx,
                 "job.resume",
                 None,
                 Some("api".to_string()),
@@ -1602,20 +1721,34 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "job.resume",
+            None,
+            "api",
+            json!({"job_id": job_id}),
+        )
+        .await;
         Ok(JobToggleResponse {
             job: to_job_view(job),
         })
     }
 
     pub async fn remove_job(&self, job_id: Uuid) -> Result<JobRemoveResponse, KernelError> {
+        let mut tx = self
+            .jobs
+            .pool()
+            .begin()
+            .await
+            .map_err(|err| internal(err.into()))?;
         self.jobs
-            .get_job(job_id)
+            .get_job_in_tx(&mut tx, job_id, "failed to query scheduler job")
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("job not found".to_string()))?;
         let revoked_policy_grants = self
             .jobs
-            .delete_job_with_scope_cleanup(&self.policy, job_id)
+            .delete_job_with_scope_cleanup_in_tx(&mut tx, &self.policy, job_id)
             .await
             .map_err(internal)?;
         let Some(revoked_policy_grants) = revoked_policy_grants else {
@@ -1624,7 +1757,8 @@ impl Kernel {
             ));
         };
         self.audit
-            .append(
+            .append_in_tx(
+                &mut tx,
                 "job.remove",
                 None,
                 Some("api".to_string()),
@@ -1635,6 +1769,17 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "job.remove",
+            None,
+            "api",
+            json!({
+                "job_id": job_id,
+                "revoked_policy_grants": revoked_policy_grants,
+            }),
+        )
+        .await;
         Ok(JobRemoveResponse {
             job_id,
             removed: true,
@@ -1704,6 +1849,590 @@ impl Kernel {
         &self.audit
     }
 
+    pub(super) async fn record_scheduler_continuity_success(
+        &self,
+        job: &SchedulerJobRecord,
+        run: &SchedulerJobRunRecord,
+        assistant_text: &str,
+    ) -> Result<(), KernelError> {
+        let Some(layout) = &self.continuity else {
+            return Ok(());
+        };
+
+        let artifact_path = layout
+            .record_artifact(ContinuityArtifact {
+                at: Utc::now(),
+                slug: format!("{}-{}", job.name, run.run_id),
+                title: format!("Scheduled Output: {}", job.name),
+                kind: "scheduler_job_output".to_string(),
+                summary: Some(format!("run {}", run.run_id)),
+                source: Some(format!("job:{} run:{}", job.job_id, run.run_id)),
+                body: assistant_text.to_string(),
+            })
+            .await
+            .map_err(internal)?;
+        layout
+            .append_daily_event(ContinuityEvent {
+                at: Utc::now(),
+                title: format!("Scheduled job '{}' completed", job.name),
+                details: vec![
+                    format!("run {}", run.run_id),
+                    format!("artifact {}", self.relative_workspace_path(&artifact_path)),
+                ],
+            })
+            .await
+            .map_err(internal)?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "scheduler.job.completed",
+            None,
+            "kernel",
+            json!({
+                "job_id": job.job_id,
+                "run_id": run.run_id,
+            }),
+        )
+        .await;
+        Ok(())
+    }
+
+    pub(super) async fn record_scheduler_continuity_failure(
+        &self,
+        job: &SchedulerJobRecord,
+        run: &SchedulerJobRunRecord,
+        error: &str,
+    ) -> Result<(), KernelError> {
+        let Some(layout) = &self.continuity else {
+            return Ok(());
+        };
+
+        layout
+            .append_daily_event(ContinuityEvent {
+                at: Utc::now(),
+                title: format!("Scheduled job '{}' failed", job.name),
+                details: vec![format!("run {}", run.run_id), error.trim().to_string()],
+            })
+            .await
+            .map_err(internal)?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "scheduler.job.failed",
+            None,
+            "kernel",
+            json!({
+                "job_id": job.job_id,
+                "run_id": run.run_id,
+            }),
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn record_pairing_pending_continuity(
+        &self,
+        channel_id: &str,
+        peer_id: &str,
+        pairing_code: &str,
+    ) -> Result<(), KernelError> {
+        let Some(layout) = &self.continuity else {
+            return Ok(());
+        };
+
+        layout
+            .append_daily_event(ContinuityEvent {
+                at: Utc::now(),
+                title: format!("Pairing required for {}/{}", channel_id, peer_id),
+                details: vec![format!("pairing code {}", pairing_code)],
+            })
+            .await
+            .map_err(internal)?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "channel.peer.pairing_pending",
+            None,
+            "kernel",
+            json!({
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+            }),
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn record_session_failure_continuity(
+        &self,
+        session: &super::sessions::Session,
+        turn_id: Uuid,
+        status: SessionTurnStatus,
+        error_text: &str,
+    ) -> Result<(), KernelError> {
+        let Some(layout) = &self.continuity else {
+            return Ok(());
+        };
+
+        layout
+            .append_daily_event(ContinuityEvent {
+                at: Utc::now(),
+                title: format!(
+                    "Session turn failed for {}/{}",
+                    session.channel_id, session.peer_id
+                ),
+                details: vec![
+                    format!("turn {}", turn_id),
+                    format!("status {}", status.as_str()),
+                    error_text.trim().to_string(),
+                ],
+            })
+            .await
+            .map_err(internal)?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "session.failure_continuity",
+            Some(session.session_id),
+            "kernel",
+            json!({
+                "turn_id": turn_id,
+                "status": status.as_str(),
+            }),
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn maybe_compact_session_transcript(
+        &self,
+        session: &super::sessions::Session,
+    ) -> Result<(), KernelError> {
+        let Some(latest_turn) = self
+            .session_turns
+            .latest(session.session_id)
+            .await
+            .map_err(internal)?
+        else {
+            return Ok(());
+        };
+
+        if latest_turn.sequence_no <= COMPACTION_RAW_KEEP {
+            return Ok(());
+        }
+
+        let through_sequence_no = latest_turn.sequence_no.saturating_sub(COMPACTION_RAW_KEEP);
+        let previous_compaction = self
+            .session_compactions
+            .latest(session.session_id)
+            .await
+            .map_err(internal)?;
+        let already_compacted = previous_compaction
+            .as_ref()
+            .map(|record| record.through_sequence_no)
+            .unwrap_or(0);
+        if through_sequence_no <= already_compacted {
+            return Ok(());
+        }
+
+        let turns = self
+            .session_turns
+            .list_sequence_range(session.session_id, already_compacted, through_sequence_no)
+            .await
+            .map_err(internal)?;
+        if turns.is_empty() {
+            return Ok(());
+        }
+
+        let start_sequence_no = previous_compaction
+            .as_ref()
+            .map(|record| record.start_sequence_no)
+            .or_else(|| turns.first().map(|turn| turn.sequence_no))
+            .unwrap_or(already_compacted + 1);
+        let previous_summary_state = previous_compaction
+            .as_ref()
+            .map(|record| record.summary_state.clone());
+        let runtime_id = turns
+            .last()
+            .map(|turn| turn.runtime_id.as_str())
+            .unwrap_or(BUILTIN_RUNTIME_MOCK);
+        let summary_state = self
+            .build_compaction_summary_state(
+                session.session_id,
+                runtime_id,
+                previous_summary_state.as_ref(),
+                &turns,
+            )
+            .await?;
+        self.flush_compaction_continuity(session, &summary_state)
+            .await?;
+        let summary_text =
+            render_compaction_summary(start_sequence_no, through_sequence_no, &summary_state);
+        if summary_text.trim().is_empty() {
+            return Ok(());
+        }
+
+        let record = self
+            .session_compactions
+            .insert(
+                session.session_id,
+                start_sequence_no,
+                through_sequence_no,
+                summary_text,
+                &summary_state,
+            )
+            .await
+            .map_err(internal)?;
+        let _ = self
+            .audit
+            .append(
+                "session.compacted",
+                Some(session.session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "compaction_id": record.compaction_id,
+                    "start_sequence_no": record.start_sequence_no,
+                    "through_sequence_no": record.through_sequence_no,
+                }),
+            )
+            .await;
+        Ok(())
+    }
+
+    async fn maybe_compact_session_transcript_best_effort(
+        &self,
+        session: &super::sessions::Session,
+    ) {
+        let error_text = match self.maybe_compact_session_transcript(session).await {
+            Ok(()) => return,
+            Err(err) => err.to_string(),
+        };
+        let _ = self
+            .audit
+            .append(
+                "session.compaction.failed",
+                Some(session.session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "error": error_text,
+                }),
+            )
+            .await;
+    }
+
+    async fn refresh_active_continuity(&self) -> Result<(), KernelError> {
+        let Some(layout) = &self.continuity else {
+            return Ok(());
+        };
+        let _guard = self.active_continuity_refresh_lock.lock().await;
+
+        let pending_approvals = self
+            .channel_state
+            .list_pending_peers(ACTIVE_GLOBAL_SLICE_LIMIT)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(|peer| format!("{}/{}", peer.channel_id, peer.peer_id))
+            .collect::<Vec<_>>();
+
+        let mut matters_today = Vec::new();
+        for job in self
+            .jobs
+            .list_attention_jobs(ACTIVE_GLOBAL_SLICE_LIMIT)
+            .await
+            .map_err(internal)?
+        {
+            let error = job.last_error.as_deref().unwrap_or("no error recorded");
+            matters_today.push(format!("Job '{}' needs attention: {}", job.name, error));
+        }
+        for turn in self
+            .session_turns
+            .list_recent_failures(ACTIVE_GLOBAL_SLICE_LIMIT)
+            .await
+            .map_err(internal)?
+        {
+            matters_today.push(format!(
+                "Session {} turn {} {}",
+                turn.session_id,
+                turn.sequence_no,
+                turn.status.as_str()
+            ));
+        }
+
+        let open_loops = layout
+            .list_active_open_loops()
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(|open_loop| match open_loop.next_step {
+                Some(next_step) if !next_step.trim().is_empty() => {
+                    format!("{} (next: {})", open_loop.title, next_step.trim())
+                }
+                _ => open_loop.title,
+            })
+            .collect::<Vec<_>>();
+        let pending_proposals = layout
+            .list_memory_proposals(5)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(|proposal| proposal.title)
+            .collect::<Vec<_>>();
+        let recent_outputs = layout
+            .list_recent_artifacts(5)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(|artifact| format!("{} ({})", artifact.title, artifact.relative_path))
+            .collect::<Vec<_>>();
+
+        layout
+            .write_active(&ActiveContinuitySnapshot {
+                matters_today,
+                open_loops,
+                pending_approvals,
+                pending_proposals,
+                recent_outputs,
+            })
+            .await
+            .map_err(internal)?;
+        Ok(())
+    }
+
+    async fn refresh_active_continuity_after_commit_best_effort(
+        &self,
+        source_action: &str,
+        session_id: Option<Uuid>,
+        actor: &str,
+        details: serde_json::Value,
+    ) {
+        if let Err(err) = self.refresh_active_continuity().await {
+            let mut details = details;
+            match &mut details {
+                serde_json::Value::Object(map) => {
+                    map.insert("source_action".to_string(), json!(source_action));
+                    map.insert("error".to_string(), json!(err.to_string()));
+                }
+                _ => {
+                    details = json!({
+                        "source_action": source_action,
+                        "details": details,
+                        "error": err.to_string(),
+                    });
+                }
+            }
+            let _ = self
+                .audit
+                .append(
+                    "continuity.refresh_failed",
+                    session_id,
+                    Some(actor.to_string()),
+                    details,
+                )
+                .await;
+        }
+    }
+
+    async fn append_audit_event_best_effort(
+        &self,
+        event_type: &str,
+        actor: &str,
+        details: serde_json::Value,
+    ) {
+        let _ = self
+            .audit
+            .append(event_type, None, Some(actor.to_string()), details)
+            .await;
+    }
+
+    async fn build_compaction_summary_state(
+        &self,
+        session_id: Uuid,
+        runtime_id: &str,
+        previous_summary_state: Option<&CompactionSummaryState>,
+        turns: &[SessionTurnRecord],
+    ) -> Result<CompactionSummaryState, KernelError> {
+        let fallback = merge_compaction_summary_state(previous_summary_state, turns);
+        let prompt = build_compaction_prompt(previous_summary_state, turns);
+        let assistant_text = match self
+            .run_hidden_compaction_turn(session_id, runtime_id, prompt)
+            .await
+        {
+            Ok(text) => text,
+            Err(_) => return Ok(fallback),
+        };
+
+        match parse_compaction_summary_state(&assistant_text) {
+            Ok(summary_state) => Ok(merge_compaction_summary_updates(
+                previous_summary_state,
+                summary_state,
+            )),
+            Err(_) => Ok(fallback),
+        }
+    }
+
+    async fn run_hidden_compaction_turn(
+        &self,
+        session_id: Uuid,
+        runtime_id: &str,
+        prompt: String,
+    ) -> Result<String, KernelError> {
+        let adapter = self.runtime.get(runtime_id).await.ok_or_else(|| {
+            KernelError::NotFound(format!("runtime adapter '{}' not found", runtime_id))
+        })?;
+        if adapter.hidden_turn_support() != HiddenTurnSupport::SideEffectFree {
+            return Err(KernelError::Runtime(format!(
+                "runtime '{}' does not support side-effect-free hidden compaction",
+                runtime_id
+            )));
+        }
+        let execution_context = self
+            .resolve_runtime_execution_context(
+                session_id,
+                runtime_id,
+                RuntimeExecutionRequest::new(None, Vec::new(), Some(30_000)),
+            )
+            .await?;
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: execution_context.working_dir,
+                environment: execution_context.environment,
+                selected_skills: Vec::new(),
+            })
+            .await
+            .map_err(|err| KernelError::Runtime(err.to_string()))?;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let turn_outcome = timeout(
+            execution_context.hard_timeout,
+            adapter.turn(
+                RuntimeTurnInput {
+                    runtime_session_id: handle.runtime_session_id.clone(),
+                    prompt,
+                    selected_skills: Vec::new(),
+                },
+                event_tx,
+            ),
+        )
+        .await;
+
+        let outcome = match turn_outcome {
+            Ok(Ok(result)) => {
+                if !result.capability_requests.is_empty() {
+                    Err(KernelError::Runtime(
+                        "compaction summarizer requested capabilities".to_string(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Ok(Err(err)) => Err(KernelError::Runtime(err.to_string())),
+            Err(_) => {
+                let _ = adapter
+                    .cancel(&handle, Some("compaction summarizer timed out".to_string()))
+                    .await;
+                Err(KernelError::RuntimeTimeout(
+                    "compaction summarizer timed out".to_string(),
+                ))
+            }
+        };
+
+        let mut events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            events.push(event);
+        }
+        let close_result = adapter.close(&handle).await;
+        outcome?;
+        close_result.map_err(|err| KernelError::Runtime(err.to_string()))?;
+        Ok(assistant_text_from_events(&events))
+    }
+
+    async fn flush_compaction_continuity(
+        &self,
+        session: &super::sessions::Session,
+        summary_state: &CompactionSummaryState,
+    ) -> Result<(), KernelError> {
+        let Some(layout) = &self.continuity else {
+            return Ok(());
+        };
+
+        let mut proposal_paths = Vec::new();
+        for proposal in &summary_state.memory_proposals {
+            if let Some(path) = layout
+                .record_memory_proposal(&ContinuityMemoryProposalDraft {
+                    title: proposal.title.clone(),
+                    rationale: proposal.rationale.clone(),
+                    entries: proposal.entries.clone(),
+                    source: Some(format!("session:{}", session.session_id)),
+                })
+                .await
+                .map_err(internal)?
+            {
+                proposal_paths.push(self.relative_workspace_path(&path));
+            }
+        }
+
+        let mut loop_paths = Vec::new();
+        for open_loop in &summary_state.open_loops {
+            if let Some(path) = layout
+                .upsert_open_loop(&ContinuityOpenLoopDraft {
+                    title: open_loop.title.clone(),
+                    summary: open_loop.summary.clone(),
+                    next_step: open_loop.next_step.clone(),
+                    source: Some(format!("session:{}", session.session_id)),
+                })
+                .await
+                .map_err(internal)?
+            {
+                loop_paths.push(self.relative_workspace_path(&path));
+            }
+        }
+
+        if proposal_paths.is_empty() && loop_paths.is_empty() {
+            return Ok(());
+        }
+
+        let mut details = vec![format!("session {}", session.session_id)];
+        if !proposal_paths.is_empty() {
+            details.push(format!("memory proposals {}", proposal_paths.join(", ")));
+        }
+        if !loop_paths.is_empty() {
+            details.push(format!("open loops {}", loop_paths.join(", ")));
+        }
+        layout
+            .append_daily_event(ContinuityEvent {
+                at: Utc::now(),
+                title: "Continuity flush before transcript compaction".to_string(),
+                details,
+            })
+            .await
+            .map_err(internal)?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "session.compaction.flush",
+            Some(session.session_id),
+            "kernel",
+            json!({
+                "memory_proposal_count": proposal_paths.len(),
+                "open_loop_count": loop_paths.len(),
+            }),
+        )
+        .await;
+        let _ = self
+            .audit
+            .append(
+                "session.compaction.flush",
+                Some(session.session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "memory_proposal_count": proposal_paths.len(),
+                    "open_loop_count": loop_paths.len(),
+                }),
+            )
+            .await;
+        Ok(())
+    }
+
+    fn relative_workspace_path(&self, path: &Path) -> String {
+        self.workspace_root
+            .as_ref()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string()
+    }
+
     pub(super) async fn execute_scheduled_job_turn(
         &self,
         session_id: Uuid,
@@ -1760,6 +2489,512 @@ impl Kernel {
             .collect::<Vec<_>>();
 
         Ok(AuditQueryResponse { events })
+    }
+
+    pub async fn continuity_status(&self) -> Result<ContinuityStatusResponse, KernelError> {
+        let layout = self
+            .continuity
+            .as_ref()
+            .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let status = layout.status().await.map_err(internal)?;
+        Ok(ContinuityStatusResponse {
+            memory_path: status.memory_path,
+            active_path: status.active_path,
+            latest_daily_path: status.latest_daily_path,
+            open_loops: status
+                .open_loops
+                .into_iter()
+                .map(to_continuity_open_loop_view)
+                .collect(),
+            recent_artifacts: status
+                .recent_artifacts
+                .into_iter()
+                .map(to_continuity_artifact_view)
+                .collect(),
+            memory_proposals: status
+                .memory_proposals
+                .into_iter()
+                .map(to_continuity_memory_proposal_view)
+                .collect(),
+        })
+    }
+
+    pub async fn continuity_search(
+        &self,
+        req: ContinuitySearchRequest,
+    ) -> Result<ContinuitySearchResponse, KernelError> {
+        let layout = self
+            .continuity
+            .as_ref()
+            .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let limit = req.limit.unwrap_or(10).clamp(1, 100);
+        let matches = layout.search(&req.query, limit).await.map_err(internal)?;
+        Ok(ContinuitySearchResponse {
+            matches: matches
+                .into_iter()
+                .map(|item| ContinuitySearchMatchView {
+                    title: item.title,
+                    relative_path: item.relative_path,
+                    snippet: item.snippet,
+                })
+                .collect(),
+        })
+    }
+
+    pub async fn continuity_get(
+        &self,
+        req: ContinuityPathRequest,
+    ) -> Result<ContinuityGetResponse, KernelError> {
+        let layout = self
+            .continuity
+            .as_ref()
+            .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let content = layout
+            .read_relative(&req.relative_path)
+            .await
+            .map_err(internal)?;
+        Ok(ContinuityGetResponse {
+            relative_path: req.relative_path,
+            content,
+        })
+    }
+
+    pub async fn list_continuity_memory_proposals(
+        &self,
+    ) -> Result<ContinuityProposalListResponse, KernelError> {
+        let layout = self
+            .continuity
+            .as_ref()
+            .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let proposals = layout.list_memory_proposals(100).await.map_err(internal)?;
+        Ok(ContinuityProposalListResponse {
+            proposals: proposals
+                .into_iter()
+                .map(to_continuity_memory_proposal_view)
+                .collect(),
+        })
+    }
+
+    pub async fn merge_continuity_memory_proposal(
+        &self,
+        req: ContinuityPathRequest,
+    ) -> Result<ContinuityProposalActionResponse, KernelError> {
+        self.merge_continuity_memory_proposal_with_actor(req, "api")
+            .await
+    }
+
+    pub async fn merge_continuity_memory_proposal_with_actor(
+        &self,
+        req: ContinuityPathRequest,
+        actor: &str,
+    ) -> Result<ContinuityProposalActionResponse, KernelError> {
+        let layout = self
+            .continuity
+            .as_ref()
+            .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let metadata = layout
+            .memory_proposal_metadata(&req.relative_path)
+            .await
+            .map_err(internal)?;
+        let archived = layout
+            .merge_memory_proposal(&req.relative_path)
+            .await
+            .map_err(internal)?;
+        self.remove_memory_proposal_from_all_compactions(&metadata.cleanup_key)
+            .await?;
+        let archived_path = self.relative_workspace_path(&archived);
+        let memory_path = self.relative_workspace_path(&layout.memory_path());
+        self.refresh_active_continuity_after_commit_best_effort(
+            "continuity.memory_proposal.merged",
+            None,
+            actor,
+            json!({
+                "archived_path": archived_path,
+                "memory_path": memory_path,
+            }),
+        )
+        .await;
+        self.append_audit_event_best_effort(
+            "continuity.memory_proposal.merged",
+            actor,
+            json!({
+                "archived_path": archived_path,
+                "memory_path": memory_path,
+            }),
+        )
+        .await;
+        Ok(ContinuityProposalActionResponse {
+            archived_path,
+            memory_path: Some(memory_path),
+        })
+    }
+
+    pub async fn reject_continuity_memory_proposal(
+        &self,
+        req: ContinuityPathRequest,
+    ) -> Result<ContinuityProposalActionResponse, KernelError> {
+        self.reject_continuity_memory_proposal_with_actor(req, "api")
+            .await
+    }
+
+    pub async fn reject_continuity_memory_proposal_with_actor(
+        &self,
+        req: ContinuityPathRequest,
+        actor: &str,
+    ) -> Result<ContinuityProposalActionResponse, KernelError> {
+        let layout = self
+            .continuity
+            .as_ref()
+            .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let metadata = layout
+            .memory_proposal_metadata(&req.relative_path)
+            .await
+            .map_err(internal)?;
+        let archived = layout
+            .reject_memory_proposal(&req.relative_path)
+            .await
+            .map_err(internal)?;
+        self.remove_memory_proposal_from_all_compactions(&metadata.cleanup_key)
+            .await?;
+        let archived_path = self.relative_workspace_path(&archived);
+        self.refresh_active_continuity_after_commit_best_effort(
+            "continuity.memory_proposal.rejected",
+            None,
+            actor,
+            json!({
+                "archived_path": archived_path,
+            }),
+        )
+        .await;
+        self.append_audit_event_best_effort(
+            "continuity.memory_proposal.rejected",
+            actor,
+            json!({
+                "archived_path": archived_path,
+            }),
+        )
+        .await;
+        Ok(ContinuityProposalActionResponse {
+            archived_path,
+            memory_path: None,
+        })
+    }
+
+    pub async fn list_continuity_open_loops(
+        &self,
+    ) -> Result<ContinuityOpenLoopListResponse, KernelError> {
+        let layout = self
+            .continuity
+            .as_ref()
+            .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let loops = layout.list_active_open_loops().await.map_err(internal)?;
+        Ok(ContinuityOpenLoopListResponse {
+            loops: loops
+                .into_iter()
+                .map(to_continuity_open_loop_view)
+                .collect(),
+        })
+    }
+
+    pub async fn resolve_continuity_open_loop(
+        &self,
+        req: ContinuityPathRequest,
+    ) -> Result<ContinuityOpenLoopActionResponse, KernelError> {
+        self.resolve_continuity_open_loop_with_actor(req, "api")
+            .await
+    }
+
+    pub async fn resolve_continuity_open_loop_with_actor(
+        &self,
+        req: ContinuityPathRequest,
+        actor: &str,
+    ) -> Result<ContinuityOpenLoopActionResponse, KernelError> {
+        let layout = self
+            .continuity
+            .as_ref()
+            .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let metadata = layout
+            .open_loop_metadata(&req.relative_path)
+            .await
+            .map_err(internal)?;
+        let archived = layout
+            .resolve_open_loop(&req.relative_path)
+            .await
+            .map_err(internal)?;
+        self.remove_open_loop_from_all_compactions(&metadata.cleanup_key)
+            .await?;
+        let archived_path = self.relative_workspace_path(&archived);
+        self.refresh_active_continuity_after_commit_best_effort(
+            "continuity.open_loop.resolved",
+            None,
+            actor,
+            json!({
+                "archived_path": archived_path,
+            }),
+        )
+        .await;
+        self.append_audit_event_best_effort(
+            "continuity.open_loop.resolved",
+            actor,
+            json!({
+                "archived_path": archived_path,
+            }),
+        )
+        .await;
+        Ok(ContinuityOpenLoopActionResponse { archived_path })
+    }
+
+    async fn remove_memory_proposal_from_all_compactions(
+        &self,
+        cleanup_key: &str,
+    ) -> Result<(), KernelError> {
+        self.remove_summary_title_from_all_compactions(
+            cleanup_key,
+            remove_memory_proposal_from_summary_state,
+        )
+        .await
+    }
+
+    async fn remove_open_loop_from_all_compactions(
+        &self,
+        cleanup_key: &str,
+    ) -> Result<(), KernelError> {
+        self.remove_summary_title_from_all_compactions(
+            cleanup_key,
+            remove_open_loop_from_summary_state,
+        )
+        .await
+    }
+
+    async fn remove_summary_title_from_all_compactions(
+        &self,
+        cleanup_key: &str,
+        remove_from_summary_state: fn(&mut CompactionSummaryState, &str) -> bool,
+    ) -> Result<(), KernelError> {
+        for session_id in self
+            .session_compactions
+            .list_session_ids()
+            .await
+            .map_err(internal)?
+        {
+            let session_lock = self.session_lock(session_id).await;
+            let _guard = session_lock.lock().await;
+            let Some(mut record) = self
+                .session_compactions
+                .latest(session_id)
+                .await
+                .map_err(internal)?
+            else {
+                continue;
+            };
+            if !remove_from_summary_state(&mut record.summary_state, cleanup_key) {
+                continue;
+            }
+            let _ = self
+                .session_compactions
+                .replace_summary_state(record.compaction_id, &record.summary_state)
+                .await
+                .map_err(internal)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+    use tokio::time::{sleep, Duration};
+
+    use super::*;
+    use crate::kernel::continuity::title_file_name;
+    use crate::kernel::session_transcript::{CompactionMemoryProposal, CompactionOpenLoop};
+
+    #[tokio::test]
+    async fn active_continuity_refresh_serializes_snapshot_rebuilds() {
+        let temp_dir = tempdir().expect("temp dir");
+        let workspace_root = temp_dir.path().join("workspace");
+        let db_path = temp_dir.path().join("lionclaw.db");
+        let kernel = Kernel::new_with_options(
+            &db_path,
+            KernelOptions {
+                workspace_root: Some(workspace_root.clone()),
+                project_workspace_root: Some(temp_dir.path().join("project-root")),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let layout = kernel
+            .continuity
+            .as_ref()
+            .expect("continuity layout")
+            .clone();
+
+        let guard = kernel.active_continuity_refresh_lock.lock().await;
+        let refresh_kernel = kernel.clone();
+        let refresh_task =
+            tokio::spawn(async move { refresh_kernel.refresh_active_continuity().await });
+        sleep(Duration::from_millis(20)).await;
+        assert!(
+            !refresh_task.is_finished(),
+            "refresh should wait for the active continuity lock"
+        );
+
+        layout
+            .upsert_open_loop(&ContinuityOpenLoopDraft {
+                title: "Serialized Refresh Loop".to_string(),
+                summary: "added while an earlier refresh is waiting".to_string(),
+                next_step: "write the latest snapshot".to_string(),
+                source: Some("test".to_string()),
+            })
+            .await
+            .expect("upsert open loop");
+
+        drop(guard);
+        refresh_task
+            .await
+            .expect("join refresh task")
+            .expect("refresh succeeds");
+
+        let active = tokio::fs::read_to_string(workspace_root.join("continuity/ACTIVE.md"))
+            .await
+            .expect("read active continuity");
+        assert!(
+            active.contains("Serialized Refresh Loop"),
+            "serialized refresh should observe continuity changes committed while it was waiting"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_memory_proposals_from_compactions_waits_for_session_lock() {
+        let temp_dir = tempdir().expect("temp dir");
+        let workspace_root = temp_dir.path().join("workspace");
+        let db_path = temp_dir.path().join("lionclaw.db");
+        let kernel = Kernel::new_with_options(
+            &db_path,
+            KernelOptions {
+                workspace_root: Some(workspace_root),
+                project_workspace_root: Some(temp_dir.path().join("project-root")),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let session_id = Uuid::new_v4();
+        let summary_state = CompactionSummaryState {
+            memory_proposals: vec![CompactionMemoryProposal {
+                title: "Working Preferences".to_string(),
+                rationale: "durable preference".to_string(),
+                entries: vec!["Keep the core small.".to_string()],
+            }],
+            ..CompactionSummaryState::default()
+        };
+        kernel
+            .session_compactions
+            .insert(
+                session_id,
+                1,
+                3,
+                render_compaction_summary(1, 3, &summary_state),
+                &summary_state,
+            )
+            .await
+            .expect("insert compaction");
+
+        let session_lock = kernel.session_lock(session_id).await;
+        let guard = session_lock.clone().lock_owned().await;
+        let remove_kernel = kernel.clone();
+        let remove_task = tokio::spawn(async move {
+            remove_kernel
+                .remove_memory_proposal_from_all_compactions(&title_file_name(
+                    "working preferences",
+                ))
+                .await
+        });
+        sleep(Duration::from_millis(20)).await;
+        assert!(
+            !remove_task.is_finished(),
+            "memory proposal cleanup should wait for the session lock"
+        );
+
+        drop(guard);
+        remove_task
+            .await
+            .expect("join remove task")
+            .expect("remove memory proposal");
+
+        let latest = kernel
+            .session_compactions
+            .latest(session_id)
+            .await
+            .expect("latest compaction")
+            .expect("record");
+        assert!(latest.summary_state.memory_proposals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn removing_open_loops_from_compactions_waits_for_session_lock() {
+        let temp_dir = tempdir().expect("temp dir");
+        let workspace_root = temp_dir.path().join("workspace");
+        let db_path = temp_dir.path().join("lionclaw.db");
+        let kernel = Kernel::new_with_options(
+            &db_path,
+            KernelOptions {
+                workspace_root: Some(workspace_root),
+                project_workspace_root: Some(temp_dir.path().join("project-root")),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let session_id = Uuid::new_v4();
+        let summary_state = CompactionSummaryState {
+            open_loops: vec![CompactionOpenLoop {
+                title: "Review continuity search".to_string(),
+                summary: "Need to verify the search path.".to_string(),
+                next_step: "Run continuity search".to_string(),
+            }],
+            ..CompactionSummaryState::default()
+        };
+        kernel
+            .session_compactions
+            .insert(
+                session_id,
+                1,
+                3,
+                render_compaction_summary(1, 3, &summary_state),
+                &summary_state,
+            )
+            .await
+            .expect("insert compaction");
+
+        let session_lock = kernel.session_lock(session_id).await;
+        let guard = session_lock.clone().lock_owned().await;
+        let remove_kernel = kernel.clone();
+        let remove_task = tokio::spawn(async move {
+            remove_kernel
+                .remove_open_loop_from_all_compactions(&title_file_name("review continuity search"))
+                .await
+        });
+        sleep(Duration::from_millis(20)).await;
+        assert!(
+            !remove_task.is_finished(),
+            "open loop cleanup should wait for the session lock"
+        );
+
+        drop(guard);
+        remove_task
+            .await
+            .expect("join remove task")
+            .expect("remove open loop");
+
+        let latest = kernel
+            .session_compactions
+            .latest(session_id)
+            .await
+            .expect("latest compaction")
+            .expect("record");
+        assert!(latest.summary_state.open_loops.is_empty());
     }
 }
 
@@ -1829,6 +3064,37 @@ fn to_session_open_response(session: super::sessions::Session) -> SessionOpenRes
         trust_tier: session.trust_tier,
         history_policy: session.history_policy,
         created_at: session.created_at,
+    }
+}
+
+fn to_continuity_open_loop_view(
+    open_loop: super::continuity::ContinuityOpenLoop,
+) -> ContinuityOpenLoopView {
+    ContinuityOpenLoopView {
+        title: open_loop.title,
+        relative_path: open_loop.relative_path,
+        summary: open_loop.summary,
+        next_step: open_loop.next_step,
+    }
+}
+
+fn to_continuity_artifact_view(
+    artifact: super::continuity::ContinuityArtifactSummary,
+) -> crate::contracts::ContinuityArtifactView {
+    crate::contracts::ContinuityArtifactView {
+        title: artifact.title,
+        relative_path: artifact.relative_path,
+    }
+}
+
+fn to_continuity_memory_proposal_view(
+    proposal: super::continuity::ContinuityMemoryProposal,
+) -> ContinuityMemoryProposalView {
+    ContinuityMemoryProposalView {
+        title: proposal.title,
+        relative_path: proposal.relative_path,
+        rationale: proposal.rationale,
+        entries: proposal.entries,
     }
 }
 
@@ -2681,6 +3947,8 @@ impl Kernel {
             .record_turn(session.session_id)
             .await
             .map_err(internal)?;
+        self.maybe_compact_session_transcript_best_effort(session)
+            .await;
 
         if let Some(stream_context) = &channel_stream_context {
             if artifacts.saw_error {
@@ -2774,7 +4042,7 @@ impl Kernel {
                     status,
                     assistant_text,
                     error_code: Some(error_code),
-                    error_text: Some(error_text),
+                    error_text: Some(error_text.clone()),
                 },
             )
             .await
@@ -2784,6 +4052,26 @@ impl Kernel {
             .record_turn(session.session_id)
             .await
             .map_err(internal)?;
+        self.maybe_compact_session_transcript_best_effort(session)
+            .await;
+        if let Err(err) = self
+            .record_session_failure_continuity(session, persisted_turn.turn_id, status, &error_text)
+            .await
+        {
+            let _ = self
+                .audit
+                .append(
+                    "session.failure_continuity.failed",
+                    Some(session.session_id),
+                    Some("kernel".to_string()),
+                    json!({
+                        "turn_id": persisted_turn.turn_id,
+                        "status": status.as_str(),
+                        "error": err.to_string(),
+                    }),
+                )
+                .await;
+        }
         Ok(())
     }
 
@@ -3493,6 +4781,17 @@ impl Kernel {
         session: &super::sessions::Session,
         limit: usize,
     ) -> anyhow::Result<Vec<String>> {
+        let mut sections = Vec::new();
+        if let Some(record) = self.session_compactions.latest(session.session_id).await? {
+            let summary_text = render_compaction_summary(
+                record.start_sequence_no,
+                record.through_sequence_no,
+                &record.summary_state,
+            );
+            if !summary_text.trim().is_empty() {
+                sections.push(summary_text);
+            }
+        }
         let turns = load_repaired_turns(
             &self.session_turns,
             session.session_id,
@@ -3500,7 +4799,8 @@ impl Kernel {
             TranscriptMode::Prompt(session.history_policy),
         )
         .await?;
-        Ok(render_turns_for_prompt(&turns, session.history_policy))
+        sections.extend(render_turns_for_prompt(&turns, session.history_policy));
+        Ok(sections)
     }
 
     async fn read_skill_context(

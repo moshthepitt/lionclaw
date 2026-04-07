@@ -6,9 +6,9 @@ use uuid::Uuid;
 use crate::kernel::{
     policy::Capability,
     runtime::{
-        RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityRequest, RuntimeCapabilityResult,
-        RuntimeEvent, RuntimeEventSender, RuntimeMessageLane, RuntimeSessionHandle,
-        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
+        HiddenTurnSupport, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityRequest,
+        RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender, RuntimeMessageLane,
+        RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
     },
 };
 
@@ -22,6 +22,10 @@ impl RuntimeAdapter for MockRuntimeAdapter {
             version: "0.1".to_string(),
             healthy: true,
         }
+    }
+
+    fn hidden_turn_support(&self) -> HiddenTurnSupport {
+        HiddenTurnSupport::SideEffectFree
     }
 
     async fn session_start(

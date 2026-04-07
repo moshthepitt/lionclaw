@@ -1,0 +1,338 @@
+use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Utc};
+use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
+use uuid::Uuid;
+
+use crate::kernel::db::{ms_to_datetime, now_ms};
+use crate::kernel::session_transcript::{render_compaction_summary, CompactionSummaryState};
+
+#[derive(Debug, Clone)]
+pub struct SessionCompactionRecord {
+    pub compaction_id: Uuid,
+    pub session_id: Uuid,
+    pub start_sequence_no: u64,
+    pub through_sequence_no: u64,
+    pub summary_text: String,
+    pub summary_state: CompactionSummaryState,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionCompactionStore {
+    pool: SqlitePool,
+}
+
+impl SessionCompactionStore {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    pub async fn latest_through_sequence(&self, session_id: Uuid) -> Result<u64> {
+        let raw = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MAX(through_sequence_no) \
+             FROM session_compactions \
+             WHERE session_id = ?1",
+        )
+        .bind(session_id.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to query latest session compaction")?
+        .unwrap_or(0);
+        u64::try_from(raw).context("invalid latest through_sequence_no")
+    }
+
+    pub async fn latest(&self, session_id: Uuid) -> Result<Option<SessionCompactionRecord>> {
+        let row = sqlx::query(
+            "SELECT compaction_id, session_id, start_sequence_no, through_sequence_no, summary_text, summary_state_json, created_at_ms \
+             FROM session_compactions \
+             WHERE session_id = ?1 \
+             ORDER BY through_sequence_no DESC, compaction_id DESC \
+             LIMIT 1",
+        )
+        .bind(session_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query latest session compaction record")?;
+
+        row.map(map_compaction_row).transpose()
+    }
+
+    pub async fn insert(
+        &self,
+        session_id: Uuid,
+        start_sequence_no: u64,
+        through_sequence_no: u64,
+        summary_text: String,
+        summary_state: &CompactionSummaryState,
+    ) -> Result<SessionCompactionRecord> {
+        let compaction_id = Uuid::new_v4();
+        let created_at_ms = now_ms();
+        let summary_state_json = serde_json::to_string(summary_state)
+            .context("failed to serialize session compaction summary state")?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start session compaction transaction")?;
+        sqlx::query(
+            "INSERT INTO session_compactions \
+             (compaction_id, session_id, start_sequence_no, through_sequence_no, summary_text, summary_state_json, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(compaction_id.to_string())
+        .bind(session_id.to_string())
+        .bind(i64::try_from(start_sequence_no).context("start_sequence_no is too large")?)
+        .bind(i64::try_from(through_sequence_no).context("through_sequence_no is too large")?)
+        .bind(summary_text)
+        .bind(summary_state_json)
+        .bind(created_at_ms)
+        .execute(&mut *tx)
+        .await
+        .context("failed to insert session compaction")?;
+
+        sqlx::query(
+            "DELETE FROM session_compactions \
+             WHERE session_id = ?1 AND compaction_id != ?2",
+        )
+        .bind(session_id.to_string())
+        .bind(compaction_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .context("failed to prune superseded session compactions")?;
+
+        tx.commit()
+            .await
+            .context("failed to commit session compaction transaction")?;
+
+        self.get(compaction_id)
+            .await?
+            .ok_or_else(|| anyhow!("session compaction disappeared immediately after insert"))
+    }
+
+    pub async fn get(&self, compaction_id: Uuid) -> Result<Option<SessionCompactionRecord>> {
+        let row = sqlx::query(
+            "SELECT compaction_id, session_id, start_sequence_no, through_sequence_no, summary_text, summary_state_json, created_at_ms \
+             FROM session_compactions \
+             WHERE compaction_id = ?1",
+        )
+        .bind(compaction_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query session compaction")?;
+
+        row.map(map_compaction_row).transpose()
+    }
+
+    pub async fn list_recent(
+        &self,
+        session_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<SessionCompactionRecord>> {
+        let rows = sqlx::query(
+            "SELECT compaction_id, session_id, start_sequence_no, through_sequence_no, summary_text, summary_state_json, created_at_ms \
+             FROM session_compactions \
+             WHERE session_id = ?1 \
+             ORDER BY through_sequence_no DESC, compaction_id DESC \
+             LIMIT ?2",
+        )
+        .bind(session_id.to_string())
+        .bind(i64::try_from(limit).context("session compaction limit is too large")?)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list session compactions")?;
+
+        rows.into_iter().map(map_compaction_row).collect()
+    }
+
+    pub async fn list_session_ids(&self) -> Result<Vec<Uuid>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT session_id \
+             FROM session_compactions \
+             ORDER BY session_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list session compaction session ids")?;
+
+        rows.into_iter()
+            .map(|raw| {
+                Uuid::parse_str(&raw)
+                    .with_context(|| format!("invalid session_id '{}' in session compactions", raw))
+            })
+            .collect()
+    }
+
+    pub async fn replace_summary_state(
+        &self,
+        compaction_id: Uuid,
+        summary_state: &CompactionSummaryState,
+    ) -> Result<Option<SessionCompactionRecord>> {
+        let Some(record) = self.get(compaction_id).await? else {
+            return Ok(None);
+        };
+        let summary_text = render_compaction_summary(
+            record.start_sequence_no,
+            record.through_sequence_no,
+            summary_state,
+        );
+        let summary_state_json = serde_json::to_string(summary_state)
+            .context("failed to serialize updated session compaction summary state")?;
+        let rows_affected = sqlx::query(
+            "UPDATE session_compactions \
+             SET summary_text = ?2, summary_state_json = ?3 \
+             WHERE compaction_id = ?1",
+        )
+        .bind(compaction_id.to_string())
+        .bind(summary_text)
+        .bind(summary_state_json)
+        .execute(&self.pool)
+        .await
+        .context("failed to update session compaction summary state")?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            return Ok(None);
+        }
+
+        self.get(compaction_id).await
+    }
+}
+
+fn map_compaction_row(row: SqliteRow) -> Result<SessionCompactionRecord> {
+    let compaction_id_raw: String = row.get("compaction_id");
+    let session_id_raw: String = row.get("session_id");
+    let start_sequence_no_raw: i64 = row.get("start_sequence_no");
+    let through_sequence_no_raw: i64 = row.get("through_sequence_no");
+    let summary_state_json: String = row.get("summary_state_json");
+    let created_at_ms: i64 = row.get("created_at_ms");
+
+    Ok(SessionCompactionRecord {
+        compaction_id: Uuid::parse_str(&compaction_id_raw)
+            .with_context(|| format!("invalid compaction_id '{}'", compaction_id_raw))?,
+        session_id: Uuid::parse_str(&session_id_raw)
+            .with_context(|| format!("invalid session_id '{}'", session_id_raw))?,
+        start_sequence_no: u64::try_from(start_sequence_no_raw)
+            .with_context(|| format!("invalid start_sequence_no '{}'", start_sequence_no_raw))?,
+        through_sequence_no: u64::try_from(through_sequence_no_raw).with_context(|| {
+            format!("invalid through_sequence_no '{}'", through_sequence_no_raw)
+        })?,
+        summary_text: row.get("summary_text"),
+        summary_state: serde_json::from_str(&summary_state_json).with_context(|| {
+            format!(
+                "invalid session compaction summary_state_json '{}'",
+                summary_state_json
+            )
+        })?,
+        created_at: ms_to_datetime(created_at_ms)
+            .ok_or_else(|| anyhow!("invalid created_at_ms '{}'", created_at_ms))?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+    use uuid::Uuid;
+
+    use super::SessionCompactionStore;
+    use crate::kernel::db::Db;
+    use crate::kernel::session_transcript::CompactionSummaryState;
+
+    #[tokio::test]
+    async fn insert_prunes_superseded_compactions_for_session() {
+        let temp_dir = tempdir().expect("temp dir");
+        let db = Db::connect_file(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("db connect");
+        let store = SessionCompactionStore::new(db.pool());
+        let session_id = Uuid::new_v4();
+
+        let first = store
+            .insert(
+                session_id,
+                1,
+                5,
+                "first".to_string(),
+                &CompactionSummaryState::default(),
+            )
+            .await
+            .expect("insert first");
+        let second = store
+            .insert(
+                session_id,
+                1,
+                10,
+                "second".to_string(),
+                &CompactionSummaryState::default(),
+            )
+            .await
+            .expect("insert second");
+
+        assert!(store
+            .get(first.compaction_id)
+            .await
+            .expect("get first")
+            .is_none());
+        let latest = store
+            .latest(session_id)
+            .await
+            .expect("latest")
+            .expect("record");
+        assert_eq!(latest.compaction_id, second.compaction_id);
+        assert_eq!(latest.summary_text, "second");
+        assert_eq!(latest.summary_state, CompactionSummaryState::default());
+        assert_eq!(
+            store.list_recent(session_id, 10).await.expect("list").len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_summary_state_by_stale_identity_does_not_clobber_latest() {
+        let temp_dir = tempdir().expect("temp dir");
+        let db = Db::connect_file(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("db connect");
+        let store = SessionCompactionStore::new(db.pool());
+        let session_id = Uuid::new_v4();
+
+        let first = store
+            .insert(
+                session_id,
+                1,
+                5,
+                "first".to_string(),
+                &CompactionSummaryState::default(),
+            )
+            .await
+            .expect("insert first");
+        let second_state = CompactionSummaryState {
+            goal: Some("keep the newer summary".to_string()),
+            ..CompactionSummaryState::default()
+        };
+        let second = store
+            .insert(session_id, 1, 10, "second".to_string(), &second_state)
+            .await
+            .expect("insert second");
+
+        let updated = store
+            .replace_summary_state(
+                first.compaction_id,
+                &CompactionSummaryState {
+                    goal: Some("stale update".to_string()),
+                    ..CompactionSummaryState::default()
+                },
+            )
+            .await
+            .expect("replace summary state");
+        assert!(updated.is_none());
+
+        let latest = store
+            .latest(session_id)
+            .await
+            .expect("latest")
+            .expect("record");
+        assert_eq!(latest.compaction_id, second.compaction_id);
+        assert_eq!(latest.summary_text, "second");
+        assert_eq!(latest.summary_state, second_state);
+    }
+}

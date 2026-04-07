@@ -17,13 +17,15 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     config.home.ensure_base_dirs().await?;
     let home_id = config.home.ensure_home_id().await?;
     let operator_config = OperatorConfig::load(&config.home).await?;
-    let workspace_root = if std::env::var_os("LIONCLAW_WORKSPACE").is_some()
-        || std::env::var_os("LIONCLAW_WORKSPACE_ROOT").is_some()
-    {
+    let workspace_root = if std::env::var_os("LIONCLAW_WORKSPACE").is_some() {
         config.workspace_root.clone()
     } else {
         operator_config.workspace_root(&config.home)
     };
+    let project_workspace_root = config
+        .project_workspace_root
+        .clone()
+        .unwrap_or_else(|| workspace_root.clone());
     let default_runtime_id = config
         .default_runtime_id
         .clone()
@@ -41,6 +43,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 ),
                 default_runtime_id,
                 workspace_root: Some(workspace_root),
+                project_workspace_root: Some(project_workspace_root),
                 ..KernelOptions::default()
             },
         )
