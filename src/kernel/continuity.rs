@@ -591,17 +591,19 @@ impl ContinuityLayout {
         }
 
         if let Some(index_store) = &self.index_store {
-            self.rebuild_index().await?;
-            let indexed = index_store.search(&needle, limit).await?;
-            if !indexed.is_empty() {
-                return Ok(indexed
-                    .into_iter()
-                    .map(|item| ContinuitySearchMatch {
-                        relative_path: item.relative_path,
-                        title: item.title,
-                        snippet: item.snippet,
-                    })
-                    .collect());
+            if index_store.can_search(&needle) {
+                self.rebuild_index().await?;
+                let indexed = index_store.search(&needle, limit).await?;
+                if !indexed.is_empty() {
+                    return Ok(indexed
+                        .into_iter()
+                        .map(|item| ContinuitySearchMatch {
+                            relative_path: item.relative_path,
+                            title: item.title,
+                            snippet: item.snippet,
+                        })
+                        .collect());
+                }
             }
         }
 

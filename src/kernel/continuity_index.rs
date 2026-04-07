@@ -26,6 +26,10 @@ impl ContinuityIndexStore {
         Self { pool }
     }
 
+    pub fn can_search(&self, query: &str) -> bool {
+        build_match_query(query).is_some()
+    }
+
     pub async fn replace_all(&self, documents: &[ContinuityIndexedDocument]) -> Result<()> {
         let mut tx = self
             .pool
