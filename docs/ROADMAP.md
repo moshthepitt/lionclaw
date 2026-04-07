@@ -70,6 +70,9 @@ Exit criteria:
 
 Goal: real runtime support with kernel-owned execution boundaries.
 
+Design direction for this area is recorded in
+`docs/MEDIATED_WORK_DECISIONS.md`.
+
 - [x] Implement subprocess adapter manager for long-lived runtime sessions.
 - [x] Implement `codex` adapter.
 - [ ] Implement `claude-code` adapter.
