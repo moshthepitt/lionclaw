@@ -125,6 +125,10 @@ async fn insert_document(
 }
 
 fn build_match_query(query: &str) -> Option<String> {
+    if !query.is_ascii() {
+        return None;
+    }
+
     let tokens = query
         .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
         .map(str::trim)
@@ -142,7 +146,7 @@ fn build_match_query(query: &str) -> Option<String> {
 mod tests {
     use tempfile::tempdir;
 
-    use super::{ContinuityIndexStore, ContinuityIndexedDocument};
+    use super::{build_match_query, ContinuityIndexStore, ContinuityIndexedDocument};
     use crate::kernel::db::Db;
 
     #[tokio::test]
@@ -203,5 +207,7 @@ mod tests {
         assert!(hyphenated
             .iter()
             .any(|item| item.relative_path == "continuity/open-loops/review-audit.md"));
+
+        assert!(build_match_query("café review").is_none());
     }
 }

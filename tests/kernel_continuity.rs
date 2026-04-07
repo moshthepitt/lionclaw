@@ -1014,6 +1014,54 @@ async fn continuity_search_handles_unicode_cross_line_fallback_without_panicking
 }
 
 #[tokio::test]
+async fn continuity_search_does_not_short_circuit_mixed_unicode_queries_to_lossy_index_hits() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    tokio::fs::write(
+        env.workspace_root().join("MEMORY.md"),
+        "# Memory\n\n## Entries\n- Plain cafe review only.\n",
+    )
+    .await
+    .expect("write ascii memory");
+    tokio::fs::write(
+        env.workspace_root()
+            .join("continuity/open-loops/review-audit.md"),
+        "# Review Audit\n\n- Summary: Need café review before release.\n",
+    )
+    .await
+    .expect("write unicode continuity file");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let search = kernel
+        .continuity_search(ContinuitySearchRequest {
+            query: "café review".to_string(),
+            limit: Some(10),
+        })
+        .await
+        .expect("mixed unicode search");
+
+    assert!(search
+        .matches
+        .iter()
+        .any(|item| item.relative_path == "continuity/open-loops/review-audit.md"));
+    assert!(!search
+        .matches
+        .iter()
+        .any(|item| item.relative_path == "MEMORY.md"));
+}
+
+#[tokio::test]
 async fn unsafe_runtimes_do_not_receive_hidden_compaction_prompts() {
     let env = TestEnv::new();
     bootstrap_workspace(&env.workspace_root())
