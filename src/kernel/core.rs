@@ -2748,35 +2748,45 @@ impl Kernel {
         &self,
         title: &str,
     ) -> Result<(), KernelError> {
-        for mut record in self
-            .session_compactions
-            .list_all()
-            .await
-            .map_err(internal)?
-        {
-            if !remove_memory_proposal_from_summary_state(&mut record.summary_state, title) {
-                continue;
-            }
-            self.session_compactions
-                .replace_latest_summary_state(record.session_id, &record.summary_state)
-                .await
-                .map_err(internal)?;
-        }
-        Ok(())
+        self.remove_summary_title_from_all_compactions(
+            title,
+            remove_memory_proposal_from_summary_state,
+        )
+        .await
     }
 
     async fn remove_open_loop_from_all_compactions(&self, title: &str) -> Result<(), KernelError> {
-        for mut record in self
+        self.remove_summary_title_from_all_compactions(title, remove_open_loop_from_summary_state)
+            .await
+    }
+
+    async fn remove_summary_title_from_all_compactions(
+        &self,
+        title: &str,
+        remove_from_summary_state: fn(&mut CompactionSummaryState, &str) -> bool,
+    ) -> Result<(), KernelError> {
+        for session_id in self
             .session_compactions
-            .list_all()
+            .list_session_ids()
             .await
             .map_err(internal)?
         {
-            if !remove_open_loop_from_summary_state(&mut record.summary_state, title) {
+            let session_lock = self.session_lock(session_id).await;
+            let _guard = session_lock.lock().await;
+            let Some(mut record) = self
+                .session_compactions
+                .latest(session_id)
+                .await
+                .map_err(internal)?
+            else {
+                continue;
+            };
+            if !remove_from_summary_state(&mut record.summary_state, title) {
                 continue;
             }
-            self.session_compactions
-                .replace_latest_summary_state(record.session_id, &record.summary_state)
+            let _ = self
+                .session_compactions
+                .replace_summary_state(record.compaction_id, &record.summary_state)
                 .await
                 .map_err(internal)?;
         }
@@ -2790,6 +2800,7 @@ mod tests {
     use tokio::time::{sleep, Duration};
 
     use super::*;
+    use crate::kernel::session_transcript::{CompactionMemoryProposal, CompactionOpenLoop};
 
     #[tokio::test]
     async fn active_continuity_refresh_serializes_snapshot_rebuilds() {
@@ -2845,6 +2856,136 @@ mod tests {
             active.contains("Serialized Refresh Loop"),
             "serialized refresh should observe continuity changes committed while it was waiting"
         );
+    }
+
+    #[tokio::test]
+    async fn removing_memory_proposals_from_compactions_waits_for_session_lock() {
+        let temp_dir = tempdir().expect("temp dir");
+        let workspace_root = temp_dir.path().join("workspace");
+        let db_path = temp_dir.path().join("lionclaw.db");
+        let kernel = Kernel::new_with_options(
+            &db_path,
+            KernelOptions {
+                workspace_root: Some(workspace_root),
+                project_workspace_root: Some(temp_dir.path().join("project-root")),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let session_id = Uuid::new_v4();
+        let summary_state = CompactionSummaryState {
+            memory_proposals: vec![CompactionMemoryProposal {
+                title: "Working Preferences".to_string(),
+                rationale: "durable preference".to_string(),
+                entries: vec!["Keep the core small.".to_string()],
+            }],
+            ..CompactionSummaryState::default()
+        };
+        kernel
+            .session_compactions
+            .insert(
+                session_id,
+                1,
+                3,
+                render_compaction_summary(1, 3, &summary_state),
+                &summary_state,
+            )
+            .await
+            .expect("insert compaction");
+
+        let session_lock = kernel.session_lock(session_id).await;
+        let guard = session_lock.clone().lock_owned().await;
+        let remove_kernel = kernel.clone();
+        let remove_task = tokio::spawn(async move {
+            remove_kernel
+                .remove_memory_proposal_from_all_compactions("working preferences")
+                .await
+        });
+        sleep(Duration::from_millis(20)).await;
+        assert!(
+            !remove_task.is_finished(),
+            "memory proposal cleanup should wait for the session lock"
+        );
+
+        drop(guard);
+        remove_task
+            .await
+            .expect("join remove task")
+            .expect("remove memory proposal");
+
+        let latest = kernel
+            .session_compactions
+            .latest(session_id)
+            .await
+            .expect("latest compaction")
+            .expect("record");
+        assert!(latest.summary_state.memory_proposals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn removing_open_loops_from_compactions_waits_for_session_lock() {
+        let temp_dir = tempdir().expect("temp dir");
+        let workspace_root = temp_dir.path().join("workspace");
+        let db_path = temp_dir.path().join("lionclaw.db");
+        let kernel = Kernel::new_with_options(
+            &db_path,
+            KernelOptions {
+                workspace_root: Some(workspace_root),
+                project_workspace_root: Some(temp_dir.path().join("project-root")),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let session_id = Uuid::new_v4();
+        let summary_state = CompactionSummaryState {
+            open_loops: vec![CompactionOpenLoop {
+                title: "Review continuity search".to_string(),
+                summary: "Need to verify the search path.".to_string(),
+                next_step: "Run continuity search".to_string(),
+            }],
+            ..CompactionSummaryState::default()
+        };
+        kernel
+            .session_compactions
+            .insert(
+                session_id,
+                1,
+                3,
+                render_compaction_summary(1, 3, &summary_state),
+                &summary_state,
+            )
+            .await
+            .expect("insert compaction");
+
+        let session_lock = kernel.session_lock(session_id).await;
+        let guard = session_lock.clone().lock_owned().await;
+        let remove_kernel = kernel.clone();
+        let remove_task = tokio::spawn(async move {
+            remove_kernel
+                .remove_open_loop_from_all_compactions("review continuity search")
+                .await
+        });
+        sleep(Duration::from_millis(20)).await;
+        assert!(
+            !remove_task.is_finished(),
+            "open loop cleanup should wait for the session lock"
+        );
+
+        drop(guard);
+        remove_task
+            .await
+            .expect("join remove task")
+            .expect("remove open loop");
+
+        let latest = kernel
+            .session_compactions
+            .latest(session_id)
+            .await
+            .expect("latest compaction")
+            .expect("record");
+        assert!(latest.summary_state.open_loops.is_empty());
     }
 }
 

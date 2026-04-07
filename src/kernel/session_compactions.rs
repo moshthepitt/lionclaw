@@ -157,12 +157,30 @@ impl SessionCompactionStore {
         rows.into_iter().map(map_compaction_row).collect()
     }
 
-    pub async fn replace_latest_summary_state(
+    pub async fn list_session_ids(&self) -> Result<Vec<Uuid>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT session_id \
+             FROM session_compactions \
+             ORDER BY session_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list session compaction session ids")?;
+
+        rows.into_iter()
+            .map(|raw| {
+                Uuid::parse_str(&raw)
+                    .with_context(|| format!("invalid session_id '{}' in session compactions", raw))
+            })
+            .collect()
+    }
+
+    pub async fn replace_summary_state(
         &self,
-        session_id: Uuid,
+        compaction_id: Uuid,
         summary_state: &CompactionSummaryState,
     ) -> Result<Option<SessionCompactionRecord>> {
-        let Some(record) = self.latest(session_id).await? else {
+        let Some(record) = self.get(compaction_id).await? else {
             return Ok(None);
         };
         let summary_text = render_compaction_summary(
@@ -172,19 +190,24 @@ impl SessionCompactionStore {
         );
         let summary_state_json = serde_json::to_string(summary_state)
             .context("failed to serialize updated session compaction summary state")?;
-        sqlx::query(
+        let rows_affected = sqlx::query(
             "UPDATE session_compactions \
              SET summary_text = ?2, summary_state_json = ?3 \
              WHERE compaction_id = ?1",
         )
-        .bind(record.compaction_id.to_string())
+        .bind(compaction_id.to_string())
         .bind(summary_text)
         .bind(summary_state_json)
         .execute(&self.pool)
         .await
-        .context("failed to update latest session compaction summary state")?;
+        .context("failed to update session compaction summary state")?
+        .rows_affected();
 
-        self.get(record.compaction_id).await
+        if rows_affected == 0 {
+            return Ok(None);
+        }
+
+        self.get(compaction_id).await
     }
 }
 
@@ -274,5 +297,55 @@ mod tests {
             store.list_recent(session_id, 10).await.expect("list").len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn replace_summary_state_by_stale_identity_does_not_clobber_latest() {
+        let temp_dir = tempdir().expect("temp dir");
+        let db = Db::connect_file(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("db connect");
+        let store = SessionCompactionStore::new(db.pool());
+        let session_id = Uuid::new_v4();
+
+        let first = store
+            .insert(
+                session_id,
+                1,
+                5,
+                "first".to_string(),
+                &CompactionSummaryState::default(),
+            )
+            .await
+            .expect("insert first");
+        let second_state = CompactionSummaryState {
+            goal: Some("keep the newer summary".to_string()),
+            ..CompactionSummaryState::default()
+        };
+        let second = store
+            .insert(session_id, 1, 10, "second".to_string(), &second_state)
+            .await
+            .expect("insert second");
+
+        let updated = store
+            .replace_summary_state(
+                first.compaction_id,
+                &CompactionSummaryState {
+                    goal: Some("stale update".to_string()),
+                    ..CompactionSummaryState::default()
+                },
+            )
+            .await
+            .expect("replace summary state");
+        assert!(updated.is_none());
+
+        let latest = store
+            .latest(session_id)
+            .await
+            .expect("latest")
+            .expect("record");
+        assert_eq!(latest.compaction_id, second.compaction_id);
+        assert_eq!(latest.summary_text, "second");
+        assert_eq!(latest.summary_state, second_state);
     }
 }
