@@ -93,6 +93,7 @@ Implemented now:
 - for continuity-adjacent API mutations backed by SQLite, authoritative state and audit commit atomically in one transaction
 - `continuity/ACTIVE.md` refresh is derived state:
   - it runs after committed mutations
+  - snapshot rebuilds are serialized in the kernel so an older refresh cannot overwrite a newer active view
   - refresh failure is audited as `continuity.refresh_failed`
   - refresh failure does not flip an already-committed mutation into an outward API error
 

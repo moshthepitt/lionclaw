@@ -122,6 +122,7 @@ pub struct Kernel {
     channel_stream_notifiers: Arc<RwLock<HashMap<String, Arc<Notify>>>>,
     channel_turn_workers: Arc<RwLock<HashSet<String>>>,
     session_locks: Arc<RwLock<HashMap<Uuid, Arc<Mutex<()>>>>>,
+    active_continuity_refresh_lock: Arc<Mutex<()>>,
     runtime_turn_idle_timeout: Duration,
     runtime_turn_hard_timeout: Duration,
     runtime_execution_policy: RuntimeExecutionPolicy,
@@ -193,6 +194,7 @@ impl Kernel {
             channel_stream_notifiers: Arc::new(RwLock::new(HashMap::new())),
             channel_turn_workers: Arc::new(RwLock::new(HashSet::new())),
             session_locks: Arc::new(RwLock::new(HashMap::new())),
+            active_continuity_refresh_lock: Arc::new(Mutex::new(())),
             runtime_turn_idle_timeout,
             runtime_turn_hard_timeout,
             runtime_execution_policy: options.runtime_execution_policy,
@@ -2112,6 +2114,7 @@ impl Kernel {
         let Some(layout) = &self.continuity else {
             return Ok(());
         };
+        let _guard = self.active_continuity_refresh_lock.lock().await;
 
         let pending_approvals = self
             .channel_state
@@ -2786,6 +2789,70 @@ impl Kernel {
                 .map_err(internal)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+    use tokio::time::{sleep, Duration};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn active_continuity_refresh_serializes_snapshot_rebuilds() {
+        let temp_dir = tempdir().expect("temp dir");
+        let workspace_root = temp_dir.path().join("workspace");
+        let db_path = temp_dir.path().join("lionclaw.db");
+        let kernel = Kernel::new_with_options(
+            &db_path,
+            KernelOptions {
+                workspace_root: Some(workspace_root.clone()),
+                project_workspace_root: Some(temp_dir.path().join("project-root")),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let layout = kernel
+            .continuity
+            .as_ref()
+            .expect("continuity layout")
+            .clone();
+
+        let guard = kernel.active_continuity_refresh_lock.lock().await;
+        let refresh_kernel = kernel.clone();
+        let refresh_task =
+            tokio::spawn(async move { refresh_kernel.refresh_active_continuity().await });
+        sleep(Duration::from_millis(20)).await;
+        assert!(
+            !refresh_task.is_finished(),
+            "refresh should wait for the active continuity lock"
+        );
+
+        layout
+            .upsert_open_loop(&ContinuityOpenLoopDraft {
+                title: "Serialized Refresh Loop".to_string(),
+                summary: "added while an earlier refresh is waiting".to_string(),
+                next_step: "write the latest snapshot".to_string(),
+                source: Some("test".to_string()),
+            })
+            .await
+            .expect("upsert open loop");
+
+        drop(guard);
+        refresh_task
+            .await
+            .expect("join refresh task")
+            .expect("refresh succeeds");
+
+        let active = tokio::fs::read_to_string(workspace_root.join("continuity/ACTIVE.md"))
+            .await
+            .expect("read active continuity");
+        assert!(
+            active.contains("Serialized Refresh Loop"),
+            "serialized refresh should observe continuity changes committed while it was waiting"
+        );
     }
 }
 
