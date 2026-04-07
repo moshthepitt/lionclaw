@@ -973,6 +973,47 @@ async fn continuity_surface_lists_searches_and_manages_proposals_and_loops() {
 }
 
 #[tokio::test]
+async fn continuity_search_handles_unicode_cross_line_fallback_without_panicking() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    tokio::fs::write(
+        env.workspace_root().join("MEMORY.md"),
+        "# Memory\n\n## Entries\n- Ä\nÖ continuity marker.\n",
+    )
+    .await
+    .expect("write unicode memory");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let search = kernel
+        .continuity_search(ContinuitySearchRequest {
+            query: "Ä\nÖ".to_string(),
+            limit: Some(10),
+        })
+        .await
+        .expect("unicode fallback search");
+
+    assert!(search
+        .matches
+        .iter()
+        .any(|item| item.relative_path == "MEMORY.md"));
+    assert!(search
+        .matches
+        .iter()
+        .any(|item| item.snippet.contains("Ä Ö continuity marker.")));
+}
+
+#[tokio::test]
 async fn unsafe_runtimes_do_not_receive_hidden_compaction_prompts() {
     let env = TestEnv::new();
     bootstrap_workspace(&env.workspace_root())

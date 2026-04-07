@@ -1029,16 +1029,72 @@ fn search_snippet(content: &str, needle: &str) -> Option<String> {
         }
     }
 
-    let lower = content.to_lowercase();
-    let offset = lower.find(needle)?;
-    let start = offset.saturating_sub(60);
-    let end = (offset + needle.len() + 60).min(content.len());
-    Some(
-        content[start..end]
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
+    let (match_start, match_end) = find_case_insensitive_range(content, needle)?;
+    Some(snippet_from_source_window(
+        content,
+        match_start,
+        match_end,
+        60,
+    ))
+}
+
+fn find_case_insensitive_range(content: &str, needle: &str) -> Option<(usize, usize)> {
+    if needle.is_empty() {
+        return None;
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct FoldedSpan {
+        folded_end: usize,
+        source_start: usize,
+        source_end: usize,
+    }
+
+    let mut folded = String::with_capacity(content.len());
+    let mut spans = Vec::with_capacity(content.chars().count());
+    let mut chars = content.char_indices().peekable();
+    while let Some((source_start, ch)) = chars.next() {
+        let source_end = chars.peek().map_or(content.len(), |(next, _)| *next);
+        for lower in ch.to_lowercase() {
+            folded.push(lower);
+        }
+        let folded_end = folded.len();
+        spans.push(FoldedSpan {
+            folded_end,
+            source_start,
+            source_end,
+        });
+    }
+
+    let folded_start = folded.find(needle)?;
+    let folded_end = folded_start + needle.len();
+    let start_span = spans.iter().find(|span| folded_start < span.folded_end)?;
+    let end_boundary = folded_end.saturating_sub(1);
+    let end_span = spans.iter().find(|span| end_boundary < span.folded_end)?;
+    Some((start_span.source_start, end_span.source_end))
+}
+
+fn snippet_from_source_window(
+    content: &str,
+    match_start: usize,
+    match_end: usize,
+    context_chars: usize,
+) -> String {
+    let mut boundaries = content
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .collect::<Vec<_>>();
+    boundaries.push(content.len());
+
+    let start_char = boundaries.partition_point(|&idx| idx < match_start);
+    let end_char = boundaries.partition_point(|&idx| idx < match_end);
+    let window_start = start_char.saturating_sub(context_chars);
+    let window_end = (end_char + context_chars).min(boundaries.len() - 1);
+
+    content[boundaries[window_start]..boundaries[window_end]]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn is_direct_child(path: &Path, root: &Path) -> bool {
@@ -1097,7 +1153,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        replace_or_insert_metadata, title_file_name, ActiveContinuitySnapshot, ContinuityArtifact,
+        find_case_insensitive_range, replace_or_insert_metadata, search_snippet,
+        snippet_from_source_window, title_file_name, ActiveContinuitySnapshot, ContinuityArtifact,
         ContinuityEvent, ContinuityLayout, ContinuityMemoryProposalDraft, ContinuityOpenLoopDraft,
         MERGED_DIR,
     };
@@ -1840,6 +1897,31 @@ mod tests {
         assert!(neither.contains("- Source: job:123"));
         assert!(neither.contains("- Status: resolved"));
         assert!(neither.contains("- Updated: 2026-04-07T00:00:00Z UTC"));
+    }
+
+    #[test]
+    fn search_snippet_handles_unicode_lowercase_expansion_in_fallback() {
+        let snippet = search_snippet("Need İ\nstanbul continuity review.", "i̇\nstanbul")
+            .expect("unicode fallback snippet");
+        assert_eq!(snippet, "Need İ stanbul continuity review.");
+    }
+
+    #[test]
+    fn search_snippet_handles_multibyte_context_window_safely() {
+        let content = format!("{} café\nrésumé {}", "🙂".repeat(80), "🚀".repeat(80));
+        let (match_start, match_end) =
+            find_case_insensitive_range(&content, "café\nrésumé").expect("match range");
+        let snippet = snippet_from_source_window(&content, match_start, match_end, 4);
+        assert!(snippet.contains("café résumé"));
+        assert!(snippet.chars().any(|ch| ch == '🙂'));
+        assert!(snippet.chars().any(|ch| ch == '🚀'));
+    }
+
+    #[test]
+    fn search_snippet_finds_cross_line_matches() {
+        let snippet =
+            search_snippet("Need release\nreview soon.", "release\nreview").expect("snippet");
+        assert_eq!(snippet, "Need release review soon.");
     }
 
     #[tokio::test]
