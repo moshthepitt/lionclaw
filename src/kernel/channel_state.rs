@@ -478,6 +478,22 @@ impl ChannelStateStore {
         rows.into_iter().map(map_peer_row).collect()
     }
 
+    pub async fn list_pending_peers(&self, limit: usize) -> Result<Vec<ChannelPeerRecord>> {
+        let rows = sqlx::query(
+            "SELECT channel_id, peer_id, status, trust_tier, pairing_code, first_seen_ms, updated_at_ms \
+             FROM channel_peers \
+             WHERE status = 'pending' \
+             ORDER BY updated_at_ms DESC, channel_id ASC, peer_id ASC \
+             LIMIT ?1",
+        )
+        .bind(i64::try_from(limit).context("pending peer limit is too large")?)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list pending channel peers")?;
+
+        rows.into_iter().map(map_peer_row).collect()
+    }
+
     pub(crate) async fn get_peer_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
@@ -1148,4 +1164,60 @@ fn map_turn_row(row: SqliteRow) -> Result<ChannelTurnRecord> {
         started_at,
         finished_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::db::Db;
+
+    async fn new_store() -> ChannelStateStore {
+        let db = Db::connect_memory().await.expect("connect memory db");
+        ChannelStateStore::new(db.pool())
+    }
+
+    #[tokio::test]
+    async fn list_pending_peers_returns_newest_pending_only() {
+        let store = new_store().await;
+        store
+            .upsert_pending_peer("terminal", "alice", "code-a")
+            .await
+            .expect("seed alice");
+        store
+            .upsert_pending_peer("terminal", "bob", "code-b")
+            .await
+            .expect("seed bob");
+        store
+            .upsert_pending_peer("matrix", "carol", "code-c")
+            .await
+            .expect("seed carol");
+        store
+            .approve_peer("terminal", "alice", TrustTier::Main)
+            .await
+            .expect("approve alice");
+
+        sqlx::query(
+            "UPDATE channel_peers \
+             SET updated_at_ms = CASE peer_id \
+                WHEN 'alice' THEN 1000 \
+                WHEN 'bob' THEN 3000 \
+                WHEN 'carol' THEN 2000 \
+                ELSE updated_at_ms \
+             END",
+        )
+        .execute(store.pool())
+        .await
+        .expect("set peer timestamps");
+
+        let peers = store
+            .list_pending_peers(2)
+            .await
+            .expect("list pending peers");
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].peer_id, "bob");
+        assert_eq!(peers[1].peer_id, "carol");
+        assert!(peers
+            .iter()
+            .all(|peer| peer.status == ChannelPeerStatus::Pending));
+    }
 }

@@ -217,6 +217,7 @@ Queued channel turns emit machine-stable status/error codes through the same str
 - Archives are historical records only; they do not suppress future active items with the same title.
 - Continuity-adjacent API mutations treat SQLite state plus audit as the authoritative commit boundary.
 - `continuity/ACTIVE.md` refresh is a derived post-commit projection; snapshot rebuilds are serialized in the kernel, and failures are audited as `continuity.refresh_failed` instead of turning committed mutations into outward API failures.
+- The hot `ACTIVE.md` projection uses bounded, purpose-shaped queries for pending peers, attention jobs, and recent failed turns instead of broad list-and-filter scans.
 - Continuity search uses a derived SQLite FTS index in `lionclaw.db`; the Markdown files remain the canonical source of truth.
 - Transcript compaction summaries are stored in SQLite separately from file-backed continuity.
 - Prompt history sees one bounded structured compaction handoff summary plus the recent raw tail.

@@ -24,7 +24,7 @@ use lionclaw::{
     workspace::bootstrap_workspace,
 };
 use serde_json::json;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -303,6 +303,193 @@ async fn scheduler_success_records_artifact_and_updates_active_in_home_workspace
     assert!(artifacts.contains("Scheduled Output: daily brief"));
     assert!(artifacts.contains(&created.job.job_id.to_string()));
     assert!(!env.project_root().join("continuity").exists());
+}
+
+#[tokio::test]
+async fn continuity_refresh_indexes_exist() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+    let _ = kernel;
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+
+    let session_turn_indexes = sqlx::query("PRAGMA index_list('session_turns')")
+        .fetch_all(&pool)
+        .await
+        .expect("session_turns index list")
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<Vec<_>>();
+    assert!(session_turn_indexes
+        .iter()
+        .any(|name| name == "idx_session_turns_recent_failures"));
+
+    let channel_peer_indexes = sqlx::query("PRAGMA index_list('channel_peers')")
+        .fetch_all(&pool)
+        .await
+        .expect("channel_peers index list")
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<Vec<_>>();
+    assert!(channel_peer_indexes
+        .iter()
+        .any(|name| name == "idx_channel_peers_pending_recent"));
+
+    let scheduler_job_indexes = sqlx::query("PRAGMA index_list('scheduler_jobs')")
+        .fetch_all(&pool)
+        .await
+        .expect("scheduler_jobs index list")
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<Vec<_>>();
+    assert!(scheduler_job_indexes
+        .iter()
+        .any(|name| name == "idx_scheduler_jobs_attention_recent"));
+}
+
+#[tokio::test]
+async fn active_continuity_global_slices_are_bounded_to_recent_items() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    kernel
+        .register_runtime_adapter("boom", Arc::new(FailingRuntimeAdapter))
+        .await;
+    install_and_bind_channel(&kernel, "terminal").await;
+
+    let session = open_local_session(&kernel, "bounded-active-peer").await;
+    for index in 0..7 {
+        let _ = kernel
+            .turn_session(SessionTurnRequest {
+                session_id: session.session_id,
+                user_text: format!("fail turn {}", index),
+                runtime_id: Some("boom".to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await
+            .expect_err("seed failed turn");
+    }
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    for sequence_no in 1_i64..=7 {
+        sqlx::query(
+            "UPDATE session_turns \
+             SET started_at_ms = ?3 \
+             WHERE session_id = ?1 AND sequence_no = ?2",
+        )
+        .bind(session.session_id.to_string())
+        .bind(sequence_no)
+        .bind(sequence_no * 1000)
+        .execute(&pool)
+        .await
+        .expect("seed failure ordering");
+    }
+
+    for index in 0..7 {
+        let created = kernel
+            .create_job(JobCreateRequest {
+                name: format!("attention-{index:02}"),
+                runtime_id: "mock".to_string(),
+                schedule: lionclaw::contracts::JobScheduleDto::Once {
+                    run_at: Utc::now() + ChronoDuration::minutes(5 + i64::from(index)),
+                },
+                prompt_text: "attention job".to_string(),
+                skill_ids: Vec::new(),
+                allow_capabilities: Vec::new(),
+                delivery: None,
+                retry_attempts: Some(0),
+            })
+            .await
+            .expect("create attention job");
+        sqlx::query(
+            "UPDATE scheduler_jobs \
+             SET last_status = 'failed', last_error = ?2, updated_at_ms = ?3 \
+             WHERE job_id = ?1",
+        )
+        .bind(created.job.job_id.to_string())
+        .bind(format!("attention-{index:02} failed"))
+        .bind(i64::from(index + 1) * 1000)
+        .execute(&pool)
+        .await
+        .expect("seed attention job state");
+    }
+
+    for index in 0..7 {
+        sqlx::query(
+            "INSERT INTO channel_peers \
+             (channel_id, peer_id, status, trust_tier, pairing_code, first_seen_ms, updated_at_ms) \
+             VALUES (?1, ?2, 'pending', 'untrusted', ?3, ?4, ?4)",
+        )
+        .bind("terminal")
+        .bind(format!("peer-{index:02}"))
+        .bind(format!("code-{index:02}"))
+        .bind(i64::from(index + 1) * 1000)
+        .execute(&pool)
+        .await
+        .expect("seed pending peer ordering");
+    }
+
+    kernel
+        .create_job(JobCreateRequest {
+            name: "refresh-trigger".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() + ChronoDuration::minutes(30),
+            },
+            prompt_text: "refresh active continuity".to_string(),
+            skill_ids: Vec::new(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create refresh trigger job");
+
+    let active = tokio::fs::read_to_string(env.workspace_root().join("continuity/ACTIVE.md"))
+        .await
+        .expect("read active");
+
+    assert!(!active.contains("terminal/peer-00"));
+    assert!(!active.contains("terminal/peer-01"));
+    assert!(active.contains("terminal/peer-02"));
+    assert!(active.contains("terminal/peer-06"));
+
+    assert!(!active.contains("Job 'attention-00' needs attention"));
+    assert!(!active.contains("Job 'attention-01' needs attention"));
+    assert!(active.contains("Job 'attention-02' needs attention"));
+    assert!(active.contains("Job 'attention-06' needs attention"));
+
+    assert!(!active.contains(&format!("Session {} turn 1 failed", session.session_id)));
+    assert!(!active.contains(&format!("Session {} turn 2 failed", session.session_id)));
+    assert!(active.contains(&format!("Session {} turn 3 failed", session.session_id)));
+    assert!(active.contains(&format!("Session {} turn 7 failed", session.session_id)));
 }
 
 #[tokio::test]
@@ -1643,7 +1830,7 @@ impl TestEnv {
     }
 }
 
-async fn seed_pending_peer(kernel: &Kernel, channel_id: &str, peer_id: &str) -> String {
+async fn enqueue_pending_peer(kernel: &Kernel, channel_id: &str, peer_id: &str) {
     kernel
         .process_inbound_channel_text(InboundChannelText {
             channel_id: channel_id.to_string(),
@@ -1656,6 +1843,10 @@ async fn seed_pending_peer(kernel: &Kernel, channel_id: &str, peer_id: &str) -> 
         })
         .await
         .expect("seed pending peer");
+}
+
+async fn seed_pending_peer(kernel: &Kernel, channel_id: &str, peer_id: &str) -> String {
+    enqueue_pending_peer(kernel, channel_id, peer_id).await;
     let peers = kernel
         .list_channel_peers(Some(channel_id.to_string()))
         .await

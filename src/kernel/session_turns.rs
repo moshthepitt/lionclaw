@@ -372,3 +372,136 @@ fn map_session_turn_row(row: SqliteRow) -> Result<SessionTurnRecord> {
         finished_at,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contracts::{SessionHistoryPolicy, TrustTier};
+    use crate::kernel::{db::Db, sessions::SessionStore};
+
+    async fn new_store_with_session() -> (SessionTurnStore, Uuid) {
+        let db = Db::connect_memory().await.expect("connect memory db");
+        let pool = db.pool();
+        let sessions = SessionStore::new(pool.clone());
+        let turns = SessionTurnStore::new(pool);
+        let session = sessions
+            .open(
+                "local-cli".to_string(),
+                "failure-peer".to_string(),
+                TrustTier::Main,
+                SessionHistoryPolicy::Interactive,
+            )
+            .await
+            .expect("open session");
+        (turns, session.session_id)
+    }
+
+    #[tokio::test]
+    async fn list_recent_failures_returns_newest_failure_states_only() {
+        let (store, session_id) = new_store_with_session().await;
+        let failed = store
+            .begin_turn(NewSessionTurn {
+                turn_id: Uuid::new_v4(),
+                session_id,
+                kind: SessionTurnKind::Normal,
+                display_user_text: "failed".to_string(),
+                prompt_user_text: "failed".to_string(),
+                runtime_id: "mock".to_string(),
+            })
+            .await
+            .expect("begin failed turn");
+        store
+            .complete_turn(
+                failed.turn_id,
+                SessionTurnCompletion {
+                    status: SessionTurnStatus::Failed,
+                    assistant_text: String::new(),
+                    error_code: Some("runtime.failed".to_string()),
+                    error_text: Some("failed".to_string()),
+                },
+            )
+            .await
+            .expect("complete failed turn");
+
+        let completed = store
+            .begin_turn(NewSessionTurn {
+                turn_id: Uuid::new_v4(),
+                session_id,
+                kind: SessionTurnKind::Normal,
+                display_user_text: "completed".to_string(),
+                prompt_user_text: "completed".to_string(),
+                runtime_id: "mock".to_string(),
+            })
+            .await
+            .expect("begin completed turn");
+        store
+            .complete_turn(
+                completed.turn_id,
+                SessionTurnCompletion {
+                    status: SessionTurnStatus::Completed,
+                    assistant_text: "ok".to_string(),
+                    error_code: None,
+                    error_text: None,
+                },
+            )
+            .await
+            .expect("complete completed turn");
+
+        let interrupted = store
+            .begin_turn(NewSessionTurn {
+                turn_id: Uuid::new_v4(),
+                session_id,
+                kind: SessionTurnKind::Normal,
+                display_user_text: "interrupted".to_string(),
+                prompt_user_text: "interrupted".to_string(),
+                runtime_id: "mock".to_string(),
+            })
+            .await
+            .expect("begin interrupted turn");
+        store
+            .complete_turn(
+                interrupted.turn_id,
+                SessionTurnCompletion {
+                    status: SessionTurnStatus::Interrupted,
+                    assistant_text: String::new(),
+                    error_code: Some("runtime.interrupted".to_string()),
+                    error_text: Some("interrupted".to_string()),
+                },
+            )
+            .await
+            .expect("complete interrupted turn");
+
+        sqlx::query(
+            "UPDATE session_turns \
+             SET started_at_ms = CASE turn_id \
+                WHEN ?1 THEN 1000 \
+                WHEN ?2 THEN 2000 \
+                WHEN ?3 THEN 3000 \
+                ELSE started_at_ms \
+             END",
+        )
+        .bind(failed.turn_id.to_string())
+        .bind(completed.turn_id.to_string())
+        .bind(interrupted.turn_id.to_string())
+        .execute(&store.pool)
+        .await
+        .expect("set turn timestamps");
+
+        let failures = store
+            .list_recent_failures(5)
+            .await
+            .expect("list recent failures");
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0].turn_id, interrupted.turn_id);
+        assert_eq!(failures[1].turn_id, failed.turn_id);
+        assert!(failures.iter().all(|turn| {
+            matches!(
+                turn.status,
+                SessionTurnStatus::Failed
+                    | SessionTurnStatus::TimedOut
+                    | SessionTurnStatus::Cancelled
+                    | SessionTurnStatus::Interrupted
+            )
+        }));
+    }
+}

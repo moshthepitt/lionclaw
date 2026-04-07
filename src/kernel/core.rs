@@ -80,6 +80,8 @@ use super::{
     skills::{SkillInstallInput, SkillStore},
 };
 
+const ACTIVE_GLOBAL_SLICE_LIMIT: usize = 5;
+
 #[derive(Debug, Clone)]
 pub struct KernelOptions {
     pub runtime_turn_idle_timeout: Duration,
@@ -2118,36 +2120,26 @@ impl Kernel {
 
         let pending_approvals = self
             .channel_state
-            .list_peers(None)
+            .list_pending_peers(ACTIVE_GLOBAL_SLICE_LIMIT)
             .await
             .map_err(internal)?
             .into_iter()
-            .filter(|peer| peer.status == ChannelPeerStatus::Pending)
             .map(|peer| format!("{}/{}", peer.channel_id, peer.peer_id))
             .collect::<Vec<_>>();
 
         let mut matters_today = Vec::new();
         for job in self
             .jobs
-            .list_jobs()
+            .list_attention_jobs(ACTIVE_GLOBAL_SLICE_LIMIT)
             .await
             .map_err(internal)?
-            .into_iter()
-            .filter(|job| {
-                matches!(
-                    job.last_status,
-                    Some(SchedulerJobRunStatus::Failed)
-                        | Some(SchedulerJobRunStatus::DeadLetter)
-                        | Some(SchedulerJobRunStatus::Interrupted)
-                )
-            })
         {
             let error = job.last_error.as_deref().unwrap_or("no error recorded");
             matters_today.push(format!("Job '{}' needs attention: {}", job.name, error));
         }
         for turn in self
             .session_turns
-            .list_recent_failures(5)
+            .list_recent_failures(ACTIVE_GLOBAL_SLICE_LIMIT)
             .await
             .map_err(internal)?
         {

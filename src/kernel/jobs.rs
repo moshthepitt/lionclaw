@@ -334,6 +334,24 @@ impl JobStore {
         rows.into_iter().map(map_job_row).collect()
     }
 
+    pub async fn list_attention_jobs(&self, limit: usize) -> Result<Vec<SchedulerJobRecord>> {
+        let rows = sqlx::query(
+            "SELECT job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
+             skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
+             last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms \
+             FROM scheduler_jobs \
+             WHERE last_status IN ('failed', 'dead_letter', 'interrupted') \
+             ORDER BY updated_at_ms DESC, job_id DESC \
+             LIMIT ?1",
+        )
+        .bind(i64::try_from(limit).context("attention job limit is too large")?)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list scheduler jobs needing attention")?;
+
+        rows.into_iter().map(map_job_row).collect()
+    }
+
     pub async fn get_job(&self, job_id: Uuid) -> Result<Option<SchedulerJobRecord>> {
         self.get_job_optional_from_pool(job_id, "failed to query scheduler job")
             .await
@@ -1839,5 +1857,93 @@ mod tests {
             updated_job.last_error.as_deref(),
             Some("unexpected scheduler failure")
         );
+    }
+
+    #[tokio::test]
+    async fn list_attention_jobs_returns_newest_attention_states_only() {
+        let store = new_store().await;
+        let alpha = store
+            .create_job(NewSchedulerJob {
+                name: "alpha".to_string(),
+                runtime_id: "mock".to_string(),
+                schedule: JobSchedule::Once {
+                    run_at: Utc::now() + ChronoDuration::minutes(1),
+                },
+                prompt_text: "prompt".to_string(),
+                skill_ids: Vec::new(),
+                delivery: None,
+                retry_attempts: 0,
+            })
+            .await
+            .expect("create alpha");
+        let beta = store
+            .create_job(NewSchedulerJob {
+                name: "beta".to_string(),
+                runtime_id: "mock".to_string(),
+                schedule: JobSchedule::Once {
+                    run_at: Utc::now() + ChronoDuration::minutes(2),
+                },
+                prompt_text: "prompt".to_string(),
+                skill_ids: Vec::new(),
+                delivery: None,
+                retry_attempts: 0,
+            })
+            .await
+            .expect("create beta");
+        let gamma = store
+            .create_job(NewSchedulerJob {
+                name: "gamma".to_string(),
+                runtime_id: "mock".to_string(),
+                schedule: JobSchedule::Once {
+                    run_at: Utc::now() + ChronoDuration::minutes(3),
+                },
+                prompt_text: "prompt".to_string(),
+                skill_ids: Vec::new(),
+                delivery: None,
+                retry_attempts: 0,
+            })
+            .await
+            .expect("create gamma");
+
+        sqlx::query(
+            "UPDATE scheduler_jobs \
+             SET last_status = CASE name \
+                WHEN 'alpha' THEN 'failed' \
+                WHEN 'beta' THEN 'completed' \
+                WHEN 'gamma' THEN 'interrupted' \
+                ELSE last_status \
+             END, \
+             last_error = CASE name \
+                WHEN 'alpha' THEN 'alpha failed' \
+                WHEN 'gamma' THEN 'gamma interrupted' \
+                ELSE last_error \
+             END, \
+             updated_at_ms = CASE name \
+                WHEN 'alpha' THEN 1000 \
+                WHEN 'beta' THEN 3000 \
+                WHEN 'gamma' THEN 2000 \
+                ELSE updated_at_ms \
+             END",
+        )
+        .execute(store.pool())
+        .await
+        .expect("seed attention states");
+
+        let jobs = store
+            .list_attention_jobs(5)
+            .await
+            .expect("list attention jobs");
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].job_id, gamma.job_id);
+        assert_eq!(jobs[1].job_id, alpha.job_id);
+        assert!(jobs.iter().all(|job| {
+            matches!(
+                job.last_status,
+                Some(SchedulerJobRunStatus::Failed)
+                    | Some(SchedulerJobRunStatus::DeadLetter)
+                    | Some(SchedulerJobRunStatus::Interrupted)
+            )
+        }));
+        assert!(!jobs.iter().any(|job| job.job_id == beta.job_id));
     }
 }

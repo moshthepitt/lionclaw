@@ -94,6 +94,7 @@ Implemented now:
 - `continuity/ACTIVE.md` refresh is derived state:
   - it runs after committed mutations
   - snapshot rebuilds are serialized in the kernel so an older refresh cannot overwrite a newer active view
+  - its global slices are built from bounded, purpose-specific store queries rather than full-table scans
   - refresh failure is audited as `continuity.refresh_failed`
   - refresh failure does not flip an already-committed mutation into an outward API error
 
