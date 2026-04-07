@@ -1065,41 +1065,26 @@ fn replace_or_insert_metadata(
     secondary_value: String,
 ) -> String {
     let mut lines = content.lines().map(ToString::to_string).collect::<Vec<_>>();
-    let primary_prefix = format!("- {}:", primary_key);
-    let secondary_prefix = format!("- {}:", secondary_key);
-    let mut primary_found = false;
-    let mut secondary_found = false;
-
-    for line in &mut lines {
-        let trimmed = line.trim();
-        if trimmed.starts_with(&primary_prefix) {
-            *line = format!("- {}: {}", primary_key, primary_value);
-            primary_found = true;
-        } else if trimmed.starts_with(&secondary_prefix) {
-            *line = format!("- {}: {}", secondary_key, secondary_value);
-            secondary_found = true;
-        }
-    }
-
-    let insert_at = lines
+    let section_start = lines
         .iter()
         .position(|line| line.trim().starts_with("## "))
         .unwrap_or(lines.len());
-    if !primary_found {
-        lines.insert(insert_at, format!("- {}: {}", primary_key, primary_value));
+    let trailing_sections = lines.split_off(section_start);
+    let primary_prefix = format!("- {}:", primary_key);
+    let secondary_prefix = format!("- {}:", secondary_key);
+    let mut metadata = Vec::with_capacity(lines.len() + 2);
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.starts_with(&primary_prefix) || trimmed.starts_with(&secondary_prefix) {
+            continue;
+        }
+        metadata.push(line);
     }
-    if !secondary_found {
-        let secondary_insert_at = lines
-            .iter()
-            .position(|line| line.trim().starts_with("## "))
-            .unwrap_or(lines.len());
-        lines.insert(
-            secondary_insert_at + usize::from(primary_found),
-            format!("- {}: {}", secondary_key, secondary_value),
-        );
-    }
+    metadata.push(format!("- {}: {}", primary_key, primary_value));
+    metadata.push(format!("- {}: {}", secondary_key, secondary_value));
+    metadata.extend(trailing_sections);
 
-    let mut rendered = lines.join("\n");
+    let mut rendered = metadata.join("\n");
     if !rendered.ends_with('\n') {
         rendered.push('\n');
     }
@@ -1112,8 +1097,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        title_file_name, ActiveContinuitySnapshot, ContinuityArtifact, ContinuityEvent,
-        ContinuityLayout, ContinuityMemoryProposalDraft, ContinuityOpenLoopDraft, MERGED_DIR,
+        replace_or_insert_metadata, title_file_name, ActiveContinuitySnapshot, ContinuityArtifact,
+        ContinuityEvent, ContinuityLayout, ContinuityMemoryProposalDraft, ContinuityOpenLoopDraft,
+        MERGED_DIR,
     };
     use crate::kernel::{continuity_index::ContinuityIndexStore, db::Db};
 
@@ -1819,6 +1805,90 @@ mod tests {
             .await
             .expect_err("archived loop resolve should fail");
         assert!(err.to_string().contains("not an active child"));
+    }
+
+    #[test]
+    fn replace_or_insert_metadata_is_headingless_safe_and_deterministic() {
+        let primary_only = replace_or_insert_metadata(
+            "# Headingless Loop\n- Status: open\n",
+            "Status",
+            "resolved".to_string(),
+            "Updated",
+            "2026-04-07T00:00:00Z UTC".to_string(),
+        );
+        assert!(primary_only.contains("- Status: resolved"));
+        assert!(primary_only.contains("- Updated: 2026-04-07T00:00:00Z UTC"));
+        assert!(primary_only.starts_with("# Headingless Loop\n"));
+
+        let secondary_only = replace_or_insert_metadata(
+            "# Headingless Loop\n- Updated: old\n",
+            "Status",
+            "resolved".to_string(),
+            "Updated",
+            "2026-04-07T00:00:00Z UTC".to_string(),
+        );
+        assert!(secondary_only.contains("- Status: resolved"));
+        assert!(secondary_only.contains("- Updated: 2026-04-07T00:00:00Z UTC"));
+
+        let neither = replace_or_insert_metadata(
+            "# Headingless Loop\n- Source: job:123\n",
+            "Status",
+            "resolved".to_string(),
+            "Updated",
+            "2026-04-07T00:00:00Z UTC".to_string(),
+        );
+        assert!(neither.contains("- Source: job:123"));
+        assert!(neither.contains("- Status: resolved"));
+        assert!(neither.contains("- Updated: 2026-04-07T00:00:00Z UTC"));
+    }
+
+    #[tokio::test]
+    async fn headingless_manual_files_can_be_archived_without_panicking() {
+        let temp_dir = tempdir().expect("temp dir");
+        let layout = ContinuityLayout::new(temp_dir.path().join("workspace"));
+        layout.ensure_base_layout().await.expect("bootstrap");
+
+        let proposal_path = layout
+            .memory_proposals_dir()
+            .join(title_file_name("Manual Proposal"));
+        std::fs::write(
+            &proposal_path,
+            "# Memory Proposal: Manual Proposal\n- Status: proposed\n- Rationale: manual\n",
+        )
+        .expect("write headingless proposal");
+        let proposal_relative = proposal_path
+            .strip_prefix(layout.workspace_root())
+            .expect("proposal relative")
+            .to_string_lossy()
+            .to_string();
+        let archived_proposal = layout
+            .merge_memory_proposal(&proposal_relative)
+            .await
+            .expect("merge headingless proposal");
+        let archived_proposal_content =
+            std::fs::read_to_string(&archived_proposal).expect("read archived proposal");
+        assert!(archived_proposal_content.contains("- Status: merged"));
+        assert!(archived_proposal_content.contains("- Proposed: "));
+
+        let open_loop_path = layout.open_loops_dir().join(title_file_name("Manual Loop"));
+        std::fs::write(
+            &open_loop_path,
+            "# Manual Loop\n- Status: open\n- Summary: manual summary\n- Next Step: manual next\n",
+        )
+        .expect("write headingless loop");
+        let loop_relative = open_loop_path
+            .strip_prefix(layout.workspace_root())
+            .expect("loop relative")
+            .to_string_lossy()
+            .to_string();
+        let archived_loop = layout
+            .resolve_open_loop(&loop_relative)
+            .await
+            .expect("resolve headingless loop");
+        let archived_loop_content =
+            std::fs::read_to_string(&archived_loop).expect("read archived loop");
+        assert!(archived_loop_content.contains("- Status: resolved"));
+        assert!(archived_loop_content.contains("- Updated: "));
     }
 
     #[tokio::test]

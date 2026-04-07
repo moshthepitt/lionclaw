@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -780,19 +780,24 @@ fn normalize_lines(values: &[String], limit: usize) -> Vec<String> {
 fn normalize_memory_proposals(
     values: &[CompactionMemoryProposal],
 ) -> Vec<CompactionMemoryProposal> {
-    values
-        .iter()
-        .filter_map(normalize_memory_proposal)
-        .take(COMPACTION_LIST_KEEP)
-        .collect()
+    merge_unique_keyed(
+        Vec::new(),
+        values
+            .iter()
+            .filter_map(normalize_memory_proposal)
+            .collect(),
+        COMPACTION_LIST_KEEP,
+        |proposal| normalized_summary_title_key(&proposal.title),
+    )
 }
 
 fn normalize_open_loops(values: &[CompactionOpenLoop]) -> Vec<CompactionOpenLoop> {
-    values
-        .iter()
-        .filter_map(normalize_open_loop)
-        .take(COMPACTION_LIST_KEEP)
-        .collect()
+    merge_unique_keyed(
+        Vec::new(),
+        values.iter().filter_map(normalize_open_loop).collect(),
+        COMPACTION_LIST_KEEP,
+        |open_loop| normalized_summary_title_key(&open_loop.title),
+    )
 }
 
 fn normalize_memory_proposal(
@@ -839,36 +844,38 @@ fn merge_unique_memory_proposals(
     previous: Vec<CompactionMemoryProposal>,
     current: Vec<CompactionMemoryProposal>,
 ) -> Vec<CompactionMemoryProposal> {
-    let mut seen = BTreeSet::new();
-    let mut merged = Vec::new();
-    for proposal in previous.into_iter().chain(current) {
-        let Some(key) = normalized_summary_title_key(&proposal.title) else {
-            continue;
-        };
-        if !seen.insert(key) {
-            continue;
-        }
-        merged.push(proposal);
-    }
-    keep_tail(merged, COMPACTION_LIST_KEEP)
+    merge_unique_keyed(previous, current, COMPACTION_LIST_KEEP, |proposal| {
+        normalized_summary_title_key(&proposal.title)
+    })
 }
 
 fn merge_unique_open_loops(
     previous: Vec<CompactionOpenLoop>,
     current: Vec<CompactionOpenLoop>,
 ) -> Vec<CompactionOpenLoop> {
-    let mut seen = BTreeSet::new();
+    merge_unique_keyed(previous, current, COMPACTION_LIST_KEEP, |open_loop| {
+        normalized_summary_title_key(&open_loop.title)
+    })
+}
+
+fn merge_unique_keyed<T, F>(previous: Vec<T>, current: Vec<T>, limit: usize, key_of: F) -> Vec<T>
+where
+    F: Fn(&T) -> Option<String>,
+{
+    let mut positions = BTreeMap::new();
     let mut merged = Vec::new();
-    for open_loop in previous.into_iter().chain(current) {
-        let Some(key) = normalized_summary_title_key(&open_loop.title) else {
+    for item in previous.into_iter().chain(current) {
+        let Some(key) = key_of(&item) else {
             continue;
         };
-        if !seen.insert(key) {
-            continue;
+        if let Some(index) = positions.get(&key).copied() {
+            merged[index] = item;
+        } else {
+            positions.insert(key, merged.len());
+            merged.push(item);
         }
-        merged.push(open_loop);
     }
-    keep_tail(merged, COMPACTION_LIST_KEEP)
+    keep_tail(merged, limit)
 }
 
 fn keep_tail<T>(mut items: Vec<T>, limit: usize) -> Vec<T> {
@@ -944,7 +951,8 @@ mod tests {
 
     use super::{
         build_compaction_prompt, merge_compaction_summary_state, merge_compaction_summary_updates,
-        merge_unique_memory_proposals, merge_unique_open_loops, parse_compaction_summary_state,
+        merge_unique_memory_proposals, merge_unique_open_loops, normalize_memory_proposals,
+        normalize_open_loops, parse_compaction_summary_state,
         remove_memory_proposal_from_summary_state, remove_open_loop_from_summary_state,
         render_compaction_summary, repair_turns, CompactionSummaryState, TranscriptMode,
         COMPACTION_LIST_KEEP,
@@ -1351,5 +1359,75 @@ mod tests {
         assert!(!merged_loops
             .iter()
             .any(|open_loop| open_loop.title == "Loop 0"));
+    }
+
+    #[test]
+    fn merge_replaces_stale_payload_when_titles_collide() {
+        let merged_proposals = merge_unique_memory_proposals(
+            vec![super::CompactionMemoryProposal {
+                title: "Working Preferences".to_string(),
+                rationale: "stale rationale".to_string(),
+                entries: vec!["stale entry".to_string()],
+            }],
+            vec![super::CompactionMemoryProposal {
+                title: " working  preferences ".to_string(),
+                rationale: "fresh rationale".to_string(),
+                entries: vec!["fresh entry".to_string()],
+            }],
+        );
+        assert_eq!(merged_proposals.len(), 1);
+        assert_eq!(merged_proposals[0].rationale, "fresh rationale");
+        assert_eq!(merged_proposals[0].entries, vec!["fresh entry"]);
+
+        let merged_loops = merge_unique_open_loops(
+            vec![super::CompactionOpenLoop {
+                title: "Release Checklist".to_string(),
+                summary: "stale summary".to_string(),
+                next_step: "stale next".to_string(),
+            }],
+            vec![super::CompactionOpenLoop {
+                title: "release checklist".to_string(),
+                summary: "fresh summary".to_string(),
+                next_step: "fresh next".to_string(),
+            }],
+        );
+        assert_eq!(merged_loops.len(), 1);
+        assert_eq!(merged_loops[0].summary, "fresh summary");
+        assert_eq!(merged_loops[0].next_step, "fresh next");
+    }
+
+    #[test]
+    fn normalize_dedupes_duplicate_titles_and_keeps_latest_payload() {
+        let normalized_proposals = normalize_memory_proposals(&[
+            super::CompactionMemoryProposal {
+                title: "Working Preferences".to_string(),
+                rationale: "stale rationale".to_string(),
+                entries: vec!["stale entry".to_string()],
+            },
+            super::CompactionMemoryProposal {
+                title: " working preferences ".to_string(),
+                rationale: "fresh rationale".to_string(),
+                entries: vec!["fresh entry".to_string()],
+            },
+        ]);
+        assert_eq!(normalized_proposals.len(), 1);
+        assert_eq!(normalized_proposals[0].rationale, "fresh rationale");
+        assert_eq!(normalized_proposals[0].entries, vec!["fresh entry"]);
+
+        let normalized_loops = normalize_open_loops(&[
+            super::CompactionOpenLoop {
+                title: "Release Checklist".to_string(),
+                summary: "stale summary".to_string(),
+                next_step: "stale next".to_string(),
+            },
+            super::CompactionOpenLoop {
+                title: "release checklist".to_string(),
+                summary: "fresh summary".to_string(),
+                next_step: "fresh next".to_string(),
+            },
+        ]);
+        assert_eq!(normalized_loops.len(), 1);
+        assert_eq!(normalized_loops[0].summary, "fresh summary");
+        assert_eq!(normalized_loops[0].next_step, "fresh next");
     }
 }
