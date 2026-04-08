@@ -136,7 +136,7 @@ Operator launch model:
 
 - `launch_mode=service`: channel worker is supervised by `lionclaw service up` through the platform service manager.
 - `launch_mode=interactive`: channel worker is foreground-only and started with `lionclaw channel attach <id>`.
-- Worker entrypoint resolution prefers `scripts/worker` and falls back to legacy `scripts/worker.sh`.
+- Worker entrypoint resolution requires `scripts/worker`.
 - `LIONCLAW_HOME` gets a stable machine-owned `config/home-id`; attach and service flows only reuse a daemon when `/v0/daemon/info` reports the same `home_id`.
 
 Adding a new adapter:

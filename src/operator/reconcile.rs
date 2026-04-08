@@ -640,15 +640,13 @@ pub(crate) fn resolve_worker_entrypoint(
     snapshot_dir: &str,
 ) -> Result<PathBuf> {
     let snapshot_root = home.root().join(snapshot_dir);
-    for relative in ["scripts/worker", "scripts/worker.sh"] {
-        let candidate = snapshot_root.join(relative);
-        if candidate.exists() {
-            return Ok(candidate);
-        }
+    let candidate = snapshot_root.join("scripts/worker");
+    if candidate.exists() {
+        return Ok(candidate);
     }
 
     Err(anyhow!(
-        "worker entrypoint is missing under '{}'; expected 'scripts/worker' or legacy 'scripts/worker.sh'",
+        "worker entrypoint is missing under '{}'; expected 'scripts/worker'",
         snapshot_root.display()
     ))
 }
@@ -719,7 +717,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        apply, onboard, render_marker_file, up, ApplyResult, OnboardBindSelection, StackBinaryPaths,
+        apply, onboard, render_marker_file, resolve_worker_entrypoint, up, ApplyResult,
+        OnboardBindSelection, StackBinaryPaths,
     };
     use crate::{
         contracts::DaemonInfoResponse,
@@ -780,6 +779,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn worker_entrypoint_requires_canonical_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let snapshot_dir = "skills/example";
+        let scripts_dir = home.root().join(snapshot_dir).join("scripts");
+        fs::create_dir_all(&scripts_dir).expect("scripts dir");
+        fs::write(scripts_dir.join("worker.sh"), "#!/usr/bin/env bash\n").expect("worker");
+
+        let err = resolve_worker_entrypoint(&home, snapshot_dir).expect_err("should fail");
+        assert!(err.to_string().contains("expected 'scripts/worker'"));
+    }
+
     #[tokio::test]
     async fn up_with_fake_manager_materializes_units() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -803,11 +815,16 @@ mod tests {
             "---\nname: channel-telegram\ndescription: test\n---\n",
         )
         .expect("skill md");
-        fs::write(
-            skill_source.join("scripts/worker.sh"),
-            "#!/usr/bin/env bash\n",
-        )
-        .expect("worker");
+        fs::write(skill_source.join("scripts/worker"), "#!/usr/bin/env bash\n").expect("worker");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                skill_source.join("scripts/worker"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod worker");
+        }
 
         config.runtimes = [(
             "codex".to_string(),
@@ -865,10 +882,19 @@ mod tests {
         )
         .expect("skill md v1");
         fs::write(
-            skill_source.join("scripts/worker.sh"),
+            skill_source.join("scripts/worker"),
             "#!/usr/bin/env bash\necho v1\n",
         )
         .expect("worker v1");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                skill_source.join("scripts/worker"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod worker v1");
+        }
 
         let config = OperatorConfig {
             skills: vec![ManagedSkillConfig {

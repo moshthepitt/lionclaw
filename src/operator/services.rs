@@ -574,7 +574,7 @@ mod tests {
             &home,
             &ChannelServiceSpec {
                 channel_id: "telegram".to_string(),
-                worker_path: "/tmp/skills/telegram/scripts/worker.sh".into(),
+                worker_path: "/tmp/skills/telegram/scripts/worker".into(),
                 env: vec![("TELEGRAM_BOT_TOKEN".to_string(), "secret".to_string())],
             },
         );

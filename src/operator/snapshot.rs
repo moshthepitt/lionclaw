@@ -190,11 +190,7 @@ mod tests {
             "---\nname: channel-telegram\ndescription: test\n---\n",
         )
         .expect("skill");
-        fs::write(
-            source_dir.join("scripts/worker.sh"),
-            "#!/usr/bin/env bash\n",
-        )
-        .expect("worker");
+        fs::write(source_dir.join("scripts/worker"), "#!/usr/bin/env bash\n").expect("worker");
 
         let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
         fs::create_dir_all(home.skills_dir()).expect("skills dir");
@@ -216,7 +212,7 @@ mod tests {
 
         assert_eq!(first.hash, second.hash);
         assert_eq!(first.snapshot_abs_dir, second.snapshot_abs_dir);
-        assert!(first.snapshot_abs_dir.join("scripts/worker.sh").exists());
+        assert!(first.snapshot_abs_dir.join("scripts/worker").exists());
     }
 
     #[test]
