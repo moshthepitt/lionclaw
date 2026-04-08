@@ -39,7 +39,7 @@ pub enum NetworkMode {
     Allowlist,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct SecretBinding {
     pub name: String,
@@ -48,7 +48,7 @@ pub struct SecretBinding {
     pub target_env: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SecretBindingKind {
     LaunchEnv,
@@ -100,11 +100,21 @@ impl ConfinementConfig {
     }
 }
 
+impl ConfinementBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Oci => "oci",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct OciConfinementConfig {
+    #[serde(default = "default_oci_engine")]
     pub engine: String,
-    pub image: String,
+    #[serde(default)]
+    pub image: Option<String>,
     #[serde(default)]
     pub read_only_rootfs: bool,
     #[serde(default)]
@@ -113,6 +123,10 @@ pub struct OciConfinementConfig {
     pub additional_mounts: Vec<MountSpec>,
     #[serde(default)]
     pub limits: ExecutionLimits,
+}
+
+fn default_oci_engine() -> String {
+    "podman".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -176,8 +190,6 @@ mod tests {
     fn oci_confinement_uses_nested_limits_shape() {
         let config: ConfinementConfig = serde_json::from_value(json!({
             "backend": "oci",
-            "engine": "podman",
-            "image": "ghcr.io/lionclaw/runtime:v1",
             "read-only-rootfs": true,
             "limits": {
                 "memory-limit": "4g",
@@ -192,6 +204,11 @@ mod tests {
             .get("limits")
             .and_then(|raw| raw.as_object())
             .expect("limits object");
+        assert_eq!(
+            value.get("engine").and_then(|raw| raw.as_str()),
+            Some("podman")
+        );
+        assert_eq!(value.get("image"), Some(&serde_json::Value::Null));
         assert_eq!(
             limits.get("memory-limit").and_then(|raw| raw.as_str()),
             Some("4g")

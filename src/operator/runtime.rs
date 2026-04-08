@@ -20,21 +20,15 @@ pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConf
             RuntimeProfileConfig::Codex {
                 executable,
                 model,
-                sandbox,
-                skip_git_repo_check,
-                ephemeral,
+                confinement: _,
             } => {
+                let codex = CodexRuntimeConfig {
+                    executable: executable.clone(),
+                    model: model.clone(),
+                    ..CodexRuntimeConfig::default()
+                };
                 kernel
-                    .register_runtime_adapter(
-                        id.clone(),
-                        Arc::new(CodexRuntimeAdapter::new(CodexRuntimeConfig {
-                            executable: executable.clone(),
-                            model: model.clone(),
-                            sandbox_mode: sandbox.clone(),
-                            skip_git_repo_check: *skip_git_repo_check,
-                            ephemeral: *ephemeral,
-                        })),
-                    )
+                    .register_runtime_adapter(id.clone(), Arc::new(CodexRuntimeAdapter::new(codex)))
                     .await;
             }
             RuntimeProfileConfig::OpenCode {
@@ -44,6 +38,7 @@ pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConf
                 agent,
                 xdg_data_home,
                 continue_last_session,
+                confinement: _,
             } => {
                 kernel
                     .register_runtime_adapter(
@@ -185,9 +180,7 @@ mod tests {
             RuntimeProfileConfig::Codex {
                 executable: path.to_string_lossy().to_string(),
                 model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
+                confinement: None,
             },
         );
 
@@ -204,9 +197,7 @@ mod tests {
             RuntimeProfileConfig::Codex {
                 executable: "sh".to_string(),
                 model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
+                confinement: None,
             },
         );
 
@@ -223,9 +214,7 @@ mod tests {
             RuntimeProfileConfig::Codex {
                 executable: "codex".to_string(),
                 model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
+                confinement: None,
             },
         );
 

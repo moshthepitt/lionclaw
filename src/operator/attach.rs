@@ -290,9 +290,7 @@ mod tests {
                 RuntimeProfileConfig::Codex {
                     executable: runtime_stub.to_string_lossy().to_string(),
                     model: None,
-                    sandbox: "read-only".to_string(),
-                    skip_git_repo_check: true,
-                    ephemeral: true,
+                    confinement: None,
                 },
             )]
             .into_iter()

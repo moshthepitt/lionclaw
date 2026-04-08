@@ -151,6 +151,9 @@ Normal user flow:
 2. `lionclaw runtime add codex --kind codex --bin codex`
 3. `lionclaw run codex`
 
+Runtime definitions, execution presets, and confinement settings live in
+`~/.lionclaw/config/lionclaw.toml`, not in ad hoc shell configuration.
+
 Inside `lionclaw run`, recovery stays command-first:
 
 - `/continue`

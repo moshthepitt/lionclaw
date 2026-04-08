@@ -5,6 +5,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::home::{LionClawHome, DEFAULT_WORKSPACE};
+use crate::kernel::runtime::{ConfinementConfig, ExecutionPreset};
 use crate::kernel::skills::sanitize_skill_name;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -13,6 +14,8 @@ pub struct OperatorConfig {
     pub daemon: DaemonConfig,
     #[serde(default)]
     pub defaults: OperatorDefaults,
+    #[serde(default)]
+    pub presets: BTreeMap<String, ExecutionPreset>,
     #[serde(default)]
     pub runtimes: BTreeMap<String, RuntimeProfileConfig>,
     #[serde(default)]
@@ -106,6 +109,28 @@ impl OperatorConfig {
         self.runtimes.get(id)
     }
 
+    pub fn upsert_preset(&mut self, id: String, preset: ExecutionPreset) {
+        let should_set_default = self.defaults.preset.is_none();
+        self.presets.insert(id.clone(), preset);
+        if should_set_default {
+            self.defaults.preset = Some(id);
+        }
+        self.normalize();
+    }
+
+    pub fn remove_preset(&mut self, id: &str) -> bool {
+        let removed = self.presets.remove(id).is_some();
+        if removed && self.defaults.preset.as_deref() == Some(id) {
+            self.defaults.preset = None;
+        }
+        self.normalize();
+        removed
+    }
+
+    pub fn preset(&self, id: &str) -> Option<&ExecutionPreset> {
+        self.presets.get(id)
+    }
+
     pub fn resolve_runtime_id(&self, requested: Option<&str>) -> Result<String> {
         if let Some(runtime_id) = requested.map(str::trim).filter(|value| !value.is_empty()) {
             return Ok(runtime_id.to_string());
@@ -117,11 +142,31 @@ impl OperatorConfig {
             .ok_or_else(|| anyhow!("runtime is required when no default runtime is configured"))
     }
 
+    pub fn resolve_preset_id(&self, requested: Option<&str>) -> Result<String> {
+        if let Some(preset_id) = requested.map(str::trim).filter(|value| !value.is_empty()) {
+            return Ok(preset_id.to_string());
+        }
+
+        self.defaults
+            .preset
+            .clone()
+            .ok_or_else(|| anyhow!("preset is required when no default preset is configured"))
+    }
+
     pub fn set_default_runtime(&mut self, id: &str) -> Result<()> {
         if !self.runtimes.contains_key(id) {
             return Err(anyhow!("runtime profile '{}' is not configured", id));
         }
         self.defaults.runtime = Some(id.to_string());
+        self.normalize();
+        Ok(())
+    }
+
+    pub fn set_default_preset(&mut self, id: &str) -> Result<()> {
+        if !self.presets.contains_key(id) {
+            return Err(anyhow!("preset '{}' is not configured", id));
+        }
+        self.defaults.preset = Some(id.to_string());
         self.normalize();
         Ok(())
     }
@@ -137,6 +182,23 @@ impl OperatorConfig {
             .as_ref()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        self.defaults.preset = self
+            .defaults
+            .preset
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.presets = std::mem::take(&mut self.presets)
+            .into_iter()
+            .filter_map(|(id, mut preset)| {
+                let id = id.trim().to_string();
+                if id.is_empty() {
+                    return None;
+                }
+                normalize_execution_preset(&mut preset);
+                Some((id, preset))
+            })
+            .collect();
         self.skills
             .sort_by(|left, right| left.alias.cmp(&right.alias));
         self.channels.sort_by(|left, right| left.id.cmp(&right.id));
@@ -151,6 +213,8 @@ impl OperatorConfig {
 pub struct OperatorDefaults {
     #[serde(default)]
     pub runtime: Option<String>,
+    #[serde(default)]
+    pub preset: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,10 +296,6 @@ pub fn default_workspace() -> String {
     DEFAULT_WORKSPACE.to_string()
 }
 
-fn default_codex_sandbox() -> String {
-    "read-only".to_string()
-}
-
 fn default_opencode_format() -> String {
     "json".to_string()
 }
@@ -248,10 +308,6 @@ fn default_enabled() -> bool {
     true
 }
 
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum RuntimeProfileConfig {
@@ -260,12 +316,8 @@ pub enum RuntimeProfileConfig {
         executable: String,
         #[serde(default)]
         model: Option<String>,
-        #[serde(default = "default_codex_sandbox")]
-        sandbox: String,
-        #[serde(default = "default_true")]
-        skip_git_repo_check: bool,
-        #[serde(default = "default_true")]
-        ephemeral: bool,
+        #[serde(default)]
+        confinement: Option<ConfinementConfig>,
     },
     #[serde(rename = "opencode")]
     OpenCode {
@@ -280,6 +332,8 @@ pub enum RuntimeProfileConfig {
         xdg_data_home: Option<String>,
         #[serde(default)]
         continue_last_session: bool,
+        #[serde(default)]
+        confinement: Option<ConfinementConfig>,
     },
 }
 
@@ -296,6 +350,34 @@ impl RuntimeProfileConfig {
             Self::Codex { executable, .. } | Self::OpenCode { executable, .. } => executable,
         }
     }
+
+    pub fn confinement(&self) -> Option<&ConfinementConfig> {
+        match self {
+            Self::Codex { confinement, .. } | Self::OpenCode { confinement, .. } => {
+                confinement.as_ref()
+            }
+        }
+    }
+}
+
+fn normalize_execution_preset(preset: &mut ExecutionPreset) {
+    preset.secret_bindings = std::mem::take(&mut preset.secret_bindings)
+        .into_iter()
+        .filter_map(|mut binding| {
+            binding.name = binding.name.trim().to_string();
+            binding.target_env = binding
+                .target_env
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            if binding.name.is_empty() {
+                return None;
+            }
+            Some(binding)
+        })
+        .collect();
+    preset.secret_bindings.sort();
+    preset.secret_bindings.dedup();
 }
 
 pub fn derive_skill_alias(source: &str) -> String {
@@ -405,6 +487,9 @@ mod tests {
         derive_skill_alias, normalize_executable, normalize_local_source, validate_executable,
         ChannelLaunchMode, ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig,
     };
+    use crate::kernel::runtime::{
+        ExecutionPreset, NetworkMode, SecretBinding, SecretBindingKind, WorkspaceAccess,
+    };
 
     #[test]
     fn derives_channel_alias_from_source_path() {
@@ -423,6 +508,7 @@ mod tests {
         assert!(config.skills.is_empty());
         assert!(config.channels.is_empty());
         assert!(config.runtimes.is_empty());
+        assert!(config.presets.is_empty());
     }
 
     #[tokio::test]
@@ -480,9 +566,7 @@ mod tests {
             RuntimeProfileConfig::Codex {
                 executable: "/tmp/codex".to_string(),
                 model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
+                confinement: None,
             },
         );
 
@@ -497,14 +581,104 @@ mod tests {
             RuntimeProfileConfig::Codex {
                 executable: "/tmp/codex".to_string(),
                 model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
+                confinement: None,
             },
         );
 
         assert!(config.remove_runtime("codex"));
         assert!(config.defaults.runtime.is_none());
+    }
+
+    #[test]
+    fn first_preset_becomes_default() {
+        let mut config = OperatorConfig::default();
+        config.upsert_preset(
+            "everyday".to_string(),
+            ExecutionPreset {
+                workspace_access: WorkspaceAccess::ReadWrite,
+                network_mode: NetworkMode::On,
+                secret_bindings: Vec::new(),
+                escape_classes: Default::default(),
+            },
+        );
+
+        assert_eq!(config.defaults.preset.as_deref(), Some("everyday"));
+    }
+
+    #[test]
+    fn removing_default_preset_clears_default() {
+        let mut config = OperatorConfig::default();
+        config.upsert_preset(
+            "everyday".to_string(),
+            ExecutionPreset {
+                workspace_access: WorkspaceAccess::ReadWrite,
+                network_mode: NetworkMode::On,
+                secret_bindings: Vec::new(),
+                escape_classes: Default::default(),
+            },
+        );
+
+        assert!(config.remove_preset("everyday"));
+        assert!(config.defaults.preset.is_none());
+    }
+
+    #[test]
+    fn preset_normalization_trims_keys_and_dedupes_secret_bindings() {
+        let mut config = OperatorConfig::default();
+        config.upsert_preset(
+            "  everyday  ".to_string(),
+            ExecutionPreset {
+                workspace_access: WorkspaceAccess::ReadWrite,
+                network_mode: NetworkMode::On,
+                secret_bindings: vec![
+                    SecretBinding {
+                        name: "github".to_string(),
+                        kind: SecretBindingKind::LaunchEnv,
+                        target_env: Some("GITHUB_TOKEN".to_string()),
+                    },
+                    SecretBinding {
+                        name: "github".to_string(),
+                        kind: SecretBindingKind::LaunchEnv,
+                        target_env: Some("GITHUB_TOKEN".to_string()),
+                    },
+                ],
+                escape_classes: Default::default(),
+            },
+        );
+
+        assert!(config.preset("  everyday  ").is_none());
+        let preset = config.preset("everyday").expect("normalized preset");
+        assert_eq!(preset.secret_bindings.len(), 1);
+    }
+
+    #[test]
+    fn legacy_codex_runtime_fields_are_ignored_on_load() {
+        let config: OperatorConfig = toml::from_str(
+            r#"
+                [runtimes.codex]
+                kind = "codex"
+                executable = "codex"
+                model = "gpt-5-codex"
+                sandbox = "danger-full-access"
+                skip_git_repo_check = false
+                ephemeral = false
+            "#,
+        )
+        .expect("parse config");
+
+        let runtime = config.runtime("codex").expect("codex runtime");
+        match runtime {
+            RuntimeProfileConfig::Codex {
+                executable,
+                model,
+                confinement,
+            } => {
+                assert_eq!(executable, "codex");
+                assert_eq!(model.as_deref(), Some("gpt-5-codex"));
+                assert!(confinement.is_none());
+            }
+            other => panic!("unexpected runtime profile: {}", other.kind()),
+        }
     }
 
     #[cfg(unix)]

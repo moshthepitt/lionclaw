@@ -457,9 +457,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             RuntimeProfileConfig::Codex {
                 executable: stub.to_string_lossy().to_string(),
                 model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
+                confinement: None,
             },
         );
         config.save(&home).await.expect("save config");
@@ -509,9 +507,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             RuntimeProfileConfig::Codex {
                 executable: stub.to_string_lossy().to_string(),
                 model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
+                confinement: None,
             },
         );
         config.save(&home).await.expect("save config");
@@ -563,9 +559,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             RuntimeProfileConfig::Codex {
                 executable: stub.to_string_lossy().to_string(),
                 model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
+                confinement: None,
             },
         );
         config.save(&home).await.expect("save config");
@@ -645,9 +639,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             RuntimeProfileConfig::Codex {
                 executable: stub.to_string_lossy().to_string(),
                 model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
+                confinement: None,
             },
         );
         config.save(&home).await.expect("save config");
@@ -713,9 +705,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             RuntimeProfileConfig::Codex {
                 executable: stub.to_string_lossy().to_string(),
                 model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
+                confinement: None,
             },
         );
         config.save(&home).await.expect("save config");
@@ -758,9 +748,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             RuntimeProfileConfig::Codex {
                 executable: stub.to_string_lossy().to_string(),
                 model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
+                confinement: None,
             },
         );
         config.save(&home).await.expect("save config");
@@ -805,9 +793,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
                     .to_string_lossy()
                     .to_string(),
                 model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
+                confinement: None,
             },
         );
         config.save(&home).await.expect("save config");

@@ -11,7 +11,10 @@ use crate::{
         JobRunsRequest, JobScheduleDto, TrustTier,
     },
     home::LionClawHome,
-    kernel::jobs::normalize_cron_expression,
+    kernel::{
+        jobs::normalize_cron_expression,
+        runtime::{ConfinementConfig, ExecutionLimits, OciConfinementConfig},
+    },
     operator::{
         attach::attach_channel,
         config::{
@@ -45,7 +48,7 @@ enum Command {
     Run(RunArgs),
     Runtime {
         #[command(subcommand)]
-        command: RuntimeCommand,
+        command: Box<RuntimeCommand>,
     },
     Service {
         #[command(subcommand)]
@@ -107,7 +110,7 @@ struct LogsArgs {
 
 #[derive(Debug, Subcommand)]
 enum RuntimeCommand {
-    Add(RuntimeAddArgs),
+    Add(Box<RuntimeAddArgs>),
     Rm(RuntimeRmArgs),
     Ls,
     SetDefault(RuntimeSetDefaultArgs),
@@ -122,12 +125,6 @@ struct RuntimeAddArgs {
     executable: String,
     #[arg(long)]
     model: Option<String>,
-    #[arg(long, default_value = "read-only")]
-    sandbox: String,
-    #[arg(long)]
-    no_skip_git_repo_check: bool,
-    #[arg(long)]
-    no_ephemeral: bool,
     #[arg(long, default_value = "json")]
     format: String,
     #[arg(long)]
@@ -136,6 +133,28 @@ struct RuntimeAddArgs {
     xdg_data_home: Option<String>,
     #[arg(long)]
     continue_last_session: bool,
+    #[arg(long, help = "Confinement backend for this runtime profile")]
+    backend: Option<String>,
+    #[arg(long, help = "OCI engine to use when backend is 'oci'")]
+    engine: Option<String>,
+    #[arg(long, help = "Runtime image override for the confinement backend")]
+    image: Option<String>,
+    #[arg(long, help = "Use a read-only container root filesystem")]
+    read_only_rootfs: bool,
+    #[arg(long = "tmpfs", help = "Add a tmpfs mount inside the confined runtime")]
+    tmpfs: Vec<String>,
+    #[arg(long = "memory-limit")]
+    memory_limit: Option<String>,
+    #[arg(long = "cpu-limit")]
+    cpu_limit: Option<String>,
+    #[arg(long = "pids-limit")]
+    pids_limit: Option<u32>,
+    #[arg(long, hide = true)]
+    sandbox: Option<String>,
+    #[arg(long, hide = true)]
+    no_skip_git_repo_check: bool,
+    #[arg(long, hide = true)]
+    no_ephemeral: bool,
 }
 
 #[derive(Debug, Args)]
@@ -348,8 +367,9 @@ pub async fn run() -> Result<()> {
         Command::Run(args) => {
             run_local(&home, args.runtime, args.continue_last_session).await?;
         }
-        Command::Runtime { command } => match command {
+        Command::Runtime { command } => match *command {
             RuntimeCommand::Add(args) => {
+                warn_if_legacy_runtime_flags_used(&args);
                 let executable = normalize_executable(&args.executable)?;
                 let profile = build_runtime_profile(&args, executable)?;
                 let mut config = OperatorConfig::load(&home).await?;
@@ -379,11 +399,18 @@ pub async fn run() -> Result<()> {
                             " "
                         };
                         println!(
-                            "{} {} kind={} command={}",
+                            "{} {} kind={} command={}{}",
                             marker,
                             id,
                             profile.kind(),
-                            profile.executable()
+                            profile.executable(),
+                            profile
+                                .confinement()
+                                .map(|confinement| format!(
+                                    " confinement={}",
+                                    confinement.backend().as_str()
+                                ))
+                                .unwrap_or_default()
                         );
                     }
                 }
@@ -914,15 +941,14 @@ fn build_runtime_profile(
     args: &RuntimeAddArgs,
     executable: String,
 ) -> Result<RuntimeProfileConfig> {
+    let confinement = build_confinement_config(args)?;
     match args.kind.trim() {
         "codex" => {
             reject_opencode_only_flags(args)?;
             Ok(RuntimeProfileConfig::Codex {
                 executable,
                 model: args.model.clone(),
-                sandbox: args.sandbox.clone(),
-                skip_git_repo_check: !args.no_skip_git_repo_check,
-                ephemeral: !args.no_ephemeral,
+                confinement,
             })
         }
         "opencode" => {
@@ -934,12 +960,87 @@ fn build_runtime_profile(
                 agent: args.agent.clone(),
                 xdg_data_home: args.xdg_data_home.clone(),
                 continue_last_session: args.continue_last_session,
+                confinement,
             })
         }
         other => Err(anyhow!(
             "unsupported runtime kind '{}'; expected 'codex' or 'opencode'",
             other
         )),
+    }
+}
+
+fn build_confinement_config(args: &RuntimeAddArgs) -> Result<Option<ConfinementConfig>> {
+    let wants_confinement = args.backend.is_some()
+        || args.engine.is_some()
+        || args.image.is_some()
+        || args.read_only_rootfs
+        || !args.tmpfs.is_empty()
+        || args.memory_limit.is_some()
+        || args.cpu_limit.is_some()
+        || args.pids_limit.is_some();
+
+    if !wants_confinement {
+        return Ok(None);
+    }
+
+    let backend = args
+        .backend
+        .as_deref()
+        .unwrap_or("oci")
+        .trim()
+        .to_ascii_lowercase();
+    match backend.as_str() {
+        "oci" => Ok(Some(ConfinementConfig::Oci(OciConfinementConfig {
+            engine: args
+                .engine
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| "podman".to_string()),
+            image: args
+                .image
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+            read_only_rootfs: args.read_only_rootfs,
+            tmpfs: args
+                .tmpfs
+                .iter()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect(),
+            additional_mounts: Vec::new(),
+            limits: ExecutionLimits {
+                memory_limit: args
+                    .memory_limit
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned),
+                cpu_limit: args
+                    .cpu_limit
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned),
+                pids_limit: args.pids_limit,
+            },
+        }))),
+        other => Err(anyhow!(
+            "unsupported confinement backend '{}'; expected 'oci'",
+            other
+        )),
+    }
+}
+
+fn warn_if_legacy_runtime_flags_used(args: &RuntimeAddArgs) {
+    if args.sandbox.is_some() || args.no_skip_git_repo_check || args.no_ephemeral {
+        eprintln!(
+            "warning: legacy Codex sandbox flags are deprecated and ignored; use confinement config instead"
+        );
     }
 }
 
@@ -957,7 +1058,7 @@ fn reject_opencode_only_flags(args: &RuntimeAddArgs) -> Result<()> {
 }
 
 fn reject_codex_only_flags(args: &RuntimeAddArgs) -> Result<()> {
-    if args.no_skip_git_repo_check || args.no_ephemeral || args.sandbox != "read-only" {
+    if args.no_skip_git_repo_check || args.no_ephemeral || args.sandbox.is_some() {
         return Err(anyhow!(
             "codex-specific flags are not valid for kind 'opencode'"
         ));
@@ -968,8 +1069,33 @@ fn reject_codex_only_flags(args: &RuntimeAddArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::runtime::ConfinementConfig;
     use chrono::Duration as ChronoDuration;
     use tempfile::NamedTempFile;
+
+    fn runtime_add_args(kind: &str) -> RuntimeAddArgs {
+        RuntimeAddArgs {
+            id: "runtime".to_string(),
+            kind: kind.to_string(),
+            executable: "runtime-bin".to_string(),
+            model: None,
+            format: "json".to_string(),
+            agent: None,
+            xdg_data_home: None,
+            continue_last_session: false,
+            backend: None,
+            engine: None,
+            image: None,
+            read_only_rootfs: false,
+            tmpfs: Vec::new(),
+            memory_limit: None,
+            cpu_limit: None,
+            pids_limit: None,
+            sandbox: None,
+            no_skip_git_repo_check: false,
+            no_ephemeral: false,
+        }
+    }
 
     #[test]
     fn parses_duration_schedule_as_once() {
@@ -1041,5 +1167,55 @@ mod tests {
             .expect("load prompt file");
 
         assert_eq!(prompt, "repo status brief");
+    }
+
+    #[test]
+    fn builds_codex_runtime_profile_with_oci_confinement() {
+        let mut args = runtime_add_args("codex");
+        args.image = Some("ghcr.io/lionclaw/codex:v1".to_string());
+        args.read_only_rootfs = true;
+        args.tmpfs = vec!["/tmp:size=512m".to_string()];
+        args.memory_limit = Some("4g".to_string());
+
+        let profile = build_runtime_profile(&args, "codex".to_string()).expect("build profile");
+        let RuntimeProfileConfig::Codex {
+            executable,
+            model,
+            confinement,
+        } = profile
+        else {
+            panic!("expected codex profile");
+        };
+
+        assert_eq!(executable, "codex");
+        assert!(model.is_none());
+        match confinement {
+            Some(ConfinementConfig::Oci(config)) => {
+                assert_eq!(config.engine, "podman");
+                assert_eq!(config.image.as_deref(), Some("ghcr.io/lionclaw/codex:v1"));
+                assert!(config.read_only_rootfs);
+                assert_eq!(config.tmpfs, vec!["/tmp:size=512m".to_string()]);
+                assert_eq!(config.limits.memory_limit.as_deref(), Some("4g"));
+            }
+            other => panic!("unexpected confinement config: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_confinement_config_returns_none_without_confinement_flags() {
+        let args = runtime_add_args("codex");
+        let confinement = build_confinement_config(&args).expect("build confinement config");
+        assert!(confinement.is_none());
+    }
+
+    #[test]
+    fn opencode_rejects_legacy_codex_flags() {
+        let mut args = runtime_add_args("opencode");
+        args.sandbox = Some("read-only".to_string());
+
+        let err = build_runtime_profile(&args, "opencode".to_string()).expect_err("should fail");
+        assert!(err
+            .to_string()
+            .contains("codex-specific flags are not valid for kind 'opencode'"));
     }
 }

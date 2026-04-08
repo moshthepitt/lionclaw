@@ -198,7 +198,12 @@ Override the root with `LIONCLAW_HOME`.
 
 ## Runtime config
 
-Runtime profiles live in `~/.lionclaw/config/lionclaw.toml`.
+Runtime profiles, execution presets, and confinement settings live in
+`~/.lionclaw/config/lionclaw.toml`.
+
+`lionclaw runtime add` configures the runtime protocol details and can attach
+confinement metadata. Execution policy remains config-owned in LionClaw state,
+not ambient shell state.
 
 Use these env vars for manual setup and migration:
 
