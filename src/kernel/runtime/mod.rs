@@ -10,6 +10,7 @@ use super::policy::Capability;
 
 pub mod adapters;
 pub mod builtins;
+pub mod execution;
 
 pub use adapters::{
     CodexRuntimeAdapter, CodexRuntimeConfig, MockRuntimeAdapter, OpenCodeRuntimeAdapter,
@@ -18,6 +19,12 @@ pub use adapters::{
 pub use builtins::{
     register_builtin_runtime_adapters, BUILTIN_RUNTIME_CODEX, BUILTIN_RUNTIME_MOCK,
     BUILTIN_RUNTIME_OPENCODE,
+};
+pub use execution::{
+    ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionBackend,
+    ExecutionLimits, ExecutionOutput, ExecutionPreset, ExecutionRequest, MountAccess, MountSpec,
+    NetworkMode, OciConfinementConfig, OciExecutionBackend, RuntimeProgramSpec, SecretBinding,
+    SecretBindingKind, WorkspaceAccess,
 };
 
 #[derive(Debug, Clone)]
