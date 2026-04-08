@@ -1,7 +1,7 @@
 //! Execution planning and confinement contracts for runtime launches.
 //!
-//! Phase 0 introduces these types without changing runtime behavior so later
-//! phases can move launch policy out of individual adapters.
+//! These types are introduced without changing runtime behavior so later work
+//! can move launch policy out of individual adapters.
 
 pub mod backend;
 pub mod oci;

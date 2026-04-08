@@ -8,9 +8,8 @@ use super::{
 
 /// Rootless OCI execution backend placeholder.
 ///
-/// Phase 0 introduces the backend contract without changing any existing launch
-/// behavior. Later phases will replace adapter-owned process spawning with a
-/// concrete Podman-backed implementation here.
+/// This backend contract exists before the concrete launch path is wired in so
+/// adapter-owned process spawning can move here later.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OciExecutionBackend;
 
