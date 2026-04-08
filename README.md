@@ -205,12 +205,11 @@ Runtime profiles, execution presets, and confinement settings live in
 confinement metadata. Execution policy remains config-owned in LionClaw state,
 not ambient shell state.
 
-Use these env vars for manual setup and migration:
+Built-in runtime fallback recognizes these env vars:
 
 - `LIONCLAW_DEFAULT_RUNTIME_ID`
 - `LIONCLAW_CODEX_BIN`
 - `LIONCLAW_CODEX_MODEL`
-- `LIONCLAW_CODEX_SANDBOX`
 - `LIONCLAW_OPENCODE_BIN`
 - `LIONCLAW_OPENCODE_MODEL`
 - `LIONCLAW_OPENCODE_AGENT`

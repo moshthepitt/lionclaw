@@ -18,9 +18,6 @@ use super::subprocess::{run_non_interactive_streaming, SubprocessInvocation};
 pub struct CodexRuntimeConfig {
     pub executable: String,
     pub model: Option<String>,
-    pub sandbox_mode: String,
-    pub skip_git_repo_check: bool,
-    pub ephemeral: bool,
 }
 
 impl Default for CodexRuntimeConfig {
@@ -28,9 +25,6 @@ impl Default for CodexRuntimeConfig {
         Self {
             executable: "codex".to_string(),
             model: None,
-            sandbox_mode: "read-only".to_string(),
-            skip_git_repo_check: true,
-            ephemeral: true,
         }
     }
 }
@@ -46,9 +40,6 @@ impl CodexRuntimeConfig {
             model: std::env::var("LIONCLAW_CODEX_MODEL")
                 .ok()
                 .filter(|raw| !raw.trim().is_empty()),
-            sandbox_mode: default.sandbox_mode,
-            skip_git_repo_check: default.skip_git_repo_check,
-            ephemeral: default.ephemeral,
         }
     }
 }
@@ -189,16 +180,6 @@ fn build_codex_exec_args(
     if let Some(model) = &config.model {
         args.push("--model".to_string());
         args.push(model.to_string());
-    }
-    if !config.sandbox_mode.trim().is_empty() {
-        args.push("--sandbox".to_string());
-        args.push(config.sandbox_mode.clone());
-    }
-    if config.skip_git_repo_check {
-        args.push("--skip-git-repo-check".to_string());
-    }
-    if config.ephemeral {
-        args.push("--ephemeral".to_string());
     }
     if let Some(working_dir) = session_working_dir {
         args.push("--cd".to_string());
@@ -477,7 +458,9 @@ mod tests {
         RuntimeTurnInput,
     };
 
-    use super::{parse_codex_stdout, CodexRuntimeAdapter, CodexRuntimeConfig};
+    use super::{
+        build_codex_exec_args, parse_codex_stdout, CodexRuntimeAdapter, CodexRuntimeConfig,
+    };
     use tempfile::tempdir;
     use tokio::sync::mpsc;
     use uuid::Uuid;
@@ -603,6 +586,29 @@ exit 7
         assert!(
             message.contains("stub failure"),
             "stderr output should be surfaced in error"
+        );
+    }
+
+    #[test]
+    fn codex_exec_args_only_include_protocol_fields() {
+        let args = build_codex_exec_args(
+            &CodexRuntimeConfig {
+                executable: "codex".to_string(),
+                model: Some("gpt-5-codex".to_string()),
+            },
+            Some("/workspace"),
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "--json".to_string(),
+                "--model".to_string(),
+                "gpt-5-codex".to_string(),
+                "--cd".to_string(),
+                "/workspace".to_string(),
+            ]
         );
     }
 

@@ -259,11 +259,10 @@ Queued channel turns emit machine-stable status/error codes through the same str
 1. Default deny: policy checks deny unless grant exists.
 2. No default external channel in core; all external transport is skill-worker code outside Rust kernel.
 3. Runtime adapters registered by default: local `mock`, subprocess `codex`, and subprocess `opencode`.
-4. `codex` adapter runs in secure defaults (`read-only` sandbox, `--ephemeral`) and kernel-owned capability broker routing.
-5. `opencode` adapter runs in JSON event mode and maps runtime events into kernel events.
-6. Kernel-enforced runtime idle timeout + hard timeout + cancellation path (`runtime.turn.timeout` audit event with `timeout_kind=idle|hard`).
-7. Runtime execution policy supports per-turn working directory, idle timeout override, and env passthrough constraints while the daemon keeps a separate hard timeout ceiling.
-8. Capability side effects route through kernel brokers only:
+4. `codex` and `opencode` adapters currently run subprocess runtimes in JSON event mode and map runtime output into kernel events.
+5. Kernel-enforced runtime idle timeout + hard timeout + cancellation path (`runtime.turn.timeout` audit event with `timeout_kind=idle|hard`).
+6. Runtime execution policy supports per-turn working directory, idle timeout override, and env passthrough constraints while the daemon keeps a separate hard timeout ceiling.
+7. Capability side effects route through kernel brokers only:
    - `fs.read` / `fs.write` use workspace-bounded filesystem broker.
    - `channel.send` records outbound transcript entries and appends typed stream events for external channel skills.
    - `net.egress`, `secret.request`, `scheduler.run` are broker-gated and denied until configured.

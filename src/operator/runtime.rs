@@ -28,7 +28,6 @@ pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConf
                         Arc::new(CodexRuntimeAdapter::new(CodexRuntimeConfig {
                             executable: executable.clone(),
                             model: model.clone(),
-                            ..CodexRuntimeConfig::default()
                         })),
                     )
                     .await;
