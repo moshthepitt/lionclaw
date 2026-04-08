@@ -651,36 +651,6 @@ mod tests {
         assert_eq!(preset.secret_bindings.len(), 1);
     }
 
-    #[test]
-    fn legacy_codex_runtime_fields_are_ignored_on_load() {
-        let config: OperatorConfig = toml::from_str(
-            r#"
-                [runtimes.codex]
-                kind = "codex"
-                executable = "codex"
-                model = "gpt-5-codex"
-                sandbox = "danger-full-access"
-                skip_git_repo_check = false
-                ephemeral = false
-            "#,
-        )
-        .expect("parse config");
-
-        let runtime = config.runtime("codex").expect("codex runtime");
-        match runtime {
-            RuntimeProfileConfig::Codex {
-                executable,
-                model,
-                confinement,
-            } => {
-                assert_eq!(executable, "codex");
-                assert_eq!(model.as_deref(), Some("gpt-5-codex"));
-                assert!(confinement.is_none());
-            }
-            other => panic!("unexpected runtime profile: {}", other.kind()),
-        }
-    }
-
     #[cfg(unix)]
     #[test]
     fn normalize_executable_rejects_non_executable_file() {

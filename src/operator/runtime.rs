@@ -22,13 +22,15 @@ pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConf
                 model,
                 confinement: _,
             } => {
-                let codex = CodexRuntimeConfig {
-                    executable: executable.clone(),
-                    model: model.clone(),
-                    ..CodexRuntimeConfig::default()
-                };
                 kernel
-                    .register_runtime_adapter(id.clone(), Arc::new(CodexRuntimeAdapter::new(codex)))
+                    .register_runtime_adapter(
+                        id.clone(),
+                        Arc::new(CodexRuntimeAdapter::new(CodexRuntimeConfig {
+                            executable: executable.clone(),
+                            model: model.clone(),
+                            ..CodexRuntimeConfig::default()
+                        })),
+                    )
                     .await;
             }
             RuntimeProfileConfig::OpenCode {
@@ -105,9 +107,6 @@ fn build_runtime_fallback_env(runtime_id: &str) -> Result<Vec<(String, String)>>
 
             let mut env = vec![("LIONCLAW_CODEX_BIN".to_string(), executable)];
             copy_if_present(&mut env, "LIONCLAW_CODEX_MODEL");
-            copy_if_present(&mut env, "LIONCLAW_CODEX_SANDBOX");
-            copy_if_present(&mut env, "LIONCLAW_CODEX_SKIP_GIT_REPO_CHECK");
-            copy_if_present(&mut env, "LIONCLAW_CODEX_EPHEMERAL");
             Ok(env)
         }
         BUILTIN_RUNTIME_OPENCODE => {

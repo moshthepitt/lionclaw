@@ -149,12 +149,6 @@ struct RuntimeAddArgs {
     cpu_limit: Option<String>,
     #[arg(long = "pids-limit")]
     pids_limit: Option<u32>,
-    #[arg(long, hide = true)]
-    sandbox: Option<String>,
-    #[arg(long, hide = true)]
-    no_skip_git_repo_check: bool,
-    #[arg(long, hide = true)]
-    no_ephemeral: bool,
 }
 
 #[derive(Debug, Args)]
@@ -369,7 +363,6 @@ pub async fn run() -> Result<()> {
         }
         Command::Runtime { command } => match *command {
             RuntimeCommand::Add(args) => {
-                warn_if_legacy_runtime_flags_used(&args);
                 let executable = normalize_executable(&args.executable)?;
                 let profile = build_runtime_profile(&args, executable)?;
                 let mut config = OperatorConfig::load(&home).await?;
@@ -944,25 +937,22 @@ fn build_runtime_profile(
     let confinement = build_confinement_config(args)?;
     match args.kind.trim() {
         "codex" => {
-            reject_opencode_only_flags(args)?;
+            validate_codex_profile_args(args)?;
             Ok(RuntimeProfileConfig::Codex {
                 executable,
                 model: args.model.clone(),
                 confinement,
             })
         }
-        "opencode" => {
-            reject_codex_only_flags(args)?;
-            Ok(RuntimeProfileConfig::OpenCode {
-                executable,
-                format: args.format.clone(),
-                model: args.model.clone(),
-                agent: args.agent.clone(),
-                xdg_data_home: args.xdg_data_home.clone(),
-                continue_last_session: args.continue_last_session,
-                confinement,
-            })
-        }
+        "opencode" => Ok(RuntimeProfileConfig::OpenCode {
+            executable,
+            format: args.format.clone(),
+            model: args.model.clone(),
+            agent: args.agent.clone(),
+            xdg_data_home: args.xdg_data_home.clone(),
+            continue_last_session: args.continue_last_session,
+            confinement,
+        }),
         other => Err(anyhow!(
             "unsupported runtime kind '{}'; expected 'codex' or 'opencode'",
             other
@@ -1036,15 +1026,7 @@ fn build_confinement_config(args: &RuntimeAddArgs) -> Result<Option<ConfinementC
     }
 }
 
-fn warn_if_legacy_runtime_flags_used(args: &RuntimeAddArgs) {
-    if args.sandbox.is_some() || args.no_skip_git_repo_check || args.no_ephemeral {
-        eprintln!(
-            "warning: legacy Codex sandbox flags are deprecated and ignored; use confinement config instead"
-        );
-    }
-}
-
-fn reject_opencode_only_flags(args: &RuntimeAddArgs) -> Result<()> {
+fn validate_codex_profile_args(args: &RuntimeAddArgs) -> Result<()> {
     if args.agent.is_some()
         || args.xdg_data_home.is_some()
         || args.continue_last_session
@@ -1052,15 +1034,6 @@ fn reject_opencode_only_flags(args: &RuntimeAddArgs) -> Result<()> {
     {
         return Err(anyhow!(
             "opencode-specific flags are not valid for kind 'codex'"
-        ));
-    }
-    Ok(())
-}
-
-fn reject_codex_only_flags(args: &RuntimeAddArgs) -> Result<()> {
-    if args.no_skip_git_repo_check || args.no_ephemeral || args.sandbox.is_some() {
-        return Err(anyhow!(
-            "codex-specific flags are not valid for kind 'opencode'"
         ));
     }
     Ok(())
@@ -1091,9 +1064,6 @@ mod tests {
             memory_limit: None,
             cpu_limit: None,
             pids_limit: None,
-            sandbox: None,
-            no_skip_git_repo_check: false,
-            no_ephemeral: false,
         }
     }
 
@@ -1209,13 +1179,13 @@ mod tests {
     }
 
     #[test]
-    fn opencode_rejects_legacy_codex_flags() {
-        let mut args = runtime_add_args("opencode");
-        args.sandbox = Some("read-only".to_string());
+    fn codex_rejects_opencode_specific_flags() {
+        let mut args = runtime_add_args("codex");
+        args.agent = Some("planner".to_string());
 
-        let err = build_runtime_profile(&args, "opencode".to_string()).expect_err("should fail");
+        let err = build_runtime_profile(&args, "codex".to_string()).expect_err("should fail");
         assert!(err
             .to_string()
-            .contains("codex-specific flags are not valid for kind 'opencode'"));
+            .contains("opencode-specific flags are not valid for kind 'codex'"));
     }
 }

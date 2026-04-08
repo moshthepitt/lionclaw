@@ -46,13 +46,9 @@ impl CodexRuntimeConfig {
             model: std::env::var("LIONCLAW_CODEX_MODEL")
                 .ok()
                 .filter(|raw| !raw.trim().is_empty()),
-            sandbox_mode: std::env::var("LIONCLAW_CODEX_SANDBOX")
-                .ok()
-                .filter(|raw| !raw.trim().is_empty())
-                .unwrap_or(default.sandbox_mode),
-            skip_git_repo_check: env_flag("LIONCLAW_CODEX_SKIP_GIT_REPO_CHECK")
-                .unwrap_or(default.skip_git_repo_check),
-            ephemeral: env_flag("LIONCLAW_CODEX_EPHEMERAL").unwrap_or(default.ephemeral),
+            sandbox_mode: default.sandbox_mode,
+            skip_git_repo_check: default.skip_git_repo_check,
+            ephemeral: default.ephemeral,
         }
     }
 }
@@ -210,15 +206,6 @@ fn build_codex_exec_args(
     }
 
     args
-}
-
-fn env_flag(name: &str) -> Option<bool> {
-    let value = std::env::var(name).ok()?;
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
