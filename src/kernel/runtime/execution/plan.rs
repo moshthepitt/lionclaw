@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 pub struct RuntimeProgramSpec {
     pub executable: String,
     pub args: Vec<String>,
-    pub working_dir: Option<String>,
     pub environment: Vec<(String, String)>,
     pub stdin: String,
 }
@@ -17,7 +16,6 @@ pub struct RuntimeProgramSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ExecutionPreset {
-    pub name: String,
     pub workspace_access: WorkspaceAccess,
     pub network_mode: NetworkMode,
     #[serde(default)]
@@ -114,14 +112,11 @@ pub struct OciConfinementConfig {
     #[serde(default)]
     pub additional_mounts: Vec<MountSpec>,
     #[serde(default)]
-    pub memory_limit: Option<String>,
-    #[serde(default)]
-    pub cpu_limit: Option<String>,
-    #[serde(default)]
-    pub pids_limit: Option<u32>,
+    pub limits: ExecutionLimits,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct ExecutionLimits {
     pub memory_limit: Option<String>,
     pub cpu_limit: Option<String>,
@@ -142,4 +137,72 @@ pub struct EffectiveExecutionPlan {
     pub secret_bindings: Vec<SecretBinding>,
     pub escape_classes: BTreeSet<EscapeClass>,
     pub limits: ExecutionLimits,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        ConfinementConfig, EscapeClass, ExecutionPreset, NetworkMode, SecretBinding,
+        SecretBindingKind, WorkspaceAccess,
+    };
+
+    #[test]
+    fn execution_preset_round_trips_without_embedded_name() {
+        let preset = ExecutionPreset {
+            workspace_access: WorkspaceAccess::ReadWrite,
+            network_mode: NetworkMode::On,
+            secret_bindings: vec![SecretBinding {
+                name: "github".to_string(),
+                kind: SecretBindingKind::LaunchEnv,
+                target_env: Some("GITHUB_TOKEN".to_string()),
+            }],
+            escape_classes: [EscapeClass::SecretRequest].into_iter().collect(),
+        };
+
+        let value = serde_json::to_value(&preset).expect("serialize preset");
+        assert!(
+            value.get("name").is_none(),
+            "preset identity should stay external"
+        );
+
+        let round_trip: ExecutionPreset =
+            serde_json::from_value(value).expect("deserialize preset");
+        assert_eq!(round_trip, preset);
+    }
+
+    #[test]
+    fn oci_confinement_uses_nested_limits_shape() {
+        let config: ConfinementConfig = serde_json::from_value(json!({
+            "backend": "oci",
+            "engine": "podman",
+            "image": "ghcr.io/lionclaw/runtime:v1",
+            "read-only-rootfs": true,
+            "limits": {
+                "memory-limit": "4g",
+                "cpu-limit": "2",
+                "pids-limit": 512
+            }
+        }))
+        .expect("deserialize confinement config");
+
+        let value = serde_json::to_value(&config).expect("serialize confinement config");
+        let limits = value
+            .get("limits")
+            .and_then(|raw| raw.as_object())
+            .expect("limits object");
+        assert_eq!(
+            limits.get("memory-limit").and_then(|raw| raw.as_str()),
+            Some("4g")
+        );
+        assert_eq!(
+            limits.get("cpu-limit").and_then(|raw| raw.as_str()),
+            Some("2")
+        );
+        assert_eq!(
+            limits.get("pids-limit").and_then(|raw| raw.as_u64()),
+            Some(512)
+        );
+    }
 }
