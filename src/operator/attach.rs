@@ -365,7 +365,7 @@ mod tests {
         );
         assert!(
             spec.worker_path.ends_with("scripts/worker"),
-            "canonical worker entrypoint should be preferred"
+            "canonical worker entrypoint should be required"
         );
 
         let env = spec.env.into_iter().collect::<BTreeMap<_, _>>();

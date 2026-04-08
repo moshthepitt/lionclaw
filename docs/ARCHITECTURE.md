@@ -272,7 +272,7 @@ Queued channel turns emit machine-stable status/error codes through the same str
 ## Planned Hardening After v0
 
 1. Wasmtime execution boundary.
-2. Rootless container fallback for heavy tasks.
+2. Rootless container execution backend for heavier workloads.
 3. Egress proxy with allowlist enforcement.
 4. Secret broker issuing scoped, short-lived credentials.
 5. Skill source pinning + signatures.
