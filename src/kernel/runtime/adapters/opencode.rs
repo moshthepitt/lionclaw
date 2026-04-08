@@ -37,33 +37,6 @@ impl Default for OpenCodeRuntimeConfig {
     }
 }
 
-impl OpenCodeRuntimeConfig {
-    pub fn from_env() -> Self {
-        let default = Self::default();
-        Self {
-            executable: std::env::var("LIONCLAW_OPENCODE_BIN")
-                .ok()
-                .filter(|raw| !raw.trim().is_empty())
-                .unwrap_or(default.executable),
-            format: std::env::var("LIONCLAW_OPENCODE_FORMAT")
-                .ok()
-                .filter(|raw| !raw.trim().is_empty())
-                .unwrap_or(default.format),
-            model: std::env::var("LIONCLAW_OPENCODE_MODEL")
-                .ok()
-                .filter(|raw| !raw.trim().is_empty()),
-            agent: std::env::var("LIONCLAW_OPENCODE_AGENT")
-                .ok()
-                .filter(|raw| !raw.trim().is_empty()),
-            xdg_data_home: std::env::var("LIONCLAW_OPENCODE_XDG_DATA_HOME")
-                .ok()
-                .filter(|raw| !raw.trim().is_empty()),
-            continue_last_session: env_flag("LIONCLAW_OPENCODE_CONTINUE_LAST_SESSION")
-                .unwrap_or(default.continue_last_session),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct OpenCodeSessionState {
     working_dir: Option<String>,
@@ -77,10 +50,6 @@ pub struct OpenCodeRuntimeAdapter {
 }
 
 impl OpenCodeRuntimeAdapter {
-    pub fn from_env() -> Self {
-        Self::new(OpenCodeRuntimeConfig::from_env())
-    }
-
     pub fn new(config: OpenCodeRuntimeConfig) -> Self {
         Self {
             config,
@@ -265,15 +234,6 @@ fn merge_environment(
         base.push((key, value));
     }
     base
-}
-
-fn env_flag(name: &str) -> Option<bool> {
-    let value = std::env::var(name).ok()?;
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

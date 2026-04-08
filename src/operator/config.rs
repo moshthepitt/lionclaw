@@ -133,6 +133,12 @@ impl OperatorConfig {
 
     pub fn resolve_runtime_id(&self, requested: Option<&str>) -> Result<String> {
         if let Some(runtime_id) = requested.map(str::trim).filter(|value| !value.is_empty()) {
+            if !self.runtimes.contains_key(runtime_id) {
+                return Err(anyhow!(
+                    "runtime profile '{}' is not configured",
+                    runtime_id
+                ));
+            }
             return Ok(runtime_id.to_string());
         }
 
@@ -587,6 +593,18 @@ mod tests {
 
         assert!(config.remove_runtime("codex"));
         assert!(config.defaults.runtime.is_none());
+    }
+
+    #[test]
+    fn requested_runtime_must_be_configured() {
+        let config = OperatorConfig::default();
+        let err = config
+            .resolve_runtime_id(Some("codex"))
+            .expect_err("unconfigured runtime should fail");
+
+        assert!(err
+            .to_string()
+            .contains("runtime profile 'codex' is not configured"));
     }
 
     #[test]

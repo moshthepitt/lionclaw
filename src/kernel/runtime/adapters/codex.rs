@@ -29,21 +29,6 @@ impl Default for CodexRuntimeConfig {
     }
 }
 
-impl CodexRuntimeConfig {
-    pub fn from_env() -> Self {
-        let default = Self::default();
-        Self {
-            executable: std::env::var("LIONCLAW_CODEX_BIN")
-                .ok()
-                .filter(|raw| !raw.trim().is_empty())
-                .unwrap_or(default.executable),
-            model: std::env::var("LIONCLAW_CODEX_MODEL")
-                .ok()
-                .filter(|raw| !raw.trim().is_empty()),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct CodexSessionState {
     working_dir: Option<String>,
@@ -57,10 +42,6 @@ pub struct CodexRuntimeAdapter {
 }
 
 impl CodexRuntimeAdapter {
-    pub fn from_env() -> Self {
-        Self::new(CodexRuntimeConfig::from_env())
-    }
-
     pub fn new(config: CodexRuntimeConfig) -> Self {
         Self {
             config,

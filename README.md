@@ -205,14 +205,9 @@ Runtime profiles, execution presets, and confinement settings live in
 confinement metadata. Execution policy remains config-owned in LionClaw state,
 not ambient shell state.
 
-Built-in runtime fallback recognizes these env vars:
+Daemon/service plumbing recognizes these env vars:
 
 - `LIONCLAW_DEFAULT_RUNTIME_ID`
-- `LIONCLAW_CODEX_BIN`
-- `LIONCLAW_CODEX_MODEL`
-- `LIONCLAW_OPENCODE_BIN`
-- `LIONCLAW_OPENCODE_MODEL`
-- `LIONCLAW_OPENCODE_AGENT`
 - `LIONCLAW_RUNTIME_TURN_IDLE_TIMEOUT_MS`
 - `LIONCLAW_RUNTIME_TURN_HARD_TIMEOUT_MS`
 - `LIONCLAW_RUNTIME_TURN_TIMEOUT_MS`
