@@ -1,7 +1,7 @@
 //! Execution planning and confinement contracts for runtime launches.
 //!
-//! These types are introduced without changing runtime behavior so later work
-//! can move launch policy out of individual adapters.
+//! This module owns execution planning, backend launch contracts, and shared
+//! process utilities so confinement policy stays out of individual adapters.
 
 pub mod backend;
 pub mod oci;
