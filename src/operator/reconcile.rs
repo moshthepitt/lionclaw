@@ -18,7 +18,7 @@ use crate::{
             configured_runtime_execution_profiles, register_configured_runtimes,
             validate_runtime_availability,
         },
-        runtime_secrets::load_runtime_secrets,
+        runtime_secrets::resolve_runtime_secrets_file,
         services::{
             channel_unit_name, render_channel_unit, render_daemon_unit, unit_status_is_active,
             ChannelServiceSpec, ManagedServiceUnit, ServiceManager, DAEMON_UNIT_NAME,
@@ -593,6 +593,10 @@ pub(crate) async fn render_runtime_cache(
         }
     }
 
+    sections.push(
+        "## Runtime Secrets\n\nIf this preset mounts runtime secrets, look under /run/secrets for the LionClaw-provided dotenv file whose name starts with lionclaw-runtime-secrets-, read it, and do not print its contents.".to_string(),
+    );
+
     let rendered = render_marker_file(
         &format!(
             "# LionClaw Generated Agent Context\n\nThis file is generated for runtime '{}'.\n",
@@ -698,7 +702,7 @@ pub(crate) async fn open_kernel(
         .ok()
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace_root.clone());
-    let runtime_secrets = load_runtime_secrets(home).await?;
+    let runtime_secrets_file = resolve_runtime_secrets_file(home).await?;
     let kernel = Kernel::new_with_options(
         &home.db_path(),
         KernelOptions {
@@ -706,7 +710,7 @@ pub(crate) async fn open_kernel(
             default_preset_name: config.defaults.preset.clone(),
             execution_presets: config.presets.clone(),
             runtime_execution_profiles: configured_runtime_execution_profiles(config),
-            runtime_secrets,
+            runtime_secrets_file,
             workspace_root: Some(workspace_root),
             project_workspace_root: Some(project_workspace_root),
             runtime_root: Some(home.runtime_dir()),
@@ -731,8 +735,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        apply, onboard, render_marker_file, resolve_worker_entrypoint, up, ApplyResult,
-        OnboardBindSelection, StackBinaryPaths,
+        apply, onboard, render_marker_file, render_runtime_cache, resolve_worker_entrypoint, up,
+        ApplyResult, OnboardBindSelection, StackBinaryPaths,
     };
     use crate::{
         contracts::DaemonInfoResponse,
@@ -749,6 +753,7 @@ mod tests {
             lockfile::OperatorLockfile,
             services::{FakeServiceManager, ServiceManager, DAEMON_UNIT_NAME},
         },
+        workspace::GENERATED_AGENTS_FILE,
     };
 
     async fn spawn_probe_server(app: Router, bind_addr: &str) -> tokio::task::JoinHandle<()> {
@@ -797,6 +802,28 @@ mod tests {
 
         let reloaded = OperatorConfig::load(&home).await.expect("load config");
         assert_eq!(reloaded.daemon.bind, config.daemon.bind);
+    }
+
+    #[tokio::test]
+    async fn render_runtime_cache_includes_runtime_secret_guidance() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let config = onboard(&home, None).await.expect("onboard");
+        let lockfile = OperatorLockfile::default();
+
+        render_runtime_cache(&home, &config, &lockfile, "codex")
+            .await
+            .expect("render runtime cache");
+
+        let rendered = tokio::fs::read_to_string(
+            home.runtime_workspace_dir("codex", &config.daemon.workspace)
+                .join(GENERATED_AGENTS_FILE),
+        )
+        .await
+        .expect("read generated agents");
+        assert!(rendered.contains("/run/secrets"));
+        assert!(rendered.contains("lionclaw-runtime-secrets-"));
+        assert!(rendered.contains("do not print its contents"));
     }
 
     #[test]

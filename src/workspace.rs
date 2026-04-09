@@ -13,8 +13,7 @@ pub const GENERATED_AGENTS_FILE: &str = "AGENTS.generated.md";
 const IDENTITY_TEMPLATE: &str = "# Identity\n\nLionClaw is your local secure-first agent kernel.\n";
 const SOUL_TEMPLATE: &str =
     "# Soul\n\nLionClaw is calm, precise, security-first, and execution-oriented.\n";
-const AGENTS_TEMPLATE: &str =
-    "# Agents\n\nFollow kernel policy, use installed skills, and preserve auditability.\n";
+const AGENTS_TEMPLATE: &str = "# Agents\n\nFollow kernel policy, use installed skills, and preserve auditability.\nIf this preset mounts runtime secrets, look under /run/secrets for the LionClaw-provided dotenv file whose name starts with lionclaw-runtime-secrets-, read it, and do not print its contents.\n";
 const USER_TEMPLATE: &str =
     "# User\n\nCapture operator-specific goals, preferences, and environment notes here.\n";
 
@@ -56,7 +55,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{bootstrap_workspace, read_workspace_sections, SOUL_FILE};
+    use super::{bootstrap_workspace, read_workspace_sections, AGENTS_FILE, SOUL_FILE};
 
     #[tokio::test]
     async fn bootstrap_workspace_rejects_symlinked_root() {
@@ -90,5 +89,19 @@ mod tests {
             .expect_err("read workspace sections should fail");
         let message = err.to_string();
         assert!(message.contains("failed to open") || message.contains("not a regular file"));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_workspace_writes_runtime_secret_guidance_to_agents() {
+        let temp_dir = tempdir().expect("temp dir");
+        let workspace = temp_dir.path().join("workspace");
+        bootstrap_workspace(&workspace)
+            .await
+            .expect("bootstrap workspace");
+
+        let agents = std::fs::read_to_string(workspace.join(AGENTS_FILE)).expect("read agents");
+        assert!(agents.contains("/run/secrets"));
+        assert!(agents.contains("lionclaw-runtime-secrets-"));
+        assert!(agents.contains("do not print its contents"));
     }
 }

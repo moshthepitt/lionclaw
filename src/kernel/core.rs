@@ -64,8 +64,8 @@ use super::{
         ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset,
         HiddenTurnSupport, RuntimeAdapter, RuntimeCapabilityRequest, RuntimeCapabilityResult,
         RuntimeEvent, RuntimeExecutionProfile, RuntimeMessageLane, RuntimeRegistry,
-        RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
-        RuntimeTurnResult,
+        RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
+        RuntimeTurnMode, RuntimeTurnResult,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -94,7 +94,7 @@ pub struct KernelOptions {
     pub default_preset_name: Option<String>,
     pub execution_presets: BTreeMap<String, ExecutionPreset>,
     pub runtime_execution_profiles: BTreeMap<String, RuntimeExecutionProfile>,
-    pub runtime_secrets: BTreeMap<String, String>,
+    pub runtime_secrets_file: Option<PathBuf>,
     pub workspace_root: Option<PathBuf>,
     pub project_workspace_root: Option<PathBuf>,
     pub runtime_root: Option<PathBuf>,
@@ -115,7 +115,7 @@ impl fmt::Debug for KernelOptions {
                 "runtime_execution_profiles",
                 &self.runtime_execution_profiles,
             )
-            .field("runtime_secrets_count", &self.runtime_secrets.len())
+            .field("runtime_secrets_file", &self.runtime_secrets_file)
             .field("workspace_root", &self.workspace_root)
             .field("project_workspace_root", &self.project_workspace_root)
             .field("runtime_root", &self.runtime_root)
@@ -135,7 +135,7 @@ impl Default for KernelOptions {
             default_preset_name: None,
             execution_presets: BTreeMap::new(),
             runtime_execution_profiles: BTreeMap::new(),
-            runtime_secrets: BTreeMap::new(),
+            runtime_secrets_file: None,
             workspace_root: None,
             project_workspace_root: None,
             runtime_root: None,
@@ -165,6 +165,7 @@ pub struct Kernel {
     active_continuity_refresh_lock: Arc<Mutex<()>>,
     execution_planner: ExecutionPlanner,
     default_runtime_id: Option<String>,
+    runtime_secrets_file: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
     continuity: Option<ContinuityLayout>,
 }
@@ -220,7 +221,6 @@ impl Kernel {
             default_preset_name: options.default_preset_name.clone(),
             presets: options.execution_presets.clone(),
             runtimes: options.runtime_execution_profiles.clone(),
-            runtime_secrets: options.runtime_secrets.clone(),
             workspace_root: options.workspace_root.clone(),
             project_workspace_root: options.project_workspace_root.clone(),
             runtime_root: options.runtime_root.clone(),
@@ -248,6 +248,7 @@ impl Kernel {
             active_continuity_refresh_lock: Arc::new(Mutex::new(())),
             execution_planner,
             default_runtime_id: options.default_runtime_id,
+            runtime_secrets_file: options.runtime_secrets_file,
             workspace_root: options.workspace_root,
             continuity,
         };
@@ -2354,6 +2355,7 @@ impl Kernel {
             prompt,
             selected_skills: Vec::new(),
         };
+        let runtime_secrets_mount = self.resolve_runtime_secrets_mount(&execution_plan)?;
         let turn_outcome = timeout(execution_plan.hard_timeout, async {
             match adapter.turn_mode() {
                 RuntimeTurnMode::Direct => adapter.turn(turn_input, event_tx).await,
@@ -2361,6 +2363,7 @@ impl Kernel {
                     execute_program_backed_turn(
                         adapter.as_ref(),
                         execution_plan,
+                        runtime_secrets_mount,
                         turn_input,
                         event_tx,
                     )
@@ -2864,8 +2867,6 @@ impl Kernel {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use tempfile::tempdir;
     use tokio::time::{sleep, Duration};
 
@@ -2874,18 +2875,15 @@ mod tests {
     use crate::kernel::session_transcript::{CompactionMemoryProposal, CompactionOpenLoop};
 
     #[test]
-    fn kernel_options_debug_redacts_runtime_secret_values() {
+    fn kernel_options_debug_reports_runtime_secret_file_path() {
         let options = KernelOptions {
-            runtime_secrets: BTreeMap::from([(
-                "GITHUB_TOKEN".to_string(),
-                "ghp_secret".to_string(),
-            )]),
+            runtime_secrets_file: Some("/tmp/runtime-secrets.env".into()),
             ..KernelOptions::default()
         };
 
         let debug = format!("{options:?}");
-        assert!(debug.contains("runtime_secrets_count"));
-        assert!(!debug.contains("ghp_secret"));
+        assert!(debug.contains("runtime_secrets_file"));
+        assert!(debug.contains("/tmp/runtime-secrets.env"));
     }
 
     #[tokio::test]
@@ -4960,7 +4958,7 @@ impl Kernel {
                             "effective_env_passthrough_count": request_env.len(),
                             "effective_environment_count": plan.environment.len(),
                             "network_mode": plan.network_mode.as_str(),
-                            "secret_env": plan.secret_env.clone(),
+                            "mount_runtime_secrets": plan.mount_runtime_secrets,
                             "escape_classes": plan.escape_classes.iter().map(|class| class.as_str()).collect::<Vec<_>>(),
                             "mounts": plan.mounts.iter().map(|mount| {
                                 json!({
@@ -4999,6 +4997,23 @@ impl Kernel {
                 )))
             }
         }
+    }
+
+    fn resolve_runtime_secrets_mount(
+        &self,
+        plan: &EffectiveExecutionPlan,
+    ) -> Result<Option<RuntimeSecretsMount>, KernelError> {
+        if !plan.mount_runtime_secrets {
+            return Ok(None);
+        }
+
+        let source = self.runtime_secrets_file.clone().ok_or_else(|| {
+            KernelError::Runtime(
+                "runtime preset requires runtime secrets, but LIONCLAW_HOME/config/runtime-secrets.env is not configured"
+                    .to_string(),
+            )
+        })?;
+        Ok(Some(RuntimeSecretsMount { source }))
     }
 
     async fn execute_runtime_turn(
@@ -5060,6 +5075,14 @@ impl Kernel {
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let adapter_for_task = adapter.clone();
+        let runtime_secrets_mount = self
+            .resolve_runtime_secrets_mount(&execution_plan)
+            .map_err(|err| FailedRuntimeTurn {
+                events: Vec::new(),
+                status: SessionTurnStatus::Failed,
+                error_code: "runtime.error".to_string(),
+                error_text: err.to_string(),
+            })?;
         let mut turn_task = tokio::spawn(async move {
             match adapter_for_task.turn_mode() {
                 RuntimeTurnMode::Direct => adapter_for_task.turn(input, event_tx).await,
@@ -5067,6 +5090,7 @@ impl Kernel {
                     execute_program_backed_turn(
                         adapter_for_task.as_ref(),
                         execution_plan,
+                        runtime_secrets_mount,
                         input,
                         event_tx,
                     )

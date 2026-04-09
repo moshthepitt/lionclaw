@@ -201,11 +201,12 @@ Override the root with `LIONCLAW_HOME`.
 Runtime profiles, execution presets, and confinement settings live in
 `~/.lionclaw/config/lionclaw.toml`.
 
-Runtime env secrets for confined runtimes live separately in
-`~/.lionclaw/config/runtime-secrets.env`. Presets opt into specific variables
-with `secret_env = ["GITHUB_TOKEN", "OPENAI_API_KEY"]`; LionClaw injects only
-those names into the runtime environment. Keep that file owner-only; LionClaw
-hardens it to `0600` on Unix when loading it.
+Runtime secrets for confined runtimes live separately in
+`~/.lionclaw/config/runtime-secrets.env`. Presets either mount that whole file
+or mount no runtime secrets at all with `mount-runtime-secrets = true|false`.
+When mounted, Podman places it under `/run/secrets/` with a LionClaw-managed
+name that starts with `lionclaw-runtime-secrets-`. Keep the source file
+owner-only; LionClaw hardens it to `0600` on Unix before handing it to Podman.
 
 `lionclaw runtime add` configures the runtime command that runs inside the
 confinement image, plus the concrete host OCI engine path and image LionClaw

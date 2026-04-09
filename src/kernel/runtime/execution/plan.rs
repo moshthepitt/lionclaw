@@ -30,7 +30,7 @@ pub struct ExecutionPreset {
     pub workspace_access: WorkspaceAccess,
     pub network_mode: NetworkMode,
     #[serde(default)]
-    pub secret_env: Vec<String>,
+    pub mount_runtime_secrets: bool,
     #[serde(default)]
     pub escape_classes: BTreeSet<EscapeClass>,
 }
@@ -40,7 +40,7 @@ impl Default for ExecutionPreset {
         Self {
             workspace_access: WorkspaceAccess::ReadWrite,
             network_mode: NetworkMode::On,
-            secret_env: Vec::new(),
+            mount_runtime_secrets: false,
             escape_classes: BTreeSet::new(),
         }
     }
@@ -221,7 +221,7 @@ pub struct EffectiveExecutionPlan {
     pub idle_timeout: Duration,
     pub hard_timeout: Duration,
     pub mounts: Vec<MountSpec>,
-    pub secret_env: Vec<String>,
+    pub mount_runtime_secrets: bool,
     pub escape_classes: BTreeSet<EscapeClass>,
     pub limits: ExecutionLimits,
 }
@@ -239,7 +239,7 @@ impl fmt::Debug for EffectiveExecutionPlan {
             .field("idle_timeout", &self.idle_timeout)
             .field("hard_timeout", &self.hard_timeout)
             .field("mounts", &self.mounts)
-            .field("secret_env", &self.secret_env)
+            .field("mount_runtime_secrets", &self.mount_runtime_secrets)
             .field("escape_classes", &self.escape_classes)
             .field("limits", &self.limits)
             .finish()
@@ -257,7 +257,7 @@ mod tests {
         let preset = ExecutionPreset {
             workspace_access: WorkspaceAccess::ReadWrite,
             network_mode: NetworkMode::On,
-            secret_env: vec!["GITHUB_TOKEN".to_string()],
+            mount_runtime_secrets: true,
             escape_classes: [EscapeClass::SecretRequest].into_iter().collect(),
         };
 

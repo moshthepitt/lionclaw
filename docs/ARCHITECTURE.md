@@ -135,9 +135,11 @@ The everyday confined runtime layout is mount-first:
 
 The execution planner also injects stable runtime-private environment defaults such as `HOME=/runtime/home` and `LIONCLAW_DRAFTS_DIR=/drafts` so program-backed runtimes keep ephemeral state out of LionClaw continuity.
 
-Runtime env secrets are loaded from `~/.lionclaw/config/runtime-secrets.env`.
-Presets opt into specific names with `secret_env = [...]`, and the planner
-injects only those listed variables into the confined runtime environment.
+Runtime secrets are loaded from `~/.lionclaw/config/runtime-secrets.env`.
+Presets either mount that whole file or mount no runtime secrets at all with
+`mount-runtime-secrets = true|false`, and the OCI backend mounts it read-only
+under Podman's default `/run/secrets/` directory with a LionClaw-managed name
+that starts with `lionclaw-runtime-secrets-`.
 LionClaw hardens the config directory to `0700` and the runtime secret file to
 `0600` on Unix before loading it.
 

@@ -1,11 +1,7 @@
-use std::{
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use tempfile::NamedTempFile;
 
 use super::{
     backend::{ExecutionBackend, ExecutionOutput, ExecutionRequest, ExecutionStdoutSender},
@@ -27,8 +23,9 @@ impl ExecutionBackend for OciExecutionBackend {
         request: ExecutionRequest,
         stdout: ExecutionStdoutSender,
     ) -> Result<ExecutionOutput> {
-        let prepared = build_oci_process_invocation(&request)?;
-        run_process_streaming(&prepared.invocation, move |line| {
+        ensure_runtime_secrets_registered(&request).await?;
+        let invocation = build_oci_process_invocation(&request)?;
+        run_process_streaming(&invocation, move |line| {
             let _ = stdout.send(line.to_string());
             Ok(())
         })
@@ -36,13 +33,7 @@ impl ExecutionBackend for OciExecutionBackend {
     }
 }
 
-#[derive(Debug)]
-struct PreparedProcessInvocation {
-    invocation: ProcessInvocation,
-    _env_file: Option<NamedTempFile>,
-}
-
-fn build_oci_process_invocation(request: &ExecutionRequest) -> Result<PreparedProcessInvocation> {
+fn build_oci_process_invocation(request: &ExecutionRequest) -> Result<ProcessInvocation> {
     let config = request.plan.confinement.oci();
 
     let image = config.image.as_deref().ok_or_else(|| {
@@ -101,14 +92,21 @@ fn build_oci_process_invocation(request: &ExecutionRequest) -> Result<PreparedPr
         args.push(value.to_string());
     }
 
-    let env_file = build_env_file(
-        &request.plan.environment,
-        &request.program.environment,
-        request,
-    )?;
-    if let Some(env_file_path) = env_file.as_ref().map(|file| file.path()) {
-        args.push("--env-file".to_string());
-        args.push(path_to_arg(env_file_path)?);
+    for (key, value) in merged_environment(&request.plan.environment, &request.program.environment)
+    {
+        args.push("--env".to_string());
+        args.push(format!("{key}={value}"));
+    }
+
+    if request.runtime_secrets_mount.is_some() {
+        args.push("--secret".to_string());
+        args.push(
+            request
+                .runtime_secrets_mount
+                .as_ref()
+                .expect("checked above")
+                .mounted_name(),
+        );
     }
 
     if let Some(memory_limit) = config.limits.memory_limit.as_deref() {
@@ -128,52 +126,57 @@ fn build_oci_process_invocation(request: &ExecutionRequest) -> Result<PreparedPr
     args.push(request.program.executable.clone());
     args.extend(request.program.args.clone());
 
-    Ok(PreparedProcessInvocation {
-        invocation: ProcessInvocation {
-            executable: config.engine.clone(),
-            args,
-            working_dir: None,
-            environment: Vec::new(),
-            input: request.program.stdin.clone(),
-        },
-        _env_file: env_file,
+    Ok(ProcessInvocation {
+        executable: config.engine.clone(),
+        args,
+        working_dir: None,
+        environment: Vec::new(),
+        input: request.program.stdin.clone(),
     })
 }
 
-fn build_env_file(
-    plan_environment: &[(String, String)],
-    program_environment: &[(String, String)],
-    request: &ExecutionRequest,
-) -> Result<Option<NamedTempFile>> {
-    let merged = merged_environment(plan_environment, program_environment);
-    if merged.is_empty() {
-        return Ok(None);
-    }
-
-    let mut env_file = NamedTempFile::new().context("failed to create OCI environment file")?;
-    for (key, value) in &merged {
-        if value.contains(['\n', '\r']) {
-            bail!(
-                "runtime '{}' environment variable '{}' contains a newline and cannot be delivered through an OCI env file",
-                request.plan.runtime_id,
-                key
-            );
-        }
-        writeln!(env_file, "{key}={value}").with_context(|| {
-            format!(
-                "failed to write OCI environment file for runtime '{}'",
-                request.plan.runtime_id
-            )
-        })?;
-    }
-    env_file.flush().with_context(|| {
+async fn ensure_runtime_secrets_registered(request: &ExecutionRequest) -> Result<()> {
+    let Some(mount) = request.runtime_secrets_mount.as_ref() else {
+        return Ok(());
+    };
+    let engine = request.plan.confinement.oci().engine.clone();
+    let output = run_process_streaming(
+        &ProcessInvocation {
+            executable: engine.clone(),
+            args: vec![
+                "secret".to_string(),
+                "create".to_string(),
+                "--replace".to_string(),
+                mount.mounted_name(),
+                path_to_arg(&mount.source)?,
+            ],
+            working_dir: None,
+            environment: Vec::new(),
+            input: String::new(),
+        },
+        |_| Ok(()),
+    )
+    .await
+    .with_context(|| {
         format!(
-            "failed to flush OCI environment file for runtime '{}'",
+            "failed to register OCI runtime secrets for runtime '{}'",
             request.plan.runtime_id
         )
     })?;
 
-    Ok(Some(env_file))
+    if output.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        bail!(
+            "failed to register OCI runtime secrets; podman secret create exited with code {:?}",
+            output.exit_code
+        );
+    }
+
+    bail!("failed to register OCI runtime secrets: {}", stderr)
 }
 
 fn path_to_arg(path: &Path) -> Result<String> {
@@ -275,7 +278,7 @@ mod tests {
     use super::build_oci_process_invocation;
     use crate::kernel::runtime::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionRequest, NetworkMode,
-        OciConfinementConfig, RuntimeProgramSpec, WorkspaceAccess,
+        OciConfinementConfig, RuntimeProgramSpec, RuntimeSecretsMount, WorkspaceAccess,
     };
     use crate::kernel::runtime::{MountAccess, MountSpec};
 
@@ -289,10 +292,12 @@ mod tests {
                 environment: vec![("MODEL".to_string(), "gpt-5-codex".to_string())],
                 stdin: "hello".to_string(),
             },
+            runtime_secrets_mount: Some(RuntimeSecretsMount {
+                source: "/home/mosh/.lionclaw/config/runtime-secrets.env".into(),
+            }),
         };
 
-        let prepared = build_oci_process_invocation(&request).expect("invocation");
-        let invocation = &prepared.invocation;
+        let invocation = build_oci_process_invocation(&request).expect("invocation");
 
         assert_eq!(invocation.executable, "podman");
         assert_eq!(invocation.working_dir, None);
@@ -338,8 +343,21 @@ mod tests {
         assert!(invocation
             .args
             .windows(2)
-            .any(|pair| { pair[0] == "--env-file" }));
-        assert!(!invocation.args.iter().any(|arg| arg == "--env"));
+            .any(|pair| { pair == ["--env".to_string(), "FOO=from-plan".to_string()] }));
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|pair| { pair == ["--env".to_string(), "MODEL=gpt-5-codex".to_string()] }));
+        assert!(invocation.args.windows(2).any(|pair| {
+            pair == [
+                "--secret".to_string(),
+                request
+                    .runtime_secrets_mount
+                    .as_ref()
+                    .expect("runtime secrets mount")
+                    .mounted_name(),
+            ]
+        }));
         assert!(invocation
             .args
             .windows(2)
@@ -367,16 +385,6 @@ mod tests {
                 "--json".to_string(),
             ]
         );
-
-        let env_file_path = invocation
-            .args
-            .windows(2)
-            .find_map(|pair| (pair[0] == "--env-file").then_some(pair[1].clone()))
-            .expect("env file path");
-        let env_file =
-            std::fs::read_to_string(&env_file_path).expect("read generated OCI environment file");
-        assert!(env_file.contains("FOO=from-plan"));
-        assert!(env_file.contains("MODEL=gpt-5-codex"));
     }
 
     #[test]
@@ -384,7 +392,7 @@ mod tests {
         let mut plan = sample_plan();
         plan.network_mode = NetworkMode::None;
 
-        let prepared = build_oci_process_invocation(&ExecutionRequest {
+        let invocation = build_oci_process_invocation(&ExecutionRequest {
             plan,
             program: RuntimeProgramSpec {
                 executable: "codex".to_string(),
@@ -392,32 +400,14 @@ mod tests {
                 environment: Vec::new(),
                 stdin: String::new(),
             },
+            runtime_secrets_mount: None,
         })
         .expect("invocation");
-        let invocation = &prepared.invocation;
 
         assert!(invocation
             .args
             .windows(2)
             .any(|pair| { pair == ["--network".to_string(), "none".to_string()] }));
-    }
-
-    #[test]
-    fn oci_backend_rejects_newlines_in_environment_values() {
-        let err = build_oci_process_invocation(&ExecutionRequest {
-            plan: sample_plan(),
-            program: RuntimeProgramSpec {
-                executable: "codex".to_string(),
-                args: Vec::new(),
-                environment: vec![("PEM".to_string(), "line1\nline2".to_string())],
-                stdin: String::new(),
-            },
-        })
-        .expect_err("newline env should fail");
-
-        assert!(err
-            .to_string()
-            .contains("cannot be delivered through an OCI env file"));
     }
 
     #[test]
@@ -428,6 +418,7 @@ mod tests {
         let err = build_oci_process_invocation(&ExecutionRequest {
             plan,
             program: RuntimeProgramSpec::default(),
+            runtime_secrets_mount: None,
         })
         .expect_err("allowlist should fail");
 
@@ -442,6 +433,7 @@ mod tests {
         let err = build_oci_process_invocation(&ExecutionRequest {
             plan,
             program: RuntimeProgramSpec::default(),
+            runtime_secrets_mount: None,
         })
         .expect_err("missing image should fail");
 
@@ -456,6 +448,7 @@ mod tests {
         let err = build_oci_process_invocation(&ExecutionRequest {
             plan,
             program: RuntimeProgramSpec::default(),
+            runtime_secrets_mount: None,
         })
         .expect_err("working dir should fail");
 
@@ -508,7 +501,7 @@ mod tests {
                     access: MountAccess::ReadOnly,
                 },
             ],
-            secret_env: Vec::new(),
+            mount_runtime_secrets: true,
             escape_classes: Default::default(),
             limits: ExecutionLimits {
                 memory_limit: Some("4g".to_string()),

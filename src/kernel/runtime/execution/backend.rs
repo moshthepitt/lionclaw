@@ -1,16 +1,45 @@
-use std::fmt;
+use std::{fmt, path::PathBuf};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use super::oci::OciExecutionBackend;
 use super::plan::{ConfinementBackend, EffectiveExecutionPlan, RuntimeProgramSpec};
 
+pub const RUNTIME_SECRETS_NAME_PREFIX: &str = "lionclaw-runtime-secrets-";
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeSecretsMount {
+    pub source: PathBuf,
+}
+
+impl RuntimeSecretsMount {
+    pub fn mounted_name(&self) -> String {
+        let digest = Sha256::digest(self.source.to_string_lossy().as_bytes());
+        format!(
+            "{}{}",
+            RUNTIME_SECRETS_NAME_PREFIX,
+            &hex::encode(digest)[..12]
+        )
+    }
+}
+
+impl fmt::Debug for RuntimeSecretsMount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeSecretsMount")
+            .field("source", &self.source)
+            .field("mounted_name", &self.mounted_name())
+            .finish()
+    }
+}
+
 #[derive(Clone)]
 pub struct ExecutionRequest {
     pub plan: EffectiveExecutionPlan,
     pub program: RuntimeProgramSpec,
+    pub runtime_secrets_mount: Option<RuntimeSecretsMount>,
 }
 
 impl fmt::Debug for ExecutionRequest {
@@ -18,6 +47,7 @@ impl fmt::Debug for ExecutionRequest {
         f.debug_struct("ExecutionRequest")
             .field("plan", &self.plan)
             .field("program", &self.program)
+            .field("runtime_secrets_mount", &self.runtime_secrets_mount)
             .finish()
     }
 }
@@ -50,7 +80,7 @@ pub async fn execute_streaming(
 mod tests {
     use std::time::Duration;
 
-    use super::ExecutionRequest;
+    use super::{ExecutionRequest, RuntimeSecretsMount, RUNTIME_SECRETS_NAME_PREFIX};
     use crate::kernel::runtime::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, NetworkMode,
         OciConfinementConfig, RuntimeProgramSpec, WorkspaceAccess,
@@ -72,7 +102,7 @@ mod tests {
                     idle_timeout: Duration::from_secs(30),
                     hard_timeout: Duration::from_secs(90),
                     mounts: Vec::new(),
-                    secret_env: vec!["GITHUB_TOKEN".to_string()],
+                    mount_runtime_secrets: true,
                     escape_classes: Default::default(),
                     limits: ExecutionLimits::default(),
                 },
@@ -82,11 +112,31 @@ mod tests {
                     environment: vec![("OPENAI_API_KEY".to_string(), "sk-secret".to_string())],
                     stdin: "hello".to_string(),
                 },
+                runtime_secrets_mount: Some(super::RuntimeSecretsMount {
+                    source: "/tmp/runtime-secrets.env".into(),
+                }),
             }
         );
 
         assert!(!debug.contains("ghp_secret"));
         assert!(!debug.contains("sk-secret"));
         assert!(!debug.contains("hello"));
+    }
+
+    #[test]
+    fn runtime_secrets_mount_name_is_stable_and_prefixed() {
+        let mount = RuntimeSecretsMount {
+            source: "/tmp/home-a/config/runtime-secrets.env".into(),
+        };
+        let same_mount = RuntimeSecretsMount {
+            source: "/tmp/home-a/config/runtime-secrets.env".into(),
+        };
+        let other_mount = RuntimeSecretsMount {
+            source: "/tmp/home-b/config/runtime-secrets.env".into(),
+        };
+
+        assert_eq!(mount.mounted_name(), same_mount.mounted_name());
+        assert_ne!(mount.mounted_name(), other_mount.mounted_name());
+        assert!(mount.mounted_name().starts_with(RUNTIME_SECRETS_NAME_PREFIX));
     }
 }

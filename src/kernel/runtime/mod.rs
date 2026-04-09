@@ -22,7 +22,7 @@ pub use execution::{
     ExecutionLimits, ExecutionOutput, ExecutionPlanRequest, ExecutionPlanner,
     ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, MountAccess, MountSpec, NetworkMode,
     OciConfinementConfig, OciExecutionBackend, RuntimeExecutionProfile, RuntimeProgramSpec,
-    WorkspaceAccess, BUILTIN_PRESET_EVERYDAY,
+    RuntimeSecretsMount, WorkspaceAccess, BUILTIN_PRESET_EVERYDAY,
 };
 
 #[derive(Debug, Clone)]
@@ -196,12 +196,20 @@ impl RuntimeRegistry {
 pub async fn execute_program_backed_turn(
     adapter: &(dyn RuntimeAdapter + Send + Sync),
     plan: EffectiveExecutionPlan,
+    runtime_secrets_mount: Option<RuntimeSecretsMount>,
     input: RuntimeTurnInput,
     events: RuntimeEventSender,
 ) -> Result<RuntimeTurnResult> {
     let program = adapter.build_turn_program(&input)?;
     let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel();
-    let execution = execution::execute_streaming(ExecutionRequest { plan, program }, stdout_tx);
+    let execution = execution::execute_streaming(
+        ExecutionRequest {
+            plan,
+            program,
+            runtime_secrets_mount,
+        },
+        stdout_tx,
+    );
     tokio::pin!(execution);
 
     let mut saw_done = false;

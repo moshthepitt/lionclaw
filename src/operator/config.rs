@@ -439,15 +439,7 @@ impl RuntimeProfileConfig {
     }
 }
 
-fn normalize_execution_preset(preset: &mut ExecutionPreset) {
-    preset.secret_env = std::mem::take(&mut preset.secret_env)
-        .into_iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect();
-    preset.secret_env.sort();
-    preset.secret_env.dedup();
-}
+fn normalize_execution_preset(_preset: &mut ExecutionPreset) {}
 
 fn normalize_confinement_config(config: &mut ConfinementConfig) {
     match config {
@@ -712,7 +704,7 @@ mod tests {
             ExecutionPreset {
                 workspace_access: WorkspaceAccess::ReadWrite,
                 network_mode: NetworkMode::On,
-                secret_env: Vec::new(),
+                mount_runtime_secrets: false,
                 escape_classes: Default::default(),
             },
         );
@@ -728,7 +720,7 @@ mod tests {
             ExecutionPreset {
                 workspace_access: WorkspaceAccess::ReadWrite,
                 network_mode: NetworkMode::On,
-                secret_env: Vec::new(),
+                mount_runtime_secrets: false,
                 escape_classes: Default::default(),
             },
         );
@@ -738,21 +730,21 @@ mod tests {
     }
 
     #[test]
-    fn preset_normalization_trims_keys_and_dedupes_secret_env() {
+    fn preset_normalization_trims_name_and_preserves_secret_mount_toggle() {
         let mut config = OperatorConfig::default();
         config.upsert_preset(
             "  everyday  ".to_string(),
             ExecutionPreset {
                 workspace_access: WorkspaceAccess::ReadWrite,
                 network_mode: NetworkMode::On,
-                secret_env: vec![" GITHUB_TOKEN ".to_string(), "GITHUB_TOKEN".to_string()],
+                mount_runtime_secrets: true,
                 escape_classes: Default::default(),
             },
         );
 
         assert!(config.preset("  everyday  ").is_none());
         let preset = config.preset("everyday").expect("normalized preset");
-        assert_eq!(preset.secret_env, vec!["GITHUB_TOKEN".to_string()]);
+        assert!(preset.mount_runtime_secrets);
     }
 
     #[cfg(unix)]
