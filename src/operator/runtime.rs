@@ -14,6 +14,8 @@ use crate::kernel::{
 use super::config::{OperatorConfig, RuntimeProfileConfig};
 
 pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConfig) -> Result<()> {
+    validate_configured_runtimes(config)?;
+
     for (id, runtime) in &config.runtimes {
         match runtime {
             RuntimeProfileConfig::Codex {
@@ -70,6 +72,14 @@ pub fn resolve_runtime_id(config: &OperatorConfig, requested: Option<&str>) -> R
     config.resolve_runtime_id(requested)
 }
 
+pub fn validate_configured_runtimes(config: &OperatorConfig) -> Result<()> {
+    for runtime_id in config.runtimes.keys() {
+        validate_runtime_availability(config, runtime_id)?;
+    }
+
+    Ok(())
+}
+
 pub fn validate_runtime_availability(config: &OperatorConfig, runtime_id: &str) -> Result<()> {
     let profile = config
         .runtime(runtime_id)
@@ -86,7 +96,7 @@ pub fn validate_runtime_availability(config: &OperatorConfig, runtime_id: &str) 
 
 #[cfg(test)]
 mod tests {
-    use super::validate_runtime_availability;
+    use super::{validate_configured_runtimes, validate_runtime_availability};
     use crate::kernel::runtime::{ConfinementConfig, OciConfinementConfig};
     use crate::operator::config::{OperatorConfig, RuntimeProfileConfig};
 
@@ -161,5 +171,41 @@ mod tests {
         assert!(err
             .to_string()
             .contains("OCI confinement image is required"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_runtime_validation_rejects_any_invalid_profile() {
+        let engine = std::env::current_exe().expect("current exe");
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "codex".to_string(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: engine.to_string_lossy().to_string(),
+                    image: Some("ghcr.io/lionclaw/codex-runtime:latest".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+        config.upsert_runtime(
+            "broken".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "codex".to_string(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: engine.to_string_lossy().to_string(),
+                    image: None,
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+
+        let err = validate_configured_runtimes(&config).expect_err("should fail");
+        assert!(err
+            .to_string()
+            .contains("configured runtime profile 'broken' is invalid"));
     }
 }
