@@ -596,16 +596,19 @@ impl ContinuityLayout {
         limit: usize,
     ) -> Result<Vec<ContinuityArtifactSummary>> {
         let fs = self.fs().await?;
-        let mut files = fs.list_markdown_files(&self.artifacts_rel_dir())?;
+        let mut files = fs.list_regular_files(&self.artifacts_rel_dir())?;
         files = self.sort_relative_paths_by_modified_desc(files).await?;
 
         let mut artifacts = Vec::new();
         for path in files.into_iter().take(limit) {
-            let Some(content) = fs.read_to_string_if_exists(&path)? else {
-                continue;
-            };
             artifacts.push(ContinuityArtifactSummary {
-                title: extract_heading(&content).unwrap_or_else(|| stem_fallback(&path)),
+                title: if path.extension().is_some_and(|ext| ext == "md") {
+                    fs.read_to_string_if_exists(&path)?
+                        .and_then(|content| extract_heading(&content))
+                        .unwrap_or_else(|| stem_fallback(&path))
+                } else {
+                    stem_fallback(&path)
+                },
                 relative_path: path.to_string_lossy().to_string(),
             });
         }

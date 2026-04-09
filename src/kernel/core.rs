@@ -3130,6 +3130,14 @@ mod tests {
                 .expect("read promoted artifact"),
             "# Report"
         );
+        let status = kernel.continuity_status().await.expect("continuity status");
+        assert!(
+            status
+                .recent_artifacts
+                .iter()
+                .any(|artifact| artifact.relative_path == response.artifact_path),
+            "promoted artifact should appear in recent artifacts"
+        );
     }
 
     #[tokio::test]
