@@ -10,7 +10,6 @@ async-trait = "0.1"
 axum = { version = "0.7", features = ["macros", "json"] }
 chrono-tz = "0.10"
 cron = "0.12"
-dotenvy = "0.15"
 http-body-util = "0.1"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 clap = { version = "4.5", features = ["derive"] }

@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fmt,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -84,7 +85,7 @@ use super::{
 
 const ACTIVE_GLOBAL_SLICE_LIMIT: usize = 5;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct KernelOptions {
     pub runtime_turn_idle_timeout: Duration,
     pub runtime_turn_hard_timeout: Duration,
@@ -99,6 +100,29 @@ pub struct KernelOptions {
     pub runtime_root: Option<PathBuf>,
     pub workspace_name: Option<String>,
     pub scheduler: SchedulerConfig,
+}
+
+impl fmt::Debug for KernelOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KernelOptions")
+            .field("runtime_turn_idle_timeout", &self.runtime_turn_idle_timeout)
+            .field("runtime_turn_hard_timeout", &self.runtime_turn_hard_timeout)
+            .field("runtime_execution_policy", &self.runtime_execution_policy)
+            .field("default_runtime_id", &self.default_runtime_id)
+            .field("default_preset_name", &self.default_preset_name)
+            .field("execution_presets", &self.execution_presets)
+            .field(
+                "runtime_execution_profiles",
+                &self.runtime_execution_profiles,
+            )
+            .field("runtime_secrets_count", &self.runtime_secrets.len())
+            .field("workspace_root", &self.workspace_root)
+            .field("project_workspace_root", &self.project_workspace_root)
+            .field("runtime_root", &self.runtime_root)
+            .field("workspace_name", &self.workspace_name)
+            .field("scheduler", &self.scheduler)
+            .finish()
+    }
 }
 
 impl Default for KernelOptions {
@@ -2840,12 +2864,29 @@ impl Kernel {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use tempfile::tempdir;
     use tokio::time::{sleep, Duration};
 
     use super::*;
     use crate::kernel::continuity::title_file_name;
     use crate::kernel::session_transcript::{CompactionMemoryProposal, CompactionOpenLoop};
+
+    #[test]
+    fn kernel_options_debug_redacts_runtime_secret_values() {
+        let options = KernelOptions {
+            runtime_secrets: BTreeMap::from([(
+                "GITHUB_TOKEN".to_string(),
+                "ghp_secret".to_string(),
+            )]),
+            ..KernelOptions::default()
+        };
+
+        let debug = format!("{options:?}");
+        assert!(debug.contains("runtime_secrets_count"));
+        assert!(!debug.contains("ghp_secret"));
+    }
 
     #[tokio::test]
     async fn active_continuity_refresh_serializes_snapshot_rebuilds() {

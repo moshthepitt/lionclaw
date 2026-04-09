@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, fmt, path::PathBuf, time::Duration};
 
 use crate::kernel::runtime_policy::{RuntimeExecutionPolicy, RuntimeExecutionRequest};
 
@@ -25,7 +25,7 @@ impl Default for RuntimeExecutionProfile {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExecutionPlannerConfig {
     pub policy: RuntimeExecutionPolicy,
     pub default_preset_name: Option<String>,
@@ -40,6 +40,24 @@ pub struct ExecutionPlannerConfig {
     pub default_hard_timeout: Duration,
 }
 
+impl fmt::Debug for ExecutionPlannerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecutionPlannerConfig")
+            .field("policy", &self.policy)
+            .field("default_preset_name", &self.default_preset_name)
+            .field("presets", &self.presets)
+            .field("runtimes", &self.runtimes)
+            .field("runtime_secrets_count", &self.runtime_secrets.len())
+            .field("workspace_root", &self.workspace_root)
+            .field("project_workspace_root", &self.project_workspace_root)
+            .field("runtime_root", &self.runtime_root)
+            .field("workspace_name", &self.workspace_name)
+            .field("default_idle_timeout", &self.default_idle_timeout)
+            .field("default_hard_timeout", &self.default_hard_timeout)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionPlanRequest {
     pub runtime_id: String,
@@ -49,7 +67,7 @@ pub struct ExecutionPlanRequest {
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExecutionPlanner {
     policy: RuntimeExecutionPolicy,
     default_preset_name: Option<String>,
@@ -62,6 +80,24 @@ pub struct ExecutionPlanner {
     workspace_name: Option<String>,
     default_idle_timeout: Duration,
     default_hard_timeout: Duration,
+}
+
+impl fmt::Debug for ExecutionPlanner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecutionPlanner")
+            .field("policy", &self.policy)
+            .field("default_preset_name", &self.default_preset_name)
+            .field("presets", &self.presets)
+            .field("runtimes", &self.runtimes)
+            .field("runtime_secrets_count", &self.runtime_secrets.len())
+            .field("workspace_root", &self.workspace_root)
+            .field("project_workspace_root", &self.project_workspace_root)
+            .field("runtime_root", &self.runtime_root)
+            .field("workspace_name", &self.workspace_name)
+            .field("default_idle_timeout", &self.default_idle_timeout)
+            .field("default_hard_timeout", &self.default_hard_timeout)
+            .finish()
+    }
 }
 
 impl ExecutionPlanner {
@@ -575,5 +611,28 @@ mod tests {
             .expect_err("missing runtime secret should fail");
 
         assert!(err.contains("runtime secret env 'GITHUB_TOKEN' is not configured"));
+    }
+
+    #[test]
+    fn planner_debug_redacts_runtime_secret_values() {
+        let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: RuntimeExecutionPolicy::default(),
+            default_preset_name: None,
+            presets: BTreeMap::new(),
+            runtimes: BTreeMap::new(),
+            runtime_secrets: [("GITHUB_TOKEN".to_string(), "ghp_secret".to_string())]
+                .into_iter()
+                .collect(),
+            workspace_root: None,
+            project_workspace_root: None,
+            runtime_root: None,
+            workspace_name: None,
+            default_idle_timeout: Duration::from_secs(30),
+            default_hard_timeout: Duration::from_secs(90),
+        });
+
+        let debug = format!("{planner:?}");
+        assert!(debug.contains("runtime_secrets_count"));
+        assert!(!debug.contains("ghp_secret"));
     }
 }
