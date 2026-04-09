@@ -41,13 +41,12 @@ pub fn render_daemon_unit(
     bind_addr: &str,
     runtime_id: &str,
     workspace: &str,
-    extra_env: &[(String, String)],
 ) -> ManagedServiceUnit {
     let env_path = home.services_env_dir().join("lionclawd.env");
     let unit_path = home.services_systemd_dir().join(DAEMON_UNIT_NAME);
 
     let (host, port) = parse_bind_addr(bind_addr);
-    let mut env_lines = vec![
+    let env_lines = [
         (
             "LIONCLAW_HOME".to_string(),
             home.root().display().to_string(),
@@ -61,7 +60,6 @@ pub fn render_daemon_unit(
         ),
         ("LIONCLAW_WORKSPACE".to_string(), workspace.to_string()),
     ];
-    env_lines.extend(extra_env.iter().cloned());
     let env_content = env_lines
         .iter()
         .map(|(key, value)| format!("{key}={}\n", escape_env_value(value)))
@@ -562,7 +560,6 @@ mod tests {
             "127.0.0.1:8979",
             "codex",
             "main",
-            &[],
         );
         assert!(daemon.unit_content.contains("ExecStart=/tmp/bin/lionclawd"));
         assert!(daemon

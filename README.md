@@ -202,8 +202,9 @@ Runtime profiles, execution presets, and confinement settings live in
 `~/.lionclaw/config/lionclaw.toml`.
 
 `lionclaw runtime add` configures the runtime protocol details and can attach
-confinement metadata. Execution policy remains config-owned in LionClaw state,
-not ambient shell state.
+confinement metadata. It resolves the runtime executable once and stores the
+concrete path in LionClaw state. Execution policy remains config-owned in
+LionClaw state, not ambient shell state.
 
 Daemon/service plumbing recognizes these env vars:
 

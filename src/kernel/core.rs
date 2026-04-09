@@ -62,7 +62,7 @@ use super::{
         register_builtin_runtime_adapters, HiddenTurnSupport, RuntimeAdapter,
         RuntimeCapabilityRequest, RuntimeCapabilityResult, RuntimeEvent, RuntimeMessageLane,
         RuntimeRegistry, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
-        RuntimeTurnResult, BUILTIN_RUNTIME_MOCK,
+        RuntimeTurnResult,
     },
     runtime_policy::{RuntimeExecutionContext, RuntimeExecutionPolicy, RuntimeExecutionRequest},
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -99,7 +99,7 @@ impl Default for KernelOptions {
             runtime_turn_idle_timeout: Duration::from_secs(120),
             runtime_turn_hard_timeout: Duration::from_secs(600),
             runtime_execution_policy: RuntimeExecutionPolicy::default(),
-            default_runtime_id: Some(BUILTIN_RUNTIME_MOCK.to_string()),
+            default_runtime_id: None,
             workspace_root: None,
             project_workspace_root: None,
             scheduler: SchedulerConfig::default(),
@@ -2046,8 +2046,9 @@ impl Kernel {
             .map(|record| record.summary_state.clone());
         let runtime_id = turns
             .last()
-            .map(|turn| turn.runtime_id.as_str())
-            .unwrap_or(BUILTIN_RUNTIME_MOCK);
+            .expect("compaction turn set is not empty")
+            .runtime_id
+            .as_str();
         let summary_state = self
             .build_compaction_summary_state(
                 session.session_id,

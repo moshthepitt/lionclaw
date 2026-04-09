@@ -129,10 +129,6 @@ struct RuntimeAddArgs {
     format: String,
     #[arg(long)]
     agent: Option<String>,
-    #[arg(long = "xdg-data-home")]
-    xdg_data_home: Option<String>,
-    #[arg(long)]
-    continue_last_session: bool,
     #[arg(long, help = "Confinement backend for this runtime profile")]
     backend: Option<String>,
     #[arg(long, help = "OCI engine to use when backend is 'oci'")]
@@ -949,8 +945,6 @@ fn build_runtime_profile(
             format: args.format.clone(),
             model: args.model.clone(),
             agent: args.agent.clone(),
-            xdg_data_home: args.xdg_data_home.clone(),
-            continue_last_session: args.continue_last_session,
             confinement,
         }),
         other => Err(anyhow!(
@@ -1027,11 +1021,7 @@ fn build_confinement_config(args: &RuntimeAddArgs) -> Result<Option<ConfinementC
 }
 
 fn validate_codex_profile_args(args: &RuntimeAddArgs) -> Result<()> {
-    if args.agent.is_some()
-        || args.xdg_data_home.is_some()
-        || args.continue_last_session
-        || args.format != "json"
-    {
+    if args.agent.is_some() || args.format != "json" {
         return Err(anyhow!(
             "opencode-specific flags are not valid for kind 'codex'"
         ));
@@ -1054,8 +1044,6 @@ mod tests {
             model: None,
             format: "json".to_string(),
             agent: None,
-            xdg_data_home: None,
-            continue_last_session: false,
             backend: None,
             engine: None,
             image: None,

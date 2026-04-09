@@ -20,8 +20,6 @@ pub struct OpenCodeRuntimeConfig {
     pub format: String,
     pub model: Option<String>,
     pub agent: Option<String>,
-    pub xdg_data_home: Option<String>,
-    pub continue_last_session: bool,
 }
 
 impl Default for OpenCodeRuntimeConfig {
@@ -31,8 +29,6 @@ impl Default for OpenCodeRuntimeConfig {
             format: "json".to_string(),
             model: None,
             agent: None,
-            xdg_data_home: None,
-            continue_last_session: false,
         }
     }
 }
@@ -103,10 +99,7 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
                 &input.prompt,
             ),
             working_dir: None,
-            environment: merge_environment(
-                build_opencode_environment(&self.config),
-                session.environment.clone(),
-            ),
+            environment: session.environment.clone(),
             input: String::new(),
         };
 
@@ -195,9 +188,6 @@ fn build_opencode_run_args(
         config.format.clone(),
     ];
 
-    if config.continue_last_session {
-        args.push("--continue".to_string());
-    }
     if let Some(model) = &config.model {
         args.push("--model".to_string());
         args.push(model.to_string());
@@ -213,27 +203,6 @@ fn build_opencode_run_args(
     args.push(prompt.to_string());
 
     args
-}
-
-fn build_opencode_environment(config: &OpenCodeRuntimeConfig) -> Vec<(String, String)> {
-    let mut env = Vec::new();
-    if let Some(xdg_data_home) = &config.xdg_data_home {
-        env.push(("XDG_DATA_HOME".to_string(), xdg_data_home.to_string()));
-    }
-    env
-}
-
-fn merge_environment(
-    mut base: Vec<(String, String)>,
-    extra: Vec<(String, String)>,
-) -> Vec<(String, String)> {
-    for (key, value) in extra {
-        if base.iter().any(|(existing_key, _)| existing_key == &key) {
-            continue;
-        }
-        base.push((key, value));
-    }
-    base
 }
 
 #[cfg(test)]

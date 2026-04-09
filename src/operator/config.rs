@@ -335,10 +335,6 @@ pub enum RuntimeProfileConfig {
         #[serde(default)]
         agent: Option<String>,
         #[serde(default)]
-        xdg_data_home: Option<String>,
-        #[serde(default)]
-        continue_last_session: bool,
-        #[serde(default)]
         confinement: Option<ConfinementConfig>,
     },
 }
@@ -418,16 +414,14 @@ pub fn normalize_executable(source: &str) -> Result<String> {
         return Err(anyhow!("runtime command or path cannot be empty"));
     }
 
-    if looks_like_path(raw) {
-        let path = normalize_executable_path(raw)?;
-        validate_executable_path(&path)?;
-        return Ok(path.to_string_lossy().to_string());
-    }
-
-    let resolved = which::which(raw)
-        .with_context(|| format!("failed to resolve runtime command '{}'", source))?;
-    validate_executable_path(&resolved)?;
-    Ok(raw.to_string())
+    let path = if looks_like_path(raw) {
+        normalize_executable_path(raw)?
+    } else {
+        which::which(raw)
+            .with_context(|| format!("failed to resolve runtime command '{}'", source))?
+    };
+    validate_executable_path(&path)?;
+    Ok(path.to_string_lossy().to_string())
 }
 
 pub fn validate_executable_path(path: &Path) -> Result<()> {
@@ -463,13 +457,13 @@ pub fn validate_executable(source: &str) -> Result<()> {
         return Err(anyhow!("runtime command or path cannot be empty"));
     }
 
-    if looks_like_path(raw) {
-        return validate_executable_path(&normalize_executable_path(raw)?);
+    if !looks_like_path(raw) {
+        return Err(anyhow!(
+            "runtime executable '{}' must be stored as an absolute or explicit path",
+            source
+        ));
     }
-
-    let resolved = which::which(raw)
-        .with_context(|| format!("failed to resolve runtime command '{}'", source))?;
-    validate_executable_path(&resolved)
+    validate_executable_path(&normalize_executable_path(raw)?)
 }
 
 fn looks_like_path(raw: &str) -> bool {
@@ -685,15 +679,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn normalize_executable_keeps_bare_command_names() {
+    fn normalize_executable_resolves_bare_commands_to_absolute_paths() {
         let normalized = normalize_executable("sh").expect("normalize");
+        let expected = which::which("sh").expect("resolve sh");
 
-        assert_eq!(normalized, "sh");
+        assert_eq!(normalized, expected.to_string_lossy());
     }
 
     #[cfg(unix)]
     #[test]
-    fn validate_executable_resolves_bare_commands_via_path() {
-        validate_executable("sh").expect("bare command should validate");
+    fn validate_executable_rejects_bare_commands() {
+        let err = validate_executable("sh").expect_err("bare command should fail");
+        assert!(err
+            .to_string()
+            .contains("must be stored as an absolute or explicit path"));
     }
 }

@@ -34,8 +34,6 @@ pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConf
                 format,
                 model,
                 agent,
-                xdg_data_home,
-                continue_last_session,
                 confinement: _,
             } => {
                 kernel
@@ -46,8 +44,6 @@ pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConf
                             format: format.clone(),
                             model: model.clone(),
                             agent: agent.clone(),
-                            xdg_data_home: xdg_data_home.clone(),
-                            continue_last_session: *continue_last_session,
                         })),
                     )
                     .await;
@@ -76,37 +72,10 @@ pub fn validate_runtime_availability(config: &OperatorConfig, runtime_id: &str) 
     Ok(())
 }
 
-pub fn runtime_service_env(
-    config: &OperatorConfig,
-    runtime_id: &str,
-) -> Result<Vec<(String, String)>> {
-    config
-        .runtime(runtime_id)
-        .ok_or_else(|| anyhow!("runtime profile '{}' is not configured", runtime_id))?;
-    Ok(current_process_path_env())
-}
-
-fn current_process_path_env() -> Vec<(String, String)> {
-    std::env::var("PATH")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| vec![("PATH".to_string(), value)])
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::validate_runtime_availability;
     use crate::operator::config::{OperatorConfig, RuntimeProfileConfig};
-
-    #[test]
-    fn runtime_service_env_requires_configured_runtime() {
-        let config = OperatorConfig::default();
-        let err = super::runtime_service_env(&config, "custom-runtime").expect_err("should fail");
-        assert!(err
-            .to_string()
-            .contains("runtime profile 'custom-runtime' is not configured"));
-    }
 
     #[cfg(unix)]
     #[test]
@@ -135,34 +104,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn configured_runtime_command_is_validated_via_path() {
+        let executable = which::which("sh").expect("resolve sh");
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
             "codex".to_string(),
             RuntimeProfileConfig::Codex {
-                executable: "sh".to_string(),
+                executable: executable.to_string_lossy().to_string(),
                 model: None,
                 confinement: None,
             },
         );
 
         validate_runtime_availability(&config, "codex").expect("runtime command should validate");
-    }
-
-    #[test]
-    fn configured_runtime_service_env_carries_path() {
-        let path = std::env::var("PATH").expect("path");
-
-        let mut config = OperatorConfig::default();
-        config.upsert_runtime(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
-                model: None,
-                confinement: None,
-            },
-        );
-
-        let env = super::runtime_service_env(&config, "codex").expect("service env");
-        assert_eq!(env, vec![("PATH".to_string(), path)]);
     }
 }

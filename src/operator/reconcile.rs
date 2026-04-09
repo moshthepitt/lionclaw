@@ -14,9 +14,7 @@ use crate::{
         },
         daemon_probe::{classify_daemon, DaemonClassification},
         lockfile::{LockedChannel, LockedSkill, OperatorLockfile},
-        runtime::{
-            register_configured_runtimes, runtime_service_env, validate_runtime_availability,
-        },
+        runtime::{register_configured_runtimes, validate_runtime_availability},
         services::{
             channel_unit_name, render_channel_unit, render_daemon_unit, unit_status_is_active,
             ChannelServiceSpec, ManagedServiceUnit, ServiceManager, DAEMON_UNIT_NAME,
@@ -490,14 +488,12 @@ pub(crate) fn build_managed_units(
     binaries: &StackBinaryPaths,
 ) -> Result<Vec<ManagedServiceUnit>> {
     let mut units = Vec::new();
-    let daemon_runtime_env = runtime_service_env(config, runtime_id)?;
     units.push(render_daemon_unit(
         home,
         &binaries.daemon_bin,
         &config.daemon.bind,
         runtime_id,
         &config.daemon.workspace,
-        &daemon_runtime_env,
     ));
 
     let base_url = base_url_from_bind(&config.daemon.bind);
