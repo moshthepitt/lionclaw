@@ -8,6 +8,9 @@ use super::plan::{
 };
 
 pub const BUILTIN_PRESET_EVERYDAY: &str = "everyday";
+const WORKSPACE_MOUNT_TARGET: &str = "/workspace";
+const RUNTIME_MOUNT_TARGET: &str = "/runtime";
+const DRAFTS_MOUNT_TARGET: &str = "/drafts";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeExecutionProfile {
@@ -96,6 +99,18 @@ impl ExecutionPlanner {
         let limits = match &runtime_profile.confinement {
             ConfinementConfig::Oci(config) => config.limits.clone(),
         };
+        let environment = build_runtime_environment(
+            execution_context.environment,
+            mounts
+                .iter()
+                .any(|mount| mount.target == WORKSPACE_MOUNT_TARGET),
+            mounts
+                .iter()
+                .any(|mount| mount.target == RUNTIME_MOUNT_TARGET),
+            mounts
+                .iter()
+                .any(|mount| mount.target == DRAFTS_MOUNT_TARGET),
+        );
 
         Ok(EffectiveExecutionPlan {
             runtime_id: request.runtime_id,
@@ -104,7 +119,7 @@ impl ExecutionPlanner {
             workspace_access: preset.workspace_access,
             network_mode: preset.network_mode,
             working_dir: execution_context.working_dir,
-            environment: execution_context.environment,
+            environment,
             idle_timeout: execution_context.idle_timeout,
             hard_timeout: execution_context.hard_timeout,
             mounts,
@@ -164,7 +179,7 @@ impl ExecutionPlanner {
         {
             mounts.push(MountSpec {
                 source: workspace_source,
-                target: "/workspace".to_string(),
+                target: WORKSPACE_MOUNT_TARGET.to_string(),
                 access: workspace_access_to_mount_access(preset.workspace_access),
             });
         }
@@ -175,12 +190,12 @@ impl ExecutionPlanner {
             let runtime_workspace = runtime_root.join(runtime_id).join(workspace_name);
             mounts.push(MountSpec {
                 source: runtime_workspace.clone(),
-                target: "/runtime".to_string(),
+                target: RUNTIME_MOUNT_TARGET.to_string(),
                 access: MountAccess::ReadWrite,
             });
             mounts.push(MountSpec {
                 source: runtime_workspace.join("drafts"),
-                target: "/drafts".to_string(),
+                target: DRAFTS_MOUNT_TARGET.to_string(),
                 access: MountAccess::ReadWrite,
             });
         }
@@ -198,6 +213,52 @@ fn workspace_access_to_mount_access(access: WorkspaceAccess) -> MountAccess {
         WorkspaceAccess::ReadOnly => MountAccess::ReadOnly,
         WorkspaceAccess::ReadWrite => MountAccess::ReadWrite,
     }
+}
+
+fn build_runtime_environment(
+    mut passthrough_environment: Vec<(String, String)>,
+    has_workspace_mount: bool,
+    has_runtime_mount: bool,
+    has_drafts_mount: bool,
+) -> Vec<(String, String)> {
+    if has_workspace_mount {
+        passthrough_environment.push((
+            "LIONCLAW_WORKSPACE_DIR".to_string(),
+            WORKSPACE_MOUNT_TARGET.to_string(),
+        ));
+    }
+
+    if has_runtime_mount {
+        passthrough_environment.extend([
+            ("HOME".to_string(), format!("{}/home", RUNTIME_MOUNT_TARGET)),
+            (
+                "XDG_CONFIG_HOME".to_string(),
+                format!("{}/home/.config", RUNTIME_MOUNT_TARGET),
+            ),
+            (
+                "XDG_CACHE_HOME".to_string(),
+                format!("{}/home/.cache", RUNTIME_MOUNT_TARGET),
+            ),
+            (
+                "XDG_STATE_HOME".to_string(),
+                format!("{}/home/.local/state", RUNTIME_MOUNT_TARGET),
+            ),
+            (
+                "LIONCLAW_RUNTIME_DIR".to_string(),
+                RUNTIME_MOUNT_TARGET.to_string(),
+            ),
+        ]);
+    }
+
+    if has_drafts_mount {
+        passthrough_environment.push((
+            "LIONCLAW_DRAFTS_DIR".to_string(),
+            DRAFTS_MOUNT_TARGET.to_string(),
+        ));
+    }
+
+    passthrough_environment.push(("TMPDIR".to_string(), "/tmp".to_string()));
+    passthrough_environment
 }
 
 #[cfg(test)]
@@ -306,6 +367,31 @@ mod tests {
         );
         assert_eq!(plan.mounts[2].target, "/drafts");
         assert_eq!(plan.mounts[3], extra_mount);
+        assert_eq!(
+            plan.environment,
+            vec![
+                (
+                    "LIONCLAW_WORKSPACE_DIR".to_string(),
+                    "/workspace".to_string()
+                ),
+                ("HOME".to_string(), "/runtime/home".to_string()),
+                (
+                    "XDG_CONFIG_HOME".to_string(),
+                    "/runtime/home/.config".to_string()
+                ),
+                (
+                    "XDG_CACHE_HOME".to_string(),
+                    "/runtime/home/.cache".to_string()
+                ),
+                (
+                    "XDG_STATE_HOME".to_string(),
+                    "/runtime/home/.local/state".to_string()
+                ),
+                ("LIONCLAW_RUNTIME_DIR".to_string(), "/runtime".to_string()),
+                ("LIONCLAW_DRAFTS_DIR".to_string(), "/drafts".to_string()),
+                ("TMPDIR".to_string(), "/tmp".to_string()),
+            ]
+        );
     }
 
     #[test]

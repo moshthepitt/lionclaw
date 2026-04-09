@@ -70,6 +70,16 @@ impl LionClawHome {
         self.runtime_dir().join(runtime_id).join(workspace)
     }
 
+    pub fn runtime_workspace_home_dir(&self, runtime_id: &str, workspace: &str) -> PathBuf {
+        self.runtime_workspace_dir(runtime_id, workspace)
+            .join("home")
+    }
+
+    pub fn runtime_workspace_drafts_dir(&self, runtime_id: &str, workspace: &str) -> PathBuf {
+        self.runtime_workspace_dir(runtime_id, workspace)
+            .join("drafts")
+    }
+
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")
     }
@@ -176,6 +186,14 @@ mod tests {
         assert_eq!(
             home.runtime_channel_dir("telegram"),
             std::path::PathBuf::from("/tmp/lionclaw-home/runtime/channels/telegram")
+        );
+        assert_eq!(
+            home.runtime_workspace_home_dir("codex", DEFAULT_WORKSPACE),
+            std::path::PathBuf::from("/tmp/lionclaw-home/runtime/codex/main/home")
+        );
+        assert_eq!(
+            home.runtime_workspace_drafts_dir("codex", DEFAULT_WORKSPACE),
+            std::path::PathBuf::from("/tmp/lionclaw-home/runtime/codex/main/drafts")
         );
     }
 

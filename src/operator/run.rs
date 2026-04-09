@@ -302,7 +302,7 @@ where
     F: Future<Output = Result<crate::contracts::SessionTurnResponse, crate::kernel::KernelError>>
         + Unpin,
 {
-    let mut assistant_seen = false;
+    let mut message_seen = false;
     let mut error_seen = false;
     let mut turn_error: Option<crate::kernel::KernelError> = None;
 
@@ -319,8 +319,8 @@ where
                 let Some(event) = maybe_event else {
                     continue;
                 };
-                if is_answer_delta(&event) {
-                    assistant_seen = true;
+                if is_visible_message_delta(&event) {
+                    message_seen = true;
                 }
                 if matches!(event.kind, StreamEventKindDto::Error) {
                     error_seen = true;
@@ -332,8 +332,8 @@ where
     }
 
     while let Ok(event) = rx.try_recv() {
-        if is_answer_delta(&event) {
-            assistant_seen = true;
+        if is_visible_message_delta(&event) {
+            message_seen = true;
         }
         if matches!(event.kind, StreamEventKindDto::Error) {
             error_seen = true;
@@ -343,19 +343,26 @@ where
     output.flush()?;
 
     if let Some(err) = turn_error {
-        if assistant_seen
-            && matches!(
-                err,
-                crate::kernel::KernelError::RuntimeTimeout(_)
-                    | crate::kernel::KernelError::Runtime(_)
-            )
-        {
-            writeln!(
-                output,
-                "Timed out. Partial output is shown above. Use /continue, /retry, or /reset."
-            )?;
-            output.flush()?;
-            return Ok(());
+        if message_seen {
+            match err {
+                crate::kernel::KernelError::RuntimeTimeout(_) => {
+                    writeln!(
+                        output,
+                        "Timed out. Partial output is shown above. Use /continue, /retry, or /reset."
+                    )?;
+                    output.flush()?;
+                    return Ok(());
+                }
+                crate::kernel::KernelError::Runtime(_) => {
+                    writeln!(
+                        output,
+                        "Runtime error. Partial output is shown above. Use /continue, /retry, or /reset."
+                    )?;
+                    output.flush()?;
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
         if !error_seen {
             writeln!(output, "error: {}", err)?;
@@ -366,12 +373,12 @@ where
     Ok(())
 }
 
-fn is_answer_delta(event: &StreamEventDto) -> bool {
+fn is_visible_message_delta(event: &StreamEventDto) -> bool {
     matches!(
         (&event.kind, &event.lane),
         (
             StreamEventKindDto::MessageDelta,
-            Some(StreamLaneDto::Answer)
+            Some(StreamLaneDto::Answer | StreamLaneDto::Reasoning)
         )
     ) && event.text.as_deref().is_some_and(|text| !text.is_empty())
 }
@@ -770,6 +777,67 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             .expect_err("missing engine should error");
 
         assert!(err.to_string().contains("configured runtime profile"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_local_streams_codex_reasoning_and_answer_lanes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let stub = temp_dir.path().join("codex-stub.sh");
+        write_script(
+            &stub,
+            r#"#!/usr/bin/env bash
+cat >/dev/null
+echo '{"type":"item.updated","item":{"type":"reasoning","text":"planning next step"}}'
+echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from codex"}}'
+"#,
+        );
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
+        config.save(&home).await.expect("save config");
+
+        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut output = Vec::new();
+        run_local_with_io(&home, None, false, &mut input, &mut output)
+            .await
+            .expect("run local");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("thinking> planning next step"));
+        assert!(output.contains("lionclaw> hello from codex"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_local_reports_reasoning_only_runtime_failures_as_partial_output() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let stub = temp_dir.path().join("codex-stub.sh");
+        write_script(
+            &stub,
+            r#"#!/usr/bin/env bash
+cat >/dev/null
+echo '{"type":"item.updated","item":{"type":"reasoning","text":"checking the workspace"}}'
+exit 7
+"#,
+        );
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
+        config.save(&home).await.expect("save config");
+
+        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut output = Vec::new();
+        run_local_with_io(&home, None, false, &mut input, &mut output)
+            .await
+            .expect("run local");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("thinking> checking the workspace"));
+        assert!(output.contains("Runtime error. Partial output is shown above."));
+        assert!(!output.contains("Timed out. Partial output is shown above."));
     }
 
     #[test]

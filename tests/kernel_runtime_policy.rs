@@ -76,6 +76,7 @@ async fn runtime_policy_allows_configured_execution_overrides() {
     assert_eq!(details["effective_timeout_ms"].as_u64(), Some(750));
     assert_eq!(details["effective_hard_timeout_ms"].as_u64(), Some(900));
     assert_eq!(details["effective_env_passthrough_count"].as_u64(), Some(1));
+    assert_eq!(details["effective_environment_count"].as_u64(), Some(2));
 }
 
 #[tokio::test]

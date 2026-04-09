@@ -120,6 +120,21 @@ Runtime module layout:
 - `kernel/runtime/adapters/codex.rs`: production program-backed adapter for Codex protocol details.
 - `kernel/runtime/adapters/opencode.rs`: production program-backed adapter for OpenCode protocol details.
 
+Program-backed runtimes stream two message lanes:
+
+- `answer`: canonical assistant reply text that is persisted into turn history.
+- `reasoning`: optional live thought/progress text that channels may render or ignore.
+
+LionClaw transports both lanes through the stream APIs, but only `answer` is treated as the durable assistant reply.
+
+The everyday confined runtime layout is mount-first:
+
+- `/workspace`: project/workspace root with preset-controlled read-only or read-write access.
+- `/runtime`: runtime-private writable state root.
+- `/drafts`: runtime-private draft/output area.
+
+The execution planner also injects stable runtime-private environment defaults such as `HOME=/runtime/home` and `LIONCLAW_DRAFTS_DIR=/drafts` so program-backed runtimes keep ephemeral state out of LionClaw continuity.
+
 Channel bridge layout:
 
 - `kernel/channel_state.rs`: durable channel bindings/peers/offsets/messages + stream event/cursor storage.

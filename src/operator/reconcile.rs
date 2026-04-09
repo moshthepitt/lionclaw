@@ -556,10 +556,17 @@ pub(crate) async fn render_runtime_cache(
     lockfile: &OperatorLockfile,
     runtime_id: &str,
 ) -> Result<()> {
-    let target_dir = home.runtime_workspace_dir(runtime_id, &config.daemon.workspace);
-    tokio::fs::create_dir_all(&target_dir)
-        .await
-        .with_context(|| format!("failed to create {}", target_dir.display()))?;
+    let workspace = &config.daemon.workspace;
+    let target_dir = home.runtime_workspace_dir(runtime_id, workspace);
+    for path in [
+        target_dir.clone(),
+        home.runtime_workspace_home_dir(runtime_id, workspace),
+        home.runtime_workspace_drafts_dir(runtime_id, workspace),
+    ] {
+        tokio::fs::create_dir_all(&path)
+            .await
+            .with_context(|| format!("failed to create {}", path.display()))?;
+    }
     let target_path = target_dir.join(GENERATED_AGENTS_FILE);
 
     let mut sections = Vec::new();
@@ -878,6 +885,8 @@ mod tests {
             .runtime_workspace_dir("codex", "main")
             .join("AGENTS.generated.md")
             .exists());
+        assert!(home.runtime_workspace_home_dir("codex", "main").exists());
+        assert!(home.runtime_workspace_drafts_dir("codex", "main").exists());
     }
 
     #[tokio::test]
