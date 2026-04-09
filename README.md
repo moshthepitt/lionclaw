@@ -201,7 +201,8 @@ Override the root with `LIONCLAW_HOME`.
 Runtime profiles, execution presets, and confinement settings live in
 `~/.lionclaw/config/lionclaw.toml`.
 Today, confined runtime presets support only coarse network modes:
-`network-mode = "on"` or `network-mode = "none"`.
+`network-mode = "on"` or `network-mode = "none"`. `on` maps to Podman's
+private network namespace, not host networking.
 
 Runtime secrets for confined runtimes live separately in
 `~/.lionclaw/config/runtime-secrets.env`. Presets either mount that whole file

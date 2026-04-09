@@ -137,7 +137,9 @@ The execution planner also injects stable runtime-private environment defaults s
 
 Current runtime network policy is intentionally coarse: presets choose only
 `network-mode = "on"` or `network-mode = "none"`. LionClaw does not expose a
-fake allowlist mode before a real egress-control plane exists.
+fake allowlist mode before a real egress-control plane exists. `on` is mapped
+explicitly to the container engine's private network mode rather than inherited
+from engine defaults.
 
 Runtime secrets are loaded from `~/.lionclaw/config/runtime-secrets.env`.
 Presets either mount that whole file or mount no runtime secrets at all with

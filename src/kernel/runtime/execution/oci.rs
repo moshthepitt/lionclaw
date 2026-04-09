@@ -58,7 +58,10 @@ fn build_oci_process_invocation(request: &ExecutionRequest) -> Result<ProcessInv
             args.push("--network".to_string());
             args.push("none".to_string());
         }
-        NetworkMode::On => {}
+        NetworkMode::On => {
+            args.push("--network".to_string());
+            args.push("private".to_string());
+        }
     }
 
     if let Some(working_dir) = request.plan.working_dir.as_deref() {
@@ -405,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn oci_backend_leaves_network_unset_for_on_mode() {
+    fn oci_backend_adds_private_network_flag_for_on_mode() {
         let invocation = build_oci_process_invocation(&ExecutionRequest {
             plan: sample_plan(),
             program: RuntimeProgramSpec::default(),
@@ -413,10 +416,10 @@ mod tests {
         })
         .expect("invocation");
 
-        assert!(
-            !invocation.args.iter().any(|arg| arg == "--network"),
-            "network=on should use the engine default private network mode"
-        );
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|pair| { pair == ["--network".to_string(), "private".to_string()] }));
     }
 
     #[test]
