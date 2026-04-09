@@ -1,7 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use tempfile::NamedTempFile;
 
 use super::{
     backend::{ExecutionBackend, ExecutionOutput, ExecutionRequest, ExecutionStdoutSender},
@@ -23,8 +27,8 @@ impl ExecutionBackend for OciExecutionBackend {
         request: ExecutionRequest,
         stdout: ExecutionStdoutSender,
     ) -> Result<ExecutionOutput> {
-        let invocation = build_oci_process_invocation(&request)?;
-        run_process_streaming(&invocation, move |line| {
+        let prepared = build_oci_process_invocation(&request)?;
+        run_process_streaming(&prepared.invocation, move |line| {
             let _ = stdout.send(line.to_string());
             Ok(())
         })
@@ -32,7 +36,13 @@ impl ExecutionBackend for OciExecutionBackend {
     }
 }
 
-fn build_oci_process_invocation(request: &ExecutionRequest) -> Result<ProcessInvocation> {
+#[derive(Debug)]
+struct PreparedProcessInvocation {
+    invocation: ProcessInvocation,
+    _env_file: Option<NamedTempFile>,
+}
+
+fn build_oci_process_invocation(request: &ExecutionRequest) -> Result<PreparedProcessInvocation> {
     let config = request.plan.confinement.oci();
 
     let image = config.image.as_deref().ok_or_else(|| {
@@ -91,10 +101,14 @@ fn build_oci_process_invocation(request: &ExecutionRequest) -> Result<ProcessInv
         args.push(value.to_string());
     }
 
-    for (key, value) in merged_environment(&request.plan.environment, &request.program.environment)
-    {
-        args.push("--env".to_string());
-        args.push(format!("{key}={value}"));
+    let env_file = build_env_file(
+        &request.plan.environment,
+        &request.program.environment,
+        request,
+    )?;
+    if let Some(env_file_path) = env_file.as_ref().map(|file| file.path()) {
+        args.push("--env-file".to_string());
+        args.push(path_to_arg(env_file_path)?);
     }
 
     if let Some(memory_limit) = config.limits.memory_limit.as_deref() {
@@ -114,13 +128,58 @@ fn build_oci_process_invocation(request: &ExecutionRequest) -> Result<ProcessInv
     args.push(request.program.executable.clone());
     args.extend(request.program.args.clone());
 
-    Ok(ProcessInvocation {
-        executable: config.engine.clone(),
-        args,
-        working_dir: None,
-        environment: Vec::new(),
-        input: request.program.stdin.clone(),
+    Ok(PreparedProcessInvocation {
+        invocation: ProcessInvocation {
+            executable: config.engine.clone(),
+            args,
+            working_dir: None,
+            environment: Vec::new(),
+            input: request.program.stdin.clone(),
+        },
+        _env_file: env_file,
     })
+}
+
+fn build_env_file(
+    plan_environment: &[(String, String)],
+    program_environment: &[(String, String)],
+    request: &ExecutionRequest,
+) -> Result<Option<NamedTempFile>> {
+    let merged = merged_environment(plan_environment, program_environment);
+    if merged.is_empty() {
+        return Ok(None);
+    }
+
+    let mut env_file = NamedTempFile::new().context("failed to create OCI environment file")?;
+    for (key, value) in &merged {
+        if value.contains(['\n', '\r']) {
+            bail!(
+                "runtime '{}' environment variable '{}' contains a newline and cannot be delivered through an OCI env file",
+                request.plan.runtime_id,
+                key
+            );
+        }
+        writeln!(env_file, "{key}={value}").with_context(|| {
+            format!(
+                "failed to write OCI environment file for runtime '{}'",
+                request.plan.runtime_id
+            )
+        })?;
+    }
+    env_file.flush().with_context(|| {
+        format!(
+            "failed to flush OCI environment file for runtime '{}'",
+            request.plan.runtime_id
+        )
+    })?;
+
+    Ok(Some(env_file))
+}
+
+fn path_to_arg(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(|value| value.to_string())
+        .ok_or_else(|| anyhow!("path '{}' is not valid UTF-8", path.display()))
 }
 
 fn map_host_path_into_container(path: &str, mounts: &[MountSpec]) -> Result<String> {
@@ -232,7 +291,8 @@ mod tests {
             },
         };
 
-        let invocation = build_oci_process_invocation(&request).expect("invocation");
+        let prepared = build_oci_process_invocation(&request).expect("invocation");
+        let invocation = &prepared.invocation;
 
         assert_eq!(invocation.executable, "podman");
         assert_eq!(invocation.working_dir, None);
@@ -278,11 +338,8 @@ mod tests {
         assert!(invocation
             .args
             .windows(2)
-            .any(|pair| { pair == ["--env".to_string(), "FOO=from-plan".to_string()] }));
-        assert!(invocation
-            .args
-            .windows(2)
-            .any(|pair| { pair == ["--env".to_string(), "MODEL=gpt-5-codex".to_string()] }));
+            .any(|pair| { pair[0] == "--env-file" }));
+        assert!(!invocation.args.iter().any(|arg| arg == "--env"));
         assert!(invocation
             .args
             .windows(2)
@@ -310,6 +367,16 @@ mod tests {
                 "--json".to_string(),
             ]
         );
+
+        let env_file_path = invocation
+            .args
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--env-file").then_some(pair[1].clone()))
+            .expect("env file path");
+        let env_file =
+            std::fs::read_to_string(&env_file_path).expect("read generated OCI environment file");
+        assert!(env_file.contains("FOO=from-plan"));
+        assert!(env_file.contains("MODEL=gpt-5-codex"));
     }
 
     #[test]
@@ -317,7 +384,7 @@ mod tests {
         let mut plan = sample_plan();
         plan.network_mode = NetworkMode::None;
 
-        let invocation = build_oci_process_invocation(&ExecutionRequest {
+        let prepared = build_oci_process_invocation(&ExecutionRequest {
             plan,
             program: RuntimeProgramSpec {
                 executable: "codex".to_string(),
@@ -327,11 +394,30 @@ mod tests {
             },
         })
         .expect("invocation");
+        let invocation = &prepared.invocation;
 
         assert!(invocation
             .args
             .windows(2)
             .any(|pair| { pair == ["--network".to_string(), "none".to_string()] }));
+    }
+
+    #[test]
+    fn oci_backend_rejects_newlines_in_environment_values() {
+        let err = build_oci_process_invocation(&ExecutionRequest {
+            plan: sample_plan(),
+            program: RuntimeProgramSpec {
+                executable: "codex".to_string(),
+                args: Vec::new(),
+                environment: vec![("PEM".to_string(), "line1\nline2".to_string())],
+                stdin: String::new(),
+            },
+        })
+        .expect_err("newline env should fail");
+
+        assert!(err
+            .to_string()
+            .contains("cannot be delivered through an OCI env file"));
     }
 
     #[test]

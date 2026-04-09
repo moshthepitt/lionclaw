@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, io::ErrorKind, path::Path};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -6,17 +6,71 @@ use crate::home::LionClawHome;
 
 pub async fn load_runtime_secrets(home: &LionClawHome) -> Result<BTreeMap<String, String>> {
     let path = home.runtime_secrets_env_path();
-    if !tokio::fs::try_exists(&path)
-        .await
-        .with_context(|| format!("failed to stat {}", path.display()))?
-    {
-        return Ok(BTreeMap::new());
+    let metadata = match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "runtime secrets file '{}' cannot be a symlink",
+            path.display()
+        ));
     }
+    if !metadata.file_type().is_file() {
+        return Err(anyhow!(
+            "runtime secrets path '{}' must be a regular file",
+            path.display()
+        ));
+    }
+    harden_runtime_secret_permissions(&path).await?;
 
     let content = tokio::fs::read_to_string(&path)
         .await
         .with_context(|| format!("failed to read {}", path.display()))?;
     parse_runtime_secrets(&content, &path)
+}
+
+#[cfg(unix)]
+async fn harden_runtime_secret_permissions(path: &Path) -> Result<()> {
+    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+
+    let config_dir = path.parent().ok_or_else(|| {
+        anyhow!(
+            "runtime secrets file '{}' does not have a parent directory",
+            path.display()
+        )
+    })?;
+    let config_mode = tokio::fs::metadata(config_dir)
+        .await
+        .with_context(|| format!("failed to read metadata for {}", config_dir.display()))?
+        .permissions()
+        .mode();
+    if config_mode & 0o077 != 0 {
+        tokio::fs::set_permissions(config_dir, Permissions::from_mode(0o700))
+            .await
+            .with_context(|| format!("failed to chmod {}", config_dir.display()))?;
+    }
+
+    let file_mode = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?
+        .permissions()
+        .mode();
+    if file_mode & 0o077 != 0 {
+        tokio::fs::set_permissions(path, Permissions::from_mode(0o600))
+            .await
+            .with_context(|| format!("failed to chmod {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn harden_runtime_secret_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn parse_runtime_secrets(content: &str, path: &Path) -> Result<BTreeMap<String, String>> {
@@ -226,5 +280,59 @@ mod tests {
 
         assert_eq!(secrets["GITHUB_TOKEN"], "$FROM_ENV");
         assert_eq!(secrets["OPENAI_API_KEY"], "sk-test#$literal");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_secrets_file_is_hardened_to_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+
+        std::fs::set_permissions(home.config_dir(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod config dir");
+        tokio::fs::write(home.runtime_secrets_env_path(), "GITHUB_TOKEN=ghp_test\n")
+            .await
+            .expect("write env");
+        std::fs::set_permissions(
+            home.runtime_secrets_env_path(),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("chmod runtime secrets");
+
+        let secrets = load_runtime_secrets(&home).await.expect("load secrets");
+        assert_eq!(secrets["GITHUB_TOKEN"], "ghp_test");
+
+        let config_mode = std::fs::metadata(home.config_dir())
+            .expect("config metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = std::fs::metadata(home.runtime_secrets_env_path())
+            .expect("file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(config_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_secrets_file_rejects_symlinks() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+
+        let real = temp_dir.path().join("real.env");
+        std::fs::write(&real, "GITHUB_TOKEN=ghp_test\n").expect("write real env");
+        std::os::unix::fs::symlink(&real, home.runtime_secrets_env_path()).expect("symlink env");
+
+        let err = load_runtime_secrets(&home)
+            .await
+            .expect_err("symlinked env file should fail");
+        assert!(err.to_string().contains("cannot be a symlink"));
     }
 }

@@ -1,15 +1,26 @@
-use std::{collections::BTreeSet, path::PathBuf, time::Duration};
+use std::{collections::BTreeSet, fmt, path::PathBuf, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
 /// Adapter-produced program invocation details, independent from how LionClaw
 /// chooses to confine the process.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct RuntimeProgramSpec {
     pub executable: String,
     pub args: Vec<String>,
     pub environment: Vec<(String, String)>,
     pub stdin: String,
+}
+
+impl fmt::Debug for RuntimeProgramSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeProgramSpec")
+            .field("executable", &self.executable)
+            .field("args", &self.args)
+            .field("environment_count", &self.environment.len())
+            .field("stdin_len", &self.stdin.len())
+            .finish()
+    }
 }
 
 /// User-facing coarse execution preset compiled before a turn starts.
@@ -198,7 +209,7 @@ pub struct ExecutionLimits {
 }
 
 /// Kernel-compiled execution plan for a single runtime turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EffectiveExecutionPlan {
     pub runtime_id: String,
     pub preset_name: String,
@@ -213,6 +224,26 @@ pub struct EffectiveExecutionPlan {
     pub secret_env: Vec<String>,
     pub escape_classes: BTreeSet<EscapeClass>,
     pub limits: ExecutionLimits,
+}
+
+impl fmt::Debug for EffectiveExecutionPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EffectiveExecutionPlan")
+            .field("runtime_id", &self.runtime_id)
+            .field("preset_name", &self.preset_name)
+            .field("confinement", &self.confinement)
+            .field("workspace_access", &self.workspace_access)
+            .field("network_mode", &self.network_mode)
+            .field("working_dir", &self.working_dir)
+            .field("environment_count", &self.environment.len())
+            .field("idle_timeout", &self.idle_timeout)
+            .field("hard_timeout", &self.hard_timeout)
+            .field("mounts", &self.mounts)
+            .field("secret_env", &self.secret_env)
+            .field("escape_classes", &self.escape_classes)
+            .field("limits", &self.limits)
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -276,5 +307,22 @@ mod tests {
             limits.get("pids-limit").and_then(|raw| raw.as_u64()),
             Some(512)
         );
+    }
+
+    #[test]
+    fn runtime_program_spec_debug_redacts_environment_and_stdin_values() {
+        let debug = format!(
+            "{:?}",
+            super::RuntimeProgramSpec {
+                executable: "codex".to_string(),
+                args: vec!["exec".to_string()],
+                environment: vec![("GITHUB_TOKEN".to_string(), "ghp_secret".to_string())],
+                stdin: "hello".to_string(),
+            }
+        );
+
+        assert!(debug.contains("environment_count"));
+        assert!(!debug.contains("ghp_secret"));
+        assert!(!debug.contains("hello"));
     }
 }

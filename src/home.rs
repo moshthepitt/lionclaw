@@ -121,6 +121,14 @@ impl LionClawHome {
                 .await
                 .with_context(|| format!("failed to create {}", path.display()))?;
         }
+        #[cfg(unix)]
+        {
+            use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+
+            tokio::fs::set_permissions(self.config_dir(), Permissions::from_mode(0o700))
+                .await
+                .with_context(|| format!("failed to chmod {}", self.config_dir().display()))?;
+        }
 
         self.ensure_home_id().await?;
         Ok(())

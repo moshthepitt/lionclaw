@@ -138,6 +138,8 @@ The execution planner also injects stable runtime-private environment defaults s
 Runtime env secrets are loaded from `~/.lionclaw/config/runtime-secrets.env`.
 Presets opt into specific names with `secret_env = [...]`, and the planner
 injects only those listed variables into the confined runtime environment.
+LionClaw hardens the config directory to `0700` and the runtime secret file to
+`0600` on Unix before loading it.
 
 Channel bridge layout:
 

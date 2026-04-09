@@ -163,7 +163,8 @@ Runtime definitions, execution presets, and confinement settings live in
 
 Runtime env secrets live separately in `~/.lionclaw/config/runtime-secrets.env`.
 Presets bind them by name with `secret_env = ["GITHUB_TOKEN"]`, and LionClaw
-injects only those listed variables into the confined runtime.
+injects only those listed variables into the confined runtime. LionClaw
+hardens that file to owner-only permissions on Unix before loading it.
 
 Inside `lionclaw run`, recovery stays command-first:
 
