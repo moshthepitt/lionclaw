@@ -125,6 +125,9 @@ Inspect and manage that continuity with:
 ./target/release/lionclaw continuity status
 ./target/release/lionclaw continuity search "release"
 ./target/release/lionclaw continuity get continuity/ACTIVE.md
+./target/release/lionclaw continuity drafts ls --runtime codex
+./target/release/lionclaw continuity drafts promote report.md --runtime codex
+./target/release/lionclaw continuity drafts discard report.md --runtime codex
 ./target/release/lionclaw continuity proposals ls
 ./target/release/lionclaw continuity proposals merge continuity/proposals/memory/<proposal>.md
 ./target/release/lionclaw continuity loops ls

@@ -7,8 +7,9 @@ use cron::Schedule;
 
 use crate::{
     contracts::{
-        ContinuityPathRequest, ContinuitySearchRequest, JobCreateRequest, JobRefRequest,
-        JobRunsRequest, JobScheduleDto, TrustTier,
+        ContinuityDraftActionRequest, ContinuityDraftListRequest, ContinuityPathRequest,
+        ContinuitySearchRequest, JobCreateRequest, JobRefRequest, JobRunsRequest, JobScheduleDto,
+        TrustTier,
     },
     home::LionClawHome,
     kernel::{
@@ -241,6 +242,10 @@ enum ContinuityCommand {
     Status,
     Search(ContinuitySearchArgs),
     Get(ContinuityPathArgs),
+    Drafts {
+        #[command(subcommand)]
+        command: ContinuityDraftCommand,
+    },
     Loops {
         #[command(subcommand)]
         command: ContinuityLoopCommand,
@@ -255,6 +260,13 @@ enum ContinuityCommand {
 enum ContinuityLoopCommand {
     Ls,
     Resolve(ContinuityPathArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ContinuityDraftCommand {
+    Ls(ContinuityDraftListArgs),
+    Promote(ContinuityDraftPathArgs),
+    Discard(ContinuityDraftPathArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -277,6 +289,19 @@ struct PairingApproveArgs {
     pairing_code: String,
     #[arg(long, default_value = "main")]
     trust_tier: String,
+}
+
+#[derive(Debug, Args)]
+struct ContinuityDraftListArgs {
+    #[arg(long)]
+    runtime: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ContinuityDraftPathArgs {
+    relative_path: String,
+    #[arg(long)]
+    runtime: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -582,6 +607,52 @@ pub async fn run() -> Result<()> {
                         .await?;
                     print!("{}", response.content);
                 }
+                ContinuityCommand::Drafts { command } => match command {
+                    ContinuityDraftCommand::Ls(args) => {
+                        let response = kernel
+                            .list_continuity_drafts(ContinuityDraftListRequest {
+                                runtime_id: args.runtime,
+                            })
+                            .await?;
+                        println!("runtime={}", response.runtime_id);
+                        for draft in response.drafts {
+                            println!(
+                                "path={} size={} media_type={}",
+                                draft.relative_path, draft.size_bytes, draft.media_type
+                            );
+                        }
+                    }
+                    ContinuityDraftCommand::Promote(args) => {
+                        let response = kernel
+                            .promote_continuity_draft_with_actor(
+                                ContinuityDraftActionRequest {
+                                    runtime_id: args.runtime,
+                                    relative_path: args.relative_path,
+                                },
+                                "operator",
+                            )
+                            .await?;
+                        println!(
+                            "promoted runtime={} draft={} artifact={}",
+                            response.runtime_id, response.draft_path, response.artifact_path
+                        );
+                    }
+                    ContinuityDraftCommand::Discard(args) => {
+                        let response = kernel
+                            .discard_continuity_draft_with_actor(
+                                ContinuityDraftActionRequest {
+                                    runtime_id: args.runtime,
+                                    relative_path: args.relative_path,
+                                },
+                                "operator",
+                            )
+                            .await?;
+                        println!(
+                            "discarded runtime={} draft={}",
+                            response.runtime_id, response.draft_path
+                        );
+                    }
+                },
                 ContinuityCommand::Loops { command } => match command {
                     ContinuityLoopCommand::Ls => {
                         for open_loop in kernel.list_continuity_open_loops().await?.loops {

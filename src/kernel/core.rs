@@ -21,7 +21,9 @@ use crate::contracts::{
     ChannelListResponse, ChannelPeerApproveRequest, ChannelPeerBlockRequest,
     ChannelPeerListResponse, ChannelPeerResponse, ChannelPeerView, ChannelStreamAckRequest,
     ChannelStreamAckResponse, ChannelStreamEventView, ChannelStreamPullRequest,
-    ChannelStreamPullResponse, ContinuityGetResponse, ContinuityMemoryProposalView,
+    ChannelStreamPullResponse, ContinuityDraftActionRequest, ContinuityDraftDiscardResponse,
+    ContinuityDraftListRequest, ContinuityDraftListResponse, ContinuityDraftPromoteResponse,
+    ContinuityDraftView, ContinuityGetResponse, ContinuityMemoryProposalView,
     ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse, ContinuityOpenLoopView,
     ContinuityPathRequest, ContinuityProposalActionResponse, ContinuityProposalListResponse,
     ContinuitySearchMatchView, ContinuitySearchRequest, ContinuitySearchResponse,
@@ -52,6 +54,7 @@ use super::{
     },
     continuity_index::ContinuityIndexStore,
     db::Db,
+    drafts,
     error::KernelError,
     jobs::{
         compute_initial_next_run, JobDeliveryTarget, JobSchedule, JobStore, NewSchedulerJob,
@@ -167,6 +170,8 @@ pub struct Kernel {
     default_runtime_id: Option<String>,
     runtime_secrets_file: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
+    runtime_root: Option<PathBuf>,
+    workspace_name: Option<String>,
     continuity: Option<ContinuityLayout>,
 }
 
@@ -250,6 +255,8 @@ impl Kernel {
             default_runtime_id: options.default_runtime_id,
             runtime_secrets_file: options.runtime_secrets_file,
             workspace_root: options.workspace_root,
+            runtime_root: options.runtime_root,
+            workspace_name: options.workspace_name,
             continuity,
         };
 
@@ -2624,6 +2631,127 @@ impl Kernel {
         })
     }
 
+    pub async fn list_continuity_drafts(
+        &self,
+        req: ContinuityDraftListRequest,
+    ) -> Result<ContinuityDraftListResponse, KernelError> {
+        let (runtime_id, drafts_root) =
+            self.resolve_runtime_drafts_root(req.runtime_id.as_deref())?;
+        let drafts = drafts::list_outputs(&drafts_root).map_err(internal)?;
+        Ok(ContinuityDraftListResponse {
+            runtime_id,
+            drafts: drafts.into_iter().map(to_continuity_draft_view).collect(),
+        })
+    }
+
+    pub async fn promote_continuity_draft(
+        &self,
+        req: ContinuityDraftActionRequest,
+    ) -> Result<ContinuityDraftPromoteResponse, KernelError> {
+        self.promote_continuity_draft_with_actor(req, "api").await
+    }
+
+    pub async fn promote_continuity_draft_with_actor(
+        &self,
+        req: ContinuityDraftActionRequest,
+        actor: &str,
+    ) -> Result<ContinuityDraftPromoteResponse, KernelError> {
+        let layout = self
+            .continuity
+            .as_ref()
+            .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
+        let (runtime_id, drafts_root) =
+            self.resolve_runtime_drafts_root(req.runtime_id.as_deref())?;
+        let drafts = drafts::list_outputs(&drafts_root).map_err(internal)?;
+        if !drafts
+            .iter()
+            .any(|draft| draft.relative_path == req.relative_path)
+        {
+            return Err(KernelError::NotFound(format!(
+                "draft '{}' was not found",
+                req.relative_path
+            )));
+        }
+        let file_name = Path::new(&req.relative_path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| KernelError::BadRequest("draft path is invalid".to_string()))?;
+        let destination = layout
+            .prepare_promoted_artifact_path(file_name)
+            .await
+            .map_err(internal)?;
+        drafts::move_output(&drafts_root, &req.relative_path, &destination).map_err(internal)?;
+
+        let artifact_path = self.relative_workspace_path(&destination);
+        self.refresh_active_continuity_after_commit_best_effort(
+            "continuity.draft.promoted",
+            None,
+            actor,
+            json!({
+                "runtime_id": runtime_id,
+                "draft_path": req.relative_path,
+                "artifact_path": artifact_path,
+            }),
+        )
+        .await;
+        self.append_audit_event_best_effort(
+            "continuity.draft.promoted",
+            actor,
+            json!({
+                "runtime_id": runtime_id,
+                "draft_path": req.relative_path,
+                "artifact_path": artifact_path,
+            }),
+        )
+        .await;
+
+        Ok(ContinuityDraftPromoteResponse {
+            runtime_id,
+            draft_path: req.relative_path,
+            artifact_path,
+        })
+    }
+
+    pub async fn discard_continuity_draft(
+        &self,
+        req: ContinuityDraftActionRequest,
+    ) -> Result<ContinuityDraftDiscardResponse, KernelError> {
+        self.discard_continuity_draft_with_actor(req, "api").await
+    }
+
+    pub async fn discard_continuity_draft_with_actor(
+        &self,
+        req: ContinuityDraftActionRequest,
+        actor: &str,
+    ) -> Result<ContinuityDraftDiscardResponse, KernelError> {
+        let (runtime_id, drafts_root) =
+            self.resolve_runtime_drafts_root(req.runtime_id.as_deref())?;
+        let drafts = drafts::list_outputs(&drafts_root).map_err(internal)?;
+        if !drafts
+            .iter()
+            .any(|draft| draft.relative_path == req.relative_path)
+        {
+            return Err(KernelError::NotFound(format!(
+                "draft '{}' was not found",
+                req.relative_path
+            )));
+        }
+        drafts::remove_output(&drafts_root, &req.relative_path).map_err(internal)?;
+        self.append_audit_event_best_effort(
+            "continuity.draft.discarded",
+            actor,
+            json!({
+                "runtime_id": runtime_id,
+                "draft_path": req.relative_path,
+            }),
+        )
+        .await;
+        Ok(ContinuityDraftDiscardResponse {
+            runtime_id,
+            draft_path: req.relative_path,
+        })
+    }
+
     pub async fn list_continuity_memory_proposals(
         &self,
     ) -> Result<ContinuityProposalListResponse, KernelError> {
@@ -2867,6 +2995,8 @@ impl Kernel {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use tempfile::tempdir;
     use tokio::time::{sleep, Duration};
 
@@ -2884,6 +3014,122 @@ mod tests {
         let debug = format!("{options:?}");
         assert!(debug.contains("runtime_secrets_file"));
         assert!(debug.contains("/tmp/runtime-secrets.env"));
+    }
+
+    #[tokio::test]
+    async fn continuity_draft_list_scans_runtime_drafts_on_demand() {
+        let temp_dir = tempdir().expect("temp dir");
+        let workspace_root = temp_dir.path().join("workspace");
+        let runtime_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(runtime_root.join("codex/main/drafts/reports")).expect("draft dirs");
+        fs::write(runtime_root.join("codex/main/drafts/report.md"), "# Report").expect("report");
+        fs::write(
+            runtime_root.join("codex/main/drafts/reports/chart.csv"),
+            "x,y\n1,2\n",
+        )
+        .expect("chart");
+        let db_path = temp_dir.path().join("lionclaw.db");
+        let kernel = Kernel::new_with_options(
+            &db_path,
+            KernelOptions {
+                workspace_root: Some(workspace_root),
+                project_workspace_root: Some(temp_dir.path().join("project-root")),
+                runtime_root: Some(runtime_root),
+                workspace_name: Some("main".to_string()),
+                default_runtime_id: Some("codex".to_string()),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+
+        let response = kernel
+            .list_continuity_drafts(ContinuityDraftListRequest { runtime_id: None })
+            .await
+            .expect("list drafts");
+
+        assert_eq!(response.runtime_id, "codex");
+        assert_eq!(response.drafts.len(), 2);
+        assert_eq!(response.drafts[0].relative_path, "report.md");
+        assert_eq!(response.drafts[1].relative_path, "reports/chart.csv");
+    }
+
+    #[tokio::test]
+    async fn continuity_draft_discard_deletes_runtime_draft_file() {
+        let temp_dir = tempdir().expect("temp dir");
+        let workspace_root = temp_dir.path().join("workspace");
+        let runtime_root = temp_dir.path().join("runtime");
+        let draft_path = runtime_root.join("codex/main/drafts/report.md");
+        fs::create_dir_all(draft_path.parent().expect("parent")).expect("draft dirs");
+        fs::write(&draft_path, "# Report").expect("report");
+        let db_path = temp_dir.path().join("lionclaw.db");
+        let kernel = Kernel::new_with_options(
+            &db_path,
+            KernelOptions {
+                workspace_root: Some(workspace_root),
+                project_workspace_root: Some(temp_dir.path().join("project-root")),
+                runtime_root: Some(runtime_root),
+                workspace_name: Some("main".to_string()),
+                default_runtime_id: Some("codex".to_string()),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+
+        let response = kernel
+            .discard_continuity_draft(ContinuityDraftActionRequest {
+                runtime_id: None,
+                relative_path: "report.md".to_string(),
+            })
+            .await
+            .expect("discard draft");
+
+        assert_eq!(response.runtime_id, "codex");
+        assert_eq!(response.draft_path, "report.md");
+        assert!(!draft_path.exists());
+    }
+
+    #[tokio::test]
+    async fn continuity_draft_promote_moves_file_into_continuity_artifacts() {
+        let temp_dir = tempdir().expect("temp dir");
+        let workspace_root = temp_dir.path().join("workspace");
+        let runtime_root = temp_dir.path().join("runtime");
+        let draft_path = runtime_root.join("codex/main/drafts/report.md");
+        fs::create_dir_all(draft_path.parent().expect("parent")).expect("draft dirs");
+        fs::write(&draft_path, "# Report").expect("report");
+        let db_path = temp_dir.path().join("lionclaw.db");
+        let kernel = Kernel::new_with_options(
+            &db_path,
+            KernelOptions {
+                workspace_root: Some(workspace_root.clone()),
+                project_workspace_root: Some(temp_dir.path().join("project-root")),
+                runtime_root: Some(runtime_root),
+                workspace_name: Some("main".to_string()),
+                default_runtime_id: Some("codex".to_string()),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+
+        let response = kernel
+            .promote_continuity_draft(ContinuityDraftActionRequest {
+                runtime_id: None,
+                relative_path: "report.md".to_string(),
+            })
+            .await
+            .expect("promote draft");
+
+        assert_eq!(response.runtime_id, "codex");
+        assert_eq!(response.draft_path, "report.md");
+        assert!(response.artifact_path.contains("continuity/artifacts/"));
+        assert!(!draft_path.exists());
+        assert_eq!(
+            fs::read_to_string(workspace_root.join(&response.artifact_path))
+                .expect("read promoted artifact"),
+            "# Report"
+        );
     }
 
     #[tokio::test]
@@ -3152,6 +3398,14 @@ fn to_continuity_open_loop_view(
         relative_path: open_loop.relative_path,
         summary: open_loop.summary,
         next_step: open_loop.next_step,
+    }
+}
+
+fn to_continuity_draft_view(draft: drafts::DraftOutput) -> ContinuityDraftView {
+    ContinuityDraftView {
+        relative_path: draft.relative_path,
+        size_bytes: draft.size_bytes,
+        media_type: draft.media_type,
     }
 }
 
@@ -4173,6 +4427,28 @@ impl Kernel {
                 "runtime_id is required when no default runtime is configured".to_string(),
             )
         })
+    }
+
+    fn resolve_runtime_drafts_root(
+        &self,
+        requested_runtime_id: Option<&str>,
+    ) -> Result<(String, PathBuf), KernelError> {
+        let runtime_id = self.resolve_runtime_id(requested_runtime_id)?;
+        let runtime_root = self
+            .runtime_root
+            .as_ref()
+            .ok_or_else(|| KernelError::NotFound("runtime root is not configured".to_string()))?;
+        let workspace_name = self
+            .workspace_name
+            .as_deref()
+            .ok_or_else(|| KernelError::NotFound("workspace name is not configured".to_string()))?;
+        Ok((
+            runtime_id.clone(),
+            runtime_root
+                .join(&runtime_id)
+                .join(workspace_name)
+                .join("drafts"),
+        ))
     }
 
     async fn resolve_channel_runtime_id(

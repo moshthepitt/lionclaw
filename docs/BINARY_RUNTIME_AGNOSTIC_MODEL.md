@@ -127,6 +127,7 @@ For confined runtimes, LionClaw treats that runtime area as private scratch spac
 - `/runtime` is the runtime-private writable root.
 - `/drafts` is the runtime-private draft/output area.
 - the planner points `HOME` and XDG state under `/runtime` so engine-specific caches and config stay out of assistant continuity.
+- LionClaw scans `/drafts` on demand when the user lists outputs; keep/discard actions then move or delete validated files directly from that shared host/container directory.
 - only the `answer` lane is canonical reply content; `reasoning` is an optional live stream for channels that choose to render it.
 
 ## Process and service model

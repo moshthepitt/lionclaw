@@ -594,6 +594,10 @@ pub(crate) async fn render_runtime_cache(
     }
 
     sections.push(
+        "## Draft Outputs\n\nWrite generated files intended for review or keeping to LIONCLAW_DRAFTS_DIR.".to_string(),
+    );
+
+    sections.push(
         "## Runtime Secrets\n\nIf this preset mounts runtime secrets, look under /run/secrets for the LionClaw-provided dotenv file whose name starts with lionclaw-runtime-secrets-, read it, and do not print its contents.".to_string(),
     );
 

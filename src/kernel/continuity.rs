@@ -323,6 +323,24 @@ impl ContinuityLayout {
         Ok(fs.absolute_path(&relative))
     }
 
+    pub async fn prepare_promoted_artifact_path(&self, file_name: &str) -> Result<PathBuf> {
+        let file_name = Path::new(file_name)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("artifact file name '{}' is invalid", file_name))?;
+        let at = Utc::now();
+        let relative = self
+            .artifacts_rel_dir()
+            .join(format!("{:04}", at.year()))
+            .join(format!("{:02}", at.month()))
+            .join(format!("{}-{}", Uuid::new_v4(), file_name));
+        let fs = self.fs().await?;
+        if let Some(parent) = relative.parent() {
+            fs.create_dir_all(parent)?;
+        }
+        Ok(fs.absolute_path(&relative))
+    }
+
     pub async fn upsert_open_loop(
         &self,
         loop_draft: &ContinuityOpenLoopDraft,

@@ -66,6 +66,9 @@ Unix environments.
 - `GET /v0/continuity/status`
 - `POST /v0/continuity/get`
 - `POST /v0/continuity/search`
+- `POST /v0/continuity/drafts/list`
+- `POST /v0/continuity/drafts/promote`
+- `POST /v0/continuity/drafts/discard`
 - `GET /v0/continuity/proposals`
 - `POST /v0/continuity/proposals/merge`
 - `POST /v0/continuity/proposals/reject`
@@ -134,6 +137,7 @@ The everyday confined runtime layout is mount-first:
 - `/drafts`: runtime-private draft/output area.
 
 The execution planner also injects stable runtime-private environment defaults such as `HOME=/runtime/home` and `LIONCLAW_DRAFTS_DIR=/drafts` so program-backed runtimes keep ephemeral state out of LionClaw continuity.
+LionClaw does not persist a separate draft registry. Draft listing scans that shared drafts directory on demand, and explicit keep/discard actions move or delete files directly from there.
 
 Current runtime network policy is intentionally coarse: presets choose only
 `network-mode = "on"` or `network-mode = "none"`. LionClaw does not expose a

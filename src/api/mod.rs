@@ -17,17 +17,18 @@ use crate::{
         ChannelPeerApproveRequest, ChannelPeerBlockRequest, ChannelPeerListParams,
         ChannelPeerListResponse, ChannelPeerResponse, ChannelStreamAckRequest,
         ChannelStreamAckResponse, ChannelStreamPullRequest, ChannelStreamPullResponse,
-        ContinuityGetResponse, ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse,
-        ContinuityPathRequest, ContinuityProposalActionResponse, ContinuityProposalListResponse,
-        ContinuitySearchRequest, ContinuitySearchResponse, ContinuityStatusResponse,
-        DaemonInfoResponse, JobCreateRequest, JobCreateResponse, JobGetResponse, JobListResponse,
-        JobManualRunResponse, JobRefRequest, JobRemoveResponse, JobRunsRequest, JobRunsResponse,
-        JobTickResponse, JobToggleResponse, PolicyGrantRequest, PolicyGrantResponse,
-        PolicyRevokeRequest, PolicyRevokeResponse, SessionActionRequest, SessionActionResponse,
-        SessionHistoryRequest, SessionHistoryResponse, SessionLatestQuery, SessionLatestResponse,
-        SessionOpenRequest, SessionOpenResponse, SessionTurnRequest, SessionTurnResponse,
-        SkillInstallRequest, SkillInstallResponse, SkillListResponse, SkillToggleRequest,
-        SkillToggleResponse,
+        ContinuityDraftActionRequest, ContinuityDraftDiscardResponse, ContinuityDraftListRequest,
+        ContinuityDraftListResponse, ContinuityDraftPromoteResponse, ContinuityGetResponse,
+        ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse, ContinuityPathRequest,
+        ContinuityProposalActionResponse, ContinuityProposalListResponse, ContinuitySearchRequest,
+        ContinuitySearchResponse, ContinuityStatusResponse, DaemonInfoResponse, JobCreateRequest,
+        JobCreateResponse, JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest,
+        JobRemoveResponse, JobRunsRequest, JobRunsResponse, JobTickResponse, JobToggleResponse,
+        PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeRequest, PolicyRevokeResponse,
+        SessionActionRequest, SessionActionResponse, SessionHistoryRequest, SessionHistoryResponse,
+        SessionLatestQuery, SessionLatestResponse, SessionOpenRequest, SessionOpenResponse,
+        SessionTurnRequest, SessionTurnResponse, SkillInstallRequest, SkillInstallResponse,
+        SkillListResponse, SkillToggleRequest, SkillToggleResponse,
     },
     kernel::{Kernel, KernelError},
 };
@@ -78,6 +79,15 @@ pub fn build_router(kernel: Arc<Kernel>, daemon_info: DaemonInfoResponse) -> Rou
         .route("/v0/continuity/status", get(continuity_status))
         .route("/v0/continuity/get", post(continuity_get))
         .route("/v0/continuity/search", post(continuity_search))
+        .route("/v0/continuity/drafts/list", post(list_continuity_drafts))
+        .route(
+            "/v0/continuity/drafts/promote",
+            post(promote_continuity_draft),
+        )
+        .route(
+            "/v0/continuity/drafts/discard",
+            post(discard_continuity_draft),
+        )
         .route("/v0/continuity/proposals", get(list_continuity_proposals))
         .route(
             "/v0/continuity/proposals/merge",
@@ -338,6 +348,30 @@ async fn continuity_search(
     Json(req): Json<ContinuitySearchRequest>,
 ) -> Result<Json<ContinuitySearchResponse>, ApiError> {
     let result = state.kernel.continuity_search(req).await?;
+    Ok(Json(result))
+}
+
+async fn list_continuity_drafts(
+    State(state): State<ApiState>,
+    Json(req): Json<ContinuityDraftListRequest>,
+) -> Result<Json<ContinuityDraftListResponse>, ApiError> {
+    let result = state.kernel.list_continuity_drafts(req).await?;
+    Ok(Json(result))
+}
+
+async fn promote_continuity_draft(
+    State(state): State<ApiState>,
+    Json(req): Json<ContinuityDraftActionRequest>,
+) -> Result<Json<ContinuityDraftPromoteResponse>, ApiError> {
+    let result = state.kernel.promote_continuity_draft(req).await?;
+    Ok(Json(result))
+}
+
+async fn discard_continuity_draft(
+    State(state): State<ApiState>,
+    Json(req): Json<ContinuityDraftActionRequest>,
+) -> Result<Json<ContinuityDraftDiscardResponse>, ApiError> {
+    let result = state.kernel.discard_continuity_draft(req).await?;
     Ok(Json(result))
 }
 
