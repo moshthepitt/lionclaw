@@ -1,16 +1,15 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::RwLock;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::kernel::runtime::execution::process::{run_process_streaming, ProcessInvocation};
 use crate::kernel::runtime::{
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
-    RuntimeMessageLane, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
-    RuntimeTurnResult,
+    ExecutionOutput, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
+    RuntimeEventSender, RuntimeMessageLane, RuntimeProgramSpec, RuntimeSessionHandle,
+    RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
 };
 
 #[derive(Debug, Clone)]
@@ -28,23 +27,17 @@ impl Default for CodexRuntimeConfig {
     }
 }
 
-#[derive(Debug, Clone)]
-struct CodexSessionState {
-    working_dir: Option<String>,
-    environment: Vec<(String, String)>,
-}
-
 #[derive(Debug)]
 pub struct CodexRuntimeAdapter {
     config: CodexRuntimeConfig,
-    sessions: RwLock<HashMap<String, CodexSessionState>>,
+    sessions: RwLock<HashSet<String>>,
 }
 
 impl CodexRuntimeAdapter {
     pub fn new(config: CodexRuntimeConfig) -> Self {
         Self {
             config,
-            sessions: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(HashSet::new()),
         }
     }
 }
@@ -59,68 +52,48 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
         }
     }
 
+    fn turn_mode(&self) -> RuntimeTurnMode {
+        RuntimeTurnMode::ProgramBacked
+    }
+
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_session_id = format!("codex-{}", Uuid::new_v4());
-        let state = CodexSessionState {
-            working_dir: input.working_dir,
-            environment: input.environment,
-        };
+        let _ = input;
         self.sessions
             .write()
-            .await
-            .insert(runtime_session_id.clone(), state);
+            .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
+            .insert(runtime_session_id.clone());
 
         Ok(RuntimeSessionHandle { runtime_session_id })
     }
 
-    async fn turn(
-        &self,
-        input: RuntimeTurnInput,
-        events: RuntimeEventSender,
-    ) -> Result<RuntimeTurnResult> {
-        let session = self
-            .sessions
-            .read()
-            .await
-            .get(&input.runtime_session_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("runtime session '{}' not found", input.runtime_session_id))?;
+    fn build_turn_program(&self, input: &RuntimeTurnInput) -> Result<RuntimeProgramSpec> {
+        ensure_runtime_session_exists(&self.sessions, &input.runtime_session_id)?;
 
-        let invocation = ProcessInvocation {
+        Ok(RuntimeProgramSpec {
             executable: self.config.executable.clone(),
-            args: build_codex_exec_args(&self.config, session.working_dir.as_deref()),
-            working_dir: None,
-            environment: session.environment.clone(),
-            input: input.prompt,
-        };
-
-        let mut saw_done = false;
-        let output = run_process_streaming(&invocation, |line| {
-            for event in parse_codex_output_line(line) {
-                if matches!(event, RuntimeEvent::Done) {
-                    saw_done = true;
-                }
-                let _ = events.send(event);
-            }
-            Ok(())
+            args: build_codex_exec_args(&self.config),
+            environment: Vec::new(),
+            stdin: input.prompt.clone(),
         })
-        .await?;
+    }
+
+    fn parse_program_output_line(&self, line: &str) -> Vec<RuntimeEvent> {
+        parse_codex_output_line(line)
+    }
+
+    fn format_program_exit_error(
+        &self,
+        output: &ExecutionOutput,
+        _observed_error_text: Option<&str>,
+    ) -> String {
+        let code = output.exit_code.unwrap_or(1);
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if !output.success() {
-            let code = output.exit_code.unwrap_or(1);
-            if stderr.is_empty() {
-                return Err(anyhow!("codex exec exited with code {}", code));
-            }
-            return Err(anyhow!("codex exec exited with code {}: {}", code, stderr));
+        if stderr.is_empty() {
+            format!("codex exec exited with code {}", code)
+        } else {
+            format!("codex exec exited with code {}: {}", code, stderr)
         }
-
-        if !saw_done {
-            let _ = events.send(RuntimeEvent::Done);
-        }
-
-        Ok(RuntimeTurnResult {
-            capability_requests: Vec::new(),
-        })
     }
 
     async fn resolve_capability_requests(
@@ -145,28 +118,39 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
     async fn close(&self, handle: &RuntimeSessionHandle) -> Result<()> {
         self.sessions
             .write()
-            .await
+            .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
             .remove(&handle.runtime_session_id);
         Ok(())
     }
 }
 
-fn build_codex_exec_args(
-    config: &CodexRuntimeConfig,
-    session_working_dir: Option<&str>,
-) -> Vec<String> {
+fn build_codex_exec_args(config: &CodexRuntimeConfig) -> Vec<String> {
     let mut args = vec!["exec".to_string(), "--json".to_string()];
 
     if let Some(model) = &config.model {
         args.push("--model".to_string());
         args.push(model.to_string());
     }
-    if let Some(working_dir) = session_working_dir {
-        args.push("--cd".to_string());
-        args.push(working_dir.to_string());
-    }
 
     args
+}
+
+fn ensure_runtime_session_exists(
+    sessions: &RwLock<HashSet<String>>,
+    runtime_session_id: &str,
+) -> Result<()> {
+    if sessions
+        .read()
+        .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
+        .contains(runtime_session_id)
+    {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "runtime session '{}' not found",
+            runtime_session_id
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -434,37 +418,22 @@ fn truncate_status_detail(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::kernel::runtime::{
-        RuntimeAdapter, RuntimeEvent, RuntimeMessageLane, RuntimeSessionStartInput,
-        RuntimeTurnInput,
+        ExecutionOutput, RuntimeAdapter, RuntimeEvent, RuntimeMessageLane,
+        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
     };
 
     use super::{
         build_codex_exec_args, parse_codex_stdout, CodexRuntimeAdapter, CodexRuntimeConfig,
     };
-    use tempfile::tempdir;
-    use tokio::sync::mpsc;
     use uuid::Uuid;
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn codex_adapter_translates_json_agent_message() {
-        let sandbox = tempdir().expect("temp dir");
-        let codex_stub = sandbox.path().join("codex-stub.sh");
-        write_script(
-            &codex_stub,
-            r#"#!/usr/bin/env bash
-cat >/dev/null
-echo '{"type":"turn.started"}'
-echo '{"type":"item.completed","item":{"id":"reason-1","type":"reasoning","text":"thinking through the request"}}'
-echo '{"type":"item.completed","item":{"id":"msg-1","type":"agent_message","text":"hello from codex"}}'
-echo '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":2}}'
-"#,
-        );
-
+    async fn codex_adapter_builds_program_spec_for_registered_session() {
         let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig {
-            executable: codex_stub.to_string_lossy().to_string(),
-            ..CodexRuntimeConfig::default()
+            executable: "codex".to_string(),
+            model: Some("gpt-5-codex".to_string()),
         });
+        assert_eq!(adapter.turn_mode(), RuntimeTurnMode::ProgramBacked);
 
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
@@ -476,89 +445,45 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0
             .await
             .expect("start");
 
-        let (tx, rx) = mpsc::unbounded_channel();
-        let output = adapter
-            .turn(
-                RuntimeTurnInput {
-                    runtime_session_id: handle.runtime_session_id.clone(),
-                    prompt: "hello".to_string(),
-                    selected_skills: Vec::new(),
-                },
-                tx,
-            )
-            .await
-            .expect("turn");
-        let events = collect_events(rx).await;
+        let program = adapter
+            .build_turn_program(&RuntimeTurnInput {
+                runtime_session_id: handle.runtime_session_id.clone(),
+                prompt: "hello".to_string(),
+                selected_skills: Vec::new(),
+            })
+            .expect("program");
 
-        assert!(
-            output.capability_requests.is_empty(),
-            "codex adapter should not emit kernel capability requests yet"
+        assert_eq!(program.executable, "codex");
+        assert_eq!(
+            program.args,
+            vec![
+                "exec".to_string(),
+                "--json".to_string(),
+                "--model".to_string(),
+                "gpt-5-codex".to_string(),
+            ]
         );
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Reasoning, text } if text == "thinking through the request"
-            )),
-            "reasoning item text should be translated into reasoning delta"
-        );
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text } if text == "hello from codex"
-            )),
-            "agent message should be translated into text delta"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, RuntimeEvent::Done)),
-            "turn output should include terminal done event"
-        );
+        assert!(program.environment.is_empty());
+        assert_eq!(program.stdin, "hello");
 
         adapter.close(&handle).await.expect("close");
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn codex_adapter_surfaces_nonzero_exit() {
-        let sandbox = tempdir().expect("temp dir");
-        let codex_stub = sandbox.path().join("codex-stub-fail.sh");
-        write_script(
-            &codex_stub,
-            r#"#!/usr/bin/env bash
-cat >/dev/null
-echo "stub failure" 1>&2
-exit 7
-"#,
-        );
-
+    #[test]
+    fn codex_adapter_formats_nonzero_exit_from_stderr() {
         let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig {
-            executable: codex_stub.to_string_lossy().to_string(),
+            executable: "codex".to_string(),
             ..CodexRuntimeConfig::default()
         });
-        let handle = adapter
-            .session_start(RuntimeSessionStartInput {
-                session_id: Uuid::new_v4(),
-                working_dir: None,
-                environment: Vec::new(),
-                selected_skills: Vec::new(),
-            })
-            .await
-            .expect("start");
+        let message = adapter.format_program_exit_error(
+            &ExecutionOutput {
+                stderr: b"stub failure\n".to_vec(),
+                exit_code: Some(7),
+                ..ExecutionOutput::default()
+            },
+            None,
+        );
 
-        let err = adapter
-            .turn(
-                RuntimeTurnInput {
-                    runtime_session_id: handle.runtime_session_id,
-                    prompt: "hello".to_string(),
-                    selected_skills: Vec::new(),
-                },
-                mpsc::unbounded_channel().0,
-            )
-            .await
-            .expect_err("turn should fail");
-
-        let message = err.to_string();
         assert!(
             message.contains("exited with code 7"),
             "exit code should be included in error"
@@ -571,13 +496,10 @@ exit 7
 
     #[test]
     fn codex_exec_args_only_include_protocol_fields() {
-        let args = build_codex_exec_args(
-            &CodexRuntimeConfig {
-                executable: "codex".to_string(),
-                model: Some("gpt-5-codex".to_string()),
-            },
-            Some("/workspace"),
-        );
+        let args = build_codex_exec_args(&CodexRuntimeConfig {
+            executable: "codex".to_string(),
+            model: Some("gpt-5-codex".to_string()),
+        });
 
         assert_eq!(
             args,
@@ -586,8 +508,6 @@ exit 7
                 "--json".to_string(),
                 "--model".to_string(),
                 "gpt-5-codex".to_string(),
-                "--cd".to_string(),
-                "/workspace".to_string(),
             ]
         );
     }
@@ -632,28 +552,5 @@ exit 7
             RuntimeEvent::Status { code: None, text }
                 if text == "codex web search 'weather: Nairobi, Kenya' (search)"
         ));
-    }
-
-    async fn collect_events(mut rx: mpsc::UnboundedReceiver<RuntimeEvent>) -> Vec<RuntimeEvent> {
-        let mut events = Vec::new();
-        while let Some(event) = rx.recv().await {
-            events.push(event);
-        }
-        events
-    }
-
-    #[cfg(unix)]
-    fn write_script(path: &std::path::Path, content: &str) {
-        use std::{fs, io::Write, os::unix::fs::PermissionsExt};
-
-        let temp_path = path.with_extension("tmp");
-        let mut file = fs::File::create(&temp_path).expect("create temp script");
-        file.write_all(content.as_bytes())
-            .expect("write temp script");
-        file.sync_all().expect("sync temp script");
-        drop(file);
-        let permissions = fs::Permissions::from_mode(0o755);
-        fs::set_permissions(&temp_path, permissions).expect("chmod temp script");
-        fs::rename(&temp_path, path).expect("install script");
     }
 }

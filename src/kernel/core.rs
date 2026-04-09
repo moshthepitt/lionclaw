@@ -59,11 +59,12 @@ use super::{
     },
     policy::{Capability, PolicyStore, Scope},
     runtime::{
-        register_builtin_runtime_adapters, EffectiveExecutionPlan, ExecutionPlanRequest,
-        ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset, HiddenTurnSupport,
-        RuntimeAdapter, RuntimeCapabilityRequest, RuntimeCapabilityResult, RuntimeEvent,
-        RuntimeExecutionProfile, RuntimeMessageLane, RuntimeRegistry, RuntimeSessionHandle,
-        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
+        execute_program_backed_turn, register_builtin_runtime_adapters, EffectiveExecutionPlan,
+        ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset,
+        HiddenTurnSupport, RuntimeAdapter, RuntimeCapabilityRequest, RuntimeCapabilityResult,
+        RuntimeEvent, RuntimeExecutionProfile, RuntimeMessageLane, RuntimeRegistry,
+        RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
+        RuntimeTurnResult,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -2314,24 +2315,32 @@ impl Kernel {
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
                 session_id: Uuid::new_v4(),
-                working_dir: execution_plan.working_dir,
-                environment: execution_plan.environment,
+                working_dir: execution_plan.working_dir.clone(),
+                environment: execution_plan.environment.clone(),
                 selected_skills: Vec::new(),
             })
             .await
             .map_err(|err| KernelError::Runtime(err.to_string()))?;
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let turn_outcome = timeout(
-            execution_plan.hard_timeout,
-            adapter.turn(
-                RuntimeTurnInput {
-                    runtime_session_id: handle.runtime_session_id.clone(),
-                    prompt,
-                    selected_skills: Vec::new(),
-                },
-                event_tx,
-            ),
-        )
+        let turn_input = RuntimeTurnInput {
+            runtime_session_id: handle.runtime_session_id.clone(),
+            prompt,
+            selected_skills: Vec::new(),
+        };
+        let turn_outcome = timeout(execution_plan.hard_timeout, async {
+            match adapter.turn_mode() {
+                RuntimeTurnMode::Direct => adapter.turn(turn_input, event_tx).await,
+                RuntimeTurnMode::ProgramBacked => {
+                    execute_program_backed_turn(
+                        adapter.as_ref(),
+                        execution_plan,
+                        turn_input,
+                        event_tx,
+                    )
+                    .await
+                }
+            }
+        })
         .await;
 
         let outcome = match turn_outcome {
@@ -3518,6 +3527,7 @@ struct RuntimeTurnExecution<'a> {
     runtime_id: &'a str,
     session_id: Uuid,
     handle: &'a RuntimeSessionHandle,
+    execution_plan: EffectiveExecutionPlan,
     idle_timeout: Duration,
     hard_timeout: Duration,
     input: RuntimeTurnInput,
@@ -3819,6 +3829,7 @@ impl Kernel {
                 runtime_id: &runtime_id,
                 session_id: session.session_id,
                 handle: &handle,
+                execution_plan: execution_plan.clone(),
                 idle_timeout: execution_plan.idle_timeout,
                 hard_timeout: execution_plan.hard_timeout,
                 input: RuntimeTurnInput {
@@ -4955,6 +4966,7 @@ impl Kernel {
             runtime_id,
             session_id,
             handle,
+            execution_plan,
             idle_timeout,
             hard_timeout,
             input,
@@ -5003,8 +5015,20 @@ impl Kernel {
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let adapter_for_task = adapter.clone();
-        let mut turn_task =
-            tokio::spawn(async move { adapter_for_task.turn(input, event_tx).await });
+        let mut turn_task = tokio::spawn(async move {
+            match adapter_for_task.turn_mode() {
+                RuntimeTurnMode::Direct => adapter_for_task.turn(input, event_tx).await,
+                RuntimeTurnMode::ProgramBacked => {
+                    execute_program_backed_turn(
+                        adapter_for_task.as_ref(),
+                        execution_plan,
+                        input,
+                        event_tx,
+                    )
+                    .await
+                }
+            }
+        });
         let idle_sleep = sleep(idle_timeout);
         tokio::pin!(idle_sleep);
         let hard_sleep = sleep(hard_timeout);

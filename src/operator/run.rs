@@ -433,7 +433,10 @@ mod tests {
     use crate::{
         contracts::{StreamEventDto, StreamEventKindDto, StreamLaneDto},
         home::LionClawHome,
-        kernel::db::Db,
+        kernel::{
+            db::Db,
+            runtime::{ConfinementConfig, OciConfinementConfig},
+        },
         operator::config::{OperatorConfig, RuntimeProfileConfig},
     };
 
@@ -452,14 +455,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         );
 
         let mut config = OperatorConfig::default();
-        config.upsert_runtime(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: stub.to_string_lossy().to_string(),
-                model: None,
-                confinement: None,
-            },
-        );
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
@@ -502,14 +498,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         );
 
         let mut config = OperatorConfig::default();
-        config.upsert_runtime(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: stub.to_string_lossy().to_string(),
-                model: None,
-                confinement: None,
-            },
-        );
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
 
         let mut first_input = Cursor::new(b"hello\n/exit\n".to_vec());
@@ -554,14 +543,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         );
 
         let mut config = OperatorConfig::default();
-        config.upsert_runtime(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: stub.to_string_lossy().to_string(),
-                model: None,
-                confinement: None,
-            },
-        );
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
 
         let mut first_input = Cursor::new(b"hello\n/exit\n".to_vec());
@@ -634,14 +616,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         write_script(&stub, "#!/usr/bin/env bash\ncat >/dev/null\n");
 
         let mut config = OperatorConfig::default();
-        config.upsert_runtime(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: stub.to_string_lossy().to_string(),
-                model: None,
-                confinement: None,
-            },
-        );
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
         let pool = Db::connect_file(&home.db_path())
             .await
@@ -700,14 +675,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         }
 
         let mut config = OperatorConfig::default();
-        config.upsert_runtime(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: stub.to_string_lossy().to_string(),
-                model: None,
-                confinement: None,
-            },
-        );
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
 
         let mut input = Cursor::new(b"/reset\n/exit\n".to_vec());
@@ -743,14 +711,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         }
 
         let mut config = OperatorConfig::default();
-        config.upsert_runtime(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: stub.to_string_lossy().to_string(),
-                model: None,
-                confinement: None,
-            },
-        );
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
 
         let mut input = Cursor::new(b"/exit\n".to_vec());
@@ -867,5 +828,17 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         std::fs::rename(&temp_path, path).expect("rename script");
         let permissions = std::fs::Permissions::from_mode(0o755);
         std::fs::set_permissions(path, permissions).expect("chmod script");
+    }
+
+    fn stubbed_codex_runtime(executable: &std::path::Path) -> RuntimeProfileConfig {
+        RuntimeProfileConfig::Codex {
+            executable: executable.to_string_lossy().to_string(),
+            model: None,
+            confinement: Some(ConfinementConfig::Oci(OciConfinementConfig {
+                engine: executable.to_string_lossy().to_string(),
+                image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                ..OciConfinementConfig::default()
+            })),
+        }
     }
 }

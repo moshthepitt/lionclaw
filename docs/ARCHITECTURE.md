@@ -117,8 +117,8 @@ Runtime module layout:
 - `kernel/runtime/execution/oci.rs`: rootless OCI backend and typed command builder.
 - `kernel/runtime/execution/process.rs`: shared process execution utility for adapters and backends.
 - `kernel/runtime/adapters/mock.rs`: deterministic test adapter.
-- `kernel/runtime/adapters/codex.rs`: production subprocess adapter.
-- `kernel/runtime/adapters/opencode.rs`: production subprocess adapter.
+- `kernel/runtime/adapters/codex.rs`: production program-backed adapter for Codex protocol details.
+- `kernel/runtime/adapters/opencode.rs`: production program-backed adapter for OpenCode protocol details.
 
 Channel bridge layout:
 
