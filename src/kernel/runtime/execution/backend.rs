@@ -137,6 +137,8 @@ mod tests {
 
         assert_eq!(mount.mounted_name(), same_mount.mounted_name());
         assert_ne!(mount.mounted_name(), other_mount.mounted_name());
-        assert!(mount.mounted_name().starts_with(RUNTIME_SECRETS_NAME_PREFIX));
+        assert!(mount
+            .mounted_name()
+            .starts_with(RUNTIME_SECRETS_NAME_PREFIX));
     }
 }
