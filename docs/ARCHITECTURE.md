@@ -135,6 +135,10 @@ The everyday confined runtime layout is mount-first:
 
 The execution planner also injects stable runtime-private environment defaults such as `HOME=/runtime/home` and `LIONCLAW_DRAFTS_DIR=/drafts` so program-backed runtimes keep ephemeral state out of LionClaw continuity.
 
+Current runtime network policy is intentionally coarse: presets choose only
+`network-mode = "on"` or `network-mode = "none"`. LionClaw does not expose a
+fake allowlist mode before a real egress-control plane exists.
+
 Runtime secrets are loaded from `~/.lionclaw/config/runtime-secrets.env`.
 Presets either mount that whole file or mount no runtime secrets at all with
 `mount-runtime-secrets = true|false`, and the OCI backend mounts it read-only

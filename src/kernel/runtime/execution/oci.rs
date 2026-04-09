@@ -59,12 +59,6 @@ fn build_oci_process_invocation(request: &ExecutionRequest) -> Result<ProcessInv
             args.push("none".to_string());
         }
         NetworkMode::On => {}
-        NetworkMode::Allowlist => {
-            bail!(
-                "runtime '{}' requests network allowlist mode, which the OCI backend does not implement yet",
-                request.plan.runtime_id
-            );
-        }
     }
 
     if let Some(working_dir) = request.plan.working_dir.as_deref() {
@@ -411,18 +405,18 @@ mod tests {
     }
 
     #[test]
-    fn oci_backend_rejects_allowlist_network_mode() {
-        let mut plan = sample_plan();
-        plan.network_mode = NetworkMode::Allowlist;
-
-        let err = build_oci_process_invocation(&ExecutionRequest {
-            plan,
+    fn oci_backend_leaves_network_unset_for_on_mode() {
+        let invocation = build_oci_process_invocation(&ExecutionRequest {
+            plan: sample_plan(),
             program: RuntimeProgramSpec::default(),
             runtime_secrets_mount: None,
         })
-        .expect_err("allowlist should fail");
+        .expect("invocation");
 
-        assert!(err.to_string().contains("does not implement yet"));
+        assert!(
+            !invocation.args.iter().any(|arg| arg == "--network"),
+            "network=on should use the engine default private network mode"
+        );
     }
 
     #[test]

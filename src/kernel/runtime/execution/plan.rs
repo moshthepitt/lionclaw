@@ -67,7 +67,6 @@ impl WorkspaceAccess {
 pub enum NetworkMode {
     None,
     On,
-    Allowlist,
 }
 
 impl NetworkMode {
@@ -75,7 +74,6 @@ impl NetworkMode {
         match self {
             Self::None => "none",
             Self::On => "on",
-            Self::Allowlist => "allowlist",
         }
     }
 }
@@ -307,6 +305,19 @@ mod tests {
             limits.get("pids-limit").and_then(|raw| raw.as_u64()),
             Some(512)
         );
+    }
+
+    #[test]
+    fn execution_preset_rejects_allowlist_network_mode() {
+        let err = serde_json::from_value::<ExecutionPreset>(json!({
+            "workspace-access": "read-write",
+            "network-mode": "allowlist",
+            "mount-runtime-secrets": false
+        }))
+        .expect_err("allowlist network mode should be rejected");
+
+        assert!(err.to_string().contains("unknown variant"));
+        assert!(err.to_string().contains("allowlist"));
     }
 
     #[test]

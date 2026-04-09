@@ -160,6 +160,8 @@ Normal user flow:
 
 Runtime definitions, execution presets, and confinement settings live in
 `~/.lionclaw/config/lionclaw.toml`, not in ad hoc shell configuration.
+For now, runtime network policy is intentionally coarse:
+`network-mode = "on"` or `network-mode = "none"`.
 
 Runtime secrets live separately in `~/.lionclaw/config/runtime-secrets.env`.
 Presets either mount that whole file or mount no runtime secrets at all with
