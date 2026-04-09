@@ -6,5 +6,6 @@ pub mod lockfile;
 pub mod reconcile;
 pub mod run;
 pub mod runtime;
+pub mod runtime_secrets;
 pub mod services;
 pub mod snapshot;

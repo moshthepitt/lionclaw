@@ -14,7 +14,7 @@ pub use oci::OciExecutionBackend;
 pub use plan::{
     ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionLimits,
     ExecutionPreset, MountAccess, MountSpec, NetworkMode, OciConfinementConfig, RuntimeProgramSpec,
-    SecretBinding, SecretBindingKind, WorkspaceAccess,
+    WorkspaceAccess,
 };
 pub use planner::{
     ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig, RuntimeExecutionProfile,

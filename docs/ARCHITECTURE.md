@@ -135,6 +135,10 @@ The everyday confined runtime layout is mount-first:
 
 The execution planner also injects stable runtime-private environment defaults such as `HOME=/runtime/home` and `LIONCLAW_DRAFTS_DIR=/drafts` so program-backed runtimes keep ephemeral state out of LionClaw continuity.
 
+Runtime env secrets are loaded from `~/.lionclaw/config/runtime-secrets.env`.
+Presets opt into specific names with `secret_env = [...]`, and the planner
+injects only those listed variables into the confined runtime environment.
+
 Channel bridge layout:
 
 - `kernel/channel_state.rs`: durable channel bindings/peers/offsets/messages + stream event/cursor storage.

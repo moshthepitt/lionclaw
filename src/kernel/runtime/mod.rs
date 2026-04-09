@@ -22,7 +22,7 @@ pub use execution::{
     ExecutionLimits, ExecutionOutput, ExecutionPlanRequest, ExecutionPlanner,
     ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, MountAccess, MountSpec, NetworkMode,
     OciConfinementConfig, OciExecutionBackend, RuntimeExecutionProfile, RuntimeProgramSpec,
-    SecretBinding, SecretBindingKind, WorkspaceAccess, BUILTIN_PRESET_EVERYDAY,
+    WorkspaceAccess, BUILTIN_PRESET_EVERYDAY,
 };
 
 #[derive(Debug, Clone)]

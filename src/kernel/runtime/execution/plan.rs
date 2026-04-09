@@ -19,7 +19,7 @@ pub struct ExecutionPreset {
     pub workspace_access: WorkspaceAccess,
     pub network_mode: NetworkMode,
     #[serde(default)]
-    pub secret_bindings: Vec<SecretBinding>,
+    pub secret_env: Vec<String>,
     #[serde(default)]
     pub escape_classes: BTreeSet<EscapeClass>,
 }
@@ -29,7 +29,7 @@ impl Default for ExecutionPreset {
         Self {
             workspace_access: WorkspaceAccess::ReadWrite,
             network_mode: NetworkMode::On,
-            secret_bindings: Vec::new(),
+            secret_env: Vec::new(),
             escape_classes: BTreeSet::new(),
         }
     }
@@ -67,22 +67,6 @@ impl NetworkMode {
             Self::Allowlist => "allowlist",
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct SecretBinding {
-    pub name: String,
-    pub kind: SecretBindingKind,
-    #[serde(default)]
-    pub target_env: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SecretBindingKind {
-    LaunchEnv,
-    Brokered,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Hash)]
@@ -226,7 +210,7 @@ pub struct EffectiveExecutionPlan {
     pub idle_timeout: Duration,
     pub hard_timeout: Duration,
     pub mounts: Vec<MountSpec>,
-    pub secret_bindings: Vec<SecretBinding>,
+    pub secret_env: Vec<String>,
     pub escape_classes: BTreeSet<EscapeClass>,
     pub limits: ExecutionLimits,
 }
@@ -235,21 +219,14 @@ pub struct EffectiveExecutionPlan {
 mod tests {
     use serde_json::json;
 
-    use super::{
-        ConfinementConfig, EscapeClass, ExecutionPreset, NetworkMode, SecretBinding,
-        SecretBindingKind, WorkspaceAccess,
-    };
+    use super::{ConfinementConfig, EscapeClass, ExecutionPreset, NetworkMode, WorkspaceAccess};
 
     #[test]
     fn execution_preset_round_trips_without_embedded_name() {
         let preset = ExecutionPreset {
             workspace_access: WorkspaceAccess::ReadWrite,
             network_mode: NetworkMode::On,
-            secret_bindings: vec![SecretBinding {
-                name: "github".to_string(),
-                kind: SecretBindingKind::LaunchEnv,
-                target_env: Some("GITHUB_TOKEN".to_string()),
-            }],
+            secret_env: vec!["GITHUB_TOKEN".to_string()],
             escape_classes: [EscapeClass::SecretRequest].into_iter().collect(),
         };
 

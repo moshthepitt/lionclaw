@@ -31,6 +31,7 @@ pub struct ExecutionPlannerConfig {
     pub default_preset_name: Option<String>,
     pub presets: BTreeMap<String, ExecutionPreset>,
     pub runtimes: BTreeMap<String, RuntimeExecutionProfile>,
+    pub runtime_secrets: BTreeMap<String, String>,
     pub workspace_root: Option<PathBuf>,
     pub project_workspace_root: Option<PathBuf>,
     pub runtime_root: Option<PathBuf>,
@@ -54,6 +55,7 @@ pub struct ExecutionPlanner {
     default_preset_name: Option<String>,
     presets: BTreeMap<String, ExecutionPreset>,
     runtimes: BTreeMap<String, RuntimeExecutionProfile>,
+    runtime_secrets: BTreeMap<String, String>,
     workspace_root: Option<PathBuf>,
     project_workspace_root: Option<PathBuf>,
     runtime_root: Option<PathBuf>,
@@ -69,6 +71,7 @@ impl ExecutionPlanner {
             default_preset_name: config.default_preset_name,
             presets: config.presets,
             runtimes: config.runtimes,
+            runtime_secrets: config.runtime_secrets,
             workspace_root: config.workspace_root,
             project_workspace_root: config.project_workspace_root,
             runtime_root: config.runtime_root,
@@ -101,6 +104,8 @@ impl ExecutionPlanner {
         };
         let environment = build_runtime_environment(
             execution_context.environment,
+            &preset.secret_env,
+            &self.runtime_secrets,
             mounts
                 .iter()
                 .any(|mount| mount.target == WORKSPACE_MOUNT_TARGET),
@@ -110,7 +115,7 @@ impl ExecutionPlanner {
             mounts
                 .iter()
                 .any(|mount| mount.target == DRAFTS_MOUNT_TARGET),
-        );
+        )?;
 
         Ok(EffectiveExecutionPlan {
             runtime_id: request.runtime_id,
@@ -123,7 +128,7 @@ impl ExecutionPlanner {
             idle_timeout: execution_context.idle_timeout,
             hard_timeout: execution_context.hard_timeout,
             mounts,
-            secret_bindings: preset.secret_bindings,
+            secret_env: preset.secret_env,
             escape_classes: preset.escape_classes,
             limits,
         })
@@ -217,10 +222,12 @@ fn workspace_access_to_mount_access(access: WorkspaceAccess) -> MountAccess {
 
 fn build_runtime_environment(
     mut passthrough_environment: Vec<(String, String)>,
+    secret_env: &[String],
+    runtime_secrets: &BTreeMap<String, String>,
     has_workspace_mount: bool,
     has_runtime_mount: bool,
     has_drafts_mount: bool,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>, String> {
     if has_workspace_mount {
         passthrough_environment.push((
             "LIONCLAW_WORKSPACE_DIR".to_string(),
@@ -257,8 +264,16 @@ fn build_runtime_environment(
         ));
     }
 
+    for key in secret_env {
+        let value = runtime_secrets
+            .get(key)
+            .cloned()
+            .ok_or_else(|| format!("runtime secret env '{}' is not configured", key))?;
+        passthrough_environment.push((key.clone(), value));
+    }
+
     passthrough_environment.push(("TMPDIR".to_string(), "/tmp".to_string()));
-    passthrough_environment
+    Ok(passthrough_environment)
 }
 
 #[cfg(test)]
@@ -284,6 +299,7 @@ mod tests {
             default_preset_name: None,
             presets: BTreeMap::new(),
             runtimes: BTreeMap::new(),
+            runtime_secrets: BTreeMap::new(),
             workspace_root: None,
             project_workspace_root: None,
             runtime_root: None,
@@ -335,6 +351,7 @@ mod tests {
             default_preset_name: None,
             presets: BTreeMap::new(),
             runtimes,
+            runtime_secrets: BTreeMap::new(),
             workspace_root: Some(workspace_root.clone()),
             project_workspace_root: None,
             runtime_root: Some(runtime_root.clone()),
@@ -401,6 +418,7 @@ mod tests {
             default_preset_name: Some("missing".to_string()),
             presets: BTreeMap::new(),
             runtimes: BTreeMap::new(),
+            runtime_secrets: BTreeMap::new(),
             workspace_root: None,
             project_workspace_root: None,
             runtime_root: None,
@@ -448,6 +466,7 @@ mod tests {
             default_preset_name: Some("readonly".to_string()),
             presets,
             runtimes: BTreeMap::new(),
+            runtime_secrets: BTreeMap::new(),
             workspace_root: Some(sandbox.path().join("workspace")),
             project_workspace_root: None,
             runtime_root: None,
@@ -474,5 +493,87 @@ mod tests {
         );
         assert_eq!(plan.idle_timeout, Duration::from_secs(45));
         assert_eq!(plan.hard_timeout, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn planner_injects_configured_runtime_secret_env() {
+        let presets = [(
+            "everyday".to_string(),
+            ExecutionPreset {
+                secret_env: vec!["GITHUB_TOKEN".to_string()],
+                ..ExecutionPreset::default()
+            },
+        )]
+        .into_iter()
+        .collect();
+        let runtime_secrets = [("GITHUB_TOKEN".to_string(), "ghp_test".to_string())]
+            .into_iter()
+            .collect();
+        let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: RuntimeExecutionPolicy::default(),
+            default_preset_name: Some("everyday".to_string()),
+            presets,
+            runtimes: BTreeMap::new(),
+            runtime_secrets,
+            workspace_root: None,
+            project_workspace_root: None,
+            runtime_root: None,
+            workspace_name: None,
+            default_idle_timeout: Duration::from_secs(30),
+            default_hard_timeout: Duration::from_secs(90),
+        });
+
+        let plan = planner
+            .plan(ExecutionPlanRequest {
+                runtime_id: "codex".to_string(),
+                preset_name: None,
+                working_dir: None,
+                env_passthrough_keys: Vec::new(),
+                timeout_ms: None,
+            })
+            .expect("plan");
+
+        assert_eq!(plan.secret_env, vec!["GITHUB_TOKEN".to_string()]);
+        assert!(plan
+            .environment
+            .contains(&("GITHUB_TOKEN".to_string(), "ghp_test".to_string())));
+    }
+
+    #[test]
+    fn planner_rejects_missing_runtime_secret_env() {
+        let presets = [(
+            "everyday".to_string(),
+            ExecutionPreset {
+                secret_env: vec!["GITHUB_TOKEN".to_string()],
+                ..ExecutionPreset::default()
+            },
+        )]
+        .into_iter()
+        .collect();
+        let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: RuntimeExecutionPolicy::default(),
+            default_preset_name: Some("everyday".to_string()),
+            presets,
+            runtimes: BTreeMap::new(),
+            runtime_secrets: BTreeMap::new(),
+            workspace_root: None,
+            project_workspace_root: None,
+            runtime_root: None,
+            workspace_name: None,
+            default_idle_timeout: Duration::from_secs(30),
+            default_hard_timeout: Duration::from_secs(90),
+        });
+
+        let err = planner
+            .plan(ExecutionPlanRequest {
+                runtime_id: "codex".to_string(),
+                preset_name: None,
+                working_dir: None,
+                env_passthrough_keys: Vec::new(),
+                timeout_ms: None,
+            })
+            .expect_err("missing runtime secret should fail");
+
+        assert!(err.contains("runtime secret env 'GITHUB_TOKEN' is not configured"));
     }
 }

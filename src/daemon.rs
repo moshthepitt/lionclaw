@@ -13,6 +13,7 @@ use crate::{
     operator::{
         config::OperatorConfig,
         runtime::{configured_runtime_execution_profiles, register_configured_runtimes},
+        runtime_secrets::load_runtime_secrets,
     },
 };
 
@@ -33,6 +34,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .default_runtime_id
         .clone()
         .or_else(|| operator_config.defaults.runtime.clone());
+    let runtime_secrets = load_runtime_secrets(&config.home).await?;
 
     let kernel = Arc::new(
         Kernel::new_with_options(
@@ -48,6 +50,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 default_preset_name: operator_config.defaults.preset.clone(),
                 execution_presets: operator_config.presets.clone(),
                 runtime_execution_profiles: configured_runtime_execution_profiles(&operator_config),
+                runtime_secrets,
                 workspace_root: Some(workspace_root),
                 project_workspace_root: Some(project_workspace_root),
                 runtime_root: Some(config.home.runtime_dir()),

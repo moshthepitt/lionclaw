@@ -161,6 +161,10 @@ Normal user flow:
 Runtime definitions, execution presets, and confinement settings live in
 `~/.lionclaw/config/lionclaw.toml`, not in ad hoc shell configuration.
 
+Runtime env secrets live separately in `~/.lionclaw/config/runtime-secrets.env`.
+Presets bind them by name with `secret_env = ["GITHUB_TOKEN"]`, and LionClaw
+injects only those listed variables into the confined runtime.
+
 Inside `lionclaw run`, recovery stays command-first:
 
 - `/continue`

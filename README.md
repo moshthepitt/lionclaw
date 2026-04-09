@@ -201,6 +201,11 @@ Override the root with `LIONCLAW_HOME`.
 Runtime profiles, execution presets, and confinement settings live in
 `~/.lionclaw/config/lionclaw.toml`.
 
+Runtime env secrets for confined runtimes live separately in
+`~/.lionclaw/config/runtime-secrets.env`. Presets opt into specific variables
+with `secret_env = ["GITHUB_TOKEN", "OPENAI_API_KEY"]`; LionClaw injects only
+those names into the runtime environment.
+
 `lionclaw runtime add` configures the runtime command that runs inside the
 confinement image, plus the concrete host OCI engine path and image LionClaw
 uses to launch it. Execution policy remains config-owned in LionClaw state, not

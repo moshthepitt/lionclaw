@@ -1016,6 +1016,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "cron",
+ "dotenvy",
  "hex",
  "http-body-util",
  "hyper",

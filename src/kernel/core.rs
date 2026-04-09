@@ -93,6 +93,7 @@ pub struct KernelOptions {
     pub default_preset_name: Option<String>,
     pub execution_presets: BTreeMap<String, ExecutionPreset>,
     pub runtime_execution_profiles: BTreeMap<String, RuntimeExecutionProfile>,
+    pub runtime_secrets: BTreeMap<String, String>,
     pub workspace_root: Option<PathBuf>,
     pub project_workspace_root: Option<PathBuf>,
     pub runtime_root: Option<PathBuf>,
@@ -110,6 +111,7 @@ impl Default for KernelOptions {
             default_preset_name: None,
             execution_presets: BTreeMap::new(),
             runtime_execution_profiles: BTreeMap::new(),
+            runtime_secrets: BTreeMap::new(),
             workspace_root: None,
             project_workspace_root: None,
             runtime_root: None,
@@ -194,6 +196,7 @@ impl Kernel {
             default_preset_name: options.default_preset_name.clone(),
             presets: options.execution_presets.clone(),
             runtimes: options.runtime_execution_profiles.clone(),
+            runtime_secrets: options.runtime_secrets.clone(),
             workspace_root: options.workspace_root.clone(),
             project_workspace_root: options.project_workspace_root.clone(),
             runtime_root: options.runtime_root.clone(),
@@ -4916,7 +4919,7 @@ impl Kernel {
                             "effective_env_passthrough_count": request_env.len(),
                             "effective_environment_count": plan.environment.len(),
                             "network_mode": plan.network_mode.as_str(),
-                            "secret_bindings": plan.secret_bindings.iter().map(|binding| binding.name.clone()).collect::<Vec<_>>(),
+                            "secret_env": plan.secret_env.clone(),
                             "escape_classes": plan.escape_classes.iter().map(|class| class.as_str()).collect::<Vec<_>>(),
                             "mounts": plan.mounts.iter().map(|mount| {
                                 json!({

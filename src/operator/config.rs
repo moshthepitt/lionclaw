@@ -440,23 +440,13 @@ impl RuntimeProfileConfig {
 }
 
 fn normalize_execution_preset(preset: &mut ExecutionPreset) {
-    preset.secret_bindings = std::mem::take(&mut preset.secret_bindings)
+    preset.secret_env = std::mem::take(&mut preset.secret_env)
         .into_iter()
-        .filter_map(|mut binding| {
-            binding.name = binding.name.trim().to_string();
-            binding.target_env = binding
-                .target_env
-                .as_ref()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty());
-            if binding.name.is_empty() {
-                return None;
-            }
-            Some(binding)
-        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
         .collect();
-    preset.secret_bindings.sort();
-    preset.secret_bindings.dedup();
+    preset.secret_env.sort();
+    preset.secret_env.dedup();
 }
 
 fn normalize_confinement_config(config: &mut ConfinementConfig) {
@@ -601,8 +591,7 @@ mod tests {
         ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig,
     };
     use crate::kernel::runtime::{
-        ConfinementConfig, ExecutionPreset, NetworkMode, OciConfinementConfig, SecretBinding,
-        SecretBindingKind, WorkspaceAccess,
+        ConfinementConfig, ExecutionPreset, NetworkMode, OciConfinementConfig, WorkspaceAccess,
     };
 
     #[test]
@@ -723,7 +712,7 @@ mod tests {
             ExecutionPreset {
                 workspace_access: WorkspaceAccess::ReadWrite,
                 network_mode: NetworkMode::On,
-                secret_bindings: Vec::new(),
+                secret_env: Vec::new(),
                 escape_classes: Default::default(),
             },
         );
@@ -739,7 +728,7 @@ mod tests {
             ExecutionPreset {
                 workspace_access: WorkspaceAccess::ReadWrite,
                 network_mode: NetworkMode::On,
-                secret_bindings: Vec::new(),
+                secret_env: Vec::new(),
                 escape_classes: Default::default(),
             },
         );
@@ -749,32 +738,21 @@ mod tests {
     }
 
     #[test]
-    fn preset_normalization_trims_keys_and_dedupes_secret_bindings() {
+    fn preset_normalization_trims_keys_and_dedupes_secret_env() {
         let mut config = OperatorConfig::default();
         config.upsert_preset(
             "  everyday  ".to_string(),
             ExecutionPreset {
                 workspace_access: WorkspaceAccess::ReadWrite,
                 network_mode: NetworkMode::On,
-                secret_bindings: vec![
-                    SecretBinding {
-                        name: "github".to_string(),
-                        kind: SecretBindingKind::LaunchEnv,
-                        target_env: Some("GITHUB_TOKEN".to_string()),
-                    },
-                    SecretBinding {
-                        name: "github".to_string(),
-                        kind: SecretBindingKind::LaunchEnv,
-                        target_env: Some("GITHUB_TOKEN".to_string()),
-                    },
-                ],
+                secret_env: vec![" GITHUB_TOKEN ".to_string(), "GITHUB_TOKEN".to_string()],
                 escape_classes: Default::default(),
             },
         );
 
         assert!(config.preset("  everyday  ").is_none());
         let preset = config.preset("everyday").expect("normalized preset");
-        assert_eq!(preset.secret_bindings.len(), 1);
+        assert_eq!(preset.secret_env, vec!["GITHUB_TOKEN".to_string()]);
     }
 
     #[cfg(unix)]

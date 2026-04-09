@@ -422,7 +422,7 @@ mod tests {
                     access: MountAccess::ReadOnly,
                 },
             ],
-            secret_bindings: Vec::new(),
+            secret_env: Vec::new(),
             escape_classes: Default::default(),
             limits: ExecutionLimits {
                 memory_limit: Some("4g".to_string()),

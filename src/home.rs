@@ -46,6 +46,10 @@ impl LionClawHome {
         self.config_dir().join("lionclaw.toml")
     }
 
+    pub fn runtime_secrets_env_path(&self) -> PathBuf {
+        self.config_dir().join("runtime-secrets.env")
+    }
+
     pub fn home_id_path(&self) -> PathBuf {
         self.config_dir().join("home-id")
     }
@@ -170,6 +174,10 @@ mod tests {
         assert_eq!(
             home.config_path(),
             std::path::PathBuf::from("/tmp/lionclaw-home/config/lionclaw.toml")
+        );
+        assert_eq!(
+            home.runtime_secrets_env_path(),
+            std::path::PathBuf::from("/tmp/lionclaw-home/config/runtime-secrets.env")
         );
         assert_eq!(
             home.home_id_path(),
