@@ -10,7 +10,10 @@ use crate::{
     config::Config,
     contracts::DaemonInfoResponse,
     kernel::{Kernel, KernelOptions},
-    operator::{config::OperatorConfig, runtime::register_configured_runtimes},
+    operator::{
+        config::OperatorConfig,
+        runtime::{configured_runtime_execution_profiles, register_configured_runtimes},
+    },
 };
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
@@ -42,8 +45,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                     config.runtime_turn_hard_timeout_ms,
                 ),
                 default_runtime_id,
+                default_preset_name: operator_config.defaults.preset.clone(),
+                execution_presets: operator_config.presets.clone(),
+                runtime_execution_profiles: configured_runtime_execution_profiles(&operator_config),
                 workspace_root: Some(workspace_root),
                 project_workspace_root: Some(project_workspace_root),
+                runtime_root: Some(config.home.runtime_dir()),
+                workspace_name: Some(operator_config.daemon.workspace.clone()),
                 ..KernelOptions::default()
             },
         )

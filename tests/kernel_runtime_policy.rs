@@ -59,19 +59,20 @@ async fn runtime_policy_allows_configured_execution_overrides() {
     let policy_events = kernel
         .query_audit(
             Some(session.session_id),
-            Some("runtime.policy.allow".to_string()),
+            Some("runtime.plan.allow".to_string()),
             None,
             Some(10),
         )
         .await
-        .expect("query policy audit");
+        .expect("query plan audit");
 
     assert_eq!(
         policy_events.events.len(),
         1,
-        "one policy allow event expected"
+        "one plan allow event expected"
     );
     let details = &policy_events.events[0].details;
+    assert_eq!(details["effective_preset_name"].as_str(), Some("everyday"));
     assert_eq!(details["effective_timeout_ms"].as_u64(), Some(750));
     assert_eq!(details["effective_hard_timeout_ms"].as_u64(), Some(900));
     assert_eq!(details["effective_env_passthrough_count"].as_u64(), Some(1));
@@ -117,18 +118,14 @@ async fn runtime_policy_denies_unallowed_env_passthrough() {
     let deny_events = kernel
         .query_audit(
             Some(session.session_id),
-            Some("runtime.policy.deny".to_string()),
+            Some("runtime.plan.deny".to_string()),
             None,
             Some(10),
         )
         .await
         .expect("query deny audit");
 
-    assert_eq!(
-        deny_events.events.len(),
-        1,
-        "one policy deny event expected"
-    );
+    assert_eq!(deny_events.events.len(), 1, "one plan deny event expected");
     assert!(
         deny_events.events[0].details["reason"]
             .as_str()

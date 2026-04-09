@@ -14,7 +14,10 @@ use crate::{
         },
         daemon_probe::{classify_daemon, DaemonClassification},
         lockfile::{LockedChannel, LockedSkill, OperatorLockfile},
-        runtime::{register_configured_runtimes, validate_runtime_availability},
+        runtime::{
+            configured_runtime_execution_profiles, register_configured_runtimes,
+            validate_runtime_availability,
+        },
         services::{
             channel_unit_name, render_channel_unit, render_daemon_unit, unit_status_is_active,
             ChannelServiceSpec, ManagedServiceUnit, ServiceManager, DAEMON_UNIT_NAME,
@@ -691,8 +694,13 @@ pub(crate) async fn open_kernel(
         &home.db_path(),
         KernelOptions {
             default_runtime_id: default_runtime_id.or_else(|| config.defaults.runtime.clone()),
+            default_preset_name: config.defaults.preset.clone(),
+            execution_presets: config.presets.clone(),
+            runtime_execution_profiles: configured_runtime_execution_profiles(config),
             workspace_root: Some(workspace_root),
             project_workspace_root: Some(project_workspace_root),
+            runtime_root: Some(home.runtime_dir()),
+            workspace_name: Some(config.daemon.workspace.clone()),
             ..KernelOptions::default()
         },
     )

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -59,12 +59,13 @@ use super::{
     },
     policy::{Capability, PolicyStore, Scope},
     runtime::{
-        register_builtin_runtime_adapters, HiddenTurnSupport, RuntimeAdapter,
-        RuntimeCapabilityRequest, RuntimeCapabilityResult, RuntimeEvent, RuntimeMessageLane,
-        RuntimeRegistry, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
-        RuntimeTurnResult,
+        register_builtin_runtime_adapters, EffectiveExecutionPlan, ExecutionPlanRequest,
+        ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset, HiddenTurnSupport,
+        RuntimeAdapter, RuntimeCapabilityRequest, RuntimeCapabilityResult, RuntimeEvent,
+        RuntimeExecutionProfile, RuntimeMessageLane, RuntimeRegistry, RuntimeSessionHandle,
+        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
     },
-    runtime_policy::{RuntimeExecutionContext, RuntimeExecutionPolicy, RuntimeExecutionRequest},
+    runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
     selector::SkillSelector,
     session_compactions::SessionCompactionStore,
@@ -88,8 +89,13 @@ pub struct KernelOptions {
     pub runtime_turn_hard_timeout: Duration,
     pub runtime_execution_policy: RuntimeExecutionPolicy,
     pub default_runtime_id: Option<String>,
+    pub default_preset_name: Option<String>,
+    pub execution_presets: BTreeMap<String, ExecutionPreset>,
+    pub runtime_execution_profiles: BTreeMap<String, RuntimeExecutionProfile>,
     pub workspace_root: Option<PathBuf>,
     pub project_workspace_root: Option<PathBuf>,
+    pub runtime_root: Option<PathBuf>,
+    pub workspace_name: Option<String>,
     pub scheduler: SchedulerConfig,
 }
 
@@ -100,8 +106,13 @@ impl Default for KernelOptions {
             runtime_turn_hard_timeout: Duration::from_secs(600),
             runtime_execution_policy: RuntimeExecutionPolicy::default(),
             default_runtime_id: None,
+            default_preset_name: None,
+            execution_presets: BTreeMap::new(),
+            runtime_execution_profiles: BTreeMap::new(),
             workspace_root: None,
             project_workspace_root: None,
+            runtime_root: None,
+            workspace_name: None,
             scheduler: SchedulerConfig::default(),
         }
     }
@@ -125,9 +136,7 @@ pub struct Kernel {
     channel_turn_workers: Arc<RwLock<HashSet<String>>>,
     session_locks: Arc<RwLock<HashMap<Uuid, Arc<Mutex<()>>>>>,
     active_continuity_refresh_lock: Arc<Mutex<()>>,
-    runtime_turn_idle_timeout: Duration,
-    runtime_turn_hard_timeout: Duration,
-    runtime_execution_policy: RuntimeExecutionPolicy,
+    execution_planner: ExecutionPlanner,
     default_runtime_id: Option<String>,
     workspace_root: Option<PathBuf>,
     continuity: Option<ContinuityLayout>,
@@ -179,6 +188,18 @@ impl Kernel {
                 Some(ContinuityIndexStore::new(pool.clone())),
             )
         });
+        let execution_planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: options.runtime_execution_policy.clone(),
+            default_preset_name: options.default_preset_name.clone(),
+            presets: options.execution_presets.clone(),
+            runtimes: options.runtime_execution_profiles.clone(),
+            workspace_root: options.workspace_root.clone(),
+            project_workspace_root: options.project_workspace_root.clone(),
+            runtime_root: options.runtime_root.clone(),
+            workspace_name: options.workspace_name.clone(),
+            default_idle_timeout: runtime_turn_idle_timeout,
+            default_hard_timeout: runtime_turn_hard_timeout,
+        });
 
         let kernel = Self {
             sessions: SessionStore::new(pool.clone()),
@@ -197,9 +218,7 @@ impl Kernel {
             channel_turn_workers: Arc::new(RwLock::new(HashSet::new())),
             session_locks: Arc::new(RwLock::new(HashMap::new())),
             active_continuity_refresh_lock: Arc::new(Mutex::new(())),
-            runtime_turn_idle_timeout,
-            runtime_turn_hard_timeout,
-            runtime_execution_policy: options.runtime_execution_policy,
+            execution_planner,
             default_runtime_id: options.default_runtime_id,
             workspace_root: options.workspace_root,
             continuity,
@@ -2279,25 +2298,31 @@ impl Kernel {
                 runtime_id
             )));
         }
-        let execution_context = self
-            .resolve_runtime_execution_context(
+        let execution_plan = self
+            .resolve_runtime_execution_plan(
                 session_id,
                 runtime_id,
-                RuntimeExecutionRequest::new(None, Vec::new(), Some(30_000)),
+                ExecutionPlanRequest {
+                    runtime_id: runtime_id.to_string(),
+                    preset_name: None,
+                    working_dir: None,
+                    env_passthrough_keys: Vec::new(),
+                    timeout_ms: Some(30_000),
+                },
             )
             .await?;
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
                 session_id: Uuid::new_v4(),
-                working_dir: execution_context.working_dir,
-                environment: execution_context.environment,
+                working_dir: execution_plan.working_dir,
+                environment: execution_plan.environment,
                 selected_skills: Vec::new(),
             })
             .await
             .map_err(|err| KernelError::Runtime(err.to_string()))?;
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let turn_outcome = timeout(
-            execution_context.hard_timeout,
+            execution_plan.hard_timeout,
             adapter.turn(
                 RuntimeTurnInput {
                     runtime_session_id: handle.runtime_session_id.clone(),
@@ -3733,15 +3758,17 @@ impl Kernel {
         let adapter = self.runtime.get(&runtime_id).await.ok_or_else(|| {
             KernelError::NotFound(format!("runtime adapter '{}' not found", runtime_id))
         })?;
-        let execution_context = self
-            .resolve_runtime_execution_context(
+        let execution_plan = self
+            .resolve_runtime_execution_plan(
                 session.session_id,
                 &runtime_id,
-                RuntimeExecutionRequest::new(
-                    runtime_working_dir.clone(),
-                    runtime_env_passthrough.clone().unwrap_or_default(),
-                    runtime_timeout_ms,
-                ),
+                ExecutionPlanRequest {
+                    runtime_id: runtime_id.clone(),
+                    preset_name: None,
+                    working_dir: runtime_working_dir.clone(),
+                    env_passthrough_keys: runtime_env_passthrough.clone().unwrap_or_default(),
+                    timeout_ms: runtime_timeout_ms,
+                },
             )
             .await?;
         let prompt_envelope = self
@@ -3763,8 +3790,8 @@ impl Kernel {
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
                 session_id: session.session_id,
-                working_dir: execution_context.working_dir.clone(),
-                environment: execution_context.environment.clone(),
+                working_dir: execution_plan.working_dir.clone(),
+                environment: execution_plan.environment.clone(),
                 selected_skills: allowed_skills.clone(),
             })
             .await
@@ -3792,8 +3819,8 @@ impl Kernel {
                 runtime_id: &runtime_id,
                 session_id: session.session_id,
                 handle: &handle,
-                idle_timeout: execution_context.idle_timeout,
-                hard_timeout: execution_context.hard_timeout,
+                idle_timeout: execution_plan.idle_timeout,
+                hard_timeout: execution_plan.hard_timeout,
                 input: RuntimeTurnInput {
                     runtime_session_id: handle.runtime_session_id.clone(),
                     prompt: prompt_envelope,
@@ -4006,10 +4033,11 @@ impl Kernel {
                     "runtime_id": runtime_id,
                     "selected_skills": allowed_skills,
                     "prompt_len": prompt_user_text.len(),
-                    "runtime_working_dir": execution_context.working_dir,
-                    "runtime_idle_timeout_ms": execution_context.idle_timeout.as_millis() as u64,
-                    "runtime_hard_timeout_ms": execution_context.hard_timeout.as_millis() as u64,
-                    "runtime_env_passthrough_count": execution_context.environment.len(),
+                    "runtime_preset_name": execution_plan.preset_name,
+                    "runtime_working_dir": execution_plan.working_dir,
+                    "runtime_idle_timeout_ms": execution_plan.idle_timeout.as_millis() as u64,
+                    "runtime_hard_timeout_ms": execution_plan.hard_timeout.as_millis() as u64,
+                    "runtime_env_passthrough_count": execution_plan.environment.len(),
                 }),
             )
             .await
@@ -4845,51 +4873,61 @@ impl Kernel {
         Ok(turns_to_history_views(turns))
     }
 
-    async fn resolve_runtime_execution_context(
+    async fn resolve_runtime_execution_plan(
         &self,
         session_id: uuid::Uuid,
         runtime_id: &str,
-        request: RuntimeExecutionRequest,
-    ) -> Result<RuntimeExecutionContext, KernelError> {
+        request: ExecutionPlanRequest,
+    ) -> Result<EffectiveExecutionPlan, KernelError> {
+        let request_preset = request.preset_name.clone();
         let request_working_dir = request.working_dir.clone();
         let request_timeout_ms = request.timeout_ms;
         let request_env = request.env_passthrough_keys.clone();
 
-        match self.runtime_execution_policy.evaluate(
-            runtime_id,
-            request,
-            self.runtime_turn_idle_timeout,
-            self.runtime_turn_hard_timeout,
-        ) {
-            Ok(context) => {
+        match self.execution_planner.plan(request) {
+            Ok(plan) => {
                 self.audit
                     .append(
-                        "runtime.policy.allow",
+                        "runtime.plan.allow",
                         Some(session_id),
                         Some("kernel".to_string()),
                         json!({
                             "runtime_id": runtime_id,
+                            "requested_preset_name": request_preset,
                             "requested_working_dir": request_working_dir,
                             "requested_timeout_ms": request_timeout_ms,
                             "requested_env_passthrough": request_env,
-                            "effective_working_dir": context.working_dir,
-                            "effective_timeout_ms": context.idle_timeout.as_millis() as u64,
-                            "effective_hard_timeout_ms": context.hard_timeout.as_millis() as u64,
-                            "effective_env_passthrough_count": context.environment.len(),
+                            "effective_preset_name": plan.preset_name.clone(),
+                            "confinement_backend": plan.confinement.backend().as_str(),
+                            "effective_working_dir": plan.working_dir.clone(),
+                            "effective_timeout_ms": plan.idle_timeout.as_millis() as u64,
+                            "effective_hard_timeout_ms": plan.hard_timeout.as_millis() as u64,
+                            "effective_env_passthrough_count": plan.environment.len(),
+                            "network_mode": plan.network_mode.as_str(),
+                            "secret_bindings": plan.secret_bindings.iter().map(|binding| binding.name.clone()).collect::<Vec<_>>(),
+                            "escape_classes": plan.escape_classes.iter().map(|class| class.as_str()).collect::<Vec<_>>(),
+                            "mounts": plan.mounts.iter().map(|mount| {
+                                json!({
+                                    "source": mount.source.display().to_string(),
+                                    "target": mount.target.clone(),
+                                    "access": mount.access.as_str(),
+                                })
+                            }).collect::<Vec<_>>(),
                         }),
                     )
                     .await
                     .map_err(internal)?;
-                Ok(context)
+                Ok(plan)
             }
             Err(reason) => {
                 self.audit
                     .append(
-                        "runtime.policy.deny",
+                        "runtime.plan.deny",
                         Some(session_id),
                         Some("kernel".to_string()),
                         json!({
                             "runtime_id": runtime_id,
+                            "requested_preset_name": request_preset,
                             "requested_working_dir": request_working_dir,
                             "requested_timeout_ms": request_timeout_ms,
                             "requested_env_passthrough": request_env,
@@ -4900,7 +4938,7 @@ impl Kernel {
                     .map_err(internal)?;
 
                 Err(KernelError::BadRequest(format!(
-                    "runtime execution policy denied request: {}",
+                    "runtime execution plan denied request: {}",
                     reason
                 )))
             }

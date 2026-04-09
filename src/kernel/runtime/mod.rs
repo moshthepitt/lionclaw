@@ -19,9 +19,10 @@ pub use adapters::{
 pub use builtins::{register_builtin_runtime_adapters, BUILTIN_RUNTIME_MOCK};
 pub use execution::{
     ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionBackend,
-    ExecutionLimits, ExecutionOutput, ExecutionPreset, ExecutionRequest, MountAccess, MountSpec,
-    NetworkMode, OciConfinementConfig, OciExecutionBackend, RuntimeProgramSpec, SecretBinding,
-    SecretBindingKind, WorkspaceAccess,
+    ExecutionLimits, ExecutionOutput, ExecutionPlanRequest, ExecutionPlanner,
+    ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, MountAccess, MountSpec, NetworkMode,
+    OciConfinementConfig, OciExecutionBackend, RuntimeExecutionProfile, RuntimeProgramSpec,
+    SecretBinding, SecretBindingKind, WorkspaceAccess, BUILTIN_PRESET_EVERYDAY,
 };
 
 #[derive(Debug, Clone)]

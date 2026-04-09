@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -5,6 +6,7 @@ use anyhow::{anyhow, Result};
 use crate::kernel::{
     runtime::{
         CodexRuntimeAdapter, CodexRuntimeConfig, OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig,
+        RuntimeExecutionProfile,
     },
     Kernel,
 };
@@ -52,6 +54,16 @@ pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConf
     }
 
     Ok(())
+}
+
+pub fn configured_runtime_execution_profiles(
+    config: &OperatorConfig,
+) -> BTreeMap<String, RuntimeExecutionProfile> {
+    config
+        .runtimes
+        .iter()
+        .map(|(id, runtime)| (id.clone(), runtime.execution_profile()))
+        .collect()
 }
 
 pub fn resolve_runtime_id(config: &OperatorConfig, requested: Option<&str>) -> Result<String> {

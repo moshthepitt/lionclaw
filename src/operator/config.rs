@@ -5,7 +5,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::home::{LionClawHome, DEFAULT_WORKSPACE};
-use crate::kernel::runtime::{ConfinementConfig, ExecutionPreset};
+use crate::kernel::runtime::{ConfinementConfig, ExecutionPreset, RuntimeExecutionProfile};
 use crate::kernel::skills::sanitize_skill_name;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -359,6 +359,13 @@ impl RuntimeProfileConfig {
                 confinement.as_ref()
             }
         }
+    }
+
+    pub fn execution_profile(&self) -> RuntimeExecutionProfile {
+        self.confinement()
+            .cloned()
+            .map(|confinement| RuntimeExecutionProfile { confinement })
+            .unwrap_or_default()
     }
 }
 

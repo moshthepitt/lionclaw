@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{collections::BTreeSet, path::PathBuf, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
@@ -24,11 +24,31 @@ pub struct ExecutionPreset {
     pub escape_classes: BTreeSet<EscapeClass>,
 }
 
+impl Default for ExecutionPreset {
+    fn default() -> Self {
+        Self {
+            workspace_access: WorkspaceAccess::ReadWrite,
+            network_mode: NetworkMode::On,
+            secret_bindings: Vec::new(),
+            escape_classes: BTreeSet::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkspaceAccess {
     ReadOnly,
     ReadWrite,
+}
+
+impl WorkspaceAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::ReadWrite => "read-write",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +57,16 @@ pub enum NetworkMode {
     None,
     On,
     Allowlist,
+}
+
+impl NetworkMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::On => "on",
+            Self::Allowlist => "allowlist",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -65,6 +95,18 @@ pub enum EscapeClass {
     ArtifactPublish,
 }
 
+impl EscapeClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ChannelSend => "channel-send",
+            Self::NetEgress => "net-egress",
+            Self::SecretRequest => "secret-request",
+            Self::SchedulerRun => "scheduler-run",
+            Self::ArtifactPublish => "artifact-publish",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct MountSpec {
@@ -78,6 +120,15 @@ pub struct MountSpec {
 pub enum MountAccess {
     ReadOnly,
     ReadWrite,
+}
+
+impl MountAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::ReadWrite => "read-write",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +176,19 @@ pub struct OciConfinementConfig {
     pub limits: ExecutionLimits,
 }
 
+impl Default for OciConfinementConfig {
+    fn default() -> Self {
+        Self {
+            engine: default_oci_engine(),
+            image: None,
+            read_only_rootfs: false,
+            tmpfs: Vec::new(),
+            additional_mounts: Vec::new(),
+            limits: ExecutionLimits::default(),
+        }
+    }
+}
+
 fn default_oci_engine() -> String {
     "podman".to_string()
 }
@@ -147,6 +211,8 @@ pub struct EffectiveExecutionPlan {
     pub network_mode: NetworkMode,
     pub working_dir: Option<String>,
     pub environment: Vec<(String, String)>,
+    pub idle_timeout: Duration,
+    pub hard_timeout: Duration,
     pub mounts: Vec<MountSpec>,
     pub secret_bindings: Vec<SecretBinding>,
     pub escape_classes: BTreeSet<EscapeClass>,
