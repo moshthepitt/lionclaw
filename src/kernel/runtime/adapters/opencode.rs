@@ -6,13 +6,12 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::kernel::runtime::execution::process::{run_process_streaming, ProcessInvocation};
 use crate::kernel::runtime::{
     RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
     RuntimeMessageLane, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
     RuntimeTurnResult,
 };
-
-use super::subprocess::{run_non_interactive_streaming, SubprocessInvocation};
 
 #[derive(Debug, Clone)]
 pub struct OpenCodeRuntimeConfig {
@@ -91,7 +90,7 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
             .cloned()
             .ok_or_else(|| anyhow!("runtime session '{}' not found", input.runtime_session_id))?;
 
-        let invocation = SubprocessInvocation {
+        let invocation = ProcessInvocation {
             executable: self.config.executable.clone(),
             args: build_opencode_run_args(
                 &self.config,
@@ -105,7 +104,7 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
 
         let mut saw_done = false;
         let mut last_error_text: Option<String> = None;
-        let output = run_non_interactive_streaming(&invocation, |line| {
+        let output = run_process_streaming(&invocation, |line| {
             for event in parse_opencode_output_line(line) {
                 if matches!(event, RuntimeEvent::Done) {
                     saw_done = true;

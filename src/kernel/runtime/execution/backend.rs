@@ -1,6 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use tokio::sync::mpsc;
 
+use super::oci::OciExecutionBackend;
 use super::plan::{ConfinementBackend, EffectiveExecutionPlan, RuntimeProgramSpec};
 
 #[derive(Debug, Clone)]
@@ -9,22 +11,26 @@ pub struct ExecutionRequest {
     pub program: RuntimeProgramSpec,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ExecutionOutput {
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub exit_code: Option<i32>,
-}
+pub type ExecutionOutput = super::process::ProcessOutput;
 
-impl ExecutionOutput {
-    pub fn success(&self) -> bool {
-        self.exit_code == Some(0)
-    }
-}
+pub type ExecutionStdoutSender = mpsc::UnboundedSender<String>;
 
 #[async_trait]
 pub trait ExecutionBackend: Send + Sync {
     fn kind(&self) -> ConfinementBackend;
 
-    async fn execute(&self, request: ExecutionRequest) -> Result<ExecutionOutput>;
+    async fn execute_streaming(
+        &self,
+        request: ExecutionRequest,
+        stdout: ExecutionStdoutSender,
+    ) -> Result<ExecutionOutput>;
+}
+
+pub async fn execute_streaming(
+    request: ExecutionRequest,
+    stdout: ExecutionStdoutSender,
+) -> Result<ExecutionOutput> {
+    match request.plan.confinement.backend() {
+        ConfinementBackend::Oci => OciExecutionBackend.execute_streaming(request, stdout).await,
+    }
 }

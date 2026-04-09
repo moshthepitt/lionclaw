@@ -7,8 +7,9 @@ pub mod backend;
 pub mod oci;
 pub mod plan;
 pub mod planner;
+pub(crate) mod process;
 
-pub use backend::{ExecutionBackend, ExecutionOutput, ExecutionRequest};
+pub use backend::{execute_streaming, ExecutionBackend, ExecutionOutput, ExecutionRequest};
 pub use oci::OciExecutionBackend;
 pub use plan::{
     ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionLimits,

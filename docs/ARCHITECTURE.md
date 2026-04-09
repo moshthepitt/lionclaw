@@ -114,11 +114,11 @@ Runtime module layout:
 - `kernel/runtime/execution/plan.rs`: typed execution presets, confinement config, and effective per-turn plans.
 - `kernel/runtime/execution/planner.rs`: deterministic plan compilation from runtime config, preset config, and request overrides.
 - `kernel/runtime/execution/backend.rs`: backend execution contract for confined runtime launch.
-- `kernel/runtime/execution/oci.rs`: rootless OCI backend placeholder.
+- `kernel/runtime/execution/oci.rs`: rootless OCI backend and typed command builder.
+- `kernel/runtime/execution/process.rs`: shared process execution utility for adapters and backends.
 - `kernel/runtime/adapters/mock.rs`: deterministic test adapter.
 - `kernel/runtime/adapters/codex.rs`: production subprocess adapter.
 - `kernel/runtime/adapters/opencode.rs`: production subprocess adapter.
-- `kernel/runtime/adapters/subprocess.rs`: shared subprocess execution utility.
 
 Channel bridge layout:
 

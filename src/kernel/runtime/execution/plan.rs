@@ -149,6 +149,18 @@ impl ConfinementConfig {
             Self::Oci(_) => ConfinementBackend::Oci,
         }
     }
+
+    pub fn oci(&self) -> &OciConfinementConfig {
+        match self {
+            Self::Oci(config) => config,
+        }
+    }
+
+    pub fn oci_mut(&mut self) -> &mut OciConfinementConfig {
+        match self {
+            Self::Oci(config) => config,
+        }
+    }
 }
 
 impl ConfinementBackend {
