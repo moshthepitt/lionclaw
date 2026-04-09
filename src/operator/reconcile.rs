@@ -727,7 +727,10 @@ mod tests {
     use crate::{
         contracts::DaemonInfoResponse,
         home::LionClawHome,
-        kernel::{Kernel, KernelOptions},
+        kernel::{
+            runtime::{ConfinementConfig, OciConfinementConfig},
+            Kernel, KernelOptions,
+        },
         operator::{
             config::{
                 ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig, OperatorConfig,
@@ -745,6 +748,18 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve probe app");
         })
+    }
+
+    fn test_codex_runtime(runtime_stub: &std::path::Path) -> RuntimeProfileConfig {
+        RuntimeProfileConfig::Codex {
+            executable: "codex".to_string(),
+            model: None,
+            confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                engine: runtime_stub.to_string_lossy().to_string(),
+                image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                ..OciConfinementConfig::default()
+            }),
+        }
     }
 
     #[tokio::test]
@@ -830,16 +845,9 @@ mod tests {
             .expect("chmod worker");
         }
 
-        config.runtimes = [(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: runtime_stub.to_string_lossy().to_string(),
-                model: None,
-                confinement: None,
-            },
-        )]
-        .into_iter()
-        .collect();
+        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
+            .into_iter()
+            .collect();
         config.skills = vec![ManagedSkillConfig {
             alias: "telegram".to_string(),
             source: skill_source.to_string_lossy().to_string(),
@@ -982,16 +990,9 @@ mod tests {
             .expect("chmod worker");
         }
 
-        config.runtimes = [(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: runtime_stub.to_string_lossy().to_string(),
-                model: None,
-                confinement: None,
-            },
-        )]
-        .into_iter()
-        .collect();
+        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
+            .into_iter()
+            .collect();
         config.skills = vec![ManagedSkillConfig {
             alias: "terminal".to_string(),
             source: skill_source.to_string_lossy().to_string(),
@@ -1127,16 +1128,9 @@ mod tests {
             fs::set_permissions(&runtime_stub, fs::Permissions::from_mode(0o755))
                 .expect("chmod runtime stub");
         }
-        config.runtimes = [(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: runtime_stub.to_string_lossy().to_string(),
-                model: None,
-                confinement: None,
-            },
-        )]
-        .into_iter()
-        .collect();
+        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
+            .into_iter()
+            .collect();
         config.save(&home).await.expect("save config");
 
         let home_id = home.ensure_home_id().await.expect("home id");

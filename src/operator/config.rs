@@ -205,6 +205,17 @@ impl OperatorConfig {
                 Some((id, preset))
             })
             .collect();
+        self.runtimes = std::mem::take(&mut self.runtimes)
+            .into_iter()
+            .filter_map(|(id, mut runtime)| {
+                let id = id.trim().to_string();
+                if id.is_empty() {
+                    return None;
+                }
+                runtime.normalize();
+                Some((id, runtime))
+            })
+            .collect();
         self.skills
             .sort_by(|left, right| left.alias.cmp(&right.alias));
         self.channels.sort_by(|left, right| left.id.cmp(&right.id));
@@ -322,8 +333,7 @@ pub enum RuntimeProfileConfig {
         executable: String,
         #[serde(default)]
         model: Option<String>,
-        #[serde(default)]
-        confinement: Option<ConfinementConfig>,
+        confinement: ConfinementConfig,
     },
     #[serde(rename = "opencode")]
     OpenCode {
@@ -334,8 +344,7 @@ pub enum RuntimeProfileConfig {
         model: Option<String>,
         #[serde(default)]
         agent: Option<String>,
-        #[serde(default)]
-        confinement: Option<ConfinementConfig>,
+        confinement: ConfinementConfig,
     },
 }
 
@@ -353,19 +362,80 @@ impl RuntimeProfileConfig {
         }
     }
 
-    pub fn confinement(&self) -> Option<&ConfinementConfig> {
+    pub fn confinement(&self) -> &ConfinementConfig {
         match self {
-            Self::Codex { confinement, .. } | Self::OpenCode { confinement, .. } => {
-                confinement.as_ref()
-            }
+            Self::Codex { confinement, .. } | Self::OpenCode { confinement, .. } => confinement,
         }
     }
 
     pub fn execution_profile(&self) -> RuntimeExecutionProfile {
-        self.confinement()
-            .cloned()
-            .map(|confinement| RuntimeExecutionProfile { confinement })
-            .unwrap_or_default()
+        RuntimeExecutionProfile {
+            confinement: self.confinement().clone(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_runtime_command(self.executable())?;
+
+        match self.confinement() {
+            ConfinementConfig::Oci(config) => {
+                validate_host_executable(&config.engine)?;
+                if config
+                    .image
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+                {
+                    return Err(anyhow!("OCI confinement image is required"));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn normalize(&mut self) {
+        match self {
+            Self::Codex {
+                executable,
+                model,
+                confinement,
+            } => {
+                *executable = executable.trim().to_string();
+                *model = model
+                    .as_ref()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                normalize_confinement_config(confinement);
+            }
+            Self::OpenCode {
+                executable,
+                format,
+                model,
+                agent,
+                confinement,
+            } => {
+                *executable = executable.trim().to_string();
+                *format = {
+                    let trimmed = format.trim();
+                    if trimmed.is_empty() {
+                        default_opencode_format()
+                    } else {
+                        trimmed.to_string()
+                    }
+                };
+                *model = model
+                    .as_ref()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                *agent = agent
+                    .as_ref()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                normalize_confinement_config(confinement);
+            }
+        }
     }
 }
 
@@ -387,6 +457,27 @@ fn normalize_execution_preset(preset: &mut ExecutionPreset) {
         .collect();
     preset.secret_bindings.sort();
     preset.secret_bindings.dedup();
+}
+
+fn normalize_confinement_config(config: &mut ConfinementConfig) {
+    match config {
+        ConfinementConfig::Oci(oci) => {
+            oci.engine = oci.engine.trim().to_string();
+            oci.image = oci
+                .image
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            oci.tmpfs = std::mem::take(&mut oci.tmpfs)
+                .into_iter()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect();
+            for mount in &mut oci.additional_mounts {
+                mount.target = mount.target.trim().to_string();
+            }
+        }
+    }
 }
 
 pub fn derive_skill_alias(source: &str) -> String {
@@ -415,17 +506,34 @@ pub fn normalize_local_source(source: &str) -> Result<String> {
     Ok(format!("local:{}", absolute.display()))
 }
 
-pub fn normalize_executable(source: &str) -> Result<String> {
+pub fn normalize_runtime_command(source: &str) -> Result<String> {
     let raw = source.trim();
     if raw.is_empty() {
-        return Err(anyhow!("runtime command or path cannot be empty"));
+        return Err(anyhow!("runtime command cannot be empty"));
+    }
+
+    Ok(raw.to_string())
+}
+
+pub fn validate_runtime_command(source: &str) -> Result<()> {
+    if source.trim().is_empty() {
+        return Err(anyhow!("runtime command cannot be empty"));
+    }
+
+    Ok(())
+}
+
+pub fn normalize_host_executable(source: &str) -> Result<String> {
+    let raw = source.trim();
+    if raw.is_empty() {
+        return Err(anyhow!("host executable command or path cannot be empty"));
     }
 
     let path = if looks_like_path(raw) {
         normalize_executable_path(raw)?
     } else {
         which::which(raw)
-            .with_context(|| format!("failed to resolve runtime command '{}'", source))?
+            .with_context(|| format!("failed to resolve host executable '{}'", source))?
     };
     validate_executable_path(&path)?;
     Ok(path.to_string_lossy().to_string())
@@ -433,10 +541,7 @@ pub fn normalize_executable(source: &str) -> Result<String> {
 
 pub fn validate_executable_path(path: &Path) -> Result<()> {
     if !path.is_file() {
-        return Err(anyhow!(
-            "runtime executable '{}' is not a file",
-            path.display()
-        ));
+        return Err(anyhow!("executable '{}' is not a file", path.display()));
     }
 
     #[cfg(unix)]
@@ -449,7 +554,7 @@ pub fn validate_executable_path(path: &Path) -> Result<()> {
             .mode();
         if mode & 0o111 == 0 {
             return Err(anyhow!(
-                "runtime executable '{}' is not marked executable",
+                "executable '{}' is not marked executable",
                 path.display()
             ));
         }
@@ -458,15 +563,15 @@ pub fn validate_executable_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn validate_executable(source: &str) -> Result<()> {
+pub fn validate_host_executable(source: &str) -> Result<()> {
     let raw = source.trim();
     if raw.is_empty() {
-        return Err(anyhow!("runtime command or path cannot be empty"));
+        return Err(anyhow!("host executable command or path cannot be empty"));
     }
 
     if !looks_like_path(raw) {
         return Err(anyhow!(
-            "runtime executable '{}' must be stored as an absolute or explicit path",
+            "host executable '{}' must be stored as an absolute or explicit path",
             source
         ));
     }
@@ -491,11 +596,13 @@ fn normalize_executable_path(raw: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_skill_alias, normalize_executable, normalize_local_source, validate_executable,
-        ChannelLaunchMode, ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig,
+        derive_skill_alias, normalize_host_executable, normalize_local_source,
+        normalize_runtime_command, validate_host_executable, ChannelLaunchMode,
+        ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig,
     };
     use crate::kernel::runtime::{
-        ExecutionPreset, NetworkMode, SecretBinding, SecretBindingKind, WorkspaceAccess,
+        ConfinementConfig, ExecutionPreset, NetworkMode, OciConfinementConfig, SecretBinding,
+        SecretBindingKind, WorkspaceAccess,
     };
 
     #[test]
@@ -571,9 +678,9 @@ mod tests {
         config.upsert_runtime(
             "codex".to_string(),
             RuntimeProfileConfig::Codex {
-                executable: "/tmp/codex".to_string(),
+                executable: "codex".to_string(),
                 model: None,
-                confinement: None,
+                confinement: sample_confinement(),
             },
         );
 
@@ -586,9 +693,9 @@ mod tests {
         config.upsert_runtime(
             "codex".to_string(),
             RuntimeProfileConfig::Codex {
-                executable: "/tmp/codex".to_string(),
+                executable: "codex".to_string(),
                 model: None,
-                confinement: None,
+                confinement: sample_confinement(),
             },
         );
 
@@ -672,7 +779,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn normalize_executable_rejects_non_executable_file() {
+    fn normalize_host_executable_rejects_non_executable_file() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -680,14 +787,15 @@ mod tests {
         std::fs::write(&path, "#!/usr/bin/env bash\n").expect("write file");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
 
-        let err = normalize_executable(path.to_str().expect("path utf8")).expect_err("should fail");
+        let err =
+            normalize_host_executable(path.to_str().expect("path utf8")).expect_err("should fail");
         assert!(err.to_string().contains("not marked executable"));
     }
 
     #[cfg(unix)]
     #[test]
-    fn normalize_executable_resolves_bare_commands_to_absolute_paths() {
-        let normalized = normalize_executable("sh").expect("normalize");
+    fn normalize_host_executable_resolves_bare_commands_to_absolute_paths() {
+        let normalized = normalize_host_executable("sh").expect("normalize");
         let expected = which::which("sh").expect("resolve sh");
 
         assert_eq!(normalized, expected.to_string_lossy());
@@ -695,10 +803,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn validate_executable_rejects_bare_commands() {
-        let err = validate_executable("sh").expect_err("bare command should fail");
+    fn validate_host_executable_rejects_bare_commands() {
+        let err = validate_host_executable("sh").expect_err("bare command should fail");
         assert!(err
             .to_string()
             .contains("must be stored as an absolute or explicit path"));
+    }
+
+    #[test]
+    fn normalize_runtime_command_trims_without_host_resolution() {
+        let normalized = normalize_runtime_command("  /usr/local/bin/codex  ").expect("trim");
+        assert_eq!(normalized, "/usr/local/bin/codex");
+    }
+
+    fn sample_confinement() -> ConfinementConfig {
+        ConfinementConfig::Oci(OciConfinementConfig {
+            engine: "/usr/bin/podman".to_string(),
+            image: Some("ghcr.io/lionclaw/runtime:latest".to_string()),
+            ..OciConfinementConfig::default()
+        })
     }
 }

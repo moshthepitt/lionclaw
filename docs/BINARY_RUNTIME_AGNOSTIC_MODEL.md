@@ -148,7 +148,7 @@ Background operation is explicit. If you want long-running channels and auto-res
 Normal user flow:
 
 1. `lionclaw onboard`
-2. `lionclaw runtime add codex --kind codex --bin codex`
+2. `lionclaw runtime add codex --kind codex --bin codex --image ghcr.io/lionclaw/codex-runtime:v1`
 3. `lionclaw run codex`
 
 Runtime definitions, execution presets, and confinement settings live in

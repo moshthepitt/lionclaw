@@ -740,7 +740,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
     }
 
     #[tokio::test]
-    async fn run_local_errors_when_runtime_executable_is_missing() {
+    async fn run_local_errors_when_runtime_engine_is_missing() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
 
@@ -748,13 +748,17 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         config.upsert_runtime(
             "codex".to_string(),
             RuntimeProfileConfig::Codex {
-                executable: temp_dir
-                    .path()
-                    .join("missing-codex")
-                    .to_string_lossy()
-                    .to_string(),
+                executable: "codex".to_string(),
                 model: None,
-                confinement: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: temp_dir
+                        .path()
+                        .join("missing-podman")
+                        .to_string_lossy()
+                        .to_string(),
+                    image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
             },
         );
         config.save(&home).await.expect("save config");
@@ -763,9 +767,9 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let mut output = Vec::new();
         let err = run_local_with_io(&home, None, false, &mut input, &mut output)
             .await
-            .expect_err("missing executable should error");
+            .expect_err("missing engine should error");
 
-        assert!(err.to_string().contains("configured runtime command"));
+        assert!(err.to_string().contains("configured runtime profile"));
     }
 
     #[test]
@@ -832,13 +836,13 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
 
     fn stubbed_codex_runtime(executable: &std::path::Path) -> RuntimeProfileConfig {
         RuntimeProfileConfig::Codex {
-            executable: executable.to_string_lossy().to_string(),
+            executable: "codex".to_string(),
             model: None,
-            confinement: Some(ConfinementConfig::Oci(OciConfinementConfig {
+            confinement: ConfinementConfig::Oci(OciConfinementConfig {
                 engine: executable.to_string_lossy().to_string(),
                 image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
                 ..OciConfinementConfig::default()
-            })),
+            }),
         }
     }
 }

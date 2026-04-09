@@ -227,6 +227,7 @@ mod tests {
     use crate::{
         contracts::DaemonInfoResponse,
         home::LionClawHome,
+        kernel::runtime::{ConfinementConfig, OciConfinementConfig},
         operator::{
             config::{
                 ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig, OperatorConfig,
@@ -288,9 +289,13 @@ mod tests {
             runtimes: [(
                 "codex".to_string(),
                 RuntimeProfileConfig::Codex {
-                    executable: runtime_stub.to_string_lossy().to_string(),
+                    executable: "codex".to_string(),
                     model: None,
-                    confinement: None,
+                    confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                        engine: runtime_stub.to_string_lossy().to_string(),
+                        image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                        ..OciConfinementConfig::default()
+                    }),
                 },
             )]
             .into_iter()

@@ -11,7 +11,7 @@ use crate::kernel::{
     Kernel,
 };
 
-use super::config::{validate_executable, OperatorConfig, RuntimeProfileConfig};
+use super::config::{OperatorConfig, RuntimeProfileConfig};
 
 pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConfig) -> Result<()> {
     for (id, runtime) in &config.runtimes {
@@ -74,10 +74,10 @@ pub fn validate_runtime_availability(config: &OperatorConfig, runtime_id: &str) 
     let profile = config
         .runtime(runtime_id)
         .ok_or_else(|| anyhow!("runtime profile '{}' is not configured", runtime_id))?;
-    validate_executable(profile.executable()).map_err(|err| {
+    profile.validate().map_err(|err| {
         anyhow!(
-            "configured runtime command '{}' is invalid: {}",
-            profile.executable(),
+            "configured runtime profile '{}' is invalid: {}",
+            runtime_id,
             err
         )
     })?;
@@ -87,15 +87,16 @@ pub fn validate_runtime_availability(config: &OperatorConfig, runtime_id: &str) 
 #[cfg(test)]
 mod tests {
     use super::validate_runtime_availability;
+    use crate::kernel::runtime::{ConfinementConfig, OciConfinementConfig};
     use crate::operator::config::{OperatorConfig, RuntimeProfileConfig};
 
     #[cfg(unix)]
     #[test]
-    fn configured_runtime_requires_executable_file() {
+    fn configured_runtime_requires_usable_host_engine() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let path = temp_dir.path().join("codex");
+        let path = temp_dir.path().join("podman");
         std::fs::write(&path, "#!/usr/bin/env bash\n").expect("write file");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
 
@@ -103,9 +104,13 @@ mod tests {
         config.upsert_runtime(
             "codex".to_string(),
             RuntimeProfileConfig::Codex {
-                executable: path.to_string_lossy().to_string(),
+                executable: "codex".to_string(),
                 model: None,
-                confinement: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: path.to_string_lossy().to_string(),
+                    image: Some("ghcr.io/lionclaw/codex-runtime:latest".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
             },
         );
 
@@ -115,18 +120,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn configured_runtime_command_is_validated_via_path() {
-        let executable = which::which("sh").expect("resolve sh");
+    fn configured_runtime_profile_accepts_container_command_with_valid_engine() {
+        let engine = std::env::current_exe().expect("current exe");
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
             "codex".to_string(),
             RuntimeProfileConfig::Codex {
-                executable: executable.to_string_lossy().to_string(),
+                executable: "codex".to_string(),
                 model: None,
-                confinement: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: engine.to_string_lossy().to_string(),
+                    image: Some("ghcr.io/lionclaw/codex-runtime:latest".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
             },
         );
 
         validate_runtime_availability(&config, "codex").expect("runtime command should validate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_runtime_requires_image() {
+        let engine = std::env::current_exe().expect("current exe");
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "codex".to_string(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: engine.to_string_lossy().to_string(),
+                    image: None,
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+
+        let err = validate_runtime_availability(&config, "codex").expect_err("should fail");
+        assert!(err
+            .to_string()
+            .contains("OCI confinement image is required"));
     }
 }

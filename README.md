@@ -53,7 +53,7 @@ cargo build --release
 ./target/release/lionclaw onboard
 
 # 3. Attach a model and start executing
-./target/release/lionclaw runtime add codex --kind codex --bin codex
+./target/release/lionclaw runtime add codex --kind codex --bin codex --image ghcr.io/lionclaw/codex-runtime:v1
 ./target/release/lionclaw run codex
 ```
 
@@ -201,10 +201,10 @@ Override the root with `LIONCLAW_HOME`.
 Runtime profiles, execution presets, and confinement settings live in
 `~/.lionclaw/config/lionclaw.toml`.
 
-`lionclaw runtime add` configures the runtime protocol details and can attach
-confinement metadata. It resolves the runtime executable once and stores the
-concrete path in LionClaw state. Execution policy remains config-owned in
-LionClaw state, not ambient shell state.
+`lionclaw runtime add` configures the runtime command that runs inside the
+confinement image, plus the concrete host OCI engine path and image LionClaw
+uses to launch it. Execution policy remains config-owned in LionClaw state, not
+ambient shell state.
 
 Daemon/service plumbing recognizes these env vars:
 
