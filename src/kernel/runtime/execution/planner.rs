@@ -553,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_omits_runtime_secret_env_when_disabled() {
+    fn planner_omits_runtime_secret_mount_when_disabled() {
         let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
             policy: RuntimeExecutionPolicy::default(),
             default_preset_name: None,
