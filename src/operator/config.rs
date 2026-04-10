@@ -377,6 +377,14 @@ impl RuntimeProfileConfig {
     pub fn validate(&self) -> Result<()> {
         validate_runtime_command(self.executable())?;
 
+        if let Self::OpenCode { format, .. } = self {
+            if format.trim() != "json" {
+                return Err(anyhow!(
+                    "OpenCode runtime format must be 'json' for LionClaw streaming"
+                ));
+            }
+        }
+
         match self.confinement() {
             ConfinementConfig::Oci(config) => {
                 validate_host_executable(&config.engine)?;

@@ -129,6 +129,7 @@ Program-backed runtimes stream two message lanes:
 - `reasoning`: optional live thought/progress text that channels may render or ignore.
 
 LionClaw transports both lanes through the stream APIs, but only `answer` is treated as the durable assistant reply.
+Configured OpenCode profiles are pinned to `--format json` so LionClaw always receives machine-readable events instead of a degraded plain-text stream.
 
 The everyday confined runtime layout is mount-first:
 

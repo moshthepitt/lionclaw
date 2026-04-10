@@ -836,6 +836,70 @@ echo '{"type":"response.output_text.delta","text":"hello from opencode"}'
         let output = String::from_utf8(output).expect("utf8 output");
         assert!(output.contains("runtime: opencode"));
         assert!(output.contains("lionclaw> hello from opencode"));
+        assert!(!output.contains("[status] opencode event: response.output_text.delta"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_local_streams_opencode_reasoning_and_answer_lanes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let stub = temp_dir.path().join("opencode-stub.sh");
+        write_script(
+            &stub,
+            r#"#!/usr/bin/env bash
+cat >/dev/null
+echo '{"type":"reasoning","text":"planning next step"}'
+echo '{"type":"text","text":"hello from opencode"}'
+"#,
+        );
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("opencode".to_string(), stubbed_opencode_runtime(&stub));
+        config.save(&home).await.expect("save config");
+
+        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut output = Vec::new();
+        run_local_with_io(&home, None, false, &mut input, &mut output)
+            .await
+            .expect("run local");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("thinking> planning next step"));
+        assert!(output.contains("lionclaw> hello from opencode"));
+        assert!(!output.contains("[status] opencode event: reasoning"));
+        assert!(!output.contains("[status] opencode event: text"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_local_reports_opencode_reasoning_only_failures_as_partial_output() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let stub = temp_dir.path().join("opencode-stub.sh");
+        write_script(
+            &stub,
+            r#"#!/usr/bin/env bash
+cat >/dev/null
+echo '{"type":"reasoning","text":"checking the workspace"}'
+exit 7
+"#,
+        );
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("opencode".to_string(), stubbed_opencode_runtime(&stub));
+        config.save(&home).await.expect("save config");
+
+        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut output = Vec::new();
+        run_local_with_io(&home, None, false, &mut input, &mut output)
+            .await
+            .expect("run local");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("thinking> checking the workspace"));
+        assert!(output.contains("Runtime error. Partial output is shown above."));
+        assert!(!output.contains("Timed out. Partial output is shown above."));
     }
 
     #[cfg(unix)]

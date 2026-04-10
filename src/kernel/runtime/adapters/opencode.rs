@@ -146,6 +146,7 @@ fn build_opencode_run_args(config: &OpenCodeRuntimeConfig, prompt: &str) -> Vec<
         "run".to_string(),
         "--format".to_string(),
         config.format.clone(),
+        "--thinking".to_string(),
     ];
 
     if let Some(model) = &config.model {
@@ -214,15 +215,6 @@ fn parse_opencode_output_line(line: &str) -> Vec<RuntimeEvent> {
 }
 
 fn parse_opencode_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
-    let event_type = json.get("type").and_then(Value::as_str);
-
-    if let Some(event_type) = event_type {
-        events.push(RuntimeEvent::Status {
-            code: None,
-            text: format!("opencode event: {}", event_type),
-        });
-    }
-
     if let Some(message) = extract_error_message(json) {
         events.push(RuntimeEvent::Error {
             code: Some("runtime.error".to_string()),
@@ -231,11 +223,13 @@ fn parse_opencode_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
         return;
     }
 
-    if let Some(text) = extract_text_delta(json) {
-        events.push(RuntimeEvent::MessageDelta {
-            lane: RuntimeMessageLane::Answer,
-            text,
-        });
+    if let Some((lane, text)) = extract_text_delta(json) {
+        events.push(RuntimeEvent::MessageDelta { lane, text });
+        return;
+    }
+
+    if let Some(text) = describe_opencode_status(json) {
+        events.push(RuntimeEvent::Status { code: None, text });
     }
 }
 
@@ -289,7 +283,13 @@ fn extract_error_message(json: &Value) -> Option<String> {
     Some("opencode error event".to_string())
 }
 
-fn extract_text_delta(json: &Value) -> Option<String> {
+fn extract_text_delta(json: &Value) -> Option<(RuntimeMessageLane, String)> {
+    let lane = if is_reasoning_event(json) {
+        RuntimeMessageLane::Reasoning
+    } else {
+        RuntimeMessageLane::Answer
+    };
+
     for pointer in [
         "/text",
         "/part/text",
@@ -299,7 +299,7 @@ fn extract_text_delta(json: &Value) -> Option<String> {
     ] {
         if let Some(text) = json.pointer(pointer).and_then(Value::as_str) {
             if !text.trim().is_empty() {
-                return Some(text.to_string());
+                return Some((lane, text.to_string()));
             }
         }
     }
@@ -315,12 +315,39 @@ fn extract_text_delta(json: &Value) -> Option<String> {
         if let Some(value) = json.pointer(pointer) {
             let texts = collect_texts(value);
             if !texts.is_empty() {
-                return Some(texts.join("\n"));
+                return Some((lane, texts.join("\n")));
             }
         }
     }
 
     None
+}
+
+fn is_reasoning_event(json: &Value) -> bool {
+    for pointer in ["/type", "/part/type", "/message/type", "/delta/type"] {
+        if let Some(event_type) = json.pointer(pointer).and_then(Value::as_str) {
+            if event_type == "reasoning" || event_type.contains("reasoning") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn describe_opencode_status(json: &Value) -> Option<String> {
+    let event_type = json.get("type").and_then(Value::as_str)?;
+    if matches!(
+        event_type,
+        "text"
+            | "reasoning"
+            | "response.output_text.delta"
+            | "response.reasoning.delta"
+            | "response.completed"
+    ) {
+        return None;
+    }
+
+    Some(format!("opencode event: {}", event_type))
 }
 
 fn collect_texts(value: &Value) -> Vec<String> {
@@ -402,6 +429,7 @@ mod tests {
                 "run".to_string(),
                 "--format".to_string(),
                 "json".to_string(),
+                "--thinking".to_string(),
                 "--model".to_string(),
                 "gpt-5".to_string(),
                 "--agent".to_string(),
@@ -450,14 +478,21 @@ mod tests {
         let events =
             parse_opencode_stdout(br#"{"type":"response.output_text.delta","text":"hello"}"#);
 
-        assert_eq!(events.len(), 2, "expected status plus answer delta");
+        assert_eq!(events.len(), 1, "expected one answer delta");
         assert!(matches!(
             &events[0],
-            RuntimeEvent::Status { text, .. } if text == "opencode event: response.output_text.delta"
-        ));
-        assert!(matches!(
-            &events[1],
             RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text } if text == "hello"
+        ));
+    }
+
+    #[test]
+    fn opencode_stdout_parses_reasoning_lane_without_status_spam() {
+        let events = parse_opencode_stdout(br#"{"type":"reasoning","text":"planning next step"}"#);
+
+        assert_eq!(events.len(), 1, "expected one reasoning delta");
+        assert!(matches!(
+            &events[0],
+            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Reasoning, text } if text == "planning next step"
         ));
     }
 }

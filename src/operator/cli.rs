@@ -1009,6 +1009,7 @@ fn build_runtime_profile(
             })
         }
         "opencode" => {
+            validate_opencode_profile_args(args)?;
             let confinement = build_confinement_config(args)?;
             Ok(RuntimeProfileConfig::OpenCode {
                 executable,
@@ -1086,6 +1087,15 @@ fn validate_codex_profile_args(args: &RuntimeAddArgs) -> Result<()> {
     if args.agent.is_some() || args.format != "json" {
         return Err(anyhow!(
             "opencode-specific flags are not valid for kind 'codex'"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_opencode_profile_args(args: &RuntimeAddArgs) -> Result<()> {
+    if args.format.trim() != "json" {
+        return Err(anyhow!(
+            "opencode runtimes must use --format json for LionClaw streaming"
         ));
     }
     Ok(())
@@ -1248,5 +1258,17 @@ mod tests {
         assert!(err
             .to_string()
             .contains("opencode-specific flags are not valid for kind 'codex'"));
+    }
+
+    #[test]
+    fn opencode_rejects_non_json_format() {
+        let mut args = runtime_add_args("opencode");
+        args.format = "default".to_string();
+        args.image = Some("ghcr.io/lionclaw/opencode:v1".to_string());
+
+        let err = build_runtime_profile(&args, "opencode".to_string()).expect_err("should fail");
+        assert!(err
+            .to_string()
+            .contains("opencode runtimes must use --format json"));
     }
 }
