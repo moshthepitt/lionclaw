@@ -313,10 +313,6 @@ pub fn default_workspace() -> String {
     DEFAULT_WORKSPACE.to_string()
 }
 
-fn default_opencode_format() -> String {
-    "json".to_string()
-}
-
 fn default_reference() -> String {
     "local".to_string()
 }
@@ -338,8 +334,6 @@ pub enum RuntimeProfileConfig {
     #[serde(rename = "opencode")]
     OpenCode {
         executable: String,
-        #[serde(default = "default_opencode_format")]
-        format: String,
         #[serde(default)]
         model: Option<String>,
         #[serde(default)]
@@ -377,14 +371,6 @@ impl RuntimeProfileConfig {
     pub fn validate(&self) -> Result<()> {
         validate_runtime_command(self.executable())?;
 
-        if let Self::OpenCode { format, .. } = self {
-            if format.trim() != "json" {
-                return Err(anyhow!(
-                    "OpenCode runtime format must be 'json' for LionClaw streaming"
-                ));
-            }
-        }
-
         match self.confinement() {
             ConfinementConfig::Oci(config) => {
                 validate_host_executable(&config.engine)?;
@@ -419,20 +405,11 @@ impl RuntimeProfileConfig {
             }
             Self::OpenCode {
                 executable,
-                format,
                 model,
                 agent,
                 confinement,
             } => {
                 *executable = executable.trim().to_string();
-                *format = {
-                    let trimmed = format.trim();
-                    if trimmed.is_empty() {
-                        default_opencode_format()
-                    } else {
-                        trimmed.to_string()
-                    }
-                };
                 *model = model
                     .as_ref()
                     .map(|value| value.trim().to_string())

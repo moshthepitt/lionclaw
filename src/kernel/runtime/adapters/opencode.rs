@@ -15,7 +15,6 @@ use crate::kernel::runtime::{
 #[derive(Debug, Clone)]
 pub struct OpenCodeRuntimeConfig {
     pub executable: String,
-    pub format: String,
     pub model: Option<String>,
     pub agent: Option<String>,
 }
@@ -24,7 +23,6 @@ impl Default for OpenCodeRuntimeConfig {
     fn default() -> Self {
         Self {
             executable: "opencode".to_string(),
-            format: "json".to_string(),
             model: None,
             agent: None,
         }
@@ -145,7 +143,7 @@ fn build_opencode_run_args(config: &OpenCodeRuntimeConfig, prompt: &str) -> Vec<
     let mut args = vec![
         "run".to_string(),
         "--format".to_string(),
-        config.format.clone(),
+        "json".to_string(),
         "--thinking".to_string(),
     ];
 
@@ -398,7 +396,6 @@ mod tests {
     async fn opencode_adapter_builds_program_spec_for_registered_session() {
         let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig {
             executable: "opencode".to_string(),
-            format: "json".to_string(),
             model: Some("gpt-5".to_string()),
             agent: Some("builder".to_string()),
         });

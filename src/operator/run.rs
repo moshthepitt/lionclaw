@@ -1010,7 +1010,6 @@ exit 7
     fn stubbed_opencode_runtime(executable: &std::path::Path) -> RuntimeProfileConfig {
         RuntimeProfileConfig::OpenCode {
             executable: "opencode".to_string(),
-            format: "json".to_string(),
             model: None,
             agent: None,
             confinement: ConfinementConfig::Oci(OciConfinementConfig {

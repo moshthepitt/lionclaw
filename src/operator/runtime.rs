@@ -35,7 +35,6 @@ pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConf
             }
             RuntimeProfileConfig::OpenCode {
                 executable,
-                format,
                 model,
                 agent,
                 confinement: _,
@@ -45,7 +44,6 @@ pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConf
                         id.clone(),
                         Arc::new(OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig {
                             executable: executable.clone(),
-                            format: format.clone(),
                             model: model.clone(),
                             agent: agent.clone(),
                         })),
@@ -207,31 +205,5 @@ mod tests {
         assert!(err
             .to_string()
             .contains("configured runtime profile 'broken' is invalid"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn configured_opencode_runtime_requires_json_format() {
-        let engine = std::env::current_exe().expect("current exe");
-        let mut config = OperatorConfig::default();
-        config.upsert_runtime(
-            "opencode".to_string(),
-            RuntimeProfileConfig::OpenCode {
-                executable: "opencode".to_string(),
-                format: "default".to_string(),
-                model: None,
-                agent: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine: engine.to_string_lossy().to_string(),
-                    image: Some("ghcr.io/lionclaw/opencode-runtime:latest".to_string()),
-                    ..OciConfinementConfig::default()
-                }),
-            },
-        );
-
-        let err = validate_runtime_availability(&config, "opencode").expect_err("should fail");
-        assert!(err
-            .to_string()
-            .contains("OpenCode runtime format must be 'json'"));
     }
 }

@@ -129,8 +129,6 @@ struct RuntimeAddArgs {
     executable: String,
     #[arg(long)]
     model: Option<String>,
-    #[arg(long, default_value = "json")]
-    format: String,
     #[arg(long)]
     agent: Option<String>,
     #[arg(long, help = "Confinement backend for this runtime profile")]
@@ -1009,11 +1007,9 @@ fn build_runtime_profile(
             })
         }
         "opencode" => {
-            validate_opencode_profile_args(args)?;
             let confinement = build_confinement_config(args)?;
             Ok(RuntimeProfileConfig::OpenCode {
                 executable,
-                format: args.format.clone(),
                 model: args.model.clone(),
                 agent: args.agent.clone(),
                 confinement,
@@ -1084,18 +1080,9 @@ fn build_confinement_config(args: &RuntimeAddArgs) -> Result<ConfinementConfig> 
 }
 
 fn validate_codex_profile_args(args: &RuntimeAddArgs) -> Result<()> {
-    if args.agent.is_some() || args.format != "json" {
+    if args.agent.is_some() {
         return Err(anyhow!(
             "opencode-specific flags are not valid for kind 'codex'"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_opencode_profile_args(args: &RuntimeAddArgs) -> Result<()> {
-    if args.format.trim() != "json" {
-        return Err(anyhow!(
-            "opencode runtimes must use --format json for LionClaw streaming"
         ));
     }
     Ok(())
@@ -1114,7 +1101,6 @@ mod tests {
             kind: kind.to_string(),
             executable: "runtime-bin".to_string(),
             model: None,
-            format: "json".to_string(),
             agent: None,
             backend: None,
             engine: Some(
@@ -1258,17 +1244,5 @@ mod tests {
         assert!(err
             .to_string()
             .contains("opencode-specific flags are not valid for kind 'codex'"));
-    }
-
-    #[test]
-    fn opencode_rejects_non_json_format() {
-        let mut args = runtime_add_args("opencode");
-        args.format = "default".to_string();
-        args.image = Some("ghcr.io/lionclaw/opencode:v1".to_string());
-
-        let err = build_runtime_profile(&args, "opencode".to_string()).expect_err("should fail");
-        assert!(err
-            .to_string()
-            .contains("opencode runtimes must use --format json"));
     }
 }

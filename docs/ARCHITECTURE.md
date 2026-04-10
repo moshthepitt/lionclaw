@@ -301,17 +301,17 @@ Queued channel turns emit machine-stable status/error codes through the same str
 4. Configured `codex` and `opencode` profiles run through the shared execution planner and OCI backend, then map runtime JSON output into kernel events.
 5. Kernel-enforced runtime idle timeout + hard timeout + cancellation path (`runtime.turn.timeout` audit event with `timeout_kind=idle|hard`).
 6. Runtime execution policy supports per-turn working directory, idle timeout override, and env passthrough constraints while the daemon keeps a separate hard timeout ceiling.
-7. Capability side effects route through kernel brokers only:
-   - `fs.read` / `fs.write` use workspace-bounded filesystem broker.
-   - `channel.send` records outbound transcript entries and appends typed stream events for external channel skills.
-   - `net.egress`, `secret.request`, `scheduler.run` are broker-gated and denied until configured.
+7. Ordinary confined runtime file work stays inside mounted workspace/runtime/drafts paths. Kernel brokers are reserved for explicit side effects:
+   - the existing `fs.read` / `fs.write` broker remains available for narrow non-runtime surfaces and tests, not the everyday confined runtime path
+   - `channel.send` records outbound transcript entries and appends typed stream events for external channel skills
+   - `net.egress`, `secret.request`, `scheduler.run` are broker-gated and denied until configured
 9. Auditing covers API mutations plus capability request/result decisions.
 10. Channel inbound is gated by pairing approval (`pending` -> `approved`), with duplicate update suppression and worker-controlled polling offsets.
 
 ## Planned Hardening After v0
 
 1. Wasmtime execution boundary.
-2. Rootless container execution backend for heavier workloads.
+2. Alternative confinement backends beyond the shipped OCI path.
 3. Egress proxy with allowlist enforcement.
-4. Secret broker issuing scoped, short-lived credentials.
+4. Secret broker issuing scoped, short-lived credentials for non-runtime-visible secrets.
 5. Skill source pinning + signatures.

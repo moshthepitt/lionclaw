@@ -34,8 +34,8 @@ LionClaw v0 is a local daemon kernel that:
 3. Channels are skills.
 4. Anthropic skill format is immutable input.
 5. Policy enforced at runtime boundary.
-6. Secrets are brokered, never mounted into untrusted runtime contexts.
-7. Egress is deny-by-default in final design (v0 includes policy scaffolding).
+6. Runtime-visible secrets may be mounted into the confined runtime boundary; LionClaw-owned secrets remain outside that boundary until a future broker exists.
+7. Egress is coarse in v0 (`on` or `none`); tighter deny-by-default egress controls remain future work.
 8. Every privileged action is auditable.
 9. Versioned installs and permission diffs before activation.
 10. Runtime adapters are replaceable, not special-cased.
@@ -50,7 +50,7 @@ LionClaw v0 is a local daemon kernel that:
 
 ## Non-Goals (v0)
 
-1. Production sandboxing (WASM/container) implementation.
-2. Production-grade secret broker.
+1. Alternative confinement backends beyond the shipped OCI/container path.
+2. Production-grade secret broker for non-runtime-visible secrets.
 3. Full SKILL.md semantic execution.
 4. Remote registry and signature enforcement (planned in M3/M4).
