@@ -444,4 +444,20 @@ mod tests {
             RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text } if text == "plain line"
         ));
     }
+
+    #[test]
+    fn opencode_stdout_parses_json_text_delta() {
+        let events =
+            parse_opencode_stdout(br#"{"type":"response.output_text.delta","text":"hello"}"#);
+
+        assert_eq!(events.len(), 2, "expected status plus answer delta");
+        assert!(matches!(
+            &events[0],
+            RuntimeEvent::Status { text, .. } if text == "opencode event: response.output_text.delta"
+        ));
+        assert!(matches!(
+            &events[1],
+            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text } if text == "hello"
+        ));
+    }
 }

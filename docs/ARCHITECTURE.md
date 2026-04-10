@@ -296,8 +296,8 @@ Queued channel turns emit machine-stable status/error codes through the same str
 
 1. Default deny: policy checks deny unless grant exists.
 2. No default external channel in core; all external transport is skill-worker code outside Rust kernel.
-3. Runtime adapters registered by default: local `mock`, subprocess `codex`, and subprocess `opencode`.
-4. `codex` and `opencode` adapters currently run subprocess runtimes in JSON event mode and map runtime output into kernel events.
+3. Runtime adapters registered by default: local `mock` only. `codex` and `opencode` are configured runtime profiles that bind program-backed adapters at startup.
+4. Configured `codex` and `opencode` profiles run through the shared execution planner and OCI backend, then map runtime JSON output into kernel events.
 5. Kernel-enforced runtime idle timeout + hard timeout + cancellation path (`runtime.turn.timeout` audit event with `timeout_kind=idle|hard`).
 6. Runtime execution policy supports per-turn working directory, idle timeout override, and env passthrough constraints while the daemon keeps a separate hard timeout ceiling.
 7. Capability side effects route through kernel brokers only:

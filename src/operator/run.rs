@@ -811,6 +811,35 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn run_local_executes_opencode_on_the_shared_program_backed_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let stub = temp_dir.path().join("opencode-stub.sh");
+        write_script(
+            &stub,
+            r#"#!/usr/bin/env bash
+cat >/dev/null
+echo '{"type":"response.output_text.delta","text":"hello from opencode"}'
+"#,
+        );
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("opencode".to_string(), stubbed_opencode_runtime(&stub));
+        config.save(&home).await.expect("save config");
+
+        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut output = Vec::new();
+        run_local_with_io(&home, None, false, &mut input, &mut output)
+            .await
+            .expect("run local");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("runtime: opencode"));
+        assert!(output.contains("lionclaw> hello from opencode"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn run_local_reports_reasoning_only_runtime_failures_as_partial_output() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
@@ -909,6 +938,20 @@ exit 7
             confinement: ConfinementConfig::Oci(OciConfinementConfig {
                 engine: executable.to_string_lossy().to_string(),
                 image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                ..OciConfinementConfig::default()
+            }),
+        }
+    }
+
+    fn stubbed_opencode_runtime(executable: &std::path::Path) -> RuntimeProfileConfig {
+        RuntimeProfileConfig::OpenCode {
+            executable: "opencode".to_string(),
+            format: "json".to_string(),
+            model: None,
+            agent: None,
+            confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                engine: executable.to_string_lossy().to_string(),
+                image: Some("ghcr.io/lionclaw/test-opencode-runtime:latest".to_string()),
                 ..OciConfinementConfig::default()
             }),
         }
