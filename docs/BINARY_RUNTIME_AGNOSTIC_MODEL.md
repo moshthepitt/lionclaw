@@ -144,7 +144,7 @@ This may mean many processes (example: 13 channels plus the background service).
 From the operator side, LionClaw has one normal interactive path plus explicit service commands:
 
 - `lionclaw run [runtime]` (interactive local use)
-- `lionclaw run --continue-last-session [runtime]` (resume the latest local interactive session)
+- `lionclaw run --continue-last-session [runtime]` (resume the latest local interactive session for the current project)
 - `lionclaw apply` (reconcile desired state)
 - `lionclaw service up` (start supervised stack + ensure auto-restart policy)
 - `lionclaw service down`
@@ -181,7 +181,7 @@ Inside `lionclaw run`, recovery stays command-first:
 - `/reset`
 - `/exit`
 
-The core keeps durable per-turn history, preserves partial assistant output across timeouts and restart interruption, and reopens the latest local session by most recent activity.
+The core keeps durable per-turn history, preserves partial assistant output across timeouts and restart interruption, and reopens the latest local session for the current project by most recent activity.
 Interactive runtime continuity now has two layers:
 
 - LionClaw keeps the durable session transcript, audit trail, and artifacts.

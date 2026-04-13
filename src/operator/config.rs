@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::home::{LionClawHome, DEFAULT_WORKSPACE};
+use crate::home::{runtime_profile_partition_key, LionClawHome, DEFAULT_WORKSPACE};
 use crate::kernel::runtime::{ConfinementConfig, ExecutionPreset, RuntimeExecutionProfile};
 use crate::kernel::skills::sanitize_skill_name;
 
@@ -365,7 +365,16 @@ impl RuntimeProfileConfig {
     pub fn execution_profile(&self) -> RuntimeExecutionProfile {
         RuntimeExecutionProfile {
             confinement: self.confinement().clone(),
+            compatibility_key: self.compatibility_key(),
         }
+    }
+
+    pub fn compatibility_key(&self) -> String {
+        let mut normalized = self.clone();
+        normalized.normalize();
+        let encoded = serde_json::to_vec(&normalized)
+            .expect("runtime profile config should always serialize");
+        runtime_profile_partition_key(&encoded)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -705,6 +714,28 @@ mod tests {
         assert!(err
             .to_string()
             .contains("runtime profile 'codex' is not configured"));
+    }
+
+    #[test]
+    fn runtime_compatibility_key_changes_when_profile_changes() {
+        let left = RuntimeProfileConfig::Codex {
+            executable: "codex".to_string(),
+            model: Some("gpt-5".to_string()),
+            confinement: sample_confinement(),
+        };
+        let right = RuntimeProfileConfig::Codex {
+            executable: "codex".to_string(),
+            model: Some("gpt-5.1".to_string()),
+            confinement: sample_confinement(),
+        };
+        let normalized = RuntimeProfileConfig::Codex {
+            executable: " codex ".to_string(),
+            model: Some(" gpt-5 ".to_string()),
+            confinement: sample_confinement(),
+        };
+
+        assert_ne!(left.compatibility_key(), right.compatibility_key());
+        assert_eq!(left.compatibility_key(), normalized.compatibility_key());
     }
 
     #[test]

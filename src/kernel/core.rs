@@ -4305,9 +4305,6 @@ impl Kernel {
         let runtime_turn = match turn_result {
             Ok(output) => output,
             Err(turn_err) => {
-                if !turn_err.events.is_empty() {
-                    self.mark_runtime_session_ready(&execution_plan).await;
-                }
                 let _ = self
                     .close_runtime_session(
                         adapter.clone(),
@@ -4376,10 +4373,6 @@ impl Kernel {
             Ok::<Vec<RuntimeEvent>, KernelError>(runtime_events)
         }
         .await;
-
-        if runtime_events_result.is_ok() {
-            self.mark_runtime_session_ready(&execution_plan).await;
-        }
 
         let close_result = self
             .close_runtime_session(adapter.clone(), &runtime_id, session.session_id, &handle)
@@ -4453,6 +4446,7 @@ impl Kernel {
             .record_turn(session.session_id)
             .await
             .map_err(internal)?;
+        self.mark_runtime_session_ready(&execution_plan).await;
         self.maybe_compact_session_transcript_best_effort(session)
             .await;
 

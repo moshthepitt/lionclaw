@@ -17,9 +17,9 @@ use lionclaw::{
     home::RUNTIME_SESSION_READY_MARKER,
     kernel::{
         runtime::{
-            RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
-            RuntimeEventSender, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
-            RuntimeTurnResult,
+            ConfinementConfig, OciConfinementConfig, RuntimeAdapter, RuntimeAdapterInfo,
+            RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender, RuntimeExecutionProfile,
+            RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
         },
         Kernel, KernelError, KernelOptions,
     },
@@ -769,7 +769,7 @@ async fn session_scoped_runtime_state_resumes_without_replaying_full_history() {
 }
 
 #[tokio::test]
-async fn partial_failure_still_marks_runtime_session_resumable_for_continue() {
+async fn partial_failure_does_not_mark_runtime_session_resumable_for_continue() {
     let env = TestEnv::new();
     let workspace_root = env.path().join("workspace");
     let project_root = env.path().join("project");
@@ -824,11 +824,11 @@ async fn partial_failure_still_marks_runtime_session_resumable_for_continue() {
             Some("flaky".to_string()),
         )
         .await
-        .expect("continue should reuse resumable runtime session");
+        .expect("continue should still succeed from canonical history");
     assert_eq!(response.assistant_text, "continued");
 
     let resumed_flags = resumed_flags.lock().expect("resumed flags lock").clone();
-    assert_eq!(resumed_flags, vec![false, true]);
+    assert_eq!(resumed_flags, vec![false, false]);
 }
 
 #[tokio::test]
@@ -903,6 +903,122 @@ async fn retry_restarts_harness_session_from_canonical_history() {
         roots[0], roots[1],
         "retry should reuse the same session-scoped root path"
     );
+    let resumed_flags = resumed_flags.lock().expect("resumed flags lock").clone();
+    assert_eq!(resumed_flags, vec![false, false]);
+}
+
+#[tokio::test]
+async fn runtime_profile_change_invalidates_resumable_state() {
+    let env = TestEnv::new();
+    let workspace_root = env.path().join("workspace");
+    let project_root = env.path().join("project");
+    let runtime_root = env.path().join("runtime");
+    std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+    std::fs::create_dir_all(&project_root).expect("create project root");
+
+    let recorded_prompts = Arc::new(Mutex::new(Vec::new()));
+    let recorded_roots = Arc::new(Mutex::new(Vec::new()));
+    let resumed_flags = Arc::new(Mutex::new(Vec::new()));
+
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(workspace_root.clone()),
+            project_workspace_root: Some(project_root.clone()),
+            runtime_root: Some(runtime_root.clone()),
+            workspace_name: Some("main".to_string()),
+            runtime_execution_profiles: [(
+                "resumable".to_string(),
+                test_runtime_profile("runtime-v1"),
+            )]
+            .into_iter()
+            .collect(),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    kernel
+        .register_runtime_adapter(
+            "resumable",
+            Arc::new(ResumableCaptureAdapter {
+                prompts: recorded_prompts.clone(),
+                runtime_roots: recorded_roots.clone(),
+                resumed_flags: resumed_flags.clone(),
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+
+    let session = open_session(
+        &kernel,
+        "runtime-profile-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "first request".to_string(),
+            runtime_id: Some("resumable".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("first turn");
+
+    drop(kernel);
+
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(workspace_root),
+            project_workspace_root: Some(project_root),
+            runtime_root: Some(runtime_root),
+            workspace_name: Some("main".to_string()),
+            runtime_execution_profiles: [(
+                "resumable".to_string(),
+                test_runtime_profile("runtime-v2"),
+            )]
+            .into_iter()
+            .collect(),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel reinit");
+
+    kernel
+        .register_runtime_adapter(
+            "resumable",
+            Arc::new(ResumableCaptureAdapter {
+                prompts: recorded_prompts.clone(),
+                runtime_roots: recorded_roots.clone(),
+                resumed_flags: resumed_flags.clone(),
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "second request".to_string(),
+            runtime_id: Some("resumable".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("second turn");
+
+    let roots = recorded_roots.lock().expect("roots lock").clone();
+    assert_eq!(roots.len(), 2);
+    assert_ne!(roots[0], roots[1]);
+
     let resumed_flags = resumed_flags.lock().expect("resumed flags lock").clone();
     assert_eq!(resumed_flags, vec![false, false]);
 }
@@ -1249,6 +1365,13 @@ impl RuntimeAdapter for BlockingAnswerAdapter {
 
 struct TestEnv {
     temp_dir: TempDir,
+}
+
+fn test_runtime_profile(compatibility_key: &str) -> RuntimeExecutionProfile {
+    RuntimeExecutionProfile {
+        confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
+        compatibility_key: compatibility_key.to_string(),
+    }
 }
 
 impl TestEnv {

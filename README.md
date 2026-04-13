@@ -62,7 +62,7 @@ LionClaw keeps its own continuity, runtime state, services, and config under
 `LIONCLAW_HOME`, while the confined runtime sees the project itself at
 `/workspace`.
 
-Continue the latest local session instead of starting fresh:
+Continue the latest local session for the current project instead of starting fresh:
 
 ```bash
 ./target/release/lionclaw run --continue-last-session codex

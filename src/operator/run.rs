@@ -1,6 +1,7 @@
 use std::{
     future::Future,
     io::{BufRead, Write},
+    path::Path,
 };
 
 use anyhow::{anyhow, Result};
@@ -13,7 +14,7 @@ use crate::{
         SessionOpenRequest, SessionTurnRequest, SessionTurnStatus, SessionTurnView, StreamEventDto,
         StreamEventKindDto, StreamLaneDto, TrustTier,
     },
-    home::LionClawHome,
+    home::{runtime_project_partition_key, LionClawHome},
     kernel::Kernel,
     operator::{
         reconcile::{apply, onboard, open_runtime_kernel, render_runtime_cache},
@@ -56,7 +57,7 @@ pub(crate) async fn run_local_with_io<R: BufRead, W: Write>(
     let kernel = open_runtime_kernel(home, &applied.config, Some(runtime_id.clone())).await?;
     let project_workspace_root = resolve_project_workspace_root()
         .map_err(|err| anyhow!("failed to resolve project workspace root: {}", err))?;
-    let peer_id = local_peer_id();
+    let peer_id = local_peer_id_for_project(&project_workspace_root);
     run_repl(
         &kernel,
         &runtime_id,
@@ -151,13 +152,21 @@ async fn run_repl<R: BufRead, W: Write>(
     Ok(())
 }
 
-fn local_peer_id() -> String {
+fn local_user_id() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "local-user".to_string())
+}
+
+fn local_peer_id_for_project(project_root: &Path) -> String {
+    format!(
+        "{}@project:{}",
+        local_user_id(),
+        runtime_project_partition_key(Some(project_root))
+    )
 }
 
 fn kernel_to_anyhow(err: crate::kernel::KernelError) -> anyhow::Error {
@@ -438,13 +447,17 @@ mod tests {
     use sqlx::{Row, SqlitePool};
     use uuid::Uuid;
 
-    use super::{local_peer_id, render_turn_stream, run_local_with_io};
+    use super::{
+        local_peer_id_for_project, render_turn_stream, resolve_repl_session, run_local_with_io,
+    };
     use crate::{
+        config::resolve_project_workspace_root,
         contracts::{StreamEventDto, StreamEventKindDto, StreamLaneDto},
         home::LionClawHome,
         kernel::{
             db::Db,
             runtime::{ConfinementConfig, OciConfinementConfig},
+            Kernel, KernelOptions,
         },
         operator::config::{OperatorConfig, RuntimeProfileConfig},
     };
@@ -583,7 +596,9 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
              VALUES (?1, 'local-cli', ?2, 'main', 'interactive', ?3, NULL, NULL, 0)",
         )
         .bind(Uuid::new_v4().to_string())
-        .bind(local_peer_id())
+        .bind(local_peer_id_for_project(
+            &resolve_project_workspace_root().expect("project root"),
+        ))
         .bind(newer_created_at_ms)
         .execute(&pool)
         .await
@@ -631,7 +646,8 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             .await
             .expect("connect db")
             .pool();
-        let peer_id = local_peer_id();
+        let peer_id =
+            local_peer_id_for_project(&resolve_project_workspace_root().expect("project root"));
         let session_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO sessions \
@@ -668,6 +684,36 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         );
         assert!(output.contains("lionclaw> partial reply"));
         assert!(output.contains("[error] turn interrupted by kernel restart"));
+    }
+
+    #[tokio::test]
+    async fn local_continue_last_session_is_project_scoped() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("lionclaw.db");
+        let kernel = Kernel::new_with_options(&db_path, KernelOptions::default())
+            .await
+            .expect("kernel init");
+        let project_a = temp_dir.path().join("project-a");
+        let project_b = temp_dir.path().join("project-b");
+        fs::create_dir_all(&project_a).expect("project a");
+        fs::create_dir_all(&project_b).expect("project b");
+
+        let project_a_peer = local_peer_id_for_project(&project_a);
+        let project_b_peer = local_peer_id_for_project(&project_b);
+        assert_ne!(project_a_peer, project_b_peer);
+
+        let existing = resolve_repl_session(&kernel, &project_a_peer, false)
+            .await
+            .expect("open project a session");
+        let resumed = resolve_repl_session(&kernel, &project_a_peer, true)
+            .await
+            .expect("resume project a session");
+        let isolated = resolve_repl_session(&kernel, &project_b_peer, true)
+            .await
+            .expect("open project b session");
+
+        assert_eq!(resumed.session_id, existing.session_id);
+        assert_ne!(isolated.session_id, existing.session_id);
     }
 
     #[tokio::test]

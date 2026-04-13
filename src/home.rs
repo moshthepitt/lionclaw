@@ -123,6 +123,7 @@ impl LionClawHome {
         workspace: &str,
         project_root: &Path,
         session_id: Uuid,
+        compatibility_key: &str,
         shape_key: &str,
     ) -> PathBuf {
         runtime_session_state_dir_from_parts(
@@ -131,6 +132,7 @@ impl LionClawHome {
             workspace,
             Some(project_root),
             session_id,
+            compatibility_key,
             shape_key,
         )
     }
@@ -218,8 +220,11 @@ pub fn runtime_project_partition_key(project_root: Option<&Path>) -> String {
     let digest_source = project_root
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| "global".to_string());
-    let digest = Sha256::digest(digest_source.as_bytes());
-    format!("project-{}", &hex::encode(digest)[..12])
+    hashed_partition_key("project", digest_source.as_bytes())
+}
+
+pub fn runtime_profile_partition_key(source: &[u8]) -> String {
+    hashed_partition_key("runtime", source)
 }
 
 pub fn runtime_project_dir_from_parts(
@@ -261,12 +266,19 @@ pub fn runtime_session_state_dir_from_parts(
     workspace: &str,
     project_root: Option<&Path>,
     session_id: Uuid,
+    compatibility_key: &str,
     shape_key: &str,
 ) -> PathBuf {
     runtime_project_dir_from_parts(runtime_root, runtime_id, workspace, project_root)
         .join(RUNTIME_SESSIONS_DIR)
         .join(session_id.to_string())
+        .join(compatibility_key)
         .join(shape_key)
+}
+
+fn hashed_partition_key(prefix: &str, source: &[u8]) -> String {
+    let digest = Sha256::digest(source);
+    format!("{prefix}-{}", &hex::encode(digest)[..12])
 }
 
 fn default_home_root() -> Option<PathBuf> {
@@ -276,8 +288,8 @@ fn default_home_root() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        runtime_project_partition_key, LionClawHome, DEFAULT_WORKSPACE, RUNTIME_DRAFTS_DIR,
-        RUNTIME_PROJECTS_DIR, RUNTIME_SESSIONS_DIR,
+        runtime_profile_partition_key, runtime_project_partition_key, LionClawHome,
+        DEFAULT_WORKSPACE, RUNTIME_DRAFTS_DIR, RUNTIME_PROJECTS_DIR, RUNTIME_SESSIONS_DIR,
     };
     use uuid::Uuid;
 
@@ -286,6 +298,7 @@ mod tests {
         let home = LionClawHome::new("/tmp/lionclaw-home".into());
         let project_root = std::path::Path::new("/tmp/project");
         let project_key = runtime_project_partition_key(Some(project_root));
+        let compatibility_key = runtime_profile_partition_key(b"codex-v1");
         let session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("uuid");
 
         assert_eq!(
@@ -339,6 +352,7 @@ mod tests {
                 DEFAULT_WORKSPACE,
                 project_root,
                 session_id,
+                &compatibility_key,
                 "workspace-read-write__network-on__secrets-off"
             ),
             std::path::PathBuf::from("/tmp/lionclaw-home/runtime")
@@ -348,6 +362,7 @@ mod tests {
                 .join(project_key)
                 .join(RUNTIME_SESSIONS_DIR)
                 .join(session_id.to_string())
+                .join(compatibility_key)
                 .join("workspace-read-write__network-on__secrets-off")
         );
     }

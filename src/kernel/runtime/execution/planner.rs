@@ -19,12 +19,14 @@ const DRAFTS_MOUNT_TARGET: &str = "/drafts";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeExecutionProfile {
     pub confinement: ConfinementConfig,
+    pub compatibility_key: String,
 }
 
 impl Default for RuntimeExecutionProfile {
     fn default() -> Self {
         Self {
             confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
+            compatibility_key: "runtime-default".to_string(),
         }
     }
 }
@@ -267,6 +269,7 @@ impl ExecutionPlanner {
                     workspace_name,
                     self.project_workspace_root.as_deref(),
                     session_id,
+                    &runtime_profile.compatibility_key,
                     &runtime_session_shape_key(preset),
                 ),
                 target: RUNTIME_MOUNT_TARGET.to_string(),
@@ -452,6 +455,7 @@ mod tests {
                     additional_mounts: vec![extra_mount.clone()],
                     ..OciConfinementConfig::default()
                 }),
+                compatibility_key: "runtime-codex-v1".to_string(),
             },
         )]
         .into_iter()
@@ -497,6 +501,7 @@ mod tests {
                 .join(&project_key)
                 .join(RUNTIME_SESSIONS_DIR)
                 .join(session_id.to_string())
+                .join("runtime-codex-v1")
                 .join("workspace-read-write__network-on__secrets-off")
         );
         assert_eq!(plan.mounts[1].target, "/runtime");
