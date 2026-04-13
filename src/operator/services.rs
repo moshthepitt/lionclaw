@@ -42,6 +42,7 @@ pub fn render_daemon_unit(
     runtime_id: &str,
     workspace: &str,
     project_workspace_root: &Path,
+    config_fingerprint: &str,
 ) -> ManagedServiceUnit {
     let env_path = home.services_env_dir().join("lionclawd.env");
     let unit_path = home.services_systemd_dir().join(DAEMON_UNIT_NAME);
@@ -63,6 +64,10 @@ pub fn render_daemon_unit(
         (
             "LIONCLAW_WORKSPACE_ROOT".to_string(),
             project_workspace_root.display().to_string(),
+        ),
+        (
+            "LIONCLAW_DAEMON_CONFIG_FINGERPRINT".to_string(),
+            config_fingerprint.to_string(),
         ),
     ];
     let env_content = env_lines
@@ -566,6 +571,7 @@ mod tests {
             "codex",
             "main",
             Path::new("/tmp/project"),
+            "daemon-compat-test",
         );
         assert!(daemon.unit_content.contains("ExecStart=/tmp/bin/lionclawd"));
         assert!(daemon
@@ -575,6 +581,9 @@ mod tests {
         assert!(daemon
             .env_content
             .contains("LIONCLAW_WORKSPACE_ROOT=\"/tmp/project\""));
+        assert!(daemon
+            .env_content
+            .contains("LIONCLAW_DAEMON_CONFIG_FINGERPRINT=\"daemon-compat-test\""));
 
         let channel = render_channel_unit(
             &home,

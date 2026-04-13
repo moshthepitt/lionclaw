@@ -10,8 +10,8 @@ use crate::{
     kernel::{Kernel, KernelOptions, RuntimeExecutionPolicy},
     operator::{
         config::{
-            normalize_local_source, ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig,
-            OperatorConfig,
+            daemon_compat_fingerprint, normalize_local_source, ChannelLaunchMode,
+            ManagedChannelConfig, ManagedSkillConfig, OperatorConfig,
         },
         daemon_probe::{classify_daemon, DaemonClassification},
         lockfile::{LockedChannel, LockedSkill, OperatorLockfile},
@@ -269,9 +269,17 @@ pub async fn up<M: ServiceManager>(
     let project_root =
         resolve_project_workspace_root().context("failed to resolve project workspace root")?;
     let project_scope = runtime_project_partition_key(Some(project_root.as_path()));
-    match classify_daemon(&config.daemon.bind, &home_id, &project_scope).await? {
+    let expected_config_fingerprint = daemon_compat_fingerprint(&config);
+    match classify_daemon(
+        &config.daemon.bind,
+        &home_id,
+        &project_scope,
+        &expected_config_fingerprint,
+    )
+    .await?
+    {
         DaemonClassification::Absent => {}
-        DaemonClassification::SameHome => {
+        DaemonClassification::SameHome | DaemonClassification::SameHomeDifferentConfig => {
             let daemon_status = manager.unit_status(DAEMON_UNIT_NAME).await?;
             if !unit_status_is_active(&daemon_status) {
                 return Err(anyhow!(
@@ -511,6 +519,7 @@ pub(crate) fn build_managed_units(
         runtime_id,
         &config.daemon.workspace,
         &project_workspace_root,
+        &daemon_compat_fingerprint(config),
     ));
 
     let base_url = base_url_from_bind(&config.daemon.bind);
@@ -792,8 +801,8 @@ mod tests {
         },
         operator::{
             config::{
-                ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig, OperatorConfig,
-                RuntimeProfileConfig,
+                daemon_compat_fingerprint, ChannelLaunchMode, ManagedChannelConfig,
+                ManagedSkillConfig, OperatorConfig, RuntimeProfileConfig,
             },
             lockfile::OperatorLockfile,
             services::{FakeServiceManager, ServiceManager, DAEMON_UNIT_NAME},
@@ -814,6 +823,10 @@ mod tests {
         let project_root =
             resolve_project_workspace_root().expect("resolve project workspace root");
         runtime_project_partition_key(Some(project_root.as_path()))
+    }
+
+    async fn current_daemon_config_fingerprint(home: &LionClawHome) -> String {
+        daemon_compat_fingerprint(&OperatorConfig::load(home).await.expect("load config"))
     }
 
     #[cfg(unix)]
@@ -1164,6 +1177,7 @@ mod tests {
             .expect("load config")
             .daemon
             .bind;
+        let config_fingerprint = current_daemon_config_fingerprint(&home).await;
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",
@@ -1177,6 +1191,7 @@ mod tests {
                             home_root: "/tmp/foreign-home".to_string(),
                             bind_addr: bind_addr.clone(),
                             project_scope: "foreign-project".to_string(),
+                            config_fingerprint: config_fingerprint.clone(),
                         })
                     }
                 }),
@@ -1205,6 +1220,7 @@ mod tests {
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind;
         let home_root = home.root().display().to_string();
+        let config_fingerprint = current_daemon_config_fingerprint(&home).await;
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",
@@ -1221,6 +1237,7 @@ mod tests {
                             home_root: home_root.clone(),
                             bind_addr: bind_addr.clone(),
                             project_scope: project_scope.clone(),
+                            config_fingerprint: config_fingerprint.clone(),
                         })
                     }
                 }),
@@ -1250,6 +1267,7 @@ mod tests {
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind;
         let home_root = home.root().display().to_string();
+        let config_fingerprint = current_daemon_config_fingerprint(&home).await;
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",
@@ -1265,6 +1283,7 @@ mod tests {
                             home_root: home_root.clone(),
                             bind_addr: bind_addr.clone(),
                             project_scope: "different-project".to_string(),
+                            config_fingerprint: config_fingerprint.clone(),
                         })
                     }
                 }),
@@ -1306,6 +1325,7 @@ mod tests {
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
         let home_root = home.root().display().to_string();
+        let config_fingerprint = current_daemon_config_fingerprint(&home).await;
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",
@@ -1322,6 +1342,7 @@ mod tests {
                             home_root: home_root.clone(),
                             bind_addr: bind_addr.clone(),
                             project_scope: project_scope.clone(),
+                            config_fingerprint: config_fingerprint.clone(),
                         })
                     }
                 }),
@@ -1341,6 +1362,68 @@ mod tests {
         assert!(
             manager.was_restarted(DAEMON_UNIT_NAME),
             "changed active daemon unit should be restarted"
+        );
+    }
+
+    #[tokio::test]
+    async fn up_restarts_same_home_daemon_when_config_is_stale() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
+        let runtime_stub = temp_dir.path().join("codex-stub.sh");
+        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&runtime_stub, fs::Permissions::from_mode(0o755))
+                .expect("chmod runtime stub");
+        }
+        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
+            .into_iter()
+            .collect();
+        config.save(&home).await.expect("save config");
+
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let bind_addr = config.daemon.bind.clone();
+        let home_root = home.root().display().to_string();
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    let home_id = home_id.clone();
+                    let home_root = home_root.clone();
+                    let project_scope = current_project_scope();
+                    move || async move {
+                        Json(DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: home_id.clone(),
+                            home_root: home_root.clone(),
+                            bind_addr: bind_addr.clone(),
+                            project_scope: project_scope.clone(),
+                            config_fingerprint: "daemon-stale-config".to_string(),
+                        })
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+        let manager = FakeServiceManager::default();
+        manager.set_unit_status(DAEMON_UNIT_NAME, "loaded/active/running");
+        let binaries = StackBinaryPaths {
+            daemon_bin: "/tmp/lionclawd".into(),
+        };
+
+        up(&home, &manager, "codex", &binaries)
+            .await
+            .expect("stale managed daemon should be reconciled");
+        assert!(
+            manager.was_restarted(DAEMON_UNIT_NAME),
+            "managed daemon should be restarted when daemon config fingerprint changes"
         );
     }
 

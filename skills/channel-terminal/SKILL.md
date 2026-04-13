@@ -43,7 +43,7 @@ lionclaw channel add terminal --launch interactive
 lionclaw channel attach terminal
 ```
 
-If LionClaw is not already running, `channel attach` will start it using the default runtime, or the runtime passed with `--runtime`.
+If LionClaw is not already running, `channel attach` will start it for you. Passing `--runtime <id>` pins that attached worker's turns to the requested runtime.
 
 For a fresh manual test home in one command:
 
@@ -73,5 +73,6 @@ For repeated manual testing, you can use the repo helper:
   - `/exit`
 - The Transcript pane is durable session history plus live answer deltas.
 - The Thinking pane is live-only. It does not replay historical reasoning on attach.
-- Runtime selection normally comes from the running LionClaw service or `lionclaw channel attach <id> --runtime ...` when attach needs to start it. Attach only reuses a daemon when that daemon belongs to the same `LIONCLAW_HOME`.
+- Runtime selection normally comes from the running LionClaw service, unless you pass `lionclaw channel attach <id> --runtime ...`, which pins that attached worker to a specific runtime.
+- Attach only reuses a daemon when that daemon belongs to the same `LIONCLAW_HOME`, current project, and daemon-compatible runtime/preset config.
 - A shell debug harness is available in `scripts/debug-worker.sh`.

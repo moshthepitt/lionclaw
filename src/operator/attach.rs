@@ -9,6 +9,7 @@ use crate::{
     home::runtime_project_partition_key,
     home::LionClawHome,
     operator::{
+        config::daemon_compat_fingerprint,
         config::ChannelLaunchMode,
         daemon_probe::{classify_daemon, wait_for_same_home_daemon, DaemonClassification},
         reconcile::{apply, base_url_from_bind, resolve_worker_entrypoint, up, StackBinaryPaths},
@@ -22,6 +23,7 @@ pub(crate) struct ChannelAttachSpec {
     pub bind_addr: String,
     pub env: Vec<(String, String)>,
     pub started_services: bool,
+    pub expected_config_fingerprint: String,
 }
 
 pub async fn attach_channel<M: ServiceManager>(
@@ -50,11 +52,18 @@ pub async fn attach_channel<M: ServiceManager>(
             &spec.bind_addr,
             &home_id,
             &project_scope,
+            &spec.expected_config_fingerprint,
             Duration::from_secs(5),
         )
         .await?
         {
             DaemonClassification::SameHome => {}
+            DaemonClassification::SameHomeDifferentConfig => {
+                return Err(anyhow!(
+                    "bind '{}' became available with stale runtime or preset config while attaching",
+                    spec.bind_addr
+                ));
+            }
             DaemonClassification::Absent => {
                 return Err(anyhow!(
                     "lionclawd did not become available at '{}' within 5s",
@@ -102,12 +111,14 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
     binaries: &StackBinaryPaths,
 ) -> Result<ChannelAttachSpec> {
     let initial_config = crate::operator::config::OperatorConfig::load(home).await?;
+    let expected_config_fingerprint = daemon_compat_fingerprint(&initial_config);
     let home_id = home.ensure_home_id().await?;
     let mut started_services = false;
     let applied = match classify_daemon(
         &initial_config.daemon.bind,
         &home_id,
         expected_project_scope,
+        &expected_config_fingerprint,
     )
     .await?
     {
@@ -117,6 +128,11 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
             up(home, manager, &runtime_id, binaries).await?
         }
         DaemonClassification::SameHome => apply(home).await?,
+        DaemonClassification::SameHomeDifferentConfig => {
+            let runtime_id = initial_config.resolve_runtime_id(requested_runtime_id.as_deref())?;
+            started_services = true;
+            up(home, manager, &runtime_id, binaries).await?
+        }
         DaemonClassification::SameHomeDifferentProject => {
             return Err(anyhow!(
                 "bind '{}' is already served by this LionClaw home for a different project; stop that daemon or attach from the matching project root",
@@ -217,6 +233,7 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
         bind_addr: applied.config.daemon.bind,
         env: env.into_iter().collect(),
         started_services,
+        expected_config_fingerprint,
     })
 }
 
@@ -278,8 +295,8 @@ mod tests {
         kernel::runtime::{ConfinementConfig, OciConfinementConfig},
         operator::{
             config::{
-                ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig, OperatorConfig,
-                RuntimeProfileConfig,
+                daemon_compat_fingerprint, ChannelLaunchMode, ManagedChannelConfig,
+                ManagedSkillConfig, OperatorConfig, RuntimeProfileConfig,
             },
             services::{FakeServiceManager, ServiceManager},
         },
@@ -295,6 +312,10 @@ mod tests {
         let project_root =
             resolve_project_workspace_root().expect("resolve project workspace root");
         runtime_project_partition_key(Some(project_root.as_path()))
+    }
+
+    fn current_config_fingerprint(config: &OperatorConfig) -> String {
+        daemon_compat_fingerprint(config)
     }
 
     #[cfg(unix)]
@@ -464,6 +485,7 @@ mod tests {
         let config = OperatorConfig::load(&home).await.expect("load config");
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
+        let config_fingerprint = current_config_fingerprint(&config);
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",
@@ -480,6 +502,7 @@ mod tests {
                             home_root: home_root.clone(),
                             bind_addr: bind_addr.clone(),
                             project_scope: project_scope.clone(),
+                            config_fingerprint: config_fingerprint.clone(),
                         };
                         async move { Json(response) }
                     }
@@ -512,6 +535,7 @@ mod tests {
         let config = OperatorConfig::load(&home).await.expect("load config");
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
+        let config_fingerprint = current_config_fingerprint(&config);
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",
@@ -528,6 +552,7 @@ mod tests {
                             home_root: home_root.clone(),
                             bind_addr: bind_addr.clone(),
                             project_scope: project_scope.clone(),
+                            config_fingerprint: config_fingerprint.clone(),
                         };
                         async move { Json(response) }
                     }
@@ -559,8 +584,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn prepare_channel_attach_rejects_unknown_requested_runtime_when_reusing_same_home_daemon(
-    ) {
+    async fn prepare_channel_attach_restarts_same_home_daemon_when_config_is_stale() {
         let (_temp_dir, home, manager) =
             seed_interactive_channel(ChannelLaunchMode::Interactive).await;
         let config = OperatorConfig::load(&home).await.expect("load config");
@@ -582,6 +606,66 @@ mod tests {
                             home_root: home_root.clone(),
                             bind_addr: bind_addr.clone(),
                             project_scope: project_scope.clone(),
+                            config_fingerprint: "daemon-stale-config".to_string(),
+                        };
+                        async move { Json(response) }
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+        manager.set_unit_status(
+            crate::operator::services::DAEMON_UNIT_NAME,
+            "loaded/active/running",
+        );
+
+        let spec = prepare_channel_attach(
+            &home,
+            &manager,
+            "terminal".to_string(),
+            None,
+            Some("codex".to_string()),
+            &current_project_scope(),
+            &binaries(),
+        )
+        .await
+        .expect("prepare attach");
+
+        assert!(spec.started_services, "stale daemon should be reconciled");
+        assert!(
+            manager.was_restarted(crate::operator::services::DAEMON_UNIT_NAME),
+            "managed daemon should be restarted when config fingerprint changes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_channel_attach_rejects_unknown_requested_runtime_when_reusing_same_home_daemon(
+    ) {
+        let (_temp_dir, home, manager) =
+            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let bind_addr = config.daemon.bind.clone();
+        let config_fingerprint = current_config_fingerprint(&config);
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    let home_root = home.root().display().to_string();
+                    let home_id = home_id.clone();
+                    let project_scope = current_project_scope();
+                    move || {
+                        let response = DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: home_id.clone(),
+                            home_root: home_root.clone(),
+                            bind_addr: bind_addr.clone(),
+                            project_scope: project_scope.clone(),
+                            config_fingerprint: config_fingerprint.clone(),
                         };
                         async move { Json(response) }
                     }
@@ -615,6 +699,7 @@ mod tests {
             seed_interactive_channel(ChannelLaunchMode::Interactive).await;
         let config = OperatorConfig::load(&home).await.expect("load config");
         let bind_addr = config.daemon.bind.clone();
+        let config_fingerprint = current_config_fingerprint(&config);
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",
@@ -628,6 +713,7 @@ mod tests {
                             home_root: "/tmp/foreign-home".to_string(),
                             bind_addr: bind_addr.clone(),
                             project_scope: "foreign-project".to_string(),
+                            config_fingerprint: config_fingerprint.clone(),
                         })
                     }
                 }),
@@ -691,6 +777,7 @@ mod tests {
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
         let home_root = home.root().display().to_string();
+        let config_fingerprint = current_config_fingerprint(&config);
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",
@@ -706,6 +793,7 @@ mod tests {
                             home_root: home_root.clone(),
                             bind_addr: bind_addr.clone(),
                             project_scope: "different-project".to_string(),
+                            config_fingerprint: config_fingerprint.clone(),
                         })
                     }
                 }),

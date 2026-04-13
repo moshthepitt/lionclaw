@@ -12,7 +12,7 @@ use crate::{
     home::runtime_project_partition_key,
     kernel::{Kernel, KernelOptions, RuntimeExecutionPolicy},
     operator::{
-        config::OperatorConfig,
+        config::{daemon_compat_fingerprint, OperatorConfig},
         runtime::{configured_runtime_execution_profiles, register_configured_runtimes},
         runtime_secrets::resolve_runtime_secrets_file,
     },
@@ -33,6 +33,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .or_else(|| resolve_project_workspace_root().ok())
         .unwrap_or_else(|| workspace_root.clone());
     let project_scope = runtime_project_partition_key(Some(project_workspace_root.as_path()));
+    let config_fingerprint = daemon_compat_fingerprint(&operator_config);
     let default_runtime_id = config
         .default_runtime_id
         .clone()
@@ -80,6 +81,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             home_root: config.home.root().display().to_string(),
             bind_addr: config.bind_addr.clone(),
             project_scope,
+            config_fingerprint,
         },
     );
 

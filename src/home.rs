@@ -227,6 +227,10 @@ pub fn runtime_profile_partition_key(source: &[u8]) -> String {
     hashed_partition_key("runtime", source)
 }
 
+pub fn daemon_compat_partition_key(source: &[u8]) -> String {
+    hashed_partition_key("daemon", source)
+}
+
 pub fn runtime_project_dir_from_parts(
     runtime_root: &Path,
     runtime_id: &str,

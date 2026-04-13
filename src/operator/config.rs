@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::home::{runtime_profile_partition_key, LionClawHome, DEFAULT_WORKSPACE};
+use crate::home::{
+    daemon_compat_partition_key, runtime_profile_partition_key, LionClawHome, DEFAULT_WORKSPACE,
+};
 use crate::kernel::runtime::{ConfinementConfig, ExecutionPreset, RuntimeExecutionProfile};
 use crate::kernel::skills::sanitize_skill_name;
 
@@ -224,6 +226,27 @@ impl OperatorConfig {
             channel.required_env.dedup();
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DaemonCompatConfig {
+    version: u32,
+    default_preset_name: Option<String>,
+    execution_presets: BTreeMap<String, ExecutionPreset>,
+    runtime_profiles: BTreeMap<String, RuntimeProfileConfig>,
+}
+
+pub fn daemon_compat_fingerprint(config: &OperatorConfig) -> String {
+    let mut normalized = config.clone();
+    normalized.normalize();
+    let encoded = serde_json::to_vec(&DaemonCompatConfig {
+        version: 1,
+        default_preset_name: normalized.defaults.preset.clone(),
+        execution_presets: normalized.presets,
+        runtime_profiles: normalized.runtimes,
+    })
+    .expect("daemon compatibility config should always serialize");
+    daemon_compat_partition_key(&encoded)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
