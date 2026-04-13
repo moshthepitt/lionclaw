@@ -4115,6 +4115,9 @@ impl Kernel {
                 },
             )
             .await?;
+        if kind == SessionTurnKind::Retry {
+            self.reset_runtime_plan_state(&execution_plan).await?;
+        }
         self.materialize_runtime_plan(&runtime_id, &execution_plan)
             .await?;
         let persisted_turn = self
@@ -4189,6 +4192,9 @@ impl Kernel {
         let runtime_turn = match turn_result {
             Ok(output) => output,
             Err(turn_err) => {
+                if !turn_err.events.is_empty() {
+                    self.mark_runtime_session_ready(&execution_plan).await;
+                }
                 let _ = self
                     .close_runtime_session(
                         adapter.clone(),
@@ -4555,6 +4561,21 @@ impl Kernel {
         .await
         .map_err(|err| internal(err.into()))?;
         Ok(())
+    }
+
+    async fn reset_runtime_plan_state(
+        &self,
+        plan: &EffectiveExecutionPlan,
+    ) -> Result<(), KernelError> {
+        let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
+            return Ok(());
+        };
+
+        match tokio::fs::remove_dir_all(runtime_state_root).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(internal(err.into())),
+        }
     }
 
     async fn mark_runtime_session_ready(&self, plan: &EffectiveExecutionPlan) {
