@@ -74,5 +74,5 @@ For repeated manual testing, you can use the repo helper:
 - The Transcript pane is durable session history plus live answer deltas.
 - The Thinking pane is live-only. It does not replay historical reasoning on attach.
 - Runtime selection normally comes from the running LionClaw service, unless you pass `lionclaw channel attach <id> --runtime ...`, which pins that attached worker to a specific runtime.
-- Attach only reuses a daemon when that daemon belongs to the same `LIONCLAW_HOME`, current project, and daemon-compatible runtime/preset config.
+- Attach only reuses a daemon when that daemon belongs to the same `LIONCLAW_HOME`, current project, and daemon-compatible config, including runtime, preset, and workspace settings.
 - A shell debug harness is available in `scripts/debug-worker.sh`.

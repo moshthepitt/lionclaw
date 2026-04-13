@@ -60,7 +60,7 @@ pub async fn attach_channel<M: ServiceManager>(
             DaemonClassification::SameHome => {}
             DaemonClassification::SameHomeDifferentConfig => {
                 return Err(anyhow!(
-                    "bind '{}' became available with stale runtime or preset config while attaching",
+                    "bind '{}' became available with stale daemon-compatible config while attaching",
                     spec.bind_addr
                 ));
             }

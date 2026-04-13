@@ -7,7 +7,7 @@ use tracing::info;
 
 use crate::{
     api::build_router,
-    config::{resolve_project_workspace_root, Config},
+    config::Config,
     contracts::DaemonInfoResponse,
     home::runtime_project_partition_key,
     kernel::{Kernel, KernelOptions, RuntimeExecutionPolicy},
@@ -29,7 +29,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let project_workspace_root = config
         .project_workspace_root
         .clone()
-        .or_else(|| resolve_project_workspace_root().ok())
         .unwrap_or_else(|| workspace_root.clone());
     let project_scope = runtime_project_partition_key(Some(project_workspace_root.as_path()));
     let config_fingerprint = daemon_compat_fingerprint(&operator_config);
