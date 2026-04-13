@@ -19,7 +19,6 @@ use crate::{
             configured_runtime_execution_profiles, register_configured_runtimes,
             validate_runtime_availability,
         },
-        runtime_secrets::resolve_runtime_secrets_file,
         services::{
             channel_unit_name, render_channel_unit, render_daemon_unit, unit_status_is_active,
             ChannelServiceSpec, ManagedServiceUnit, ServiceManager, DAEMON_UNIT_NAME,
@@ -750,7 +749,6 @@ async fn open_kernel_with_project_root(
     project_workspace_root: Option<PathBuf>,
 ) -> Result<Kernel> {
     let workspace_root = config.workspace_root(home);
-    let runtime_secrets_file = resolve_runtime_secrets_file(home).await?;
     let kernel = Kernel::new_with_options(
         &home.db_path(),
         KernelOptions {
@@ -762,7 +760,7 @@ async fn open_kernel_with_project_root(
             default_preset_name: config.defaults.preset.clone(),
             execution_presets: config.presets.clone(),
             runtime_execution_profiles: configured_runtime_execution_profiles(config),
-            runtime_secrets_file,
+            runtime_secrets_home: Some(home.clone()),
             workspace_root: Some(workspace_root),
             project_workspace_root,
             runtime_root: Some(home.runtime_dir()),

@@ -42,7 +42,7 @@ use crate::contracts::{
 use crate::{
     home::{
         runtime_project_drafts_dir_from_parts, runtime_project_generated_agents_path_from_parts,
-        runtime_project_partition_key, RUNTIME_SESSION_READY_MARKER,
+        runtime_project_partition_key, LionClawHome, RUNTIME_SESSION_READY_MARKER,
     },
     workspace::{read_workspace_sections, GENERATED_AGENTS_FILE},
 };
@@ -103,7 +103,7 @@ pub struct KernelOptions {
     pub default_preset_name: Option<String>,
     pub execution_presets: BTreeMap<String, ExecutionPreset>,
     pub runtime_execution_profiles: BTreeMap<String, RuntimeExecutionProfile>,
-    pub runtime_secrets_file: Option<PathBuf>,
+    pub runtime_secrets_home: Option<LionClawHome>,
     pub workspace_root: Option<PathBuf>,
     pub project_workspace_root: Option<PathBuf>,
     pub runtime_root: Option<PathBuf>,
@@ -124,7 +124,7 @@ impl fmt::Debug for KernelOptions {
                 "runtime_execution_profiles",
                 &self.runtime_execution_profiles,
             )
-            .field("runtime_secrets_file", &self.runtime_secrets_file)
+            .field("runtime_secrets_home", &self.runtime_secrets_home)
             .field("workspace_root", &self.workspace_root)
             .field("project_workspace_root", &self.project_workspace_root)
             .field("runtime_root", &self.runtime_root)
@@ -144,7 +144,7 @@ impl Default for KernelOptions {
             default_preset_name: None,
             execution_presets: BTreeMap::new(),
             runtime_execution_profiles: BTreeMap::new(),
-            runtime_secrets_file: None,
+            runtime_secrets_home: None,
             workspace_root: None,
             project_workspace_root: None,
             runtime_root: None,
@@ -174,7 +174,7 @@ pub struct Kernel {
     active_continuity_refresh_lock: Arc<Mutex<()>>,
     execution_planner: ExecutionPlanner,
     default_runtime_id: Option<String>,
-    runtime_secrets_file: Option<PathBuf>,
+    runtime_secrets_home: Option<LionClawHome>,
     workspace_root: Option<PathBuf>,
     project_workspace_root: Option<PathBuf>,
     session_scope: String,
@@ -278,7 +278,7 @@ impl Kernel {
             active_continuity_refresh_lock: Arc::new(Mutex::new(())),
             execution_planner,
             default_runtime_id: options.default_runtime_id,
-            runtime_secrets_file: options.runtime_secrets_file,
+            runtime_secrets_home: options.runtime_secrets_home,
             workspace_root: options.workspace_root,
             project_workspace_root: options.project_workspace_root,
             session_scope,
@@ -2378,7 +2378,7 @@ impl Kernel {
             prompt,
             selected_skills: Vec::new(),
         };
-        let runtime_secrets_mount = self.resolve_runtime_secrets_mount(&execution_plan)?;
+        let runtime_secrets_mount = self.resolve_runtime_secrets_mount(&execution_plan).await?;
         let turn_outcome = timeout(execution_plan.hard_timeout, async {
             match adapter.turn_mode() {
                 RuntimeTurnMode::Direct => adapter.turn(turn_input, event_tx).await,
@@ -3013,15 +3013,69 @@ mod tests {
     use crate::kernel::session_transcript::{CompactionMemoryProposal, CompactionOpenLoop};
 
     #[test]
-    fn kernel_options_debug_reports_runtime_secret_file_path() {
+    fn kernel_options_debug_reports_runtime_secret_home() {
+        let home = LionClawHome::new("/tmp/lionclaw-home".into());
         let options = KernelOptions {
-            runtime_secrets_file: Some("/tmp/runtime-secrets.env".into()),
+            runtime_secrets_home: Some(home),
             ..KernelOptions::default()
         };
 
         let debug = format!("{options:?}");
-        assert!(debug.contains("runtime_secrets_file"));
-        assert!(debug.contains("/tmp/runtime-secrets.env"));
+        assert!(debug.contains("runtime_secrets_home"));
+        assert!(debug.contains("/tmp/lionclaw-home"));
+    }
+
+    #[tokio::test]
+    async fn runtime_secrets_mount_resolves_runtime_secrets_file_on_demand() {
+        let temp_dir = tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        let db_path = temp_dir.path().join("lionclaw.db");
+        let kernel = Kernel::new_with_options(
+            &db_path,
+            KernelOptions {
+                runtime_secrets_home: Some(home.clone()),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let plan = EffectiveExecutionPlan {
+            runtime_id: "codex".to_string(),
+            preset_name: "everyday".to_string(),
+            confinement: crate::kernel::runtime::ConfinementConfig::Oci(
+                crate::kernel::runtime::OciConfinementConfig::default(),
+            ),
+            workspace_access: crate::kernel::runtime::WorkspaceAccess::ReadWrite,
+            network_mode: crate::kernel::runtime::NetworkMode::On,
+            working_dir: None,
+            environment: Vec::new(),
+            idle_timeout: Duration::from_secs(1),
+            hard_timeout: Duration::from_secs(1),
+            mounts: Vec::new(),
+            mount_runtime_secrets: true,
+            escape_classes: Default::default(),
+            limits: Default::default(),
+        };
+
+        let err = kernel
+            .resolve_runtime_secrets_mount(&plan)
+            .await
+            .expect_err("missing runtime secrets should fail");
+        assert!(err
+            .to_string()
+            .contains("runtime-secrets.env is not configured"));
+
+        tokio::fs::write(home.runtime_secrets_env_path(), "GITHUB_TOKEN=ghp_test\n")
+            .await
+            .expect("write runtime secrets");
+
+        let mount = kernel
+            .resolve_runtime_secrets_mount(&plan)
+            .await
+            .expect("resolve runtime secrets mount")
+            .expect("runtime secrets mount");
+        assert_eq!(mount.source, home.runtime_secrets_env_path());
     }
 
     #[tokio::test]
@@ -5555,7 +5609,7 @@ impl Kernel {
         }
     }
 
-    fn resolve_runtime_secrets_mount(
+    async fn resolve_runtime_secrets_mount(
         &self,
         plan: &EffectiveExecutionPlan,
     ) -> Result<Option<RuntimeSecretsMount>, KernelError> {
@@ -5563,12 +5617,22 @@ impl Kernel {
             return Ok(None);
         }
 
-        let source = self.runtime_secrets_file.clone().ok_or_else(|| {
+        let home = self.runtime_secrets_home.clone().ok_or_else(|| {
             KernelError::Runtime(
                 "runtime preset requires runtime secrets, but LIONCLAW_HOME/config/runtime-secrets.env is not configured"
                     .to_string(),
             )
         })?;
+        let source = home
+            .resolve_runtime_secrets_file()
+            .await
+            .map_err(|err| KernelError::Runtime(err.to_string()))?
+            .ok_or_else(|| {
+                KernelError::Runtime(
+                    "runtime preset requires runtime secrets, but LIONCLAW_HOME/config/runtime-secrets.env is not configured"
+                        .to_string(),
+                )
+            })?;
         Ok(Some(RuntimeSecretsMount { source }))
     }
 
@@ -5633,6 +5697,7 @@ impl Kernel {
         let adapter_for_task = adapter.clone();
         let runtime_secrets_mount = self
             .resolve_runtime_secrets_mount(&execution_plan)
+            .await
             .map_err(|err| FailedRuntimeTurn {
                 events: Vec::new(),
                 status: SessionTurnStatus::Failed,
