@@ -169,6 +169,14 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
         )
     })?;
     let worker_path = resolve_worker_entrypoint(home, &locked_skill.snapshot_dir)?;
+    let effective_runtime_id = match requested_runtime_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(runtime_id) => Some(applied.config.resolve_runtime_id(Some(runtime_id))?),
+        None => None,
+    };
     let peer_id = requested_peer_id
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -199,6 +207,9 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
         if !path.trim().is_empty() {
             env.insert("PATH".to_string(), path);
         }
+    }
+    if let Some(runtime_id) = effective_runtime_id {
+        env.insert("LIONCLAW_RUNTIME_ID".to_string(), runtime_id);
     }
 
     Ok(ChannelAttachSpec {
@@ -491,6 +502,110 @@ mod tests {
         .expect("prepare attach");
 
         assert!(!spec.started_services, "same-home daemon should be reused");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_channel_attach_exports_requested_runtime_when_reusing_same_home_daemon() {
+        let (_temp_dir, home, manager) =
+            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let bind_addr = config.daemon.bind.clone();
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    let home_root = home.root().display().to_string();
+                    let home_id = home_id.clone();
+                    let project_scope = current_project_scope();
+                    move || {
+                        let response = DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: home_id.clone(),
+                            home_root: home_root.clone(),
+                            bind_addr: bind_addr.clone(),
+                            project_scope: project_scope.clone(),
+                        };
+                        async move { Json(response) }
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+
+        let spec = prepare_channel_attach(
+            &home,
+            &manager,
+            "terminal".to_string(),
+            None,
+            Some("codex".to_string()),
+            &current_project_scope(),
+            &binaries(),
+        )
+        .await
+        .expect("prepare attach");
+
+        let env = spec.env.into_iter().collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            env.get("LIONCLAW_RUNTIME_ID").map(String::as_str),
+            Some("codex")
+        );
+        assert!(!spec.started_services, "same-home daemon should be reused");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_channel_attach_rejects_unknown_requested_runtime_when_reusing_same_home_daemon(
+    ) {
+        let (_temp_dir, home, manager) =
+            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let bind_addr = config.daemon.bind.clone();
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    let home_root = home.root().display().to_string();
+                    let home_id = home_id.clone();
+                    let project_scope = current_project_scope();
+                    move || {
+                        let response = DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: home_id.clone(),
+                            home_root: home_root.clone(),
+                            bind_addr: bind_addr.clone(),
+                            project_scope: project_scope.clone(),
+                        };
+                        async move { Json(response) }
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+
+        let err = prepare_channel_attach(
+            &home,
+            &manager,
+            "terminal".to_string(),
+            None,
+            Some("missing".to_string()),
+            &current_project_scope(),
+            &binaries(),
+        )
+        .await
+        .expect_err("unknown requested runtime should fail");
+
+        assert!(err
+            .to_string()
+            .contains("runtime profile 'missing' is not configured"));
     }
 
     #[cfg(unix)]
