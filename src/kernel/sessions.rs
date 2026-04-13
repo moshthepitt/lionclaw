@@ -15,6 +15,7 @@ pub struct Session {
     pub session_id: Uuid,
     pub channel_id: String,
     pub peer_id: String,
+    pub project_scope: String,
     pub trust_tier: TrustTier,
     pub history_policy: SessionHistoryPolicy,
     pub created_at: DateTime<Utc>,
@@ -36,6 +37,7 @@ impl SessionStore {
         &self,
         channel_id: String,
         peer_id: String,
+        project_scope: String,
         trust_tier: TrustTier,
         history_policy: SessionHistoryPolicy,
     ) -> Result<Session> {
@@ -44,12 +46,13 @@ impl SessionStore {
 
         sqlx::query(
             "INSERT INTO sessions \
-             (session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, last_activity_at_ms, turn_count) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, 0)",
+             (session_id, channel_id, peer_id, project_scope, trust_tier, history_policy, created_at_ms, last_turn_at_ms, last_activity_at_ms, turn_count) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, 0)",
         )
         .bind(session_id.to_string())
         .bind(&channel_id)
         .bind(&peer_id)
+        .bind(&project_scope)
         .bind(trust_tier.as_str())
         .bind(history_policy.as_str())
         .bind(created_at_ms)
@@ -64,7 +67,7 @@ impl SessionStore {
 
     pub async fn get(&self, session_id: Uuid) -> Result<Option<Session>> {
         let row = sqlx::query(
-            "SELECT session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_activity_at_ms, turn_count \
+            "SELECT session_id, channel_id, peer_id, project_scope, trust_tier, history_policy, created_at_ms, last_activity_at_ms, turn_count \
              FROM sessions \
              WHERE session_id = ?1",
         )
@@ -80,8 +83,9 @@ impl SessionStore {
         &self,
         channel_id: &str,
         peer_id: &str,
+        project_scope: &str,
     ) -> Result<Option<Session>> {
-        self.find_latest_by_channel_peer_and_policy(channel_id, peer_id, None)
+        self.find_latest_by_channel_peer_and_policy(channel_id, peer_id, project_scope, None)
             .await
     }
 
@@ -89,21 +93,42 @@ impl SessionStore {
         &self,
         channel_id: &str,
         peer_id: &str,
+        project_scope: &str,
         history_policy: Option<SessionHistoryPolicy>,
     ) -> Result<Option<Session>> {
         let row = sqlx::query(
-            "SELECT session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_activity_at_ms, turn_count \
+            "SELECT session_id, channel_id, peer_id, project_scope, trust_tier, history_policy, created_at_ms, last_activity_at_ms, turn_count \
              FROM sessions \
-             WHERE channel_id = ?1 AND peer_id = ?2 AND (?3 IS NULL OR history_policy = ?3) \
+             WHERE channel_id = ?1 AND peer_id = ?2 AND project_scope = ?3 AND (?4 IS NULL OR history_policy = ?4) \
              ORDER BY (last_activity_at_ms IS NOT NULL) DESC, COALESCE(last_activity_at_ms, created_at_ms) DESC, created_at_ms DESC \
              LIMIT 1",
         )
         .bind(channel_id)
         .bind(peer_id)
+        .bind(project_scope)
         .bind(history_policy.map(SessionHistoryPolicy::as_str))
         .fetch_optional(&self.pool)
         .await
         .context("failed to query latest session by channel and peer")?;
+
+        row.map(map_session_row).transpose()
+    }
+
+    pub async fn get_scoped(
+        &self,
+        session_id: Uuid,
+        project_scope: &str,
+    ) -> Result<Option<Session>> {
+        let row = sqlx::query(
+            "SELECT session_id, channel_id, peer_id, project_scope, trust_tier, history_policy, created_at_ms, last_activity_at_ms, turn_count \
+             FROM sessions \
+             WHERE session_id = ?1 AND project_scope = ?2",
+        )
+        .bind(session_id.to_string())
+        .bind(project_scope)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query scoped session")?;
 
         row.map(map_session_row).transpose()
     }
@@ -177,6 +202,7 @@ fn map_session_row(row: SqliteRow) -> Result<Session> {
         session_id,
         channel_id: row.get("channel_id"),
         peer_id: row.get("peer_id"),
+        project_scope: row.get("project_scope"),
         trust_tier,
         history_policy,
         created_at,

@@ -42,7 +42,7 @@ use crate::contracts::{
 use crate::{
     home::{
         runtime_project_drafts_dir_from_parts, runtime_project_generated_agents_path_from_parts,
-        RUNTIME_SESSION_READY_MARKER,
+        runtime_project_partition_key, RUNTIME_SESSION_READY_MARKER,
     },
     workspace::{read_workspace_sections, GENERATED_AGENTS_FILE},
 };
@@ -177,6 +177,7 @@ pub struct Kernel {
     runtime_secrets_file: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
     project_workspace_root: Option<PathBuf>,
+    session_scope: String,
     runtime_root: Option<PathBuf>,
     workspace_name: Option<String>,
     continuity: Option<ContinuityLayout>,
@@ -194,6 +195,21 @@ pub struct InboundChannelText {
 }
 
 impl Kernel {
+    fn session_scope(&self) -> &str {
+        &self.session_scope
+    }
+
+    async fn get_scoped_session(
+        &self,
+        session_id: Uuid,
+    ) -> Result<super::sessions::Session, KernelError> {
+        self.sessions
+            .get_scoped(session_id, self.session_scope())
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("session not found".to_string()))
+    }
+
     pub async fn new(db_path: &Path) -> anyhow::Result<Self> {
         Self::new_with_options(db_path, KernelOptions::default()).await
     }
@@ -240,6 +256,8 @@ impl Kernel {
             default_idle_timeout: runtime_turn_idle_timeout,
             default_hard_timeout: runtime_turn_hard_timeout,
         });
+        let session_scope =
+            runtime_project_partition_key(options.project_workspace_root.as_deref());
 
         let kernel = Self {
             sessions: SessionStore::new(pool.clone()),
@@ -263,6 +281,7 @@ impl Kernel {
             runtime_secrets_file: options.runtime_secrets_file,
             workspace_root: options.workspace_root,
             project_workspace_root: options.project_workspace_root,
+            session_scope,
             runtime_root: options.runtime_root,
             workspace_name: options.workspace_name,
             continuity,
@@ -337,6 +356,7 @@ impl Kernel {
             .open(
                 channel_id.to_string(),
                 peer_id.to_string(),
+                self.session_scope().to_string(),
                 trust_tier,
                 history_policy,
             )
@@ -367,12 +387,7 @@ impl Kernel {
         &self,
         req: SessionHistoryRequest,
     ) -> Result<SessionHistoryResponse, KernelError> {
-        let session = self
-            .sessions
-            .get(req.session_id)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| KernelError::NotFound("session not found".to_string()))?;
+        let session = self.get_scoped_session(req.session_id).await?;
 
         let limit = req.limit.unwrap_or(12).clamp(1, 100);
         let turns = self
@@ -390,7 +405,7 @@ impl Kernel {
     ) -> Result<Option<SessionOpenResponse>, KernelError> {
         let Some(session) = self
             .sessions
-            .find_latest_by_channel_peer(channel_id, peer_id)
+            .find_latest_by_channel_peer(channel_id, peer_id, self.session_scope())
             .await
             .map_err(internal)?
         else {
@@ -415,6 +430,7 @@ impl Kernel {
             .find_latest_by_channel_peer_and_policy(
                 query.channel_id.trim(),
                 query.peer_id.trim(),
+                self.session_scope(),
                 query.history_policy,
             )
             .await
@@ -495,12 +511,7 @@ impl Kernel {
     ) -> Result<SessionActionResponse, KernelError> {
         match req.action {
             SessionActionKind::ResetSession => {
-                let session = self
-                    .sessions
-                    .get(req.session_id)
-                    .await
-                    .map_err(internal)?
-                    .ok_or_else(|| KernelError::NotFound("session not found".to_string()))?;
+                let session = self.get_scoped_session(req.session_id).await?;
                 self.require_session_mutation_access(&session).await?;
                 let reset = self
                     .open_session(SessionOpenRequest {
@@ -645,12 +656,7 @@ impl Kernel {
         runtime_id_override: Option<String>,
         sink: Option<RuntimeEventSink>,
     ) -> Result<(super::sessions::Session, SessionTurnExecution), KernelError> {
-        let session = self
-            .sessions
-            .get(session_id)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| KernelError::NotFound("session not found".to_string()))?;
+        let session = self.get_scoped_session(session_id).await?;
         self.require_session_mutation_access(&session).await?;
 
         let latest_turn = load_repaired_turns(
@@ -1393,11 +1399,9 @@ impl Kernel {
         let session = match session_id {
             Some(session_id) => {
                 let session = self
-                    .sessions
-                    .get(session_id)
+                    .get_scoped_session(session_id)
                     .await
-                    .map_err(internal)?
-                    .ok_or_else(|| KernelError::BadRequest("session_id not found".to_string()))?;
+                    .map_err(|_| KernelError::BadRequest("session_id not found".to_string()))?;
                 if session.channel_id != channel_id || session.peer_id != peer_id {
                     return Err(KernelError::BadRequest(
                         "session_id does not belong to this channel_id and peer_id".to_string(),
@@ -1407,7 +1411,7 @@ impl Kernel {
             }
             None => match self
                 .sessions
-                .find_latest_by_channel_peer(&channel_id, &peer_id)
+                .find_latest_by_channel_peer(&channel_id, &peer_id, self.session_scope())
                 .await
                 .map_err(internal)?
             {
@@ -1417,6 +1421,7 @@ impl Kernel {
                     .open(
                         channel_id.clone(),
                         peer_id.clone(),
+                        self.session_scope().to_string(),
                         peer.trust_tier.clone(),
                         SessionHistoryPolicy::Conservative,
                     )
@@ -2523,11 +2528,9 @@ impl Kernel {
         job: &SchedulerJobRecord,
     ) -> Result<SessionTurnResponse, KernelError> {
         let session = self
-            .sessions
-            .get(session_id)
+            .get_scoped_session(session_id)
             .await
-            .map_err(internal)?
-            .ok_or_else(|| KernelError::NotFound("scheduled session not found".to_string()))?;
+            .map_err(|_| KernelError::NotFound("scheduled session not found".to_string()))?;
         self.execute_session_turn_serialized(
             session,
             SessionTurnExecution {
@@ -4117,12 +4120,7 @@ impl Kernel {
             return Err(KernelError::BadRequest("user_text is required".to_string()));
         }
 
-        let session = self
-            .sessions
-            .get(req.session_id)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| KernelError::NotFound("session not found".to_string()))?;
+        let session = self.get_scoped_session(req.session_id).await?;
         self.require_session_mutation_access(&session).await?;
 
         self.execute_session_turn_serialized(
@@ -4305,6 +4303,7 @@ impl Kernel {
         let runtime_turn = match turn_result {
             Ok(output) => output,
             Err(turn_err) => {
+                self.clear_runtime_session_ready(&execution_plan).await;
                 let _ = self
                     .close_runtime_session(
                         adapter.clone(),
@@ -4380,6 +4379,7 @@ impl Kernel {
         let runtime_events = match (runtime_events_result, close_result) {
             (Ok(events), Ok(())) => events,
             (Err(err), Ok(())) => {
+                self.clear_runtime_session_ready(&execution_plan).await;
                 self.persist_failed_session_turn(
                     session,
                     &persisted_turn,
@@ -4391,6 +4391,7 @@ impl Kernel {
                 return Err(err);
             }
             (Ok(events), Err(close_err)) => {
+                self.clear_runtime_session_ready(&execution_plan).await;
                 let assistant_text = assistant_text_from_events(&events);
                 self.persist_failed_session_turn(
                     session,
@@ -4403,6 +4404,7 @@ impl Kernel {
                 return Err(close_err);
             }
             (Err(err), Err(_)) => {
+                self.clear_runtime_session_ready(&execution_plan).await;
                 self.persist_failed_session_turn(
                     session,
                     &persisted_turn,
@@ -4418,6 +4420,7 @@ impl Kernel {
         let artifacts = summarize_runtime_events(&runtime_events);
         if let Some((error_code, error_text)) = last_runtime_error(&runtime_events) {
             let status = session_turn_status_for_error_code(&error_code);
+            self.clear_runtime_session_ready(&execution_plan).await;
             self.persist_failed_session_turn(
                 session,
                 &persisted_turn,
@@ -4694,6 +4697,17 @@ impl Kernel {
             b"ready\n",
         )
         .await;
+    }
+
+    async fn clear_runtime_session_ready(&self, plan: &EffectiveExecutionPlan) {
+        let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
+            return;
+        };
+        match tokio::fs::remove_file(runtime_state_root.join(RUNTIME_SESSION_READY_MARKER)).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
     }
 
     async fn resolve_channel_runtime_id(
@@ -5193,7 +5207,12 @@ impl Kernel {
             }
         };
 
-        let session = match self.sessions.get(turn.session_id).await.map_err(internal) {
+        let session = match self
+            .sessions
+            .get_scoped(turn.session_id, self.session_scope())
+            .await
+            .map_err(internal)
+        {
             Ok(Some(session)) => session,
             Ok(None) => {
                 let _ = self

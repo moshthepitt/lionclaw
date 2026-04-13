@@ -313,7 +313,8 @@ where
     F: Future<Output = Result<crate::contracts::SessionTurnResponse, crate::kernel::KernelError>>
         + Unpin,
 {
-    let mut message_seen = false;
+    let mut visible_output_seen = false;
+    let mut answer_output_seen = false;
     let mut error_seen = false;
     let mut turn_error: Option<crate::kernel::KernelError> = None;
 
@@ -331,7 +332,10 @@ where
                     continue;
                 };
                 if is_visible_message_delta(&event) {
-                    message_seen = true;
+                    visible_output_seen = true;
+                }
+                if is_answer_message_delta(&event) {
+                    answer_output_seen = true;
                 }
                 if matches!(event.kind, StreamEventKindDto::Error) {
                     error_seen = true;
@@ -344,7 +348,10 @@ where
 
     while let Ok(event) = rx.try_recv() {
         if is_visible_message_delta(&event) {
-            message_seen = true;
+            visible_output_seen = true;
+        }
+        if is_answer_message_delta(&event) {
+            answer_output_seen = true;
         }
         if matches!(event.kind, StreamEventKindDto::Error) {
             error_seen = true;
@@ -354,7 +361,7 @@ where
     output.flush()?;
 
     if let Some(err) = turn_error {
-        if message_seen {
+        if answer_output_seen {
             match err {
                 crate::kernel::KernelError::RuntimeTimeout(_) => {
                     writeln!(
@@ -368,6 +375,27 @@ where
                     writeln!(
                         output,
                         "Runtime error. Partial output is shown above. Use /continue, /retry, or /reset."
+                    )?;
+                    output.flush()?;
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        if visible_output_seen {
+            match err {
+                crate::kernel::KernelError::RuntimeTimeout(_) => {
+                    writeln!(
+                        output,
+                        "Timed out. Partial output is shown above. Use /retry or /reset."
+                    )?;
+                    output.flush()?;
+                    return Ok(());
+                }
+                crate::kernel::KernelError::Runtime(_) => {
+                    writeln!(
+                        output,
+                        "Runtime error. Partial output is shown above. Use /retry or /reset."
                     )?;
                     output.flush()?;
                     return Ok(());
@@ -390,6 +418,16 @@ fn is_visible_message_delta(event: &StreamEventDto) -> bool {
         (
             StreamEventKindDto::MessageDelta,
             Some(StreamLaneDto::Answer | StreamLaneDto::Reasoning)
+        )
+    ) && event.text.as_deref().is_some_and(|text| !text.is_empty())
+}
+
+fn is_answer_message_delta(event: &StreamEventDto) -> bool {
+    matches!(
+        (&event.kind, &event.lane),
+        (
+            StreamEventKindDto::MessageDelta,
+            Some(StreamLaneDto::Answer)
         )
     ) && event.text.as_deref().is_some_and(|text| !text.is_empty())
 }
@@ -453,7 +491,7 @@ mod tests {
     use crate::{
         config::resolve_project_workspace_root,
         contracts::{StreamEventDto, StreamEventKindDto, StreamLaneDto},
-        home::LionClawHome,
+        home::{runtime_project_partition_key, LionClawHome},
         kernel::{
             db::Db,
             runtime::{ConfinementConfig, OciConfinementConfig},
@@ -590,15 +628,19 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             .get::<Option<i64>, _>("last_activity_at_ms")
             .expect("last activity timestamp");
         let newer_created_at_ms = last_activity_at_ms + 1_000;
+        let project_scope = runtime_project_partition_key(Some(
+            &resolve_project_workspace_root().expect("project root"),
+        ));
         sqlx::query(
             "INSERT INTO sessions \
-             (session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, last_activity_at_ms, turn_count) \
-             VALUES (?1, 'local-cli', ?2, 'main', 'interactive', ?3, NULL, NULL, 0)",
+             (session_id, channel_id, peer_id, project_scope, trust_tier, history_policy, created_at_ms, last_turn_at_ms, last_activity_at_ms, turn_count) \
+             VALUES (?1, 'local-cli', ?2, ?3, 'main', 'interactive', ?4, NULL, NULL, 0)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(local_peer_id_for_project(
             &resolve_project_workspace_root().expect("project root"),
         ))
+        .bind(project_scope)
         .bind(newer_created_at_ms)
         .execute(&pool)
         .await
@@ -648,14 +690,18 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             .pool();
         let peer_id =
             local_peer_id_for_project(&resolve_project_workspace_root().expect("project root"));
+        let project_scope = runtime_project_partition_key(Some(
+            &resolve_project_workspace_root().expect("project root"),
+        ));
         let session_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO sessions \
-             (session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, last_activity_at_ms, turn_count) \
-             VALUES (?1, 'local-cli', ?2, 'main', 'interactive', 1, 2, 2, 1)",
+             (session_id, channel_id, peer_id, project_scope, trust_tier, history_policy, created_at_ms, last_turn_at_ms, last_activity_at_ms, turn_count) \
+             VALUES (?1, 'local-cli', ?2, ?3, 'main', 'interactive', 1, 2, 2, 1)",
         )
         .bind(session_id.to_string())
         .bind(&peer_id)
+        .bind(project_scope)
         .execute(&pool)
         .await
         .expect("insert session");
@@ -947,6 +993,8 @@ exit 7
         let output = String::from_utf8(output).expect("utf8 output");
         assert!(output.contains("thinking> checking the workspace"));
         assert!(output.contains("Runtime error. Partial output is shown above."));
+        assert!(output.contains("Use /retry or /reset."));
+        assert!(!output.contains("Use /continue, /retry, or /reset."));
         assert!(!output.contains("Timed out. Partial output is shown above."));
     }
 
@@ -978,6 +1026,8 @@ exit 7
         let output = String::from_utf8(output).expect("utf8 output");
         assert!(output.contains("thinking> checking the workspace"));
         assert!(output.contains("Runtime error. Partial output is shown above."));
+        assert!(output.contains("Use /retry or /reset."));
+        assert!(!output.contains("Use /continue, /retry, or /reset."));
         assert!(!output.contains("Timed out. Partial output is shown above."));
     }
 

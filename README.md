@@ -70,7 +70,7 @@ Continue the latest local session for the current project instead of starting fr
 
 Inside the interactive REPL:
 
-- `/continue` resumes from a partial timed-out, failed, cancelled, or interrupted reply
+- `/continue` resumes from a partial timed-out, failed, cancelled, or interrupted assistant answer
 - `/retry` reruns the previous prompt
 - `/reset` opens a fresh session
 - `/exit` leaves the REPL
@@ -225,7 +225,8 @@ uses to launch it. Execution policy remains config-owned in LionClaw state, not
 ambient shell state.
 
 `lionclaw service up` persists the project root you launch it from so the
-background daemon and confined runtimes keep operating on that same project.
+background daemon, session reuse, and confined runtimes keep operating on that
+same project.
 
 Daemon/service plumbing recognizes these env vars:
 

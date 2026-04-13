@@ -832,6 +832,95 @@ async fn partial_failure_does_not_mark_runtime_session_resumable_for_continue() 
 }
 
 #[tokio::test]
+async fn failed_turn_clears_runtime_session_resumability_for_next_turn() {
+    let env = TestEnv::new();
+    let workspace_root = env.path().join("workspace");
+    let project_root = env.path().join("project");
+    let runtime_root = env.path().join("runtime");
+    std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+    std::fs::create_dir_all(&project_root).expect("create project root");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(workspace_root),
+            project_workspace_root: Some(project_root),
+            runtime_root: Some(runtime_root),
+            workspace_name: Some("main".to_string()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let recorded_roots = Arc::new(Mutex::new(Vec::new()));
+    let resumed_flags = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "recovering",
+            Arc::new(ResumeAfterFailureAdapter {
+                runtime_roots: recorded_roots.clone(),
+                resumed_flags: resumed_flags.clone(),
+                turn_counter: AtomicUsize::new(0),
+            }),
+        )
+        .await;
+
+    let session = open_session(
+        &kernel,
+        "recovering-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "first request".to_string(),
+            runtime_id: Some("recovering".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("first turn");
+
+    let err = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "second request".to_string(),
+            runtime_id: Some("recovering".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect_err("second turn should fail");
+    assert!(matches!(err, KernelError::Runtime(_)));
+
+    let roots = recorded_roots.lock().expect("roots lock").clone();
+    assert_eq!(roots.len(), 2);
+    assert!(
+        !roots[1].join(RUNTIME_SESSION_READY_MARKER).is_file(),
+        "failed turns should clear resumability before the next follow-up"
+    );
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "third request".to_string(),
+            runtime_id: Some("recovering".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("third turn");
+
+    let resumed_flags = resumed_flags.lock().expect("resumed flags lock").clone();
+    assert_eq!(resumed_flags, vec![false, true, false]);
+}
+
+#[tokio::test]
 async fn retry_restarts_harness_session_from_canonical_history() {
     let env = TestEnv::new();
     let workspace_root = env.path().join("workspace");
@@ -1057,6 +1146,12 @@ struct ResumableCaptureAdapter {
 }
 
 struct ResumableFlakyAdapter {
+    resumed_flags: Arc<Mutex<Vec<bool>>>,
+    turn_counter: AtomicUsize,
+}
+
+struct ResumeAfterFailureAdapter {
+    runtime_roots: Arc<Mutex<Vec<PathBuf>>>,
     resumed_flags: Arc<Mutex<Vec<bool>>>,
     turn_counter: AtomicUsize,
 }
@@ -1290,6 +1385,94 @@ impl RuntimeAdapter for ResumableFlakyAdapter {
         });
         let _ = events.send(RuntimeEvent::Done);
         Ok(RuntimeTurnResult::default())
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        events: RuntimeEventSender,
+    ) -> Result<()> {
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
+    }
+
+    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for ResumeAfterFailureAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "recovering".to_string(),
+            version: "0.1".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
+        let runtime_state_root = input
+            .runtime_state_root
+            .clone()
+            .expect("runtime state root should be provided");
+        let resumes_existing_session = runtime_state_root
+            .join(RUNTIME_SESSION_READY_MARKER)
+            .is_file();
+        self.runtime_roots
+            .lock()
+            .expect("roots lock")
+            .push(runtime_state_root);
+        self.resumed_flags
+            .lock()
+            .expect("resumed flags lock")
+            .push(resumes_existing_session);
+
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("recovering-{}", Uuid::new_v4()),
+            resumes_existing_session,
+        })
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        match self.turn_counter.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                let _ = events.send(RuntimeEvent::MessageDelta {
+                    lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+                    text: "first success".to_string(),
+                });
+                let _ = events.send(RuntimeEvent::Done);
+                Ok(RuntimeTurnResult::default())
+            }
+            1 => {
+                let _ = events.send(RuntimeEvent::MessageDelta {
+                    lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+                    text: "partial failure".to_string(),
+                });
+                let _ = events.send(RuntimeEvent::Error {
+                    code: Some("runtime.error".to_string()),
+                    text: "failed after success".to_string(),
+                });
+                anyhow::bail!("failed after success");
+            }
+            _ => {
+                let _ = events.send(RuntimeEvent::MessageDelta {
+                    lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+                    text: "fresh recovery".to_string(),
+                });
+                let _ = events.send(RuntimeEvent::Done);
+                Ok(RuntimeTurnResult::default())
+            }
+        }
     }
 
     async fn resolve_capability_requests(
