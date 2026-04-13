@@ -231,6 +231,7 @@ impl OperatorConfig {
 #[derive(Debug, Clone, Serialize)]
 struct DaemonCompatConfig {
     version: u32,
+    default_runtime_id: Option<String>,
     default_preset_name: Option<String>,
     execution_presets: BTreeMap<String, ExecutionPreset>,
     runtime_profiles: BTreeMap<String, RuntimeProfileConfig>,
@@ -241,6 +242,7 @@ pub fn daemon_compat_fingerprint(config: &OperatorConfig) -> String {
     normalized.normalize();
     let encoded = serde_json::to_vec(&DaemonCompatConfig {
         version: 1,
+        default_runtime_id: normalized.defaults.runtime.clone(),
         default_preset_name: normalized.defaults.preset.clone(),
         execution_presets: normalized.presets,
         runtime_profiles: normalized.runtimes,
@@ -621,9 +623,9 @@ fn ensure_podman_executable(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_skill_alias, normalize_host_executable, normalize_local_source,
-        normalize_runtime_command, validate_host_executable, ChannelLaunchMode,
-        ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig,
+        daemon_compat_fingerprint, derive_skill_alias, normalize_host_executable,
+        normalize_local_source, normalize_runtime_command, validate_host_executable,
+        ChannelLaunchMode, ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig,
     };
     use crate::kernel::runtime::{
         ConfinementConfig, ExecutionPreset, NetworkMode, OciConfinementConfig, WorkspaceAccess,
@@ -759,6 +761,30 @@ mod tests {
 
         assert_ne!(left.compatibility_key(), right.compatibility_key());
         assert_eq!(left.compatibility_key(), normalized.compatibility_key());
+    }
+
+    #[test]
+    fn daemon_compat_fingerprint_changes_when_default_runtime_changes() {
+        let runtime = RuntimeProfileConfig::Codex {
+            executable: "codex".to_string(),
+            model: None,
+            confinement: sample_confinement(),
+        };
+        let mut left = OperatorConfig::default();
+        left.upsert_runtime("codex".to_string(), runtime.clone());
+        left.upsert_runtime("opencode".to_string(), runtime);
+        left.set_default_runtime("codex")
+            .expect("set default runtime");
+
+        let mut right = left.clone();
+        right
+            .set_default_runtime("opencode")
+            .expect("set second default runtime");
+
+        assert_ne!(
+            daemon_compat_fingerprint(&left),
+            daemon_compat_fingerprint(&right)
+        );
     }
 
     #[test]
