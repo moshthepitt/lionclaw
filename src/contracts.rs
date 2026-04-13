@@ -48,6 +48,7 @@ pub struct DaemonInfoResponse {
     pub home_id: String,
     pub home_root: String,
     pub bind_addr: String,
+    pub project_scope: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -20,6 +20,7 @@ use crate::contracts::DaemonInfoResponse;
 pub(crate) enum DaemonClassification {
     Absent,
     SameHome,
+    SameHomeDifferentProject,
     ForeignHome(DaemonInfoResponse),
     IncompatibleLionClaw,
     UnknownListener,
@@ -41,6 +42,7 @@ enum ProbeJsonResult<T> {
 pub(crate) async fn classify_daemon(
     bind_addr: &str,
     expected_home_id: &str,
+    expected_project_scope: &str,
 ) -> Result<DaemonClassification> {
     if !listener_is_present(bind_addr).await {
         return Ok(DaemonClassification::Absent);
@@ -49,7 +51,11 @@ pub(crate) async fn classify_daemon(
     match get_json::<DaemonInfoResponse>(bind_addr, "/v0/daemon/info").await? {
         ProbeJsonResult::Ok(info) => {
             if info.home_id == expected_home_id {
-                Ok(DaemonClassification::SameHome)
+                if info.project_scope == expected_project_scope {
+                    Ok(DaemonClassification::SameHome)
+                } else {
+                    Ok(DaemonClassification::SameHomeDifferentProject)
+                }
             } else {
                 Ok(DaemonClassification::ForeignHome(info))
             }
@@ -71,11 +77,13 @@ pub(crate) async fn classify_daemon(
 pub(crate) async fn wait_for_same_home_daemon(
     bind_addr: &str,
     expected_home_id: &str,
+    expected_project_scope: &str,
     timeout_duration: Duration,
 ) -> Result<DaemonClassification> {
     let deadline = Instant::now() + timeout_duration;
     loop {
-        let classification = classify_daemon(bind_addr, expected_home_id).await?;
+        let classification =
+            classify_daemon(bind_addr, expected_home_id, expected_project_scope).await?;
         if matches!(classification, DaemonClassification::SameHome) {
             return Ok(classification);
         }

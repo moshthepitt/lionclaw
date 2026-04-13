@@ -160,7 +160,7 @@ If you prefer the underlying manual steps, they are:
 ./target/release/lionclaw channel attach terminal --runtime codex
 ```
 
-`channel attach` opens the worker in your current TTY. If needed, it starts LionClaw for you, restores the latest interactive terminal session for that peer, resumes any still-running answer stream from the last durable checkpoint, and prints the pairing code and approval command on first contact. It only reuses a daemon when that daemon belongs to the same `LIONCLAW_HOME`.
+`channel attach` opens the worker in your current TTY. If needed, it starts LionClaw for you, restores the latest interactive terminal session for that peer, resumes any still-running answer stream from the last durable checkpoint, and prints the pairing code and approval command on first contact. It only reuses a daemon when that daemon belongs to the same `LIONCLAW_HOME` and current project.
 
 To run multiple local terminal channels at once, register multiple interactive channels and attach each one in its own terminal:
 

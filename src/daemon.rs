@@ -9,6 +9,7 @@ use crate::{
     api::build_router,
     config::{resolve_project_workspace_root, Config},
     contracts::DaemonInfoResponse,
+    home::runtime_project_partition_key,
     kernel::{Kernel, KernelOptions, RuntimeExecutionPolicy},
     operator::{
         config::OperatorConfig,
@@ -31,6 +32,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .clone()
         .or_else(|| resolve_project_workspace_root().ok())
         .unwrap_or_else(|| workspace_root.clone());
+    let project_scope = runtime_project_partition_key(Some(project_workspace_root.as_path()));
     let default_runtime_id = config
         .default_runtime_id
         .clone()
@@ -77,6 +79,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             home_id,
             home_root: config.home.root().display().to_string(),
             bind_addr: config.bind_addr.clone(),
+            project_scope,
         },
     );
 

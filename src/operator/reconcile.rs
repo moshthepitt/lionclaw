@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use crate::{
     config::resolve_project_workspace_root,
     contracts::{ChannelBindRequest, ChannelPeerApproveRequest, ChannelPeerResponse, TrustTier},
-    home::LionClawHome,
+    home::{runtime_project_partition_key, LionClawHome},
     kernel::{Kernel, KernelOptions, RuntimeExecutionPolicy},
     operator::{
         config::{
@@ -266,7 +266,10 @@ pub async fn up<M: ServiceManager>(
 ) -> Result<ApplyResult> {
     let config = OperatorConfig::load(home).await?;
     let home_id = home.ensure_home_id().await?;
-    match classify_daemon(&config.daemon.bind, &home_id).await? {
+    let project_root =
+        resolve_project_workspace_root().context("failed to resolve project workspace root")?;
+    let project_scope = runtime_project_partition_key(Some(project_root.as_path()));
+    match classify_daemon(&config.daemon.bind, &home_id, &project_scope).await? {
         DaemonClassification::Absent => {}
         DaemonClassification::SameHome => {
             let daemon_status = manager.unit_status(DAEMON_UNIT_NAME).await?;
@@ -277,6 +280,12 @@ pub async fn up<M: ServiceManager>(
                     DAEMON_UNIT_NAME
                 ));
             }
+        }
+        DaemonClassification::SameHomeDifferentProject => {
+            return Err(anyhow!(
+                "bind '{}' is already served by this LionClaw home for a different project; stop that daemon before running 'lionclaw service up' from this project",
+                config.daemon.bind
+            ));
         }
         DaemonClassification::ForeignHome(info) => {
             return Err(anyhow!(
@@ -776,7 +785,7 @@ mod tests {
     use crate::{
         config::resolve_project_workspace_root,
         contracts::DaemonInfoResponse,
-        home::LionClawHome,
+        home::{runtime_project_partition_key, LionClawHome},
         kernel::{
             runtime::{ConfinementConfig, OciConfinementConfig},
             Kernel, KernelOptions,
@@ -799,6 +808,12 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve probe app");
         })
+    }
+
+    fn current_project_scope() -> String {
+        let project_root =
+            resolve_project_workspace_root().expect("resolve project workspace root");
+        runtime_project_partition_key(Some(project_root.as_path()))
     }
 
     #[cfg(unix)]
@@ -1161,6 +1176,7 @@ mod tests {
                             home_id: "foreign-home".to_string(),
                             home_root: "/tmp/foreign-home".to_string(),
                             bind_addr: bind_addr.clone(),
+                            project_scope: "foreign-project".to_string(),
                         })
                     }
                 }),
@@ -1196,6 +1212,7 @@ mod tests {
                     let bind_addr = bind_addr.clone();
                     let home_id = home_id.clone();
                     let home_root = home_root.clone();
+                    let project_scope = current_project_scope();
                     move || async move {
                         Json(DaemonInfoResponse {
                             service: "lionclawd".to_string(),
@@ -1203,6 +1220,7 @@ mod tests {
                             home_id: home_id.clone(),
                             home_root: home_root.clone(),
                             bind_addr: bind_addr.clone(),
+                            project_scope: project_scope.clone(),
                         })
                     }
                 }),
@@ -1220,6 +1238,49 @@ mod tests {
             .await
             .expect_err("foreground daemon without active unit should fail");
         assert!(err.to_string().contains("foreground daemon"));
+    }
+
+    #[tokio::test]
+    async fn up_rejects_same_home_different_project_daemon() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let config = onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let bind_addr = config.daemon.bind;
+        let home_root = home.root().display().to_string();
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    let home_id = home_id.clone();
+                    let home_root = home_root.clone();
+                    move || async move {
+                        Json(DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: home_id.clone(),
+                            home_root: home_root.clone(),
+                            bind_addr: bind_addr.clone(),
+                            project_scope: "different-project".to_string(),
+                        })
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+        let manager = FakeServiceManager::default();
+        let binaries = StackBinaryPaths {
+            daemon_bin: "/tmp/lionclawd".into(),
+        };
+
+        let err = up(&home, &manager, "codex", &binaries)
+            .await
+            .expect_err("same-home different-project daemon should fail");
+        assert!(err.to_string().contains("different project"));
     }
 
     #[tokio::test]
@@ -1252,6 +1313,7 @@ mod tests {
                     let bind_addr = bind_addr.clone();
                     let home_id = home_id.clone();
                     let home_root = home_root.clone();
+                    let project_scope = current_project_scope();
                     move || async move {
                         Json(DaemonInfoResponse {
                             service: "lionclawd".to_string(),
@@ -1259,6 +1321,7 @@ mod tests {
                             home_id: home_id.clone(),
                             home_root: home_root.clone(),
                             bind_addr: bind_addr.clone(),
+                            project_scope: project_scope.clone(),
                         })
                     }
                 }),
