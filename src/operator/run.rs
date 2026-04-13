@@ -7,6 +7,7 @@ use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
 use crate::{
+    config::resolve_project_workspace_root,
     contracts::{
         SessionActionKind, SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest,
         SessionOpenRequest, SessionTurnRequest, SessionTurnStatus, SessionTurnView, StreamEventDto,
@@ -53,12 +54,13 @@ pub(crate) async fn run_local_with_io<R: BufRead, W: Write>(
     render_runtime_cache(home, &applied.config, &applied.lockfile, &runtime_id).await?;
 
     let kernel = open_kernel(home, &applied.config, Some(runtime_id.clone())).await?;
-    let workspace = applied.config.daemon.workspace.clone();
+    let project_workspace_root = resolve_project_workspace_root()
+        .map_err(|err| anyhow!("failed to resolve project workspace root: {}", err))?;
     let peer_id = local_peer_id();
     run_repl(
         &kernel,
         &runtime_id,
-        &workspace,
+        &project_workspace_root.display().to_string(),
         &peer_id,
         continue_last_session,
         input,
@@ -70,7 +72,7 @@ pub(crate) async fn run_local_with_io<R: BufRead, W: Write>(
 async fn run_repl<R: BufRead, W: Write>(
     kernel: &Kernel,
     runtime_id: &str,
-    workspace: &str,
+    project_workspace_root: &str,
     peer_id: &str,
     continue_last_session: bool,
     input: &mut R,
@@ -83,8 +85,8 @@ async fn run_repl<R: BufRead, W: Write>(
 
     writeln!(
         output,
-        "LionClaw interactive mode\nruntime: {}\nworkspace: {}\nType /continue, /retry, /reset, or /exit.\n",
-        runtime_id, workspace
+        "LionClaw interactive mode\nruntime: {}\nproject: {}\nType /continue, /retry, /reset, or /exit.\n",
+        runtime_id, project_workspace_root
     )?;
 
     if continue_last_session {
@@ -995,12 +997,62 @@ exit 7
         std::fs::set_permissions(path, permissions).expect("chmod script");
     }
 
+    #[cfg(unix)]
+    fn ensure_fake_podman(reference: &std::path::Path) -> std::path::PathBuf {
+        let engine = reference.parent().expect("stub parent").join("podman");
+        if !engine.exists() {
+            write_script(
+                &engine,
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+
+command_name="${1:-}"
+shift || true
+
+case "${command_name}" in
+  secret)
+    exit 0
+    ;;
+  run)
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --rm|--interactive|--read-only)
+          shift
+          ;;
+        --network|--workdir|--volume|--tmpfs|--env|--secret|--memory|--cpus|--pids-limit)
+          shift 2
+          ;;
+        --)
+          shift
+          break
+          ;;
+        -*)
+          shift
+          ;;
+        *)
+          shift
+          break
+          ;;
+      esac
+    done
+    exec "$@"
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"#,
+            );
+        }
+        engine
+    }
+
     fn stubbed_codex_runtime(executable: &std::path::Path) -> RuntimeProfileConfig {
         RuntimeProfileConfig::Codex {
-            executable: "codex".to_string(),
+            executable: executable.display().to_string(),
             model: None,
             confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                engine: executable.to_string_lossy().to_string(),
+                engine: ensure_fake_podman(executable).to_string_lossy().to_string(),
                 image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
                 ..OciConfinementConfig::default()
             }),
@@ -1009,11 +1061,11 @@ exit 7
 
     fn stubbed_opencode_runtime(executable: &std::path::Path) -> RuntimeProfileConfig {
         RuntimeProfileConfig::OpenCode {
-            executable: "opencode".to_string(),
+            executable: executable.display().to_string(),
             model: None,
             agent: None,
             confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                engine: executable.to_string_lossy().to_string(),
+                engine: ensure_fake_podman(executable).to_string_lossy().to_string(),
                 image: Some("ghcr.io/lionclaw/test-opencode-runtime:latest".to_string()),
                 ..OciConfinementConfig::default()
             }),

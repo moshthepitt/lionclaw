@@ -268,6 +268,8 @@ mod tests {
 
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         write_executable(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n");
+        let podman = temp_dir.path().join("podman");
+        write_executable(&podman, "#!/usr/bin/env bash\nexit 0\n");
 
         let skill_source = temp_dir.path().join("channel-terminal");
         fs::create_dir_all(skill_source.join("scripts")).expect("skill dir");
@@ -292,7 +294,7 @@ mod tests {
                     executable: "codex".to_string(),
                     model: None,
                     confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                        engine: runtime_stub.to_string_lossy().to_string(),
+                        engine: podman.to_string_lossy().to_string(),
                         image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
                         ..OciConfinementConfig::default()
                     }),

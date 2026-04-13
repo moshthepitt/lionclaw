@@ -38,7 +38,7 @@ fn build_oci_process_invocation(request: &ExecutionRequest) -> Result<ProcessInv
 
     let image = config.image.as_deref().ok_or_else(|| {
         anyhow!(
-            "runtime '{}' requires an OCI image in its confinement config",
+            "runtime '{}' requires a Podman runtime image in its confinement config",
             request.plan.runtime_id
         )
     })?;
@@ -434,7 +434,7 @@ mod tests {
         })
         .expect_err("missing image should fail");
 
-        assert!(err.to_string().contains("requires an OCI image"));
+        assert!(err.to_string().contains("requires a Podman runtime image"));
     }
 
     #[test]

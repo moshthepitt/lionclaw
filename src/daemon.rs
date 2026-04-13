@@ -7,9 +7,9 @@ use tracing::info;
 
 use crate::{
     api::build_router,
-    config::Config,
+    config::{resolve_project_workspace_root, Config},
     contracts::DaemonInfoResponse,
-    kernel::{Kernel, KernelOptions},
+    kernel::{Kernel, KernelOptions, RuntimeExecutionPolicy},
     operator::{
         config::OperatorConfig,
         runtime::{configured_runtime_execution_profiles, register_configured_runtimes},
@@ -29,6 +29,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let project_workspace_root = config
         .project_workspace_root
         .clone()
+        .or_else(|| resolve_project_workspace_root().ok())
         .unwrap_or_else(|| workspace_root.clone());
     let default_runtime_id = config
         .default_runtime_id
@@ -45,6 +46,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 ),
                 runtime_turn_hard_timeout: Duration::from_millis(
                     config.runtime_turn_hard_timeout_ms,
+                ),
+                runtime_execution_policy: RuntimeExecutionPolicy::for_working_dir_root(
+                    project_workspace_root.clone(),
                 ),
                 default_runtime_id,
                 default_preset_name: operator_config.defaults.preset.clone(),

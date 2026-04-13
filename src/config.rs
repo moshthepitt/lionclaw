@@ -55,9 +55,7 @@ impl Config {
             .unwrap_or_else(|| DEFAULT_WORKSPACE.to_string());
 
         let workspace_root = home.workspace_dir(&workspace_name);
-        let project_workspace_root = std::env::var("LIONCLAW_WORKSPACE_ROOT")
-            .ok()
-            .map(PathBuf::from);
+        let project_workspace_root = resolve_project_workspace_root().ok();
 
         Self {
             bind_addr,
@@ -70,6 +68,27 @@ impl Config {
             project_workspace_root,
         }
     }
+}
+
+pub fn resolve_project_workspace_root() -> std::io::Result<PathBuf> {
+    let configured = std::env::var("LIONCLAW_WORKSPACE_ROOT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+
+    let path = match configured {
+        Some(path) => path,
+        None => std::env::current_dir()?,
+    };
+
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+
+    resolved.canonicalize()
 }
 
 fn resolve_bind_addr(

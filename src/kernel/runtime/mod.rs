@@ -19,10 +19,11 @@ pub use adapters::{
 pub use builtins::{register_builtin_runtime_adapters, BUILTIN_RUNTIME_MOCK};
 pub use execution::{
     ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionBackend,
-    ExecutionLimits, ExecutionOutput, ExecutionPlanRequest, ExecutionPlanner,
+    ExecutionLimits, ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
     ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, MountAccess, MountSpec, NetworkMode,
     OciConfinementConfig, OciExecutionBackend, RuntimeExecutionProfile, RuntimeProgramSpec,
     RuntimeSecretsMount, WorkspaceAccess, BUILTIN_PRESET_EVERYDAY,
+    BUILTIN_PRESET_HIDDEN_COMPACTION,
 };
 
 #[derive(Debug, Clone)]

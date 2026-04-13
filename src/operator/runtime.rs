@@ -99,6 +99,17 @@ mod tests {
     use crate::operator::config::{OperatorConfig, RuntimeProfileConfig};
 
     #[cfg(unix)]
+    fn fake_podman() -> (tempfile::TempDir, String) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("podman");
+        std::fs::write(&path, "#!/usr/bin/env bash\n").expect("write file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        (temp_dir, path.to_string_lossy().to_string())
+    }
+
+    #[cfg(unix)]
     #[test]
     fn configured_runtime_requires_usable_host_engine() {
         use std::os::unix::fs::PermissionsExt;
@@ -129,7 +140,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn configured_runtime_profile_accepts_container_command_with_valid_engine() {
-        let engine = std::env::current_exe().expect("current exe");
+        let (_temp_dir, engine) = fake_podman();
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
             "codex".to_string(),
@@ -137,7 +148,7 @@ mod tests {
                 executable: "codex".to_string(),
                 model: None,
                 confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine: engine.to_string_lossy().to_string(),
+                    engine,
                     image: Some("ghcr.io/lionclaw/codex-runtime:latest".to_string()),
                     ..OciConfinementConfig::default()
                 }),
@@ -150,7 +161,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn configured_runtime_requires_image() {
-        let engine = std::env::current_exe().expect("current exe");
+        let (_temp_dir, engine) = fake_podman();
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
             "codex".to_string(),
@@ -158,7 +169,7 @@ mod tests {
                 executable: "codex".to_string(),
                 model: None,
                 confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine: engine.to_string_lossy().to_string(),
+                    engine,
                     image: None,
                     ..OciConfinementConfig::default()
                 }),
@@ -166,15 +177,13 @@ mod tests {
         );
 
         let err = validate_runtime_availability(&config, "codex").expect_err("should fail");
-        assert!(err
-            .to_string()
-            .contains("OCI confinement image is required"));
+        assert!(err.to_string().contains("Podman runtime image is required"));
     }
 
     #[cfg(unix)]
     #[test]
     fn configured_runtime_validation_rejects_any_invalid_profile() {
-        let engine = std::env::current_exe().expect("current exe");
+        let (_temp_dir, engine) = fake_podman();
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
             "codex".to_string(),
@@ -182,7 +191,7 @@ mod tests {
                 executable: "codex".to_string(),
                 model: None,
                 confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine: engine.to_string_lossy().to_string(),
+                    engine: engine.clone(),
                     image: Some("ghcr.io/lionclaw/codex-runtime:latest".to_string()),
                     ..OciConfinementConfig::default()
                 }),
@@ -194,7 +203,7 @@ mod tests {
                 executable: "codex".to_string(),
                 model: None,
                 confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine: engine.to_string_lossy().to_string(),
+                    engine,
                     image: None,
                     ..OciConfinementConfig::default()
                 }),

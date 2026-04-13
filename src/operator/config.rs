@@ -373,7 +373,7 @@ impl RuntimeProfileConfig {
 
         match self.confinement() {
             ConfinementConfig::Oci(config) => {
-                validate_host_executable(&config.engine)?;
+                validate_podman_executable(&config.engine)?;
                 if config
                     .image
                     .as_deref()
@@ -381,7 +381,7 @@ impl RuntimeProfileConfig {
                     .filter(|value| !value.is_empty())
                     .is_none()
                 {
-                    return Err(anyhow!("OCI confinement image is required"));
+                    return Err(anyhow!("Podman runtime image is required"));
                 }
             }
         }
@@ -506,6 +506,12 @@ pub fn normalize_host_executable(source: &str) -> Result<String> {
     Ok(path.to_string_lossy().to_string())
 }
 
+pub fn normalize_podman_executable(source: &str) -> Result<String> {
+    let normalized = normalize_host_executable(source)?;
+    ensure_podman_executable(Path::new(&normalized))?;
+    Ok(normalized)
+}
+
 pub fn validate_executable_path(path: &Path) -> Result<()> {
     if !path.is_file() {
         return Err(anyhow!("executable '{}' is not a file", path.display()));
@@ -545,6 +551,11 @@ pub fn validate_host_executable(source: &str) -> Result<()> {
     validate_executable_path(&normalize_executable_path(raw)?)
 }
 
+pub fn validate_podman_executable(source: &str) -> Result<()> {
+    validate_host_executable(source)?;
+    ensure_podman_executable(&normalize_executable_path(source.trim())?)
+}
+
 fn looks_like_path(raw: &str) -> bool {
     let path = Path::new(raw);
     path.is_absolute() || raw.contains('/') || raw.starts_with(".")
@@ -558,6 +569,21 @@ fn normalize_executable_path(raw: &str) -> Result<PathBuf> {
 
     let current_dir = std::env::current_dir().context("failed to resolve current directory")?;
     Ok(current_dir.join(path))
+}
+
+fn ensure_podman_executable(path: &Path) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("podman engine path '{}' has no file name", path.display()))?;
+    if file_name != "podman" {
+        return Err(anyhow!(
+            "Podman confinement requires a 'podman' executable path, got '{}'",
+            path.display()
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

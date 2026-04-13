@@ -57,6 +57,11 @@ cargo build --release
 ./target/release/lionclaw run codex
 ```
 
+`lionclaw run ...` uses your current directory as the project root by default.
+LionClaw keeps its own continuity, runtime state, services, and config under
+`LIONCLAW_HOME`, while the confined runtime sees the project itself at
+`/workspace`.
+
 Continue the latest local session instead of starting fresh:
 
 ```bash
@@ -215,9 +220,12 @@ name that starts with `lionclaw-runtime-secrets-`. Keep the source file
 owner-only; LionClaw hardens it to `0600` on Unix before handing it to Podman.
 
 `lionclaw runtime add` configures the runtime command that runs inside the
-confinement image, plus the concrete host OCI engine path and image LionClaw
+runtime image, plus the concrete host `podman` executable and image LionClaw
 uses to launch it. Execution policy remains config-owned in LionClaw state, not
 ambient shell state.
+
+`lionclaw service up` persists the project root you launch it from so the
+background daemon and confined runtimes keep operating on that same project.
 
 Daemon/service plumbing recognizes these env vars:
 

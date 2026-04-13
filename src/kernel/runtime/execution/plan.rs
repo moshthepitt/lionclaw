@@ -125,14 +125,15 @@ impl MountAccess {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "backend", rename_all = "kebab-case")]
+#[serde(tag = "backend")]
 pub enum ConfinementConfig {
+    #[serde(rename = "podman")]
     Oci(OciConfinementConfig),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum ConfinementBackend {
+    #[serde(rename = "podman")]
     Oci,
 }
 
@@ -159,7 +160,7 @@ impl ConfinementConfig {
 impl ConfinementBackend {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Oci => "oci",
+            Self::Oci => "podman",
         }
     }
 }
@@ -167,7 +168,7 @@ impl ConfinementBackend {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct OciConfinementConfig {
-    #[serde(default = "default_oci_engine")]
+    #[serde(default = "default_podman_engine")]
     pub engine: String,
     #[serde(default)]
     pub image: Option<String>,
@@ -184,7 +185,7 @@ pub struct OciConfinementConfig {
 impl Default for OciConfinementConfig {
     fn default() -> Self {
         Self {
-            engine: default_oci_engine(),
+            engine: default_podman_engine(),
             image: None,
             read_only_rootfs: false,
             tmpfs: Vec::new(),
@@ -194,7 +195,7 @@ impl Default for OciConfinementConfig {
     }
 }
 
-fn default_oci_engine() -> String {
+fn default_podman_engine() -> String {
     "podman".to_string()
 }
 
@@ -271,9 +272,9 @@ mod tests {
     }
 
     #[test]
-    fn oci_confinement_uses_nested_limits_shape() {
+    fn podman_confinement_uses_nested_limits_shape() {
         let config: ConfinementConfig = serde_json::from_value(json!({
-            "backend": "oci",
+            "backend": "podman",
             "read-only-rootfs": true,
             "limits": {
                 "memory-limit": "4g",

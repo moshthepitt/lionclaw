@@ -117,7 +117,7 @@ Runtime module layout:
 - `kernel/runtime/execution/plan.rs`: typed execution presets, confinement config, and effective per-turn plans.
 - `kernel/runtime/execution/planner.rs`: deterministic plan compilation from runtime config, preset config, and request overrides.
 - `kernel/runtime/execution/backend.rs`: backend execution contract for confined runtime launch.
-- `kernel/runtime/execution/oci.rs`: rootless OCI backend and typed command builder.
+- `kernel/runtime/execution/oci.rs`: rootless Podman backend and typed command builder.
 - `kernel/runtime/execution/process.rs`: shared process execution utility for adapters and backends.
 - `kernel/runtime/adapters/mock.rs`: deterministic test adapter.
 - `kernel/runtime/adapters/codex.rs`: production program-backed adapter for Codex protocol details.
@@ -137,6 +137,10 @@ The everyday confined runtime layout is mount-first:
 - `/runtime`: runtime-private writable state root.
 - `/drafts`: runtime-private draft/output area.
 
+For local `lionclaw run`, the project root defaults to the current working
+directory and is mounted at `/workspace`. `LIONCLAW_HOME` remains LionClaw's
+own state root and is not the everyday project tree.
+
 The execution planner also injects stable runtime-private environment defaults such as `HOME=/runtime/home` and `LIONCLAW_DRAFTS_DIR=/drafts` so program-backed runtimes keep ephemeral state out of LionClaw continuity.
 LionClaw does not persist a separate draft registry. Draft listing scans that shared drafts directory on demand, and explicit keep/discard actions move or delete files directly from there.
 
@@ -148,7 +152,7 @@ from engine defaults.
 
 Runtime secrets are loaded from `~/.lionclaw/config/runtime-secrets.env`.
 Presets either mount that whole file or mount no runtime secrets at all with
-`mount-runtime-secrets = true|false`, and the OCI backend mounts it read-only
+`mount-runtime-secrets = true|false`, and the Podman backend mounts it read-only
 under Podman's default `/run/secrets/` directory with a LionClaw-managed name
 that starts with `lionclaw-runtime-secrets-`.
 LionClaw hardens the config directory to `0700` and the runtime secret file to
@@ -298,7 +302,7 @@ Queued channel turns emit machine-stable status/error codes through the same str
 1. Default deny: policy checks deny unless grant exists.
 2. No default external channel in core; all external transport is skill-worker code outside Rust kernel.
 3. Runtime adapters registered by default: local `mock` only. `codex` and `opencode` are configured runtime profiles that bind program-backed adapters at startup.
-4. Configured `codex` and `opencode` profiles run through the shared execution planner and OCI backend, then map runtime JSON output into kernel events.
+4. Configured `codex` and `opencode` profiles run through the shared execution planner and Podman backend, then map runtime JSON output into kernel events.
 5. Kernel-enforced runtime idle timeout + hard timeout + cancellation path (`runtime.turn.timeout` audit event with `timeout_kind=idle|hard`).
 6. Runtime execution policy supports per-turn working directory, idle timeout override, and env passthrough constraints while the daemon keeps a separate hard timeout ceiling.
 7. Ordinary confined runtime file work stays inside mounted workspace/runtime/drafts paths. Kernel brokers are reserved for explicit side effects:

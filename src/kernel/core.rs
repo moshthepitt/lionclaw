@@ -64,11 +64,11 @@ use super::{
     policy::{Capability, PolicyStore, Scope},
     runtime::{
         execute_program_backed_turn, register_builtin_runtime_adapters, EffectiveExecutionPlan,
-        ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset,
-        HiddenTurnSupport, RuntimeAdapter, RuntimeCapabilityRequest, RuntimeCapabilityResult,
-        RuntimeEvent, RuntimeExecutionProfile, RuntimeMessageLane, RuntimeRegistry,
-        RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
-        RuntimeTurnMode, RuntimeTurnResult,
+        ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
+        ExecutionPreset, HiddenTurnSupport, RuntimeAdapter, RuntimeCapabilityRequest,
+        RuntimeCapabilityResult, RuntimeEvent, RuntimeExecutionProfile, RuntimeMessageLane,
+        RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput,
+        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -2340,6 +2340,7 @@ impl Kernel {
                 runtime_id,
                 ExecutionPlanRequest {
                     runtime_id: runtime_id.to_string(),
+                    purpose: ExecutionPlanPurpose::HiddenCompaction,
                     preset_name: None,
                     working_dir: None,
                     env_passthrough_keys: Vec::new(),
@@ -4078,6 +4079,7 @@ impl Kernel {
                 &runtime_id,
                 ExecutionPlanRequest {
                     runtime_id: runtime_id.clone(),
+                    purpose: ExecutionPlanPurpose::Interactive,
                     preset_name: None,
                     working_dir: runtime_working_dir.clone(),
                     env_passthrough_keys: runtime_env_passthrough.clone().unwrap_or_default(),

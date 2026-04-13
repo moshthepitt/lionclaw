@@ -8,6 +8,7 @@ use super::plan::{
 };
 
 pub const BUILTIN_PRESET_EVERYDAY: &str = "everyday";
+pub const BUILTIN_PRESET_HIDDEN_COMPACTION: &str = "hidden-compaction";
 const WORKSPACE_MOUNT_TARGET: &str = "/workspace";
 const RUNTIME_MOUNT_TARGET: &str = "/runtime";
 const DRAFTS_MOUNT_TARGET: &str = "/drafts";
@@ -59,10 +60,18 @@ impl fmt::Debug for ExecutionPlannerConfig {
 #[derive(Debug, Clone)]
 pub struct ExecutionPlanRequest {
     pub runtime_id: String,
+    pub purpose: ExecutionPlanPurpose,
     pub preset_name: Option<String>,
     pub working_dir: Option<String>,
     pub env_passthrough_keys: Vec<String>,
     pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExecutionPlanPurpose {
+    #[default]
+    Interactive,
+    HiddenCompaction,
 }
 
 #[derive(Clone)]
@@ -128,8 +137,14 @@ impl ExecutionPlanner {
             .get(&request.runtime_id)
             .cloned()
             .unwrap_or_default();
-        let (preset_name, preset) = self.resolve_preset(request.preset_name.as_deref())?;
-        let mounts = self.build_mounts(&request.runtime_id, &preset, &runtime_profile);
+        let (preset_name, preset) =
+            self.resolve_preset(request.preset_name.as_deref(), request.purpose)?;
+        let mounts = self.build_mounts(
+            &request.runtime_id,
+            &preset,
+            &runtime_profile,
+            request.purpose,
+        );
         let limits = match &runtime_profile.confinement {
             ConfinementConfig::Oci(config) => config.limits.clone(),
         };
@@ -145,6 +160,9 @@ impl ExecutionPlanner {
                 .iter()
                 .any(|mount| mount.target == DRAFTS_MOUNT_TARGET),
         );
+        let working_dir = execution_context
+            .working_dir
+            .or_else(|| default_working_dir_for_purpose(request.purpose, &mounts));
 
         Ok(EffectiveExecutionPlan {
             runtime_id: request.runtime_id,
@@ -152,7 +170,7 @@ impl ExecutionPlanner {
             confinement: runtime_profile.confinement,
             workspace_access: preset.workspace_access,
             network_mode: preset.network_mode,
-            working_dir: execution_context.working_dir,
+            working_dir,
             environment,
             idle_timeout: execution_context.idle_timeout,
             hard_timeout: execution_context.hard_timeout,
@@ -166,7 +184,15 @@ impl ExecutionPlanner {
     fn resolve_preset(
         &self,
         requested_name: Option<&str>,
+        purpose: ExecutionPlanPurpose,
     ) -> Result<(String, ExecutionPreset), String> {
+        if purpose == ExecutionPlanPurpose::HiddenCompaction {
+            return Ok((
+                BUILTIN_PRESET_HIDDEN_COMPACTION.to_string(),
+                hidden_compaction_preset(),
+            ));
+        }
+
         if let Some(name) = requested_name
             .map(str::trim)
             .filter(|name| !name.is_empty())
@@ -203,7 +229,12 @@ impl ExecutionPlanner {
         runtime_id: &str,
         preset: &ExecutionPreset,
         runtime_profile: &RuntimeExecutionProfile,
+        purpose: ExecutionPlanPurpose,
     ) -> Vec<MountSpec> {
+        if purpose == ExecutionPlanPurpose::HiddenCompaction {
+            return Vec::new();
+        }
+
         let mut mounts = Vec::new();
 
         if let Some(workspace_source) = self
@@ -247,6 +278,29 @@ fn workspace_access_to_mount_access(access: WorkspaceAccess) -> MountAccess {
         WorkspaceAccess::ReadOnly => MountAccess::ReadOnly,
         WorkspaceAccess::ReadWrite => MountAccess::ReadWrite,
     }
+}
+
+fn hidden_compaction_preset() -> ExecutionPreset {
+    ExecutionPreset {
+        workspace_access: WorkspaceAccess::ReadOnly,
+        network_mode: super::plan::NetworkMode::None,
+        mount_runtime_secrets: false,
+        escape_classes: Default::default(),
+    }
+}
+
+fn default_working_dir_for_purpose(
+    purpose: ExecutionPlanPurpose,
+    mounts: &[MountSpec],
+) -> Option<String> {
+    if purpose != ExecutionPlanPurpose::Interactive {
+        return None;
+    }
+
+    mounts
+        .iter()
+        .find(|mount| mount.target == WORKSPACE_MOUNT_TARGET)
+        .map(|mount| mount.source.to_string_lossy().to_string())
 }
 
 fn build_runtime_environment(
@@ -302,8 +356,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig, RuntimeExecutionProfile,
-        BUILTIN_PRESET_EVERYDAY,
+        ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
+        RuntimeExecutionProfile, BUILTIN_PRESET_EVERYDAY, BUILTIN_PRESET_HIDDEN_COMPACTION,
     };
     use crate::kernel::runtime::{
         ConfinementConfig, ExecutionPreset, MountAccess, MountSpec, NetworkMode,
@@ -329,6 +383,7 @@ mod tests {
         let plan = planner
             .plan(ExecutionPlanRequest {
                 runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::Interactive,
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
@@ -380,6 +435,7 @@ mod tests {
         let plan = planner
             .plan(ExecutionPlanRequest {
                 runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::Interactive,
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
@@ -390,6 +446,10 @@ mod tests {
         assert_eq!(plan.mounts[0].source, workspace_root);
         assert_eq!(plan.mounts[0].target, "/workspace");
         assert_eq!(plan.mounts[0].access, MountAccess::ReadWrite);
+        assert_eq!(
+            plan.working_dir.as_deref(),
+            Some(workspace_root.to_string_lossy().as_ref())
+        );
         assert_eq!(
             plan.mounts[1].source,
             runtime_root.join("codex").join("main")
@@ -446,6 +506,7 @@ mod tests {
         let err = planner
             .plan(ExecutionPlanRequest {
                 runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::Interactive,
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
@@ -494,6 +555,7 @@ mod tests {
         let plan = planner
             .plan(ExecutionPlanRequest {
                 runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::Interactive,
                 preset_name: None,
                 working_dir: Some(child.to_string_lossy().to_string()),
                 env_passthrough_keys: Vec::new(),
@@ -538,6 +600,7 @@ mod tests {
         let plan = planner
             .plan(ExecutionPlanRequest {
                 runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::Interactive,
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
@@ -570,6 +633,7 @@ mod tests {
         let plan = planner
             .plan(ExecutionPlanRequest {
                 runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::Interactive,
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
@@ -582,6 +646,54 @@ mod tests {
             .environment
             .iter()
             .any(|(key, _)| key == "LIONCLAW_RUNTIME_SECRETS_FILE"));
+    }
+
+    #[test]
+    fn hidden_compaction_plan_is_locked_down() {
+        let sandbox = tempdir().expect("temp dir");
+        let presets = [(
+            "everyday".to_string(),
+            ExecutionPreset {
+                mount_runtime_secrets: true,
+                ..ExecutionPreset::default()
+            },
+        )]
+        .into_iter()
+        .collect();
+        let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: RuntimeExecutionPolicy::default(),
+            default_preset_name: Some("everyday".to_string()),
+            presets,
+            runtimes: BTreeMap::new(),
+            workspace_root: Some(sandbox.path().join("workspace")),
+            project_workspace_root: Some(sandbox.path().join("project")),
+            runtime_root: Some(sandbox.path().join("runtime")),
+            workspace_name: Some("main".to_string()),
+            default_idle_timeout: Duration::from_secs(30),
+            default_hard_timeout: Duration::from_secs(90),
+        });
+
+        let plan = planner
+            .plan(ExecutionPlanRequest {
+                runtime_id: "mock".to_string(),
+                purpose: ExecutionPlanPurpose::HiddenCompaction,
+                preset_name: None,
+                working_dir: None,
+                env_passthrough_keys: Vec::new(),
+                timeout_ms: None,
+            })
+            .expect("plan");
+
+        assert_eq!(plan.preset_name, BUILTIN_PRESET_HIDDEN_COMPACTION);
+        assert_eq!(plan.workspace_access, WorkspaceAccess::ReadOnly);
+        assert_eq!(plan.network_mode, NetworkMode::None);
+        assert!(!plan.mount_runtime_secrets);
+        assert!(plan.mounts.is_empty());
+        assert_eq!(plan.working_dir, None);
+        assert_eq!(
+            plan.environment,
+            vec![("TMPDIR".to_string(), "/tmp".to_string())]
+        );
     }
 
     #[test]

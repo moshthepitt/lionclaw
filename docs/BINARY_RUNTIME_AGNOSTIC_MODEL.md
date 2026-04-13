@@ -57,7 +57,9 @@ or delivery surface.
 
 `~/.lionclaw/workspaces/main/` is the default assistant home workspace.
 
-This is distinct from any optional project/task workspace root used for brokered filesystem access.
+This is distinct from the project/task root that LionClaw mounts into confined
+runtimes at `/workspace`. By default, local `lionclaw run` uses the current
+working directory as that project root.
 
 This is the assistant's durable life context. It is where LionClaw keeps the
 runtime-independent identity files that shape prompt assembly and future

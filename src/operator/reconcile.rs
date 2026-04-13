@@ -4,9 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::{
+    config::resolve_project_workspace_root,
     contracts::{ChannelBindRequest, ChannelPeerApproveRequest, ChannelPeerResponse, TrustTier},
     home::LionClawHome,
-    kernel::{Kernel, KernelOptions},
+    kernel::{Kernel, KernelOptions, RuntimeExecutionPolicy},
     operator::{
         config::{
             normalize_local_source, ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig,
@@ -492,12 +493,15 @@ pub(crate) fn build_managed_units(
     binaries: &StackBinaryPaths,
 ) -> Result<Vec<ManagedServiceUnit>> {
     let mut units = Vec::new();
+    let project_workspace_root = resolve_project_workspace_root()
+        .context("failed to resolve project workspace root for managed daemon")?;
     units.push(render_daemon_unit(
         home,
         &binaries.daemon_bin,
         &config.daemon.bind,
         runtime_id,
         &config.daemon.workspace,
+        &project_workspace_root,
     ));
 
     let base_url = base_url_from_bind(&config.daemon.bind);
@@ -702,14 +706,15 @@ pub(crate) async fn open_kernel(
     default_runtime_id: Option<String>,
 ) -> Result<Kernel> {
     let workspace_root = config.workspace_root(home);
-    let project_workspace_root = std::env::var("LIONCLAW_WORKSPACE_ROOT")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root.clone());
+    let project_workspace_root =
+        resolve_project_workspace_root().context("failed to resolve project workspace root")?;
     let runtime_secrets_file = resolve_runtime_secrets_file(home).await?;
     let kernel = Kernel::new_with_options(
         &home.db_path(),
         KernelOptions {
+            runtime_execution_policy: RuntimeExecutionPolicy::for_working_dir_root(
+                project_workspace_root.clone(),
+            ),
             default_runtime_id: default_runtime_id.or_else(|| config.defaults.runtime.clone()),
             default_preset_name: config.defaults.preset.clone(),
             execution_presets: config.presets.clone(),
@@ -769,12 +774,27 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
+    fn ensure_fake_podman(reference: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let engine = reference.parent().expect("stub parent").join("podman");
+        if !engine.exists() {
+            fs::write(&engine, "#!/usr/bin/env bash\nexit 0\n").expect("write fake podman");
+            fs::set_permissions(&engine, fs::Permissions::from_mode(0o755))
+                .expect("chmod fake podman");
+        }
+        engine
+    }
+
     fn test_codex_runtime(runtime_stub: &std::path::Path) -> RuntimeProfileConfig {
         RuntimeProfileConfig::Codex {
             executable: "codex".to_string(),
             model: None,
             confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                engine: runtime_stub.to_string_lossy().to_string(),
+                engine: ensure_fake_podman(runtime_stub)
+                    .to_string_lossy()
+                    .to_string(),
                 image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
                 ..OciConfinementConfig::default()
             }),

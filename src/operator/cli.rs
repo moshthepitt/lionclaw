@@ -19,7 +19,7 @@ use crate::{
     operator::{
         attach::attach_channel,
         config::{
-            derive_skill_alias, normalize_host_executable, normalize_runtime_command,
+            derive_skill_alias, normalize_podman_executable, normalize_runtime_command,
             ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig,
         },
         lockfile::OperatorLockfile,
@@ -131,11 +131,9 @@ struct RuntimeAddArgs {
     model: Option<String>,
     #[arg(long)]
     agent: Option<String>,
-    #[arg(long, help = "Confinement backend for this runtime profile")]
-    backend: Option<String>,
-    #[arg(long, help = "Host OCI engine executable to use when backend is 'oci'")]
+    #[arg(long, help = "Host Podman executable LionClaw should use")]
     engine: Option<String>,
-    #[arg(long, help = "Runtime image for the confinement backend")]
+    #[arg(long, help = "Runtime image LionClaw should run with Podman")]
     image: Option<String>,
     #[arg(long, help = "Use a read-only container root filesystem")]
     read_only_rootfs: bool,
@@ -1023,60 +1021,48 @@ fn build_runtime_profile(
 }
 
 fn build_confinement_config(args: &RuntimeAddArgs) -> Result<ConfinementConfig> {
-    let backend = args
-        .backend
-        .as_deref()
-        .unwrap_or("oci")
-        .trim()
-        .to_ascii_lowercase();
-    match backend.as_str() {
-        "oci" => Ok(ConfinementConfig::Oci(OciConfinementConfig {
-            engine: match args
-                .engine
+    Ok(ConfinementConfig::Oci(OciConfinementConfig {
+        engine: match args
+            .engine
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(engine) => normalize_podman_executable(engine)?,
+            None => normalize_podman_executable("podman")?,
+        },
+        image: Some(
+            args.image
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-            {
-                Some(engine) => normalize_host_executable(engine)?,
-                None => normalize_host_executable("podman")?,
-            },
-            image: Some(
-                args.image
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| anyhow!("runtime image is required"))?
-                    .to_string(),
-            ),
-            read_only_rootfs: args.read_only_rootfs,
-            tmpfs: args
-                .tmpfs
-                .iter()
-                .map(|value| value.trim().to_string())
+                .ok_or_else(|| anyhow!("runtime image is required"))?
+                .to_string(),
+        ),
+        read_only_rootfs: args.read_only_rootfs,
+        tmpfs: args
+            .tmpfs
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect(),
+        additional_mounts: Vec::new(),
+        limits: ExecutionLimits {
+            memory_limit: args
+                .memory_limit
+                .as_deref()
+                .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .collect(),
-            additional_mounts: Vec::new(),
-            limits: ExecutionLimits {
-                memory_limit: args
-                    .memory_limit
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToOwned::to_owned),
-                cpu_limit: args
-                    .cpu_limit
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToOwned::to_owned),
-                pids_limit: args.pids_limit,
-            },
-        })),
-        other => Err(anyhow!(
-            "unsupported confinement backend '{}'; expected 'oci'",
-            other
-        )),
-    }
+                .map(ToOwned::to_owned),
+            cpu_limit: args
+                .cpu_limit
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+            pids_limit: args.pids_limit,
+        },
+    }))
 }
 
 fn validate_codex_profile_args(args: &RuntimeAddArgs) -> Result<()> {
@@ -1093,29 +1079,35 @@ mod tests {
     use super::*;
     use crate::kernel::runtime::ConfinementConfig;
     use chrono::Duration as ChronoDuration;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
-    fn runtime_add_args(kind: &str) -> RuntimeAddArgs {
-        RuntimeAddArgs {
-            id: "runtime".to_string(),
-            kind: kind.to_string(),
-            executable: "runtime-bin".to_string(),
-            model: None,
-            agent: None,
-            backend: None,
-            engine: Some(
-                std::env::current_exe()
-                    .expect("current exe")
-                    .to_string_lossy()
-                    .to_string(),
-            ),
-            image: None,
-            read_only_rootfs: false,
-            tmpfs: Vec::new(),
-            memory_limit: None,
-            cpu_limit: None,
-            pids_limit: None,
-        }
+    #[cfg(unix)]
+    fn runtime_add_args(kind: &str) -> (TempDir, RuntimeAddArgs) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let podman = temp_dir.path().join("podman");
+        std::fs::write(&podman, "#!/usr/bin/env bash\n").expect("write podman");
+        std::fs::set_permissions(&podman, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod podman");
+
+        (
+            temp_dir,
+            RuntimeAddArgs {
+                id: "runtime".to_string(),
+                kind: kind.to_string(),
+                executable: "runtime-bin".to_string(),
+                model: None,
+                agent: None,
+                engine: Some(podman.to_string_lossy().to_string()),
+                image: None,
+                read_only_rootfs: false,
+                tmpfs: Vec::new(),
+                memory_limit: None,
+                cpu_limit: None,
+                pids_limit: None,
+            },
+        )
     }
 
     #[test]
@@ -1192,7 +1184,7 @@ mod tests {
 
     #[test]
     fn builds_codex_runtime_profile_with_oci_confinement() {
-        let mut args = runtime_add_args("codex");
+        let (_temp_dir, mut args) = runtime_add_args("codex");
         args.image = Some("ghcr.io/lionclaw/codex:v1".to_string());
         args.read_only_rootfs = true;
         args.tmpfs = vec!["/tmp:size=512m".to_string()];
@@ -1212,13 +1204,7 @@ mod tests {
         assert!(model.is_none());
         match confinement {
             ConfinementConfig::Oci(config) => {
-                assert_eq!(
-                    config.engine,
-                    std::env::current_exe()
-                        .expect("current exe")
-                        .to_string_lossy()
-                        .to_string()
-                );
+                assert!(config.engine.ends_with("/podman"));
                 assert_eq!(config.image.as_deref(), Some("ghcr.io/lionclaw/codex:v1"));
                 assert!(config.read_only_rootfs);
                 assert_eq!(config.tmpfs, vec!["/tmp:size=512m".to_string()]);
@@ -1229,14 +1215,14 @@ mod tests {
 
     #[test]
     fn build_confinement_config_requires_image() {
-        let args = runtime_add_args("codex");
+        let (_temp_dir, args) = runtime_add_args("codex");
         let err = build_confinement_config(&args).expect_err("missing image should fail");
         assert!(err.to_string().contains("runtime image is required"));
     }
 
     #[test]
     fn codex_rejects_opencode_specific_flags() {
-        let mut args = runtime_add_args("codex");
+        let (_temp_dir, mut args) = runtime_add_args("codex");
         args.agent = Some("planner".to_string());
         args.image = Some("ghcr.io/lionclaw/codex:v1".to_string());
 

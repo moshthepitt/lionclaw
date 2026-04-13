@@ -19,6 +19,6 @@ pub use plan::{
     WorkspaceAccess,
 };
 pub use planner::{
-    ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig, RuntimeExecutionProfile,
-    BUILTIN_PRESET_EVERYDAY,
+    ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
+    RuntimeExecutionProfile, BUILTIN_PRESET_EVERYDAY, BUILTIN_PRESET_HIDDEN_COMPACTION,
 };

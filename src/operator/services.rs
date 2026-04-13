@@ -41,6 +41,7 @@ pub fn render_daemon_unit(
     bind_addr: &str,
     runtime_id: &str,
     workspace: &str,
+    project_workspace_root: &Path,
 ) -> ManagedServiceUnit {
     let env_path = home.services_env_dir().join("lionclawd.env");
     let unit_path = home.services_systemd_dir().join(DAEMON_UNIT_NAME);
@@ -59,6 +60,10 @@ pub fn render_daemon_unit(
             runtime_id.to_string(),
         ),
         ("LIONCLAW_WORKSPACE".to_string(), workspace.to_string()),
+        (
+            "LIONCLAW_WORKSPACE_ROOT".to_string(),
+            project_workspace_root.display().to_string(),
+        ),
     ];
     let env_content = env_lines
         .iter()
@@ -560,12 +565,16 @@ mod tests {
             "127.0.0.1:8979",
             "codex",
             "main",
+            Path::new("/tmp/project"),
         );
         assert!(daemon.unit_content.contains("ExecStart=/tmp/bin/lionclawd"));
         assert!(daemon
             .env_content
             .contains("LIONCLAW_BIND_ADDR=\"127.0.0.1:8979\""));
         assert!(daemon.env_content.contains("LIONCLAW_WORKSPACE=\"main\""));
+        assert!(daemon
+            .env_content
+            .contains("LIONCLAW_WORKSPACE_ROOT=\"/tmp/project\""));
 
         let channel = render_channel_unit(
             &home,
