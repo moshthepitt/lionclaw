@@ -175,7 +175,7 @@ mod tests {
         let err = canonicalize_project_workspace_root(std::path::PathBuf::from(
             "/definitely/missing/path",
         ))
-            .expect_err("missing path should fail");
+        .expect_err("missing path should fail");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
