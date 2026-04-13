@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -39,11 +39,13 @@ pub struct RuntimeSessionStartInput {
     pub working_dir: Option<String>,
     pub environment: Vec<(String, String)>,
     pub selected_skills: Vec<String>,
+    pub runtime_state_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RuntimeSessionHandle {
     pub runtime_session_id: String,
+    pub resumes_existing_session: bool,
 }
 
 #[derive(Debug, Clone)]

@@ -1,5 +1,8 @@
 use std::{collections::BTreeMap, fmt, path::PathBuf, time::Duration};
 
+use uuid::Uuid;
+
+use crate::home::{runtime_project_drafts_dir_from_parts, runtime_session_state_dir_from_parts};
 use crate::kernel::runtime_policy::{RuntimeExecutionPolicy, RuntimeExecutionRequest};
 
 use super::plan::{
@@ -59,6 +62,7 @@ impl fmt::Debug for ExecutionPlannerConfig {
 
 #[derive(Debug, Clone)]
 pub struct ExecutionPlanRequest {
+    pub session_id: Option<Uuid>,
     pub runtime_id: String,
     pub purpose: ExecutionPlanPurpose,
     pub preset_name: Option<String>,
@@ -140,6 +144,7 @@ impl ExecutionPlanner {
         let (preset_name, preset) =
             self.resolve_preset(request.preset_name.as_deref(), request.purpose)?;
         let mounts = self.build_mounts(
+            request.session_id,
             &request.runtime_id,
             &preset,
             &runtime_profile,
@@ -226,6 +231,7 @@ impl ExecutionPlanner {
 
     fn build_mounts(
         &self,
+        session_id: Option<Uuid>,
         runtime_id: &str,
         preset: &ExecutionPreset,
         runtime_profile: &RuntimeExecutionProfile,
@@ -249,17 +255,30 @@ impl ExecutionPlanner {
             });
         }
 
-        if let (Some(runtime_root), Some(workspace_name)) =
-            (self.runtime_root.as_ref(), self.workspace_name.as_ref())
-        {
-            let runtime_workspace = runtime_root.join(runtime_id).join(workspace_name);
+        if let (Some(runtime_root), Some(workspace_name), Some(session_id)) = (
+            self.runtime_root.as_ref(),
+            self.workspace_name.as_ref(),
+            session_id,
+        ) {
             mounts.push(MountSpec {
-                source: runtime_workspace.clone(),
+                source: runtime_session_state_dir_from_parts(
+                    runtime_root,
+                    runtime_id,
+                    workspace_name,
+                    self.project_workspace_root.as_deref(),
+                    session_id,
+                    &runtime_session_shape_key(preset),
+                ),
                 target: RUNTIME_MOUNT_TARGET.to_string(),
                 access: MountAccess::ReadWrite,
             });
             mounts.push(MountSpec {
-                source: runtime_workspace.join("drafts"),
+                source: runtime_project_drafts_dir_from_parts(
+                    runtime_root,
+                    runtime_id,
+                    workspace_name,
+                    self.project_workspace_root.as_deref(),
+                ),
                 target: DRAFTS_MOUNT_TARGET.to_string(),
                 access: MountAccess::ReadWrite,
             });
@@ -278,6 +297,19 @@ fn workspace_access_to_mount_access(access: WorkspaceAccess) -> MountAccess {
         WorkspaceAccess::ReadOnly => MountAccess::ReadOnly,
         WorkspaceAccess::ReadWrite => MountAccess::ReadWrite,
     }
+}
+
+fn runtime_session_shape_key(preset: &ExecutionPreset) -> String {
+    format!(
+        "workspace-{}__network-{}__secrets-{}",
+        preset.workspace_access.as_str(),
+        preset.network_mode.as_str(),
+        if preset.mount_runtime_secrets {
+            "on"
+        } else {
+            "off"
+        }
+    )
 }
 
 fn hidden_compaction_preset() -> ExecutionPreset {
@@ -354,11 +386,13 @@ mod tests {
     use std::{collections::BTreeMap, time::Duration};
 
     use tempfile::tempdir;
+    use uuid::Uuid;
 
     use super::{
         ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
         RuntimeExecutionProfile, BUILTIN_PRESET_EVERYDAY, BUILTIN_PRESET_HIDDEN_COMPACTION,
     };
+    use crate::home::{runtime_project_partition_key, RUNTIME_PROJECTS_DIR, RUNTIME_SESSIONS_DIR};
     use crate::kernel::runtime::{
         ConfinementConfig, ExecutionPreset, MountAccess, MountSpec, NetworkMode,
         OciConfinementConfig, WorkspaceAccess,
@@ -382,6 +416,7 @@ mod tests {
 
         let plan = planner
             .plan(ExecutionPlanRequest {
+                session_id: None,
                 runtime_id: "codex".to_string(),
                 purpose: ExecutionPlanPurpose::Interactive,
                 preset_name: None,
@@ -403,6 +438,8 @@ mod tests {
         let sandbox = tempdir().expect("temp dir");
         let workspace_root = sandbox.path().join("project");
         let runtime_root = sandbox.path().join("runtime");
+        let session_id = Uuid::nil();
+        let project_key = runtime_project_partition_key(Some(workspace_root.as_path()));
         let extra_mount = MountSpec {
             source: sandbox.path().join("refs"),
             target: "/refs".to_string(),
@@ -425,7 +462,7 @@ mod tests {
             presets: BTreeMap::new(),
             runtimes,
             workspace_root: Some(workspace_root.clone()),
-            project_workspace_root: None,
+            project_workspace_root: Some(workspace_root.clone()),
             runtime_root: Some(runtime_root.clone()),
             workspace_name: Some("main".to_string()),
             default_idle_timeout: Duration::from_secs(30),
@@ -434,6 +471,7 @@ mod tests {
 
         let plan = planner
             .plan(ExecutionPlanRequest {
+                session_id: Some(session_id),
                 runtime_id: "codex".to_string(),
                 purpose: ExecutionPlanPurpose::Interactive,
                 preset_name: None,
@@ -452,12 +490,24 @@ mod tests {
         );
         assert_eq!(
             plan.mounts[1].source,
-            runtime_root.join("codex").join("main")
+            runtime_root
+                .join("codex")
+                .join("main")
+                .join(RUNTIME_PROJECTS_DIR)
+                .join(&project_key)
+                .join(RUNTIME_SESSIONS_DIR)
+                .join(session_id.to_string())
+                .join("workspace-read-write__network-on__secrets-off")
         );
         assert_eq!(plan.mounts[1].target, "/runtime");
         assert_eq!(
             plan.mounts[2].source,
-            runtime_root.join("codex").join("main").join("drafts")
+            runtime_root
+                .join("codex")
+                .join("main")
+                .join(RUNTIME_PROJECTS_DIR)
+                .join(project_key)
+                .join("drafts")
         );
         assert_eq!(plan.mounts[2].target, "/drafts");
         assert_eq!(plan.mounts[3], extra_mount);
@@ -505,6 +555,7 @@ mod tests {
 
         let err = planner
             .plan(ExecutionPlanRequest {
+                session_id: None,
                 runtime_id: "codex".to_string(),
                 purpose: ExecutionPlanPurpose::Interactive,
                 preset_name: None,
@@ -554,6 +605,7 @@ mod tests {
 
         let plan = planner
             .plan(ExecutionPlanRequest {
+                session_id: None,
                 runtime_id: "codex".to_string(),
                 purpose: ExecutionPlanPurpose::Interactive,
                 preset_name: None,
@@ -599,6 +651,7 @@ mod tests {
 
         let plan = planner
             .plan(ExecutionPlanRequest {
+                session_id: None,
                 runtime_id: "codex".to_string(),
                 purpose: ExecutionPlanPurpose::Interactive,
                 preset_name: None,
@@ -632,6 +685,7 @@ mod tests {
 
         let plan = planner
             .plan(ExecutionPlanRequest {
+                session_id: None,
                 runtime_id: "codex".to_string(),
                 purpose: ExecutionPlanPurpose::Interactive,
                 preset_name: None,
@@ -646,6 +700,81 @@ mod tests {
             .environment
             .iter()
             .any(|(key, _)| key == "LIONCLAW_RUNTIME_SECRETS_FILE"));
+    }
+
+    #[test]
+    fn planner_partitions_runtime_state_by_security_shape() {
+        let sandbox = tempdir().expect("temp dir");
+        let session_id = Uuid::nil();
+        let presets = [
+            (
+                "plain".to_string(),
+                ExecutionPreset {
+                    mount_runtime_secrets: false,
+                    ..ExecutionPreset::default()
+                },
+            ),
+            (
+                "secreted".to_string(),
+                ExecutionPreset {
+                    mount_runtime_secrets: true,
+                    ..ExecutionPreset::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: RuntimeExecutionPolicy::default(),
+            default_preset_name: None,
+            presets,
+            runtimes: BTreeMap::new(),
+            workspace_root: Some(sandbox.path().join("workspace")),
+            project_workspace_root: Some(sandbox.path().join("project")),
+            runtime_root: Some(sandbox.path().join("runtime")),
+            workspace_name: Some("main".to_string()),
+            default_idle_timeout: Duration::from_secs(30),
+            default_hard_timeout: Duration::from_secs(90),
+        });
+
+        let plain = planner
+            .plan(ExecutionPlanRequest {
+                session_id: Some(session_id),
+                runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::Interactive,
+                preset_name: Some("plain".to_string()),
+                working_dir: None,
+                env_passthrough_keys: Vec::new(),
+                timeout_ms: None,
+            })
+            .expect("plain plan");
+        let secreted = planner
+            .plan(ExecutionPlanRequest {
+                session_id: Some(session_id),
+                runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::Interactive,
+                preset_name: Some("secreted".to_string()),
+                working_dir: None,
+                env_passthrough_keys: Vec::new(),
+                timeout_ms: None,
+            })
+            .expect("secreted plan");
+
+        let plain_runtime_root = plain
+            .mounts
+            .iter()
+            .find(|mount| mount.target == "/runtime")
+            .expect("plain runtime mount");
+        let secreted_runtime_root = secreted
+            .mounts
+            .iter()
+            .find(|mount| mount.target == "/runtime")
+            .expect("secreted runtime mount");
+
+        assert_ne!(
+            plain_runtime_root.source, secreted_runtime_root.source,
+            "runtime state roots should partition by secret-mount policy"
+        );
     }
 
     #[test]
@@ -675,6 +804,7 @@ mod tests {
 
         let plan = planner
             .plan(ExecutionPlanRequest {
+                session_id: Some(Uuid::nil()),
                 runtime_id: "mock".to_string(),
                 purpose: ExecutionPlanPurpose::HiddenCompaction,
                 preset_name: None,

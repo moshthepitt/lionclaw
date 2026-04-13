@@ -1,5 +1,5 @@
-use std::collections::HashSet;
 use std::sync::RwLock;
+use std::{collections::HashMap, path::Path};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -32,14 +32,19 @@ impl Default for OpenCodeRuntimeConfig {
 #[derive(Debug)]
 pub struct OpenCodeRuntimeAdapter {
     config: OpenCodeRuntimeConfig,
-    sessions: RwLock<HashSet<String>>,
+    sessions: RwLock<HashMap<String, OpenCodeSessionState>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OpenCodeSessionState {
+    resumes_existing_session: bool,
 }
 
 impl OpenCodeRuntimeAdapter {
     pub fn new(config: OpenCodeRuntimeConfig) -> Self {
         Self {
             config,
-            sessions: RwLock::new(HashSet::new()),
+            sessions: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -60,21 +65,38 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
 
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_session_id = format!("opencode-{}", Uuid::new_v4());
-        let _ = input;
+        let resumes_existing_session = input
+            .runtime_state_root
+            .as_deref()
+            .map(runtime_session_is_ready)
+            .transpose()?
+            .unwrap_or(false);
         self.sessions
             .write()
             .map_err(|_| anyhow!("opencode runtime session state lock poisoned"))?
-            .insert(runtime_session_id.clone());
+            .insert(
+                runtime_session_id.clone(),
+                OpenCodeSessionState {
+                    resumes_existing_session,
+                },
+            );
 
-        Ok(RuntimeSessionHandle { runtime_session_id })
+        Ok(RuntimeSessionHandle {
+            runtime_session_id,
+            resumes_existing_session,
+        })
     }
 
     fn build_turn_program(&self, input: &RuntimeTurnInput) -> Result<RuntimeProgramSpec> {
-        ensure_runtime_session_exists(&self.sessions, &input.runtime_session_id)?;
+        let session = get_runtime_session(&self.sessions, &input.runtime_session_id)?;
 
         Ok(RuntimeProgramSpec {
             executable: self.config.executable.clone(),
-            args: build_opencode_run_args(&self.config, &input.prompt),
+            args: build_opencode_run_args(
+                &self.config,
+                &input.prompt,
+                session.resumes_existing_session,
+            ),
             environment: Vec::new(),
             stdin: String::new(),
         })
@@ -139,13 +161,22 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
     }
 }
 
-fn build_opencode_run_args(config: &OpenCodeRuntimeConfig, prompt: &str) -> Vec<String> {
-    let mut args = vec![
-        "run".to_string(),
+fn build_opencode_run_args(
+    config: &OpenCodeRuntimeConfig,
+    prompt: &str,
+    resumes_existing_session: bool,
+) -> Vec<String> {
+    let mut args = vec!["run".to_string()];
+
+    if resumes_existing_session {
+        args.push("--continue".to_string());
+    }
+
+    args.extend([
         "--format".to_string(),
         "json".to_string(),
         "--thinking".to_string(),
-    ];
+    ]);
 
     if let Some(model) = &config.model {
         args.push("--model".to_string());
@@ -160,22 +191,22 @@ fn build_opencode_run_args(config: &OpenCodeRuntimeConfig, prompt: &str) -> Vec<
     args
 }
 
-fn ensure_runtime_session_exists(
-    sessions: &RwLock<HashSet<String>>,
+fn get_runtime_session(
+    sessions: &RwLock<HashMap<String, OpenCodeSessionState>>,
     runtime_session_id: &str,
-) -> Result<()> {
-    if sessions
+) -> Result<OpenCodeSessionState> {
+    sessions
         .read()
         .map_err(|_| anyhow!("opencode runtime session state lock poisoned"))?
-        .contains(runtime_session_id)
-    {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "runtime session '{}' not found",
-            runtime_session_id
-        ))
-    }
+        .get(runtime_session_id)
+        .copied()
+        .ok_or_else(|| anyhow!("runtime session '{}' not found", runtime_session_id))
+}
+
+fn runtime_session_is_ready(root: &Path) -> Result<bool> {
+    Ok(root
+        .join(crate::home::RUNTIME_SESSION_READY_MARKER)
+        .is_file())
 }
 
 #[cfg(test)]
@@ -407,6 +438,7 @@ mod tests {
                 working_dir: None,
                 environment: Vec::new(),
                 selected_skills: Vec::new(),
+                runtime_state_root: None,
             })
             .await
             .expect("start");
@@ -491,5 +523,34 @@ mod tests {
             &events[0],
             RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Reasoning, text } if text == "planning next step"
         ));
+    }
+
+    #[test]
+    fn opencode_continue_args_resume_last_session() {
+        let args = super::build_opencode_run_args(
+            &OpenCodeRuntimeConfig {
+                executable: "opencode".to_string(),
+                model: Some("gpt-5".to_string()),
+                agent: Some("builder".to_string()),
+            },
+            "hello",
+            true,
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "run".to_string(),
+                "--continue".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+                "--thinking".to_string(),
+                "--model".to_string(),
+                "gpt-5".to_string(),
+                "--agent".to_string(),
+                "builder".to_string(),
+                "hello".to_string(),
+            ]
+        );
     }
 }

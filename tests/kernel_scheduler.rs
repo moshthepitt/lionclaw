@@ -628,6 +628,7 @@ impl RuntimeAdapter for AlwaysFailRuntimeAdapter {
     ) -> Result<RuntimeSessionHandle> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("always-fail-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
         })
     }
 
@@ -677,6 +678,7 @@ impl RuntimeAdapter for BlockingRuntimeAdapter {
     ) -> Result<RuntimeSessionHandle> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("blocking-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
         })
     }
 

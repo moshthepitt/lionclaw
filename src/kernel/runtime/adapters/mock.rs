@@ -34,6 +34,7 @@ impl RuntimeAdapter for MockRuntimeAdapter {
     ) -> Result<RuntimeSessionHandle> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("mock-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
         })
     }
 

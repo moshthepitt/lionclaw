@@ -142,6 +142,15 @@ directory and is mounted at `/workspace`. `LIONCLAW_HOME` remains LionClaw's
 own state root and is not the everyday project tree.
 
 The execution planner also injects stable runtime-private environment defaults such as `HOME=/runtime/home` and `LIONCLAW_DRAFTS_DIR=/drafts` so program-backed runtimes keep ephemeral state out of LionClaw continuity.
+Interactive Codex/OpenCode turns still launch a fresh confined process for each
+request, but the mounted `/runtime` state root is now scoped to the LionClaw
+session, project root, and execution security shape. That lets the harness
+resume its own conversation state across turns without sharing runtime-private
+state across different projects or secret/network shapes.
+LionClaw still keeps the canonical transcript itself. Fresh harness sessions get
+replayed transcript history in the prompt envelope; resumed harness sessions get
+a continuation note plus the new user input instead of the full prior transcript
+on every turn.
 LionClaw does not persist a separate draft registry. Draft listing scans that shared drafts directory on demand, and explicit keep/discard actions move or delete files directly from there.
 
 Current runtime network policy is intentionally coarse: presets choose only

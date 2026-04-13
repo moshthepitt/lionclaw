@@ -1,5 +1,5 @@
-use std::collections::HashSet;
 use std::sync::RwLock;
+use std::{collections::HashMap, path::Path};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -30,14 +30,19 @@ impl Default for CodexRuntimeConfig {
 #[derive(Debug)]
 pub struct CodexRuntimeAdapter {
     config: CodexRuntimeConfig,
-    sessions: RwLock<HashSet<String>>,
+    sessions: RwLock<HashMap<String, CodexSessionState>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CodexSessionState {
+    resumes_existing_session: bool,
 }
 
 impl CodexRuntimeAdapter {
     pub fn new(config: CodexRuntimeConfig) -> Self {
         Self {
             config,
-            sessions: RwLock::new(HashSet::new()),
+            sessions: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -58,21 +63,34 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
 
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_session_id = format!("codex-{}", Uuid::new_v4());
-        let _ = input;
+        let resumes_existing_session = input
+            .runtime_state_root
+            .as_deref()
+            .map(runtime_session_is_ready)
+            .transpose()?
+            .unwrap_or(false);
         self.sessions
             .write()
             .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
-            .insert(runtime_session_id.clone());
+            .insert(
+                runtime_session_id.clone(),
+                CodexSessionState {
+                    resumes_existing_session,
+                },
+            );
 
-        Ok(RuntimeSessionHandle { runtime_session_id })
+        Ok(RuntimeSessionHandle {
+            runtime_session_id,
+            resumes_existing_session,
+        })
     }
 
     fn build_turn_program(&self, input: &RuntimeTurnInput) -> Result<RuntimeProgramSpec> {
-        ensure_runtime_session_exists(&self.sessions, &input.runtime_session_id)?;
+        let session = get_runtime_session(&self.sessions, &input.runtime_session_id)?;
 
         Ok(RuntimeProgramSpec {
             executable: self.config.executable.clone(),
-            args: build_codex_exec_args(&self.config),
+            args: build_codex_exec_args(&self.config, session.resumes_existing_session),
             environment: Vec::new(),
             stdin: input.prompt.clone(),
         })
@@ -124,8 +142,21 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
     }
 }
 
-fn build_codex_exec_args(config: &CodexRuntimeConfig) -> Vec<String> {
-    let mut args = vec!["exec".to_string(), "--json".to_string()];
+fn build_codex_exec_args(
+    config: &CodexRuntimeConfig,
+    resumes_existing_session: bool,
+) -> Vec<String> {
+    let mut args = if resumes_existing_session {
+        vec![
+            "exec".to_string(),
+            "resume".to_string(),
+            "--last".to_string(),
+            "--json".to_string(),
+            "-".to_string(),
+        ]
+    } else {
+        vec!["exec".to_string(), "--json".to_string()]
+    };
 
     if let Some(model) = &config.model {
         args.push("--model".to_string());
@@ -135,22 +166,22 @@ fn build_codex_exec_args(config: &CodexRuntimeConfig) -> Vec<String> {
     args
 }
 
-fn ensure_runtime_session_exists(
-    sessions: &RwLock<HashSet<String>>,
+fn get_runtime_session(
+    sessions: &RwLock<HashMap<String, CodexSessionState>>,
     runtime_session_id: &str,
-) -> Result<()> {
-    if sessions
+) -> Result<CodexSessionState> {
+    sessions
         .read()
         .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
-        .contains(runtime_session_id)
-    {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "runtime session '{}' not found",
-            runtime_session_id
-        ))
-    }
+        .get(runtime_session_id)
+        .copied()
+        .ok_or_else(|| anyhow!("runtime session '{}' not found", runtime_session_id))
+}
+
+fn runtime_session_is_ready(root: &Path) -> Result<bool> {
+    Ok(root
+        .join(crate::home::RUNTIME_SESSION_READY_MARKER)
+        .is_file())
 }
 
 #[cfg(test)]
@@ -441,6 +472,7 @@ mod tests {
                 working_dir: None,
                 environment: Vec::new(),
                 selected_skills: Vec::new(),
+                runtime_state_root: None,
             })
             .await
             .expect("start");
@@ -496,16 +528,43 @@ mod tests {
 
     #[test]
     fn codex_exec_args_only_include_protocol_fields() {
-        let args = build_codex_exec_args(&CodexRuntimeConfig {
-            executable: "codex".to_string(),
-            model: Some("gpt-5-codex".to_string()),
-        });
+        let args = build_codex_exec_args(
+            &CodexRuntimeConfig {
+                executable: "codex".to_string(),
+                model: Some("gpt-5-codex".to_string()),
+            },
+            false,
+        );
 
         assert_eq!(
             args,
             vec![
                 "exec".to_string(),
                 "--json".to_string(),
+                "--model".to_string(),
+                "gpt-5-codex".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_resume_args_request_last_session_and_read_prompt_from_stdin() {
+        let args = build_codex_exec_args(
+            &CodexRuntimeConfig {
+                executable: "codex".to_string(),
+                model: Some("gpt-5-codex".to_string()),
+            },
+            true,
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "resume".to_string(),
+                "--last".to_string(),
+                "--json".to_string(),
+                "-".to_string(),
                 "--model".to_string(),
                 "gpt-5-codex".to_string(),
             ]

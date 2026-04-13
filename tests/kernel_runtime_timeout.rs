@@ -192,6 +192,7 @@ impl RuntimeAdapter for SlowRuntimeAdapter {
     ) -> Result<RuntimeSessionHandle> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("slow-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
         })
     }
 
@@ -244,6 +245,7 @@ impl RuntimeAdapter for ChattyRuntimeAdapter {
     ) -> Result<RuntimeSessionHandle> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("chatty-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
         })
     }
 

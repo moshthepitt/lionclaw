@@ -562,11 +562,12 @@ pub(crate) async fn render_runtime_cache(
     runtime_id: &str,
 ) -> Result<()> {
     let workspace = &config.daemon.workspace;
-    let target_dir = home.runtime_workspace_dir(runtime_id, workspace);
+    let project_workspace_root =
+        resolve_project_workspace_root().context("failed to resolve project workspace root")?;
+    let target_dir = home.runtime_project_dir(runtime_id, workspace, &project_workspace_root);
     for path in [
         target_dir.clone(),
-        home.runtime_workspace_home_dir(runtime_id, workspace),
-        home.runtime_workspace_drafts_dir(runtime_id, workspace),
+        home.runtime_project_drafts_dir(runtime_id, workspace, &project_workspace_root),
     ] {
         tokio::fs::create_dir_all(&path)
             .await
@@ -748,6 +749,7 @@ mod tests {
         ApplyResult, OnboardBindSelection, StackBinaryPaths,
     };
     use crate::{
+        config::resolve_project_workspace_root,
         contracts::DaemonInfoResponse,
         home::LionClawHome,
         kernel::{
@@ -838,9 +840,11 @@ mod tests {
         render_runtime_cache(&home, &config, &lockfile, "codex")
             .await
             .expect("render runtime cache");
+        let project_workspace_root =
+            resolve_project_workspace_root().expect("resolve project workspace root");
 
         let rendered = tokio::fs::read_to_string(
-            home.runtime_workspace_dir("codex", &config.daemon.workspace)
+            home.runtime_project_dir("codex", &config.daemon.workspace, &project_workspace_root)
                 .join(GENERATED_AGENTS_FILE),
         )
         .await
@@ -933,14 +937,17 @@ mod tests {
             daemon_bin: "/tmp/lionclawd".into(),
         };
         let applied: ApplyResult = up(&home, &manager, "codex", &binaries).await.expect("up");
+        let project_workspace_root =
+            resolve_project_workspace_root().expect("resolve project workspace root");
 
         assert_eq!(applied.config.channels.len(), 1);
         assert!(home
-            .runtime_workspace_dir("codex", "main")
+            .runtime_project_dir("codex", "main", &project_workspace_root)
             .join("AGENTS.generated.md")
             .exists());
-        assert!(home.runtime_workspace_home_dir("codex", "main").exists());
-        assert!(home.runtime_workspace_drafts_dir("codex", "main").exists());
+        assert!(home
+            .runtime_project_drafts_dir("codex", "main", &project_workspace_root)
+            .exists());
     }
 
     #[tokio::test]

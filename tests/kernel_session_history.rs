@@ -11,6 +11,7 @@ use lionclaw::{
         SessionActionKind, SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery,
         SessionOpenRequest, SessionTurnKind, SessionTurnRequest, SessionTurnStatus, TrustTier,
     },
+    home::RUNTIME_SESSION_READY_MARKER,
     kernel::{
         runtime::{
             RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
@@ -674,6 +675,92 @@ async fn latest_session_snapshot_prefers_reset_session_without_turns() {
     assert!(snapshot.resume_after_sequence.is_none());
 }
 
+#[tokio::test]
+async fn session_scoped_runtime_state_resumes_without_replaying_full_history() {
+    let env = TestEnv::new();
+    let workspace_root = env.path().join("workspace");
+    let project_root = env.path().join("project");
+    let runtime_root = env.path().join("runtime");
+    std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+    std::fs::create_dir_all(&project_root).expect("create project root");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(workspace_root),
+            project_workspace_root: Some(project_root),
+            runtime_root: Some(runtime_root),
+            workspace_name: Some("main".to_string()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let recorded_prompts = Arc::new(Mutex::new(Vec::new()));
+    let recorded_roots = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "resumable",
+            Arc::new(ResumableCaptureAdapter {
+                prompts: recorded_prompts.clone(),
+                runtime_roots: recorded_roots.clone(),
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+
+    let session = open_session(&kernel, "resume-peer", SessionHistoryPolicy::Interactive).await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "first request".to_string(),
+            runtime_id: Some("resumable".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("first turn");
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "second request".to_string(),
+            runtime_id: Some("resumable".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("second turn");
+
+    let prompts = recorded_prompts.lock().expect("prompt lock").clone();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains("first request"));
+    assert!(prompts[1].contains("second request"));
+    assert!(
+        !prompts[1].contains("User: first request"),
+        "resumed harness sessions should not replay the full prior transcript"
+    );
+    assert!(
+        prompts[1]
+            .contains("Continue the existing runtime conversation for this LionClaw session."),
+        "resumed harness sessions should get the runtime-session continuation note"
+    );
+
+    let roots = recorded_roots.lock().expect("roots lock").clone();
+    assert_eq!(roots.len(), 2);
+    assert_eq!(
+        roots[0], roots[1],
+        "same LionClaw session should reuse runtime state root"
+    );
+    assert!(
+        roots[0].join(RUNTIME_SESSION_READY_MARKER).is_file(),
+        "successful turns should mark the runtime state root as resumable"
+    );
+}
+
 async fn open_session(
     kernel: &Kernel,
     peer_id: &str,
@@ -700,6 +787,12 @@ struct CapturePromptAdapter {
     reply: String,
 }
 
+struct ResumableCaptureAdapter {
+    prompts: Arc<Mutex<Vec<String>>>,
+    runtime_roots: Arc<Mutex<Vec<PathBuf>>>,
+    reply: String,
+}
+
 struct BlockingAnswerAdapter {
     answer: String,
     sleep_for: Duration,
@@ -721,6 +814,7 @@ impl RuntimeAdapter for PartialTimeoutAdapter {
     ) -> Result<RuntimeSessionHandle> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("partial-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
         })
     }
 
@@ -772,6 +866,69 @@ impl RuntimeAdapter for CapturePromptAdapter {
     ) -> Result<RuntimeSessionHandle> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("capture-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn turn(
+        &self,
+        input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        self.prompts.lock().expect("prompt lock").push(input.prompt);
+        let _ = events.send(RuntimeEvent::MessageDelta {
+            lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+            text: self.reply.clone(),
+        });
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(RuntimeTurnResult::default())
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        events: RuntimeEventSender,
+    ) -> Result<()> {
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
+    }
+
+    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for ResumableCaptureAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "resumable".to_string(),
+            version: "0.1".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
+        let runtime_state_root = input
+            .runtime_state_root
+            .clone()
+            .expect("runtime state root should be provided");
+        let resumes_existing_session = runtime_state_root
+            .join(RUNTIME_SESSION_READY_MARKER)
+            .is_file();
+        self.runtime_roots
+            .lock()
+            .expect("roots lock")
+            .push(runtime_state_root);
+
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("resumable-{}", Uuid::new_v4()),
+            resumes_existing_session,
         })
     }
 
@@ -824,6 +981,7 @@ impl RuntimeAdapter for BlockingAnswerAdapter {
     ) -> Result<RuntimeSessionHandle> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("blocking-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
         })
     }
 

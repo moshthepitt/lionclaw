@@ -1149,6 +1149,7 @@ impl RuntimeAdapter for TwoChunkAnswerAdapter {
     ) -> Result<RuntimeSessionHandle, anyhow::Error> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("two-chunk:{}", input.session_id),
+            resumes_existing_session: false,
         })
     }
 
@@ -1218,6 +1219,7 @@ impl RuntimeAdapter for PartialFailureAdapter {
     ) -> Result<RuntimeSessionHandle, anyhow::Error> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("partial-failure:{}", input.session_id),
+            resumes_existing_session: false,
         })
     }
 
@@ -1369,6 +1371,7 @@ impl RuntimeAdapter for SlowAnswerAdapter {
     ) -> Result<RuntimeSessionHandle, anyhow::Error> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("slow-answer:{}", input.session_id),
+            resumes_existing_session: false,
         })
     }
 

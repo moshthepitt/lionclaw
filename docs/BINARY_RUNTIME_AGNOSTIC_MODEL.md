@@ -182,6 +182,17 @@ Inside `lionclaw run`, recovery stays command-first:
 - `/exit`
 
 The core keeps durable per-turn history, preserves partial assistant output across timeouts and restart interruption, and reopens the latest local session by most recent activity.
+Interactive runtime continuity now has two layers:
+
+- LionClaw keeps the durable session transcript, audit trail, and artifacts.
+- The harness keeps resumable runtime-private state under a session-scoped
+  `/runtime` mount that is partitioned by project root and security shape.
+
+LionClaw still spawns a fresh confined process for each interactive turn, but
+Codex/OpenCode resume their own prior session state from that mounted runtime
+root. LionClaw only replays the full transcript into the prompt when the
+harness session is fresh; resumed harness sessions receive the new user input
+plus a continuation note instead of the entire prior transcript every turn.
 
 Background channels remain an explicit service flow:
 
