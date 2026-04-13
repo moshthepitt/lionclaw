@@ -16,7 +16,7 @@ use crate::{
     home::LionClawHome,
     kernel::Kernel,
     operator::{
-        reconcile::{apply, onboard, open_kernel, render_runtime_cache},
+        reconcile::{apply, onboard, open_runtime_kernel, render_runtime_cache},
         runtime::{resolve_runtime_id, validate_runtime_availability},
     },
 };
@@ -53,7 +53,7 @@ pub(crate) async fn run_local_with_io<R: BufRead, W: Write>(
     validate_runtime_availability(&applied.config, &runtime_id)?;
     render_runtime_cache(home, &applied.config, &applied.lockfile, &runtime_id).await?;
 
-    let kernel = open_kernel(home, &applied.config, Some(runtime_id.clone())).await?;
+    let kernel = open_runtime_kernel(home, &applied.config, Some(runtime_id.clone())).await?;
     let project_workspace_root = resolve_project_workspace_root()
         .map_err(|err| anyhow!("failed to resolve project workspace root: {}", err))?;
     let peer_id = local_peer_id();

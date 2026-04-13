@@ -2673,11 +2673,7 @@ impl Kernel {
             .ok_or_else(|| KernelError::NotFound("continuity is not configured".to_string()))?;
         let (runtime_id, drafts_root) =
             self.resolve_runtime_drafts_root(req.runtime_id.as_deref())?;
-        let drafts = drafts::list_outputs(&drafts_root).map_err(internal)?;
-        if !drafts
-            .iter()
-            .any(|draft| draft.relative_path == req.relative_path)
-        {
+        if !drafts::output_exists(&drafts_root, &req.relative_path).map_err(draft_request_error)? {
             return Err(KernelError::NotFound(format!(
                 "draft '{}' was not found",
                 req.relative_path
@@ -2691,7 +2687,8 @@ impl Kernel {
             .prepare_promoted_artifact_path(file_name)
             .await
             .map_err(internal)?;
-        drafts::move_output(&drafts_root, &req.relative_path, &destination).map_err(internal)?;
+        drafts::move_output(&drafts_root, &req.relative_path, &destination)
+            .map_err(|err| draft_action_error(&req.relative_path, err))?;
 
         let artifact_path = self.relative_workspace_path(&destination);
         self.refresh_active_continuity_after_commit_best_effort(
@@ -2737,17 +2734,14 @@ impl Kernel {
     ) -> Result<ContinuityDraftDiscardResponse, KernelError> {
         let (runtime_id, drafts_root) =
             self.resolve_runtime_drafts_root(req.runtime_id.as_deref())?;
-        let drafts = drafts::list_outputs(&drafts_root).map_err(internal)?;
-        if !drafts
-            .iter()
-            .any(|draft| draft.relative_path == req.relative_path)
-        {
+        if !drafts::output_exists(&drafts_root, &req.relative_path).map_err(draft_request_error)? {
             return Err(KernelError::NotFound(format!(
                 "draft '{}' was not found",
                 req.relative_path
             )));
         }
-        drafts::remove_output(&drafts_root, &req.relative_path).map_err(internal)?;
+        drafts::remove_output(&drafts_root, &req.relative_path)
+            .map_err(|err| draft_action_error(&req.relative_path, err))?;
         self.append_audit_event_best_effort(
             "continuity.draft.discarded",
             actor,
@@ -3112,6 +3106,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn continuity_draft_discard_ignores_unrelated_symlink() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let temp_dir = tempdir().expect("temp dir");
+            let workspace_root = temp_dir.path().join("workspace");
+            let runtime_root = temp_dir.path().join("runtime");
+            let project_root = temp_dir.path().join("project-root");
+            let drafts_root = runtime_project_drafts_dir_from_parts(
+                &runtime_root,
+                "codex",
+                "main",
+                Some(project_root.as_path()),
+            );
+            let draft_path = drafts_root.join("report.md");
+            fs::create_dir_all(&drafts_root).expect("draft dirs");
+            fs::write(&draft_path, "# Report").expect("report");
+            let outside = temp_dir.path().join("outside.txt");
+            fs::write(&outside, "outside").expect("outside");
+            symlink(&outside, drafts_root.join("blocked-link")).expect("symlink");
+            let db_path = temp_dir.path().join("lionclaw.db");
+            let kernel = Kernel::new_with_options(
+                &db_path,
+                KernelOptions {
+                    workspace_root: Some(workspace_root),
+                    project_workspace_root: Some(project_root),
+                    runtime_root: Some(runtime_root),
+                    workspace_name: Some("main".to_string()),
+                    default_runtime_id: Some("codex".to_string()),
+                    ..KernelOptions::default()
+                },
+            )
+            .await
+            .expect("kernel init");
+
+            let response = kernel
+                .discard_continuity_draft(ContinuityDraftActionRequest {
+                    runtime_id: None,
+                    relative_path: "report.md".to_string(),
+                })
+                .await
+                .expect("discard draft");
+
+            assert_eq!(response.runtime_id, "codex");
+            assert_eq!(response.draft_path, "report.md");
+            assert!(!draft_path.exists());
+        }
+    }
+
+    #[tokio::test]
     async fn continuity_draft_promote_moves_file_into_continuity_artifacts() {
         let temp_dir = tempdir().expect("temp dir");
         let workspace_root = temp_dir.path().join("workspace");
@@ -3166,6 +3211,58 @@ mod tests {
                 .any(|artifact| artifact.relative_path == response.artifact_path),
             "promoted artifact should appear in recent artifacts"
         );
+    }
+
+    #[tokio::test]
+    async fn continuity_draft_promote_ignores_unrelated_symlink() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let temp_dir = tempdir().expect("temp dir");
+            let workspace_root = temp_dir.path().join("workspace");
+            let runtime_root = temp_dir.path().join("runtime");
+            let project_root = temp_dir.path().join("project-root");
+            let drafts_root = runtime_project_drafts_dir_from_parts(
+                &runtime_root,
+                "codex",
+                "main",
+                Some(project_root.as_path()),
+            );
+            let draft_path = drafts_root.join("report.md");
+            fs::create_dir_all(&drafts_root).expect("draft dirs");
+            fs::write(&draft_path, "# Report").expect("report");
+            let outside = temp_dir.path().join("outside.txt");
+            fs::write(&outside, "outside").expect("outside");
+            symlink(&outside, drafts_root.join("blocked-link")).expect("symlink");
+            let db_path = temp_dir.path().join("lionclaw.db");
+            let kernel = Kernel::new_with_options(
+                &db_path,
+                KernelOptions {
+                    workspace_root: Some(workspace_root.clone()),
+                    project_workspace_root: Some(project_root),
+                    runtime_root: Some(runtime_root),
+                    workspace_name: Some("main".to_string()),
+                    default_runtime_id: Some("codex".to_string()),
+                    ..KernelOptions::default()
+                },
+            )
+            .await
+            .expect("kernel init");
+
+            let response = kernel
+                .promote_continuity_draft(ContinuityDraftActionRequest {
+                    runtime_id: None,
+                    relative_path: "report.md".to_string(),
+                })
+                .await
+                .expect("promote draft");
+
+            assert_eq!(response.runtime_id, "codex");
+            assert_eq!(response.draft_path, "report.md");
+            assert!(!draft_path.exists());
+            assert!(workspace_root.join(response.artifact_path).exists());
+        }
     }
 
     #[tokio::test]
@@ -3640,6 +3737,22 @@ fn to_stream_event_view(event: RuntimeEvent) -> StreamEventDto {
 
 fn internal(err: anyhow::Error) -> KernelError {
     KernelError::Internal(err.to_string())
+}
+
+fn draft_request_error(err: anyhow::Error) -> KernelError {
+    KernelError::BadRequest(err.to_string())
+}
+
+fn draft_action_error(relative_path: &str, err: anyhow::Error) -> KernelError {
+    if err
+        .root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    {
+        KernelError::NotFound(format!("draft '{}' was not found", relative_path))
+    } else {
+        internal(err)
+    }
 }
 
 fn parse_channel_send_intent(

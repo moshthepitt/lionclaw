@@ -28,6 +28,23 @@ pub fn remove_output(root: &Path, relative_path: &str) -> Result<()> {
     fs::remove_file(&path).with_context(|| format!("failed to delete {}", path.display()))
 }
 
+pub fn output_exists(root: &Path, relative_path: &str) -> Result<bool> {
+    let relative = normalize_relative_path(relative_path)?;
+    let path = root.join(&relative);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("failed to stat {}", path.display())),
+    };
+    if metadata.file_type().is_symlink() {
+        bail!("draft path '{}' is a symlink", path.display());
+    }
+    if !metadata.is_file() {
+        bail!("draft path '{}' is not a regular file", path.display());
+    }
+    Ok(true)
+}
+
 pub fn move_output(root: &Path, relative_path: &str, destination: &Path) -> Result<()> {
     let source = resolve_output_path(root, relative_path)?;
     if let Some(parent) = destination.parent() {
@@ -70,7 +87,7 @@ fn collect_outputs(
         let metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("failed to stat {}", path.display()))?;
         if metadata.file_type().is_symlink() {
-            bail!("draft path '{}' is a symlink", path.display());
+            continue;
         }
         if metadata.is_dir() {
             collect_outputs(root, &relative, outputs)?;
@@ -151,7 +168,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{list_outputs, move_output, remove_output};
+    use super::{list_outputs, move_output, output_exists, remove_output};
 
     #[test]
     fn lists_regular_files_recursively() {
@@ -167,14 +184,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_symlinked_files() {
+    fn skips_symlinked_files() {
         let temp_dir = tempdir().expect("temp dir");
-        let outside = temp_dir.path().join("outside.txt");
+        let outside_dir = tempdir().expect("outside dir");
+        let outside = outside_dir.path().join("outside.txt");
         std::fs::write(&outside, "secret").expect("outside");
         symlink(&outside, temp_dir.path().join("report.txt")).expect("symlink");
+        std::fs::write(temp_dir.path().join("notes.txt"), "visible").expect("notes");
 
-        let err = list_outputs(temp_dir.path()).expect_err("symlink should fail");
-        assert!(err.to_string().contains("symlink"));
+        let outputs = list_outputs(temp_dir.path()).expect("list");
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].relative_path, "notes.txt");
+    }
+
+    #[test]
+    fn output_exists_returns_false_for_missing_file() {
+        let temp_dir = tempdir().expect("temp dir");
+        assert!(!output_exists(temp_dir.path(), "missing.txt").expect("missing file"));
     }
 
     #[test]

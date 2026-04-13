@@ -24,9 +24,9 @@ use crate::{
         },
         lockfile::OperatorLockfile,
         reconcile::{
-            add_channel, add_skill, apply, down, logs, onboard, open_kernel, pairing_approve,
-            pairing_block, pairing_list, remove_channel, remove_skill, resolve_stack_binaries,
-            status, up, OnboardBindSelection,
+            add_channel, add_skill, apply, down, logs, onboard, open_kernel, open_runtime_kernel,
+            pairing_approve, pairing_block, pairing_list, remove_channel, remove_skill,
+            resolve_stack_binaries, status, up, OnboardBindSelection,
         },
         run::run_local,
         runtime::resolve_runtime_id,
@@ -567,254 +567,168 @@ pub async fn run() -> Result<()> {
         },
         Command::Continuity { command } => {
             let applied = apply(&home).await?;
-            let kernel = open_kernel(&home, &applied.config, None).await?;
             match command {
-                ContinuityCommand::Status => {
-                    let status = kernel.continuity_status().await?;
-                    println!("memory={}", status.memory_path);
-                    println!("active={}", status.active_path);
-                    println!(
-                        "latest_daily={}",
-                        status.latest_daily_path.unwrap_or_else(|| "-".to_string())
-                    );
-                    println!("open_loops={}", status.open_loops.len());
-                    println!("memory_proposals={}", status.memory_proposals.len());
-                    println!("recent_artifacts={}", status.recent_artifacts.len());
-                }
-                ContinuityCommand::Search(args) => {
-                    let response = kernel
-                        .continuity_search(ContinuitySearchRequest {
-                            query: args.query,
-                            limit: Some(args.limit),
-                        })
-                        .await?;
-                    for item in response.matches {
-                        println!(
-                            "path={} title={} snippet={}",
-                            item.relative_path, item.title, item.snippet
-                        );
-                    }
-                }
-                ContinuityCommand::Get(args) => {
-                    let response = kernel
-                        .continuity_get(ContinuityPathRequest {
-                            relative_path: args.relative_path,
-                        })
-                        .await?;
-                    print!("{}", response.content);
-                }
-                ContinuityCommand::Drafts { command } => match command {
-                    ContinuityDraftCommand::Ls(args) => {
-                        let response = kernel
-                            .list_continuity_drafts(ContinuityDraftListRequest {
-                                runtime_id: args.runtime,
-                            })
-                            .await?;
-                        println!("runtime={}", response.runtime_id);
-                        for draft in response.drafts {
-                            println!(
-                                "path={} size={} media_type={}",
-                                draft.relative_path, draft.size_bytes, draft.media_type
-                            );
-                        }
-                    }
-                    ContinuityDraftCommand::Promote(args) => {
-                        let response = kernel
-                            .promote_continuity_draft_with_actor(
-                                ContinuityDraftActionRequest {
+                ContinuityCommand::Drafts { command } => {
+                    let kernel = open_runtime_kernel(&home, &applied.config, None).await?;
+                    match command {
+                        ContinuityDraftCommand::Ls(args) => {
+                            let response = kernel
+                                .list_continuity_drafts(ContinuityDraftListRequest {
                                     runtime_id: args.runtime,
-                                    relative_path: args.relative_path,
-                                },
-                                "operator",
-                            )
-                            .await?;
-                        println!(
-                            "promoted runtime={} draft={} artifact={}",
-                            response.runtime_id, response.draft_path, response.artifact_path
-                        );
-                    }
-                    ContinuityDraftCommand::Discard(args) => {
-                        let response = kernel
-                            .discard_continuity_draft_with_actor(
-                                ContinuityDraftActionRequest {
-                                    runtime_id: args.runtime,
-                                    relative_path: args.relative_path,
-                                },
-                                "operator",
-                            )
-                            .await?;
-                        println!(
-                            "discarded runtime={} draft={}",
-                            response.runtime_id, response.draft_path
-                        );
-                    }
-                },
-                ContinuityCommand::Loops { command } => match command {
-                    ContinuityLoopCommand::Ls => {
-                        for open_loop in kernel.list_continuity_open_loops().await?.loops {
+                                })
+                                .await?;
+                            println!("runtime={}", response.runtime_id);
+                            for draft in response.drafts {
+                                println!(
+                                    "path={} size={} media_type={}",
+                                    draft.relative_path, draft.size_bytes, draft.media_type
+                                );
+                            }
+                        }
+                        ContinuityDraftCommand::Promote(args) => {
+                            let response = kernel
+                                .promote_continuity_draft_with_actor(
+                                    ContinuityDraftActionRequest {
+                                        runtime_id: args.runtime,
+                                        relative_path: args.relative_path,
+                                    },
+                                    "operator",
+                                )
+                                .await?;
                             println!(
-                                "path={} title={} next_step={}",
-                                open_loop.relative_path,
-                                open_loop.title,
-                                open_loop.next_step.unwrap_or_else(|| "-".to_string())
+                                "promoted runtime={} draft={} artifact={}",
+                                response.runtime_id, response.draft_path, response.artifact_path
+                            );
+                        }
+                        ContinuityDraftCommand::Discard(args) => {
+                            let response = kernel
+                                .discard_continuity_draft_with_actor(
+                                    ContinuityDraftActionRequest {
+                                        runtime_id: args.runtime,
+                                        relative_path: args.relative_path,
+                                    },
+                                    "operator",
+                                )
+                                .await?;
+                            println!(
+                                "discarded runtime={} draft={}",
+                                response.runtime_id, response.draft_path
                             );
                         }
                     }
-                    ContinuityLoopCommand::Resolve(args) => {
-                        let response = kernel
-                            .resolve_continuity_open_loop_with_actor(
-                                ContinuityPathRequest {
-                                    relative_path: args.relative_path,
-                                },
-                                "operator",
-                            )
-                            .await?;
-                        println!("resolved {}", response.archived_path);
-                    }
-                },
-                ContinuityCommand::Proposals { command } => match command {
-                    ContinuityProposalCommand::Ls => {
-                        for proposal in kernel.list_continuity_memory_proposals().await?.proposals {
+                }
+                other => {
+                    let kernel = open_kernel(&home, &applied.config, None).await?;
+                    match other {
+                        ContinuityCommand::Status => {
+                            let status = kernel.continuity_status().await?;
+                            println!("memory={}", status.memory_path);
+                            println!("active={}", status.active_path);
                             println!(
-                                "path={} title={} entries={}",
-                                proposal.relative_path,
-                                proposal.title,
-                                proposal.entries.len()
+                                "latest_daily={}",
+                                status.latest_daily_path.unwrap_or_else(|| "-".to_string())
                             );
+                            println!("open_loops={}", status.open_loops.len());
+                            println!("memory_proposals={}", status.memory_proposals.len());
+                            println!("recent_artifacts={}", status.recent_artifacts.len());
                         }
-                    }
-                    ContinuityProposalCommand::Merge(args) => {
-                        let response = kernel
-                            .merge_continuity_memory_proposal_with_actor(
-                                ContinuityPathRequest {
+                        ContinuityCommand::Search(args) => {
+                            let response = kernel
+                                .continuity_search(ContinuitySearchRequest {
+                                    query: args.query,
+                                    limit: Some(args.limit),
+                                })
+                                .await?;
+                            for item in response.matches {
+                                println!(
+                                    "path={} title={} snippet={}",
+                                    item.relative_path, item.title, item.snippet
+                                );
+                            }
+                        }
+                        ContinuityCommand::Get(args) => {
+                            let response = kernel
+                                .continuity_get(ContinuityPathRequest {
                                     relative_path: args.relative_path,
-                                },
-                                "operator",
-                            )
-                            .await?;
-                        println!(
-                            "merged {} into {}",
-                            response.archived_path,
-                            response
-                                .memory_path
-                                .unwrap_or_else(|| "MEMORY.md".to_string())
-                        );
+                                })
+                                .await?;
+                            print!("{}", response.content);
+                        }
+                        ContinuityCommand::Loops { command } => match command {
+                            ContinuityLoopCommand::Ls => {
+                                for open_loop in kernel.list_continuity_open_loops().await?.loops {
+                                    println!(
+                                        "path={} title={} next_step={}",
+                                        open_loop.relative_path,
+                                        open_loop.title,
+                                        open_loop.next_step.unwrap_or_else(|| "-".to_string())
+                                    );
+                                }
+                            }
+                            ContinuityLoopCommand::Resolve(args) => {
+                                let response = kernel
+                                    .resolve_continuity_open_loop_with_actor(
+                                        ContinuityPathRequest {
+                                            relative_path: args.relative_path,
+                                        },
+                                        "operator",
+                                    )
+                                    .await?;
+                                println!("resolved {}", response.archived_path);
+                            }
+                        },
+                        ContinuityCommand::Proposals { command } => match command {
+                            ContinuityProposalCommand::Ls => {
+                                for proposal in
+                                    kernel.list_continuity_memory_proposals().await?.proposals
+                                {
+                                    println!(
+                                        "path={} title={} entries={}",
+                                        proposal.relative_path,
+                                        proposal.title,
+                                        proposal.entries.len()
+                                    );
+                                }
+                            }
+                            ContinuityProposalCommand::Merge(args) => {
+                                let response = kernel
+                                    .merge_continuity_memory_proposal_with_actor(
+                                        ContinuityPathRequest {
+                                            relative_path: args.relative_path,
+                                        },
+                                        "operator",
+                                    )
+                                    .await?;
+                                println!(
+                                    "merged {} into {}",
+                                    response.archived_path,
+                                    response
+                                        .memory_path
+                                        .unwrap_or_else(|| "MEMORY.md".to_string())
+                                );
+                            }
+                            ContinuityProposalCommand::Reject(args) => {
+                                let response = kernel
+                                    .reject_continuity_memory_proposal_with_actor(
+                                        ContinuityPathRequest {
+                                            relative_path: args.relative_path,
+                                        },
+                                        "operator",
+                                    )
+                                    .await?;
+                                println!("rejected {}", response.archived_path);
+                            }
+                        },
+                        ContinuityCommand::Drafts { .. } => unreachable!(),
                     }
-                    ContinuityProposalCommand::Reject(args) => {
-                        let response = kernel
-                            .reject_continuity_memory_proposal_with_actor(
-                                ContinuityPathRequest {
-                                    relative_path: args.relative_path,
-                                },
-                                "operator",
-                            )
-                            .await?;
-                        println!("rejected {}", response.archived_path);
-                    }
-                },
+                }
             }
         }
         Command::Job { command } => {
             let applied = apply(&home).await?;
-            let kernel = open_kernel(&home, &applied.config, None).await?;
             match command {
-                JobCommand::Add(args) => {
-                    let args = *args;
-                    let runtime_id = resolve_runtime_id(&applied.config, args.runtime.as_deref())?;
-                    let prompt_text = load_job_prompt(args.prompt, args.prompt_file).await?;
-                    let schedule = parse_job_schedule_spec(&args.schedule, args.tz.as_deref())?;
-                    let delivery = match (args.deliver_channel, args.deliver_peer) {
-                        (None, None) => None,
-                        (Some(channel_id), Some(peer_id)) => {
-                            Some(crate::contracts::JobDeliveryTargetDto {
-                                channel_id,
-                                peer_id,
-                            })
-                        }
-                        _ => {
-                            return Err(anyhow!(
-                                "--deliver-channel and --deliver-peer must be provided together"
-                            ));
-                        }
-                    };
-                    let skill_ids = resolve_job_skill_ids(&applied.lockfile, &args.skills)?;
-                    let response = kernel
-                        .create_job(JobCreateRequest {
-                            name: args.name,
-                            runtime_id,
-                            schedule,
-                            prompt_text,
-                            skill_ids,
-                            allow_capabilities: args.allow_capabilities,
-                            delivery,
-                            retry_attempts: args.retry_attempts,
-                        })
-                        .await?;
-                    println!(
-                        "created job {} next_run_at={}",
-                        response.job.job_id,
-                        response
-                            .job
-                            .next_run_at
-                            .map(|value| value.to_rfc3339())
-                            .unwrap_or_else(|| "-".to_string())
-                    );
-                }
-                JobCommand::Ls => {
-                    for job in kernel.list_jobs().await?.jobs {
-                        println!(
-                            "job={} enabled={} runtime={} next_run_at={} status={}",
-                            job.job_id,
-                            job.enabled,
-                            job.runtime_id,
-                            job.next_run_at
-                                .map(|value| value.to_rfc3339())
-                                .unwrap_or_else(|| "-".to_string()),
-                            job.last_status
-                                .map(|value| value.as_str().to_string())
-                                .unwrap_or_else(|| "-".to_string()),
-                        );
-                    }
-                }
-                JobCommand::Show(args) => {
-                    let job_id = parse_job_id(&args.job_id)?;
-                    let job = kernel.get_job(job_id).await?.job;
-                    println!("job={}", job.job_id);
-                    println!("name={}", job.name);
-                    println!("enabled={}", job.enabled);
-                    println!("runtime={}", job.runtime_id);
-                    println!(
-                        "next_run_at={}",
-                        job.next_run_at
-                            .map(|value| value.to_rfc3339())
-                            .unwrap_or_else(|| "-".to_string())
-                    );
-                    println!(
-                        "delivery={}",
-                        job.delivery
-                            .map(|value| format!("{}:{}", value.channel_id, value.peer_id))
-                            .unwrap_or_else(|| "-".to_string())
-                    );
-                }
-                JobCommand::Pause(args) => {
-                    let job_id = parse_job_id(&args.job_id)?;
-                    let response = kernel.pause_job(job_id).await?;
-                    println!("paused {}", response.job.job_id);
-                }
-                JobCommand::Resume(args) => {
-                    let job_id = parse_job_id(&args.job_id)?;
-                    let response = kernel.resume_job(job_id).await?;
-                    println!(
-                        "resumed {} next_run_at={}",
-                        response.job.job_id,
-                        response
-                            .job
-                            .next_run_at
-                            .map(|value| value.to_rfc3339())
-                            .unwrap_or_else(|| "-".to_string())
-                    );
-                }
                 JobCommand::Run(args) => {
+                    let kernel = open_runtime_kernel(&home, &applied.config, None).await?;
                     let job_id = parse_job_id(&args.job_id)?;
                     let response = kernel.run_job_now(JobRefRequest { job_id }).await?;
                     println!(
@@ -822,49 +736,155 @@ pub async fn run() -> Result<()> {
                         response.job.job_id, response.run.run_id, response.run.status
                     );
                 }
-                JobCommand::Rm(args) => {
-                    let job_id = parse_job_id(&args.job_id)?;
-                    let response = kernel.remove_job(job_id).await?;
-                    println!(
-                        "{} {}",
-                        if response.removed {
-                            "removed"
-                        } else {
-                            "left unchanged"
-                        },
-                        response.job_id
-                    );
-                }
-                JobCommand::Runs(args) => {
-                    let job_id = parse_job_id(&args.job_id)?;
-                    for run in kernel
-                        .list_job_runs(JobRunsRequest {
-                            job_id,
-                            limit: Some(args.limit),
-                        })
-                        .await?
-                        .runs
-                    {
-                        println!(
-                            "run={} attempt={} trigger={:?} status={:?} started_at={} session={} turn={} error={}",
-                            run.run_id,
-                            run.attempt_no,
-                            run.trigger_kind,
-                            run.status,
-                            run.started_at.to_rfc3339(),
-                            run.session_id
-                                .map(|value| value.to_string())
-                                .unwrap_or_else(|| "-".to_string()),
-                            run.turn_id
-                                .map(|value| value.to_string())
-                                .unwrap_or_else(|| "-".to_string()),
-                            run.error_text.unwrap_or_else(|| "-".to_string()),
-                        );
-                    }
-                }
                 JobCommand::Tick => {
+                    let kernel = open_runtime_kernel(&home, &applied.config, None).await?;
                     let response = kernel.scheduler_tick().await?;
                     println!("claimed {} scheduled runs", response.claimed_runs);
+                }
+                other => {
+                    let kernel = open_kernel(&home, &applied.config, None).await?;
+                    match other {
+                        JobCommand::Add(args) => {
+                            let args = *args;
+                            let runtime_id =
+                                resolve_runtime_id(&applied.config, args.runtime.as_deref())?;
+                            let prompt_text =
+                                load_job_prompt(args.prompt, args.prompt_file).await?;
+                            let schedule =
+                                parse_job_schedule_spec(&args.schedule, args.tz.as_deref())?;
+                            let delivery = match (args.deliver_channel, args.deliver_peer) {
+                                (None, None) => None,
+                                (Some(channel_id), Some(peer_id)) => {
+                                    Some(crate::contracts::JobDeliveryTargetDto {
+                                        channel_id,
+                                        peer_id,
+                                    })
+                                }
+                                _ => {
+                                    return Err(anyhow!(
+                                        "--deliver-channel and --deliver-peer must be provided together"
+                                    ));
+                                }
+                            };
+                            let skill_ids = resolve_job_skill_ids(&applied.lockfile, &args.skills)?;
+                            let response = kernel
+                                .create_job(JobCreateRequest {
+                                    name: args.name,
+                                    runtime_id,
+                                    schedule,
+                                    prompt_text,
+                                    skill_ids,
+                                    allow_capabilities: args.allow_capabilities,
+                                    delivery,
+                                    retry_attempts: args.retry_attempts,
+                                })
+                                .await?;
+                            println!(
+                                "created job {} next_run_at={}",
+                                response.job.job_id,
+                                response
+                                    .job
+                                    .next_run_at
+                                    .map(|value| value.to_rfc3339())
+                                    .unwrap_or_else(|| "-".to_string())
+                            );
+                        }
+                        JobCommand::Ls => {
+                            for job in kernel.list_jobs().await?.jobs {
+                                println!(
+                                    "job={} enabled={} runtime={} next_run_at={} status={}",
+                                    job.job_id,
+                                    job.enabled,
+                                    job.runtime_id,
+                                    job.next_run_at
+                                        .map(|value| value.to_rfc3339())
+                                        .unwrap_or_else(|| "-".to_string()),
+                                    job.last_status
+                                        .map(|value| value.as_str().to_string())
+                                        .unwrap_or_else(|| "-".to_string()),
+                                );
+                            }
+                        }
+                        JobCommand::Show(args) => {
+                            let job_id = parse_job_id(&args.job_id)?;
+                            let job = kernel.get_job(job_id).await?.job;
+                            println!("job={}", job.job_id);
+                            println!("name={}", job.name);
+                            println!("enabled={}", job.enabled);
+                            println!("runtime={}", job.runtime_id);
+                            println!(
+                                "next_run_at={}",
+                                job.next_run_at
+                                    .map(|value| value.to_rfc3339())
+                                    .unwrap_or_else(|| "-".to_string())
+                            );
+                            println!(
+                                "delivery={}",
+                                job.delivery
+                                    .map(|value| format!("{}:{}", value.channel_id, value.peer_id))
+                                    .unwrap_or_else(|| "-".to_string())
+                            );
+                        }
+                        JobCommand::Pause(args) => {
+                            let job_id = parse_job_id(&args.job_id)?;
+                            let response = kernel.pause_job(job_id).await?;
+                            println!("paused {}", response.job.job_id);
+                        }
+                        JobCommand::Resume(args) => {
+                            let job_id = parse_job_id(&args.job_id)?;
+                            let response = kernel.resume_job(job_id).await?;
+                            println!(
+                                "resumed {} next_run_at={}",
+                                response.job.job_id,
+                                response
+                                    .job
+                                    .next_run_at
+                                    .map(|value| value.to_rfc3339())
+                                    .unwrap_or_else(|| "-".to_string())
+                            );
+                        }
+                        JobCommand::Rm(args) => {
+                            let job_id = parse_job_id(&args.job_id)?;
+                            let response = kernel.remove_job(job_id).await?;
+                            println!(
+                                "{} {}",
+                                if response.removed {
+                                    "removed"
+                                } else {
+                                    "left unchanged"
+                                },
+                                response.job_id
+                            );
+                        }
+                        JobCommand::Runs(args) => {
+                            let job_id = parse_job_id(&args.job_id)?;
+                            for run in kernel
+                                .list_job_runs(JobRunsRequest {
+                                    job_id,
+                                    limit: Some(args.limit),
+                                })
+                                .await?
+                                .runs
+                            {
+                                println!(
+                                    "run={} attempt={} trigger={:?} status={:?} started_at={} session={} turn={} error={}",
+                                    run.run_id,
+                                    run.attempt_no,
+                                    run.trigger_kind,
+                                    run.status,
+                                    run.started_at.to_rfc3339(),
+                                    run.session_id
+                                        .map(|value| value.to_string())
+                                        .unwrap_or_else(|| "-".to_string()),
+                                    run.turn_id
+                                        .map(|value| value.to_string())
+                                        .unwrap_or_else(|| "-".to_string()),
+                                    run.error_text.unwrap_or_else(|| "-".to_string()),
+                                );
+                            }
+                        }
+                        JobCommand::Run(_) | JobCommand::Tick => unreachable!(),
+                    }
                 }
             }
         }

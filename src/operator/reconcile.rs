@@ -706,23 +706,47 @@ pub(crate) async fn open_kernel(
     config: &OperatorConfig,
     default_runtime_id: Option<String>,
 ) -> Result<Kernel> {
-    let workspace_root = config.workspace_root(home);
+    open_kernel_with_project_root(home, config, default_runtime_id, None).await
+}
+
+pub(crate) async fn open_runtime_kernel(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+    default_runtime_id: Option<String>,
+) -> Result<Kernel> {
     let project_workspace_root =
         resolve_project_workspace_root().context("failed to resolve project workspace root")?;
+    open_kernel_with_project_root(
+        home,
+        config,
+        default_runtime_id,
+        Some(project_workspace_root),
+    )
+    .await
+}
+
+async fn open_kernel_with_project_root(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+    default_runtime_id: Option<String>,
+    project_workspace_root: Option<PathBuf>,
+) -> Result<Kernel> {
+    let workspace_root = config.workspace_root(home);
     let runtime_secrets_file = resolve_runtime_secrets_file(home).await?;
     let kernel = Kernel::new_with_options(
         &home.db_path(),
         KernelOptions {
-            runtime_execution_policy: RuntimeExecutionPolicy::for_working_dir_root(
-                project_workspace_root.clone(),
-            ),
+            runtime_execution_policy: project_workspace_root
+                .clone()
+                .map(RuntimeExecutionPolicy::for_working_dir_root)
+                .unwrap_or_default(),
             default_runtime_id: default_runtime_id.or_else(|| config.defaults.runtime.clone()),
             default_preset_name: config.defaults.preset.clone(),
             execution_presets: config.presets.clone(),
             runtime_execution_profiles: configured_runtime_execution_profiles(config),
             runtime_secrets_file,
             workspace_root: Some(workspace_root),
-            project_workspace_root: Some(project_workspace_root),
+            project_workspace_root,
             runtime_root: Some(home.runtime_dir()),
             workspace_name: Some(config.daemon.workspace.clone()),
             ..KernelOptions::default()
@@ -745,8 +769,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        apply, onboard, render_marker_file, render_runtime_cache, resolve_worker_entrypoint, up,
-        ApplyResult, OnboardBindSelection, StackBinaryPaths,
+        apply, onboard, open_kernel, open_kernel_with_project_root, render_marker_file,
+        render_runtime_cache, resolve_worker_entrypoint, up, ApplyResult, OnboardBindSelection,
+        StackBinaryPaths,
     };
     use crate::{
         config::resolve_project_workspace_root,
@@ -852,6 +877,20 @@ mod tests {
         assert!(rendered.contains("/run/secrets"));
         assert!(rendered.contains("lionclaw-runtime-secrets-"));
         assert!(rendered.contains("do not print its contents"));
+    }
+
+    #[tokio::test]
+    async fn state_kernel_open_does_not_require_project_workspace_root() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let config = onboard(&home, None).await.expect("onboard");
+
+        open_kernel(&home, &config, None)
+            .await
+            .expect("state kernel should open without a project root");
+        open_kernel_with_project_root(&home, &config, None, None)
+            .await
+            .expect("state kernel helper should allow a missing project root");
     }
 
     #[test]
