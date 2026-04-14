@@ -403,6 +403,7 @@ impl RuntimeProfileConfig {
         RuntimeExecutionProfile {
             confinement: self.confinement().clone(),
             compatibility_key: self.compatibility_key(),
+            required_runtime_auth_var: self.required_runtime_auth_var(),
         }
     }
 

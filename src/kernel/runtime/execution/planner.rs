@@ -20,6 +20,7 @@ const DRAFTS_MOUNT_TARGET: &str = "/drafts";
 pub struct RuntimeExecutionProfile {
     pub confinement: ConfinementConfig,
     pub compatibility_key: String,
+    pub required_runtime_auth_var: Option<&'static str>,
 }
 
 impl Default for RuntimeExecutionProfile {
@@ -27,6 +28,7 @@ impl Default for RuntimeExecutionProfile {
         Self {
             confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
             compatibility_key: "runtime-default".to_string(),
+            required_runtime_auth_var: None,
         }
     }
 }
@@ -229,6 +231,12 @@ impl ExecutionPlanner {
             BUILTIN_PRESET_EVERYDAY.to_string(),
             ExecutionPreset::default(),
         ))
+    }
+
+    pub fn required_runtime_auth_var(&self, runtime_id: &str) -> Option<&'static str> {
+        self.runtimes
+            .get(runtime_id)
+            .and_then(|profile| profile.required_runtime_auth_var)
     }
 
     fn build_mounts(
@@ -456,6 +464,7 @@ mod tests {
                     ..OciConfinementConfig::default()
                 }),
                 compatibility_key: "runtime-codex-v1".to_string(),
+                required_runtime_auth_var: None,
             },
         )]
         .into_iter()

@@ -6,8 +6,8 @@ use anyhow::{anyhow, Result};
 use crate::home::LionClawHome;
 use crate::kernel::{
     runtime::{
-        CodexRuntimeAdapter, CodexRuntimeConfig, OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig,
-        RuntimeExecutionProfile,
+        validate_runtime_auth_prerequisites, CodexRuntimeAdapter, CodexRuntimeConfig,
+        OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig, RuntimeExecutionProfile,
     },
     Kernel,
 };
@@ -102,32 +102,8 @@ pub async fn validate_runtime_launch_prerequisites(
     let profile = config
         .runtime(runtime_id)
         .ok_or_else(|| anyhow!("runtime profile '{}' is not configured", runtime_id))?;
-    let Some(required_var) = profile.required_runtime_auth_var() else {
-        return Ok(());
-    };
-    let auth_path = home.runtime_auth_env_path();
-    home.resolve_runtime_auth_file()
-        .await?
-        .ok_or_else(|| {
-            anyhow!(
-                "configured runtime profile '{}' requires host runtime auth file '{}' with {} configured",
-                runtime_id,
-                auth_path.display(),
-                required_var
-            )
-        })?;
-    home.read_runtime_auth_var(required_var)
-        .await?
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow!(
-                "configured runtime profile '{}' requires {} in '{}'",
-                runtime_id,
-                required_var,
-                auth_path.display()
-            )
-        })?;
-    Ok(())
+    validate_runtime_auth_prerequisites(Some(home), runtime_id, profile.required_runtime_auth_var())
+        .await
 }
 
 #[cfg(test)]

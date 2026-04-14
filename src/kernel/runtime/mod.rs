@@ -28,6 +28,46 @@ pub use execution::{
     BUILTIN_PRESET_HIDDEN_COMPACTION,
 };
 
+pub async fn validate_runtime_auth_prerequisites(
+    home: Option<&LionClawHome>,
+    runtime_id: &str,
+    required_var: Option<&str>,
+) -> Result<()> {
+    let Some(required_var) = required_var else {
+        return Ok(());
+    };
+    let home = home.ok_or_else(|| {
+        anyhow!(
+            "runtime '{}' requires host runtime auth with {} configured",
+            runtime_id,
+            required_var
+        )
+    })?;
+    let auth_path = home.runtime_auth_env_path();
+    home.resolve_runtime_auth_file()
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "configured runtime profile '{}' requires host runtime auth file '{}' with {} configured",
+                runtime_id,
+                auth_path.display(),
+                required_var
+            )
+        })?;
+    home.read_runtime_auth_var(required_var)
+        .await?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "configured runtime profile '{}' requires {} in '{}'",
+                runtime_id,
+                required_var,
+                auth_path.display()
+            )
+        })?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeAdapterInfo {
     pub id: String,

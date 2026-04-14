@@ -13,6 +13,18 @@ use super::{
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OciExecutionBackend;
 
+#[derive(Debug, Clone)]
+struct PreparedOciProcessLaunch {
+    engine: String,
+    args: Vec<String>,
+    network_mode: NetworkMode,
+    environment: Vec<(String, String)>,
+    image: String,
+    program_executable: String,
+    program_args: Vec<String>,
+    stdin: String,
+}
+
 #[async_trait]
 impl ExecutionBackend for OciExecutionBackend {
     fn kind(&self) -> ConfinementBackend {
@@ -25,11 +37,10 @@ impl ExecutionBackend for OciExecutionBackend {
         stdout: ExecutionStdoutSender,
     ) -> Result<ExecutionOutput> {
         ensure_runtime_secrets_registered(&request).await?;
+        let prepared = prepare_oci_process_launch(&request)?;
         let runtime_auth = start_for_oci_execution(&request).await?;
-        let invocation = build_oci_process_invocation(
-            &request,
-            runtime_auth.as_ref().map(|auth| auth.launch()),
-        )?;
+        let invocation =
+            build_oci_process_invocation(prepared, runtime_auth.as_ref().map(|auth| auth.launch()));
         let result = run_process_streaming(&invocation, move |line| {
             let _ = stdout.send(line.to_string());
             Ok(())
@@ -48,12 +59,8 @@ impl ExecutionBackend for OciExecutionBackend {
     }
 }
 
-fn build_oci_process_invocation(
-    request: &ExecutionRequest,
-    runtime_auth: Option<&OciRuntimeAuthLaunch>,
-) -> Result<ProcessInvocation> {
+fn prepare_oci_process_launch(request: &ExecutionRequest) -> Result<PreparedOciProcessLaunch> {
     let config = request.plan.confinement.oci();
-
     let image = config.image.as_deref().ok_or_else(|| {
         anyhow!(
             "runtime '{}' requires a Podman runtime image in its confinement config",
@@ -69,22 +76,6 @@ fn build_oci_process_invocation(
 
     if config.read_only_rootfs {
         args.push("--read-only".to_string());
-    }
-
-    if let Some(pod_name) = runtime_auth.and_then(|auth| auth.pod_name.as_deref()) {
-        args.push("--pod".to_string());
-        args.push(pod_name.to_string());
-    } else {
-        match request.plan.network_mode {
-            NetworkMode::None => {
-                args.push("--network".to_string());
-                args.push("none".to_string());
-            }
-            NetworkMode::On => {
-                args.push("--network".to_string());
-                args.push("private".to_string());
-            }
-        }
     }
 
     if let Some(working_dir) = request.plan.working_dir.as_deref() {
@@ -112,15 +103,7 @@ fn build_oci_process_invocation(
         args.push(value.to_string());
     }
 
-    let mut environment =
-        merged_environment(&request.plan.environment, &request.program.environment);
-    if let Some(runtime_auth) = runtime_auth {
-        environment = merged_environment(&environment, &runtime_auth.runtime_environment);
-    }
-    for (key, value) in environment {
-        args.push("--env".to_string());
-        args.push(format!("{key}={value}"));
-    }
+    let environment = merged_environment(&request.plan.environment, &request.program.environment);
 
     if let Some(runtime_secrets_mount) = &request.runtime_secrets_mount {
         args.push("--secret".to_string());
@@ -140,17 +123,60 @@ fn build_oci_process_invocation(
         args.push(pids_limit.to_string());
     }
 
-    args.push(image.to_string());
-    args.push(request.program.executable.clone());
-    args.extend(request.program.args.clone());
+    Ok(PreparedOciProcessLaunch {
+        engine: config.engine.clone(),
+        args,
+        network_mode: request.plan.network_mode,
+        environment,
+        image: image.to_string(),
+        program_executable: request.program.executable.clone(),
+        program_args: request.program.args.clone(),
+        stdin: request.program.stdin.clone(),
+    })
+}
 
-    Ok(ProcessInvocation {
-        executable: config.engine.clone(),
+fn build_oci_process_invocation(
+    prepared: PreparedOciProcessLaunch,
+    runtime_auth: Option<&OciRuntimeAuthLaunch>,
+) -> ProcessInvocation {
+    let mut args = prepared.args;
+
+    if let Some(pod_name) = runtime_auth.and_then(|auth| auth.pod_name.as_deref()) {
+        args.push("--pod".to_string());
+        args.push(pod_name.to_string());
+    } else {
+        match prepared.network_mode {
+            NetworkMode::None => {
+                args.push("--network".to_string());
+                args.push("none".to_string());
+            }
+            NetworkMode::On => {
+                args.push("--network".to_string());
+                args.push("private".to_string());
+            }
+        }
+    }
+
+    let mut environment = prepared.environment;
+    if let Some(runtime_auth) = runtime_auth {
+        environment = merged_environment(&environment, &runtime_auth.runtime_environment);
+    }
+    for (key, value) in environment {
+        args.push("--env".to_string());
+        args.push(format!("{key}={value}"));
+    }
+
+    args.push(prepared.image);
+    args.push(prepared.program_executable);
+    args.extend(prepared.program_args);
+
+    ProcessInvocation {
+        executable: prepared.engine,
         args,
         working_dir: None,
         environment: Vec::new(),
-        input: request.program.stdin.clone(),
-    })
+        input: prepared.stdin,
+    }
 }
 
 async fn ensure_runtime_secrets_registered(request: &ExecutionRequest) -> Result<()> {
@@ -293,7 +319,7 @@ fn merged_environment(
 mod tests {
     use std::time::Duration;
 
-    use super::build_oci_process_invocation;
+    use super::{build_oci_process_invocation, prepare_oci_process_launch};
     use crate::kernel::runtime::execution::auth_sidecar::OciRuntimeAuthLaunch;
     use crate::kernel::runtime::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionRequest, NetworkMode,
@@ -318,7 +344,10 @@ mod tests {
             runtime_auth_home: None,
         };
 
-        let invocation = build_oci_process_invocation(&request, None).expect("invocation");
+        let invocation = build_oci_process_invocation(
+            prepare_oci_process_launch(&request).expect("prepare"),
+            None,
+        );
 
         assert_eq!(invocation.executable, "podman");
         assert_eq!(invocation.working_dir, None);
@@ -413,22 +442,23 @@ mod tests {
         let mut plan = sample_plan();
         plan.network_mode = NetworkMode::None;
 
-        let invocation = build_oci_process_invocation(
-            &ExecutionRequest {
-                plan,
-                program: RuntimeProgramSpec {
-                    executable: "codex".to_string(),
-                    args: Vec::new(),
-                    environment: Vec::new(),
-                    stdin: String::new(),
-                    auth: None,
-                },
-                runtime_secrets_mount: None,
-                runtime_auth_home: None,
+        let request = ExecutionRequest {
+            plan,
+            program: RuntimeProgramSpec {
+                executable: "codex".to_string(),
+                args: Vec::new(),
+                environment: Vec::new(),
+                stdin: String::new(),
+                auth: None,
             },
+            runtime_secrets_mount: None,
+            runtime_auth_home: None,
+        };
+
+        let invocation = build_oci_process_invocation(
+            prepare_oci_process_launch(&request).expect("prepare"),
             None,
-        )
-        .expect("invocation");
+        );
 
         assert!(invocation
             .args
@@ -438,16 +468,17 @@ mod tests {
 
     #[test]
     fn oci_backend_adds_private_network_flag_for_on_mode() {
+        let request = ExecutionRequest {
+            plan: sample_plan(),
+            program: RuntimeProgramSpec::default(),
+            runtime_secrets_mount: None,
+            runtime_auth_home: None,
+        };
+
         let invocation = build_oci_process_invocation(
-            &ExecutionRequest {
-                plan: sample_plan(),
-                program: RuntimeProgramSpec::default(),
-                runtime_secrets_mount: None,
-                runtime_auth_home: None,
-            },
+            prepare_oci_process_launch(&request).expect("prepare"),
             None,
-        )
-        .expect("invocation");
+        );
 
         assert!(invocation
             .args
@@ -457,13 +488,15 @@ mod tests {
 
     #[test]
     fn oci_backend_runs_join_runtime_auth_pod_and_merges_runtime_env() {
+        let request = ExecutionRequest {
+            plan: sample_plan(),
+            program: RuntimeProgramSpec::default(),
+            runtime_secrets_mount: None,
+            runtime_auth_home: None,
+        };
+
         let invocation = build_oci_process_invocation(
-            &ExecutionRequest {
-                plan: sample_plan(),
-                program: RuntimeProgramSpec::default(),
-                runtime_secrets_mount: None,
-                runtime_auth_home: None,
-            },
+            prepare_oci_process_launch(&request).expect("prepare"),
             Some(&OciRuntimeAuthLaunch {
                 pod_name: Some("lionclaw-pod".to_string()),
                 runtime_environment: vec![(
@@ -471,8 +504,7 @@ mod tests {
                     "placeholder".to_string(),
                 )],
             }),
-        )
-        .expect("invocation");
+        );
 
         assert!(invocation
             .args
@@ -495,15 +527,12 @@ mod tests {
         let mut plan = sample_plan();
         plan.confinement.oci_mut().image = None;
 
-        let err = build_oci_process_invocation(
-            &ExecutionRequest {
-                plan,
-                program: RuntimeProgramSpec::default(),
-                runtime_secrets_mount: None,
-                runtime_auth_home: None,
-            },
-            None,
-        )
+        let err = prepare_oci_process_launch(&ExecutionRequest {
+            plan,
+            program: RuntimeProgramSpec::default(),
+            runtime_secrets_mount: None,
+            runtime_auth_home: None,
+        })
         .expect_err("missing image should fail");
 
         assert!(err.to_string().contains("requires a Podman runtime image"));
@@ -514,15 +543,12 @@ mod tests {
         let mut plan = sample_plan();
         plan.working_dir = Some("/outside".to_string());
 
-        let err = build_oci_process_invocation(
-            &ExecutionRequest {
-                plan,
-                program: RuntimeProgramSpec::default(),
-                runtime_secrets_mount: None,
-                runtime_auth_home: None,
-            },
-            None,
-        )
+        let err = prepare_oci_process_launch(&ExecutionRequest {
+            plan,
+            program: RuntimeProgramSpec::default(),
+            runtime_secrets_mount: None,
+            runtime_auth_home: None,
+        })
         .expect_err("working dir should fail");
 
         assert!(err

@@ -656,25 +656,9 @@ impl JobStore {
         limit: usize,
         trigger_kind: SchedulerJobTriggerKind,
     ) -> Result<Vec<ClaimedSchedulerJob>> {
-        let limit = i64::try_from(limit).context("claim limit is too large")?;
-        let rows = sqlx::query(
-            "SELECT job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
-             skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
-             last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms \
-             FROM scheduler_jobs \
-             WHERE enabled = 1 AND running_run_id IS NULL AND next_run_at_ms IS NOT NULL AND next_run_at_ms <= ?1 \
-             ORDER BY next_run_at_ms ASC, created_at_ms ASC, job_id ASC \
-             LIMIT ?2",
-        )
-        .bind(now.timestamp_millis())
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .context("failed to query due scheduler jobs")?;
-
+        let jobs = self.load_due_jobs(now, limit).await?;
         let mut claimed = Vec::new();
-        for row in rows {
-            let job = map_job_row(row)?;
+        for job in jobs {
             if let Some(claim) = self
                 .claim_job_run(
                     job.job_id,
@@ -694,6 +678,33 @@ impl JobStore {
         }
 
         Ok(claimed)
+    }
+
+    pub async fn peek_next_due_job(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Option<SchedulerJobRecord>> {
+        Ok(self.load_due_jobs(now, 1).await?.into_iter().next())
+    }
+
+    pub async fn claim_scheduled_run(
+        &self,
+        job_id: Uuid,
+        scheduled_for: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<ClaimedSchedulerJob>> {
+        self.claim_job_run(
+            job_id,
+            JobRunClaim {
+                trigger_kind: SchedulerJobTriggerKind::Schedule,
+                scheduled_for,
+                attempt_no: 1,
+                advance_schedule: true,
+                require_enabled: true,
+                now,
+            },
+        )
+        .await
     }
 
     pub async fn claim_manual_run(
@@ -836,6 +847,30 @@ impl JobStore {
             job: updated_job,
             run: map_run_row(run)?,
         }))
+    }
+
+    async fn load_due_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<SchedulerJobRecord>> {
+        let limit = i64::try_from(limit).context("claim limit is too large")?;
+        let rows = sqlx::query(
+            "SELECT job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
+             skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
+             last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms \
+             FROM scheduler_jobs \
+             WHERE enabled = 1 AND running_run_id IS NULL AND next_run_at_ms IS NOT NULL AND next_run_at_ms <= ?1 \
+             ORDER BY next_run_at_ms ASC, created_at_ms ASC, job_id ASC \
+             LIMIT ?2",
+        )
+        .bind(now.timestamp_millis())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to query due scheduler jobs")?;
+
+        rows.into_iter().map(map_job_row).collect()
     }
 
     pub async fn begin_retry_run(

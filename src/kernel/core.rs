@@ -69,12 +69,13 @@ use super::{
     },
     policy::{Capability, PolicyStore, Scope},
     runtime::{
-        execute_program_backed_turn, register_builtin_runtime_adapters, EffectiveExecutionPlan,
-        ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
-        ExecutionPreset, HiddenTurnSupport, RuntimeAdapter, RuntimeCapabilityRequest,
-        RuntimeCapabilityResult, RuntimeEvent, RuntimeExecutionProfile, RuntimeMessageLane,
-        RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput,
-        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
+        execute_program_backed_turn, register_builtin_runtime_adapters,
+        validate_runtime_auth_prerequisites, EffectiveExecutionPlan, ExecutionPlanPurpose,
+        ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset,
+        HiddenTurnSupport, RuntimeAdapter, RuntimeCapabilityRequest, RuntimeCapabilityResult,
+        RuntimeEvent, RuntimeExecutionProfile, RuntimeMessageLane, RuntimeRegistry,
+        RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
+        RuntimeTurnMode, RuntimeTurnResult,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -212,6 +213,19 @@ impl Kernel {
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("session not found".to_string()))
+    }
+
+    pub(super) async fn validate_runtime_launch_prerequisites(
+        &self,
+        runtime_id: &str,
+    ) -> Result<(), KernelError> {
+        validate_runtime_auth_prerequisites(
+            self.runtime_auth_home.as_ref(),
+            runtime_id,
+            self.execution_planner.required_runtime_auth_var(runtime_id),
+        )
+        .await
+        .map_err(|err| KernelError::Runtime(err.to_string()))
     }
 
     pub async fn new(db_path: &Path) -> anyhow::Result<Self> {
@@ -1603,6 +1617,15 @@ impl Kernel {
                 runtime_id
             )));
         }
+        if let Err(err) = self
+            .validate_runtime_launch_prerequisites(&runtime_id)
+            .await
+        {
+            return Err(match err {
+                KernelError::Runtime(message) => KernelError::BadRequest(message),
+                other => other,
+            });
+        }
 
         let schedule = job_schedule_from_dto(req.schedule)
             .map_err(|err| KernelError::BadRequest(err.to_string()))?;
@@ -1886,6 +1909,8 @@ impl Kernel {
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("job not found".to_string()))?;
+        self.validate_runtime_launch_prerequisites(&existing.runtime_id)
+            .await?;
         let claimed = self
             .jobs
             .claim_manual_run(req.job_id, Utc::now())
@@ -2366,6 +2391,8 @@ impl Kernel {
                     timeout_ms: Some(30_000),
                 },
             )
+            .await?;
+        self.validate_runtime_launch_prerequisites(runtime_id)
             .await?;
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
@@ -4285,6 +4312,8 @@ impl Kernel {
                     timeout_ms: runtime_timeout_ms,
                 },
             )
+            .await?;
+        self.validate_runtime_launch_prerequisites(&runtime_id)
             .await?;
         if kind == SessionTurnKind::Retry {
             self.reset_runtime_plan_state(&execution_plan).await?;

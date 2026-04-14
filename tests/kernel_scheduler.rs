@@ -1,7 +1,8 @@
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
 };
@@ -16,13 +17,15 @@ use lionclaw::{
         SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest, SessionTurnRequest,
         SkillInstallRequest, StreamEventKindDto, TrustTier,
     },
+    home::LionClawHome,
     kernel::{
         runtime::{
-            RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
-            RuntimeEventSender, RuntimeMessageLane, RuntimeSessionHandle, RuntimeSessionStartInput,
-            RuntimeTurnInput, RuntimeTurnResult,
+            ConfinementConfig, OciConfinementConfig, RuntimeAdapter, RuntimeAdapterInfo,
+            RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender, RuntimeExecutionProfile,
+            RuntimeMessageLane, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
+            RuntimeTurnResult,
         },
-        InboundChannelText, Kernel, KernelOptions,
+        InboundChannelText, Kernel, KernelError, KernelOptions,
     },
     workspace::bootstrap_workspace,
 };
@@ -111,6 +114,149 @@ async fn scheduled_job_tick_runs_in_fresh_scheduler_session() {
     assert!(
         history.turns[0].assistant_text.contains(&skill_id),
         "mock runtime should receive the explicit scheduled skill list"
+    );
+}
+
+#[tokio::test]
+async fn create_job_rejects_missing_runtime_auth_before_persisting() {
+    let env = TestEnv::new();
+    let home = LionClawHome::new(env.temp_dir.path().join(".lionclaw"));
+    home.ensure_base_dirs().await.expect("base dirs");
+    let kernel = kernel_with_codex_auth_requirement(&env, &home).await;
+
+    let err = kernel
+        .create_job(JobCreateRequest {
+            name: "codex brief".to_string(),
+            runtime_id: "codex".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once { run_at: Utc::now() },
+            prompt_text: "summarize repo".to_string(),
+            skill_ids: Vec::new(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect_err("missing runtime auth should reject job creation");
+
+    match err {
+        KernelError::BadRequest(message) => {
+            assert!(message.contains("OPENAI_API_KEY"));
+        }
+        other => panic!("unexpected error variant: {}", other),
+    }
+
+    let jobs = kernel.list_jobs().await.expect("list jobs");
+    assert!(jobs.jobs.is_empty(), "job should not be persisted");
+}
+
+#[tokio::test]
+async fn manual_job_run_rejects_missing_runtime_auth_before_launch() {
+    let env = TestEnv::new();
+    let home = LionClawHome::new(env.temp_dir.path().join(".lionclaw"));
+    home.ensure_base_dirs().await.expect("base dirs");
+    tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
+        .await
+        .expect("write runtime auth");
+    let turn_calls = Arc::new(AtomicUsize::new(0));
+    let kernel = kernel_with_counting_codex_runtime(&env, &home, turn_calls.clone()).await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "codex manual".to_string(),
+            runtime_id: "codex".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() + ChronoDuration::hours(1),
+            },
+            prompt_text: "manual run".to_string(),
+            skill_ids: Vec::new(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create job");
+
+    tokio::fs::remove_file(home.runtime_auth_env_path())
+        .await
+        .expect("remove runtime auth");
+
+    let err = kernel
+        .run_job_now(JobRefRequest {
+            job_id: created.job.job_id,
+        })
+        .await
+        .expect_err("missing runtime auth should block manual run");
+
+    match err {
+        KernelError::Runtime(message) => {
+            assert!(message.contains("OPENAI_API_KEY"));
+        }
+        other => panic!("unexpected error variant: {}", other),
+    }
+    assert_eq!(turn_calls.load(Ordering::SeqCst), 0);
+    let runs = kernel
+        .list_job_runs(JobRunsRequest {
+            job_id: created.job.job_id,
+            limit: Some(5),
+        })
+        .await
+        .expect("list job runs");
+    assert!(runs.runs.is_empty(), "manual run should not be claimed");
+}
+
+#[tokio::test]
+async fn scheduler_tick_rejects_missing_runtime_auth_before_launch() {
+    let env = TestEnv::new();
+    let home = LionClawHome::new(env.temp_dir.path().join(".lionclaw"));
+    home.ensure_base_dirs().await.expect("base dirs");
+    tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
+        .await
+        .expect("write runtime auth");
+    let turn_calls = Arc::new(AtomicUsize::new(0));
+    let kernel = kernel_with_counting_codex_runtime(&env, &home, turn_calls.clone()).await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "codex scheduled".to_string(),
+            runtime_id: "codex".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "scheduled run".to_string(),
+            skill_ids: Vec::new(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create job");
+
+    tokio::fs::remove_file(home.runtime_auth_env_path())
+        .await
+        .expect("remove runtime auth");
+
+    let err = kernel
+        .scheduler_tick()
+        .await
+        .expect_err("missing runtime auth should block scheduler tick");
+
+    match err {
+        KernelError::Runtime(message) => {
+            assert!(message.contains("OPENAI_API_KEY"));
+        }
+        other => panic!("unexpected error variant: {}", other),
+    }
+    assert_eq!(turn_calls.load(Ordering::SeqCst), 0);
+    let runs = kernel
+        .list_job_runs(JobRunsRequest {
+            job_id: created.job.job_id,
+            limit: Some(5),
+        })
+        .await
+        .expect("list job runs");
+    assert!(
+        runs.runs.is_empty(),
+        "scheduler tick should not claim the job"
     );
 }
 
@@ -590,6 +736,10 @@ async fn scheduler_ticks_are_single_flight_and_run_due_jobs_serially() {
 
 struct AlwaysFailRuntimeAdapter;
 
+struct CountingRuntimeAdapter {
+    turn_calls: Arc<AtomicUsize>,
+}
+
 struct BlockingRuntimeAdapter {
     first_turn_started: Arc<Notify>,
     release_first_turn: Arc<Notify>,
@@ -642,6 +792,54 @@ impl RuntimeAdapter for AlwaysFailRuntimeAdapter {
             text: "intentional test failure".to_string(),
         });
         anyhow::bail!("intentional test failure")
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        _events: RuntimeEventSender,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for CountingRuntimeAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "codex".to_string(),
+            version: "0.1".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        _input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("codex-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        self.turn_calls.fetch_add(1, Ordering::SeqCst);
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(RuntimeTurnResult::default())
     }
 
     async fn resolve_capability_requests(
@@ -818,4 +1016,36 @@ impl TestEnv {
     fn workspace_root(&self) -> PathBuf {
         self.temp_dir.path().join("workspace")
     }
+}
+
+async fn kernel_with_codex_auth_requirement(env: &TestEnv, home: &LionClawHome) -> Kernel {
+    kernel_with_counting_codex_runtime(env, home, Arc::new(AtomicUsize::new(0))).await
+}
+
+async fn kernel_with_counting_codex_runtime(
+    env: &TestEnv,
+    home: &LionClawHome,
+    turn_calls: Arc<AtomicUsize>,
+) -> Kernel {
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            runtime_execution_profiles: BTreeMap::from([(
+                "codex".to_string(),
+                RuntimeExecutionProfile {
+                    confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
+                    compatibility_key: "codex-auth".to_string(),
+                    required_runtime_auth_var: Some("OPENAI_API_KEY"),
+                },
+            )]),
+            runtime_auth_home: Some(home.clone()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+    kernel
+        .register_runtime_adapter("codex", Arc::new(CountingRuntimeAdapter { turn_calls }))
+        .await;
+    kernel
 }

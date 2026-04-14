@@ -14,7 +14,7 @@ use super::{
     error::KernelError,
     jobs::{
         ClaimedSchedulerJob, SchedulerJobDeliveryStatus, SchedulerJobRecord, SchedulerJobRunRecord,
-        SchedulerJobRunStatus, SchedulerJobTriggerKind,
+        SchedulerJobRunStatus,
     },
 };
 
@@ -60,7 +60,13 @@ impl SchedulerEngine {
         let renewal_handle = self.spawn_lease_renewal(kernel, owner.clone(), lease_ttl);
         let tick_result = async {
             let mut claimed_runs = 0usize;
-            while let Some(claimed_job) = self.claim_next_due_job(kernel).await? {
+            while let Some(next_due_job) = self.peek_next_due_job(kernel).await? {
+                kernel
+                    .validate_runtime_launch_prerequisites(&next_due_job.runtime_id)
+                    .await?;
+                let Some(claimed_job) = self.claim_due_job(kernel, &next_due_job).await? else {
+                    continue;
+                };
                 let _ = kernel
                     .audit_log()
                     .append(
@@ -148,17 +154,27 @@ impl SchedulerEngine {
         }
     }
 
-    async fn claim_next_due_job(
+    async fn peek_next_due_job(
         &self,
         kernel: &Kernel,
-    ) -> Result<Option<ClaimedSchedulerJob>, KernelError> {
-        Ok(kernel
+    ) -> Result<Option<SchedulerJobRecord>, KernelError> {
+        kernel
             .job_store()
-            .claim_due_jobs(Utc::now(), 1, SchedulerJobTriggerKind::Schedule)
+            .peek_next_due_job(Utc::now())
             .await
-            .map_err(internal)?
-            .into_iter()
-            .next())
+            .map_err(internal)
+    }
+
+    async fn claim_due_job(
+        &self,
+        kernel: &Kernel,
+        job: &SchedulerJobRecord,
+    ) -> Result<Option<ClaimedSchedulerJob>, KernelError> {
+        kernel
+            .job_store()
+            .claim_scheduled_run(job.job_id, job.next_run_at, Utc::now())
+            .await
+            .map_err(internal)
     }
 
     async fn deliver_job_result(
