@@ -377,6 +377,7 @@ fn map_session_turn_row(row: SqliteRow) -> Result<SessionTurnRecord> {
 mod tests {
     use super::*;
     use crate::contracts::{SessionHistoryPolicy, TrustTier};
+    use crate::home::runtime_project_partition_key;
     use crate::kernel::{db::Db, sessions::SessionStore};
 
     async fn new_store_with_session() -> (SessionTurnStore, Uuid) {
@@ -388,6 +389,7 @@ mod tests {
             .open(
                 "local-cli".to_string(),
                 "failure-peer".to_string(),
+                runtime_project_partition_key(None),
                 TrustTier::Main,
                 SessionHistoryPolicy::Interactive,
             )

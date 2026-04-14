@@ -17,7 +17,7 @@ assistant-home filesystem hardening assumes Linux/macOS-style Unix behavior.
 LionClaw has two different roots:
 
 - `LIONCLAW_HOME/workspaces/<daemon.workspace>`: the assistant home workspace
-- optional project/task workspace root: the filesystem root used for brokered `fs.read` / `fs.write`
+- project/task workspace root: the filesystem tree mounted into confined runtimes at `/workspace`
 
 Continuity always lives in the assistant home workspace.
 
@@ -25,9 +25,10 @@ That means:
 
 - prompt identity and continuity are loaded from the assistant home workspace
 - scheduler artifacts and daily notes are written to the assistant home workspace
-- brokered filesystem actions may target a different project/task root
+- normal runtime file work happens in the separate project/task root
 
-By default, when no separate project root is configured, both roles point at the same workspace.
+By default, local `lionclaw run` uses the current working directory as the
+project root, while `LIONCLAW_HOME` remains the assistant home workspace.
 
 ## Layout
 

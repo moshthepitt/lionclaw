@@ -66,6 +66,9 @@ Unix environments.
 - `GET /v0/continuity/status`
 - `POST /v0/continuity/get`
 - `POST /v0/continuity/search`
+- `POST /v0/continuity/drafts/list`
+- `POST /v0/continuity/drafts/promote`
+- `POST /v0/continuity/drafts/discard`
 - `GET /v0/continuity/proposals`
 - `POST /v0/continuity/proposals/merge`
 - `POST /v0/continuity/proposals/reject`
@@ -110,11 +113,59 @@ Runtime adapters submit `RuntimeCapabilityRequest` items. Kernel flow:
 Runtime module layout:
 
 - `kernel/runtime/mod.rs`: shared runtime contracts + registry.
-- `kernel/runtime/builtins.rs`: built-in adapter IDs + registration.
+- `kernel/runtime/builtins.rs`: mock runtime registration for tests and kernel fallback-free bootstrap.
+- `kernel/runtime/execution/plan.rs`: typed execution presets, confinement config, and effective per-turn plans.
+- `kernel/runtime/execution/planner.rs`: deterministic plan compilation from runtime config, preset config, and request overrides.
+- `kernel/runtime/execution/backend.rs`: backend execution contract for confined runtime launch.
+- `kernel/runtime/execution/oci.rs`: rootless Podman backend and typed command builder.
+- `kernel/runtime/execution/process.rs`: shared process execution utility for adapters and backends.
 - `kernel/runtime/adapters/mock.rs`: deterministic test adapter.
-- `kernel/runtime/adapters/codex.rs`: production subprocess adapter.
-- `kernel/runtime/adapters/opencode.rs`: production subprocess adapter.
-- `kernel/runtime/adapters/subprocess.rs`: shared subprocess execution utility.
+- `kernel/runtime/adapters/codex.rs`: production program-backed adapter for Codex protocol details.
+- `kernel/runtime/adapters/opencode.rs`: production program-backed adapter for OpenCode protocol details.
+
+Program-backed runtimes stream two message lanes:
+
+- `answer`: canonical assistant reply text that is persisted into turn history.
+- `reasoning`: optional live thought/progress text that channels may render or ignore.
+
+LionClaw transports both lanes through the stream APIs, but only `answer` is treated as the durable assistant reply.
+Configured OpenCode profiles are pinned to `--format json` so LionClaw always receives machine-readable events instead of a degraded plain-text stream.
+
+The everyday confined runtime layout is mount-first:
+
+- `/workspace`: project/workspace root with preset-controlled read-only or read-write access.
+- `/runtime`: runtime-private writable state root.
+- `/drafts`: runtime-private draft/output area.
+
+For local `lionclaw run`, the project root defaults to the current working
+directory and is mounted at `/workspace`. `LIONCLAW_HOME` remains LionClaw's
+own state root and is not the everyday project tree.
+
+The execution planner also injects stable runtime-private environment defaults such as `HOME=/runtime/home` and `LIONCLAW_DRAFTS_DIR=/drafts` so program-backed runtimes keep ephemeral state out of LionClaw continuity.
+Interactive Codex/OpenCode turns still launch a fresh confined process for each
+request, but the mounted `/runtime` state root is now scoped to the LionClaw
+session, project root, and execution security shape. That lets the harness
+resume its own conversation state across turns without sharing runtime-private
+state across different projects or secret/network shapes.
+LionClaw still keeps the canonical transcript itself. Fresh harness sessions get
+replayed transcript history in the prompt envelope; resumed harness sessions get
+a continuation note plus the new user input instead of the full prior transcript
+on every turn.
+LionClaw does not persist a separate draft registry. Draft listing scans that shared drafts directory on demand, and explicit keep/discard actions move or delete files directly from there.
+
+Current runtime network policy is intentionally coarse: presets choose only
+`network-mode = "on"` or `network-mode = "none"`. LionClaw does not expose a
+fake allowlist mode before a real egress-control plane exists. `on` is mapped
+explicitly to the container engine's private network mode rather than inherited
+from engine defaults.
+
+Runtime secrets are loaded from `~/.lionclaw/config/runtime-secrets.env`.
+Presets either mount that whole file or mount no runtime secrets at all with
+`mount-runtime-secrets = true|false`, and the Podman backend mounts it read-only
+under Podman's default `/run/secrets/` directory with a LionClaw-managed name
+that starts with `lionclaw-runtime-secrets-`.
+LionClaw hardens the config directory to `0700` and the runtime secret file to
+`0600` on Unix before loading it.
 
 Channel bridge layout:
 
@@ -136,15 +187,16 @@ Operator launch model:
 
 - `launch_mode=service`: channel worker is supervised by `lionclaw service up` through the platform service manager.
 - `launch_mode=interactive`: channel worker is foreground-only and started with `lionclaw channel attach <id>`.
-- Worker entrypoint resolution prefers `scripts/worker` and falls back to legacy `scripts/worker.sh`.
-- `LIONCLAW_HOME` gets a stable machine-owned `config/home-id`; attach and service flows only reuse a daemon when `/v0/daemon/info` reports the same `home_id`.
+- Worker entrypoint resolution requires `scripts/worker`.
+- `LIONCLAW_HOME` gets a stable machine-owned `config/home-id`; attach and service flows only reuse a daemon when `/v0/daemon/info` reports the same `home_id`, current project scope, and daemon-compat fingerprint.
 
 Adding a new adapter:
 
 1. Add `kernel/runtime/adapters/<adapter>.rs` implementing `RuntimeAdapter`.
 2. Export it from `kernel/runtime/adapters/mod.rs`.
-3. Register it in `kernel/runtime/builtins.rs`.
-4. Add unit tests in the adapter module + one kernel-level integration case.
+3. Wire configured registration in `operator/runtime.rs`.
+4. Only touch `kernel/runtime/builtins.rs` if the adapter is intentionally builtin test/kernel scaffolding.
+5. Add unit tests in the adapter module + one kernel-level integration case.
 
 ## Channel-Skill Contract
 
@@ -258,22 +310,21 @@ Queued channel turns emit machine-stable status/error codes through the same str
 
 1. Default deny: policy checks deny unless grant exists.
 2. No default external channel in core; all external transport is skill-worker code outside Rust kernel.
-3. Runtime adapters registered by default: local `mock`, subprocess `codex`, and subprocess `opencode`.
-4. `codex` adapter runs in secure defaults (`read-only` sandbox, `--ephemeral`) and kernel-owned capability broker routing.
-5. `opencode` adapter runs in JSON event mode and maps runtime events into kernel events.
-6. Kernel-enforced runtime idle timeout + hard timeout + cancellation path (`runtime.turn.timeout` audit event with `timeout_kind=idle|hard`).
-7. Runtime execution policy supports per-turn working directory, idle timeout override, and env passthrough constraints while the daemon keeps a separate hard timeout ceiling.
-8. Capability side effects route through kernel brokers only:
-   - `fs.read` / `fs.write` use workspace-bounded filesystem broker.
-   - `channel.send` records outbound transcript entries and appends typed stream events for external channel skills.
-   - `net.egress`, `secret.request`, `scheduler.run` are broker-gated and denied until configured.
+3. Runtime adapters registered by default: local `mock` only. `codex` and `opencode` are configured runtime profiles that bind program-backed adapters at startup.
+4. Configured `codex` and `opencode` profiles run through the shared execution planner and Podman backend, then map runtime JSON output into kernel events.
+5. Kernel-enforced runtime idle timeout + hard timeout + cancellation path (`runtime.turn.timeout` audit event with `timeout_kind=idle|hard`).
+6. Runtime execution policy supports per-turn working directory, idle timeout override, and env passthrough constraints while the daemon keeps a separate hard timeout ceiling.
+7. Ordinary confined runtime file work stays inside mounted workspace/runtime/drafts paths. Kernel brokers are reserved for explicit side effects:
+   - the existing `fs.read` / `fs.write` broker remains available for narrow non-runtime surfaces and tests, not the everyday confined runtime path
+   - `channel.send` records outbound transcript entries and appends typed stream events for external channel skills
+   - `net.egress`, `secret.request`, `scheduler.run` are broker-gated and denied until configured
 9. Auditing covers API mutations plus capability request/result decisions.
 10. Channel inbound is gated by pairing approval (`pending` -> `approved`), with duplicate update suppression and worker-controlled polling offsets.
 
 ## Planned Hardening After v0
 
 1. Wasmtime execution boundary.
-2. Rootless container fallback for heavy tasks.
+2. Alternative confinement backends beyond the shipped OCI path.
 3. Egress proxy with allowlist enforcement.
-4. Secret broker issuing scoped, short-lived credentials.
+4. Secret broker issuing scoped, short-lived credentials for non-runtime-visible secrets.
 5. Skill source pinning + signatures.

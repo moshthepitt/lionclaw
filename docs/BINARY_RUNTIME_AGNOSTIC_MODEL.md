@@ -57,7 +57,9 @@ or delivery surface.
 
 `~/.lionclaw/workspaces/main/` is the default assistant home workspace.
 
-This is distinct from any optional project/task workspace root used for brokered filesystem access.
+This is distinct from the project/task root that LionClaw mounts into confined
+runtimes at `/workspace`. By default, local `lionclaw run` uses the current
+working directory as that project root.
 
 This is the assistant's durable life context. It is where LionClaw keeps the
 runtime-independent identity files that shape prompt assembly and future
@@ -122,6 +124,14 @@ Adapters receive the assembled envelope; they do not own persona.
 3. Injected files are cache artifacts under `~/.lionclaw/runtime/` (or similar), not authoritative state.
 4. Injection can improve recall/ergonomics but cannot grant permissions or bypass policy.
 
+For confined runtimes, LionClaw treats that runtime area as private scratch space rather than continuity:
+
+- `/runtime` is the runtime-private writable root.
+- `/drafts` is the runtime-private draft/output area.
+- the planner points `HOME` and XDG state under `/runtime` so engine-specific caches and config stay out of assistant continuity.
+- LionClaw scans `/drafts` on demand when the user lists outputs; keep/discard actions then move or delete validated files directly from that shared host/container directory.
+- only the `answer` lane is canonical reply content; `reasoning` is an optional live stream for channels that choose to render it.
+
 ## Process and service model
 
 Default background deployment:
@@ -134,7 +144,7 @@ This may mean many processes (example: 13 channels plus the background service).
 From the operator side, LionClaw has one normal interactive path plus explicit service commands:
 
 - `lionclaw run [runtime]` (interactive local use)
-- `lionclaw run --continue-last-session [runtime]` (resume the latest local interactive session)
+- `lionclaw run --continue-last-session [runtime]` (resume the latest local interactive session for the current project)
 - `lionclaw apply` (reconcile desired state)
 - `lionclaw service up` (start supervised stack + ensure auto-restart policy)
 - `lionclaw service down`
@@ -148,8 +158,21 @@ Background operation is explicit. If you want long-running channels and auto-res
 Normal user flow:
 
 1. `lionclaw onboard`
-2. `lionclaw runtime add codex --kind codex --bin codex`
+2. `lionclaw runtime add codex --kind codex --bin codex --image ghcr.io/lionclaw/codex-runtime:v1`
 3. `lionclaw run codex`
+
+Runtime definitions, execution presets, and confinement settings live in
+`~/.lionclaw/config/lionclaw.toml`, not in ad hoc shell configuration.
+For now, runtime network policy is intentionally coarse:
+`network-mode = "on"` or `network-mode = "none"`. `on` means the runtime gets a
+private container network, not host networking.
+
+Runtime secrets live separately in `~/.lionclaw/config/runtime-secrets.env`.
+Presets either mount that whole file or mount no runtime secrets at all with
+`mount-runtime-secrets = true|false`, and LionClaw mounts it read-only under
+`/run/secrets/` with a LionClaw-managed name that starts with
+`lionclaw-runtime-secrets-` inside the confined runtime. LionClaw hardens that
+file to owner-only permissions on Unix before loading it.
 
 Inside `lionclaw run`, recovery stays command-first:
 
@@ -158,7 +181,18 @@ Inside `lionclaw run`, recovery stays command-first:
 - `/reset`
 - `/exit`
 
-The core keeps durable per-turn history, preserves partial assistant output across timeouts and restart interruption, and reopens the latest local session by most recent activity.
+The core keeps durable per-turn history, preserves partial assistant output across timeouts and restart interruption, and reopens the latest local session for the current project by most recent activity.
+Interactive runtime continuity now has two layers:
+
+- LionClaw keeps the durable session transcript, audit trail, and artifacts.
+- The harness keeps resumable runtime-private state under a session-scoped
+  `/runtime` mount that is partitioned by project root and security shape.
+
+LionClaw still spawns a fresh confined process for each interactive turn, but
+Codex/OpenCode resume their own prior session state from that mounted runtime
+root. LionClaw only replays the full transcript into the prompt when the
+harness session is fresh; resumed harness sessions receive the new user input
+plus a continuation note instead of the entire prior transcript every turn.
 
 Background channels remain an explicit service flow:
 
@@ -173,7 +207,7 @@ Interactive channel skills stay explicit too:
 2. `lionclaw channel add terminal --launch interactive`
 3. `lionclaw channel attach terminal`
 
-Interactive channels are foreground-only. They attach to the current TTY, restore the latest durable interactive session for that peer, resume any still-running answer stream from the last durable checkpoint, and are not managed by `lionclaw service up`.
+Interactive channels are foreground-only. They attach to the current TTY, restore the latest durable interactive session for that peer within the current project scope, resume any still-running answer stream from the last durable checkpoint, and are not managed by `lionclaw service up`.
 
 No manual API choreography should be required for normal usage or operator flows.
 

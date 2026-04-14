@@ -2136,6 +2136,7 @@ impl RuntimeAdapter for CapturePromptAdapter {
     ) -> Result<RuntimeSessionHandle> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("capture-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
         })
     }
 
@@ -2285,6 +2286,7 @@ impl RuntimeAdapter for FailingRuntimeAdapter {
     ) -> Result<RuntimeSessionHandle> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("boom-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
         })
     }
 

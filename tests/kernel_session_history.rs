@@ -1,6 +1,9 @@
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -11,11 +14,12 @@ use lionclaw::{
         SessionActionKind, SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery,
         SessionOpenRequest, SessionTurnKind, SessionTurnRequest, SessionTurnStatus, TrustTier,
     },
+    home::RUNTIME_SESSION_READY_MARKER,
     kernel::{
         runtime::{
-            RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
-            RuntimeEventSender, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
-            RuntimeTurnResult,
+            ConfinementConfig, OciConfinementConfig, RuntimeAdapter, RuntimeAdapterInfo,
+            RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender, RuntimeExecutionProfile,
+            RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
         },
         Kernel, KernelError, KernelOptions,
     },
@@ -674,6 +678,440 @@ async fn latest_session_snapshot_prefers_reset_session_without_turns() {
     assert!(snapshot.resume_after_sequence.is_none());
 }
 
+#[tokio::test]
+async fn session_scoped_runtime_state_resumes_without_replaying_full_history() {
+    let env = TestEnv::new();
+    let workspace_root = env.path().join("workspace");
+    let project_root = env.path().join("project");
+    let runtime_root = env.path().join("runtime");
+    std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+    std::fs::create_dir_all(&project_root).expect("create project root");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(workspace_root),
+            project_workspace_root: Some(project_root),
+            runtime_root: Some(runtime_root),
+            workspace_name: Some("main".to_string()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let recorded_prompts = Arc::new(Mutex::new(Vec::new()));
+    let recorded_roots = Arc::new(Mutex::new(Vec::new()));
+    let resumed_flags = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "resumable",
+            Arc::new(ResumableCaptureAdapter {
+                prompts: recorded_prompts.clone(),
+                runtime_roots: recorded_roots.clone(),
+                resumed_flags: resumed_flags.clone(),
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+
+    let session = open_session(&kernel, "resume-peer", SessionHistoryPolicy::Interactive).await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "first request".to_string(),
+            runtime_id: Some("resumable".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("first turn");
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "second request".to_string(),
+            runtime_id: Some("resumable".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("second turn");
+
+    let prompts = recorded_prompts.lock().expect("prompt lock").clone();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains("first request"));
+    assert!(prompts[1].contains("second request"));
+    assert!(
+        !prompts[1].contains("User: first request"),
+        "resumed harness sessions should not replay the full prior transcript"
+    );
+    assert!(
+        prompts[1]
+            .contains("Continue the existing runtime conversation for this LionClaw session."),
+        "resumed harness sessions should get the runtime-session continuation note"
+    );
+
+    let roots = recorded_roots.lock().expect("roots lock").clone();
+    assert_eq!(roots.len(), 2);
+    assert_eq!(
+        roots[0], roots[1],
+        "same LionClaw session should reuse runtime state root"
+    );
+    let resumed_flags = resumed_flags.lock().expect("resumed flags lock").clone();
+    assert_eq!(resumed_flags, vec![false, true]);
+    assert!(
+        roots[0].join(RUNTIME_SESSION_READY_MARKER).is_file(),
+        "successful turns should mark the runtime state root as resumable"
+    );
+}
+
+#[tokio::test]
+async fn partial_failure_does_not_mark_runtime_session_resumable_for_continue() {
+    let env = TestEnv::new();
+    let workspace_root = env.path().join("workspace");
+    let project_root = env.path().join("project");
+    let runtime_root = env.path().join("runtime");
+    std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+    std::fs::create_dir_all(&project_root).expect("create project root");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            runtime_turn_idle_timeout: Duration::from_millis(200),
+            runtime_turn_hard_timeout: Duration::from_millis(400),
+            workspace_root: Some(workspace_root),
+            project_workspace_root: Some(project_root),
+            runtime_root: Some(runtime_root),
+            workspace_name: Some("main".to_string()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let resumed_flags = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "flaky",
+            Arc::new(ResumableFlakyAdapter {
+                resumed_flags: resumed_flags.clone(),
+                turn_counter: AtomicUsize::new(0),
+            }),
+        )
+        .await;
+
+    let session = open_session(&kernel, "flaky-peer", SessionHistoryPolicy::Interactive).await;
+
+    let err = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "start a long answer".to_string(),
+            runtime_id: Some("flaky".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect_err("first turn should fail after partial output");
+    assert!(matches!(err, KernelError::Runtime(_)));
+
+    let response = kernel
+        .run_session_action(
+            session.session_id,
+            SessionActionKind::ContinueLastPartial,
+            Some("flaky".to_string()),
+        )
+        .await
+        .expect("continue should still succeed from canonical history");
+    assert_eq!(response.assistant_text, "continued");
+
+    let resumed_flags = resumed_flags.lock().expect("resumed flags lock").clone();
+    assert_eq!(resumed_flags, vec![false, false]);
+}
+
+#[tokio::test]
+async fn failed_turn_clears_runtime_session_resumability_for_next_turn() {
+    let env = TestEnv::new();
+    let workspace_root = env.path().join("workspace");
+    let project_root = env.path().join("project");
+    let runtime_root = env.path().join("runtime");
+    std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+    std::fs::create_dir_all(&project_root).expect("create project root");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(workspace_root),
+            project_workspace_root: Some(project_root),
+            runtime_root: Some(runtime_root),
+            workspace_name: Some("main".to_string()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let recorded_roots = Arc::new(Mutex::new(Vec::new()));
+    let resumed_flags = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "recovering",
+            Arc::new(ResumeAfterFailureAdapter {
+                runtime_roots: recorded_roots.clone(),
+                resumed_flags: resumed_flags.clone(),
+                turn_counter: AtomicUsize::new(0),
+            }),
+        )
+        .await;
+
+    let session = open_session(
+        &kernel,
+        "recovering-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "first request".to_string(),
+            runtime_id: Some("recovering".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("first turn");
+
+    let err = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "second request".to_string(),
+            runtime_id: Some("recovering".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect_err("second turn should fail");
+    assert!(matches!(err, KernelError::Runtime(_)));
+
+    let roots = recorded_roots.lock().expect("roots lock").clone();
+    assert_eq!(roots.len(), 2);
+    assert!(
+        !roots[1].join(RUNTIME_SESSION_READY_MARKER).is_file(),
+        "failed turns should clear resumability before the next follow-up"
+    );
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "third request".to_string(),
+            runtime_id: Some("recovering".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("third turn");
+
+    let resumed_flags = resumed_flags.lock().expect("resumed flags lock").clone();
+    assert_eq!(resumed_flags, vec![false, true, false]);
+}
+
+#[tokio::test]
+async fn retry_restarts_harness_session_from_canonical_history() {
+    let env = TestEnv::new();
+    let workspace_root = env.path().join("workspace");
+    let project_root = env.path().join("project");
+    let runtime_root = env.path().join("runtime");
+    std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+    std::fs::create_dir_all(&project_root).expect("create project root");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(workspace_root),
+            project_workspace_root: Some(project_root),
+            runtime_root: Some(runtime_root),
+            workspace_name: Some("main".to_string()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let recorded_prompts = Arc::new(Mutex::new(Vec::new()));
+    let recorded_roots = Arc::new(Mutex::new(Vec::new()));
+    let resumed_flags = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "resumable",
+            Arc::new(ResumableCaptureAdapter {
+                prompts: recorded_prompts.clone(),
+                runtime_roots: recorded_roots.clone(),
+                resumed_flags: resumed_flags.clone(),
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+
+    let session = open_session(&kernel, "retry-peer", SessionHistoryPolicy::Interactive).await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "first request".to_string(),
+            runtime_id: Some("resumable".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("first turn");
+
+    kernel
+        .run_session_action(
+            session.session_id,
+            SessionActionKind::RetryLastTurn,
+            Some("resumable".to_string()),
+        )
+        .await
+        .expect("retry turn");
+
+    let prompts = recorded_prompts.lock().expect("prompt lock").clone();
+    assert_eq!(prompts.len(), 2);
+    assert!(
+        !prompts[1].contains("## Runtime Session"),
+        "retry should force a fresh harness session rather than sending a continuation note"
+    );
+
+    let roots = recorded_roots.lock().expect("roots lock").clone();
+    assert_eq!(roots.len(), 2);
+    assert_eq!(
+        roots[0], roots[1],
+        "retry should reuse the same session-scoped root path"
+    );
+    let resumed_flags = resumed_flags.lock().expect("resumed flags lock").clone();
+    assert_eq!(resumed_flags, vec![false, false]);
+}
+
+#[tokio::test]
+async fn runtime_profile_change_invalidates_resumable_state() {
+    let env = TestEnv::new();
+    let workspace_root = env.path().join("workspace");
+    let project_root = env.path().join("project");
+    let runtime_root = env.path().join("runtime");
+    std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+    std::fs::create_dir_all(&project_root).expect("create project root");
+
+    let recorded_prompts = Arc::new(Mutex::new(Vec::new()));
+    let recorded_roots = Arc::new(Mutex::new(Vec::new()));
+    let resumed_flags = Arc::new(Mutex::new(Vec::new()));
+
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(workspace_root.clone()),
+            project_workspace_root: Some(project_root.clone()),
+            runtime_root: Some(runtime_root.clone()),
+            workspace_name: Some("main".to_string()),
+            runtime_execution_profiles: [(
+                "resumable".to_string(),
+                test_runtime_profile("runtime-v1"),
+            )]
+            .into_iter()
+            .collect(),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    kernel
+        .register_runtime_adapter(
+            "resumable",
+            Arc::new(ResumableCaptureAdapter {
+                prompts: recorded_prompts.clone(),
+                runtime_roots: recorded_roots.clone(),
+                resumed_flags: resumed_flags.clone(),
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+
+    let session = open_session(
+        &kernel,
+        "runtime-profile-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "first request".to_string(),
+            runtime_id: Some("resumable".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("first turn");
+
+    drop(kernel);
+
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(workspace_root),
+            project_workspace_root: Some(project_root),
+            runtime_root: Some(runtime_root),
+            workspace_name: Some("main".to_string()),
+            runtime_execution_profiles: [(
+                "resumable".to_string(),
+                test_runtime_profile("runtime-v2"),
+            )]
+            .into_iter()
+            .collect(),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel reinit");
+
+    kernel
+        .register_runtime_adapter(
+            "resumable",
+            Arc::new(ResumableCaptureAdapter {
+                prompts: recorded_prompts.clone(),
+                runtime_roots: recorded_roots.clone(),
+                resumed_flags: resumed_flags.clone(),
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "second request".to_string(),
+            runtime_id: Some("resumable".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("second turn");
+
+    let roots = recorded_roots.lock().expect("roots lock").clone();
+    assert_eq!(roots.len(), 2);
+    assert_ne!(roots[0], roots[1]);
+
+    let resumed_flags = resumed_flags.lock().expect("resumed flags lock").clone();
+    assert_eq!(resumed_flags, vec![false, false]);
+}
+
 async fn open_session(
     kernel: &Kernel,
     peer_id: &str,
@@ -700,6 +1138,24 @@ struct CapturePromptAdapter {
     reply: String,
 }
 
+struct ResumableCaptureAdapter {
+    prompts: Arc<Mutex<Vec<String>>>,
+    runtime_roots: Arc<Mutex<Vec<PathBuf>>>,
+    resumed_flags: Arc<Mutex<Vec<bool>>>,
+    reply: String,
+}
+
+struct ResumableFlakyAdapter {
+    resumed_flags: Arc<Mutex<Vec<bool>>>,
+    turn_counter: AtomicUsize,
+}
+
+struct ResumeAfterFailureAdapter {
+    runtime_roots: Arc<Mutex<Vec<PathBuf>>>,
+    resumed_flags: Arc<Mutex<Vec<bool>>>,
+    turn_counter: AtomicUsize,
+}
+
 struct BlockingAnswerAdapter {
     answer: String,
     sleep_for: Duration,
@@ -721,6 +1177,7 @@ impl RuntimeAdapter for PartialTimeoutAdapter {
     ) -> Result<RuntimeSessionHandle> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("partial-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
         })
     }
 
@@ -772,6 +1229,7 @@ impl RuntimeAdapter for CapturePromptAdapter {
     ) -> Result<RuntimeSessionHandle> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("capture-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
         })
     }
 
@@ -809,6 +1267,234 @@ impl RuntimeAdapter for CapturePromptAdapter {
 }
 
 #[async_trait]
+impl RuntimeAdapter for ResumableCaptureAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "resumable".to_string(),
+            version: "0.1".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
+        let runtime_state_root = input
+            .runtime_state_root
+            .clone()
+            .expect("runtime state root should be provided");
+        let resumes_existing_session = runtime_state_root
+            .join(RUNTIME_SESSION_READY_MARKER)
+            .is_file();
+        self.runtime_roots
+            .lock()
+            .expect("roots lock")
+            .push(runtime_state_root);
+        self.resumed_flags
+            .lock()
+            .expect("resumed flags lock")
+            .push(resumes_existing_session);
+
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("resumable-{}", Uuid::new_v4()),
+            resumes_existing_session,
+        })
+    }
+
+    async fn turn(
+        &self,
+        input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        self.prompts.lock().expect("prompt lock").push(input.prompt);
+        let _ = events.send(RuntimeEvent::MessageDelta {
+            lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+            text: self.reply.clone(),
+        });
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(RuntimeTurnResult::default())
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        events: RuntimeEventSender,
+    ) -> Result<()> {
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
+    }
+
+    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for ResumableFlakyAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "flaky".to_string(),
+            version: "0.1".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
+        let runtime_state_root = input
+            .runtime_state_root
+            .clone()
+            .expect("runtime state root should be provided");
+        let resumes_existing_session = runtime_state_root
+            .join(RUNTIME_SESSION_READY_MARKER)
+            .is_file();
+        self.resumed_flags
+            .lock()
+            .expect("resumed flags lock")
+            .push(resumes_existing_session);
+
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("flaky-{}", Uuid::new_v4()),
+            resumes_existing_session,
+        })
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        let turn_index = self.turn_counter.fetch_add(1, Ordering::SeqCst);
+        if turn_index == 0 {
+            let _ = events.send(RuntimeEvent::MessageDelta {
+                lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+                text: "partial".to_string(),
+            });
+            let _ = events.send(RuntimeEvent::Error {
+                code: Some("runtime.error".to_string()),
+                text: "failed after partial".to_string(),
+            });
+            anyhow::bail!("failed after partial");
+        }
+
+        let _ = events.send(RuntimeEvent::MessageDelta {
+            lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+            text: "continued".to_string(),
+        });
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(RuntimeTurnResult::default())
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        events: RuntimeEventSender,
+    ) -> Result<()> {
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
+    }
+
+    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for ResumeAfterFailureAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "recovering".to_string(),
+            version: "0.1".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
+        let runtime_state_root = input
+            .runtime_state_root
+            .clone()
+            .expect("runtime state root should be provided");
+        let resumes_existing_session = runtime_state_root
+            .join(RUNTIME_SESSION_READY_MARKER)
+            .is_file();
+        self.runtime_roots
+            .lock()
+            .expect("roots lock")
+            .push(runtime_state_root);
+        self.resumed_flags
+            .lock()
+            .expect("resumed flags lock")
+            .push(resumes_existing_session);
+
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("recovering-{}", Uuid::new_v4()),
+            resumes_existing_session,
+        })
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        match self.turn_counter.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                let _ = events.send(RuntimeEvent::MessageDelta {
+                    lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+                    text: "first success".to_string(),
+                });
+                let _ = events.send(RuntimeEvent::Done);
+                Ok(RuntimeTurnResult::default())
+            }
+            1 => {
+                let _ = events.send(RuntimeEvent::MessageDelta {
+                    lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+                    text: "partial failure".to_string(),
+                });
+                let _ = events.send(RuntimeEvent::Error {
+                    code: Some("runtime.error".to_string()),
+                    text: "failed after success".to_string(),
+                });
+                anyhow::bail!("failed after success");
+            }
+            _ => {
+                let _ = events.send(RuntimeEvent::MessageDelta {
+                    lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+                    text: "fresh recovery".to_string(),
+                });
+                let _ = events.send(RuntimeEvent::Done);
+                Ok(RuntimeTurnResult::default())
+            }
+        }
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        events: RuntimeEventSender,
+    ) -> Result<()> {
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
+    }
+
+    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl RuntimeAdapter for BlockingAnswerAdapter {
     async fn info(&self) -> RuntimeAdapterInfo {
         RuntimeAdapterInfo {
@@ -824,6 +1510,7 @@ impl RuntimeAdapter for BlockingAnswerAdapter {
     ) -> Result<RuntimeSessionHandle> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("blocking-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
         })
     }
 
@@ -861,6 +1548,13 @@ impl RuntimeAdapter for BlockingAnswerAdapter {
 
 struct TestEnv {
     temp_dir: TempDir,
+}
+
+fn test_runtime_profile(compatibility_key: &str) -> RuntimeExecutionProfile {
+    RuntimeExecutionProfile {
+        confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
+        compatibility_key: compatibility_key.to_string(),
+    }
 }
 
 impl TestEnv {

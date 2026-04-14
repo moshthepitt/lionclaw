@@ -6,6 +6,7 @@ pub mod continuity_fs;
 pub mod continuity_index;
 pub mod core;
 pub mod db;
+pub mod drafts;
 pub mod error;
 pub mod jobs;
 pub mod policy;

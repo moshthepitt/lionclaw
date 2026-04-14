@@ -36,6 +36,18 @@ pub struct RuntimeExecutionPolicy {
 }
 
 impl RuntimeExecutionPolicy {
+    pub fn for_working_dir_root(root: PathBuf) -> Self {
+        Self::default().with_default_rule(RuntimeExecutionRule {
+            working_dir_roots: vec![root],
+            ..RuntimeExecutionRule::default()
+        })
+    }
+
+    pub fn with_default_rule(mut self, rule: RuntimeExecutionRule) -> Self {
+        self.default_rule = rule;
+        self
+    }
+
     pub fn with_rule(mut self, runtime_id: impl Into<String>, rule: RuntimeExecutionRule) -> Self {
         self.rules.insert(runtime_id.into(), rule);
         self

@@ -1,4 +1,4 @@
-use std::{io::ErrorKind, process::Stdio, time::Duration};
+use std::{fmt, io::ErrorKind, process::Stdio, time::Duration};
 
 use anyhow::{Context, Result};
 use tokio::{
@@ -6,8 +6,8 @@ use tokio::{
     process::Command,
 };
 
-#[derive(Debug, Clone)]
-pub struct SubprocessInvocation {
+#[derive(Clone)]
+pub struct ProcessInvocation {
     pub executable: String,
     pub args: Vec<String>,
     pub working_dir: Option<String>,
@@ -15,23 +15,35 @@ pub struct SubprocessInvocation {
     pub input: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct SubprocessOutput {
+impl fmt::Debug for ProcessInvocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProcessInvocation")
+            .field("executable", &self.executable)
+            .field("args", &self.args)
+            .field("working_dir", &self.working_dir)
+            .field("environment_count", &self.environment.len())
+            .field("input_len", &self.input.len())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProcessOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub exit_code: Option<i32>,
 }
 
-impl SubprocessOutput {
+impl ProcessOutput {
     pub fn success(&self) -> bool {
         self.exit_code == Some(0)
     }
 }
 
-pub async fn run_non_interactive_streaming<F>(
-    invocation: &SubprocessInvocation,
+pub async fn run_process_streaming<F>(
+    invocation: &ProcessInvocation,
     mut on_stdout_line: F,
-) -> Result<SubprocessOutput>
+) -> Result<ProcessOutput>
 where
     F: FnMut(&str) -> Result<()>,
 {
@@ -50,7 +62,6 @@ where
         );
     }
     command.kill_on_drop(true);
-
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -112,7 +123,7 @@ where
         .context("failed to wait for subprocess")?;
     let captured_stderr = stderr_task.await.context("stderr reader task failed")??;
 
-    Ok(SubprocessOutput {
+    Ok(ProcessOutput {
         stdout: captured_stdout,
         stderr: captured_stderr,
         exit_code: status.code(),
@@ -149,4 +160,27 @@ async fn spawn_with_retry(
     }
 
     unreachable!("spawn_with_retry should return or error within retry loop")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProcessInvocation;
+
+    #[test]
+    fn process_invocation_debug_redacts_environment_and_input_values() {
+        let debug = format!(
+            "{:?}",
+            ProcessInvocation {
+                executable: "podman".to_string(),
+                args: vec!["run".to_string()],
+                working_dir: None,
+                environment: vec![("GITHUB_TOKEN".to_string(), "ghp_secret".to_string())],
+                input: "sensitive stdin".to_string(),
+            }
+        );
+
+        assert!(debug.contains("environment_count"));
+        assert!(!debug.contains("ghp_secret"));
+        assert!(!debug.contains("sensitive stdin"));
+    }
 }

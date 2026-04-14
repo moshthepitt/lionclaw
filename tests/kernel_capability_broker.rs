@@ -380,6 +380,7 @@ impl RuntimeAdapter for SingleCapabilityRuntimeAdapter {
     ) -> Result<RuntimeSessionHandle> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("single-capability-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
         })
     }
 

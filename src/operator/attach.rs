@@ -5,8 +5,11 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::{
+    config::resolve_project_workspace_root,
+    home::runtime_project_partition_key,
     home::LionClawHome,
     operator::{
+        config::daemon_compat_fingerprint,
         config::ChannelLaunchMode,
         daemon_probe::{classify_daemon, wait_for_same_home_daemon, DaemonClassification},
         reconcile::{apply, base_url_from_bind, resolve_worker_entrypoint, up, StackBinaryPaths},
@@ -20,6 +23,7 @@ pub(crate) struct ChannelAttachSpec {
     pub bind_addr: String,
     pub env: Vec<(String, String)>,
     pub started_services: bool,
+    pub expected_config_fingerprint: String,
 }
 
 pub async fn attach_channel<M: ServiceManager>(
@@ -31,22 +35,44 @@ pub async fn attach_channel<M: ServiceManager>(
 ) -> Result<()> {
     let binaries = crate::operator::reconcile::resolve_stack_binaries()?;
     let home_id = home.ensure_home_id().await?;
+    let project_scope = current_project_scope()?;
     let spec = prepare_channel_attach(
         home,
         manager,
         channel_id,
         requested_peer_id,
         requested_runtime_id,
+        &project_scope,
         &binaries,
     )
     .await?;
 
     if spec.started_services {
-        match wait_for_same_home_daemon(&spec.bind_addr, &home_id, Duration::from_secs(5)).await? {
+        match wait_for_same_home_daemon(
+            &spec.bind_addr,
+            &home_id,
+            &project_scope,
+            &spec.expected_config_fingerprint,
+            Duration::from_secs(5),
+        )
+        .await?
+        {
             DaemonClassification::SameHome => {}
+            DaemonClassification::SameHomeDifferentConfig => {
+                return Err(anyhow!(
+                    "bind '{}' became available with stale daemon-compatible config while attaching",
+                    spec.bind_addr
+                ));
+            }
             DaemonClassification::Absent => {
                 return Err(anyhow!(
                     "lionclawd did not become available at '{}' within 5s",
+                    spec.bind_addr
+                ));
+            }
+            DaemonClassification::SameHomeDifferentProject => {
+                return Err(anyhow!(
+                    "bind '{}' became owned by this LionClaw home for a different project while attaching",
                     spec.bind_addr
                 ));
             }
@@ -81,18 +107,38 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
     channel_id: String,
     requested_peer_id: Option<String>,
     requested_runtime_id: Option<String>,
+    expected_project_scope: &str,
     binaries: &StackBinaryPaths,
 ) -> Result<ChannelAttachSpec> {
     let initial_config = crate::operator::config::OperatorConfig::load(home).await?;
+    let expected_config_fingerprint = daemon_compat_fingerprint(&initial_config);
     let home_id = home.ensure_home_id().await?;
     let mut started_services = false;
-    let applied = match classify_daemon(&initial_config.daemon.bind, &home_id).await? {
+    let applied = match classify_daemon(
+        &initial_config.daemon.bind,
+        &home_id,
+        expected_project_scope,
+        &expected_config_fingerprint,
+    )
+    .await?
+    {
         DaemonClassification::Absent => {
             let runtime_id = initial_config.resolve_runtime_id(requested_runtime_id.as_deref())?;
             started_services = true;
             up(home, manager, &runtime_id, binaries).await?
         }
         DaemonClassification::SameHome => apply(home).await?,
+        DaemonClassification::SameHomeDifferentConfig => {
+            let runtime_id = initial_config.resolve_runtime_id(requested_runtime_id.as_deref())?;
+            started_services = true;
+            up(home, manager, &runtime_id, binaries).await?
+        }
+        DaemonClassification::SameHomeDifferentProject => {
+            return Err(anyhow!(
+                "bind '{}' is already served by this LionClaw home for a different project; stop that daemon or attach from the matching project root",
+                initial_config.daemon.bind
+            ));
+        }
         DaemonClassification::ForeignHome(info) => {
             return Err(anyhow!(
                 "bind '{}' is already served by a different LionClaw home at '{}'; stop that daemon or choose a different bind",
@@ -139,6 +185,14 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
         )
     })?;
     let worker_path = resolve_worker_entrypoint(home, &locked_skill.snapshot_dir)?;
+    let effective_runtime_id = match requested_runtime_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(runtime_id) => Some(applied.config.resolve_runtime_id(Some(runtime_id))?),
+        None => None,
+    };
     let peer_id = requested_peer_id
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -170,12 +224,16 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
             env.insert("PATH".to_string(), path);
         }
     }
+    if let Some(runtime_id) = effective_runtime_id {
+        env.insert("LIONCLAW_RUNTIME_ID".to_string(), runtime_id);
+    }
 
     Ok(ChannelAttachSpec {
         worker_path,
         bind_addr: applied.config.daemon.bind,
         env: env.into_iter().collect(),
         started_services,
+        expected_config_fingerprint,
     })
 }
 
@@ -216,6 +274,12 @@ fn default_local_peer_id() -> String {
         .unwrap_or_else(|| "local-user".to_string())
 }
 
+fn current_project_scope() -> Result<String> {
+    let project_root =
+        resolve_project_workspace_root().context("failed to resolve project workspace root")?;
+    Ok(runtime_project_partition_key(Some(project_root.as_path())))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, fs};
@@ -225,12 +289,14 @@ mod tests {
 
     use super::prepare_channel_attach;
     use crate::{
+        config::resolve_project_workspace_root,
         contracts::DaemonInfoResponse,
-        home::LionClawHome,
+        home::{runtime_project_partition_key, LionClawHome},
+        kernel::runtime::{ConfinementConfig, OciConfinementConfig},
         operator::{
             config::{
-                ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig, OperatorConfig,
-                RuntimeProfileConfig,
+                daemon_compat_fingerprint, ChannelLaunchMode, ManagedChannelConfig,
+                ManagedSkillConfig, OperatorConfig, RuntimeProfileConfig,
             },
             services::{FakeServiceManager, ServiceManager},
         },
@@ -240,6 +306,16 @@ mod tests {
         crate::operator::reconcile::StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         }
+    }
+
+    fn current_project_scope() -> String {
+        let project_root =
+            resolve_project_workspace_root().expect("resolve project workspace root");
+        runtime_project_partition_key(Some(project_root.as_path()))
+    }
+
+    fn current_config_fingerprint(config: &OperatorConfig) -> String {
+        daemon_compat_fingerprint(config)
     }
 
     #[cfg(unix)]
@@ -267,6 +343,8 @@ mod tests {
 
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         write_executable(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n");
+        let podman = temp_dir.path().join("podman");
+        write_executable(&podman, "#!/usr/bin/env bash\nexit 0\n");
 
         let skill_source = temp_dir.path().join("channel-terminal");
         fs::create_dir_all(skill_source.join("scripts")).expect("skill dir");
@@ -288,11 +366,13 @@ mod tests {
             runtimes: [(
                 "codex".to_string(),
                 RuntimeProfileConfig::Codex {
-                    executable: runtime_stub.to_string_lossy().to_string(),
+                    executable: "codex".to_string(),
                     model: None,
-                    sandbox: "read-only".to_string(),
-                    skip_git_repo_check: true,
-                    ephemeral: true,
+                    confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                        engine: podman.to_string_lossy().to_string(),
+                        image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                        ..OciConfinementConfig::default()
+                    }),
                 },
             )]
             .into_iter()
@@ -337,6 +417,7 @@ mod tests {
             "terminal".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
+            &current_project_scope(),
             &binaries(),
         )
         .await
@@ -356,6 +437,7 @@ mod tests {
             "terminal".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
+            &current_project_scope(),
             &binaries(),
         )
         .await
@@ -367,7 +449,7 @@ mod tests {
         );
         assert!(
             spec.worker_path.ends_with("scripts/worker"),
-            "canonical worker entrypoint should be preferred"
+            "canonical worker entrypoint should be required"
         );
 
         let env = spec.env.into_iter().collect::<BTreeMap<_, _>>();
@@ -403,6 +485,7 @@ mod tests {
         let config = OperatorConfig::load(&home).await.expect("load config");
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
+        let config_fingerprint = current_config_fingerprint(&config);
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",
@@ -410,6 +493,7 @@ mod tests {
                     let bind_addr = bind_addr.clone();
                     let home_root = home.root().display().to_string();
                     let home_id = home_id.clone();
+                    let project_scope = current_project_scope();
                     move || {
                         let response = DaemonInfoResponse {
                             service: "lionclawd".to_string(),
@@ -417,6 +501,8 @@ mod tests {
                             home_id: home_id.clone(),
                             home_root: home_root.clone(),
                             bind_addr: bind_addr.clone(),
+                            project_scope: project_scope.clone(),
+                            config_fingerprint: config_fingerprint.clone(),
                         };
                         async move { Json(response) }
                     }
@@ -432,6 +518,7 @@ mod tests {
             "terminal".to_string(),
             None,
             Some("codex".to_string()),
+            &current_project_scope(),
             &binaries(),
         )
         .await
@@ -442,11 +529,177 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn prepare_channel_attach_exports_requested_runtime_when_reusing_same_home_daemon() {
+        let (_temp_dir, home, manager) =
+            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let bind_addr = config.daemon.bind.clone();
+        let config_fingerprint = current_config_fingerprint(&config);
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    let home_root = home.root().display().to_string();
+                    let home_id = home_id.clone();
+                    let project_scope = current_project_scope();
+                    move || {
+                        let response = DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: home_id.clone(),
+                            home_root: home_root.clone(),
+                            bind_addr: bind_addr.clone(),
+                            project_scope: project_scope.clone(),
+                            config_fingerprint: config_fingerprint.clone(),
+                        };
+                        async move { Json(response) }
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+
+        let spec = prepare_channel_attach(
+            &home,
+            &manager,
+            "terminal".to_string(),
+            None,
+            Some("codex".to_string()),
+            &current_project_scope(),
+            &binaries(),
+        )
+        .await
+        .expect("prepare attach");
+
+        let env = spec.env.into_iter().collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            env.get("LIONCLAW_RUNTIME_ID").map(String::as_str),
+            Some("codex")
+        );
+        assert!(!spec.started_services, "same-home daemon should be reused");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_channel_attach_restarts_same_home_daemon_when_config_is_stale() {
+        let (_temp_dir, home, manager) =
+            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let bind_addr = config.daemon.bind.clone();
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    let home_root = home.root().display().to_string();
+                    let home_id = home_id.clone();
+                    let project_scope = current_project_scope();
+                    move || {
+                        let response = DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: home_id.clone(),
+                            home_root: home_root.clone(),
+                            bind_addr: bind_addr.clone(),
+                            project_scope: project_scope.clone(),
+                            config_fingerprint: "daemon-stale-config".to_string(),
+                        };
+                        async move { Json(response) }
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+        manager.set_unit_status(
+            crate::operator::services::DAEMON_UNIT_NAME,
+            "loaded/active/running",
+        );
+
+        let spec = prepare_channel_attach(
+            &home,
+            &manager,
+            "terminal".to_string(),
+            None,
+            Some("codex".to_string()),
+            &current_project_scope(),
+            &binaries(),
+        )
+        .await
+        .expect("prepare attach");
+
+        assert!(spec.started_services, "stale daemon should be reconciled");
+        assert!(
+            manager.was_restarted(crate::operator::services::DAEMON_UNIT_NAME),
+            "managed daemon should be restarted when config fingerprint changes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_channel_attach_rejects_unknown_requested_runtime_when_reusing_same_home_daemon(
+    ) {
+        let (_temp_dir, home, manager) =
+            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let bind_addr = config.daemon.bind.clone();
+        let config_fingerprint = current_config_fingerprint(&config);
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    let home_root = home.root().display().to_string();
+                    let home_id = home_id.clone();
+                    let project_scope = current_project_scope();
+                    move || {
+                        let response = DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: home_id.clone(),
+                            home_root: home_root.clone(),
+                            bind_addr: bind_addr.clone(),
+                            project_scope: project_scope.clone(),
+                            config_fingerprint: config_fingerprint.clone(),
+                        };
+                        async move { Json(response) }
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+
+        let err = prepare_channel_attach(
+            &home,
+            &manager,
+            "terminal".to_string(),
+            None,
+            Some("missing".to_string()),
+            &current_project_scope(),
+            &binaries(),
+        )
+        .await
+        .expect_err("unknown requested runtime should fail");
+
+        assert!(err
+            .to_string()
+            .contains("runtime profile 'missing' is not configured"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn prepare_channel_attach_rejects_foreign_home_daemon() {
         let (_temp_dir, home, manager) =
             seed_interactive_channel(ChannelLaunchMode::Interactive).await;
         let config = OperatorConfig::load(&home).await.expect("load config");
         let bind_addr = config.daemon.bind.clone();
+        let config_fingerprint = current_config_fingerprint(&config);
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",
@@ -459,6 +712,8 @@ mod tests {
                             home_id: "foreign-home".to_string(),
                             home_root: "/tmp/foreign-home".to_string(),
                             bind_addr: bind_addr.clone(),
+                            project_scope: "foreign-project".to_string(),
+                            config_fingerprint: config_fingerprint.clone(),
                         })
                     }
                 }),
@@ -473,6 +728,7 @@ mod tests {
             "terminal".to_string(),
             None,
             Some("codex".to_string()),
+            &current_project_scope(),
             &binaries(),
         )
         .await
@@ -503,11 +759,61 @@ mod tests {
             "terminal".to_string(),
             None,
             Some("codex".to_string()),
+            &current_project_scope(),
             &binaries(),
         )
         .await
         .expect_err("older daemon should fail");
 
         assert!(err.to_string().contains("older LionClaw daemon"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_channel_attach_rejects_same_home_different_project_daemon() {
+        let (_temp_dir, home, manager) =
+            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let bind_addr = config.daemon.bind.clone();
+        let home_root = home.root().display().to_string();
+        let config_fingerprint = current_config_fingerprint(&config);
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    let home_id = home_id.clone();
+                    let home_root = home_root.clone();
+                    move || async move {
+                        Json(DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: home_id.clone(),
+                            home_root: home_root.clone(),
+                            bind_addr: bind_addr.clone(),
+                            project_scope: "different-project".to_string(),
+                            config_fingerprint: config_fingerprint.clone(),
+                        })
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+
+        let err = prepare_channel_attach(
+            &home,
+            &manager,
+            "terminal".to_string(),
+            None,
+            Some("codex".to_string()),
+            &current_project_scope(),
+            &binaries(),
+        )
+        .await
+        .expect_err("same-home different-project daemon should fail");
+
+        assert!(err.to_string().contains("different project"));
     }
 }

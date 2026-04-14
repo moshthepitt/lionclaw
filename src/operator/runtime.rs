@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -5,24 +6,22 @@ use anyhow::{anyhow, Result};
 use crate::kernel::{
     runtime::{
         CodexRuntimeAdapter, CodexRuntimeConfig, OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig,
-        BUILTIN_RUNTIME_CODEX, BUILTIN_RUNTIME_OPENCODE,
+        RuntimeExecutionProfile,
     },
     Kernel,
 };
 
-use super::config::{
-    normalize_executable, validate_executable, OperatorConfig, RuntimeProfileConfig,
-};
+use super::config::{OperatorConfig, RuntimeProfileConfig};
 
 pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConfig) -> Result<()> {
+    validate_configured_runtimes(config)?;
+
     for (id, runtime) in &config.runtimes {
         match runtime {
             RuntimeProfileConfig::Codex {
                 executable,
                 model,
-                sandbox,
-                skip_git_repo_check,
-                ephemeral,
+                confinement: _,
             } => {
                 kernel
                     .register_runtime_adapter(
@@ -30,31 +29,23 @@ pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConf
                         Arc::new(CodexRuntimeAdapter::new(CodexRuntimeConfig {
                             executable: executable.clone(),
                             model: model.clone(),
-                            sandbox_mode: sandbox.clone(),
-                            skip_git_repo_check: *skip_git_repo_check,
-                            ephemeral: *ephemeral,
                         })),
                     )
                     .await;
             }
             RuntimeProfileConfig::OpenCode {
                 executable,
-                format,
                 model,
                 agent,
-                xdg_data_home,
-                continue_last_session,
+                confinement: _,
             } => {
                 kernel
                     .register_runtime_adapter(
                         id.clone(),
                         Arc::new(OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig {
                             executable: executable.clone(),
-                            format: format.clone(),
                             model: model.clone(),
                             agent: agent.clone(),
-                            xdg_data_home: xdg_data_home.clone(),
-                            continue_last_session: *continue_last_session,
                         })),
                     )
                     .await;
@@ -65,117 +56,66 @@ pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConf
     Ok(())
 }
 
+pub fn configured_runtime_execution_profiles(
+    config: &OperatorConfig,
+) -> BTreeMap<String, RuntimeExecutionProfile> {
+    config
+        .runtimes
+        .iter()
+        .map(|(id, runtime)| (id.clone(), runtime.execution_profile()))
+        .collect()
+}
+
 pub fn resolve_runtime_id(config: &OperatorConfig, requested: Option<&str>) -> Result<String> {
     config.resolve_runtime_id(requested)
 }
 
-pub fn validate_runtime_availability(config: &OperatorConfig, runtime_id: &str) -> Result<()> {
-    if let Some(profile) = config.runtime(runtime_id) {
-        validate_executable(profile.executable()).map_err(|err| {
-            anyhow!(
-                "configured runtime command '{}' is invalid: {}",
-                profile.executable(),
-                err
-            )
-        })?;
-        return Ok(());
+pub fn validate_configured_runtimes(config: &OperatorConfig) -> Result<()> {
+    for runtime_id in config.runtimes.keys() {
+        validate_runtime_availability(config, runtime_id)?;
     }
 
-    let _ = build_runtime_fallback_env(runtime_id)?;
     Ok(())
 }
 
-pub fn runtime_service_env(
-    config: &OperatorConfig,
-    runtime_id: &str,
-) -> Result<Vec<(String, String)>> {
-    let mut env = current_process_path_env();
-    if config.runtime(runtime_id).is_some() {
-        return Ok(env);
-    }
-
-    env.extend(build_runtime_fallback_env(runtime_id)?);
-    Ok(env)
-}
-
-fn build_runtime_fallback_env(runtime_id: &str) -> Result<Vec<(String, String)>> {
-    match runtime_id {
-        BUILTIN_RUNTIME_CODEX => {
-            let executable = std::env::var("LIONCLAW_CODEX_BIN")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .map(|value| normalize_executable(&value))
-                .transpose()?
-                .unwrap_or(normalize_executable("codex")?);
-
-            let mut env = vec![("LIONCLAW_CODEX_BIN".to_string(), executable)];
-            copy_if_present(&mut env, "LIONCLAW_CODEX_MODEL");
-            copy_if_present(&mut env, "LIONCLAW_CODEX_SANDBOX");
-            copy_if_present(&mut env, "LIONCLAW_CODEX_SKIP_GIT_REPO_CHECK");
-            copy_if_present(&mut env, "LIONCLAW_CODEX_EPHEMERAL");
-            Ok(env)
-        }
-        BUILTIN_RUNTIME_OPENCODE => {
-            let executable = std::env::var("LIONCLAW_OPENCODE_BIN")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .map(|value| normalize_executable(&value))
-                .transpose()?
-                .unwrap_or(normalize_executable("opencode")?);
-
-            let mut env = vec![("LIONCLAW_OPENCODE_BIN".to_string(), executable)];
-            copy_if_present(&mut env, "LIONCLAW_OPENCODE_FORMAT");
-            copy_if_present(&mut env, "LIONCLAW_OPENCODE_MODEL");
-            copy_if_present(&mut env, "LIONCLAW_OPENCODE_AGENT");
-            copy_if_present(&mut env, "LIONCLAW_OPENCODE_XDG_DATA_HOME");
-            copy_if_present(&mut env, "LIONCLAW_OPENCODE_CONTINUE_LAST_SESSION");
-            Ok(env)
-        }
-        _ => Err(anyhow!(
-            "runtime '{}' is not configured; add it with 'lionclaw runtime add {} --kind <codex|opencode> --bin <command-or-path>'",
-            runtime_id, runtime_id
-        )),
-    }
-}
-
-fn copy_if_present(out: &mut Vec<(String, String)>, key: &str) {
-    if let Ok(value) = std::env::var(key) {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            out.push((key.to_string(), trimmed.to_string()));
-        }
-    }
-}
-
-fn current_process_path_env() -> Vec<(String, String)> {
-    std::env::var("PATH")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| vec![("PATH".to_string(), value)])
-        .unwrap_or_default()
+pub fn validate_runtime_availability(config: &OperatorConfig, runtime_id: &str) -> Result<()> {
+    let profile = config
+        .runtime(runtime_id)
+        .ok_or_else(|| anyhow!("runtime profile '{}' is not configured", runtime_id))?;
+    profile.validate().map_err(|err| {
+        anyhow!(
+            "configured runtime profile '{}' is invalid: {}",
+            runtime_id,
+            err
+        )
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_runtime_fallback_env, validate_runtime_availability};
+    use super::{validate_configured_runtimes, validate_runtime_availability};
+    use crate::kernel::runtime::{ConfinementConfig, OciConfinementConfig};
     use crate::operator::config::{OperatorConfig, RuntimeProfileConfig};
 
-    #[test]
-    fn unsupported_runtime_requires_configuration() {
-        let err = build_runtime_fallback_env("custom-runtime").expect_err("should fail");
-        assert!(
-            err.to_string().contains("lionclaw runtime add"),
-            "error should guide the user toward configuring a runtime profile"
-        );
+    #[cfg(unix)]
+    fn fake_podman() -> (tempfile::TempDir, String) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("podman");
+        std::fs::write(&path, "#!/usr/bin/env bash\n").expect("write file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        (temp_dir, path.to_string_lossy().to_string())
     }
 
     #[cfg(unix)]
     #[test]
-    fn configured_runtime_requires_executable_file() {
+    fn configured_runtime_requires_usable_host_engine() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let path = temp_dir.path().join("codex");
+        let path = temp_dir.path().join("podman");
         std::fs::write(&path, "#!/usr/bin/env bash\n").expect("write file");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
 
@@ -183,11 +123,13 @@ mod tests {
         config.upsert_runtime(
             "codex".to_string(),
             RuntimeProfileConfig::Codex {
-                executable: path.to_string_lossy().to_string(),
+                executable: "codex".to_string(),
                 model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: path.to_string_lossy().to_string(),
+                    image: Some("ghcr.io/lionclaw/codex-runtime:latest".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
             },
         );
 
@@ -197,39 +139,80 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn configured_runtime_command_is_validated_via_path() {
-        let mut config = OperatorConfig::default();
-        config.upsert_runtime(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "sh".to_string(),
-                model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
-            },
-        );
-
-        validate_runtime_availability(&config, "codex").expect("runtime command should validate");
-    }
-
-    #[test]
-    fn configured_runtime_service_env_carries_path() {
-        let path = std::env::var("PATH").expect("path");
-
+    fn configured_runtime_profile_accepts_container_command_with_valid_engine() {
+        let (_temp_dir, engine) = fake_podman();
         let mut config = OperatorConfig::default();
         config.upsert_runtime(
             "codex".to_string(),
             RuntimeProfileConfig::Codex {
                 executable: "codex".to_string(),
                 model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine,
+                    image: Some("ghcr.io/lionclaw/codex-runtime:latest".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
             },
         );
 
-        let env = super::runtime_service_env(&config, "codex").expect("service env");
-        assert_eq!(env, vec![("PATH".to_string(), path)]);
+        validate_runtime_availability(&config, "codex").expect("runtime command should validate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_runtime_requires_image() {
+        let (_temp_dir, engine) = fake_podman();
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "codex".to_string(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine,
+                    image: None,
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+
+        let err = validate_runtime_availability(&config, "codex").expect_err("should fail");
+        assert!(err.to_string().contains("Podman runtime image is required"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_runtime_validation_rejects_any_invalid_profile() {
+        let (_temp_dir, engine) = fake_podman();
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "codex".to_string(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: engine.clone(),
+                    image: Some("ghcr.io/lionclaw/codex-runtime:latest".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+        config.upsert_runtime(
+            "broken".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "codex".to_string(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine,
+                    image: None,
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+
+        let err = validate_configured_runtimes(&config).expect_err("should fail");
+        assert!(err
+            .to_string()
+            .contains("configured runtime profile 'broken' is invalid"));
     }
 }

@@ -53,11 +53,16 @@ cargo build --release
 ./target/release/lionclaw onboard
 
 # 3. Attach a model and start executing
-./target/release/lionclaw runtime add codex --kind codex --bin codex
+./target/release/lionclaw runtime add codex --kind codex --bin codex --image ghcr.io/lionclaw/codex-runtime:v1
 ./target/release/lionclaw run codex
 ```
 
-Continue the latest local session instead of starting fresh:
+`lionclaw run ...` uses your current directory as the project root by default.
+LionClaw keeps its own continuity, runtime state, services, and config under
+`LIONCLAW_HOME`, while the confined runtime sees the project itself at
+`/workspace`.
+
+Continue the latest local session for the current project instead of starting fresh:
 
 ```bash
 ./target/release/lionclaw run --continue-last-session codex
@@ -65,7 +70,7 @@ Continue the latest local session instead of starting fresh:
 
 Inside the interactive REPL:
 
-- `/continue` resumes from a partial timed-out, failed, cancelled, or interrupted reply
+- `/continue` resumes from a partial timed-out, failed, cancelled, or interrupted assistant answer
 - `/retry` reruns the previous prompt
 - `/reset` opens a fresh session
 - `/exit` leaves the REPL
@@ -125,6 +130,9 @@ Inspect and manage that continuity with:
 ./target/release/lionclaw continuity status
 ./target/release/lionclaw continuity search "release"
 ./target/release/lionclaw continuity get continuity/ACTIVE.md
+./target/release/lionclaw continuity drafts ls --runtime codex
+./target/release/lionclaw continuity drafts promote report.md --runtime codex
+./target/release/lionclaw continuity drafts discard report.md --runtime codex
 ./target/release/lionclaw continuity proposals ls
 ./target/release/lionclaw continuity proposals merge continuity/proposals/memory/<proposal>.md
 ./target/release/lionclaw continuity loops ls
@@ -152,7 +160,7 @@ If you prefer the underlying manual steps, they are:
 ./target/release/lionclaw channel attach terminal --runtime codex
 ```
 
-`channel attach` opens the worker in your current TTY. If needed, it starts LionClaw for you, restores the latest interactive terminal session for that peer, resumes any still-running answer stream from the last durable checkpoint, and prints the pairing code and approval command on first contact. It only reuses a daemon when that daemon belongs to the same `LIONCLAW_HOME`.
+`channel attach` opens the worker in your current TTY. If needed, it starts LionClaw for you, restores the latest interactive terminal session for that peer, resumes any still-running answer stream from the last durable checkpoint, and prints the pairing code and approval command on first contact. It only reuses a daemon when that daemon belongs to the same `LIONCLAW_HOME`, current project, and compatible daemon config, including runtime, preset, and workspace settings. When you pass `--runtime <id>`, that attached worker pins its turns to the requested runtime instead of the daemon default.
 
 To run multiple local terminal channels at once, register multiple interactive channels and attach each one in its own terminal:
 
@@ -198,17 +206,31 @@ Override the root with `LIONCLAW_HOME`.
 
 ## Runtime config
 
-Runtime profiles live in `~/.lionclaw/config/lionclaw.toml`.
+Runtime profiles, execution presets, and confinement settings live in
+`~/.lionclaw/config/lionclaw.toml`.
+Today, confined runtime presets support only coarse network modes:
+`network-mode = "on"` or `network-mode = "none"`. `on` maps to Podman's
+private network namespace, not host networking.
 
-Use these env vars for manual setup and migration:
+Runtime secrets for confined runtimes live separately in
+`~/.lionclaw/config/runtime-secrets.env`. Presets either mount that whole file
+or mount no runtime secrets at all with `mount-runtime-secrets = true|false`.
+When mounted, Podman places it under `/run/secrets/` with a LionClaw-managed
+name that starts with `lionclaw-runtime-secrets-`. Keep the source file
+owner-only; LionClaw hardens it to `0600` on Unix before handing it to Podman.
+
+`lionclaw runtime add` configures the runtime command that runs inside the
+runtime image, plus the concrete host `podman` executable and image LionClaw
+uses to launch it. Execution policy remains config-owned in LionClaw state, not
+ambient shell state.
+
+`lionclaw service up` persists the project root you launch it from so the
+background daemon, session reuse, and confined runtimes keep operating on that
+same project.
+
+Daemon/service plumbing recognizes these env vars:
 
 - `LIONCLAW_DEFAULT_RUNTIME_ID`
-- `LIONCLAW_CODEX_BIN`
-- `LIONCLAW_CODEX_MODEL`
-- `LIONCLAW_CODEX_SANDBOX`
-- `LIONCLAW_OPENCODE_BIN`
-- `LIONCLAW_OPENCODE_MODEL`
-- `LIONCLAW_OPENCODE_AGENT`
 - `LIONCLAW_RUNTIME_TURN_IDLE_TIMEOUT_MS`
 - `LIONCLAW_RUNTIME_TURN_HARD_TIMEOUT_MS`
 - `LIONCLAW_RUNTIME_TURN_TIMEOUT_MS`

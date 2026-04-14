@@ -1,9 +1,17 @@
-use std::path::PathBuf;
+use std::{
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const DEFAULT_WORKSPACE: &str = "main";
+pub const RUNTIME_PROJECTS_DIR: &str = "projects";
+pub const RUNTIME_SESSIONS_DIR: &str = "sessions";
+pub const RUNTIME_DRAFTS_DIR: &str = "drafts";
+pub const RUNTIME_SESSION_READY_MARKER: &str = ".lionclaw-runtime-session";
 
 #[derive(Debug, Clone)]
 pub struct LionClawHome {
@@ -46,6 +54,38 @@ impl LionClawHome {
         self.config_dir().join("lionclaw.toml")
     }
 
+    pub fn runtime_secrets_env_path(&self) -> PathBuf {
+        self.config_dir().join("runtime-secrets.env")
+    }
+
+    pub async fn resolve_runtime_secrets_file(&self) -> Result<Option<PathBuf>> {
+        let path = self.runtime_secrets_env_path();
+        let metadata = match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to stat {}", path.display()));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(anyhow!(
+                "runtime secrets file '{}' cannot be a symlink",
+                path.display()
+            ));
+        }
+        if !metadata.file_type().is_file() {
+            return Err(anyhow!(
+                "runtime secrets path '{}' must be a regular file",
+                path.display()
+            ));
+        }
+        harden_runtime_secret_permissions(&path).await?;
+        let canonical = tokio::fs::canonicalize(&path)
+            .await
+            .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+        Ok(Some(canonical))
+    }
+
     pub fn home_id_path(&self) -> PathBuf {
         self.config_dir().join("home-id")
     }
@@ -66,8 +106,66 @@ impl LionClawHome {
         self.runtime_dir().join("channels").join(channel_id)
     }
 
-    pub fn runtime_workspace_dir(&self, runtime_id: &str, workspace: &str) -> PathBuf {
-        self.runtime_dir().join(runtime_id).join(workspace)
+    pub fn runtime_project_dir(
+        &self,
+        runtime_id: &str,
+        workspace: &str,
+        project_root: &Path,
+    ) -> PathBuf {
+        runtime_project_dir_from_parts(
+            &self.runtime_dir(),
+            runtime_id,
+            workspace,
+            Some(project_root),
+        )
+    }
+
+    pub fn runtime_project_generated_agents_path(
+        &self,
+        runtime_id: &str,
+        workspace: &str,
+        project_root: &Path,
+    ) -> PathBuf {
+        runtime_project_generated_agents_path_from_parts(
+            &self.runtime_dir(),
+            runtime_id,
+            workspace,
+            Some(project_root),
+        )
+    }
+
+    pub fn runtime_project_drafts_dir(
+        &self,
+        runtime_id: &str,
+        workspace: &str,
+        project_root: &Path,
+    ) -> PathBuf {
+        runtime_project_drafts_dir_from_parts(
+            &self.runtime_dir(),
+            runtime_id,
+            workspace,
+            Some(project_root),
+        )
+    }
+
+    pub fn runtime_session_state_dir(
+        &self,
+        runtime_id: &str,
+        workspace: &str,
+        project_root: &Path,
+        session_id: Uuid,
+        compatibility_key: &str,
+        shape_key: &str,
+    ) -> PathBuf {
+        runtime_session_state_dir_from_parts(
+            &self.runtime_dir(),
+            runtime_id,
+            workspace,
+            Some(project_root),
+            session_id,
+            compatibility_key,
+            shape_key,
+        )
     }
 
     pub fn logs_dir(&self) -> PathBuf {
@@ -107,6 +205,14 @@ impl LionClawHome {
                 .await
                 .with_context(|| format!("failed to create {}", path.display()))?;
         }
+        #[cfg(unix)]
+        {
+            use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+
+            tokio::fs::set_permissions(self.config_dir(), Permissions::from_mode(0o700))
+                .await
+                .with_context(|| format!("failed to chmod {}", self.config_dir().display()))?;
+        }
 
         self.ensure_home_id().await?;
         Ok(())
@@ -141,17 +247,134 @@ impl LionClawHome {
     }
 }
 
+pub fn runtime_project_partition_key(project_root: Option<&Path>) -> String {
+    let digest_source = project_root
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "global".to_string());
+    hashed_partition_key("project", digest_source.as_bytes())
+}
+
+pub fn runtime_profile_partition_key(source: &[u8]) -> String {
+    hashed_partition_key("runtime", source)
+}
+
+pub fn daemon_compat_partition_key(source: &[u8]) -> String {
+    hashed_partition_key("daemon", source)
+}
+
+pub fn runtime_project_dir_from_parts(
+    runtime_root: &Path,
+    runtime_id: &str,
+    workspace: &str,
+    project_root: Option<&Path>,
+) -> PathBuf {
+    runtime_root
+        .join(runtime_id)
+        .join(workspace)
+        .join(RUNTIME_PROJECTS_DIR)
+        .join(runtime_project_partition_key(project_root))
+}
+
+pub fn runtime_project_generated_agents_path_from_parts(
+    runtime_root: &Path,
+    runtime_id: &str,
+    workspace: &str,
+    project_root: Option<&Path>,
+) -> PathBuf {
+    runtime_project_dir_from_parts(runtime_root, runtime_id, workspace, project_root)
+        .join("AGENTS.generated.md")
+}
+
+pub fn runtime_project_drafts_dir_from_parts(
+    runtime_root: &Path,
+    runtime_id: &str,
+    workspace: &str,
+    project_root: Option<&Path>,
+) -> PathBuf {
+    runtime_project_dir_from_parts(runtime_root, runtime_id, workspace, project_root)
+        .join(RUNTIME_DRAFTS_DIR)
+}
+
+pub fn runtime_session_state_dir_from_parts(
+    runtime_root: &Path,
+    runtime_id: &str,
+    workspace: &str,
+    project_root: Option<&Path>,
+    session_id: Uuid,
+    compatibility_key: &str,
+    shape_key: &str,
+) -> PathBuf {
+    runtime_project_dir_from_parts(runtime_root, runtime_id, workspace, project_root)
+        .join(RUNTIME_SESSIONS_DIR)
+        .join(session_id.to_string())
+        .join(compatibility_key)
+        .join(shape_key)
+}
+
+fn hashed_partition_key(prefix: &str, source: &[u8]) -> String {
+    let digest = Sha256::digest(source);
+    format!("{prefix}-{}", &hex::encode(digest)[..12])
+}
+
 fn default_home_root() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".lionclaw"))
 }
 
+#[cfg(unix)]
+async fn harden_runtime_secret_permissions(path: &Path) -> Result<()> {
+    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+
+    let config_dir = path.parent().ok_or_else(|| {
+        anyhow!(
+            "runtime secrets file '{}' does not have a parent directory",
+            path.display()
+        )
+    })?;
+    let config_mode = tokio::fs::metadata(config_dir)
+        .await
+        .with_context(|| format!("failed to read metadata for {}", config_dir.display()))?
+        .permissions()
+        .mode();
+    if config_mode & 0o077 != 0 {
+        tokio::fs::set_permissions(config_dir, Permissions::from_mode(0o700))
+            .await
+            .with_context(|| format!("failed to chmod {}", config_dir.display()))?;
+    }
+
+    let file_mode = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?
+        .permissions()
+        .mode();
+    if file_mode & 0o077 != 0 {
+        tokio::fs::set_permissions(path, Permissions::from_mode(0o600))
+            .await
+            .with_context(|| format!("failed to chmod {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn harden_runtime_secret_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LionClawHome, DEFAULT_WORKSPACE};
+    use super::{
+        runtime_profile_partition_key, runtime_project_partition_key, LionClawHome,
+        DEFAULT_WORKSPACE, RUNTIME_DRAFTS_DIR, RUNTIME_PROJECTS_DIR, RUNTIME_SESSIONS_DIR,
+    };
+    use uuid::Uuid;
 
     #[test]
     fn derives_canonical_paths() {
         let home = LionClawHome::new("/tmp/lionclaw-home".into());
+        let project_root = std::path::Path::new("/tmp/project");
+        let project_key = runtime_project_partition_key(Some(project_root));
+        let compatibility_key = runtime_profile_partition_key(b"codex-v1");
+        let session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("uuid");
 
         assert_eq!(
             home.db_path(),
@@ -160,6 +383,10 @@ mod tests {
         assert_eq!(
             home.config_path(),
             std::path::PathBuf::from("/tmp/lionclaw-home/config/lionclaw.toml")
+        );
+        assert_eq!(
+            home.runtime_secrets_env_path(),
+            std::path::PathBuf::from("/tmp/lionclaw-home/config/runtime-secrets.env")
         );
         assert_eq!(
             home.home_id_path(),
@@ -177,6 +404,42 @@ mod tests {
             home.runtime_channel_dir("telegram"),
             std::path::PathBuf::from("/tmp/lionclaw-home/runtime/channels/telegram")
         );
+        assert_eq!(
+            home.runtime_project_dir("codex", DEFAULT_WORKSPACE, project_root),
+            std::path::PathBuf::from("/tmp/lionclaw-home/runtime")
+                .join("codex")
+                .join("main")
+                .join(RUNTIME_PROJECTS_DIR)
+                .join(&project_key)
+        );
+        assert_eq!(
+            home.runtime_project_drafts_dir("codex", DEFAULT_WORKSPACE, project_root),
+            std::path::PathBuf::from("/tmp/lionclaw-home/runtime")
+                .join("codex")
+                .join("main")
+                .join(RUNTIME_PROJECTS_DIR)
+                .join(&project_key)
+                .join(RUNTIME_DRAFTS_DIR)
+        );
+        assert_eq!(
+            home.runtime_session_state_dir(
+                "codex",
+                DEFAULT_WORKSPACE,
+                project_root,
+                session_id,
+                &compatibility_key,
+                "workspace-read-write__network-on__secrets-off"
+            ),
+            std::path::PathBuf::from("/tmp/lionclaw-home/runtime")
+                .join("codex")
+                .join("main")
+                .join(RUNTIME_PROJECTS_DIR)
+                .join(project_key)
+                .join(RUNTIME_SESSIONS_DIR)
+                .join(session_id.to_string())
+                .join(compatibility_key)
+                .join("workspace-read-write__network-on__secrets-off")
+        );
     }
 
     #[tokio::test]
@@ -193,5 +456,91 @@ mod tests {
             home.read_home_id().await.expect("read home id"),
             Some(first)
         );
+    }
+
+    #[tokio::test]
+    async fn missing_runtime_secrets_file_returns_none() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+
+        let secrets = home
+            .resolve_runtime_secrets_file()
+            .await
+            .expect("resolve secrets");
+        assert!(secrets.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_secrets_file_resolves_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        tokio::fs::write(home.runtime_secrets_env_path(), "GITHUB_TOKEN=ghp_test\n")
+            .await
+            .expect("write runtime secrets");
+
+        let secrets = home
+            .resolve_runtime_secrets_file()
+            .await
+            .expect("resolve secrets");
+        assert_eq!(secrets, Some(home.runtime_secrets_env_path()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_secrets_file_is_hardened_to_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        std::fs::set_permissions(home.config_dir(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod config dir");
+        tokio::fs::write(home.runtime_secrets_env_path(), "GITHUB_TOKEN=ghp_test\n")
+            .await
+            .expect("write runtime secrets");
+        std::fs::set_permissions(
+            home.runtime_secrets_env_path(),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("chmod env file");
+
+        let resolved = home
+            .resolve_runtime_secrets_file()
+            .await
+            .expect("resolve secrets");
+        assert_eq!(resolved, Some(home.runtime_secrets_env_path()));
+
+        let config_mode = std::fs::metadata(home.config_dir())
+            .expect("config metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = std::fs::metadata(home.runtime_secrets_env_path())
+            .expect("file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(config_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_secrets_file_rejects_symlinks() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+
+        let real = temp_dir.path().join("real.env");
+        std::fs::write(&real, "GITHUB_TOKEN=ghp_test\n").expect("write real env");
+        std::os::unix::fs::symlink(&real, home.runtime_secrets_env_path()).expect("symlink env");
+
+        let err = home
+            .resolve_runtime_secrets_file()
+            .await
+            .expect_err("symlink should fail");
+        assert!(err.to_string().contains("cannot be a symlink"));
     }
 }

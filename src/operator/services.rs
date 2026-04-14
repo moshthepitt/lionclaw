@@ -41,13 +41,14 @@ pub fn render_daemon_unit(
     bind_addr: &str,
     runtime_id: &str,
     workspace: &str,
-    extra_env: &[(String, String)],
+    project_workspace_root: &Path,
+    config_fingerprint: &str,
 ) -> ManagedServiceUnit {
     let env_path = home.services_env_dir().join("lionclawd.env");
     let unit_path = home.services_systemd_dir().join(DAEMON_UNIT_NAME);
 
     let (host, port) = parse_bind_addr(bind_addr);
-    let mut env_lines = vec![
+    let env_lines = [
         (
             "LIONCLAW_HOME".to_string(),
             home.root().display().to_string(),
@@ -60,8 +61,15 @@ pub fn render_daemon_unit(
             runtime_id.to_string(),
         ),
         ("LIONCLAW_WORKSPACE".to_string(), workspace.to_string()),
+        (
+            "LIONCLAW_WORKSPACE_ROOT".to_string(),
+            project_workspace_root.display().to_string(),
+        ),
+        (
+            "LIONCLAW_DAEMON_CONFIG_FINGERPRINT".to_string(),
+            config_fingerprint.to_string(),
+        ),
     ];
-    env_lines.extend(extra_env.iter().cloned());
     let env_content = env_lines
         .iter()
         .map(|(key, value)| format!("{key}={}\n", escape_env_value(value)))
@@ -562,19 +570,26 @@ mod tests {
             "127.0.0.1:8979",
             "codex",
             "main",
-            &[],
+            Path::new("/tmp/project"),
+            "daemon-compat-test",
         );
         assert!(daemon.unit_content.contains("ExecStart=/tmp/bin/lionclawd"));
         assert!(daemon
             .env_content
             .contains("LIONCLAW_BIND_ADDR=\"127.0.0.1:8979\""));
         assert!(daemon.env_content.contains("LIONCLAW_WORKSPACE=\"main\""));
+        assert!(daemon
+            .env_content
+            .contains("LIONCLAW_WORKSPACE_ROOT=\"/tmp/project\""));
+        assert!(daemon
+            .env_content
+            .contains("LIONCLAW_DAEMON_CONFIG_FINGERPRINT=\"daemon-compat-test\""));
 
         let channel = render_channel_unit(
             &home,
             &ChannelServiceSpec {
                 channel_id: "telegram".to_string(),
-                worker_path: "/tmp/skills/telegram/scripts/worker.sh".into(),
+                worker_path: "/tmp/skills/telegram/scripts/worker".into(),
                 env: vec![("TELEGRAM_BOT_TOKEN".to_string(), "secret".to_string())],
             },
         );

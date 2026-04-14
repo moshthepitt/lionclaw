@@ -9,8 +9,12 @@ use crate::{
     api::build_router,
     config::Config,
     contracts::DaemonInfoResponse,
-    kernel::{Kernel, KernelOptions},
-    operator::{config::OperatorConfig, runtime::register_configured_runtimes},
+    home::runtime_project_partition_key,
+    kernel::{Kernel, KernelOptions, RuntimeExecutionPolicy},
+    operator::{
+        config::{daemon_compat_fingerprint, OperatorConfig},
+        runtime::{configured_runtime_execution_profiles, register_configured_runtimes},
+    },
 };
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
@@ -26,6 +30,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .project_workspace_root
         .clone()
         .unwrap_or_else(|| workspace_root.clone());
+    let project_scope = runtime_project_partition_key(Some(project_workspace_root.as_path()));
+    let config_fingerprint = daemon_compat_fingerprint(&operator_config);
     let default_runtime_id = config
         .default_runtime_id
         .clone()
@@ -41,9 +47,18 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 runtime_turn_hard_timeout: Duration::from_millis(
                     config.runtime_turn_hard_timeout_ms,
                 ),
+                runtime_execution_policy: RuntimeExecutionPolicy::for_working_dir_root(
+                    project_workspace_root.clone(),
+                ),
                 default_runtime_id,
+                default_preset_name: operator_config.defaults.preset.clone(),
+                execution_presets: operator_config.presets.clone(),
+                runtime_execution_profiles: configured_runtime_execution_profiles(&operator_config),
+                runtime_secrets_home: Some(config.home.clone()),
                 workspace_root: Some(workspace_root),
                 project_workspace_root: Some(project_workspace_root),
+                runtime_root: Some(config.home.runtime_dir()),
+                workspace_name: Some(operator_config.daemon.workspace.clone()),
                 ..KernelOptions::default()
             },
         )
@@ -62,6 +77,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             home_id,
             home_root: config.home.root().display().to_string(),
             bind_addr: config.bind_addr.clone(),
+            project_scope,
+            config_fingerprint,
         },
     );
 

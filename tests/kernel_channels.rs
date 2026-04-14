@@ -16,7 +16,7 @@ use lionclaw::{
             RuntimeEventSender, RuntimeMessageLane, RuntimeSessionHandle, RuntimeSessionStartInput,
             RuntimeTurnInput, RuntimeTurnResult,
         },
-        InboundChannelText, Kernel, KernelError,
+        InboundChannelText, Kernel, KernelError, KernelOptions,
     },
 };
 use tempfile::TempDir;
@@ -743,6 +743,68 @@ async fn latest_session_snapshot_returns_precise_resume_sequence() {
 }
 
 #[tokio::test]
+async fn latest_session_snapshot_is_project_scoped() {
+    let env = TestEnv::new();
+    let project_a = env.temp_dir.path().join("project-a");
+    let project_b = env.temp_dir.path().join("project-b");
+    std::fs::create_dir_all(&project_a).expect("project a");
+    std::fs::create_dir_all(&project_b).expect("project b");
+
+    let kernel_a = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            project_workspace_root: Some(project_a),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel a");
+    let session_a = kernel_a
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "alice".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open project-a session");
+
+    let kernel_b = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            project_workspace_root: Some(project_b),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel b");
+
+    let snapshot = kernel_b
+        .latest_session_snapshot(SessionLatestQuery {
+            channel_id: "terminal".to_string(),
+            peer_id: "alice".to_string(),
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("latest snapshot");
+    assert!(
+        snapshot.session.is_none(),
+        "project-b kernel should not see project-a sessions"
+    );
+
+    let session_b = kernel_b
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "alice".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open project-b session");
+    assert_ne!(session_a.session_id, session_b.session_id);
+}
+
+#[tokio::test]
 async fn latest_session_snapshot_uses_stream_head_before_first_answer_checkpoint() {
     let env = TestEnv::new();
     let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
@@ -1149,6 +1211,7 @@ impl RuntimeAdapter for TwoChunkAnswerAdapter {
     ) -> Result<RuntimeSessionHandle, anyhow::Error> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("two-chunk:{}", input.session_id),
+            resumes_existing_session: false,
         })
     }
 
@@ -1218,6 +1281,7 @@ impl RuntimeAdapter for PartialFailureAdapter {
     ) -> Result<RuntimeSessionHandle, anyhow::Error> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("partial-failure:{}", input.session_id),
+            resumes_existing_session: false,
         })
     }
 
@@ -1369,6 +1433,7 @@ impl RuntimeAdapter for SlowAnswerAdapter {
     ) -> Result<RuntimeSessionHandle, anyhow::Error> {
         Ok(RuntimeSessionHandle {
             runtime_session_id: format!("slow-answer:{}", input.session_id),
+            resumes_existing_session: false,
         })
     }
 

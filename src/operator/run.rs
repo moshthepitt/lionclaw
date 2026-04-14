@@ -1,21 +1,23 @@
 use std::{
     future::Future,
     io::{BufRead, Write},
+    path::Path,
 };
 
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
 use crate::{
+    config::resolve_project_workspace_root,
     contracts::{
         SessionActionKind, SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest,
         SessionOpenRequest, SessionTurnRequest, SessionTurnStatus, SessionTurnView, StreamEventDto,
         StreamEventKindDto, StreamLaneDto, TrustTier,
     },
-    home::LionClawHome,
+    home::{runtime_project_partition_key, LionClawHome},
     kernel::Kernel,
     operator::{
-        reconcile::{apply, onboard, open_kernel, render_runtime_cache},
+        reconcile::{apply, onboard, open_runtime_kernel, render_runtime_cache},
         runtime::{resolve_runtime_id, validate_runtime_availability},
     },
 };
@@ -52,13 +54,14 @@ pub(crate) async fn run_local_with_io<R: BufRead, W: Write>(
     validate_runtime_availability(&applied.config, &runtime_id)?;
     render_runtime_cache(home, &applied.config, &applied.lockfile, &runtime_id).await?;
 
-    let kernel = open_kernel(home, &applied.config, Some(runtime_id.clone())).await?;
-    let workspace = applied.config.daemon.workspace.clone();
-    let peer_id = local_peer_id();
+    let kernel = open_runtime_kernel(home, &applied.config, Some(runtime_id.clone())).await?;
+    let project_workspace_root = resolve_project_workspace_root()
+        .map_err(|err| anyhow!("failed to resolve project workspace root: {}", err))?;
+    let peer_id = local_peer_id_for_project(&project_workspace_root);
     run_repl(
         &kernel,
         &runtime_id,
-        &workspace,
+        &project_workspace_root.display().to_string(),
         &peer_id,
         continue_last_session,
         input,
@@ -70,7 +73,7 @@ pub(crate) async fn run_local_with_io<R: BufRead, W: Write>(
 async fn run_repl<R: BufRead, W: Write>(
     kernel: &Kernel,
     runtime_id: &str,
-    workspace: &str,
+    project_workspace_root: &str,
     peer_id: &str,
     continue_last_session: bool,
     input: &mut R,
@@ -83,8 +86,8 @@ async fn run_repl<R: BufRead, W: Write>(
 
     writeln!(
         output,
-        "LionClaw interactive mode\nruntime: {}\nworkspace: {}\nType /continue, /retry, /reset, or /exit.\n",
-        runtime_id, workspace
+        "LionClaw interactive mode\nruntime: {}\nproject: {}\nType /continue, /retry, /reset, or /exit.\n",
+        runtime_id, project_workspace_root
     )?;
 
     if continue_last_session {
@@ -149,13 +152,21 @@ async fn run_repl<R: BufRead, W: Write>(
     Ok(())
 }
 
-fn local_peer_id() -> String {
+fn local_user_id() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "local-user".to_string())
+}
+
+fn local_peer_id_for_project(project_root: &Path) -> String {
+    format!(
+        "{}@project:{}",
+        local_user_id(),
+        runtime_project_partition_key(Some(project_root))
+    )
 }
 
 fn kernel_to_anyhow(err: crate::kernel::KernelError) -> anyhow::Error {
@@ -302,7 +313,8 @@ where
     F: Future<Output = Result<crate::contracts::SessionTurnResponse, crate::kernel::KernelError>>
         + Unpin,
 {
-    let mut assistant_seen = false;
+    let mut visible_output_seen = false;
+    let mut answer_output_seen = false;
     let mut error_seen = false;
     let mut turn_error: Option<crate::kernel::KernelError> = None;
 
@@ -319,8 +331,11 @@ where
                 let Some(event) = maybe_event else {
                     continue;
                 };
-                if is_answer_delta(&event) {
-                    assistant_seen = true;
+                if is_visible_message_delta(&event) {
+                    visible_output_seen = true;
+                }
+                if is_answer_message_delta(&event) {
+                    answer_output_seen = true;
                 }
                 if matches!(event.kind, StreamEventKindDto::Error) {
                     error_seen = true;
@@ -332,8 +347,11 @@ where
     }
 
     while let Ok(event) = rx.try_recv() {
-        if is_answer_delta(&event) {
-            assistant_seen = true;
+        if is_visible_message_delta(&event) {
+            visible_output_seen = true;
+        }
+        if is_answer_message_delta(&event) {
+            answer_output_seen = true;
         }
         if matches!(event.kind, StreamEventKindDto::Error) {
             error_seen = true;
@@ -343,19 +361,47 @@ where
     output.flush()?;
 
     if let Some(err) = turn_error {
-        if assistant_seen
-            && matches!(
-                err,
-                crate::kernel::KernelError::RuntimeTimeout(_)
-                    | crate::kernel::KernelError::Runtime(_)
-            )
-        {
-            writeln!(
-                output,
-                "Timed out. Partial output is shown above. Use /continue, /retry, or /reset."
-            )?;
-            output.flush()?;
-            return Ok(());
+        if answer_output_seen {
+            match err {
+                crate::kernel::KernelError::RuntimeTimeout(_) => {
+                    writeln!(
+                        output,
+                        "Timed out. Partial output is shown above. Use /continue, /retry, or /reset."
+                    )?;
+                    output.flush()?;
+                    return Ok(());
+                }
+                crate::kernel::KernelError::Runtime(_) => {
+                    writeln!(
+                        output,
+                        "Runtime error. Partial output is shown above. Use /continue, /retry, or /reset."
+                    )?;
+                    output.flush()?;
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        if visible_output_seen {
+            match err {
+                crate::kernel::KernelError::RuntimeTimeout(_) => {
+                    writeln!(
+                        output,
+                        "Timed out. Partial output is shown above. Use /retry or /reset."
+                    )?;
+                    output.flush()?;
+                    return Ok(());
+                }
+                crate::kernel::KernelError::Runtime(_) => {
+                    writeln!(
+                        output,
+                        "Runtime error. Partial output is shown above. Use /retry or /reset."
+                    )?;
+                    output.flush()?;
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
         if !error_seen {
             writeln!(output, "error: {}", err)?;
@@ -366,7 +412,17 @@ where
     Ok(())
 }
 
-fn is_answer_delta(event: &StreamEventDto) -> bool {
+fn is_visible_message_delta(event: &StreamEventDto) -> bool {
+    matches!(
+        (&event.kind, &event.lane),
+        (
+            StreamEventKindDto::MessageDelta,
+            Some(StreamLaneDto::Answer | StreamLaneDto::Reasoning)
+        )
+    ) && event.text.as_deref().is_some_and(|text| !text.is_empty())
+}
+
+fn is_answer_message_delta(event: &StreamEventDto) -> bool {
     matches!(
         (&event.kind, &event.lane),
         (
@@ -429,11 +485,18 @@ mod tests {
     use sqlx::{Row, SqlitePool};
     use uuid::Uuid;
 
-    use super::{local_peer_id, render_turn_stream, run_local_with_io};
+    use super::{
+        local_peer_id_for_project, render_turn_stream, resolve_repl_session, run_local_with_io,
+    };
     use crate::{
+        config::resolve_project_workspace_root,
         contracts::{StreamEventDto, StreamEventKindDto, StreamLaneDto},
-        home::LionClawHome,
-        kernel::db::Db,
+        home::{runtime_project_partition_key, LionClawHome},
+        kernel::{
+            db::Db,
+            runtime::{ConfinementConfig, OciConfinementConfig},
+            Kernel, KernelOptions,
+        },
         operator::config::{OperatorConfig, RuntimeProfileConfig},
     };
 
@@ -452,16 +515,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         );
 
         let mut config = OperatorConfig::default();
-        config.upsert_runtime(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: stub.to_string_lossy().to_string(),
-                model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
-            },
-        );
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
@@ -504,16 +558,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         );
 
         let mut config = OperatorConfig::default();
-        config.upsert_runtime(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: stub.to_string_lossy().to_string(),
-                model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
-            },
-        );
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
 
         let mut first_input = Cursor::new(b"hello\n/exit\n".to_vec());
@@ -558,16 +603,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         );
 
         let mut config = OperatorConfig::default();
-        config.upsert_runtime(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: stub.to_string_lossy().to_string(),
-                model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
-            },
-        );
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
 
         let mut first_input = Cursor::new(b"hello\n/exit\n".to_vec());
@@ -592,13 +628,19 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             .get::<Option<i64>, _>("last_activity_at_ms")
             .expect("last activity timestamp");
         let newer_created_at_ms = last_activity_at_ms + 1_000;
+        let project_scope = runtime_project_partition_key(Some(
+            &resolve_project_workspace_root().expect("project root"),
+        ));
         sqlx::query(
             "INSERT INTO sessions \
-             (session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, last_activity_at_ms, turn_count) \
-             VALUES (?1, 'local-cli', ?2, 'main', 'interactive', ?3, NULL, NULL, 0)",
+             (session_id, channel_id, peer_id, project_scope, trust_tier, history_policy, created_at_ms, last_turn_at_ms, last_activity_at_ms, turn_count) \
+             VALUES (?1, 'local-cli', ?2, ?3, 'main', 'interactive', ?4, NULL, NULL, 0)",
         )
         .bind(Uuid::new_v4().to_string())
-        .bind(local_peer_id())
+        .bind(local_peer_id_for_project(
+            &resolve_project_workspace_root().expect("project root"),
+        ))
+        .bind(project_scope)
         .bind(newer_created_at_ms)
         .execute(&pool)
         .await
@@ -640,30 +682,26 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         write_script(&stub, "#!/usr/bin/env bash\ncat >/dev/null\n");
 
         let mut config = OperatorConfig::default();
-        config.upsert_runtime(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: stub.to_string_lossy().to_string(),
-                model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
-            },
-        );
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
         let pool = Db::connect_file(&home.db_path())
             .await
             .expect("connect db")
             .pool();
-        let peer_id = local_peer_id();
+        let peer_id =
+            local_peer_id_for_project(&resolve_project_workspace_root().expect("project root"));
+        let project_scope = runtime_project_partition_key(Some(
+            &resolve_project_workspace_root().expect("project root"),
+        ));
         let session_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO sessions \
-             (session_id, channel_id, peer_id, trust_tier, history_policy, created_at_ms, last_turn_at_ms, last_activity_at_ms, turn_count) \
-             VALUES (?1, 'local-cli', ?2, 'main', 'interactive', 1, 2, 2, 1)",
+             (session_id, channel_id, peer_id, project_scope, trust_tier, history_policy, created_at_ms, last_turn_at_ms, last_activity_at_ms, turn_count) \
+             VALUES (?1, 'local-cli', ?2, ?3, 'main', 'interactive', 1, 2, 2, 1)",
         )
         .bind(session_id.to_string())
         .bind(&peer_id)
+        .bind(project_scope)
         .execute(&pool)
         .await
         .expect("insert session");
@@ -695,6 +733,36 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
     }
 
     #[tokio::test]
+    async fn local_continue_last_session_is_project_scoped() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("lionclaw.db");
+        let kernel = Kernel::new_with_options(&db_path, KernelOptions::default())
+            .await
+            .expect("kernel init");
+        let project_a = temp_dir.path().join("project-a");
+        let project_b = temp_dir.path().join("project-b");
+        fs::create_dir_all(&project_a).expect("project a");
+        fs::create_dir_all(&project_b).expect("project b");
+
+        let project_a_peer = local_peer_id_for_project(&project_a);
+        let project_b_peer = local_peer_id_for_project(&project_b);
+        assert_ne!(project_a_peer, project_b_peer);
+
+        let existing = resolve_repl_session(&kernel, &project_a_peer, false)
+            .await
+            .expect("open project a session");
+        let resumed = resolve_repl_session(&kernel, &project_a_peer, true)
+            .await
+            .expect("resume project a session");
+        let isolated = resolve_repl_session(&kernel, &project_b_peer, true)
+            .await
+            .expect("open project b session");
+
+        assert_eq!(resumed.session_id, existing.session_id);
+        assert_ne!(isolated.session_id, existing.session_id);
+    }
+
+    #[tokio::test]
     async fn run_local_reset_opens_a_fresh_session() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
@@ -708,16 +776,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         }
 
         let mut config = OperatorConfig::default();
-        config.upsert_runtime(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: stub.to_string_lossy().to_string(),
-                model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
-            },
-        );
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
 
         let mut input = Cursor::new(b"/reset\n/exit\n".to_vec());
@@ -753,16 +812,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         }
 
         let mut config = OperatorConfig::default();
-        config.upsert_runtime(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: stub.to_string_lossy().to_string(),
-                model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
-            },
-        );
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
 
         let mut input = Cursor::new(b"/exit\n".to_vec());
@@ -791,7 +841,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
     }
 
     #[tokio::test]
-    async fn run_local_errors_when_runtime_executable_is_missing() {
+    async fn run_local_errors_when_runtime_engine_is_missing() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
 
@@ -799,15 +849,17 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         config.upsert_runtime(
             "codex".to_string(),
             RuntimeProfileConfig::Codex {
-                executable: temp_dir
-                    .path()
-                    .join("missing-codex")
-                    .to_string_lossy()
-                    .to_string(),
+                executable: "codex".to_string(),
                 model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: temp_dir
+                        .path()
+                        .join("missing-podman")
+                        .to_string_lossy()
+                        .to_string(),
+                    image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
             },
         );
         config.save(&home).await.expect("save config");
@@ -816,9 +868,167 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let mut output = Vec::new();
         let err = run_local_with_io(&home, None, false, &mut input, &mut output)
             .await
-            .expect_err("missing executable should error");
+            .expect_err("missing engine should error");
 
-        assert!(err.to_string().contains("configured runtime command"));
+        assert!(err.to_string().contains("configured runtime profile"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_local_streams_codex_reasoning_and_answer_lanes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let stub = temp_dir.path().join("codex-stub.sh");
+        write_script(
+            &stub,
+            r#"#!/usr/bin/env bash
+cat >/dev/null
+echo '{"type":"item.updated","item":{"type":"reasoning","text":"planning next step"}}'
+echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from codex"}}'
+"#,
+        );
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
+        config.save(&home).await.expect("save config");
+
+        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut output = Vec::new();
+        run_local_with_io(&home, None, false, &mut input, &mut output)
+            .await
+            .expect("run local");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("thinking> planning next step"));
+        assert!(output.contains("lionclaw> hello from codex"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_local_executes_opencode_on_the_shared_program_backed_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let stub = temp_dir.path().join("opencode-stub.sh");
+        write_script(
+            &stub,
+            r#"#!/usr/bin/env bash
+cat >/dev/null
+echo '{"type":"response.output_text.delta","text":"hello from opencode"}'
+"#,
+        );
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("opencode".to_string(), stubbed_opencode_runtime(&stub));
+        config.save(&home).await.expect("save config");
+
+        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut output = Vec::new();
+        run_local_with_io(&home, None, false, &mut input, &mut output)
+            .await
+            .expect("run local");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("runtime: opencode"));
+        assert!(output.contains("lionclaw> hello from opencode"));
+        assert!(!output.contains("[status] opencode event: response.output_text.delta"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_local_streams_opencode_reasoning_and_answer_lanes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let stub = temp_dir.path().join("opencode-stub.sh");
+        write_script(
+            &stub,
+            r#"#!/usr/bin/env bash
+cat >/dev/null
+echo '{"type":"reasoning","text":"planning next step"}'
+echo '{"type":"text","text":"hello from opencode"}'
+"#,
+        );
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("opencode".to_string(), stubbed_opencode_runtime(&stub));
+        config.save(&home).await.expect("save config");
+
+        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut output = Vec::new();
+        run_local_with_io(&home, None, false, &mut input, &mut output)
+            .await
+            .expect("run local");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("thinking> planning next step"));
+        assert!(output.contains("lionclaw> hello from opencode"));
+        assert!(!output.contains("[status] opencode event: reasoning"));
+        assert!(!output.contains("[status] opencode event: text"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_local_reports_opencode_reasoning_only_failures_as_partial_output() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let stub = temp_dir.path().join("opencode-stub.sh");
+        write_script(
+            &stub,
+            r#"#!/usr/bin/env bash
+cat >/dev/null
+echo '{"type":"reasoning","text":"checking the workspace"}'
+exit 7
+"#,
+        );
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("opencode".to_string(), stubbed_opencode_runtime(&stub));
+        config.save(&home).await.expect("save config");
+
+        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut output = Vec::new();
+        run_local_with_io(&home, None, false, &mut input, &mut output)
+            .await
+            .expect("run local");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("thinking> checking the workspace"));
+        assert!(output.contains("Runtime error. Partial output is shown above."));
+        assert!(output.contains("Use /retry or /reset."));
+        assert!(!output.contains("Use /continue, /retry, or /reset."));
+        assert!(!output.contains("Timed out. Partial output is shown above."));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_local_reports_reasoning_only_runtime_failures_as_partial_output() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let stub = temp_dir.path().join("codex-stub.sh");
+        write_script(
+            &stub,
+            r#"#!/usr/bin/env bash
+cat >/dev/null
+echo '{"type":"item.updated","item":{"type":"reasoning","text":"checking the workspace"}}'
+exit 7
+"#,
+        );
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
+        config.save(&home).await.expect("save config");
+
+        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut output = Vec::new();
+        run_local_with_io(&home, None, false, &mut input, &mut output)
+            .await
+            .expect("run local");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("thinking> checking the workspace"));
+        assert!(output.contains("Runtime error. Partial output is shown above."));
+        assert!(output.contains("Use /retry or /reset."));
+        assert!(!output.contains("Use /continue, /retry, or /reset."));
+        assert!(!output.contains("Timed out. Partial output is shown above."));
     }
 
     #[test]
@@ -881,5 +1091,80 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         std::fs::rename(&temp_path, path).expect("rename script");
         let permissions = std::fs::Permissions::from_mode(0o755);
         std::fs::set_permissions(path, permissions).expect("chmod script");
+    }
+
+    #[cfg(unix)]
+    fn ensure_fake_podman(reference: &std::path::Path) -> std::path::PathBuf {
+        let engine = reference.parent().expect("stub parent").join("podman");
+        if !engine.exists() {
+            write_script(
+                &engine,
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+
+command_name="${1:-}"
+shift || true
+
+case "${command_name}" in
+  secret)
+    exit 0
+    ;;
+  run)
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --rm|--interactive|--read-only)
+          shift
+          ;;
+        --network|--workdir|--volume|--tmpfs|--env|--secret|--memory|--cpus|--pids-limit)
+          shift 2
+          ;;
+        --)
+          shift
+          break
+          ;;
+        -*)
+          shift
+          ;;
+        *)
+          shift
+          break
+          ;;
+      esac
+    done
+    exec "$@"
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"#,
+            );
+        }
+        engine
+    }
+
+    fn stubbed_codex_runtime(executable: &std::path::Path) -> RuntimeProfileConfig {
+        RuntimeProfileConfig::Codex {
+            executable: executable.display().to_string(),
+            model: None,
+            confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                engine: ensure_fake_podman(executable).to_string_lossy().to_string(),
+                image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                ..OciConfinementConfig::default()
+            }),
+        }
+    }
+
+    fn stubbed_opencode_runtime(executable: &std::path::Path) -> RuntimeProfileConfig {
+        RuntimeProfileConfig::OpenCode {
+            executable: executable.display().to_string(),
+            model: None,
+            agent: None,
+            confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                engine: ensure_fake_podman(executable).to_string_lossy().to_string(),
+                image: Some("ghcr.io/lionclaw/test-opencode-runtime:latest".to_string()),
+                ..OciConfinementConfig::default()
+            }),
+        }
     }
 }

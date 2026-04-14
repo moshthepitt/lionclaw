@@ -323,6 +323,24 @@ impl ContinuityLayout {
         Ok(fs.absolute_path(&relative))
     }
 
+    pub async fn prepare_promoted_artifact_path(&self, file_name: &str) -> Result<PathBuf> {
+        let file_name = Path::new(file_name)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("artifact file name '{}' is invalid", file_name))?;
+        let at = Utc::now();
+        let relative = self
+            .artifacts_rel_dir()
+            .join(format!("{:04}", at.year()))
+            .join(format!("{:02}", at.month()))
+            .join(format!("{}-{}", Uuid::new_v4(), file_name));
+        let fs = self.fs().await?;
+        if let Some(parent) = relative.parent() {
+            fs.create_dir_all(parent)?;
+        }
+        Ok(fs.absolute_path(&relative))
+    }
+
     pub async fn upsert_open_loop(
         &self,
         loop_draft: &ContinuityOpenLoopDraft,
@@ -578,16 +596,19 @@ impl ContinuityLayout {
         limit: usize,
     ) -> Result<Vec<ContinuityArtifactSummary>> {
         let fs = self.fs().await?;
-        let mut files = fs.list_markdown_files(&self.artifacts_rel_dir())?;
+        let mut files = fs.list_regular_files(&self.artifacts_rel_dir())?;
         files = self.sort_relative_paths_by_modified_desc(files).await?;
 
         let mut artifacts = Vec::new();
         for path in files.into_iter().take(limit) {
-            let Some(content) = fs.read_to_string_if_exists(&path)? else {
-                continue;
-            };
             artifacts.push(ContinuityArtifactSummary {
-                title: extract_heading(&content).unwrap_or_else(|| stem_fallback(&path)),
+                title: if path.extension().is_some_and(|ext| ext == "md") {
+                    fs.read_to_string_if_exists(&path)?
+                        .and_then(|content| extract_heading(&content))
+                        .unwrap_or_else(|| stem_fallback(&path))
+                } else {
+                    stem_fallback(&path)
+                },
                 relative_path: path.to_string_lossy().to_string(),
             });
         }

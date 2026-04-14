@@ -48,6 +48,8 @@ pub struct DaemonInfoResponse {
     pub home_id: String,
     pub home_root: String,
     pub bind_addr: String,
+    pub project_scope: String,
+    pub config_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -624,6 +626,45 @@ pub struct ContinuitySearchResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContinuityPathRequest {
     pub relative_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuityDraftListRequest {
+    #[serde(default)]
+    pub runtime_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuityDraftActionRequest {
+    #[serde(default)]
+    pub runtime_id: Option<String>,
+    pub relative_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuityDraftView {
+    pub relative_path: String,
+    pub size_bytes: u64,
+    pub media_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuityDraftListResponse {
+    pub runtime_id: String,
+    pub drafts: Vec<ContinuityDraftView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuityDraftPromoteResponse {
+    pub runtime_id: String,
+    pub draft_path: String,
+    pub artifact_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinuityDraftDiscardResponse {
+    pub runtime_id: String,
+    pub draft_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

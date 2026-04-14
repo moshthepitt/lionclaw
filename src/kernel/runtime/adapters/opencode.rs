@@ -1,73 +1,32 @@
-use std::collections::HashMap;
+use std::sync::RwLock;
+use std::{collections::HashMap, path::Path};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::kernel::runtime::{
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
-    RuntimeMessageLane, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
-    RuntimeTurnResult,
+    ExecutionOutput, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
+    RuntimeEventSender, RuntimeMessageLane, RuntimeProgramSpec, RuntimeSessionHandle,
+    RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
 };
-
-use super::subprocess::{run_non_interactive_streaming, SubprocessInvocation};
 
 #[derive(Debug, Clone)]
 pub struct OpenCodeRuntimeConfig {
     pub executable: String,
-    pub format: String,
     pub model: Option<String>,
     pub agent: Option<String>,
-    pub xdg_data_home: Option<String>,
-    pub continue_last_session: bool,
 }
 
 impl Default for OpenCodeRuntimeConfig {
     fn default() -> Self {
         Self {
             executable: "opencode".to_string(),
-            format: "json".to_string(),
             model: None,
             agent: None,
-            xdg_data_home: None,
-            continue_last_session: false,
         }
     }
-}
-
-impl OpenCodeRuntimeConfig {
-    pub fn from_env() -> Self {
-        let default = Self::default();
-        Self {
-            executable: std::env::var("LIONCLAW_OPENCODE_BIN")
-                .ok()
-                .filter(|raw| !raw.trim().is_empty())
-                .unwrap_or(default.executable),
-            format: std::env::var("LIONCLAW_OPENCODE_FORMAT")
-                .ok()
-                .filter(|raw| !raw.trim().is_empty())
-                .unwrap_or(default.format),
-            model: std::env::var("LIONCLAW_OPENCODE_MODEL")
-                .ok()
-                .filter(|raw| !raw.trim().is_empty()),
-            agent: std::env::var("LIONCLAW_OPENCODE_AGENT")
-                .ok()
-                .filter(|raw| !raw.trim().is_empty()),
-            xdg_data_home: std::env::var("LIONCLAW_OPENCODE_XDG_DATA_HOME")
-                .ok()
-                .filter(|raw| !raw.trim().is_empty()),
-            continue_last_session: env_flag("LIONCLAW_OPENCODE_CONTINUE_LAST_SESSION")
-                .unwrap_or(default.continue_last_session),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct OpenCodeSessionState {
-    working_dir: Option<String>,
-    environment: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -76,11 +35,12 @@ pub struct OpenCodeRuntimeAdapter {
     sessions: RwLock<HashMap<String, OpenCodeSessionState>>,
 }
 
-impl OpenCodeRuntimeAdapter {
-    pub fn from_env() -> Self {
-        Self::new(OpenCodeRuntimeConfig::from_env())
-    }
+#[derive(Debug, Clone, Copy)]
+struct OpenCodeSessionState {
+    resumes_existing_session: bool,
+}
 
+impl OpenCodeRuntimeAdapter {
     pub fn new(config: OpenCodeRuntimeConfig) -> Self {
         Self {
             config,
@@ -99,92 +59,78 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
         }
     }
 
-    async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
-        let runtime_session_id = format!("opencode-{}", Uuid::new_v4());
-        let state = OpenCodeSessionState {
-            working_dir: input.working_dir,
-            environment: input.environment,
-        };
-        self.sessions
-            .write()
-            .await
-            .insert(runtime_session_id.clone(), state);
-
-        Ok(RuntimeSessionHandle { runtime_session_id })
+    fn turn_mode(&self) -> RuntimeTurnMode {
+        RuntimeTurnMode::ProgramBacked
     }
 
-    async fn turn(
-        &self,
-        input: RuntimeTurnInput,
-        events: RuntimeEventSender,
-    ) -> Result<RuntimeTurnResult> {
-        let session = self
-            .sessions
-            .read()
-            .await
-            .get(&input.runtime_session_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("runtime session '{}' not found", input.runtime_session_id))?;
+    async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
+        let runtime_session_id = format!("opencode-{}", Uuid::new_v4());
+        let resumes_existing_session = input
+            .runtime_state_root
+            .as_deref()
+            .map(runtime_session_is_ready)
+            .transpose()?
+            .unwrap_or(false);
+        self.sessions
+            .write()
+            .map_err(|_| anyhow!("opencode runtime session state lock poisoned"))?
+            .insert(
+                runtime_session_id.clone(),
+                OpenCodeSessionState {
+                    resumes_existing_session,
+                },
+            );
 
-        let invocation = SubprocessInvocation {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id,
+            resumes_existing_session,
+        })
+    }
+
+    fn build_turn_program(&self, input: &RuntimeTurnInput) -> Result<RuntimeProgramSpec> {
+        let session = get_runtime_session(&self.sessions, &input.runtime_session_id)?;
+
+        Ok(RuntimeProgramSpec {
             executable: self.config.executable.clone(),
             args: build_opencode_run_args(
                 &self.config,
-                session.working_dir.as_deref(),
                 &input.prompt,
+                session.resumes_existing_session,
             ),
-            working_dir: None,
-            environment: merge_environment(
-                build_opencode_environment(&self.config),
-                session.environment.clone(),
-            ),
-            input: String::new(),
-        };
-
-        let mut saw_done = false;
-        let mut last_error_text: Option<String> = None;
-        let output = run_non_interactive_streaming(&invocation, |line| {
-            for event in parse_opencode_output_line(line) {
-                if matches!(event, RuntimeEvent::Done) {
-                    saw_done = true;
-                }
-                if let RuntimeEvent::Error { text, .. } = &event {
-                    last_error_text = Some(text.clone());
-                }
-                let _ = events.send(event);
-            }
-            Ok(())
+            environment: Vec::new(),
+            stdin: String::new(),
         })
-        .await?;
+    }
+
+    fn parse_program_output_line(&self, line: &str) -> Vec<RuntimeEvent> {
+        parse_opencode_output_line(line)
+    }
+
+    fn format_program_exit_error(
+        &self,
+        output: &ExecutionOutput,
+        observed_error_text: Option<&str>,
+    ) -> String {
+        let code = output.exit_code.unwrap_or(1);
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if !output.success() {
-            let code = output.exit_code.unwrap_or(1);
-            let detail = extract_opencode_error_detail(&output.stdout)
-                .or(last_error_text)
-                .or(if stderr.is_empty() {
-                    None
-                } else {
-                    Some(stderr)
-                });
+        let observed_detail = observed_error_text
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+        let stderr_detail = if stderr.is_empty() {
+            None
+        } else {
+            Some(stderr)
+        };
+        let detail = extract_opencode_error_detail(&output.stdout)
+            .or(observed_detail)
+            .or(stderr_detail);
 
-            return if let Some(detail) = detail {
-                Err(anyhow!(
-                    "opencode run exited with code {}: {}",
-                    code,
-                    detail
-                ))
-            } else {
-                Err(anyhow!("opencode run exited with code {}", code))
-            };
+        if let Some(detail) = detail {
+            format!("opencode run exited with code {}: {}", code, detail)
+        } else {
+            format!("opencode run exited with code {}", code)
         }
-
-        if !saw_done {
-            let _ = events.send(RuntimeEvent::Done);
-        }
-
-        Ok(RuntimeTurnResult {
-            capability_requests: Vec::new(),
-        })
     }
 
     async fn resolve_capability_requests(
@@ -209,7 +155,7 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
     async fn close(&self, handle: &RuntimeSessionHandle) -> Result<()> {
         self.sessions
             .write()
-            .await
+            .map_err(|_| anyhow!("opencode runtime session state lock poisoned"))?
             .remove(&handle.runtime_session_id);
         Ok(())
     }
@@ -217,18 +163,21 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
 
 fn build_opencode_run_args(
     config: &OpenCodeRuntimeConfig,
-    session_working_dir: Option<&str>,
     prompt: &str,
+    resumes_existing_session: bool,
 ) -> Vec<String> {
-    let mut args = vec![
-        "run".to_string(),
-        "--format".to_string(),
-        config.format.clone(),
-    ];
+    let mut args = vec!["run".to_string()];
 
-    if config.continue_last_session {
+    if resumes_existing_session {
         args.push("--continue".to_string());
     }
+
+    args.extend([
+        "--format".to_string(),
+        "json".to_string(),
+        "--thinking".to_string(),
+    ]);
+
     if let Some(model) = &config.model {
         args.push("--model".to_string());
         args.push(model.to_string());
@@ -237,43 +186,27 @@ fn build_opencode_run_args(
         args.push("--agent".to_string());
         args.push(agent.to_string());
     }
-    if let Some(working_dir) = session_working_dir {
-        args.push("--dir".to_string());
-        args.push(working_dir.to_string());
-    }
     args.push(prompt.to_string());
 
     args
 }
 
-fn build_opencode_environment(config: &OpenCodeRuntimeConfig) -> Vec<(String, String)> {
-    let mut env = Vec::new();
-    if let Some(xdg_data_home) = &config.xdg_data_home {
-        env.push(("XDG_DATA_HOME".to_string(), xdg_data_home.to_string()));
-    }
-    env
+fn get_runtime_session(
+    sessions: &RwLock<HashMap<String, OpenCodeSessionState>>,
+    runtime_session_id: &str,
+) -> Result<OpenCodeSessionState> {
+    sessions
+        .read()
+        .map_err(|_| anyhow!("opencode runtime session state lock poisoned"))?
+        .get(runtime_session_id)
+        .copied()
+        .ok_or_else(|| anyhow!("runtime session '{}' not found", runtime_session_id))
 }
 
-fn merge_environment(
-    mut base: Vec<(String, String)>,
-    extra: Vec<(String, String)>,
-) -> Vec<(String, String)> {
-    for (key, value) in extra {
-        if base.iter().any(|(existing_key, _)| existing_key == &key) {
-            continue;
-        }
-        base.push((key, value));
-    }
-    base
-}
-
-fn env_flag(name: &str) -> Option<bool> {
-    let value = std::env::var(name).ok()?;
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
+fn runtime_session_is_ready(root: &Path) -> Result<bool> {
+    Ok(root
+        .join(crate::home::RUNTIME_SESSION_READY_MARKER)
+        .is_file())
 }
 
 #[cfg(test)]
@@ -311,15 +244,6 @@ fn parse_opencode_output_line(line: &str) -> Vec<RuntimeEvent> {
 }
 
 fn parse_opencode_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
-    let event_type = json.get("type").and_then(Value::as_str);
-
-    if let Some(event_type) = event_type {
-        events.push(RuntimeEvent::Status {
-            code: None,
-            text: format!("opencode event: {}", event_type),
-        });
-    }
-
     if let Some(message) = extract_error_message(json) {
         events.push(RuntimeEvent::Error {
             code: Some("runtime.error".to_string()),
@@ -328,11 +252,13 @@ fn parse_opencode_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
         return;
     }
 
-    if let Some(text) = extract_text_delta(json) {
-        events.push(RuntimeEvent::MessageDelta {
-            lane: RuntimeMessageLane::Answer,
-            text,
-        });
+    if let Some((lane, text)) = extract_text_delta(json) {
+        events.push(RuntimeEvent::MessageDelta { lane, text });
+        return;
+    }
+
+    if let Some(text) = describe_opencode_status(json) {
+        events.push(RuntimeEvent::Status { code: None, text });
     }
 }
 
@@ -386,7 +312,13 @@ fn extract_error_message(json: &Value) -> Option<String> {
     Some("opencode error event".to_string())
 }
 
-fn extract_text_delta(json: &Value) -> Option<String> {
+fn extract_text_delta(json: &Value) -> Option<(RuntimeMessageLane, String)> {
+    let lane = if is_reasoning_event(json) {
+        RuntimeMessageLane::Reasoning
+    } else {
+        RuntimeMessageLane::Answer
+    };
+
     for pointer in [
         "/text",
         "/part/text",
@@ -396,7 +328,7 @@ fn extract_text_delta(json: &Value) -> Option<String> {
     ] {
         if let Some(text) = json.pointer(pointer).and_then(Value::as_str) {
             if !text.trim().is_empty() {
-                return Some(text.to_string());
+                return Some((lane, text.to_string()));
             }
         }
     }
@@ -412,12 +344,39 @@ fn extract_text_delta(json: &Value) -> Option<String> {
         if let Some(value) = json.pointer(pointer) {
             let texts = collect_texts(value);
             if !texts.is_empty() {
-                return Some(texts.join("\n"));
+                return Some((lane, texts.join("\n")));
             }
         }
     }
 
     None
+}
+
+fn is_reasoning_event(json: &Value) -> bool {
+    for pointer in ["/type", "/part/type", "/message/type", "/delta/type"] {
+        if let Some(event_type) = json.pointer(pointer).and_then(Value::as_str) {
+            if event_type == "reasoning" || event_type.contains("reasoning") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn describe_opencode_status(json: &Value) -> Option<String> {
+    let event_type = json.get("type").and_then(Value::as_str)?;
+    if matches!(
+        event_type,
+        "text"
+            | "reasoning"
+            | "response.output_text.delta"
+            | "response.reasoning.delta"
+            | "response.completed"
+    ) {
+        return None;
+    }
+
+    Some(format!("opencode event: {}", event_type))
 }
 
 fn collect_texts(value: &Value) -> Vec<String> {
@@ -457,34 +416,21 @@ fn collect_texts(value: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use crate::kernel::runtime::{
-        RuntimeAdapter, RuntimeEvent, RuntimeMessageLane, RuntimeSessionStartInput,
-        RuntimeTurnInput,
+        ExecutionOutput, RuntimeAdapter, RuntimeEvent, RuntimeMessageLane,
+        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
     };
 
     use super::{parse_opencode_stdout, OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig};
-    use tempfile::tempdir;
-    use tokio::sync::mpsc;
     use uuid::Uuid;
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn opencode_adapter_translates_text_events() {
-        let sandbox = tempdir().expect("temp dir");
-        let stub = sandbox.path().join("opencode-stub.sh");
-        write_script(
-            &stub,
-            r#"#!/usr/bin/env bash
-echo '{"type":"session.started","sessionID":"ses_123"}'
-echo '{"type":"step_start","part":{"type":"step-start"}}'
-echo '{"type":"text","part":{"type":"text","text":"hello from opencode"}}'
-echo '{"type":"step_finish","part":{"type":"step-finish"}}'
-"#,
-        );
-
+    async fn opencode_adapter_builds_program_spec_for_registered_session() {
         let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig {
-            executable: stub.to_string_lossy().to_string(),
-            ..OpenCodeRuntimeConfig::default()
+            executable: "opencode".to_string(),
+            model: Some("gpt-5".to_string()),
+            agent: Some("builder".to_string()),
         });
+        assert_eq!(adapter.turn_mode(), RuntimeTurnMode::ProgramBacked);
 
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
@@ -492,79 +438,54 @@ echo '{"type":"step_finish","part":{"type":"step-finish"}}'
                 working_dir: None,
                 environment: Vec::new(),
                 selected_skills: Vec::new(),
+                runtime_state_root: None,
             })
             .await
             .expect("start");
 
-        let (tx, rx) = mpsc::unbounded_channel();
-        let _output = adapter
-            .turn(
-                RuntimeTurnInput {
-                    runtime_session_id: handle.runtime_session_id.clone(),
-                    prompt: "hello".to_string(),
-                    selected_skills: Vec::new(),
-                },
-                tx,
-            )
-            .await
-            .expect("turn");
-        let events = collect_events(rx).await;
+        let program = adapter
+            .build_turn_program(&RuntimeTurnInput {
+                runtime_session_id: handle.runtime_session_id.clone(),
+                prompt: "hello".to_string(),
+                selected_skills: Vec::new(),
+            })
+            .expect("program");
 
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text } if text == "hello from opencode"
-            )),
-            "opencode message content should map to text delta"
+        assert_eq!(program.executable, "opencode");
+        assert_eq!(
+            program.args,
+            vec![
+                "run".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+                "--thinking".to_string(),
+                "--model".to_string(),
+                "gpt-5".to_string(),
+                "--agent".to_string(),
+                "builder".to_string(),
+                "hello".to_string(),
+            ]
         );
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, RuntimeEvent::Done)),
-            "turn output should include terminal done event"
-        );
+        assert!(program.environment.is_empty());
+        assert!(program.stdin.is_empty());
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn opencode_adapter_surfaces_structured_error_message() {
-        let sandbox = tempdir().expect("temp dir");
-        let stub = sandbox.path().join("opencode-stub-fail.sh");
-        write_script(
-            &stub,
-            r#"#!/usr/bin/env bash
-echo '{"type":"error","error":{"name":"UnknownError","data":{"message":"provider unavailable"}}}'
-exit 7
-"#,
-        );
-
+    #[test]
+    fn opencode_adapter_formats_structured_error_message() {
         let adapter = OpenCodeRuntimeAdapter::new(OpenCodeRuntimeConfig {
-            executable: stub.to_string_lossy().to_string(),
+            executable: "opencode".to_string(),
             ..OpenCodeRuntimeConfig::default()
         });
-        let handle = adapter
-            .session_start(RuntimeSessionStartInput {
-                session_id: Uuid::new_v4(),
-                working_dir: None,
-                environment: Vec::new(),
-                selected_skills: Vec::new(),
-            })
-            .await
-            .expect("start");
+        let message = adapter.format_program_exit_error(
+            &ExecutionOutput {
+                stdout: br#"{"type":"error","error":{"name":"UnknownError","data":{"message":"provider unavailable"}}}"#
+                    .to_vec(),
+                exit_code: Some(7),
+                ..ExecutionOutput::default()
+            },
+            None,
+        );
 
-        let err = adapter
-            .turn(
-                RuntimeTurnInput {
-                    runtime_session_id: handle.runtime_session_id,
-                    prompt: "hello".to_string(),
-                    selected_skills: Vec::new(),
-                },
-                mpsc::unbounded_channel().0,
-            )
-            .await
-            .expect_err("turn should fail");
-
-        let message = err.to_string();
         assert!(
             message.contains("provider unavailable"),
             "structured error detail should be surfaced"
@@ -581,26 +502,55 @@ exit 7
         ));
     }
 
-    async fn collect_events(mut rx: mpsc::UnboundedReceiver<RuntimeEvent>) -> Vec<RuntimeEvent> {
-        let mut events = Vec::new();
-        while let Some(event) = rx.recv().await {
-            events.push(event);
-        }
-        events
+    #[test]
+    fn opencode_stdout_parses_json_text_delta() {
+        let events =
+            parse_opencode_stdout(br#"{"type":"response.output_text.delta","text":"hello"}"#);
+
+        assert_eq!(events.len(), 1, "expected one answer delta");
+        assert!(matches!(
+            &events[0],
+            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text } if text == "hello"
+        ));
     }
 
-    #[cfg(unix)]
-    fn write_script(path: &std::path::Path, content: &str) {
-        use std::{fs, io::Write, os::unix::fs::PermissionsExt};
+    #[test]
+    fn opencode_stdout_parses_reasoning_lane_without_status_spam() {
+        let events = parse_opencode_stdout(br#"{"type":"reasoning","text":"planning next step"}"#);
 
-        let temp_path = path.with_extension("tmp");
-        let mut file = fs::File::create(&temp_path).expect("create temp script");
-        file.write_all(content.as_bytes())
-            .expect("write temp script");
-        file.sync_all().expect("sync temp script");
-        drop(file);
-        let permissions = fs::Permissions::from_mode(0o755);
-        fs::set_permissions(&temp_path, permissions).expect("chmod temp script");
-        fs::rename(&temp_path, path).expect("install script");
+        assert_eq!(events.len(), 1, "expected one reasoning delta");
+        assert!(matches!(
+            &events[0],
+            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Reasoning, text } if text == "planning next step"
+        ));
+    }
+
+    #[test]
+    fn opencode_continue_args_resume_last_session() {
+        let args = super::build_opencode_run_args(
+            &OpenCodeRuntimeConfig {
+                executable: "opencode".to_string(),
+                model: Some("gpt-5".to_string()),
+                agent: Some("builder".to_string()),
+            },
+            "hello",
+            true,
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "run".to_string(),
+                "--continue".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+                "--thinking".to_string(),
+                "--model".to_string(),
+                "gpt-5".to_string(),
+                "--agent".to_string(),
+                "builder".to_string(),
+                "hello".to_string(),
+            ]
+        );
     }
 }

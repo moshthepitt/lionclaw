@@ -214,6 +214,14 @@ impl ContinuityFs {
         Ok(files)
     }
 
+    pub fn list_regular_files(&self, relative_root: &Path) -> Result<Vec<PathBuf>> {
+        let dir = self.open_dir(relative_root, false)?;
+        let normalized_root = normalize_relative_path(relative_root)?;
+        let mut files = Vec::new();
+        self.collect_regular_files(&dir, &normalized_root, &mut files)?;
+        Ok(files)
+    }
+
     pub fn modified_at_ms(&self, relative: &Path) -> Result<i64> {
         let file = self.open_relative_file(
             relative,
@@ -294,6 +302,59 @@ impl ContinuityFs {
             if child_relative.extension().is_some_and(|ext| ext == "md") {
                 files.push(child_relative);
             }
+        }
+        Ok(())
+    }
+
+    fn collect_regular_files(
+        &self,
+        dir_file: &File,
+        relative_root: &Path,
+        files: &mut Vec<PathBuf>,
+    ) -> Result<()> {
+        let dir = Dir::read_from(dir_file).with_context(|| {
+            format!(
+                "failed to read {}",
+                self.absolute_path(relative_root).display()
+            )
+        })?;
+        for entry in dir {
+            let entry = entry.with_context(|| {
+                format!(
+                    "failed to iterate {}",
+                    self.absolute_path(relative_root).display()
+                )
+            })?;
+            let name = os_string_from_dir_entry(&entry);
+            if name.as_os_str() == "." || name.as_os_str() == ".." {
+                continue;
+            }
+
+            let child_relative = if relative_root.as_os_str().is_empty() {
+                PathBuf::from(&name)
+            } else {
+                relative_root.join(&name)
+            };
+
+            let file_type = entry.file_type();
+            if file_type.is_symlink() {
+                bail!(
+                    "continuity path '{}' is a symlink",
+                    self.absolute_path(&child_relative).display()
+                );
+            }
+            if file_type.is_dir() {
+                let child_dir = self.open_dir(&child_relative, false)?;
+                self.collect_regular_files(&child_dir, &child_relative, files)?;
+                continue;
+            }
+            if !file_type.is_file() {
+                bail!(
+                    "continuity path '{}' is not a regular file",
+                    self.absolute_path(&child_relative).display()
+                );
+            }
+            files.push(child_relative);
         }
         Ok(())
     }

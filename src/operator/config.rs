@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::home::{LionClawHome, DEFAULT_WORKSPACE};
+use crate::home::{
+    daemon_compat_partition_key, runtime_profile_partition_key, LionClawHome, DEFAULT_WORKSPACE,
+};
+use crate::kernel::runtime::{ConfinementConfig, ExecutionPreset, RuntimeExecutionProfile};
 use crate::kernel::skills::sanitize_skill_name;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -13,6 +16,8 @@ pub struct OperatorConfig {
     pub daemon: DaemonConfig,
     #[serde(default)]
     pub defaults: OperatorDefaults,
+    #[serde(default)]
+    pub presets: BTreeMap<String, ExecutionPreset>,
     #[serde(default)]
     pub runtimes: BTreeMap<String, RuntimeProfileConfig>,
     #[serde(default)]
@@ -106,8 +111,36 @@ impl OperatorConfig {
         self.runtimes.get(id)
     }
 
+    pub fn upsert_preset(&mut self, id: String, preset: ExecutionPreset) {
+        let should_set_default = self.defaults.preset.is_none();
+        self.presets.insert(id.clone(), preset);
+        if should_set_default {
+            self.defaults.preset = Some(id);
+        }
+        self.normalize();
+    }
+
+    pub fn remove_preset(&mut self, id: &str) -> bool {
+        let removed = self.presets.remove(id).is_some();
+        if removed && self.defaults.preset.as_deref() == Some(id) {
+            self.defaults.preset = None;
+        }
+        self.normalize();
+        removed
+    }
+
+    pub fn preset(&self, id: &str) -> Option<&ExecutionPreset> {
+        self.presets.get(id)
+    }
+
     pub fn resolve_runtime_id(&self, requested: Option<&str>) -> Result<String> {
         if let Some(runtime_id) = requested.map(str::trim).filter(|value| !value.is_empty()) {
+            if !self.runtimes.contains_key(runtime_id) {
+                return Err(anyhow!(
+                    "runtime profile '{}' is not configured",
+                    runtime_id
+                ));
+            }
             return Ok(runtime_id.to_string());
         }
 
@@ -117,11 +150,31 @@ impl OperatorConfig {
             .ok_or_else(|| anyhow!("runtime is required when no default runtime is configured"))
     }
 
+    pub fn resolve_preset_id(&self, requested: Option<&str>) -> Result<String> {
+        if let Some(preset_id) = requested.map(str::trim).filter(|value| !value.is_empty()) {
+            return Ok(preset_id.to_string());
+        }
+
+        self.defaults
+            .preset
+            .clone()
+            .ok_or_else(|| anyhow!("preset is required when no default preset is configured"))
+    }
+
     pub fn set_default_runtime(&mut self, id: &str) -> Result<()> {
         if !self.runtimes.contains_key(id) {
             return Err(anyhow!("runtime profile '{}' is not configured", id));
         }
         self.defaults.runtime = Some(id.to_string());
+        self.normalize();
+        Ok(())
+    }
+
+    pub fn set_default_preset(&mut self, id: &str) -> Result<()> {
+        if !self.presets.contains_key(id) {
+            return Err(anyhow!("preset '{}' is not configured", id));
+        }
+        self.defaults.preset = Some(id.to_string());
         self.normalize();
         Ok(())
     }
@@ -137,6 +190,34 @@ impl OperatorConfig {
             .as_ref()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        self.defaults.preset = self
+            .defaults
+            .preset
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.presets = std::mem::take(&mut self.presets)
+            .into_iter()
+            .filter_map(|(id, mut preset)| {
+                let id = id.trim().to_string();
+                if id.is_empty() {
+                    return None;
+                }
+                normalize_execution_preset(&mut preset);
+                Some((id, preset))
+            })
+            .collect();
+        self.runtimes = std::mem::take(&mut self.runtimes)
+            .into_iter()
+            .filter_map(|(id, mut runtime)| {
+                let id = id.trim().to_string();
+                if id.is_empty() {
+                    return None;
+                }
+                runtime.normalize();
+                Some((id, runtime))
+            })
+            .collect();
         self.skills
             .sort_by(|left, right| left.alias.cmp(&right.alias));
         self.channels.sort_by(|left, right| left.id.cmp(&right.id));
@@ -147,10 +228,37 @@ impl OperatorConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct DaemonCompatConfig {
+    version: u32,
+    workspace_name: String,
+    default_runtime_id: Option<String>,
+    default_preset_name: Option<String>,
+    execution_presets: BTreeMap<String, ExecutionPreset>,
+    runtime_profiles: BTreeMap<String, RuntimeProfileConfig>,
+}
+
+pub fn daemon_compat_fingerprint(config: &OperatorConfig) -> String {
+    let mut normalized = config.clone();
+    normalized.normalize();
+    let encoded = serde_json::to_vec(&DaemonCompatConfig {
+        version: 1,
+        workspace_name: normalized.daemon.workspace.clone(),
+        default_runtime_id: normalized.defaults.runtime.clone(),
+        default_preset_name: normalized.defaults.preset.clone(),
+        execution_presets: normalized.presets,
+        runtime_profiles: normalized.runtimes,
+    })
+    .expect("daemon compatibility config should always serialize");
+    daemon_compat_partition_key(&encoded)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OperatorDefaults {
     #[serde(default)]
     pub runtime: Option<String>,
+    #[serde(default)]
+    pub preset: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,23 +340,11 @@ pub fn default_workspace() -> String {
     DEFAULT_WORKSPACE.to_string()
 }
 
-fn default_codex_sandbox() -> String {
-    "read-only".to_string()
-}
-
-fn default_opencode_format() -> String {
-    "json".to_string()
-}
-
 fn default_reference() -> String {
     "local".to_string()
 }
 
 fn default_enabled() -> bool {
-    true
-}
-
-fn default_true() -> bool {
     true
 }
 
@@ -260,26 +356,16 @@ pub enum RuntimeProfileConfig {
         executable: String,
         #[serde(default)]
         model: Option<String>,
-        #[serde(default = "default_codex_sandbox")]
-        sandbox: String,
-        #[serde(default = "default_true")]
-        skip_git_repo_check: bool,
-        #[serde(default = "default_true")]
-        ephemeral: bool,
+        confinement: ConfinementConfig,
     },
     #[serde(rename = "opencode")]
     OpenCode {
         executable: String,
-        #[serde(default = "default_opencode_format")]
-        format: String,
         #[serde(default)]
         model: Option<String>,
         #[serde(default)]
         agent: Option<String>,
-        #[serde(default)]
-        xdg_data_home: Option<String>,
-        #[serde(default)]
-        continue_last_session: bool,
+        confinement: ConfinementConfig,
     },
 }
 
@@ -294,6 +380,105 @@ impl RuntimeProfileConfig {
     pub fn executable(&self) -> &str {
         match self {
             Self::Codex { executable, .. } | Self::OpenCode { executable, .. } => executable,
+        }
+    }
+
+    pub fn confinement(&self) -> &ConfinementConfig {
+        match self {
+            Self::Codex { confinement, .. } | Self::OpenCode { confinement, .. } => confinement,
+        }
+    }
+
+    pub fn execution_profile(&self) -> RuntimeExecutionProfile {
+        RuntimeExecutionProfile {
+            confinement: self.confinement().clone(),
+            compatibility_key: self.compatibility_key(),
+        }
+    }
+
+    pub fn compatibility_key(&self) -> String {
+        let mut normalized = self.clone();
+        normalized.normalize();
+        let encoded = serde_json::to_vec(&normalized)
+            .expect("runtime profile config should always serialize");
+        runtime_profile_partition_key(&encoded)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_runtime_command(self.executable())?;
+
+        match self.confinement() {
+            ConfinementConfig::Oci(config) => {
+                validate_podman_executable(&config.engine)?;
+                if config
+                    .image
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+                {
+                    return Err(anyhow!("Podman runtime image is required"));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn normalize(&mut self) {
+        match self {
+            Self::Codex {
+                executable,
+                model,
+                confinement,
+            } => {
+                *executable = executable.trim().to_string();
+                *model = model
+                    .as_ref()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                normalize_confinement_config(confinement);
+            }
+            Self::OpenCode {
+                executable,
+                model,
+                agent,
+                confinement,
+            } => {
+                *executable = executable.trim().to_string();
+                *model = model
+                    .as_ref()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                *agent = agent
+                    .as_ref()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                normalize_confinement_config(confinement);
+            }
+        }
+    }
+}
+
+fn normalize_execution_preset(_preset: &mut ExecutionPreset) {}
+
+fn normalize_confinement_config(config: &mut ConfinementConfig) {
+    match config {
+        ConfinementConfig::Oci(oci) => {
+            oci.engine = oci.engine.trim().to_string();
+            oci.image = oci
+                .image
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            oci.tmpfs = std::mem::take(&mut oci.tmpfs)
+                .into_iter()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect();
+            for mount in &mut oci.additional_mounts {
+                mount.target = mount.target.trim().to_string();
+            }
         }
     }
 }
@@ -324,30 +509,48 @@ pub fn normalize_local_source(source: &str) -> Result<String> {
     Ok(format!("local:{}", absolute.display()))
 }
 
-pub fn normalize_executable(source: &str) -> Result<String> {
+pub fn normalize_runtime_command(source: &str) -> Result<String> {
     let raw = source.trim();
     if raw.is_empty() {
-        return Err(anyhow!("runtime command or path cannot be empty"));
+        return Err(anyhow!("runtime command cannot be empty"));
     }
 
-    if looks_like_path(raw) {
-        let path = normalize_executable_path(raw)?;
-        validate_executable_path(&path)?;
-        return Ok(path.to_string_lossy().to_string());
-    }
-
-    let resolved = which::which(raw)
-        .with_context(|| format!("failed to resolve runtime command '{}'", source))?;
-    validate_executable_path(&resolved)?;
     Ok(raw.to_string())
+}
+
+pub fn validate_runtime_command(source: &str) -> Result<()> {
+    if source.trim().is_empty() {
+        return Err(anyhow!("runtime command cannot be empty"));
+    }
+
+    Ok(())
+}
+
+pub fn normalize_host_executable(source: &str) -> Result<String> {
+    let raw = source.trim();
+    if raw.is_empty() {
+        return Err(anyhow!("host executable command or path cannot be empty"));
+    }
+
+    let path = if looks_like_path(raw) {
+        normalize_executable_path(raw)?
+    } else {
+        which::which(raw)
+            .with_context(|| format!("failed to resolve host executable '{}'", source))?
+    };
+    validate_executable_path(&path)?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+pub fn normalize_podman_executable(source: &str) -> Result<String> {
+    let normalized = normalize_host_executable(source)?;
+    ensure_podman_executable(Path::new(&normalized))?;
+    Ok(normalized)
 }
 
 pub fn validate_executable_path(path: &Path) -> Result<()> {
     if !path.is_file() {
-        return Err(anyhow!(
-            "runtime executable '{}' is not a file",
-            path.display()
-        ));
+        return Err(anyhow!("executable '{}' is not a file", path.display()));
     }
 
     #[cfg(unix)]
@@ -360,7 +563,7 @@ pub fn validate_executable_path(path: &Path) -> Result<()> {
             .mode();
         if mode & 0o111 == 0 {
             return Err(anyhow!(
-                "runtime executable '{}' is not marked executable",
+                "executable '{}' is not marked executable",
                 path.display()
             ));
         }
@@ -369,19 +572,24 @@ pub fn validate_executable_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn validate_executable(source: &str) -> Result<()> {
+pub fn validate_host_executable(source: &str) -> Result<()> {
     let raw = source.trim();
     if raw.is_empty() {
-        return Err(anyhow!("runtime command or path cannot be empty"));
+        return Err(anyhow!("host executable command or path cannot be empty"));
     }
 
-    if looks_like_path(raw) {
-        return validate_executable_path(&normalize_executable_path(raw)?);
+    if !looks_like_path(raw) {
+        return Err(anyhow!(
+            "host executable '{}' must be stored as an absolute or explicit path",
+            source
+        ));
     }
+    validate_executable_path(&normalize_executable_path(raw)?)
+}
 
-    let resolved = which::which(raw)
-        .with_context(|| format!("failed to resolve runtime command '{}'", source))?;
-    validate_executable_path(&resolved)
+pub fn validate_podman_executable(source: &str) -> Result<()> {
+    validate_host_executable(source)?;
+    ensure_podman_executable(&normalize_executable_path(source.trim())?)
 }
 
 fn looks_like_path(raw: &str) -> bool {
@@ -399,11 +607,30 @@ fn normalize_executable_path(raw: &str) -> Result<PathBuf> {
     Ok(current_dir.join(path))
 }
 
+fn ensure_podman_executable(path: &Path) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("podman engine path '{}' has no file name", path.display()))?;
+    if file_name != "podman" {
+        return Err(anyhow!(
+            "Podman confinement requires a 'podman' executable path, got '{}'",
+            path.display()
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_skill_alias, normalize_executable, normalize_local_source, validate_executable,
+        daemon_compat_fingerprint, derive_skill_alias, normalize_host_executable,
+        normalize_local_source, normalize_runtime_command, validate_host_executable,
         ChannelLaunchMode, ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig,
+    };
+    use crate::kernel::runtime::{
+        ConfinementConfig, ExecutionPreset, NetworkMode, OciConfinementConfig, WorkspaceAccess,
     };
 
     #[test]
@@ -423,6 +650,7 @@ mod tests {
         assert!(config.skills.is_empty());
         assert!(config.channels.is_empty());
         assert!(config.runtimes.is_empty());
+        assert!(config.presets.is_empty());
     }
 
     #[tokio::test]
@@ -478,11 +706,9 @@ mod tests {
         config.upsert_runtime(
             "codex".to_string(),
             RuntimeProfileConfig::Codex {
-                executable: "/tmp/codex".to_string(),
+                executable: "codex".to_string(),
                 model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
+                confinement: sample_confinement(),
             },
         );
 
@@ -495,11 +721,9 @@ mod tests {
         config.upsert_runtime(
             "codex".to_string(),
             RuntimeProfileConfig::Codex {
-                executable: "/tmp/codex".to_string(),
+                executable: "codex".to_string(),
                 model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
+                confinement: sample_confinement(),
             },
         );
 
@@ -507,9 +731,139 @@ mod tests {
         assert!(config.defaults.runtime.is_none());
     }
 
+    #[test]
+    fn requested_runtime_must_be_configured() {
+        let config = OperatorConfig::default();
+        let err = config
+            .resolve_runtime_id(Some("codex"))
+            .expect_err("unconfigured runtime should fail");
+
+        assert!(err
+            .to_string()
+            .contains("runtime profile 'codex' is not configured"));
+    }
+
+    #[test]
+    fn runtime_compatibility_key_changes_when_profile_changes() {
+        let left = RuntimeProfileConfig::Codex {
+            executable: "codex".to_string(),
+            model: Some("gpt-5".to_string()),
+            confinement: sample_confinement(),
+        };
+        let right = RuntimeProfileConfig::Codex {
+            executable: "codex".to_string(),
+            model: Some("gpt-5.1".to_string()),
+            confinement: sample_confinement(),
+        };
+        let normalized = RuntimeProfileConfig::Codex {
+            executable: " codex ".to_string(),
+            model: Some(" gpt-5 ".to_string()),
+            confinement: sample_confinement(),
+        };
+
+        assert_ne!(left.compatibility_key(), right.compatibility_key());
+        assert_eq!(left.compatibility_key(), normalized.compatibility_key());
+    }
+
+    #[test]
+    fn daemon_compat_fingerprint_changes_when_default_runtime_changes() {
+        let runtime = RuntimeProfileConfig::Codex {
+            executable: "codex".to_string(),
+            model: None,
+            confinement: sample_confinement(),
+        };
+        let mut left = OperatorConfig::default();
+        left.upsert_runtime("codex".to_string(), runtime.clone());
+        left.upsert_runtime("opencode".to_string(), runtime);
+        left.set_default_runtime("codex")
+            .expect("set default runtime");
+
+        let mut right = left.clone();
+        right
+            .set_default_runtime("opencode")
+            .expect("set second default runtime");
+
+        assert_ne!(
+            daemon_compat_fingerprint(&left),
+            daemon_compat_fingerprint(&right)
+        );
+    }
+
+    #[test]
+    fn daemon_compat_fingerprint_changes_when_workspace_changes() {
+        let runtime = RuntimeProfileConfig::Codex {
+            executable: "codex".to_string(),
+            model: None,
+            confinement: sample_confinement(),
+        };
+        let mut left = OperatorConfig::default();
+        left.upsert_runtime("codex".to_string(), runtime);
+        left.set_default_runtime("codex")
+            .expect("set default runtime");
+
+        let mut right = left.clone();
+        right.daemon.workspace = "other-workspace".to_string();
+
+        assert_ne!(
+            daemon_compat_fingerprint(&left),
+            daemon_compat_fingerprint(&right)
+        );
+    }
+
+    #[test]
+    fn first_preset_becomes_default() {
+        let mut config = OperatorConfig::default();
+        config.upsert_preset(
+            "everyday".to_string(),
+            ExecutionPreset {
+                workspace_access: WorkspaceAccess::ReadWrite,
+                network_mode: NetworkMode::On,
+                mount_runtime_secrets: false,
+                escape_classes: Default::default(),
+            },
+        );
+
+        assert_eq!(config.defaults.preset.as_deref(), Some("everyday"));
+    }
+
+    #[test]
+    fn removing_default_preset_clears_default() {
+        let mut config = OperatorConfig::default();
+        config.upsert_preset(
+            "everyday".to_string(),
+            ExecutionPreset {
+                workspace_access: WorkspaceAccess::ReadWrite,
+                network_mode: NetworkMode::On,
+                mount_runtime_secrets: false,
+                escape_classes: Default::default(),
+            },
+        );
+
+        assert!(config.remove_preset("everyday"));
+        assert!(config.defaults.preset.is_none());
+    }
+
+    #[test]
+    fn preset_normalization_trims_name_and_preserves_secret_mount_toggle() {
+        let mut config = OperatorConfig::default();
+        config.upsert_preset(
+            "  everyday  ".to_string(),
+            ExecutionPreset {
+                workspace_access: WorkspaceAccess::ReadWrite,
+                network_mode: NetworkMode::On,
+                mount_runtime_secrets: true,
+                escape_classes: Default::default(),
+            },
+        );
+
+        assert!(config.preset("  everyday  ").is_none());
+        let preset = config.preset("everyday").expect("normalized preset");
+        assert!(preset.mount_runtime_secrets);
+    }
+
     #[cfg(unix)]
     #[test]
-    fn normalize_executable_rejects_non_executable_file() {
+    fn normalize_host_executable_rejects_non_executable_file() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -517,21 +871,40 @@ mod tests {
         std::fs::write(&path, "#!/usr/bin/env bash\n").expect("write file");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
 
-        let err = normalize_executable(path.to_str().expect("path utf8")).expect_err("should fail");
+        let err =
+            normalize_host_executable(path.to_str().expect("path utf8")).expect_err("should fail");
         assert!(err.to_string().contains("not marked executable"));
     }
 
     #[cfg(unix)]
     #[test]
-    fn normalize_executable_keeps_bare_command_names() {
-        let normalized = normalize_executable("sh").expect("normalize");
+    fn normalize_host_executable_resolves_bare_commands_to_absolute_paths() {
+        let normalized = normalize_host_executable("sh").expect("normalize");
+        let expected = which::which("sh").expect("resolve sh");
 
-        assert_eq!(normalized, "sh");
+        assert_eq!(normalized, expected.to_string_lossy());
     }
 
     #[cfg(unix)]
     #[test]
-    fn validate_executable_resolves_bare_commands_via_path() {
-        validate_executable("sh").expect("bare command should validate");
+    fn validate_host_executable_rejects_bare_commands() {
+        let err = validate_host_executable("sh").expect_err("bare command should fail");
+        assert!(err
+            .to_string()
+            .contains("must be stored as an absolute or explicit path"));
+    }
+
+    #[test]
+    fn normalize_runtime_command_trims_without_host_resolution() {
+        let normalized = normalize_runtime_command("  /usr/local/bin/codex  ").expect("trim");
+        assert_eq!(normalized, "/usr/local/bin/codex");
+    }
+
+    fn sample_confinement() -> ConfinementConfig {
+        ConfinementConfig::Oci(OciConfinementConfig {
+            engine: "/usr/bin/podman".to_string(),
+            image: Some("ghcr.io/lionclaw/runtime:latest".to_string()),
+            ..OciConfinementConfig::default()
+        })
     }
 }

@@ -4,18 +4,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::{
+    config::resolve_project_workspace_root,
     contracts::{ChannelBindRequest, ChannelPeerApproveRequest, ChannelPeerResponse, TrustTier},
-    home::LionClawHome,
-    kernel::{Kernel, KernelOptions},
+    home::{runtime_project_partition_key, LionClawHome},
+    kernel::{Kernel, KernelOptions, RuntimeExecutionPolicy},
     operator::{
         config::{
-            normalize_local_source, ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig,
-            OperatorConfig,
+            daemon_compat_fingerprint, normalize_local_source, ChannelLaunchMode,
+            ManagedChannelConfig, ManagedSkillConfig, OperatorConfig,
         },
         daemon_probe::{classify_daemon, DaemonClassification},
         lockfile::{LockedChannel, LockedSkill, OperatorLockfile},
         runtime::{
-            register_configured_runtimes, runtime_service_env, validate_runtime_availability,
+            configured_runtime_execution_profiles, register_configured_runtimes,
+            validate_runtime_availability,
         },
         services::{
             channel_unit_name, render_channel_unit, render_daemon_unit, unit_status_is_active,
@@ -263,9 +265,20 @@ pub async fn up<M: ServiceManager>(
 ) -> Result<ApplyResult> {
     let config = OperatorConfig::load(home).await?;
     let home_id = home.ensure_home_id().await?;
-    match classify_daemon(&config.daemon.bind, &home_id).await? {
+    let project_root =
+        resolve_project_workspace_root().context("failed to resolve project workspace root")?;
+    let project_scope = runtime_project_partition_key(Some(project_root.as_path()));
+    let expected_config_fingerprint = daemon_compat_fingerprint(&config);
+    match classify_daemon(
+        &config.daemon.bind,
+        &home_id,
+        &project_scope,
+        &expected_config_fingerprint,
+    )
+    .await?
+    {
         DaemonClassification::Absent => {}
-        DaemonClassification::SameHome => {
+        DaemonClassification::SameHome | DaemonClassification::SameHomeDifferentConfig => {
             let daemon_status = manager.unit_status(DAEMON_UNIT_NAME).await?;
             if !unit_status_is_active(&daemon_status) {
                 return Err(anyhow!(
@@ -274,6 +287,12 @@ pub async fn up<M: ServiceManager>(
                     DAEMON_UNIT_NAME
                 ));
             }
+        }
+        DaemonClassification::SameHomeDifferentProject => {
+            return Err(anyhow!(
+                "bind '{}' is already served by this LionClaw home for a different project; stop that daemon before running 'lionclaw service up' from this project",
+                config.daemon.bind
+            ));
         }
         DaemonClassification::ForeignHome(info) => {
             return Err(anyhow!(
@@ -490,14 +509,16 @@ pub(crate) fn build_managed_units(
     binaries: &StackBinaryPaths,
 ) -> Result<Vec<ManagedServiceUnit>> {
     let mut units = Vec::new();
-    let daemon_runtime_env = runtime_service_env(config, runtime_id)?;
+    let project_workspace_root = resolve_project_workspace_root()
+        .context("failed to resolve project workspace root for managed daemon")?;
     units.push(render_daemon_unit(
         home,
         &binaries.daemon_bin,
         &config.daemon.bind,
         runtime_id,
         &config.daemon.workspace,
-        &daemon_runtime_env,
+        &project_workspace_root,
+        &daemon_compat_fingerprint(config),
     ));
 
     let base_url = base_url_from_bind(&config.daemon.bind);
@@ -557,10 +578,18 @@ pub(crate) async fn render_runtime_cache(
     lockfile: &OperatorLockfile,
     runtime_id: &str,
 ) -> Result<()> {
-    let target_dir = home.runtime_workspace_dir(runtime_id, &config.daemon.workspace);
-    tokio::fs::create_dir_all(&target_dir)
-        .await
-        .with_context(|| format!("failed to create {}", target_dir.display()))?;
+    let workspace = &config.daemon.workspace;
+    let project_workspace_root =
+        resolve_project_workspace_root().context("failed to resolve project workspace root")?;
+    let target_dir = home.runtime_project_dir(runtime_id, workspace, &project_workspace_root);
+    for path in [
+        target_dir.clone(),
+        home.runtime_project_drafts_dir(runtime_id, workspace, &project_workspace_root),
+    ] {
+        tokio::fs::create_dir_all(&path)
+            .await
+            .with_context(|| format!("failed to create {}", path.display()))?;
+    }
     let target_path = target_dir.join(GENERATED_AGENTS_FILE);
 
     let mut sections = Vec::new();
@@ -585,6 +614,14 @@ pub(crate) async fn render_runtime_cache(
             ));
         }
     }
+
+    sections.push(
+        "## Draft Outputs\n\nWrite generated files intended for review or keeping to LIONCLAW_DRAFTS_DIR.".to_string(),
+    );
+
+    sections.push(
+        "## Runtime Secrets\n\nIf this preset mounts runtime secrets, look under /run/secrets for the LionClaw-provided dotenv file whose name starts with lionclaw-runtime-secrets-, read it, and do not print its contents.".to_string(),
+    );
 
     let rendered = render_marker_file(
         &format!(
@@ -640,15 +677,13 @@ pub(crate) fn resolve_worker_entrypoint(
     snapshot_dir: &str,
 ) -> Result<PathBuf> {
     let snapshot_root = home.root().join(snapshot_dir);
-    for relative in ["scripts/worker", "scripts/worker.sh"] {
-        let candidate = snapshot_root.join(relative);
-        if candidate.exists() {
-            return Ok(candidate);
-        }
+    let candidate = snapshot_root.join("scripts/worker");
+    if candidate.exists() {
+        return Ok(candidate);
     }
 
     Err(anyhow!(
-        "worker entrypoint is missing under '{}'; expected 'scripts/worker' or legacy 'scripts/worker.sh'",
+        "worker entrypoint is missing under '{}'; expected 'scripts/worker'",
         snapshot_root.display()
     ))
 }
@@ -688,17 +723,48 @@ pub(crate) async fn open_kernel(
     config: &OperatorConfig,
     default_runtime_id: Option<String>,
 ) -> Result<Kernel> {
+    open_kernel_with_project_root(home, config, default_runtime_id, None).await
+}
+
+pub(crate) async fn open_runtime_kernel(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+    default_runtime_id: Option<String>,
+) -> Result<Kernel> {
+    let project_workspace_root =
+        resolve_project_workspace_root().context("failed to resolve project workspace root")?;
+    open_kernel_with_project_root(
+        home,
+        config,
+        default_runtime_id,
+        Some(project_workspace_root),
+    )
+    .await
+}
+
+async fn open_kernel_with_project_root(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+    default_runtime_id: Option<String>,
+    project_workspace_root: Option<PathBuf>,
+) -> Result<Kernel> {
     let workspace_root = config.workspace_root(home);
-    let project_workspace_root = std::env::var("LIONCLAW_WORKSPACE_ROOT")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root.clone());
     let kernel = Kernel::new_with_options(
         &home.db_path(),
         KernelOptions {
+            runtime_execution_policy: project_workspace_root
+                .clone()
+                .map(RuntimeExecutionPolicy::for_working_dir_root)
+                .unwrap_or_default(),
             default_runtime_id: default_runtime_id.or_else(|| config.defaults.runtime.clone()),
+            default_preset_name: config.defaults.preset.clone(),
+            execution_presets: config.presets.clone(),
+            runtime_execution_profiles: configured_runtime_execution_profiles(config),
+            runtime_secrets_home: Some(home.clone()),
             workspace_root: Some(workspace_root),
-            project_workspace_root: Some(project_workspace_root),
+            project_workspace_root,
+            runtime_root: Some(home.runtime_dir()),
+            workspace_name: Some(config.daemon.workspace.clone()),
             ..KernelOptions::default()
         },
     )
@@ -719,20 +785,27 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        apply, onboard, render_marker_file, up, ApplyResult, OnboardBindSelection, StackBinaryPaths,
+        apply, onboard, open_kernel, open_kernel_with_project_root, render_marker_file,
+        render_runtime_cache, resolve_worker_entrypoint, up, ApplyResult, OnboardBindSelection,
+        StackBinaryPaths,
     };
     use crate::{
+        config::resolve_project_workspace_root,
         contracts::DaemonInfoResponse,
-        home::LionClawHome,
-        kernel::{Kernel, KernelOptions},
+        home::{runtime_project_partition_key, LionClawHome},
+        kernel::{
+            runtime::{ConfinementConfig, OciConfinementConfig},
+            Kernel, KernelOptions,
+        },
         operator::{
             config::{
-                ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig, OperatorConfig,
-                RuntimeProfileConfig,
+                daemon_compat_fingerprint, ChannelLaunchMode, ManagedChannelConfig,
+                ManagedSkillConfig, OperatorConfig, RuntimeProfileConfig,
             },
             lockfile::OperatorLockfile,
             services::{FakeServiceManager, ServiceManager, DAEMON_UNIT_NAME},
         },
+        workspace::GENERATED_AGENTS_FILE,
     };
 
     async fn spawn_probe_server(app: Router, bind_addr: &str) -> tokio::task::JoinHandle<()> {
@@ -742,6 +815,43 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve probe app");
         })
+    }
+
+    fn current_project_scope() -> String {
+        let project_root =
+            resolve_project_workspace_root().expect("resolve project workspace root");
+        runtime_project_partition_key(Some(project_root.as_path()))
+    }
+
+    async fn current_daemon_config_fingerprint(home: &LionClawHome) -> String {
+        daemon_compat_fingerprint(&OperatorConfig::load(home).await.expect("load config"))
+    }
+
+    #[cfg(unix)]
+    fn ensure_fake_podman(reference: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let engine = reference.parent().expect("stub parent").join("podman");
+        if !engine.exists() {
+            fs::write(&engine, "#!/usr/bin/env bash\nexit 0\n").expect("write fake podman");
+            fs::set_permissions(&engine, fs::Permissions::from_mode(0o755))
+                .expect("chmod fake podman");
+        }
+        engine
+    }
+
+    fn test_codex_runtime(runtime_stub: &std::path::Path) -> RuntimeProfileConfig {
+        RuntimeProfileConfig::Codex {
+            executable: "codex".to_string(),
+            model: None,
+            confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                engine: ensure_fake_podman(runtime_stub)
+                    .to_string_lossy()
+                    .to_string(),
+                image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                ..OciConfinementConfig::default()
+            }),
+        }
     }
 
     #[tokio::test]
@@ -771,6 +881,44 @@ mod tests {
         assert_eq!(reloaded.daemon.bind, config.daemon.bind);
     }
 
+    #[tokio::test]
+    async fn render_runtime_cache_includes_runtime_secret_guidance() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let config = onboard(&home, None).await.expect("onboard");
+        let lockfile = OperatorLockfile::default();
+
+        render_runtime_cache(&home, &config, &lockfile, "codex")
+            .await
+            .expect("render runtime cache");
+        let project_workspace_root =
+            resolve_project_workspace_root().expect("resolve project workspace root");
+
+        let rendered = tokio::fs::read_to_string(
+            home.runtime_project_dir("codex", &config.daemon.workspace, &project_workspace_root)
+                .join(GENERATED_AGENTS_FILE),
+        )
+        .await
+        .expect("read generated agents");
+        assert!(rendered.contains("/run/secrets"));
+        assert!(rendered.contains("lionclaw-runtime-secrets-"));
+        assert!(rendered.contains("do not print its contents"));
+    }
+
+    #[tokio::test]
+    async fn state_kernel_open_does_not_require_project_workspace_root() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let config = onboard(&home, None).await.expect("onboard");
+
+        open_kernel(&home, &config, None)
+            .await
+            .expect("state kernel should open without a project root");
+        open_kernel_with_project_root(&home, &config, None, None)
+            .await
+            .expect("state kernel helper should allow a missing project root");
+    }
+
     #[test]
     fn marker_file_is_deterministic() {
         let rendered = render_marker_file("# Header", "body");
@@ -778,6 +926,19 @@ mod tests {
             rendered,
             "# Header\n<!-- LIONCLAW:START -->\nbody\n<!-- LIONCLAW:END -->\n"
         );
+    }
+
+    #[test]
+    fn worker_entrypoint_requires_canonical_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let snapshot_dir = "skills/example";
+        let scripts_dir = home.root().join(snapshot_dir).join("scripts");
+        fs::create_dir_all(&scripts_dir).expect("scripts dir");
+        fs::write(scripts_dir.join("worker.sh"), "#!/usr/bin/env bash\n").expect("worker");
+
+        let err = resolve_worker_entrypoint(&home, snapshot_dir).expect_err("should fail");
+        assert!(err.to_string().contains("expected 'scripts/worker'"));
     }
 
     #[tokio::test]
@@ -803,24 +964,20 @@ mod tests {
             "---\nname: channel-telegram\ndescription: test\n---\n",
         )
         .expect("skill md");
-        fs::write(
-            skill_source.join("scripts/worker.sh"),
-            "#!/usr/bin/env bash\n",
-        )
-        .expect("worker");
+        fs::write(skill_source.join("scripts/worker"), "#!/usr/bin/env bash\n").expect("worker");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                skill_source.join("scripts/worker"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod worker");
+        }
 
-        config.runtimes = [(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: runtime_stub.to_string_lossy().to_string(),
-                model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
-            },
-        )]
-        .into_iter()
-        .collect();
+        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
+            .into_iter()
+            .collect();
         config.skills = vec![ManagedSkillConfig {
             alias: "telegram".to_string(),
             source: skill_source.to_string_lossy().to_string(),
@@ -845,11 +1002,16 @@ mod tests {
             daemon_bin: "/tmp/lionclawd".into(),
         };
         let applied: ApplyResult = up(&home, &manager, "codex", &binaries).await.expect("up");
+        let project_workspace_root =
+            resolve_project_workspace_root().expect("resolve project workspace root");
 
         assert_eq!(applied.config.channels.len(), 1);
         assert!(home
-            .runtime_workspace_dir("codex", "main")
+            .runtime_project_dir("codex", "main", &project_workspace_root)
             .join("AGENTS.generated.md")
+            .exists());
+        assert!(home
+            .runtime_project_drafts_dir("codex", "main", &project_workspace_root)
             .exists());
     }
 
@@ -867,10 +1029,19 @@ mod tests {
         )
         .expect("skill md v1");
         fs::write(
-            skill_source.join("scripts/worker.sh"),
+            skill_source.join("scripts/worker"),
             "#!/usr/bin/env bash\necho v1\n",
         )
         .expect("worker v1");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                skill_source.join("scripts/worker"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod worker v1");
+        }
 
         let config = OperatorConfig {
             skills: vec![ManagedSkillConfig {
@@ -954,18 +1125,9 @@ mod tests {
             .expect("chmod worker");
         }
 
-        config.runtimes = [(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: runtime_stub.to_string_lossy().to_string(),
-                model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
-            },
-        )]
-        .into_iter()
-        .collect();
+        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
+            .into_iter()
+            .collect();
         config.skills = vec![ManagedSkillConfig {
             alias: "terminal".to_string(),
             source: skill_source.to_string_lossy().to_string(),
@@ -1013,6 +1175,7 @@ mod tests {
             .expect("load config")
             .daemon
             .bind;
+        let config_fingerprint = current_daemon_config_fingerprint(&home).await;
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",
@@ -1025,6 +1188,8 @@ mod tests {
                             home_id: "foreign-home".to_string(),
                             home_root: "/tmp/foreign-home".to_string(),
                             bind_addr: bind_addr.clone(),
+                            project_scope: "foreign-project".to_string(),
+                            config_fingerprint: config_fingerprint.clone(),
                         })
                     }
                 }),
@@ -1053,6 +1218,7 @@ mod tests {
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind;
         let home_root = home.root().display().to_string();
+        let config_fingerprint = current_daemon_config_fingerprint(&home).await;
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",
@@ -1060,6 +1226,7 @@ mod tests {
                     let bind_addr = bind_addr.clone();
                     let home_id = home_id.clone();
                     let home_root = home_root.clone();
+                    let project_scope = current_project_scope();
                     move || async move {
                         Json(DaemonInfoResponse {
                             service: "lionclawd".to_string(),
@@ -1067,6 +1234,8 @@ mod tests {
                             home_id: home_id.clone(),
                             home_root: home_root.clone(),
                             bind_addr: bind_addr.clone(),
+                            project_scope: project_scope.clone(),
+                            config_fingerprint: config_fingerprint.clone(),
                         })
                     }
                 }),
@@ -1087,37 +1256,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn up_reuses_same_home_daemon_when_managed_unit_is_active() {
+    async fn up_rejects_same_home_different_project_daemon() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
+        let config = onboard(&home, Some(OnboardBindSelection::Auto))
             .await
             .expect("onboard");
-        let runtime_stub = temp_dir.path().join("codex-stub.sh");
-        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&runtime_stub, fs::Permissions::from_mode(0o755))
-                .expect("chmod runtime stub");
-        }
-        config.runtimes = [(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: runtime_stub.to_string_lossy().to_string(),
-                model: None,
-                sandbox: "read-only".to_string(),
-                skip_git_repo_check: true,
-                ephemeral: true,
-            },
-        )]
-        .into_iter()
-        .collect();
-        config.save(&home).await.expect("save config");
-
         let home_id = home.ensure_home_id().await.expect("home id");
-        let bind_addr = config.daemon.bind.clone();
+        let bind_addr = config.daemon.bind;
         let home_root = home.root().display().to_string();
+        let config_fingerprint = current_daemon_config_fingerprint(&home).await;
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",
@@ -1132,6 +1280,67 @@ mod tests {
                             home_id: home_id.clone(),
                             home_root: home_root.clone(),
                             bind_addr: bind_addr.clone(),
+                            project_scope: "different-project".to_string(),
+                            config_fingerprint: config_fingerprint.clone(),
+                        })
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+        let manager = FakeServiceManager::default();
+        let binaries = StackBinaryPaths {
+            daemon_bin: "/tmp/lionclawd".into(),
+        };
+
+        let err = up(&home, &manager, "codex", &binaries)
+            .await
+            .expect_err("same-home different-project daemon should fail");
+        assert!(err.to_string().contains("different project"));
+    }
+
+    #[tokio::test]
+    async fn up_reuses_same_home_daemon_when_managed_unit_is_active() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
+        let runtime_stub = temp_dir.path().join("codex-stub.sh");
+        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&runtime_stub, fs::Permissions::from_mode(0o755))
+                .expect("chmod runtime stub");
+        }
+        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
+            .into_iter()
+            .collect();
+        config.save(&home).await.expect("save config");
+
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let bind_addr = config.daemon.bind.clone();
+        let home_root = home.root().display().to_string();
+        let config_fingerprint = current_daemon_config_fingerprint(&home).await;
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    let home_id = home_id.clone();
+                    let home_root = home_root.clone();
+                    let project_scope = current_project_scope();
+                    move || async move {
+                        Json(DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: home_id.clone(),
+                            home_root: home_root.clone(),
+                            bind_addr: bind_addr.clone(),
+                            project_scope: project_scope.clone(),
+                            config_fingerprint: config_fingerprint.clone(),
                         })
                     }
                 }),
@@ -1151,6 +1360,68 @@ mod tests {
         assert!(
             manager.was_restarted(DAEMON_UNIT_NAME),
             "changed active daemon unit should be restarted"
+        );
+    }
+
+    #[tokio::test]
+    async fn up_restarts_same_home_daemon_when_config_is_stale() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
+        let runtime_stub = temp_dir.path().join("codex-stub.sh");
+        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&runtime_stub, fs::Permissions::from_mode(0o755))
+                .expect("chmod runtime stub");
+        }
+        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
+            .into_iter()
+            .collect();
+        config.save(&home).await.expect("save config");
+
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let bind_addr = config.daemon.bind.clone();
+        let home_root = home.root().display().to_string();
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    let home_id = home_id.clone();
+                    let home_root = home_root.clone();
+                    let project_scope = current_project_scope();
+                    move || async move {
+                        Json(DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: home_id.clone(),
+                            home_root: home_root.clone(),
+                            bind_addr: bind_addr.clone(),
+                            project_scope: project_scope.clone(),
+                            config_fingerprint: "daemon-stale-config".to_string(),
+                        })
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+        let manager = FakeServiceManager::default();
+        manager.set_unit_status(DAEMON_UNIT_NAME, "loaded/active/running");
+        let binaries = StackBinaryPaths {
+            daemon_bin: "/tmp/lionclawd".into(),
+        };
+
+        up(&home, &manager, "codex", &binaries)
+            .await
+            .expect("stale managed daemon should be reconciled");
+        assert!(
+            manager.was_restarted(DAEMON_UNIT_NAME),
+            "managed daemon should be restarted when daemon config fingerprint changes"
         );
     }
 

@@ -18,7 +18,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_env() -> Self {
+    pub fn from_env() -> std::io::Result<Self> {
         let home = LionClawHome::from_env();
         let bind_addr = resolve_bind_addr(
             std::env::var("LIONCLAW_BIND_ADDR").ok(),
@@ -55,11 +55,12 @@ impl Config {
             .unwrap_or_else(|| DEFAULT_WORKSPACE.to_string());
 
         let workspace_root = home.workspace_dir(&workspace_name);
-        let project_workspace_root = std::env::var("LIONCLAW_WORKSPACE_ROOT")
-            .ok()
-            .map(PathBuf::from);
+        let project_workspace_root = match configured_project_workspace_root() {
+            Some(path) => Some(canonicalize_project_workspace_root(path)?),
+            None => resolve_project_workspace_root().ok(),
+        };
 
-        Self {
+        Ok(Self {
             bind_addr,
             home,
             db_path,
@@ -68,8 +69,35 @@ impl Config {
             default_runtime_id,
             workspace_root,
             project_workspace_root,
-        }
+        })
     }
+}
+
+pub fn resolve_project_workspace_root() -> std::io::Result<PathBuf> {
+    let path = match configured_project_workspace_root() {
+        Some(path) => path,
+        None => std::env::current_dir()?,
+    };
+
+    canonicalize_project_workspace_root(path)
+}
+
+fn configured_project_workspace_root() -> Option<PathBuf> {
+    std::env::var("LIONCLAW_WORKSPACE_ROOT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn canonicalize_project_workspace_root(path: PathBuf) -> std::io::Result<PathBuf> {
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+
+    resolved.canonicalize()
 }
 
 fn resolve_bind_addr(
@@ -108,7 +136,11 @@ fn join_host_port(host: &str, port: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{join_host_port, resolve_bind_addr, DEFAULT_BIND_HOST, DEFAULT_BIND_PORT};
+    use super::{
+        canonicalize_project_workspace_root, join_host_port, resolve_bind_addr, DEFAULT_BIND_HOST,
+        DEFAULT_BIND_PORT,
+    };
+    use tempfile::tempdir;
 
     #[test]
     fn prefers_explicit_bind_addr_env() {
@@ -136,5 +168,25 @@ mod tests {
             join_host_port("::1", DEFAULT_BIND_PORT),
             format!("[::1]:{}", DEFAULT_BIND_PORT)
         );
+    }
+
+    #[test]
+    fn canonicalize_project_workspace_root_rejects_missing_path() {
+        let err = canonicalize_project_workspace_root(std::path::PathBuf::from(
+            "/definitely/missing/path",
+        ))
+        .expect_err("missing path should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn canonicalize_project_workspace_root_resolves_absolute_path() {
+        let temp_dir = tempdir().expect("temp dir");
+        let project_root = temp_dir.path().join("project");
+        std::fs::create_dir_all(&project_root).expect("create project");
+        let resolved = canonicalize_project_workspace_root(project_root.clone())
+            .expect("resolve absolute path");
+
+        assert_eq!(resolved, project_root);
     }
 }
