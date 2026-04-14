@@ -95,15 +95,9 @@ fn build_oci_process_invocation(request: &ExecutionRequest) -> Result<ProcessInv
         args.push(format!("{key}={value}"));
     }
 
-    if request.runtime_secrets_mount.is_some() {
+    if let Some(runtime_secrets_mount) = &request.runtime_secrets_mount {
         args.push("--secret".to_string());
-        args.push(
-            request
-                .runtime_secrets_mount
-                .as_ref()
-                .expect("checked above")
-                .mounted_name(),
-        );
+        args.push(runtime_secrets_mount.mounted_name());
     }
 
     if let Some(memory_limit) = config.limits.memory_limit.as_deref() {
