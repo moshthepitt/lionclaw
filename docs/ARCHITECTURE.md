@@ -172,9 +172,11 @@ Host-only runtime auth is separate. Confined Codex turns read
 `OPENAI_API_KEY`, generate a per-turn local CA and TLS listener, write a
 session-scoped `~/.codex/config.toml` under `/runtime/home`, and route Codex
 through a short-lived HTTPS proxy at `https://host.containers.internal:<port>/v1`.
-The container only sees a one-time placeholder bearer token plus the generated
-CA certificate path via `CODEX_CA_CERTIFICATE`; the raw OpenAI key stays on the
-host side of the proxy boundary.
+The container only sees a runtime-specific one-time placeholder bearer token
+plus the generated CA certificate path via `CODEX_CA_CERTIFICATE`; the raw
+OpenAI key stays on the host side of the proxy boundary. LionClaw runtime
+compatibility assumes configured OCI image references are treated as immutable;
+when runtime bits change, use a new image tag.
 
 Channel bridge layout:
 

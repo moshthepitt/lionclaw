@@ -12,7 +12,7 @@ use axum::{
     extract::State,
     http::{
         header::{AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST},
-        HeaderMap, Request, Response, StatusCode,
+        HeaderMap, Method, Request, Response, StatusCode,
     },
     routing::any,
     Router,
@@ -27,17 +27,20 @@ use super::{
     backend::ExecutionRequest,
     plan::{MountSpec, NetworkMode, RuntimeAuthProxyKind},
 };
+use crate::kernel::continuity_fs::ContinuityFs;
 
 const RUNTIME_MOUNT_TARGET: &str = "/runtime";
 const PROXY_HOST: &str = "host.containers.internal";
 const OPENAI_UPSTREAM_ORIGIN: &str = "https://api.openai.com";
 const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
+const CODEX_PROXY_TOKEN_ENV: &str = "LIONCLAW_CODEX_OPENAI_PROXY_TOKEN";
 const CODEX_CA_CERTIFICATE_ENV: &str = "CODEX_CA_CERTIFICATE";
 const CODEX_CONFIG_RELATIVE_PATH: &str = "home/.codex/config.toml";
 const PROXY_DIR_RELATIVE_PATH: &str = "home/.lionclaw/auth-proxy";
 const CA_CERT_FILENAME: &str = "ca.pem";
 const SERVER_CERT_FILENAME: &str = "server.pem";
 const SERVER_KEY_FILENAME: &str = "server.key";
+const OPENAI_RESPONSES_PATH: &str = "/v1/responses";
 const LOOPBACK_NETWORK_MODE: &str = "slirp4netns:allow_host_loopback=true";
 const MAX_PROXY_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 static RUSTLS_PROVIDER_INIT: Once = Once::new();
@@ -107,19 +110,7 @@ async fn start_codex_openai_proxy(request: &ExecutionRequest) -> Result<OciAuthP
             )
         })?;
 
-    let runtime_mount_root = runtime_mount_root(&request.plan.mounts)?;
-    let proxy_dir = runtime_mount_root.join(PROXY_DIR_RELATIVE_PATH);
-    let codex_config_path = runtime_mount_root.join(CODEX_CONFIG_RELATIVE_PATH);
-    tokio::fs::create_dir_all(&proxy_dir)
-        .await
-        .with_context(|| format!("failed to create {}", proxy_dir.display()))?;
-    if let Some(parent) = codex_config_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
-    let certificate_paths = write_proxy_certificates(&proxy_dir).await?;
+    let runtime_mount_fs = runtime_mount_fs(&request.plan.mounts)?;
     let listener =
         std::net::TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
             .context("failed to bind Codex auth proxy listener")?;
@@ -130,8 +121,9 @@ async fn start_codex_openai_proxy(request: &ExecutionRequest) -> Result<OciAuthP
         .local_addr()
         .context("failed to inspect Codex auth proxy listener")?;
     let placeholder_token = format!("lionclaw-placeholder-{}", Uuid::new_v4().simple());
+    let certificate_paths = write_proxy_certificates(&runtime_mount_fs)?;
 
-    write_codex_config(&codex_config_path, local_addr.port()).await?;
+    write_codex_config(&runtime_mount_fs, local_addr.port())?;
 
     let state = Arc::new(CodexProxyState {
         client: Client::builder()
@@ -166,7 +158,7 @@ async fn start_codex_openai_proxy(request: &ExecutionRequest) -> Result<OciAuthP
     Ok(OciAuthProxySession {
         launch: OciAuthProxyLaunch {
             environment: vec![
-                (OPENAI_API_KEY_ENV.to_string(), placeholder_token),
+                (CODEX_PROXY_TOKEN_ENV.to_string(), placeholder_token),
                 (
                     CODEX_CA_CERTIFICATE_ENV.to_string(),
                     format!("/runtime/{PROXY_DIR_RELATIVE_PATH}/{CA_CERT_FILENAME}"),
@@ -204,7 +196,7 @@ async fn proxy_codex_openai_request(
             "invalid LionClaw auth placeholder",
         );
     }
-    if !is_supported_openai_path(&parts.uri) {
+    if !is_supported_openai_request(&parts.method, &parts.uri) {
         return plain_response(StatusCode::NOT_FOUND, "unsupported auth proxy path");
     }
 
@@ -269,8 +261,8 @@ fn authorized(headers: &HeaderMap, expected_authorization: &str) -> bool {
         == Some(expected_authorization)
 }
 
-fn is_supported_openai_path(uri: &axum::http::Uri) -> bool {
-    matches!(uri.path(), "/v1" | "/v1/") || uri.path().starts_with("/v1/")
+fn is_supported_openai_request(method: &Method, uri: &axum::http::Uri) -> bool {
+    *method == Method::POST && uri.path() == OPENAI_RESPONSES_PATH
 }
 
 fn should_forward_request_header(name: &axum::http::HeaderName) -> bool {
@@ -300,32 +292,41 @@ fn runtime_mount_root(mounts: &[MountSpec]) -> Result<&Path> {
         .ok_or_else(|| anyhow!("Codex auth proxy requires a /runtime mount"))
 }
 
+fn runtime_mount_fs(mounts: &[MountSpec]) -> Result<ContinuityFs> {
+    let runtime_mount_root = runtime_mount_root(mounts)?;
+    ContinuityFs::bootstrap(runtime_mount_root)
+        .with_context(|| format!("failed to open {}", runtime_mount_root.display()))
+}
+
 struct ProxyCertificatePaths {
     server_cert: PathBuf,
     server_key: PathBuf,
 }
 
-async fn write_proxy_certificates(proxy_dir: &Path) -> Result<ProxyCertificatePaths> {
+fn write_proxy_certificates(runtime_mount_fs: &ContinuityFs) -> Result<ProxyCertificatePaths> {
     let ca = build_ca_certificate()?;
     let server = build_server_certificate(&ca)?;
 
-    let ca_cert_path = proxy_dir.join(CA_CERT_FILENAME);
-    let server_cert_path = proxy_dir.join(SERVER_CERT_FILENAME);
-    let server_key_path = proxy_dir.join(SERVER_KEY_FILENAME);
+    let proxy_dir = Path::new(PROXY_DIR_RELATIVE_PATH);
+    runtime_mount_fs.create_dir_all(proxy_dir)?;
 
-    tokio::fs::write(&ca_cert_path, ca.serialize_pem()?)
-        .await
-        .with_context(|| format!("failed to write {}", ca_cert_path.display()))?;
-    tokio::fs::write(&server_cert_path, server.serialize_pem_with_signer(&ca)?)
-        .await
-        .with_context(|| format!("failed to write {}", server_cert_path.display()))?;
-    tokio::fs::write(&server_key_path, server.serialize_private_key_pem())
-        .await
-        .with_context(|| format!("failed to write {}", server_key_path.display()))?;
+    let ca_cert_relative = proxy_dir.join(CA_CERT_FILENAME);
+    let server_cert_relative = proxy_dir.join(SERVER_CERT_FILENAME);
+    let server_key_relative = proxy_dir.join(SERVER_KEY_FILENAME);
+
+    runtime_mount_fs.write_bytes(&ca_cert_relative, ca.serialize_pem()?.as_bytes())?;
+    runtime_mount_fs.write_bytes(
+        &server_cert_relative,
+        server.serialize_pem_with_signer(&ca)?.as_bytes(),
+    )?;
+    runtime_mount_fs.write_bytes(
+        &server_key_relative,
+        server.serialize_private_key_pem().as_bytes(),
+    )?;
 
     Ok(ProxyCertificatePaths {
-        server_cert: server_cert_path,
-        server_key: server_key_path,
+        server_cert: runtime_mount_fs.absolute_path(&server_cert_relative),
+        server_key: runtime_mount_fs.absolute_path(&server_key_relative),
     })
 }
 
@@ -347,23 +348,24 @@ fn build_server_certificate(ca: &Certificate) -> Result<Certificate> {
         })
 }
 
-async fn write_codex_config(path: &Path, port: u16) -> Result<()> {
+fn write_codex_config(runtime_mount_fs: &ContinuityFs, port: u16) -> Result<()> {
     let contents = format!(
-        "[model_providers.openai]\nbase_url = \"https://{PROXY_HOST}:{port}/v1\"\nenv_key = \"{OPENAI_API_KEY_ENV}\"\nwire_api = \"responses\"\n"
+        "[model_providers.openai]\nbase_url = \"https://{PROXY_HOST}:{port}/v1\"\nenv_key = \"{CODEX_PROXY_TOKEN_ENV}\"\nwire_api = \"responses\"\n"
     );
-    tokio::fs::write(path, contents)
-        .await
-        .with_context(|| format!("failed to write {}", path.display()))
+    runtime_mount_fs.write_string(Path::new(CODEX_CONFIG_RELATIVE_PATH), &contents)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
 
     use axum::{body::Body, http::StatusCode, routing::post, Router};
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use tempfile::tempdir;
 
     use super::*;
@@ -374,6 +376,39 @@ mod tests {
             RuntimeProgramSpec, WorkspaceAccess,
         },
     };
+
+    fn sample_request(runtime_root: PathBuf, home: LionClawHome) -> ExecutionRequest {
+        ExecutionRequest {
+            plan: EffectiveExecutionPlan {
+                runtime_id: "codex".to_string(),
+                preset_name: "everyday".to_string(),
+                confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
+                workspace_access: WorkspaceAccess::ReadWrite,
+                network_mode: NetworkMode::On,
+                working_dir: None,
+                environment: Vec::new(),
+                idle_timeout: Duration::from_secs(30),
+                hard_timeout: Duration::from_secs(90),
+                mounts: vec![MountSpec {
+                    source: runtime_root,
+                    target: "/runtime".to_string(),
+                    access: super::super::plan::MountAccess::ReadWrite,
+                }],
+                mount_runtime_secrets: false,
+                escape_classes: Default::default(),
+                limits: ExecutionLimits::default(),
+            },
+            program: RuntimeProgramSpec {
+                executable: "codex".to_string(),
+                args: vec!["exec".to_string()],
+                environment: Vec::new(),
+                stdin: String::new(),
+                auth_proxy: Some(RuntimeAuthProxyKind::CodexOpenAi),
+            },
+            runtime_secrets_mount: None,
+            runtime_auth_home: Some(home),
+        }
+    }
 
     #[tokio::test]
     async fn codex_auth_proxy_swaps_placeholder_for_real_key() {
@@ -421,36 +456,7 @@ mod tests {
             .await
             .expect("create runtime root");
 
-        let request = ExecutionRequest {
-            plan: EffectiveExecutionPlan {
-                runtime_id: "codex".to_string(),
-                preset_name: "everyday".to_string(),
-                confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
-                workspace_access: WorkspaceAccess::ReadWrite,
-                network_mode: NetworkMode::On,
-                working_dir: None,
-                environment: Vec::new(),
-                idle_timeout: Duration::from_secs(30),
-                hard_timeout: Duration::from_secs(90),
-                mounts: vec![MountSpec {
-                    source: runtime_root.clone(),
-                    target: "/runtime".to_string(),
-                    access: super::super::plan::MountAccess::ReadWrite,
-                }],
-                mount_runtime_secrets: false,
-                escape_classes: Default::default(),
-                limits: ExecutionLimits::default(),
-            },
-            program: RuntimeProgramSpec {
-                executable: "codex".to_string(),
-                args: vec!["exec".to_string()],
-                environment: Vec::new(),
-                stdin: String::new(),
-                auth_proxy: Some(RuntimeAuthProxyKind::CodexOpenAi),
-            },
-            runtime_secrets_mount: None,
-            runtime_auth_home: Some(home),
-        };
+        let request = sample_request(runtime_root.clone(), home);
 
         let proxy = start_codex_openai_proxy_for_test(
             &request,
@@ -464,7 +470,7 @@ mod tests {
             .launch()
             .environment
             .iter()
-            .find(|(key, _)| key == OPENAI_API_KEY_ENV)
+            .find(|(key, _)| key == CODEX_PROXY_TOKEN_ENV)
             .map(|(_, value)| value.clone())
             .expect("placeholder token");
         let ca_path = runtime_root
@@ -493,6 +499,11 @@ mod tests {
             Some("Bearer sk-real")
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let codex_config = tokio::fs::read_to_string(runtime_root.join(CODEX_CONFIG_RELATIVE_PATH))
+            .await
+            .expect("read codex config");
+        assert!(codex_config.contains(CODEX_PROXY_TOKEN_ENV));
+        assert!(!codex_config.contains(OPENAI_API_KEY_ENV));
 
         proxy.shutdown().await.expect("shutdown proxy");
         upstream_task.abort();
@@ -512,36 +523,7 @@ mod tests {
             .await
             .expect("create runtime root");
 
-        let request = ExecutionRequest {
-            plan: EffectiveExecutionPlan {
-                runtime_id: "codex".to_string(),
-                preset_name: "everyday".to_string(),
-                confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
-                workspace_access: WorkspaceAccess::ReadWrite,
-                network_mode: NetworkMode::On,
-                working_dir: None,
-                environment: Vec::new(),
-                idle_timeout: Duration::from_secs(30),
-                hard_timeout: Duration::from_secs(90),
-                mounts: vec![MountSpec {
-                    source: runtime_root.clone(),
-                    target: "/runtime".to_string(),
-                    access: super::super::plan::MountAccess::ReadWrite,
-                }],
-                mount_runtime_secrets: false,
-                escape_classes: Default::default(),
-                limits: ExecutionLimits::default(),
-            },
-            program: RuntimeProgramSpec {
-                executable: "codex".to_string(),
-                args: vec!["exec".to_string()],
-                environment: Vec::new(),
-                stdin: String::new(),
-                auth_proxy: Some(RuntimeAuthProxyKind::CodexOpenAi),
-            },
-            runtime_secrets_mount: None,
-            runtime_auth_home: Some(home),
-        };
+        let request = sample_request(runtime_root.clone(), home);
 
         let proxy = start_codex_openai_proxy_for_test(&request, "http://127.0.0.1:9", "localhost")
             .await
@@ -567,6 +549,113 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         proxy.shutdown().await.expect("shutdown proxy");
+    }
+
+    #[tokio::test]
+    async fn codex_auth_proxy_rejects_non_responses_paths() {
+        let temp_dir = tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-real\n")
+            .await
+            .expect("write runtime auth");
+
+        let runtime_root = temp_dir.path().join("runtime-session");
+        tokio::fs::create_dir_all(&runtime_root)
+            .await
+            .expect("create runtime root");
+        let request = sample_request(runtime_root.clone(), home);
+        let proxy = start_codex_openai_proxy_for_test(&request, "http://127.0.0.1:9", "localhost")
+            .await
+            .expect("start proxy");
+        let placeholder = proxy
+            .launch()
+            .environment
+            .iter()
+            .find(|(key, _)| key == CODEX_PROXY_TOKEN_ENV)
+            .map(|(_, value)| value.clone())
+            .expect("placeholder token");
+        let ca = tokio::fs::read(
+            runtime_root
+                .join(PROXY_DIR_RELATIVE_PATH)
+                .join(CA_CERT_FILENAME),
+        )
+        .await
+        .expect("read ca");
+        let client = reqwest::Client::builder()
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(&ca).expect("load root certificate"),
+            )
+            .build()
+            .expect("client");
+
+        let response = client
+            .post(format!(
+                "https://localhost:{}/v1/chat/completions",
+                proxy.port()
+            ))
+            .header(AUTHORIZATION, format!("Bearer {placeholder}"))
+            .body("{}")
+            .send()
+            .await
+            .expect("send proxy request");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        proxy.shutdown().await.expect("shutdown proxy");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_auth_proxy_rejects_symlinked_runtime_proxy_dir() {
+        let temp_dir = tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-real\n")
+            .await
+            .expect("write runtime auth");
+
+        let runtime_root = temp_dir.path().join("runtime-session");
+        std::fs::create_dir_all(runtime_root.join("home")).expect("runtime home");
+        let outside = temp_dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        symlink(&outside, runtime_root.join("home/.lionclaw")).expect("symlink proxy subtree");
+
+        let request = sample_request(runtime_root, home);
+        let err =
+            match start_codex_openai_proxy_for_test(&request, "http://127.0.0.1:9", "localhost")
+                .await
+            {
+                Ok(_) => panic!("symlinked proxy subtree should fail"),
+                Err(err) => err,
+            };
+        assert!(err.to_string().contains("failed to open"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_auth_proxy_rejects_symlinked_runtime_codex_dir() {
+        let temp_dir = tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-real\n")
+            .await
+            .expect("write runtime auth");
+
+        let runtime_root = temp_dir.path().join("runtime-session");
+        std::fs::create_dir_all(runtime_root.join("home")).expect("runtime home");
+        let outside = temp_dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        symlink(&outside, runtime_root.join("home/.codex")).expect("symlink codex subtree");
+
+        let request = sample_request(runtime_root, home);
+        let err =
+            match start_codex_openai_proxy_for_test(&request, "http://127.0.0.1:9", "localhost")
+                .await
+            {
+                Ok(_) => panic!("symlinked codex subtree should fail"),
+                Err(err) => err,
+            };
+        assert!(err.to_string().contains("failed to open"));
     }
 
     struct TestProxySession {
@@ -617,24 +706,18 @@ mod tests {
             .read_runtime_auth_var(OPENAI_API_KEY_ENV)
             .await?
             .expect("api key");
-        let runtime_mount_root = runtime_mount_root(&request.plan.mounts)?;
-        let proxy_dir = runtime_mount_root.join(PROXY_DIR_RELATIVE_PATH);
-        let codex_config_path = runtime_mount_root.join(CODEX_CONFIG_RELATIVE_PATH);
-        tokio::fs::create_dir_all(&proxy_dir).await?;
-        if let Some(parent) = codex_config_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let certificate_paths = write_proxy_certificates(&proxy_dir).await?;
+        let runtime_mount_fs = runtime_mount_fs(&request.plan.mounts)?;
         let listener =
             std::net::TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
         let placeholder_token = format!("lionclaw-placeholder-{}", Uuid::new_v4().simple());
+        let certificate_paths = write_proxy_certificates(&runtime_mount_fs)?;
         let contents = format!(
-            "[model_providers.openai]\nbase_url = \"https://{proxy_host}:{}/v1\"\nenv_key = \"{OPENAI_API_KEY_ENV}\"\nwire_api = \"responses\"\n",
+            "[model_providers.openai]\nbase_url = \"https://{proxy_host}:{}/v1\"\nenv_key = \"{CODEX_PROXY_TOKEN_ENV}\"\nwire_api = \"responses\"\n",
             local_addr.port()
         );
-        tokio::fs::write(&codex_config_path, contents).await?;
+        runtime_mount_fs.write_string(Path::new(CODEX_CONFIG_RELATIVE_PATH), &contents)?;
         let state = Arc::new(CodexProxyState {
             client: Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -660,7 +743,7 @@ mod tests {
             OciAuthProxySession {
                 launch: OciAuthProxyLaunch {
                     environment: vec![
-                        (OPENAI_API_KEY_ENV.to_string(), placeholder_token),
+                        (CODEX_PROXY_TOKEN_ENV.to_string(), placeholder_token),
                         (
                             CODEX_CA_CERTIFICATE_ENV.to_string(),
                             format!("/runtime/{PROXY_DIR_RELATIVE_PATH}/{CA_CERT_FILENAME}"),

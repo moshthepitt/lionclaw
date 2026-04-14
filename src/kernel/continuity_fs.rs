@@ -97,8 +97,12 @@ impl ContinuityFs {
     }
 
     pub fn write_string(&self, relative: &Path, content: &str) -> Result<()> {
+        self.write_bytes(relative, content.as_bytes())
+    }
+
+    pub fn write_bytes(&self, relative: &Path, content: &[u8]) -> Result<()> {
         let (parent, name) = self.open_parent_dir(relative, true)?;
-        self.write_atomic_in_parent(&parent, &name, content.as_bytes())
+        self.write_atomic_in_parent(&parent, &name, content)
     }
 
     pub fn append_string_with_header(

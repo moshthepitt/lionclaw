@@ -158,9 +158,9 @@ Background operation is explicit. If you want long-running channels and auto-res
 Normal user flow:
 
 1. `lionclaw onboard`
-2. `podman build -t lionclaw-runtime:dev -f containers/runtime/Containerfile .`
+2. `podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .`
 3. `printf 'OPENAI_API_KEY=...\n' > ~/.lionclaw/config/runtime-auth.env`
-4. `lionclaw runtime add codex --kind codex --bin codex --image lionclaw-runtime:dev`
+4. `lionclaw runtime add codex --kind codex --bin codex --image lionclaw-runtime:v1`
 5. `lionclaw run codex`
 
 Runtime definitions, execution presets, and confinement settings live in
@@ -178,11 +178,14 @@ file to owner-only permissions on Unix before loading it.
 
 Host-only runtime auth lives separately in `~/.lionclaw/config/runtime-auth.env`.
 Today the confined Codex path reads `OPENAI_API_KEY` from that file, starts a
-short-lived local HTTPS proxy on the host, injects a one-time placeholder token
+short-lived local HTTPS proxy on the host, injects a runtime-specific one-time
+placeholder token
 into the container, and swaps the placeholder for the real OpenAI key at the
 proxy boundary. The shared OCI runtime image definition lives in
 `containers/runtime/Containerfile` and currently installs both `codex` and
-`opencode`.
+`opencode`. LionClaw runtime compatibility assumes configured image references
+are treated as immutable; rebuild under a new image tag when runtime bits
+change.
 
 Inside `lionclaw run`, recovery stays command-first:
 

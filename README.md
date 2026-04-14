@@ -49,8 +49,8 @@ git clone https://github.com/moshthepitt/lionclaw.git
 cd lionclaw
 cargo build --release
 
-# 2. Build the shared runtime image
-podman build -t lionclaw-runtime:dev -f containers/runtime/Containerfile .
+# 2. Build the shared runtime image with an immutable tag
+podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .
 
 # 3. Initialize your local environment
 ./target/release/lionclaw onboard
@@ -59,7 +59,7 @@ podman build -t lionclaw-runtime:dev -f containers/runtime/Containerfile .
 printf 'OPENAI_API_KEY=...\n' > ~/.lionclaw/config/runtime-auth.env
 
 # 5. Attach a model and start executing
-./target/release/lionclaw runtime add codex --kind codex --bin codex --image lionclaw-runtime:dev
+./target/release/lionclaw runtime add codex --kind codex --bin codex --image lionclaw-runtime:v1
 ./target/release/lionclaw run codex
 ```
 
@@ -228,15 +228,17 @@ owner-only; LionClaw hardens it to `0600` on Unix before handing it to Podman.
 Host-only runtime auth for confined Codex runs lives separately in
 `~/.lionclaw/config/runtime-auth.env`. Today LionClaw reads `OPENAI_API_KEY`
 from that file on the host, starts a short-lived local HTTPS proxy, injects a
-one-time placeholder token into the container, and swaps that placeholder for
-the real key at the proxy boundary. The raw key is not mounted into the
-container.
+runtime-specific one-time placeholder token into the container, and swaps that
+placeholder for the real key at the proxy boundary. The raw key is not mounted
+into the container.
 
 `lionclaw runtime add` configures the runtime command that runs inside the
 runtime image, plus the concrete host `podman` executable and image LionClaw
-uses to launch it. The shared development image lives at
+uses to launch it. The shared runtime image definition lives at
 `containers/runtime/Containerfile` and currently installs both `codex` and
-`opencode`. Execution policy remains config-owned in LionClaw state, not
+`opencode`. LionClaw runtime compatibility keys assume the configured image
+reference is treated as immutable; when the runtime bits change, rebuild under a
+new image tag. Execution policy remains config-owned in LionClaw state, not
 ambient shell state.
 
 `lionclaw service up` persists the project root you launch it from so the

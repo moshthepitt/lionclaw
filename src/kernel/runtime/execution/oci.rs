@@ -469,7 +469,10 @@ mod tests {
                 runtime_auth_home: None,
             },
             Some(&OciAuthProxyLaunch {
-                environment: vec![("OPENAI_API_KEY".to_string(), "placeholder".to_string())],
+                environment: vec![(
+                    "LIONCLAW_CODEX_OPENAI_PROXY_TOKEN".to_string(),
+                    "placeholder".to_string(),
+                )],
                 network_override: Some("slirp4netns:allow_host_loopback=true".to_string()),
             }),
         )
@@ -484,7 +487,7 @@ mod tests {
         assert!(invocation.args.windows(2).any(|pair| {
             pair == [
                 "--env".to_string(),
-                "OPENAI_API_KEY=placeholder".to_string(),
+                "LIONCLAW_CODEX_OPENAI_PROXY_TOKEN=placeholder".to_string(),
             ]
         }));
     }
