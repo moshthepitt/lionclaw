@@ -761,6 +761,7 @@ async fn open_kernel_with_project_root(
             execution_presets: config.presets.clone(),
             runtime_execution_profiles: configured_runtime_execution_profiles(config),
             runtime_secrets_home: Some(home.clone()),
+            runtime_auth_home: Some(home.clone()),
             workspace_root: Some(workspace_root),
             project_workspace_root,
             runtime_root: Some(home.runtime_dir()),

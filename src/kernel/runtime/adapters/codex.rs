@@ -7,9 +7,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::kernel::runtime::{
-    ExecutionOutput, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
-    RuntimeEventSender, RuntimeMessageLane, RuntimeProgramSpec, RuntimeSessionHandle,
-    RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
+    ExecutionOutput, RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthProxyKind,
+    RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender, RuntimeMessageLane,
+    RuntimeProgramSpec, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
+    RuntimeTurnMode,
 };
 
 #[derive(Debug, Clone)]
@@ -93,6 +94,7 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
             args: build_codex_exec_args(&self.config, session.resumes_existing_session),
             environment: Vec::new(),
             stdin: input.prompt.clone(),
+            auth_proxy: Some(RuntimeAuthProxyKind::CodexOpenAi),
         })
     }
 
@@ -497,6 +499,10 @@ mod tests {
         );
         assert!(program.environment.is_empty());
         assert_eq!(program.stdin, "hello");
+        assert_eq!(
+            program.auth_proxy,
+            Some(crate::kernel::runtime::RuntimeAuthProxyKind::CodexOpenAi)
+        );
 
         adapter.close(&handle).await.expect("close");
     }

@@ -31,6 +31,7 @@ Contributors (human or AI) should follow the workflow and quality gates below.
 
 ## Product Lessons
 - LionClaw must have one obvious everyday command path.
+- Prefer one canonical confinement and runtime-auth path over parallel ways to do the same job.
 - `lionclaw run [runtime]` is the canonical interactive path.
 - Raw HTTP is for workers, tests, and debugging only; never document it as normal usage.
 - `systemd --user` is deployment/admin plumbing for background services and many channels, not the default local interactive path.

@@ -104,6 +104,7 @@ pub struct KernelOptions {
     pub execution_presets: BTreeMap<String, ExecutionPreset>,
     pub runtime_execution_profiles: BTreeMap<String, RuntimeExecutionProfile>,
     pub runtime_secrets_home: Option<LionClawHome>,
+    pub runtime_auth_home: Option<LionClawHome>,
     pub workspace_root: Option<PathBuf>,
     pub project_workspace_root: Option<PathBuf>,
     pub runtime_root: Option<PathBuf>,
@@ -125,6 +126,7 @@ impl fmt::Debug for KernelOptions {
                 &self.runtime_execution_profiles,
             )
             .field("runtime_secrets_home", &self.runtime_secrets_home)
+            .field("runtime_auth_home", &self.runtime_auth_home)
             .field("workspace_root", &self.workspace_root)
             .field("project_workspace_root", &self.project_workspace_root)
             .field("runtime_root", &self.runtime_root)
@@ -145,6 +147,7 @@ impl Default for KernelOptions {
             execution_presets: BTreeMap::new(),
             runtime_execution_profiles: BTreeMap::new(),
             runtime_secrets_home: None,
+            runtime_auth_home: None,
             workspace_root: None,
             project_workspace_root: None,
             runtime_root: None,
@@ -175,6 +178,7 @@ pub struct Kernel {
     execution_planner: ExecutionPlanner,
     default_runtime_id: Option<String>,
     runtime_secrets_home: Option<LionClawHome>,
+    runtime_auth_home: Option<LionClawHome>,
     workspace_root: Option<PathBuf>,
     project_workspace_root: Option<PathBuf>,
     session_scope: String,
@@ -279,6 +283,7 @@ impl Kernel {
             execution_planner,
             default_runtime_id: options.default_runtime_id,
             runtime_secrets_home: options.runtime_secrets_home,
+            runtime_auth_home: options.runtime_auth_home,
             workspace_root: options.workspace_root,
             project_workspace_root: options.project_workspace_root,
             session_scope,
@@ -2387,6 +2392,7 @@ impl Kernel {
                         adapter.as_ref(),
                         execution_plan,
                         runtime_secrets_mount,
+                        self.runtime_auth_home.clone(),
                         turn_input,
                         event_tx,
                     )
@@ -5704,6 +5710,7 @@ impl Kernel {
                 error_code: "runtime.error".to_string(),
                 error_text: err.to_string(),
             })?;
+        let runtime_auth_home = self.runtime_auth_home.clone();
         let mut turn_task = tokio::spawn(async move {
             match adapter_for_task.turn_mode() {
                 RuntimeTurnMode::Direct => adapter_for_task.turn(input, event_tx).await,
@@ -5712,6 +5719,7 @@ impl Kernel {
                         adapter_for_task.as_ref(),
                         execution_plan,
                         runtime_secrets_mount,
+                        runtime_auth_home,
                         input,
                         event_tx,
                     )

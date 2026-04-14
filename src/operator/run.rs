@@ -517,6 +517,8 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
+        write_codex_runtime_auth(&home).await;
+        write_codex_runtime_auth(&home).await;
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
         let mut output = Vec::new();
@@ -560,6 +562,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
+        write_codex_runtime_auth(&home).await;
 
         let mut first_input = Cursor::new(b"hello\n/exit\n".to_vec());
         let mut first_output = Vec::new();
@@ -605,6 +608,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
+        write_codex_runtime_auth(&home).await;
 
         let mut first_input = Cursor::new(b"hello\n/exit\n".to_vec());
         let mut first_output = Vec::new();
@@ -684,6 +688,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
+        write_codex_runtime_auth(&home).await;
         let pool = Db::connect_file(&home.db_path())
             .await
             .expect("connect db")
@@ -778,6 +783,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
+        write_codex_runtime_auth(&home).await;
 
         let mut input = Cursor::new(b"/reset\n/exit\n".to_vec());
         let mut output = Vec::new();
@@ -814,6 +820,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
+        write_codex_runtime_auth(&home).await;
 
         let mut input = Cursor::new(b"/exit\n".to_vec());
         let mut output = Vec::new();
@@ -891,6 +898,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
+        write_codex_runtime_auth(&home).await;
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
         let mut output = Vec::new();
@@ -1016,6 +1024,7 @@ exit 7
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
+        write_codex_runtime_auth(&home).await;
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
         let mut output = Vec::new();
@@ -1153,6 +1162,12 @@ esac
                 ..OciConfinementConfig::default()
             }),
         }
+    }
+
+    async fn write_codex_runtime_auth(home: &LionClawHome) {
+        tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
+            .await
+            .expect("write codex runtime auth");
     }
 
     fn stubbed_opencode_runtime(executable: &std::path::Path) -> RuntimeProfileConfig {

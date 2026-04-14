@@ -6,6 +6,8 @@ use serde_json::Value;
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
+use crate::home::LionClawHome;
+
 use super::policy::Capability;
 
 pub mod adapters;
@@ -21,8 +23,8 @@ pub use execution::{
     ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionBackend,
     ExecutionLimits, ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
     ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, MountAccess, MountSpec, NetworkMode,
-    OciConfinementConfig, OciExecutionBackend, RuntimeExecutionProfile, RuntimeProgramSpec,
-    RuntimeSecretsMount, WorkspaceAccess, BUILTIN_PRESET_EVERYDAY,
+    OciConfinementConfig, OciExecutionBackend, RuntimeAuthProxyKind, RuntimeExecutionProfile,
+    RuntimeProgramSpec, RuntimeSecretsMount, WorkspaceAccess, BUILTIN_PRESET_EVERYDAY,
     BUILTIN_PRESET_HIDDEN_COMPACTION,
 };
 
@@ -200,6 +202,7 @@ pub async fn execute_program_backed_turn(
     adapter: &(dyn RuntimeAdapter + Send + Sync),
     plan: EffectiveExecutionPlan,
     runtime_secrets_mount: Option<RuntimeSecretsMount>,
+    runtime_auth_home: Option<LionClawHome>,
     input: RuntimeTurnInput,
     events: RuntimeEventSender,
 ) -> Result<RuntimeTurnResult> {
@@ -210,6 +213,7 @@ pub async fn execute_program_backed_turn(
             plan,
             program,
             runtime_secrets_mount,
+            runtime_auth_home,
         },
         stdout_tx,
     );

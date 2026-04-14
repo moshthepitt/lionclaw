@@ -10,6 +10,7 @@ pub struct RuntimeProgramSpec {
     pub args: Vec<String>,
     pub environment: Vec<(String, String)>,
     pub stdin: String,
+    pub auth_proxy: Option<RuntimeAuthProxyKind>,
 }
 
 impl fmt::Debug for RuntimeProgramSpec {
@@ -19,8 +20,14 @@ impl fmt::Debug for RuntimeProgramSpec {
             .field("args", &self.args)
             .field("environment_count", &self.environment.len())
             .field("stdin_len", &self.stdin.len())
+            .field("auth_proxy", &self.auth_proxy)
             .finish()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeAuthProxyKind {
+    CodexOpenAi,
 }
 
 /// User-facing coarse execution preset compiled before a turn starts.
@@ -330,6 +337,7 @@ mod tests {
                 args: vec!["exec".to_string()],
                 environment: vec![("GITHUB_TOKEN".to_string(), "ghp_secret".to_string())],
                 stdin: "hello".to_string(),
+                auth_proxy: None,
             }
         );
 

@@ -5,6 +5,8 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
+use crate::home::LionClawHome;
+
 use super::oci::OciExecutionBackend;
 use super::plan::{ConfinementBackend, EffectiveExecutionPlan, RuntimeProgramSpec};
 
@@ -40,6 +42,7 @@ pub struct ExecutionRequest {
     pub plan: EffectiveExecutionPlan,
     pub program: RuntimeProgramSpec,
     pub runtime_secrets_mount: Option<RuntimeSecretsMount>,
+    pub runtime_auth_home: Option<LionClawHome>,
 }
 
 impl fmt::Debug for ExecutionRequest {
@@ -48,6 +51,7 @@ impl fmt::Debug for ExecutionRequest {
             .field("plan", &self.plan)
             .field("program", &self.program)
             .field("runtime_secrets_mount", &self.runtime_secrets_mount)
+            .field("runtime_auth_home", &self.runtime_auth_home)
             .finish()
     }
 }
@@ -111,16 +115,21 @@ mod tests {
                     args: vec!["exec".to_string()],
                     environment: vec![("OPENAI_API_KEY".to_string(), "sk-secret".to_string())],
                     stdin: "hello".to_string(),
+                    auth_proxy: None,
                 },
                 runtime_secrets_mount: Some(super::RuntimeSecretsMount {
                     source: "/tmp/runtime-secrets.env".into(),
                 }),
+                runtime_auth_home: Some(crate::home::LionClawHome::new(
+                    "/tmp/lionclaw-home".into(),
+                )),
             }
         );
 
         assert!(!debug.contains("ghp_secret"));
         assert!(!debug.contains("sk-secret"));
         assert!(!debug.contains("hello"));
+        assert!(debug.contains("runtime_auth_home"));
     }
 
     #[test]
