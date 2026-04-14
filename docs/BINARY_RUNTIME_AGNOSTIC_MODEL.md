@@ -176,17 +176,20 @@ Presets either mount that whole file or mount no runtime secrets at all with
 file to owner-only permissions on Unix before loading it.
 
 Host-only runtime auth comes from the host Codex login itself. Today the
-confined Codex path reads `~/.codex/auth.json` or `$CODEX_HOME/auth.json`,
-preflights it before launch, starts a short-lived private Podman pod with a
-tiny HAProxy sidecar, injects a runtime-specific one-time placeholder token
-into the runtime container, and swaps that placeholder for the discovered host
-bearer only inside the sidecar on `POST /responses`. Codex talks to the
-sidecar over pod-local loopback, and LionClaw routes that traffic to either
-`api.openai.com/v1` or `chatgpt.com/backend-api/codex` depending on how the
-host Codex login is authenticated. The raw host auth never enters the runtime
-container and the runtime does not need host loopback reachability. If the
-host Codex login is missing, the fix is `codex login`, not a separate
-LionClaw auth file. The shared OCI runtime image definition lives in
+confined Codex path reads the host Codex auth store, normally
+`~/.codex/auth.json`, preflights it before launch, starts a short-lived
+private Podman pod with a tiny HAProxy sidecar, injects a runtime-specific
+one-time placeholder token into the runtime container, and swaps that
+placeholder for the discovered host bearer only inside the sidecar on
+`POST /responses`. Codex talks to the sidecar over pod-local loopback, and
+LionClaw routes that traffic to either `api.openai.com/v1` or
+`chatgpt.com/backend-api/codex` depending on how the host Codex login is
+authenticated. The raw host auth never enters the runtime container and the
+runtime does not need host loopback reachability. Interactive local runs honor
+`CODEX_HOME` when it is explicitly set in the current shell; background
+services currently use the default host Codex home. If the host Codex login is
+missing, the fix is `codex login`, not a separate LionClaw auth file. The
+shared OCI runtime image definition lives in
 `containers/runtime/Containerfile` and currently installs both `codex` and
 `opencode`. LionClaw runtime compatibility assumes configured image references
 are treated as immutable; rebuild under a new image tag when runtime bits

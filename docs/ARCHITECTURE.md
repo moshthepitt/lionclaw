@@ -168,7 +168,7 @@ LionClaw hardens the config directory to `0700` and the runtime secret file to
 `0600` on Unix before loading it.
 
 Host-only runtime auth comes from the host runtime itself. Confined Codex turns
-read `~/.codex/auth.json` or `$CODEX_HOME/auth.json` on the host, refresh that
+read the host Codex auth store, normally `~/.codex/auth.json`, refresh that
 host auth when needed, write a session-scoped `~/.codex/config.toml` under
 `/runtime/home`, create a short-lived private Podman pod, start a tiny HAProxy
 sidecar in that pod, and then launch the runtime container into the same
@@ -179,9 +179,10 @@ discovered host bearer only on `POST /responses` before forwarding upstream
 over TLS to either `api.openai.com/v1` or `chatgpt.com/backend-api/codex`,
 depending on the local Codex auth mode. The raw host auth never enters the
 runtime container, and the pod path does not require host loopback
-reachability. LionClaw runtime compatibility assumes configured OCI image
-references are treated as immutable; when runtime bits change, use a new image
-tag.
+reachability. `lionclaw run` inherits an interactive shell's `CODEX_HOME` when
+set; background services currently use the default host Codex home. LionClaw
+runtime compatibility assumes configured OCI image references are treated as
+immutable; when runtime bits change, use a new image tag.
 
 Channel bridge layout:
 

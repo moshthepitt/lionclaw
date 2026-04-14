@@ -223,7 +223,8 @@ name that starts with `lionclaw-runtime-secrets-`. Keep the source file
 owner-only; LionClaw hardens it to `0600` on Unix before handing it to Podman.
 
 Host-only runtime auth for confined Codex runs comes from the host Codex login
-state. LionClaw reads `~/.codex/auth.json` or `$CODEX_HOME/auth.json`,
+state. LionClaw reads the host Codex auth store, normally
+`~/.codex/auth.json`,
 preflights that host auth before Codex launch paths, starts a short-lived
 private Podman pod for each confined Codex execution, and runs a tiny HAProxy
 sidecar beside the runtime container. The runtime container only gets a

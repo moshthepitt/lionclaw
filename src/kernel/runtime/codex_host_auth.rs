@@ -1,19 +1,23 @@
 use std::{
     collections::BTreeMap,
+    fs::Metadata,
     io::ErrorKind,
     path::{Path, PathBuf},
+    time::Duration as StdDuration,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
 use reqwest::StatusCode;
+use rustix::fs::{flock, FlockOperation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
 const CODEX_HOME_ENV: &str = "CODEX_HOME";
 const CODEX_AUTH_FILE_NAME: &str = "auth.json";
+const CODEX_AUTH_LOCK_FILE_NAME: &str = ".lionclaw-auth.lock";
 const CHATGPT_CODEX_BASE_PATH: &str = "/backend-api/codex";
 const CHATGPT_CODEX_HOST: &str = "chatgpt.com";
 const OPENAI_API_BASE_PATH: &str = "/v1";
@@ -22,6 +26,8 @@ const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const ACCESS_TOKEN_REFRESH_SKEW: Duration = Duration::seconds(120);
 const ACCESS_TOKEN_FALLBACK_TTL: Duration = Duration::hours(1);
+const OPENAI_OAUTH_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+const OPENAI_OAUTH_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexHostAuthMode {
@@ -77,6 +83,11 @@ impl CodexHostAuth {
 #[derive(Debug, Clone)]
 struct CodexAuthStore {
     auth_path: PathBuf,
+    lock_path: PathBuf,
+}
+
+struct CodexAuthStoreLock {
+    _file: std::fs::File,
 }
 
 impl CodexAuthStore {
@@ -92,10 +103,50 @@ impl CodexAuthStore {
             .ok_or_else(|| anyhow!("could not resolve host Codex home; HOME is not set"))?;
         Ok(Self {
             auth_path: codex_home.join(CODEX_AUTH_FILE_NAME),
+            lock_path: codex_home.join(CODEX_AUTH_LOCK_FILE_NAME),
         })
     }
 
+    async fn lock(&self) -> Result<CodexAuthStoreLock> {
+        let lock_path = self.lock_path.clone();
+        tokio::task::spawn_blocking(move || acquire_codex_auth_lock(&lock_path))
+            .await
+            .context("failed to join Codex auth lock task")?
+    }
+
     async fn read(&self) -> Result<(CodexAuthFile, Option<DateTime<Utc>>)> {
+        let metadata = self.auth_metadata().await?;
+        let modified_at = metadata.modified().ok().map(DateTime::<Utc>::from);
+        let raw = tokio::fs::read_to_string(&self.auth_path)
+            .await
+            .with_context(|| format!("failed to read {}", self.auth_path.display()))?;
+        let auth = serde_json::from_str::<CodexAuthFile>(&raw)
+            .with_context(|| format!("failed to parse {}", self.auth_path.display()))?;
+        Ok((auth, modified_at))
+    }
+
+    async fn write(&self, auth: &CodexAuthFile) -> Result<()> {
+        let metadata = self.auth_metadata().await?;
+        let encoded =
+            serde_json::to_vec_pretty(auth).context("failed to encode refreshed Codex auth")?;
+        let temp_path = self.auth_path.with_file_name(format!(
+            ".lionclaw-codex-auth-{}.tmp",
+            Uuid::new_v4().simple()
+        ));
+        write_private_temp_file(&temp_path, encoded, metadata.permissions()).await?;
+        if let Err(err) = tokio::fs::rename(&temp_path, &self.auth_path).await {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to replace refreshed Codex auth at {}",
+                    self.auth_path.display()
+                )
+            });
+        }
+        Ok(())
+    }
+
+    async fn auth_metadata(&self) -> Result<Metadata> {
         let metadata = match tokio::fs::symlink_metadata(&self.auth_path).await {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -115,49 +166,16 @@ impl CodexAuthStore {
                 self.auth_path.display()
             );
         }
-
-        let modified_at = metadata.modified().ok().map(DateTime::<Utc>::from);
-        let raw = tokio::fs::read_to_string(&self.auth_path)
-            .await
-            .with_context(|| format!("failed to read {}", self.auth_path.display()))?;
-        let auth = serde_json::from_str::<CodexAuthFile>(&raw)
-            .with_context(|| format!("failed to parse {}", self.auth_path.display()))?;
-        Ok((auth, modified_at))
-    }
-
-    async fn write(&self, auth: &CodexAuthFile) -> Result<()> {
-        let metadata = tokio::fs::symlink_metadata(&self.auth_path)
-            .await
-            .with_context(|| format!("failed to stat {}", self.auth_path.display()))?;
-        if metadata.file_type().is_symlink() {
+        if !metadata.file_type().is_file() {
             bail!(
-                "host Codex auth file '{}' must not be a symlink",
+                "host Codex auth file '{}' must be a regular file",
                 self.auth_path.display()
             );
         }
-
-        let encoded =
-            serde_json::to_vec_pretty(auth).context("failed to encode refreshed Codex auth")?;
-        let temp_path = self.auth_path.with_file_name(format!(
-            ".lionclaw-codex-auth-{}.tmp",
-            Uuid::new_v4().simple()
-        ));
-        tokio::fs::write(&temp_path, encoded)
+        harden_private_file_permissions(&self.auth_path, &metadata, "host Codex auth").await?;
+        tokio::fs::symlink_metadata(&self.auth_path)
             .await
-            .with_context(|| format!("failed to write {}", temp_path.display()))?;
-        tokio::fs::set_permissions(&temp_path, metadata.permissions())
-            .await
-            .with_context(|| format!("failed to set permissions on {}", temp_path.display()))?;
-        if let Err(err) = tokio::fs::rename(&temp_path, &self.auth_path).await {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to replace refreshed Codex auth at {}",
-                    self.auth_path.display()
-                )
-            });
-        }
-        Ok(())
+            .with_context(|| format!("failed to stat {}", self.auth_path.display()))
     }
 }
 
@@ -203,6 +221,8 @@ async fn resolve_codex_host_auth_with_refresh_url(
     refresh_url: &str,
 ) -> Result<CodexHostAuth> {
     let store = CodexAuthStore::resolve(codex_home_override)?;
+    store.auth_metadata().await?;
+    let _lock = store.lock().await?;
     let (mut auth, modified_at) = store.read().await?;
 
     if let Some(api_key) = nonempty(auth.openai_api_key.as_deref()) {
@@ -286,7 +306,26 @@ async fn refresh_codex_tokens(
     refresh_url: &str,
     refresh_token: &str,
 ) -> Result<OpenAiRefreshResponse> {
-    let response = reqwest::Client::new()
+    refresh_codex_tokens_with_timeouts(
+        refresh_url,
+        refresh_token,
+        OPENAI_OAUTH_CONNECT_TIMEOUT,
+        OPENAI_OAUTH_REQUEST_TIMEOUT,
+    )
+    .await
+}
+
+async fn refresh_codex_tokens_with_timeouts(
+    refresh_url: &str,
+    refresh_token: &str,
+    connect_timeout: StdDuration,
+    request_timeout: StdDuration,
+) -> Result<OpenAiRefreshResponse> {
+    let response = reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .build()
+        .context("failed to construct Codex auth refresh client")?
         .post(refresh_url)
         .form(&[
             ("grant_type", "refresh_token"),
@@ -337,8 +376,121 @@ fn nonempty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn acquire_codex_auth_lock(lock_path: &Path) -> Result<CodexAuthStoreLock> {
+    if let Ok(metadata) = std::fs::symlink_metadata(lock_path) {
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "Codex auth lock file '{}' must not be a symlink",
+                lock_path.display()
+            );
+        }
+        if !metadata.file_type().is_file() {
+            bail!(
+                "Codex auth lock file '{}' must be a regular file",
+                lock_path.display()
+            );
+        }
+    }
+
+    let file = open_private_file(lock_path, true)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    flock(&file, FlockOperation::LockExclusive)
+        .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+    Ok(CodexAuthStoreLock { _file: file })
+}
+
+async fn write_private_temp_file(
+    path: &Path,
+    contents: Vec<u8>,
+    permissions: std::fs::Permissions,
+) -> Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        write_private_temp_file_blocking(&path, contents, permissions)
+    })
+    .await
+    .context("failed to join Codex auth temp-file write task")?
+}
+
+fn write_private_temp_file_blocking(
+    path: &Path,
+    contents: Vec<u8>,
+    permissions: std::fs::Permissions,
+) -> Result<()> {
+    use std::io::Write;
+
+    let mut file = open_private_file(path, false)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.write_all(&contents)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", path.display()))?;
+    set_private_file_permissions(path, permissions)
+        .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+    Ok(())
+}
+
+fn open_private_file(path: &Path, create: bool) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    if create {
+        options.create(true);
+    } else {
+        options.create_new(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    options.open(path).map_err(Into::into)
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &Path, permissions: std::fs::Permissions) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = permissions;
+    permissions.set_mode(permissions.mode() & 0o700);
+    std::fs::set_permissions(path, permissions).map_err(Into::into)
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(path: &Path, permissions: std::fs::Permissions) -> Result<()> {
+    std::fs::set_permissions(path, permissions).map_err(Into::into)
+}
+
+async fn harden_private_file_permissions(
+    path: &Path,
+    metadata: &Metadata,
+    label: &str,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let file_mode = metadata.permissions().mode();
+        if file_mode & 0o077 != 0 {
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .await
+                .with_context(|| format!("failed to chmod {} '{}'", label, path.display()))?;
+        }
+    }
+
+    #[cfg(not(unix))]
+    let _ = (path, metadata, label);
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
     use axum::{extract::Form, routing::post, Router};
     use serde_json::json;
     use tokio::net::TcpListener;
@@ -474,6 +626,71 @@ mod tests {
         assert!(!written.contains(&stale_access));
     }
 
+    #[tokio::test]
+    async fn concurrent_resolves_share_a_single_refresh() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let codex_home = temp_dir.path().join(".codex");
+        write_auth_file(
+            &codex_home,
+            json!({
+                "OPENAI_API_KEY": null,
+                "last_refresh": (Utc::now() - Duration::hours(2)).to_rfc3339(),
+                "tokens": {
+                    "access_token": fake_jwt(Utc::now() - Duration::minutes(5)),
+                    "refresh_token": "refresh-old",
+                }
+            }),
+        )
+        .await;
+
+        let refresh_hits = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        let refresh_hits_server = refresh_hits.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/oauth/token",
+                    post(move |Form(_form): Form<BTreeMap<String, String>>| {
+                        let refresh_hits = refresh_hits_server.clone();
+                        async move {
+                            refresh_hits.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(StdDuration::from_millis(50)).await;
+                            axum::Json(json!({
+                                "access_token": fake_jwt(Utc::now() + Duration::hours(1)),
+                                "refresh_token": "refresh-new"
+                            }))
+                        }
+                    }),
+                ),
+            )
+            .await
+            .expect("serve refresh endpoint");
+        });
+
+        let refresh_url = format!("http://{address}/oauth/token");
+        let (first, second) = tokio::join!(
+            resolve_codex_host_auth_with_refresh_url(Some(&codex_home), &refresh_url),
+            resolve_codex_host_auth_with_refresh_url(Some(&codex_home), &refresh_url),
+        );
+
+        server.abort();
+
+        let first = first.expect("first auth");
+        let second = second.expect("second auth");
+        assert_eq!(first.mode(), CodexHostAuthMode::ChatGpt);
+        assert_eq!(second.mode(), CodexHostAuthMode::ChatGpt);
+        assert_eq!(refresh_hits.load(Ordering::SeqCst), 1);
+
+        let written = tokio::fs::read_to_string(codex_home.join(CODEX_AUTH_FILE_NAME))
+            .await
+            .expect("read auth file");
+        assert!(written.contains("refresh-new"));
+    }
+
     #[test]
     fn applies_rotated_refresh_token_to_existing_auth_store() {
         let mut auth = CodexAuthFile {
@@ -503,6 +720,66 @@ mod tests {
         assert_eq!(tokens.refresh_token.as_deref(), Some("new-refresh"));
         assert_eq!(tokens.id_token.as_deref(), Some("id-old"));
         assert_eq!(tokens.account_id.as_deref(), Some("acct-old"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolves_harden_overly_broad_auth_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let codex_home = temp_dir.path().join(".codex");
+        write_auth_file(
+            &codex_home,
+            json!({
+                "OPENAI_API_KEY": "sk-test"
+            }),
+        )
+        .await;
+        std::fs::set_permissions(
+            codex_home.join(CODEX_AUTH_FILE_NAME),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("chmod auth");
+
+        let auth = resolve_codex_host_auth(Some(&codex_home))
+            .await
+            .expect("resolve auth");
+
+        assert_eq!(auth.mode(), CodexHostAuthMode::OpenAiApi);
+        let mode = std::fs::metadata(codex_home.join(CODEX_AUTH_FILE_NAME))
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[tokio::test]
+    async fn refresh_timeout_fails_fast() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept");
+            tokio::time::sleep(StdDuration::from_millis(200)).await;
+        });
+
+        let err = refresh_codex_tokens_with_timeouts(
+            &format!("http://{address}/oauth/token"),
+            "refresh-old",
+            StdDuration::from_millis(20),
+            StdDuration::from_millis(20),
+        )
+        .await
+        .expect_err("timeout should fail");
+
+        server.abort();
+
+        assert!(err
+            .to_string()
+            .contains("failed to refresh host Codex auth"));
     }
 
     #[cfg(unix)]
