@@ -14,7 +14,7 @@ use super::{
     error::KernelError,
     jobs::{
         ClaimedSchedulerJob, SchedulerJobDeliveryStatus, SchedulerJobRecord, SchedulerJobRunRecord,
-        SchedulerJobRunStatus,
+        SchedulerJobRunStatus, SchedulerJobTriggerKind,
     },
 };
 
@@ -60,28 +60,8 @@ impl SchedulerEngine {
         let renewal_handle = self.spawn_lease_renewal(kernel, owner.clone(), lease_ttl);
         let tick_result = async {
             let mut claimed_runs = 0usize;
-            while let Some(next_due_job) = self.peek_next_due_job(kernel).await? {
-                if let Err(err) = kernel
-                    .validate_runtime_launch_prerequisites(&next_due_job.runtime_id)
-                    .await
-                {
-                    let Some(claimed_job) =
-                        self.claim_and_record_due_job(kernel, &next_due_job).await?
-                    else {
-                        continue;
-                    };
-                    claimed_runs += 1;
-                    self.fail_claimed_job_preflight(kernel, claimed_job, &err)
-                        .await?;
-                    continue;
-                }
-                let Some(claimed_job) =
-                    self.claim_and_record_due_job(kernel, &next_due_job).await?
-                else {
-                    continue;
-                };
+            while let Some(claimed_job) = self.claim_next_due_job(kernel).await? {
                 claimed_runs += 1;
-
                 self.run_claimed_job(kernel, claimed_job).await?;
             }
 
@@ -121,6 +101,32 @@ impl SchedulerEngine {
         let job = claimed.job;
         let mut current_run = claimed.run;
         loop {
+            if let Err(err) = kernel
+                .validate_runtime_launch_prerequisites(&job.runtime_id)
+                .await
+            {
+                match self
+                    .handle_failed_attempt(
+                        kernel,
+                        &job,
+                        &current_run,
+                        AttemptFailureContext {
+                            session_id: None,
+                            turn_id: None,
+                            failure_phase: Some("preflight"),
+                        },
+                        &err,
+                    )
+                    .await?
+                {
+                    AttemptOutcome::Retry(next_run) => {
+                        current_run = next_run;
+                        continue;
+                    }
+                    AttemptOutcome::Finished(result) => return Ok(*result),
+                }
+            }
+
             let attempt_result = self.run_job_attempt(kernel, &job, &current_run).await;
             match attempt_result {
                 Ok(AttemptOutcome::Retry(next_run)) => {
@@ -154,35 +160,18 @@ impl SchedulerEngine {
         }
     }
 
-    async fn peek_next_due_job(
+    async fn claim_next_due_job(
         &self,
         kernel: &Kernel,
-    ) -> Result<Option<SchedulerJobRecord>, KernelError> {
-        kernel
-            .job_store()
-            .peek_next_due_job(Utc::now())
-            .await
-            .map_err(internal)
-    }
-
-    async fn claim_due_job(
-        &self,
-        kernel: &Kernel,
-        job: &SchedulerJobRecord,
     ) -> Result<Option<ClaimedSchedulerJob>, KernelError> {
-        kernel
+        let Some(claimed_job) = kernel
             .job_store()
-            .claim_scheduled_run(job.job_id, job.next_run_at, Utc::now())
+            .claim_due_jobs(Utc::now(), 1, SchedulerJobTriggerKind::Schedule)
             .await
-            .map_err(internal)
-    }
-
-    async fn claim_and_record_due_job(
-        &self,
-        kernel: &Kernel,
-        job: &SchedulerJobRecord,
-    ) -> Result<Option<ClaimedSchedulerJob>, KernelError> {
-        let Some(claimed_job) = self.claim_due_job(kernel, job).await? else {
+            .map_err(internal)?
+            .into_iter()
+            .next()
+        else {
             return Ok(None);
         };
         let _ = kernel
@@ -225,67 +214,6 @@ impl SchedulerEngine {
             Ok(_) => SchedulerJobDeliveryStatus::Delivered,
             Err(_) => SchedulerJobDeliveryStatus::Failed,
         }
-    }
-
-    async fn fail_claimed_job_preflight(
-        &self,
-        kernel: &Kernel,
-        claimed: ClaimedSchedulerJob,
-        error: &KernelError,
-    ) -> Result<(), KernelError> {
-        let ClaimedSchedulerJob { job, run } = claimed;
-        let error_text = error.to_string();
-        let failure_summary = format!("Scheduled job '{}' failed: {}", job.name, error_text);
-        let delivery_status = self
-            .deliver_job_result(kernel, &job, &failure_summary)
-            .await;
-        let final_status = if matches!(job.schedule, super::jobs::JobSchedule::Once { .. }) {
-            SchedulerJobRunStatus::DeadLetter
-        } else {
-            SchedulerJobRunStatus::Failed
-        };
-        let _updated_job = kernel
-            .job_store()
-            .complete_run_failure(
-                run.run_id,
-                None,
-                None,
-                &error_text,
-                final_status,
-                delivery_status,
-            )
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| {
-                KernelError::NotFound(
-                    "scheduled job disappeared during preflight failure".to_string(),
-                )
-            })?;
-        let final_run = kernel
-            .job_store()
-            .get_run(run.run_id)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| KernelError::NotFound("scheduled job run disappeared".to_string()))?;
-        let _ = kernel
-            .audit_log()
-            .append(
-                "job.run.failed",
-                None,
-                Some("scheduler".to_string()),
-                json!({
-                    "job_id": job.job_id,
-                    "run_id": final_run.run_id,
-                    "error": error_text.clone(),
-                    "delivery_status": delivery_status.as_str(),
-                    "failure_phase": "preflight",
-                }),
-            )
-            .await;
-        let _ = kernel
-            .record_scheduler_continuity_failure(&job, &final_run, &error_text)
-            .await;
-        Ok(())
     }
 
     async fn run_job_attempt(
@@ -355,80 +283,103 @@ impl SchedulerEngine {
                 Ok(AttemptOutcome::Finished(Box::new((updated_job, final_run))))
             }
             Err(err) => {
-                if current_run.attempt_no <= job.retry_attempts {
-                    let next_run = kernel
-                        .job_store()
-                        .begin_retry_run(current_run.run_id, Utc::now())
-                        .await
-                        .map_err(internal)?
-                        .ok_or_else(|| {
-                            KernelError::Conflict(
-                                "scheduled retry could not be started".to_string(),
-                            )
-                        })?;
-                    let _ = kernel
-                        .audit_log()
-                        .append(
-                            "job.run.retry",
-                            Some(opened.session_id),
-                            Some("scheduler".to_string()),
-                            json!({
-                                "job_id": job.job_id,
-                                "run_id": next_run.run_id,
-                                "attempt_no": next_run.attempt_no,
-                            }),
-                        )
-                        .await;
-                    return Ok(AttemptOutcome::Retry(next_run));
-                }
-
-                let failure_summary = format!("Scheduled job '{}' failed: {}", job.name, err);
-                let delivery_status = self.deliver_job_result(kernel, job, &failure_summary).await;
-                let updated_job = kernel
-                    .job_store()
-                    .complete_run_failure(
-                        current_run.run_id,
-                        Some(opened.session_id),
-                        Some(turn_id),
-                        &err.to_string(),
-                        SchedulerJobRunStatus::DeadLetter,
-                        delivery_status,
-                    )
-                    .await
-                    .map_err(internal)?
-                    .ok_or_else(|| {
-                        KernelError::NotFound(
-                            "scheduled job disappeared during failure completion".to_string(),
-                        )
-                    })?;
-                let final_run = kernel
-                    .job_store()
-                    .get_run(current_run.run_id)
-                    .await
-                    .map_err(internal)?
-                    .ok_or_else(|| {
-                        KernelError::NotFound("scheduled job run disappeared".to_string())
-                    })?;
-                let _ = kernel
-                    .audit_log()
-                    .append(
-                        "job.run.failed",
-                        Some(opened.session_id),
-                        Some("scheduler".to_string()),
-                        json!({
-                            "job_id": job.job_id,
-                            "run_id": final_run.run_id,
-                            "error": err.to_string(),
-                            "delivery_status": delivery_status.as_str(),
-                        }),
-                    )
-                    .await;
-                let _ = kernel
-                    .record_scheduler_continuity_failure(job, &final_run, &err.to_string())
-                    .await;
-                Ok(AttemptOutcome::Finished(Box::new((updated_job, final_run))))
+                self.handle_failed_attempt(
+                    kernel,
+                    job,
+                    current_run,
+                    AttemptFailureContext {
+                        session_id: Some(opened.session_id),
+                        turn_id: Some(turn_id),
+                        failure_phase: None,
+                    },
+                    &err,
+                )
+                .await
             }
         }
+    }
+
+    async fn handle_failed_attempt(
+        &self,
+        kernel: &Kernel,
+        job: &SchedulerJobRecord,
+        current_run: &SchedulerJobRunRecord,
+        context: AttemptFailureContext,
+        err: &KernelError,
+    ) -> Result<AttemptOutcome, KernelError> {
+        if current_run.attempt_no <= job.retry_attempts {
+            let next_run = kernel
+                .job_store()
+                .begin_retry_run(current_run.run_id, Utc::now())
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| {
+                    KernelError::Conflict("scheduled retry could not be started".to_string())
+                })?;
+            let _ = kernel
+                .audit_log()
+                .append(
+                    "job.run.retry",
+                    context.session_id,
+                    Some("scheduler".to_string()),
+                    json!({
+                        "job_id": job.job_id,
+                        "run_id": next_run.run_id,
+                        "attempt_no": next_run.attempt_no,
+                    }),
+                )
+                .await;
+            return Ok(AttemptOutcome::Retry(next_run));
+        }
+
+        let error_text = err.to_string();
+        let failure_summary = format!("Scheduled job '{}' failed: {}", job.name, error_text);
+        let delivery_status = self.deliver_job_result(kernel, job, &failure_summary).await;
+        let updated_job = kernel
+            .job_store()
+            .complete_run_failure(
+                current_run.run_id,
+                context.session_id,
+                context.turn_id,
+                &error_text,
+                SchedulerJobRunStatus::DeadLetter,
+                delivery_status,
+            )
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                KernelError::NotFound(
+                    "scheduled job disappeared during failure completion".to_string(),
+                )
+            })?;
+        let final_run = kernel
+            .job_store()
+            .get_run(current_run.run_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("scheduled job run disappeared".to_string()))?;
+        let mut audit_details = json!({
+            "job_id": job.job_id,
+            "run_id": final_run.run_id,
+            "error": error_text,
+            "delivery_status": delivery_status.as_str(),
+        });
+        if let Some(failure_phase) = context.failure_phase {
+            audit_details["failure_phase"] = json!(failure_phase);
+        }
+        let _ = kernel
+            .audit_log()
+            .append(
+                "job.run.failed",
+                context.session_id,
+                Some("scheduler".to_string()),
+                audit_details,
+            )
+            .await;
+        let _ = kernel
+            .record_scheduler_continuity_failure(job, &final_run, &error_text)
+            .await;
+        Ok(AttemptOutcome::Finished(Box::new((updated_job, final_run))))
     }
 
     fn spawn_lease_renewal(
@@ -468,6 +419,12 @@ struct TickLeaseRenewal {
 enum AttemptOutcome {
     Retry(SchedulerJobRunRecord),
     Finished(Box<(SchedulerJobRecord, SchedulerJobRunRecord)>),
+}
+
+struct AttemptFailureContext {
+    session_id: Option<Uuid>,
+    turn_id: Option<Uuid>,
+    failure_phase: Option<&'static str>,
 }
 
 impl TickLeaseRenewal {

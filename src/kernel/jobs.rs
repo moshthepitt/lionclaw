@@ -680,33 +680,6 @@ impl JobStore {
         Ok(claimed)
     }
 
-    pub async fn peek_next_due_job(
-        &self,
-        now: DateTime<Utc>,
-    ) -> Result<Option<SchedulerJobRecord>> {
-        Ok(self.load_due_jobs(now, 1).await?.into_iter().next())
-    }
-
-    pub async fn claim_scheduled_run(
-        &self,
-        job_id: Uuid,
-        scheduled_for: Option<DateTime<Utc>>,
-        now: DateTime<Utc>,
-    ) -> Result<Option<ClaimedSchedulerJob>> {
-        self.claim_job_run(
-            job_id,
-            JobRunClaim {
-                trigger_kind: SchedulerJobTriggerKind::Schedule,
-                scheduled_for,
-                attempt_no: 1,
-                advance_schedule: true,
-                require_enabled: true,
-                now,
-            },
-        )
-        .await
-    }
-
     pub async fn claim_manual_run(
         &self,
         job_id: Uuid,

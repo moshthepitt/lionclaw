@@ -272,6 +272,71 @@ async fn scheduler_tick_dead_letters_missing_runtime_auth_without_launching_runt
 }
 
 #[tokio::test]
+async fn scheduler_tick_retries_missing_runtime_auth_before_dead_lettering() {
+    let env = TestEnv::new();
+    let home = LionClawHome::new(env.temp_dir.path().join(".lionclaw"));
+    home.ensure_base_dirs().await.expect("base dirs");
+    tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
+        .await
+        .expect("write runtime auth");
+    let turn_calls = Arc::new(AtomicUsize::new(0));
+    let kernel = kernel_with_counting_codex_runtime(&env, &home, turn_calls.clone()).await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "codex scheduled".to_string(),
+            runtime_id: "codex".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "scheduled run".to_string(),
+            skill_ids: Vec::new(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(1),
+        })
+        .await
+        .expect("create job");
+
+    tokio::fs::remove_file(home.runtime_auth_env_path())
+        .await
+        .expect("remove runtime auth");
+
+    let tick = kernel.scheduler_tick().await.expect("scheduler tick");
+    assert_eq!(tick.claimed_runs, 1);
+    assert_eq!(turn_calls.load(Ordering::SeqCst), 0);
+
+    let job = kernel
+        .get_job(created.job.job_id)
+        .await
+        .expect("load job")
+        .job;
+    assert_eq!(
+        job.last_status,
+        Some(lionclaw::contracts::SchedulerJobRunStatusDto::DeadLetter)
+    );
+
+    let runs = kernel
+        .list_job_runs(JobRunsRequest {
+            job_id: created.job.job_id,
+            limit: Some(5),
+        })
+        .await
+        .expect("list job runs");
+    assert_eq!(runs.runs.len(), 2);
+    assert_eq!(runs.runs[0].attempt_no, 2);
+    assert_eq!(
+        runs.runs[0].status,
+        lionclaw::contracts::SchedulerJobRunStatusDto::DeadLetter
+    );
+    assert_eq!(runs.runs[1].attempt_no, 1);
+    assert_eq!(
+        runs.runs[1].status,
+        lionclaw::contracts::SchedulerJobRunStatusDto::Failed
+    );
+}
+
+#[tokio::test]
 async fn scheduler_tick_continues_past_auth_invalid_jobs() {
     let env = TestEnv::new();
     let home = LionClawHome::new(env.temp_dir.path().join(".lionclaw"));
