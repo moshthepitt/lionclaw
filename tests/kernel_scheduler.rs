@@ -205,7 +205,7 @@ async fn manual_job_run_rejects_missing_runtime_auth_before_launch() {
 }
 
 #[tokio::test]
-async fn scheduler_tick_rejects_missing_runtime_auth_before_launch() {
+async fn scheduler_tick_dead_letters_missing_runtime_auth_without_launching_runtime() {
     let env = TestEnv::new();
     let home = LionClawHome::new(env.temp_dir.path().join(".lionclaw"));
     home.ensure_base_dirs().await.expect("base dirs");
@@ -235,18 +235,26 @@ async fn scheduler_tick_rejects_missing_runtime_auth_before_launch() {
         .await
         .expect("remove runtime auth");
 
-    let err = kernel
-        .scheduler_tick()
-        .await
-        .expect_err("missing runtime auth should block scheduler tick");
-
-    match err {
-        KernelError::Runtime(message) => {
-            assert!(message.contains("OPENAI_API_KEY"));
-        }
-        other => panic!("unexpected error variant: {}", other),
-    }
+    let tick = kernel.scheduler_tick().await.expect("scheduler tick");
+    assert_eq!(tick.claimed_runs, 1);
     assert_eq!(turn_calls.load(Ordering::SeqCst), 0);
+    let job = kernel
+        .get_job(created.job.job_id)
+        .await
+        .expect("load job")
+        .job;
+    assert_eq!(
+        job.last_status,
+        Some(lionclaw::contracts::SchedulerJobRunStatusDto::DeadLetter)
+    );
+    assert!(job
+        .last_error
+        .as_deref()
+        .is_some_and(|error| error.contains("OPENAI_API_KEY")));
+    assert!(
+        !job.enabled,
+        "one-shot auth-invalid jobs should dead-letter"
+    );
     let runs = kernel
         .list_job_runs(JobRunsRequest {
             job_id: created.job.job_id,
@@ -254,9 +262,83 @@ async fn scheduler_tick_rejects_missing_runtime_auth_before_launch() {
         })
         .await
         .expect("list job runs");
-    assert!(
-        runs.runs.is_empty(),
-        "scheduler tick should not claim the job"
+    assert_eq!(runs.runs.len(), 1);
+    assert_eq!(
+        runs.runs[0].status,
+        lionclaw::contracts::SchedulerJobRunStatusDto::DeadLetter
+    );
+    assert!(runs.runs[0].session_id.is_none());
+    assert!(runs.runs[0].turn_id.is_none());
+}
+
+#[tokio::test]
+async fn scheduler_tick_continues_past_auth_invalid_jobs() {
+    let env = TestEnv::new();
+    let home = LionClawHome::new(env.temp_dir.path().join(".lionclaw"));
+    home.ensure_base_dirs().await.expect("base dirs");
+    tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
+        .await
+        .expect("write runtime auth");
+    let turn_calls = Arc::new(AtomicUsize::new(0));
+    let kernel = kernel_with_counting_codex_runtime(&env, &home, turn_calls.clone()).await;
+
+    let invalid = kernel
+        .create_job(JobCreateRequest {
+            name: "codex scheduled".to_string(),
+            runtime_id: "codex".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(2),
+            },
+            prompt_text: "scheduled run".to_string(),
+            skill_ids: Vec::new(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create invalid job");
+    let valid = kernel
+        .create_job(JobCreateRequest {
+            name: "mock scheduled".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "scheduled run".to_string(),
+            skill_ids: Vec::new(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create valid job");
+
+    tokio::fs::remove_file(home.runtime_auth_env_path())
+        .await
+        .expect("remove runtime auth");
+
+    let tick = kernel.scheduler_tick().await.expect("scheduler tick");
+    assert_eq!(tick.claimed_runs, 2);
+    assert_eq!(turn_calls.load(Ordering::SeqCst), 0);
+
+    let invalid_job = kernel
+        .get_job(invalid.job.job_id)
+        .await
+        .expect("load invalid job")
+        .job;
+    assert_eq!(
+        invalid_job.last_status,
+        Some(lionclaw::contracts::SchedulerJobRunStatusDto::DeadLetter)
+    );
+
+    let valid_job = kernel
+        .get_job(valid.job.job_id)
+        .await
+        .expect("load valid job")
+        .job;
+    assert_eq!(
+        valid_job.last_status,
+        Some(lionclaw::contracts::SchedulerJobRunStatusDto::Completed)
     );
 }
 

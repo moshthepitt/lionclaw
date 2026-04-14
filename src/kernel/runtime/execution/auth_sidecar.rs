@@ -164,6 +164,13 @@ async fn start_codex_openai_sidecar(request: &ExecutionRequest) -> Result<OciRun
     let engine = request.plan.confinement.oci().engine.clone();
     let pod_name = format!("lionclaw-runtime-{}", Uuid::new_v4().simple());
     let proxy_name = format!("lionclaw-auth-{}", Uuid::new_v4().simple());
+    let sidecar_run_invocation = build_sidecar_run_invocation(
+        &engine,
+        &pod_name,
+        &proxy_name,
+        sidecar_state.root(),
+        &openai_api_key,
+    )?;
 
     run_oci_admin_command(
         &build_pod_create_invocation(&engine, &pod_name),
@@ -177,18 +184,7 @@ async fn start_codex_openai_sidecar(request: &ExecutionRequest) -> Result<OciRun
         sidecar_state,
     };
 
-    if let Err(err) = run_oci_admin_command(
-        &build_sidecar_run_invocation(
-            &engine,
-            &pod_name,
-            &proxy_name,
-            cleanup.sidecar_state.root(),
-            &openai_api_key,
-        )?,
-        "start auth sidecar",
-    )
-    .await
-    {
+    if let Err(err) = run_oci_admin_command(&sidecar_run_invocation, "start auth sidecar").await {
         let _ = cleanup.shutdown().await;
         return Err(err);
     }
@@ -511,6 +507,20 @@ mod tests {
             invocation.args.last().map(String::as_str),
             Some(HAPROXY_IMAGE)
         );
+    }
+
+    #[test]
+    fn sidecar_run_invocation_rejects_colon_mount_sources() {
+        let err = build_sidecar_run_invocation(
+            "podman",
+            "lionclaw-pod",
+            "lionclaw-proxy",
+            Path::new("/tmp/lionclaw:auth-sidecar"),
+            "sk-real",
+        )
+        .expect_err("colon mount source should be rejected");
+
+        assert!(err.to_string().contains("contains ':'"));
     }
 
     #[tokio::test]
