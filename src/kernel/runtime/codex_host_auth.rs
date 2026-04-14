@@ -221,34 +221,27 @@ async fn resolve_codex_host_auth_with_refresh_url(
     refresh_url: &str,
 ) -> Result<CodexHostAuth> {
     let store = CodexAuthStore::resolve(codex_home_override)?;
-    store.auth_metadata().await?;
+    let (auth, modified_at) = store.read().await?;
+    if let Some(auth) = resolve_existing_codex_host_auth(&store, &auth, modified_at)? {
+        return Ok(auth);
+    }
+
     let _lock = store.lock().await?;
     let (mut auth, modified_at) = store.read().await?;
-
-    if let Some(api_key) = nonempty(auth.openai_api_key.as_deref()) {
-        return Ok(CodexHostAuth::new(
-            CodexHostAuthMode::OpenAiApi,
-            api_key.to_string(),
-        ));
+    if let Some(auth) = resolve_existing_codex_host_auth(&store, &auth, modified_at)? {
+        return Ok(auth);
     }
 
-    let tokens = auth
+    let refresh_token = auth
         .tokens
-        .as_mut()
-        .ok_or_else(|| missing_codex_auth(&store))?;
-    let access_token = nonempty(tokens.access_token.as_deref())
-        .ok_or_else(|| missing_codex_auth(&store))?
-        .to_string();
-    let refresh_token = nonempty(tokens.refresh_token.as_deref())
+        .as_ref()
+        .and_then(|tokens| nonempty(tokens.refresh_token.as_deref()))
         .ok_or_else(|| missing_codex_auth(&store))?
         .to_string();
 
-    if token_needs_refresh(&access_token, auth.last_refresh.as_deref(), modified_at) {
-        let refreshed = refresh_codex_tokens(refresh_url, &refresh_token).await?;
-        apply_refreshed_codex_tokens(&mut auth, refreshed)?;
-        store.write(&auth).await?;
-    }
-
+    let refreshed = refresh_codex_tokens(refresh_url, &refresh_token).await?;
+    apply_refreshed_codex_tokens(&mut auth, refreshed)?;
+    store.write(&auth).await?;
     let access_token = auth
         .tokens
         .as_ref()
@@ -265,6 +258,33 @@ fn missing_codex_auth(store: &CodexAuthStore) -> anyhow::Error {
         "no usable host Codex auth found at '{}'; sign in locally with `codex login`",
         store.auth_path.display()
     )
+}
+
+fn resolve_existing_codex_host_auth(
+    store: &CodexAuthStore,
+    auth: &CodexAuthFile,
+    modified_at: Option<DateTime<Utc>>,
+) -> Result<Option<CodexHostAuth>> {
+    if let Some(api_key) = nonempty(auth.openai_api_key.as_deref()) {
+        return Ok(Some(CodexHostAuth::new(
+            CodexHostAuthMode::OpenAiApi,
+            api_key.to_string(),
+        )));
+    }
+
+    let access_token = auth
+        .tokens
+        .as_ref()
+        .and_then(|tokens| nonempty(tokens.access_token.as_deref()))
+        .ok_or_else(|| missing_codex_auth(store))?;
+    if token_needs_refresh(access_token, auth.last_refresh.as_deref(), modified_at) {
+        return Ok(None);
+    }
+
+    Ok(Some(CodexHostAuth::new(
+        CodexHostAuthMode::ChatGpt,
+        access_token.to_string(),
+    )))
 }
 
 fn token_needs_refresh(
@@ -541,6 +561,37 @@ mod tests {
         assert_eq!(auth.bearer_token(), "sk-test");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolves_openai_api_key_from_read_only_codex_home_without_lock_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let codex_home = temp_dir.path().join(".codex");
+        write_auth_file(
+            &codex_home,
+            json!({
+                "OPENAI_API_KEY": "sk-test"
+            }),
+        )
+        .await;
+        std::fs::set_permissions(
+            codex_home.join(CODEX_AUTH_FILE_NAME),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod auth");
+        std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o500))
+            .expect("chmod codex home");
+
+        let auth = resolve_codex_host_auth(Some(&codex_home))
+            .await
+            .expect("resolve auth");
+
+        assert_eq!(auth.mode(), CodexHostAuthMode::OpenAiApi);
+        assert_eq!(auth.bearer_token(), "sk-test");
+        assert!(!codex_home.join(CODEX_AUTH_LOCK_FILE_NAME).exists());
+    }
+
     #[tokio::test]
     async fn resolves_chatgpt_token_from_auth_file() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -564,6 +615,41 @@ mod tests {
 
         assert_eq!(auth.mode(), CodexHostAuthMode::ChatGpt);
         assert!(auth.bearer_token().contains('.'));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolves_fresh_chatgpt_token_from_read_only_codex_home_without_lock_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let codex_home = temp_dir.path().join(".codex");
+        write_auth_file(
+            &codex_home,
+            json!({
+                "OPENAI_API_KEY": null,
+                "last_refresh": Utc::now().to_rfc3339(),
+                "tokens": {
+                    "access_token": fake_jwt(Utc::now() + Duration::minutes(30)),
+                }
+            }),
+        )
+        .await;
+        std::fs::set_permissions(
+            codex_home.join(CODEX_AUTH_FILE_NAME),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod auth");
+        std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o500))
+            .expect("chmod codex home");
+
+        let auth = resolve_codex_host_auth(Some(&codex_home))
+            .await
+            .expect("resolve auth");
+
+        assert_eq!(auth.mode(), CodexHostAuthMode::ChatGpt);
+        assert!(auth.bearer_token().contains('.'));
+        assert!(!codex_home.join(CODEX_AUTH_LOCK_FILE_NAME).exists());
     }
 
     #[tokio::test]
