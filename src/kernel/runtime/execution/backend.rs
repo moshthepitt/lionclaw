@@ -5,8 +5,6 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
-use crate::home::LionClawHome;
-
 use super::oci::OciExecutionBackend;
 use super::plan::{ConfinementBackend, EffectiveExecutionPlan, RuntimeProgramSpec};
 
@@ -42,7 +40,7 @@ pub struct ExecutionRequest {
     pub plan: EffectiveExecutionPlan,
     pub program: RuntimeProgramSpec,
     pub runtime_secrets_mount: Option<RuntimeSecretsMount>,
-    pub runtime_auth_home: Option<LionClawHome>,
+    pub codex_home_override: Option<PathBuf>,
 }
 
 impl fmt::Debug for ExecutionRequest {
@@ -51,7 +49,7 @@ impl fmt::Debug for ExecutionRequest {
             .field("plan", &self.plan)
             .field("program", &self.program)
             .field("runtime_secrets_mount", &self.runtime_secrets_mount)
-            .field("runtime_auth_home", &self.runtime_auth_home)
+            .field("codex_home_override", &self.codex_home_override)
             .finish()
     }
 }
@@ -120,16 +118,14 @@ mod tests {
                 runtime_secrets_mount: Some(super::RuntimeSecretsMount {
                     source: "/tmp/runtime-secrets.env".into(),
                 }),
-                runtime_auth_home: Some(crate::home::LionClawHome::new(
-                    "/tmp/lionclaw-home".into(),
-                )),
+                codex_home_override: Some("/tmp/test-codex-home".into()),
             }
         );
 
         assert!(!debug.contains("ghp_secret"));
         assert!(!debug.contains("sk-secret"));
         assert!(!debug.contains("hello"));
-        assert!(debug.contains("runtime_auth_home"));
+        assert!(debug.contains("codex_home_override"));
     }
 
     #[test]

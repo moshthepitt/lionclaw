@@ -62,24 +62,6 @@ impl LionClawHome {
         resolve_private_env_file(&self.runtime_secrets_env_path(), "runtime secrets").await
     }
 
-    pub fn runtime_auth_env_path(&self) -> PathBuf {
-        self.config_dir().join("runtime-auth.env")
-    }
-
-    pub async fn resolve_runtime_auth_file(&self) -> Result<Option<PathBuf>> {
-        resolve_private_env_file(&self.runtime_auth_env_path(), "runtime auth").await
-    }
-
-    pub async fn read_runtime_auth_var(&self, key: &str) -> Result<Option<String>> {
-        let Some(path) = self.resolve_runtime_auth_file().await? else {
-            return Ok(None);
-        };
-        let contents = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        parse_private_env_var(&contents, key)
-    }
-
     pub fn home_id_path(&self) -> PathBuf {
         self.config_dir().join("home-id")
     }
@@ -209,24 +191,6 @@ impl LionClawHome {
         }
 
         self.ensure_home_id().await?;
-        Ok(())
-    }
-
-    pub async fn ensure_runtime_auth_template(&self) -> Result<()> {
-        let path = self.runtime_auth_env_path();
-        match tokio::fs::symlink_metadata(&path).await {
-            Ok(_) => return Ok(()),
-            Err(err) if err.kind() == ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| format!("failed to stat {}", path.display()));
-            }
-        }
-
-        let template = "# Host-only runtime auth for confined runtimes.\n# Fill in required keys below.\n# OPENAI_API_KEY=\n";
-        tokio::fs::write(&path, template)
-            .await
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        harden_private_env_file_permissions(&path, "runtime auth").await?;
         Ok(())
     }
 
@@ -402,34 +366,6 @@ async fn resolve_private_env_file(path: &Path, label: &str) -> Result<Option<Pat
     Ok(Some(canonical))
 }
 
-fn parse_private_env_var(contents: &str, wanted_key: &str) -> Result<Option<String>> {
-    for (index, raw_line) in contents.lines().enumerate() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let (key, value) = line.split_once('=').ok_or_else(|| {
-            anyhow!(
-                "invalid env assignment on line {}: expected KEY=VALUE",
-                index + 1
-            )
-        })?;
-        let key = key.trim();
-        if key.is_empty() {
-            return Err(anyhow!(
-                "invalid env assignment on line {}: key cannot be empty",
-                index + 1
-            ));
-        }
-        if key == wanted_key {
-            return Ok(Some(value.trim().to_string()));
-        }
-    }
-
-    Ok(None)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -457,10 +393,6 @@ mod tests {
         assert_eq!(
             home.runtime_secrets_env_path(),
             std::path::PathBuf::from("/tmp/lionclaw-home/config/runtime-secrets.env")
-        );
-        assert_eq!(
-            home.runtime_auth_env_path(),
-            std::path::PathBuf::from("/tmp/lionclaw-home/config/runtime-auth.env")
         );
         assert_eq!(
             home.home_id_path(),
@@ -613,121 +545,6 @@ mod tests {
 
         let err = home
             .resolve_runtime_secrets_file()
-            .await
-            .expect_err("symlink should fail");
-        assert!(err.to_string().contains("cannot be a symlink"));
-    }
-
-    #[tokio::test]
-    async fn missing_runtime_auth_file_returns_none() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        home.ensure_base_dirs().await.expect("base dirs");
-
-        let auth = home
-            .read_runtime_auth_var("OPENAI_API_KEY")
-            .await
-            .expect("read auth");
-        assert!(auth.is_none());
-    }
-
-    #[tokio::test]
-    async fn runtime_auth_file_reads_requested_key() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        home.ensure_base_dirs().await.expect("base dirs");
-        tokio::fs::write(
-            home.runtime_auth_env_path(),
-            "# comment\nOPENAI_API_KEY=sk-test\nOTHER_KEY=ignored\n",
-        )
-        .await
-        .expect("write runtime auth");
-
-        let auth = home
-            .read_runtime_auth_var("OPENAI_API_KEY")
-            .await
-            .expect("read auth");
-        assert_eq!(auth.as_deref(), Some("sk-test"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn ensure_runtime_auth_template_creates_hardened_template() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        home.ensure_base_dirs().await.expect("base dirs");
-
-        home.ensure_runtime_auth_template()
-            .await
-            .expect("create runtime auth template");
-
-        let template = tokio::fs::read_to_string(home.runtime_auth_env_path())
-            .await
-            .expect("read template");
-        assert!(template.contains("# OPENAI_API_KEY="));
-
-        let file_mode = std::fs::metadata(home.runtime_auth_env_path())
-            .expect("file metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(file_mode, 0o600);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn runtime_auth_file_is_hardened_to_owner_only_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        home.ensure_base_dirs().await.expect("base dirs");
-        std::fs::set_permissions(home.config_dir(), std::fs::Permissions::from_mode(0o755))
-            .expect("chmod config dir");
-        tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
-            .await
-            .expect("write runtime auth");
-        std::fs::set_permissions(
-            home.runtime_auth_env_path(),
-            std::fs::Permissions::from_mode(0o644),
-        )
-        .expect("chmod env file");
-
-        let auth = home
-            .read_runtime_auth_var("OPENAI_API_KEY")
-            .await
-            .expect("read auth");
-        assert_eq!(auth.as_deref(), Some("sk-test"));
-
-        let config_mode = std::fs::metadata(home.config_dir())
-            .expect("config metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        let file_mode = std::fs::metadata(home.runtime_auth_env_path())
-            .expect("file metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(config_mode, 0o700);
-        assert_eq!(file_mode, 0o600);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn runtime_auth_file_rejects_symlinks() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        home.ensure_base_dirs().await.expect("base dirs");
-
-        let real = temp_dir.path().join("real.env");
-        std::fs::write(&real, "OPENAI_API_KEY=sk-test\n").expect("write real env");
-        std::os::unix::fs::symlink(&real, home.runtime_auth_env_path()).expect("symlink env");
-
-        let err = home
-            .resolve_runtime_auth_file()
             .await
             .expect_err("symlink should fail");
         assert!(err.to_string().contains("cannot be a symlink"));

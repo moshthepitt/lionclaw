@@ -15,12 +15,13 @@ use super::{
     plan::{MountSpec, NetworkMode, RuntimeAuthKind},
     process::{run_process_streaming, ProcessInvocation, ProcessOutput},
 };
-use crate::{home::LionClawHome, kernel::continuity_fs::ContinuityFs};
+use crate::{
+    kernel::continuity_fs::ContinuityFs,
+    kernel::runtime::{resolve_codex_host_auth, CodexHostAuthMode},
+};
 
 const RUNTIME_MOUNT_TARGET: &str = "/runtime";
-const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
-const OPENAI_UPSTREAM_HOST: &str = "api.openai.com";
-const OPENAI_RESPONSES_PATH: &str = "/v1/responses";
+const UPSTREAM_BEARER_TOKEN_ENV: &str = "LIONCLAW_CODEX_UPSTREAM_BEARER_TOKEN";
 const CODEX_PROXY_TOKEN_ENV: &str = "LIONCLAW_CODEX_OPENAI_PROXY_TOKEN";
 const CODEX_PROXY_PORT: u16 = 38080;
 const HAPROXY_IMAGE: &str = "docker.io/library/haproxy:3.3.5-alpine";
@@ -129,11 +130,11 @@ pub async fn start_for_oci_execution(
 ) -> Result<Option<OciRuntimeAuthSession>> {
     match request.program.auth {
         None => Ok(None),
-        Some(RuntimeAuthKind::CodexOpenAi) => Ok(Some(start_codex_openai_sidecar(request).await?)),
+        Some(RuntimeAuthKind::Codex) => Ok(Some(start_codex_sidecar(request).await?)),
     }
 }
 
-async fn start_codex_openai_sidecar(request: &ExecutionRequest) -> Result<OciRuntimeAuthSession> {
+async fn start_codex_sidecar(request: &ExecutionRequest) -> Result<OciRuntimeAuthSession> {
     if request.plan.network_mode != NetworkMode::On {
         bail!(
             "runtime '{}' requires network-mode 'on' when Codex runtime auth is enabled",
@@ -141,25 +142,14 @@ async fn start_codex_openai_sidecar(request: &ExecutionRequest) -> Result<OciRun
         );
     }
 
-    let runtime_auth_home = request.runtime_auth_home.clone().ok_or_else(|| {
-        anyhow!(
-            "runtime '{}' requires LIONCLAW_HOME/config/runtime-auth.env with OPENAI_API_KEY configured",
-            request.plan.runtime_id
-        )
-    })?;
-    let openai_api_key = read_required_runtime_auth_var(
-        &runtime_auth_home,
-        &request.plan.runtime_id,
-        OPENAI_API_KEY_ENV,
-    )
-    .await?;
+    let host_auth = resolve_codex_host_auth(request.codex_home_override.as_deref()).await?;
 
     let runtime_mount_fs = runtime_mount_fs(&request.plan.mounts)?;
     let placeholder_token = format!("lionclaw-placeholder-{}", Uuid::new_v4().simple());
-    write_codex_config(&runtime_mount_fs)?;
+    write_codex_config(&runtime_mount_fs, host_auth.mode())?;
 
     let sidecar_state = SidecarStateDir::new()?;
-    write_haproxy_config(&sidecar_state, &placeholder_token, OPENAI_UPSTREAM_HOST)?;
+    write_haproxy_config(&sidecar_state, &placeholder_token, host_auth.mode())?;
 
     let engine = request.plan.confinement.oci().engine.clone();
     let pod_name = format!("lionclaw-runtime-{}", Uuid::new_v4().simple());
@@ -169,7 +159,7 @@ async fn start_codex_openai_sidecar(request: &ExecutionRequest) -> Result<OciRun
         &pod_name,
         &proxy_name,
         sidecar_state.root(),
-        &openai_api_key,
+        host_auth.bearer_token(),
     )?;
 
     run_oci_admin_command(
@@ -201,24 +191,6 @@ async fn start_codex_openai_sidecar(request: &ExecutionRequest) -> Result<OciRun
         },
         cleanup: Some(cleanup),
     })
-}
-
-async fn read_required_runtime_auth_var(
-    home: &LionClawHome,
-    runtime_id: &str,
-    key: &str,
-) -> Result<String> {
-    home.read_runtime_auth_var(key)
-        .await?
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow!(
-                "runtime '{}' requires {} in '{}'",
-                runtime_id,
-                key,
-                home.runtime_auth_env_path().display()
-            )
-        })
 }
 
 fn build_pod_create_invocation(engine: &str, pod_name: &str) -> ProcessInvocation {
@@ -259,7 +231,7 @@ fn build_sidecar_run_invocation(
     pod_name: &str,
     proxy_name: &str,
     sidecar_state_root: &Path,
-    openai_api_key: &str,
+    upstream_bearer_token: &str,
 ) -> Result<ProcessInvocation> {
     Ok(ProcessInvocation {
         executable: engine.to_string(),
@@ -271,13 +243,16 @@ fn build_sidecar_run_invocation(
             "--name".to_string(),
             proxy_name.to_string(),
             "--env".to_string(),
-            OPENAI_API_KEY_ENV.to_string(),
+            UPSTREAM_BEARER_TOKEN_ENV.to_string(),
             "--volume".to_string(),
             bind_mount_arg(sidecar_state_root, SIDECAR_STATE_CONTAINER_DIR, false)?,
             HAPROXY_IMAGE.to_string(),
         ],
         working_dir: None,
-        environment: vec![(OPENAI_API_KEY_ENV.to_string(), openai_api_key.to_string())],
+        environment: vec![(
+            UPSTREAM_BEARER_TOKEN_ENV.to_string(),
+            upstream_bearer_token.to_string(),
+        )],
         input: String::new(),
     })
 }
@@ -360,9 +335,10 @@ fn runtime_mount_fs(mounts: &[MountSpec]) -> Result<ContinuityFs> {
         .with_context(|| format!("failed to open {}", runtime_mount_root.display()))
 }
 
-fn write_codex_config(runtime_mount_fs: &ContinuityFs) -> Result<()> {
+fn write_codex_config(runtime_mount_fs: &ContinuityFs, auth_mode: CodexHostAuthMode) -> Result<()> {
     let contents = format!(
-        "[model_providers.openai]\nbase_url = \"http://127.0.0.1:{CODEX_PROXY_PORT}/v1\"\nenv_key = \"{CODEX_PROXY_TOKEN_ENV}\"\nwire_api = \"responses\"\n"
+        "[model_providers.openai]\nbase_url = \"http://127.0.0.1:{CODEX_PROXY_PORT}{base_path}\"\nenv_key = \"{CODEX_PROXY_TOKEN_ENV}\"\nwire_api = \"responses\"\n",
+        base_path = auth_mode.upstream_base_path(),
     );
     runtime_mount_fs.write_string(Path::new(CODEX_CONFIG_RELATIVE_PATH), &contents)
 }
@@ -370,10 +346,12 @@ fn write_codex_config(runtime_mount_fs: &ContinuityFs) -> Result<()> {
 fn write_haproxy_config(
     sidecar_state: &SidecarStateDir,
     placeholder_token: &str,
-    upstream_host: &str,
+    auth_mode: CodexHostAuthMode,
 ) -> Result<()> {
+    let upstream_host = auth_mode.upstream_host();
+    let responses_path = format!("{}/responses", auth_mode.upstream_base_path());
     let contents = format!(
-        "global\n    log stdout format raw local0\n    stats socket {HAPROXY_ADMIN_SOCKET_CONTAINER_PATH} mode 600 level admin\n\ndefaults\n    mode http\n    timeout connect 10s\n    timeout client 5m\n    timeout server 5m\n\nfrontend codex_openai_ingress\n    bind 127.0.0.1:{CODEX_PROXY_PORT}\n    acl expected_auth req.hdr(authorization) -m str \"Bearer {placeholder_token}\"\n    acl allowed_method method POST\n    acl allowed_path path {OPENAI_RESPONSES_PATH}\n    http-request deny deny_status 401 unless expected_auth\n    http-request deny deny_status 405 unless allowed_method\n    http-request deny deny_status 404 unless allowed_path\n    default_backend codex_openai_upstream\n\nbackend codex_openai_upstream\n    http-request set-header Authorization \"Bearer %[env({OPENAI_API_KEY_ENV})]\"\n    http-request set-header Host {upstream_host}\n    server openai {upstream_host}:443 ssl verify required ca-file @system-ca sni str({upstream_host})\n"
+        "global\n    log stdout format raw local0\n    stats socket {HAPROXY_ADMIN_SOCKET_CONTAINER_PATH} mode 600 level admin\n\ndefaults\n    mode http\n    timeout connect 10s\n    timeout client 5m\n    timeout server 5m\n\nfrontend codex_openai_ingress\n    bind 127.0.0.1:{CODEX_PROXY_PORT}\n    acl expected_auth req.hdr(authorization) -m str \"Bearer {placeholder_token}\"\n    acl allowed_method method POST\n    acl allowed_path path {responses_path}\n    http-request deny deny_status 401 unless expected_auth\n    http-request deny deny_status 405 unless allowed_method\n    http-request deny deny_status 404 unless allowed_path\n    default_backend codex_openai_upstream\n\nbackend codex_openai_upstream\n    http-request set-header Authorization \"Bearer %[env({UPSTREAM_BEARER_TOKEN_ENV})]\"\n    http-request set-header Host {upstream_host}\n    server upstream {upstream_host}:443 ssl verify required ca-file @system-ca sni str({upstream_host})\n"
     );
     std::fs::write(sidecar_state.config_path(), contents)
         .with_context(|| format!("failed to write {}", sidecar_state.config_path().display()))?;
@@ -406,19 +384,30 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use chrono::Utc;
+    use serde_json::json;
     use tempfile::tempdir;
     use tokio::{net::UnixListener, sync::Mutex};
 
     use super::*;
-    use crate::{
-        home::LionClawHome,
-        kernel::runtime::{
-            ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, OciConfinementConfig,
-            RuntimeProgramSpec, WorkspaceAccess,
-        },
+    use crate::kernel::runtime::{
+        ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, OciConfinementConfig,
+        RuntimeProgramSpec, WorkspaceAccess,
     };
 
-    fn sample_request(runtime_root: PathBuf, home: LionClawHome) -> ExecutionRequest {
+    async fn write_test_codex_auth(codex_home: &Path, payload: serde_json::Value) {
+        tokio::fs::create_dir_all(codex_home)
+            .await
+            .expect("create codex home");
+        tokio::fs::write(
+            codex_home.join("auth.json"),
+            serde_json::to_vec_pretty(&payload).expect("encode auth"),
+        )
+        .await
+        .expect("write auth");
+    }
+
+    fn sample_request(runtime_root: PathBuf, codex_home_override: PathBuf) -> ExecutionRequest {
         ExecutionRequest {
             plan: EffectiveExecutionPlan {
                 runtime_id: "codex".to_string(),
@@ -444,10 +433,10 @@ mod tests {
                 args: vec!["exec".to_string()],
                 environment: Vec::new(),
                 stdin: String::new(),
-                auth: Some(RuntimeAuthKind::CodexOpenAi),
+                auth: Some(RuntimeAuthKind::Codex),
             },
             runtime_secrets_mount: None,
-            runtime_auth_home: Some(home),
+            codex_home_override: Some(codex_home_override),
         }
     }
 
@@ -471,13 +460,13 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_run_invocation_mounts_only_sidecar_state_and_real_key() {
+    fn sidecar_run_invocation_mounts_only_sidecar_state_and_real_token() {
         let invocation = build_sidecar_run_invocation(
             "podman",
             "lionclaw-pod",
             "lionclaw-proxy",
             Path::new("/tmp/lionclaw-auth-sidecar"),
-            "sk-real",
+            "auth-real",
         )
         .expect("invocation");
 
@@ -492,10 +481,13 @@ mod tests {
         assert!(invocation
             .args
             .windows(2)
-            .any(|pair| pair == ["--env".to_string(), "OPENAI_API_KEY".to_string(),]));
+            .any(|pair| pair == ["--env".to_string(), UPSTREAM_BEARER_TOKEN_ENV.to_string(),]));
         assert_eq!(
             invocation.environment,
-            vec![("OPENAI_API_KEY".to_string(), "sk-real".to_string())]
+            vec![(
+                UPSTREAM_BEARER_TOKEN_ENV.to_string(),
+                "auth-real".to_string()
+            )]
         );
         assert!(invocation.args.windows(2).any(|pair| {
             pair == [
@@ -516,7 +508,7 @@ mod tests {
             "lionclaw-pod",
             "lionclaw-proxy",
             Path::new("/tmp/lionclaw:auth-sidecar"),
-            "sk-real",
+            "auth-real",
         )
         .expect_err("colon mount source should be rejected");
 
@@ -524,26 +516,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_runtime_auth_sidecar_writes_runtime_and_sidecar_config() {
+    async fn codex_runtime_auth_sidecar_writes_openai_api_runtime_and_sidecar_config() {
         let temp_dir = tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        home.ensure_base_dirs().await.expect("base dirs");
-        tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-real\n")
-            .await
-            .expect("write runtime auth");
-
         let runtime_root = temp_dir.path().join("runtime-session");
+        let codex_home = temp_dir.path().join(".codex");
         tokio::fs::create_dir_all(&runtime_root)
             .await
             .expect("create runtime root");
+        write_test_codex_auth(
+            &codex_home,
+            json!({
+                "OPENAI_API_KEY": "sk-real"
+            }),
+        )
+        .await;
 
-        let request = sample_request(runtime_root.clone(), home);
+        let request = sample_request(runtime_root.clone(), codex_home);
         let runtime_mount_fs = runtime_mount_fs(&request.plan.mounts).expect("runtime fs");
         let placeholder = "lionclaw-placeholder-test";
         let sidecar_state = SidecarStateDir::new().expect("sidecar state");
 
-        write_codex_config(&runtime_mount_fs).expect("write codex config");
-        write_haproxy_config(&sidecar_state, placeholder, OPENAI_UPSTREAM_HOST)
+        write_codex_config(&runtime_mount_fs, CodexHostAuthMode::OpenAiApi)
+            .expect("write codex config");
+        write_haproxy_config(&sidecar_state, placeholder, CodexHostAuthMode::OpenAiApi)
             .expect("write haproxy config");
 
         let codex_config = tokio::fs::read_to_string(runtime_root.join(CODEX_CONFIG_RELATIVE_PATH))
@@ -551,16 +546,60 @@ mod tests {
             .expect("read codex config");
         assert!(codex_config.contains("http://127.0.0.1:38080/v1"));
         assert!(codex_config.contains(CODEX_PROXY_TOKEN_ENV));
-        assert!(!codex_config.contains(OPENAI_API_KEY_ENV));
+        assert!(!codex_config.contains(UPSTREAM_BEARER_TOKEN_ENV));
 
         let haproxy_config = tokio::fs::read_to_string(sidecar_state.config_path())
             .await
             .expect("read haproxy config");
-        assert!(haproxy_config.contains(OPENAI_RESPONSES_PATH));
+        assert!(haproxy_config.contains("/v1/responses"));
         assert!(haproxy_config.contains(placeholder));
-        assert!(haproxy_config.contains("%[env(OPENAI_API_KEY)]"));
+        assert!(haproxy_config.contains("%[env(LIONCLAW_CODEX_UPSTREAM_BEARER_TOKEN)]"));
         assert!(haproxy_config.contains(HAPROXY_ADMIN_SOCKET_CONTAINER_PATH));
         assert!(!haproxy_config.contains("sk-real"));
+    }
+
+    #[tokio::test]
+    async fn codex_runtime_auth_sidecar_writes_chatgpt_runtime_and_sidecar_config() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime-session");
+        let codex_home = temp_dir.path().join(".codex");
+        tokio::fs::create_dir_all(&runtime_root)
+            .await
+            .expect("create runtime root");
+        write_test_codex_auth(
+            &codex_home,
+            json!({
+                "OPENAI_API_KEY": null,
+                "last_refresh": Utc::now().to_rfc3339(),
+                "tokens": {
+                    "access_token": "header.payload.signature",
+                    "refresh_token": "refresh-test"
+                }
+            }),
+        )
+        .await;
+
+        let request = sample_request(runtime_root.clone(), codex_home);
+        let runtime_mount_fs = runtime_mount_fs(&request.plan.mounts).expect("runtime fs");
+        let placeholder = "lionclaw-placeholder-test";
+        let sidecar_state = SidecarStateDir::new().expect("sidecar state");
+
+        write_codex_config(&runtime_mount_fs, CodexHostAuthMode::ChatGpt)
+            .expect("write codex config");
+        write_haproxy_config(&sidecar_state, placeholder, CodexHostAuthMode::ChatGpt)
+            .expect("write haproxy config");
+
+        let codex_config = tokio::fs::read_to_string(runtime_root.join(CODEX_CONFIG_RELATIVE_PATH))
+            .await
+            .expect("read codex config");
+        assert!(codex_config.contains("http://127.0.0.1:38080/backend-api/codex"));
+        assert!(codex_config.contains(CODEX_PROXY_TOKEN_ENV));
+
+        let haproxy_config = tokio::fs::read_to_string(sidecar_state.config_path())
+            .await
+            .expect("read haproxy config");
+        assert!(haproxy_config.contains("/backend-api/codex/responses"));
+        assert!(haproxy_config.contains("chatgpt.com"));
     }
 
     #[tokio::test]
@@ -607,8 +646,8 @@ mod tests {
             symlink(&outside, runtime_root.join("home/.codex")).expect("symlink");
 
             let runtime_mount_fs = ContinuityFs::bootstrap(&runtime_root).expect("runtime fs");
-            let err =
-                write_codex_config(&runtime_mount_fs).expect_err("symlinked codex dir should fail");
+            let err = write_codex_config(&runtime_mount_fs, CodexHostAuthMode::OpenAiApi)
+                .expect_err("symlinked codex dir should fail");
             assert!(err.to_string().contains(".codex"));
         }
     }

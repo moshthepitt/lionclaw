@@ -140,7 +140,8 @@ async fn create_job_rejects_missing_runtime_auth_before_persisting() {
 
     match err {
         KernelError::BadRequest(message) => {
-            assert!(message.contains("OPENAI_API_KEY"));
+            assert!(message.contains("codex login"));
+            assert!(message.contains("auth.json"));
         }
         other => panic!("unexpected error variant: {}", other),
     }
@@ -154,9 +155,7 @@ async fn manual_job_run_rejects_missing_runtime_auth_before_launch() {
     let env = TestEnv::new();
     let home = LionClawHome::new(env.temp_dir.path().join(".lionclaw"));
     home.ensure_base_dirs().await.expect("base dirs");
-    tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
-        .await
-        .expect("write runtime auth");
+    write_test_codex_auth(&home).await;
     let turn_calls = Arc::new(AtomicUsize::new(0));
     let kernel = kernel_with_counting_codex_runtime(&env, &home, turn_calls.clone()).await;
 
@@ -176,7 +175,7 @@ async fn manual_job_run_rejects_missing_runtime_auth_before_launch() {
         .await
         .expect("create job");
 
-    tokio::fs::remove_file(home.runtime_auth_env_path())
+    tokio::fs::remove_file(home.root().join(".codex/auth.json"))
         .await
         .expect("remove runtime auth");
 
@@ -189,7 +188,8 @@ async fn manual_job_run_rejects_missing_runtime_auth_before_launch() {
 
     match err {
         KernelError::Runtime(message) => {
-            assert!(message.contains("OPENAI_API_KEY"));
+            assert!(message.contains("codex login"));
+            assert!(message.contains("auth.json"));
         }
         other => panic!("unexpected error variant: {}", other),
     }
@@ -209,9 +209,7 @@ async fn scheduler_tick_dead_letters_missing_runtime_auth_without_launching_runt
     let env = TestEnv::new();
     let home = LionClawHome::new(env.temp_dir.path().join(".lionclaw"));
     home.ensure_base_dirs().await.expect("base dirs");
-    tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
-        .await
-        .expect("write runtime auth");
+    write_test_codex_auth(&home).await;
     let turn_calls = Arc::new(AtomicUsize::new(0));
     let kernel = kernel_with_counting_codex_runtime(&env, &home, turn_calls.clone()).await;
 
@@ -231,7 +229,7 @@ async fn scheduler_tick_dead_letters_missing_runtime_auth_without_launching_runt
         .await
         .expect("create job");
 
-    tokio::fs::remove_file(home.runtime_auth_env_path())
+    tokio::fs::remove_file(home.root().join(".codex/auth.json"))
         .await
         .expect("remove runtime auth");
 
@@ -250,7 +248,7 @@ async fn scheduler_tick_dead_letters_missing_runtime_auth_without_launching_runt
     assert!(job
         .last_error
         .as_deref()
-        .is_some_and(|error| error.contains("OPENAI_API_KEY")));
+        .is_some_and(|error| error.contains("codex login")));
     assert!(
         !job.enabled,
         "one-shot auth-invalid jobs should dead-letter"
@@ -276,9 +274,7 @@ async fn scheduler_tick_retries_missing_runtime_auth_before_dead_lettering() {
     let env = TestEnv::new();
     let home = LionClawHome::new(env.temp_dir.path().join(".lionclaw"));
     home.ensure_base_dirs().await.expect("base dirs");
-    tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
-        .await
-        .expect("write runtime auth");
+    write_test_codex_auth(&home).await;
     let turn_calls = Arc::new(AtomicUsize::new(0));
     let kernel = kernel_with_counting_codex_runtime(&env, &home, turn_calls.clone()).await;
 
@@ -298,7 +294,7 @@ async fn scheduler_tick_retries_missing_runtime_auth_before_dead_lettering() {
         .await
         .expect("create job");
 
-    tokio::fs::remove_file(home.runtime_auth_env_path())
+    tokio::fs::remove_file(home.root().join(".codex/auth.json"))
         .await
         .expect("remove runtime auth");
 
@@ -341,9 +337,7 @@ async fn scheduler_tick_continues_past_auth_invalid_jobs() {
     let env = TestEnv::new();
     let home = LionClawHome::new(env.temp_dir.path().join(".lionclaw"));
     home.ensure_base_dirs().await.expect("base dirs");
-    tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
-        .await
-        .expect("write runtime auth");
+    write_test_codex_auth(&home).await;
     let turn_calls = Arc::new(AtomicUsize::new(0));
     let kernel = kernel_with_counting_codex_runtime(&env, &home, turn_calls.clone()).await;
 
@@ -378,7 +372,7 @@ async fn scheduler_tick_continues_past_auth_invalid_jobs() {
         .await
         .expect("create valid job");
 
-    tokio::fs::remove_file(home.runtime_auth_env_path())
+    tokio::fs::remove_file(home.root().join(".codex/auth.json"))
         .await
         .expect("remove runtime auth");
 
@@ -1145,6 +1139,21 @@ struct TestEnv {
     temp_dir: TempDir,
 }
 
+async fn write_test_codex_auth(home: &LionClawHome) {
+    let codex_home = home.root().join(".codex");
+    tokio::fs::create_dir_all(&codex_home)
+        .await
+        .expect("create codex home");
+    tokio::fs::write(
+        codex_home.join("auth.json"),
+        r#"{
+  "OPENAI_API_KEY": "sk-test"
+}"#,
+    )
+    .await
+    .expect("write codex auth");
+}
+
 impl TestEnv {
     fn new() -> Self {
         Self {
@@ -1182,10 +1191,10 @@ async fn kernel_with_counting_codex_runtime(
                 RuntimeExecutionProfile {
                     confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
                     compatibility_key: "codex-auth".to_string(),
-                    required_runtime_auth_var: Some("OPENAI_API_KEY"),
+                    required_runtime_auth: Some(lionclaw::kernel::runtime::RuntimeAuthKind::Codex),
                 },
             )]),
-            runtime_auth_home: Some(home.clone()),
+            codex_home_override: Some(home.root().join(".codex")),
             ..KernelOptions::default()
         },
     )

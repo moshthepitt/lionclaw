@@ -105,7 +105,7 @@ pub struct KernelOptions {
     pub execution_presets: BTreeMap<String, ExecutionPreset>,
     pub runtime_execution_profiles: BTreeMap<String, RuntimeExecutionProfile>,
     pub runtime_secrets_home: Option<LionClawHome>,
-    pub runtime_auth_home: Option<LionClawHome>,
+    pub codex_home_override: Option<PathBuf>,
     pub workspace_root: Option<PathBuf>,
     pub project_workspace_root: Option<PathBuf>,
     pub runtime_root: Option<PathBuf>,
@@ -127,7 +127,7 @@ impl fmt::Debug for KernelOptions {
                 &self.runtime_execution_profiles,
             )
             .field("runtime_secrets_home", &self.runtime_secrets_home)
-            .field("runtime_auth_home", &self.runtime_auth_home)
+            .field("codex_home_override", &self.codex_home_override)
             .field("workspace_root", &self.workspace_root)
             .field("project_workspace_root", &self.project_workspace_root)
             .field("runtime_root", &self.runtime_root)
@@ -148,7 +148,7 @@ impl Default for KernelOptions {
             execution_presets: BTreeMap::new(),
             runtime_execution_profiles: BTreeMap::new(),
             runtime_secrets_home: None,
-            runtime_auth_home: None,
+            codex_home_override: None,
             workspace_root: None,
             project_workspace_root: None,
             runtime_root: None,
@@ -179,7 +179,7 @@ pub struct Kernel {
     execution_planner: ExecutionPlanner,
     default_runtime_id: Option<String>,
     runtime_secrets_home: Option<LionClawHome>,
-    runtime_auth_home: Option<LionClawHome>,
+    codex_home_override: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
     project_workspace_root: Option<PathBuf>,
     session_scope: String,
@@ -220,9 +220,9 @@ impl Kernel {
         runtime_id: &str,
     ) -> Result<(), KernelError> {
         validate_runtime_auth_prerequisites(
-            self.runtime_auth_home.as_ref(),
             runtime_id,
-            self.execution_planner.required_runtime_auth_var(runtime_id),
+            self.execution_planner.required_runtime_auth(runtime_id),
+            self.codex_home_override.as_deref(),
         )
         .await
         .map_err(|err| KernelError::Runtime(err.to_string()))
@@ -297,7 +297,7 @@ impl Kernel {
             execution_planner,
             default_runtime_id: options.default_runtime_id,
             runtime_secrets_home: options.runtime_secrets_home,
-            runtime_auth_home: options.runtime_auth_home,
+            codex_home_override: options.codex_home_override,
             workspace_root: options.workspace_root,
             project_workspace_root: options.project_workspace_root,
             session_scope,
@@ -2419,7 +2419,7 @@ impl Kernel {
                         adapter.as_ref(),
                         execution_plan,
                         runtime_secrets_mount,
-                        self.runtime_auth_home.clone(),
+                        self.codex_home_override.clone(),
                         turn_input,
                         event_tx,
                     )
@@ -5739,7 +5739,7 @@ impl Kernel {
                 error_code: "runtime.error".to_string(),
                 error_text: err.to_string(),
             })?;
-        let runtime_auth_home = self.runtime_auth_home.clone();
+        let codex_home_override = self.codex_home_override.clone();
         let mut turn_task = tokio::spawn(async move {
             match adapter_for_task.turn_mode() {
                 RuntimeTurnMode::Direct => adapter_for_task.turn(input, event_tx).await,
@@ -5748,7 +5748,7 @@ impl Kernel {
                         adapter_for_task.as_ref(),
                         execution_plan,
                         runtime_secrets_mount,
-                        runtime_auth_home,
+                        codex_home_override,
                         input,
                         event_tx,
                     )

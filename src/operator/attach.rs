@@ -343,9 +343,18 @@ mod tests {
         crate::operator::reconcile::onboard(&home, None)
             .await
             .expect("onboard");
-        tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
+        let codex_home = home.root().join(".codex");
+        tokio::fs::create_dir_all(&codex_home)
             .await
-            .expect("write runtime auth");
+            .expect("create codex home");
+        tokio::fs::write(
+            codex_home.join("auth.json"),
+            r#"{
+  "OPENAI_API_KEY": "sk-test"
+}"#,
+        )
+        .await
+        .expect("write runtime auth");
 
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         write_executable(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n");
@@ -436,7 +445,8 @@ mod tests {
     async fn prepare_channel_attach_rejects_missing_codex_runtime_auth() {
         let (_temp_dir, home, manager) =
             seed_interactive_channel(ChannelLaunchMode::Interactive).await;
-        tokio::fs::write(home.runtime_auth_env_path(), "# no key\n")
+        let codex_home = home.root().join(".codex");
+        tokio::fs::write(codex_home.join("auth.json"), "{}")
             .await
             .expect("rewrite runtime auth");
 
@@ -452,8 +462,8 @@ mod tests {
         .await
         .expect_err("missing runtime auth should fail");
 
-        assert!(err.to_string().contains("runtime-auth.env"));
-        assert!(err.to_string().contains("OPENAI_API_KEY"));
+        assert!(err.to_string().contains("codex login"));
+        assert!(err.to_string().contains("auth.json"));
         let lockfile = OperatorLockfile::load(&home).await.expect("load lockfile");
         assert!(
             lockfile.skills.is_empty() && lockfile.channels.is_empty(),

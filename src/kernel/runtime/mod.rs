@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -6,12 +10,11 @@ use serde_json::Value;
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
-use crate::home::LionClawHome;
-
 use super::policy::Capability;
 
 pub mod adapters;
 pub mod builtins;
+mod codex_host_auth;
 pub mod execution;
 
 pub use adapters::{
@@ -19,6 +22,7 @@ pub use adapters::{
     OpenCodeRuntimeConfig,
 };
 pub use builtins::{register_builtin_runtime_adapters, BUILTIN_RUNTIME_MOCK};
+pub use codex_host_auth::{resolve_codex_host_auth, CodexHostAuth, CodexHostAuthMode};
 pub use execution::{
     ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionBackend,
     ExecutionLimits, ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
@@ -29,43 +33,26 @@ pub use execution::{
 };
 
 pub async fn validate_runtime_auth_prerequisites(
-    home: Option<&LionClawHome>,
     runtime_id: &str,
-    required_var: Option<&str>,
+    required_auth: Option<RuntimeAuthKind>,
+    codex_home_override: Option<&Path>,
 ) -> Result<()> {
-    let Some(required_var) = required_var else {
+    let Some(required_auth) = required_auth else {
         return Ok(());
     };
-    let home = home.ok_or_else(|| {
-        anyhow!(
-            "runtime '{}' requires host runtime auth with {} configured",
-            runtime_id,
-            required_var
-        )
-    })?;
-    let auth_path = home.runtime_auth_env_path();
-    home.resolve_runtime_auth_file()
-        .await?
-        .ok_or_else(|| {
-            anyhow!(
-                "configured runtime profile '{}' requires host runtime auth file '{}' with {} configured",
-                runtime_id,
-                auth_path.display(),
-                required_var
-            )
-        })?;
-    home.read_runtime_auth_var(required_var)
-        .await?
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow!(
-                "configured runtime profile '{}' requires {} in '{}'",
-                runtime_id,
-                required_var,
-                auth_path.display()
-            )
-        })?;
-    Ok(())
+
+    match required_auth {
+        RuntimeAuthKind::Codex => resolve_codex_host_auth(codex_home_override)
+            .await
+            .map(|_| ())
+            .map_err(|err| {
+                anyhow!(
+                    "configured runtime profile '{}' requires {}",
+                    runtime_id,
+                    err
+                )
+            }),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -242,7 +229,7 @@ pub async fn execute_program_backed_turn(
     adapter: &(dyn RuntimeAdapter + Send + Sync),
     plan: EffectiveExecutionPlan,
     runtime_secrets_mount: Option<RuntimeSecretsMount>,
-    runtime_auth_home: Option<LionClawHome>,
+    codex_home_override: Option<PathBuf>,
     input: RuntimeTurnInput,
     events: RuntimeEventSender,
 ) -> Result<RuntimeTurnResult> {
@@ -253,7 +240,7 @@ pub async fn execute_program_backed_turn(
             plan,
             program,
             runtime_secrets_mount,
-            runtime_auth_home,
+            codex_home_override,
         },
         stdout_tx,
     );

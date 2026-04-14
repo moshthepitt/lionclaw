@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::home::{
     daemon_compat_partition_key, runtime_profile_partition_key, LionClawHome, DEFAULT_WORKSPACE,
 };
-use crate::kernel::runtime::{ConfinementConfig, ExecutionPreset, RuntimeExecutionProfile};
+use crate::kernel::runtime::{
+    ConfinementConfig, ExecutionPreset, RuntimeAuthKind, RuntimeExecutionProfile,
+};
 use crate::kernel::skills::sanitize_skill_name;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -389,12 +391,12 @@ impl RuntimeProfileConfig {
         }
     }
 
-    pub fn required_runtime_auth_var(&self) -> Option<&'static str> {
+    pub fn required_runtime_auth(&self) -> Option<RuntimeAuthKind> {
         match self {
             Self::Codex {
                 confinement: ConfinementConfig::Oci(_),
                 ..
-            } => Some("OPENAI_API_KEY"),
+            } => Some(RuntimeAuthKind::Codex),
             Self::OpenCode { .. } => None,
         }
     }
@@ -403,7 +405,7 @@ impl RuntimeProfileConfig {
         RuntimeExecutionProfile {
             confinement: self.confinement().clone(),
             compatibility_key: self.compatibility_key(),
-            required_runtime_auth_var: self.required_runtime_auth_var(),
+            required_runtime_auth: self.required_runtime_auth(),
         }
     }
 

@@ -27,7 +27,7 @@ impl fmt::Debug for RuntimeProgramSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeAuthKind {
-    CodexOpenAi,
+    Codex,
 }
 
 /// User-facing coarse execution preset compiled before a turn starts.

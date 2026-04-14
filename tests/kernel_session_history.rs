@@ -1554,7 +1554,7 @@ fn test_runtime_profile(compatibility_key: &str) -> RuntimeExecutionProfile {
     RuntimeExecutionProfile {
         confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
         compatibility_key: compatibility_key.to_string(),
-        required_runtime_auth_var: None,
+        required_runtime_auth: None,
     }
 }
 

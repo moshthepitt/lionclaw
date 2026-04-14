@@ -919,8 +919,8 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             .await
             .expect_err("missing runtime auth should error");
 
-        assert!(err.to_string().contains("runtime-auth.env"));
-        assert!(err.to_string().contains("OPENAI_API_KEY"));
+        assert!(err.to_string().contains("codex login"));
+        assert!(err.to_string().contains("auth.json"));
         let lockfile = OperatorLockfile::load(&home).await.expect("load lockfile");
         assert!(
             lockfile.skills.is_empty(),
@@ -1232,9 +1232,18 @@ esac
     }
 
     async fn write_codex_runtime_auth(home: &LionClawHome) {
-        tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
+        let codex_home = home.root().join(".codex");
+        tokio::fs::create_dir_all(&codex_home)
             .await
-            .expect("write codex runtime auth");
+            .expect("create codex home");
+        tokio::fs::write(
+            codex_home.join("auth.json"),
+            r#"{
+  "OPENAI_API_KEY": "sk-test"
+}"#,
+        )
+        .await
+        .expect("write codex runtime auth");
     }
 
     fn stubbed_opencode_runtime(executable: &std::path::Path) -> RuntimeProfileConfig {

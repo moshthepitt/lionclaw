@@ -55,7 +55,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 execution_presets: operator_config.presets.clone(),
                 runtime_execution_profiles: configured_runtime_execution_profiles(&operator_config),
                 runtime_secrets_home: Some(config.home.clone()),
-                runtime_auth_home: Some(config.home.clone()),
+                codex_home_override: None,
                 workspace_root: Some(workspace_root),
                 project_workspace_root: Some(project_workspace_root),
                 runtime_root: Some(config.home.runtime_dir()),

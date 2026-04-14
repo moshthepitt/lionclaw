@@ -7,7 +7,7 @@ use crate::kernel::runtime_policy::{RuntimeExecutionPolicy, RuntimeExecutionRequ
 
 use super::plan::{
     ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset, MountAccess, MountSpec,
-    OciConfinementConfig, WorkspaceAccess,
+    OciConfinementConfig, RuntimeAuthKind, WorkspaceAccess,
 };
 
 pub const BUILTIN_PRESET_EVERYDAY: &str = "everyday";
@@ -20,7 +20,7 @@ const DRAFTS_MOUNT_TARGET: &str = "/drafts";
 pub struct RuntimeExecutionProfile {
     pub confinement: ConfinementConfig,
     pub compatibility_key: String,
-    pub required_runtime_auth_var: Option<&'static str>,
+    pub required_runtime_auth: Option<RuntimeAuthKind>,
 }
 
 impl Default for RuntimeExecutionProfile {
@@ -28,7 +28,7 @@ impl Default for RuntimeExecutionProfile {
         Self {
             confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
             compatibility_key: "runtime-default".to_string(),
-            required_runtime_auth_var: None,
+            required_runtime_auth: None,
         }
     }
 }
@@ -233,10 +233,10 @@ impl ExecutionPlanner {
         ))
     }
 
-    pub fn required_runtime_auth_var(&self, runtime_id: &str) -> Option<&'static str> {
+    pub fn required_runtime_auth(&self, runtime_id: &str) -> Option<RuntimeAuthKind> {
         self.runtimes
             .get(runtime_id)
-            .and_then(|profile| profile.required_runtime_auth_var)
+            .and_then(|profile| profile.required_runtime_auth)
     }
 
     fn build_mounts(
@@ -464,7 +464,7 @@ mod tests {
                     ..OciConfinementConfig::default()
                 }),
                 compatibility_key: "runtime-codex-v1".to_string(),
-                required_runtime_auth_var: None,
+                required_runtime_auth: None,
             },
         )]
         .into_iter()

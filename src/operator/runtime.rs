@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::{anyhow, Result};
 
@@ -102,12 +102,32 @@ pub async fn validate_runtime_launch_prerequisites(
     let profile = config
         .runtime(runtime_id)
         .ok_or_else(|| anyhow!("runtime profile '{}' is not configured", runtime_id))?;
-    validate_runtime_auth_prerequisites(Some(home), runtime_id, profile.required_runtime_auth_var())
-        .await
+    validate_runtime_auth_prerequisites(
+        runtime_id,
+        profile.required_runtime_auth(),
+        operator_codex_home_override(home).as_deref(),
+    )
+    .await
+}
+
+pub(crate) fn operator_codex_home_override(home: &LionClawHome) -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        Some(home.root().join(".codex"))
+    }
+    #[cfg(not(test))]
+    {
+        let _ = home;
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+    use chrono::{Duration as ChronoDuration, Utc};
+    use serde_json::json;
+
     use super::{
         validate_configured_runtimes, validate_runtime_availability,
         validate_runtime_launch_prerequisites,
@@ -246,9 +266,22 @@ mod tests {
         }
     }
 
+    async fn write_test_codex_auth(home: &LionClawHome, auth: serde_json::Value) {
+        let codex_home = home.root().join(".codex");
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create codex home");
+        tokio::fs::write(
+            codex_home.join("auth.json"),
+            serde_json::to_vec_pretty(&auth).expect("encode auth"),
+        )
+        .await
+        .expect("write auth file");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn codex_launch_prereqs_require_runtime_auth_file() {
+    async fn codex_launch_prereqs_require_host_codex_auth() {
         let (_temp_dir, engine) = fake_podman();
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
@@ -258,40 +291,50 @@ mod tests {
 
         let err = validate_runtime_launch_prerequisites(&home, &config, "codex")
             .await
-            .expect_err("missing runtime auth file should fail");
-        assert!(err.to_string().contains("runtime-auth.env"));
-        assert!(err.to_string().contains("OPENAI_API_KEY"));
+            .expect_err("missing host Codex auth should fail");
+        assert!(err.to_string().contains("codex login"));
+        assert!(err.to_string().contains("auth.json"));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn codex_launch_prereqs_require_openai_api_key() {
+    async fn codex_launch_prereqs_reject_unusable_codex_auth() {
         let (_temp_dir, engine) = fake_podman();
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         home.ensure_base_dirs().await.expect("base dirs");
-        tokio::fs::write(home.runtime_auth_env_path(), "# no key\n")
-            .await
-            .expect("write runtime auth");
+        write_test_codex_auth(&home, json!({ "OPENAI_API_KEY": null, "tokens": {} })).await;
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine));
 
         let err = validate_runtime_launch_prerequisites(&home, &config, "codex")
             .await
-            .expect_err("missing auth var should fail");
-        assert!(err.to_string().contains("OPENAI_API_KEY"));
+            .expect_err("missing host auth should fail");
+        assert!(err.to_string().contains("codex login"));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn codex_launch_prereqs_accept_runtime_auth_file() {
+    async fn codex_launch_prereqs_accept_host_codex_auth() {
         let (_temp_dir, engine) = fake_podman();
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         home.ensure_base_dirs().await.expect("base dirs");
-        tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
-            .await
-            .expect("write runtime auth");
+        write_test_codex_auth(
+            &home,
+            json!({
+                "OPENAI_API_KEY": null,
+                "last_refresh": Utc::now().to_rfc3339(),
+                "tokens": {
+                    "access_token": format!("a.{}.c", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                        serde_json::to_vec(&json!({ "exp": (Utc::now() + ChronoDuration::hours(1)).timestamp() }))
+                            .expect("jwt payload")
+                    )),
+                    "refresh_token": "refresh-test"
+                }
+            }),
+        )
+        .await;
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine));
 

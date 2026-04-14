@@ -55,10 +55,7 @@ podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .
 # 3. Initialize your local environment
 ./target/release/lionclaw onboard
 
-# 4. Fill in the runtime auth template `lionclaw onboard` created
-printf 'OPENAI_API_KEY=...\n' > ~/.lionclaw/config/runtime-auth.env
-
-# 5. Attach a model and start executing
+# 4. Attach a model and start executing
 ./target/release/lionclaw runtime add codex --kind codex --bin codex --image lionclaw-runtime:v1
 ./target/release/lionclaw run codex
 ```
@@ -225,17 +222,19 @@ When mounted, Podman places it under `/run/secrets/` with a LionClaw-managed
 name that starts with `lionclaw-runtime-secrets-`. Keep the source file
 owner-only; LionClaw hardens it to `0600` on Unix before handing it to Podman.
 
-Host-only runtime auth for confined Codex runs lives separately in
-`~/.lionclaw/config/runtime-auth.env`, which `lionclaw onboard` scaffolds as a
-template. LionClaw reads `OPENAI_API_KEY` from that file on the host,
-preflights it before Codex launch paths, starts a short-lived private Podman
-pod for each confined Codex execution, and runs a tiny HAProxy sidecar beside
-the runtime container. The runtime container only gets a runtime-specific
-placeholder token and points Codex at `http://127.0.0.1:38080/v1`; the sidecar
-holds the real key and swaps it onto `POST /v1/responses` calls before sending
-them upstream to OpenAI. The raw key is not mounted into the runtime
-container, and the pod is created with its own private network namespace rather
-than host loopback access.
+Host-only runtime auth for confined Codex runs comes from the host Codex login
+state. LionClaw reads `~/.codex/auth.json` or `$CODEX_HOME/auth.json`,
+preflights that host auth before Codex launch paths, starts a short-lived
+private Podman pod for each confined Codex execution, and runs a tiny HAProxy
+sidecar beside the runtime container. The runtime container only gets a
+runtime-specific placeholder token and points Codex at the pod-local sidecar;
+the sidecar holds the discovered host bearer token and swaps it onto
+`POST /responses` calls before sending them upstream to either
+`api.openai.com/v1` or `chatgpt.com/backend-api/codex`, depending on how Codex
+is authenticated locally. The raw host auth is not mounted into the runtime
+container, and the pod is created with its own private network namespace
+rather than host loopback access. If Codex is not logged in yet, sign in once
+locally with `codex login` and rerun LionClaw.
 
 `lionclaw runtime add` configures the runtime command that runs inside the
 runtime image, plus the concrete host `podman` executable and image LionClaw

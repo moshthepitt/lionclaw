@@ -159,9 +159,8 @@ Normal user flow:
 
 1. `lionclaw onboard`
 2. `podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .`
-3. Fill in the `~/.lionclaw/config/runtime-auth.env` template created by `lionclaw onboard`
-4. `lionclaw runtime add codex --kind codex --bin codex --image lionclaw-runtime:v1`
-5. `lionclaw run codex`
+3. `lionclaw runtime add codex --kind codex --bin codex --image lionclaw-runtime:v1`
+4. `lionclaw run codex`
 
 Runtime definitions, execution presets, and confinement settings live in
 `~/.lionclaw/config/lionclaw.toml`, not in ad hoc shell configuration.
@@ -176,16 +175,18 @@ Presets either mount that whole file or mount no runtime secrets at all with
 `lionclaw-runtime-secrets-` inside the confined runtime. LionClaw hardens that
 file to owner-only permissions on Unix before loading it.
 
-Host-only runtime auth lives separately in `~/.lionclaw/config/runtime-auth.env`,
-which `lionclaw onboard` scaffolds as a template. Today the confined Codex path
-reads `OPENAI_API_KEY` from that file, preflights it before launch, starts a
-short-lived private Podman pod with a tiny HAProxy sidecar, injects a
-runtime-specific one-time placeholder token into the runtime container, and
-swaps that placeholder for the real OpenAI key only inside the sidecar on
-`POST /v1/responses`. Codex talks to the sidecar over pod-local
-`http://127.0.0.1:38080/v1`, so the raw key never enters the runtime
-container and the runtime does not need host loopback reachability. The shared
-OCI runtime image definition lives in
+Host-only runtime auth comes from the host Codex login itself. Today the
+confined Codex path reads `~/.codex/auth.json` or `$CODEX_HOME/auth.json`,
+preflights it before launch, starts a short-lived private Podman pod with a
+tiny HAProxy sidecar, injects a runtime-specific one-time placeholder token
+into the runtime container, and swaps that placeholder for the discovered host
+bearer only inside the sidecar on `POST /responses`. Codex talks to the
+sidecar over pod-local loopback, and LionClaw routes that traffic to either
+`api.openai.com/v1` or `chatgpt.com/backend-api/codex` depending on how the
+host Codex login is authenticated. The raw host auth never enters the runtime
+container and the runtime does not need host loopback reachability. If the
+host Codex login is missing, the fix is `codex login`, not a separate
+LionClaw auth file. The shared OCI runtime image definition lives in
 `containers/runtime/Containerfile` and currently installs both `codex` and
 `opencode`. LionClaw runtime compatibility assumes configured image references
 are treated as immutable; rebuild under a new image tag when runtime bits

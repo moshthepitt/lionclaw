@@ -93,7 +93,7 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
             args: build_codex_exec_args(&self.config, session.resumes_existing_session),
             environment: Vec::new(),
             stdin: input.prompt.clone(),
-            auth: Some(RuntimeAuthKind::CodexOpenAi),
+            auth: Some(RuntimeAuthKind::Codex),
         })
     }
 
@@ -500,7 +500,7 @@ mod tests {
         assert_eq!(program.stdin, "hello");
         assert_eq!(
             program.auth,
-            Some(crate::kernel::runtime::RuntimeAuthKind::CodexOpenAi)
+            Some(crate::kernel::runtime::RuntimeAuthKind::Codex)
         );
 
         adapter.close(&handle).await.expect("close");

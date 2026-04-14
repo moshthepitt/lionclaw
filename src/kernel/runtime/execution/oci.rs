@@ -341,7 +341,7 @@ mod tests {
             runtime_secrets_mount: Some(RuntimeSecretsMount {
                 source: "/home/mosh/.lionclaw/config/runtime-secrets.env".into(),
             }),
-            runtime_auth_home: None,
+            codex_home_override: None,
         };
 
         let invocation = build_oci_process_invocation(
@@ -452,7 +452,7 @@ mod tests {
                 auth: None,
             },
             runtime_secrets_mount: None,
-            runtime_auth_home: None,
+            codex_home_override: None,
         };
 
         let invocation = build_oci_process_invocation(
@@ -472,7 +472,7 @@ mod tests {
             plan: sample_plan(),
             program: RuntimeProgramSpec::default(),
             runtime_secrets_mount: None,
-            runtime_auth_home: None,
+            codex_home_override: None,
         };
 
         let invocation = build_oci_process_invocation(
@@ -492,7 +492,7 @@ mod tests {
             plan: sample_plan(),
             program: RuntimeProgramSpec::default(),
             runtime_secrets_mount: None,
-            runtime_auth_home: None,
+            codex_home_override: None,
         };
 
         let invocation = build_oci_process_invocation(
@@ -531,7 +531,7 @@ mod tests {
             plan,
             program: RuntimeProgramSpec::default(),
             runtime_secrets_mount: None,
-            runtime_auth_home: None,
+            codex_home_override: None,
         })
         .expect_err("missing image should fail");
 
@@ -547,7 +547,7 @@ mod tests {
             plan,
             program: RuntimeProgramSpec::default(),
             runtime_secrets_mount: None,
-            runtime_auth_home: None,
+            codex_home_override: None,
         })
         .expect_err("working dir should fail");
 
