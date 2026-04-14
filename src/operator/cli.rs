@@ -29,7 +29,7 @@ use crate::{
             resolve_stack_binaries, status, up, OnboardBindSelection,
         },
         run::run_local,
-        runtime::resolve_runtime_id,
+        runtime::{resolve_runtime_id, validate_runtime_launch_prerequisites},
         services::SystemdUserServiceManager,
     },
 };
@@ -387,6 +387,7 @@ pub async fn run() -> Result<()> {
                 let profile = build_runtime_profile(&args, executable)?;
                 let mut config = OperatorConfig::load(&home).await?;
                 config.upsert_runtime(args.id.clone(), profile);
+                validate_runtime_launch_prerequisites(&home, &config, &args.id).await?;
                 config.save(&home).await?;
                 println!("configured runtime {}", args.id);
             }
@@ -748,6 +749,12 @@ pub async fn run() -> Result<()> {
                             let args = *args;
                             let runtime_id =
                                 resolve_runtime_id(&applied.config, args.runtime.as_deref())?;
+                            validate_runtime_launch_prerequisites(
+                                &home,
+                                &applied.config,
+                                &runtime_id,
+                            )
+                            .await?;
                             let prompt_text =
                                 load_job_prompt(args.prompt, args.prompt_file).await?;
                             let schedule =

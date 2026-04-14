@@ -18,7 +18,7 @@ use crate::{
     kernel::Kernel,
     operator::{
         reconcile::{apply, onboard, open_runtime_kernel, render_runtime_cache},
-        runtime::{resolve_runtime_id, validate_runtime_availability},
+        runtime::{resolve_runtime_id, validate_runtime_launch_prerequisites},
     },
 };
 
@@ -51,7 +51,7 @@ pub(crate) async fn run_local_with_io<R: BufRead, W: Write>(
     onboard(home, None).await?;
     let applied = apply(home).await?;
     let runtime_id = resolve_runtime_id(&applied.config, requested_runtime.as_deref())?;
-    validate_runtime_availability(&applied.config, &runtime_id)?;
+    validate_runtime_launch_prerequisites(home, &applied.config, &runtime_id).await?;
     render_runtime_cache(home, &applied.config, &applied.lockfile, &runtime_id).await?;
 
     let kernel = open_runtime_kernel(home, &applied.config, Some(runtime_id.clone())).await?;
@@ -878,6 +878,33 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             .expect_err("missing engine should error");
 
         assert!(err.to_string().contains("configured runtime profile"));
+    }
+
+    #[tokio::test]
+    async fn run_local_errors_when_codex_runtime_auth_is_missing() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let stub = temp_dir.path().join("codex-stub.sh");
+        fs::write(&stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(&stub, permissions).expect("chmod");
+        }
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
+        config.save(&home).await.expect("save config");
+
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let err = run_local_with_io(&home, None, false, &mut input, &mut output)
+            .await
+            .expect_err("missing runtime auth should error");
+
+        assert!(err.to_string().contains("runtime-auth.env"));
+        assert!(err.to_string().contains("OPENAI_API_KEY"));
     }
 
     #[cfg(unix)]

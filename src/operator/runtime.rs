@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 
+use crate::home::LionClawHome;
 use crate::kernel::{
     runtime::{
         CodexRuntimeAdapter, CodexRuntimeConfig, OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig,
@@ -92,9 +93,50 @@ pub fn validate_runtime_availability(config: &OperatorConfig, runtime_id: &str) 
     Ok(())
 }
 
+pub async fn validate_runtime_launch_prerequisites(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+    runtime_id: &str,
+) -> Result<()> {
+    validate_runtime_availability(config, runtime_id)?;
+    let profile = config
+        .runtime(runtime_id)
+        .ok_or_else(|| anyhow!("runtime profile '{}' is not configured", runtime_id))?;
+    let Some(required_var) = profile.required_runtime_auth_var() else {
+        return Ok(());
+    };
+    let auth_path = home.runtime_auth_env_path();
+    home.resolve_runtime_auth_file()
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "configured runtime profile '{}' requires host runtime auth file '{}' with {} configured",
+                runtime_id,
+                auth_path.display(),
+                required_var
+            )
+        })?;
+    home.read_runtime_auth_var(required_var)
+        .await?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "configured runtime profile '{}' requires {} in '{}'",
+                runtime_id,
+                required_var,
+                auth_path.display()
+            )
+        })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{validate_configured_runtimes, validate_runtime_availability};
+    use super::{
+        validate_configured_runtimes, validate_runtime_availability,
+        validate_runtime_launch_prerequisites,
+    };
+    use crate::home::LionClawHome;
     use crate::kernel::runtime::{ConfinementConfig, OciConfinementConfig};
     use crate::operator::config::{OperatorConfig, RuntimeProfileConfig};
 
@@ -214,5 +256,71 @@ mod tests {
         assert!(err
             .to_string()
             .contains("configured runtime profile 'broken' is invalid"));
+    }
+
+    fn codex_runtime_profile(engine: String) -> RuntimeProfileConfig {
+        RuntimeProfileConfig::Codex {
+            executable: "codex".to_string(),
+            model: None,
+            confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                engine,
+                image: Some("ghcr.io/lionclaw/codex-runtime:latest".to_string()),
+                ..OciConfinementConfig::default()
+            }),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_launch_prereqs_require_runtime_auth_file() {
+        let (_temp_dir, engine) = fake_podman();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine));
+
+        let err = validate_runtime_launch_prerequisites(&home, &config, "codex")
+            .await
+            .expect_err("missing runtime auth file should fail");
+        assert!(err.to_string().contains("runtime-auth.env"));
+        assert!(err.to_string().contains("OPENAI_API_KEY"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_launch_prereqs_require_openai_api_key() {
+        let (_temp_dir, engine) = fake_podman();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        tokio::fs::write(home.runtime_auth_env_path(), "# no key\n")
+            .await
+            .expect("write runtime auth");
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine));
+
+        let err = validate_runtime_launch_prerequisites(&home, &config, "codex")
+            .await
+            .expect_err("missing auth var should fail");
+        assert!(err.to_string().contains("OPENAI_API_KEY"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_launch_prereqs_accept_runtime_auth_file() {
+        let (_temp_dir, engine) = fake_podman();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
+            .await
+            .expect("write runtime auth");
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine));
+
+        validate_runtime_launch_prerequisites(&home, &config, "codex")
+            .await
+            .expect("runtime auth should validate");
     }
 }

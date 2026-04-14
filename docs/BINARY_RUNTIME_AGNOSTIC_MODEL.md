@@ -159,7 +159,7 @@ Normal user flow:
 
 1. `lionclaw onboard`
 2. `podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .`
-3. `printf 'OPENAI_API_KEY=...\n' > ~/.lionclaw/config/runtime-auth.env`
+3. Fill in the `~/.lionclaw/config/runtime-auth.env` template created by `lionclaw onboard`
 4. `lionclaw runtime add codex --kind codex --bin codex --image lionclaw-runtime:v1`
 5. `lionclaw run codex`
 
@@ -176,12 +176,12 @@ Presets either mount that whole file or mount no runtime secrets at all with
 `lionclaw-runtime-secrets-` inside the confined runtime. LionClaw hardens that
 file to owner-only permissions on Unix before loading it.
 
-Host-only runtime auth lives separately in `~/.lionclaw/config/runtime-auth.env`.
-Today the confined Codex path reads `OPENAI_API_KEY` from that file, starts a
+Host-only runtime auth lives separately in `~/.lionclaw/config/runtime-auth.env`,
+which `lionclaw onboard` scaffolds as a template. Today the confined Codex path
+reads `OPENAI_API_KEY` from that file, preflights it before launch, starts a
 short-lived local HTTPS proxy on the host, injects a runtime-specific one-time
-placeholder token
-into the container, and swaps the placeholder for the real OpenAI key at the
-proxy boundary. The shared OCI runtime image definition lives in
+placeholder token into the container, and swaps the placeholder for the real
+OpenAI key at the proxy boundary. The shared OCI runtime image definition lives in
 `containers/runtime/Containerfile` and currently installs both `codex` and
 `opencode`. LionClaw runtime compatibility assumes configured image references
 are treated as immutable; rebuild under a new image tag when runtime bits

@@ -168,8 +168,9 @@ LionClaw hardens the config directory to `0700` and the runtime secret file to
 `0600` on Unix before loading it.
 
 Host-only runtime auth is separate. Confined Codex turns read
-`~/.lionclaw/config/runtime-auth.env` on the host, require
-`OPENAI_API_KEY`, generate a per-turn local CA and TLS listener, write a
+`~/.lionclaw/config/runtime-auth.env` on the host, which `lionclaw onboard`
+scaffolds as a template, require `OPENAI_API_KEY`, generate a per-turn local CA
+and TLS listener, write a
 session-scoped `~/.codex/config.toml` under `/runtime/home`, and route Codex
 through a short-lived HTTPS proxy at `https://host.containers.internal:<port>/v1`.
 The container only sees a runtime-specific one-time placeholder bearer token

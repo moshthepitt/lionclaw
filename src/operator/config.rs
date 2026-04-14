@@ -389,6 +389,16 @@ impl RuntimeProfileConfig {
         }
     }
 
+    pub fn required_runtime_auth_var(&self) -> Option<&'static str> {
+        match self {
+            Self::Codex {
+                confinement: ConfinementConfig::Oci(_),
+                ..
+            } => Some("OPENAI_API_KEY"),
+            Self::OpenCode { .. } => None,
+        }
+    }
+
     pub fn execution_profile(&self) -> RuntimeExecutionProfile {
         RuntimeExecutionProfile {
             confinement: self.confinement().clone(),

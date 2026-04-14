@@ -212,6 +212,24 @@ impl LionClawHome {
         Ok(())
     }
 
+    pub async fn ensure_runtime_auth_template(&self) -> Result<()> {
+        let path = self.runtime_auth_env_path();
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(_) => return Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to stat {}", path.display()));
+            }
+        }
+
+        let template = "# Host-only runtime auth for confined runtimes.\n# Fill in required keys below.\n# OPENAI_API_KEY=\n";
+        tokio::fs::write(&path, template)
+            .await
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        harden_private_env_file_permissions(&path, "runtime auth").await?;
+        Ok(())
+    }
+
     pub async fn read_home_id(&self) -> Result<Option<String>> {
         let path = self.home_id_path();
         if !tokio::fs::try_exists(&path)
@@ -630,6 +648,32 @@ mod tests {
             .await
             .expect("read auth");
         assert_eq!(auth.as_deref(), Some("sk-test"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_runtime_auth_template_creates_hardened_template() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+
+        home.ensure_runtime_auth_template()
+            .await
+            .expect("create runtime auth template");
+
+        let template = tokio::fs::read_to_string(home.runtime_auth_env_path())
+            .await
+            .expect("read template");
+        assert!(template.contains("# OPENAI_API_KEY="));
+
+        let file_mode = std::fs::metadata(home.runtime_auth_env_path())
+            .expect("file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600);
     }
 
     #[cfg(unix)]

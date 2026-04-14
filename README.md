@@ -55,7 +55,7 @@ podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .
 # 3. Initialize your local environment
 ./target/release/lionclaw onboard
 
-# 4. Configure host-side Codex auth for confined runs
+# 4. Fill in the runtime auth template `lionclaw onboard` created
 printf 'OPENAI_API_KEY=...\n' > ~/.lionclaw/config/runtime-auth.env
 
 # 5. Attach a model and start executing
@@ -226,11 +226,12 @@ name that starts with `lionclaw-runtime-secrets-`. Keep the source file
 owner-only; LionClaw hardens it to `0600` on Unix before handing it to Podman.
 
 Host-only runtime auth for confined Codex runs lives separately in
-`~/.lionclaw/config/runtime-auth.env`. Today LionClaw reads `OPENAI_API_KEY`
-from that file on the host, starts a short-lived local HTTPS proxy, injects a
-runtime-specific one-time placeholder token into the container, and swaps that
-placeholder for the real key at the proxy boundary. The raw key is not mounted
-into the container.
+`~/.lionclaw/config/runtime-auth.env`, which `lionclaw onboard` scaffolds as a
+template. Today LionClaw reads `OPENAI_API_KEY` from that file on the host,
+preflights it before Codex launch paths, starts a short-lived local HTTPS
+proxy, injects a runtime-specific one-time placeholder token into the
+container, and swaps that placeholder for the real key at the proxy boundary.
+The raw key is not mounted into the container.
 
 `lionclaw runtime add` configures the runtime command that runs inside the
 runtime image, plus the concrete host `podman` executable and image LionClaw

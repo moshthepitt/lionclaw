@@ -13,6 +13,7 @@ use crate::{
         config::ChannelLaunchMode,
         daemon_probe::{classify_daemon, wait_for_same_home_daemon, DaemonClassification},
         reconcile::{apply, base_url_from_bind, resolve_worker_entrypoint, up, StackBinaryPaths},
+        runtime::{resolve_runtime_id, validate_runtime_launch_prerequisites},
         services::ServiceManager,
     },
 };
@@ -177,6 +178,9 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
         ));
     }
 
+    let resolved_runtime_id = resolve_runtime_id(&applied.config, requested_runtime_id.as_deref())?;
+    validate_runtime_launch_prerequisites(home, &applied.config, &resolved_runtime_id).await?;
+
     let locked_skill = applied.lockfile.find_skill(&channel.skill).ok_or_else(|| {
         anyhow!(
             "channel '{}' skill '{}' is not installed",
@@ -340,6 +344,9 @@ mod tests {
         crate::operator::reconcile::onboard(&home, None)
             .await
             .expect("onboard");
+        tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
+            .await
+            .expect("write runtime auth");
 
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         write_executable(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n");
@@ -423,6 +430,31 @@ mod tests {
         .await
         .expect_err("service launch mode should fail");
         assert!(err.to_string().contains("use 'lionclaw service up'"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_channel_attach_rejects_missing_codex_runtime_auth() {
+        let (_temp_dir, home, manager) =
+            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        tokio::fs::write(home.runtime_auth_env_path(), "# no key\n")
+            .await
+            .expect("rewrite runtime auth");
+
+        let err = prepare_channel_attach(
+            &home,
+            &manager,
+            "terminal".to_string(),
+            Some("mosh".to_string()),
+            Some("codex".to_string()),
+            &current_project_scope(),
+            &binaries(),
+        )
+        .await
+        .expect_err("missing runtime auth should fail");
+
+        assert!(err.to_string().contains("runtime-auth.env"));
+        assert!(err.to_string().contains("OPENAI_API_KEY"));
     }
 
     #[cfg(unix)]

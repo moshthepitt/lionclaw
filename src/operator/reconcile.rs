@@ -17,7 +17,7 @@ use crate::{
         lockfile::{LockedChannel, LockedSkill, OperatorLockfile},
         runtime::{
             configured_runtime_execution_profiles, register_configured_runtimes,
-            validate_runtime_availability,
+            validate_runtime_launch_prerequisites,
         },
         services::{
             channel_unit_name, render_channel_unit, render_daemon_unit, unit_status_is_active,
@@ -71,6 +71,7 @@ pub async fn onboard(
     bind_selection: Option<OnboardBindSelection>,
 ) -> Result<OperatorConfig> {
     home.ensure_base_dirs().await?;
+    home.ensure_runtime_auth_template().await?;
     let mut config = OperatorConfig::load(home).await?;
     config.daemon.bind = resolve_onboard_bind(&config.daemon.bind, bind_selection.as_ref())?;
     bootstrap_workspace(&config.workspace_root(home)).await?;
@@ -317,7 +318,7 @@ pub async fn up<M: ServiceManager>(
 
     let previous_units = managed_unit_names(home)?;
     let applied = apply(home).await?;
-    validate_runtime_availability(&applied.config, runtime_id)?;
+    validate_runtime_launch_prerequisites(home, &applied.config, runtime_id).await?;
     render_runtime_cache(home, &applied.config, &applied.lockfile, runtime_id).await?;
     let units = build_managed_units(
         home,
@@ -864,6 +865,7 @@ mod tests {
         assert_eq!(config.daemon.workspace, "main");
         assert!(home.config_path().exists());
         assert!(home.home_id_path().exists());
+        assert!(home.runtime_auth_env_path().exists());
         assert!(home.workspace_dir("main").join("SOUL.md").exists());
     }
 
@@ -949,6 +951,9 @@ mod tests {
         let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
             .await
             .expect("onboard");
+        tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
+            .await
+            .expect("write runtime auth");
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
         #[cfg(unix)]
@@ -1014,6 +1019,42 @@ mod tests {
         assert!(home
             .runtime_project_drafts_dir("codex", "main", &project_workspace_root)
             .exists());
+    }
+
+    #[tokio::test]
+    async fn up_rejects_missing_codex_runtime_auth() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
+        let runtime_stub = temp_dir.path().join("codex-stub.sh");
+        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(&runtime_stub, permissions).expect("chmod runtime stub");
+        }
+
+        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
+            .into_iter()
+            .collect();
+        config.save(&home).await.expect("save config");
+
+        let err = up(
+            &home,
+            &FakeServiceManager::default(),
+            "codex",
+            &StackBinaryPaths {
+                daemon_bin: "/tmp/lionclawd".into(),
+            },
+        )
+        .await
+        .expect_err("missing runtime auth should fail");
+
+        assert!(err.to_string().contains("runtime-auth.env"));
+        assert!(err.to_string().contains("OPENAI_API_KEY"));
     }
 
     #[tokio::test]
@@ -1143,6 +1184,9 @@ mod tests {
             required_env: Vec::new(),
         }];
         config.save(&home).await.expect("save config");
+        tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
+            .await
+            .expect("write runtime auth");
         OperatorLockfile::default()
             .save(&home)
             .await
@@ -1320,6 +1364,9 @@ mod tests {
             .into_iter()
             .collect();
         config.save(&home).await.expect("save config");
+        tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
+            .await
+            .expect("write runtime auth");
 
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
@@ -1383,6 +1430,9 @@ mod tests {
             .into_iter()
             .collect();
         config.save(&home).await.expect("save config");
+        tokio::fs::write(home.runtime_auth_env_path(), "OPENAI_API_KEY=sk-test\n")
+            .await
+            .expect("write runtime auth");
 
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
