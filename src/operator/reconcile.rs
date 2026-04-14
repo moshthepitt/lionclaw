@@ -317,8 +317,8 @@ pub async fn up<M: ServiceManager>(
     }
 
     let previous_units = managed_unit_names(home)?;
+    validate_runtime_launch_prerequisites(home, &config, runtime_id).await?;
     let applied = apply(home).await?;
-    validate_runtime_launch_prerequisites(home, &applied.config, runtime_id).await?;
     render_runtime_cache(home, &applied.config, &applied.lockfile, runtime_id).await?;
     let units = build_managed_units(
         home,
@@ -1040,6 +1040,19 @@ mod tests {
         config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
             .into_iter()
             .collect();
+        let skill_source = temp_dir.path().join("test-skill");
+        fs::create_dir_all(&skill_source).expect("skill dir");
+        fs::write(
+            skill_source.join("SKILL.md"),
+            "---\nname: test-skill\ndescription: test\n---\n",
+        )
+        .expect("skill md");
+        config.skills.push(ManagedSkillConfig {
+            alias: "test-skill".to_string(),
+            source: skill_source.display().to_string(),
+            reference: "local".to_string(),
+            enabled: true,
+        });
         config.save(&home).await.expect("save config");
 
         let err = up(
@@ -1055,6 +1068,11 @@ mod tests {
 
         assert!(err.to_string().contains("runtime-auth.env"));
         assert!(err.to_string().contains("OPENAI_API_KEY"));
+        let lockfile = OperatorLockfile::load(&home).await.expect("load lockfile");
+        assert!(
+            lockfile.skills.is_empty(),
+            "auth preflight should fail before apply() installs skill snapshots"
+        );
     }
 
     #[tokio::test]

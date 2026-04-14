@@ -169,15 +169,18 @@ LionClaw hardens the config directory to `0700` and the runtime secret file to
 
 Host-only runtime auth is separate. Confined Codex turns read
 `~/.lionclaw/config/runtime-auth.env` on the host, which `lionclaw onboard`
-scaffolds as a template, require `OPENAI_API_KEY`, generate a per-turn local CA
-and TLS listener, write a
-session-scoped `~/.codex/config.toml` under `/runtime/home`, and route Codex
-through a short-lived HTTPS proxy at `https://host.containers.internal:<port>/v1`.
-The container only sees a runtime-specific one-time placeholder bearer token
-plus the generated CA certificate path via `CODEX_CA_CERTIFICATE`; the raw
-OpenAI key stays on the host side of the proxy boundary. LionClaw runtime
-compatibility assumes configured OCI image references are treated as immutable;
-when runtime bits change, use a new image tag.
+scaffolds as a template and require `OPENAI_API_KEY`. For confined Codex turns,
+LionClaw writes a session-scoped `~/.codex/config.toml` under `/runtime/home`,
+creates a short-lived private Podman pod, starts a tiny HAProxy sidecar in that
+pod, and then launches the runtime container into the same pod-local network
+namespace. Codex talks to `http://127.0.0.1:38080/v1` inside the pod, the
+runtime container only sees a runtime-specific one-time placeholder bearer
+token, and the sidecar swaps that placeholder for the real OpenAI key only on
+`POST /v1/responses` before forwarding upstream over TLS. The raw OpenAI key
+never enters the runtime container, and the pod path does not require host
+loopback reachability. LionClaw runtime compatibility assumes configured OCI
+image references are treated as immutable; when runtime bits change, use a new
+image tag.
 
 Channel bridge layout:
 

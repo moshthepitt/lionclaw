@@ -179,9 +179,13 @@ file to owner-only permissions on Unix before loading it.
 Host-only runtime auth lives separately in `~/.lionclaw/config/runtime-auth.env`,
 which `lionclaw onboard` scaffolds as a template. Today the confined Codex path
 reads `OPENAI_API_KEY` from that file, preflights it before launch, starts a
-short-lived local HTTPS proxy on the host, injects a runtime-specific one-time
-placeholder token into the container, and swaps the placeholder for the real
-OpenAI key at the proxy boundary. The shared OCI runtime image definition lives in
+short-lived private Podman pod with a tiny HAProxy sidecar, injects a
+runtime-specific one-time placeholder token into the runtime container, and
+swaps that placeholder for the real OpenAI key only inside the sidecar on
+`POST /v1/responses`. Codex talks to the sidecar over pod-local
+`http://127.0.0.1:38080/v1`, so the raw key never enters the runtime
+container and the runtime does not need host loopback reachability. The shared
+OCI runtime image definition lives in
 `containers/runtime/Containerfile` and currently installs both `codex` and
 `opencode`. LionClaw runtime compatibility assumes configured image references
 are treated as immutable; rebuild under a new image tag when runtime bits

@@ -35,8 +35,8 @@ that complexity into the core.
 
 LionClaw records a durable audit trail for the actions that pass through the
 core. You can inspect what the model executed, when it executed it, and why the
-system allowed it. No hidden background magic, no invisible sidecar doing work
-behind your back.
+system allowed it. No hidden background actions, no invisible worker mutating
+state behind your back.
 
 ## Spin Up Your Orchestrator
 
@@ -227,11 +227,15 @@ owner-only; LionClaw hardens it to `0600` on Unix before handing it to Podman.
 
 Host-only runtime auth for confined Codex runs lives separately in
 `~/.lionclaw/config/runtime-auth.env`, which `lionclaw onboard` scaffolds as a
-template. Today LionClaw reads `OPENAI_API_KEY` from that file on the host,
-preflights it before Codex launch paths, starts a short-lived local HTTPS
-proxy, injects a runtime-specific one-time placeholder token into the
-container, and swaps that placeholder for the real key at the proxy boundary.
-The raw key is not mounted into the container.
+template. LionClaw reads `OPENAI_API_KEY` from that file on the host,
+preflights it before Codex launch paths, starts a short-lived private Podman
+pod for each confined Codex execution, and runs a tiny HAProxy sidecar beside
+the runtime container. The runtime container only gets a runtime-specific
+placeholder token and points Codex at `http://127.0.0.1:38080/v1`; the sidecar
+holds the real key and swaps it onto `POST /v1/responses` calls before sending
+them upstream to OpenAI. The raw key is not mounted into the runtime
+container, and the pod is created with its own private network namespace rather
+than host loopback access.
 
 `lionclaw runtime add` configures the runtime command that runs inside the
 runtime image, plus the concrete host `podman` executable and image LionClaw

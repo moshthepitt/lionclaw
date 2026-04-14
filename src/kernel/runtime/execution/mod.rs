@@ -3,7 +3,7 @@
 //! This module owns execution planning, backend launch contracts, and shared
 //! process utilities so confinement policy stays out of individual adapters.
 
-pub(crate) mod auth_proxy;
+pub(crate) mod auth_sidecar;
 pub mod backend;
 pub mod oci;
 pub mod plan;
@@ -16,8 +16,8 @@ pub use backend::{
 pub use oci::OciExecutionBackend;
 pub use plan::{
     ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionLimits,
-    ExecutionPreset, MountAccess, MountSpec, NetworkMode, OciConfinementConfig,
-    RuntimeAuthProxyKind, RuntimeProgramSpec, WorkspaceAccess,
+    ExecutionPreset, MountAccess, MountSpec, NetworkMode, OciConfinementConfig, RuntimeAuthKind,
+    RuntimeProgramSpec, WorkspaceAccess,
 };
 pub use planner::{
     ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,

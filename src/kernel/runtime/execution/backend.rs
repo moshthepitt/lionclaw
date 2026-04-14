@@ -115,7 +115,7 @@ mod tests {
                     args: vec!["exec".to_string()],
                     environment: vec![("OPENAI_API_KEY".to_string(), "sk-secret".to_string())],
                     stdin: "hello".to_string(),
-                    auth_proxy: None,
+                    auth: None,
                 },
                 runtime_secrets_mount: Some(super::RuntimeSecretsMount {
                     source: "/tmp/runtime-secrets.env".into(),

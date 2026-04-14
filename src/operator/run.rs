@@ -49,9 +49,10 @@ pub(crate) async fn run_local_with_io<R: BufRead, W: Write>(
     output: &mut W,
 ) -> Result<()> {
     onboard(home, None).await?;
+    let config = crate::operator::config::OperatorConfig::load(home).await?;
+    let runtime_id = resolve_runtime_id(&config, requested_runtime.as_deref())?;
+    validate_runtime_launch_prerequisites(home, &config, &runtime_id).await?;
     let applied = apply(home).await?;
-    let runtime_id = resolve_runtime_id(&applied.config, requested_runtime.as_deref())?;
-    validate_runtime_launch_prerequisites(home, &applied.config, &runtime_id).await?;
     render_runtime_cache(home, &applied.config, &applied.lockfile, &runtime_id).await?;
 
     let kernel = open_runtime_kernel(home, &applied.config, Some(runtime_id.clone())).await?;
@@ -497,7 +498,10 @@ mod tests {
             runtime::{ConfinementConfig, OciConfinementConfig},
             Kernel, KernelOptions,
         },
-        operator::config::{OperatorConfig, RuntimeProfileConfig},
+        operator::{
+            config::{ManagedSkillConfig, OperatorConfig, RuntimeProfileConfig},
+            lockfile::OperatorLockfile,
+        },
     };
 
     #[cfg(unix)]
@@ -517,7 +521,6 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
-        write_codex_runtime_auth(&home).await;
         write_codex_runtime_auth(&home).await;
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
@@ -895,6 +898,19 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
 
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
+        let skill_source = temp_dir.path().join("test-skill");
+        fs::create_dir_all(&skill_source).expect("skill dir");
+        fs::write(
+            skill_source.join("SKILL.md"),
+            "---\nname: test-skill\ndescription: test\n---\n",
+        )
+        .expect("skill md");
+        config.skills.push(ManagedSkillConfig {
+            alias: "test-skill".to_string(),
+            source: skill_source.display().to_string(),
+            reference: "local".to_string(),
+            enabled: true,
+        });
         config.save(&home).await.expect("save config");
 
         let mut input = Cursor::new(Vec::<u8>::new());
@@ -905,6 +921,11 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
 
         assert!(err.to_string().contains("runtime-auth.env"));
         assert!(err.to_string().contains("OPENAI_API_KEY"));
+        let lockfile = OperatorLockfile::load(&home).await.expect("load lockfile");
+        assert!(
+            lockfile.skills.is_empty(),
+            "auth preflight should fail before apply() installs skill snapshots"
+        );
     }
 
     #[cfg(unix)]
@@ -1145,13 +1166,16 @@ case "${command_name}" in
   secret)
     exit 0
     ;;
+  pod)
+    exit 0
+    ;;
   run)
     while [ "$#" -gt 0 ]; do
       case "$1" in
-        --rm|--interactive|--read-only)
+        --rm|--interactive|--read-only|--detach)
           shift
           ;;
-        --network|--workdir|--volume|--tmpfs|--env|--secret|--memory|--cpus|--pids-limit)
+        --network|--workdir|--volume|--tmpfs|--env|--secret|--memory|--cpus|--pids-limit|--pod|--name)
           shift 2
           ;;
         --)
@@ -1167,6 +1191,9 @@ case "${command_name}" in
           ;;
       esac
     done
+    if [ "$#" -eq 1 ]; then
+      exit 0
+    fi
     exec "$@"
     ;;
   *)

@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 
 use super::{
-    auth_proxy::{start_for_oci_execution, OciAuthProxyLaunch},
+    auth_sidecar::{start_for_oci_execution, OciRuntimeAuthLaunch},
     backend::{ExecutionBackend, ExecutionOutput, ExecutionRequest, ExecutionStdoutSender},
     plan::{ConfinementBackend, MountAccess, MountSpec, NetworkMode},
     process::{run_process_streaming, ProcessInvocation},
@@ -25,18 +25,18 @@ impl ExecutionBackend for OciExecutionBackend {
         stdout: ExecutionStdoutSender,
     ) -> Result<ExecutionOutput> {
         ensure_runtime_secrets_registered(&request).await?;
-        let auth_proxy = start_for_oci_execution(&request).await?;
+        let runtime_auth = start_for_oci_execution(&request).await?;
         let invocation = build_oci_process_invocation(
             &request,
-            auth_proxy.as_ref().map(|proxy| proxy.launch()),
+            runtime_auth.as_ref().map(|auth| auth.launch()),
         )?;
         let result = run_process_streaming(&invocation, move |line| {
             let _ = stdout.send(line.to_string());
             Ok(())
         })
         .await;
-        let shutdown_result = match auth_proxy {
-            Some(proxy) => proxy.shutdown().await,
+        let shutdown_result = match runtime_auth {
+            Some(auth) => auth.shutdown().await,
             None => Ok(()),
         };
 
@@ -50,7 +50,7 @@ impl ExecutionBackend for OciExecutionBackend {
 
 fn build_oci_process_invocation(
     request: &ExecutionRequest,
-    auth_proxy: Option<&OciAuthProxyLaunch>,
+    runtime_auth: Option<&OciRuntimeAuthLaunch>,
 ) -> Result<ProcessInvocation> {
     let config = request.plan.confinement.oci();
 
@@ -71,15 +71,11 @@ fn build_oci_process_invocation(
         args.push("--read-only".to_string());
     }
 
-    match auth_proxy
-        .and_then(|proxy| proxy.network_override.as_deref())
-        .map(str::to_string)
-    {
-        Some(network_override) => {
-            args.push("--network".to_string());
-            args.push(network_override);
-        }
-        None => match request.plan.network_mode {
+    if let Some(pod_name) = runtime_auth.and_then(|auth| auth.pod_name.as_deref()) {
+        args.push("--pod".to_string());
+        args.push(pod_name.to_string());
+    } else {
+        match request.plan.network_mode {
             NetworkMode::None => {
                 args.push("--network".to_string());
                 args.push("none".to_string());
@@ -88,7 +84,7 @@ fn build_oci_process_invocation(
                 args.push("--network".to_string());
                 args.push("private".to_string());
             }
-        },
+        }
     }
 
     if let Some(working_dir) = request.plan.working_dir.as_deref() {
@@ -118,8 +114,8 @@ fn build_oci_process_invocation(
 
     let mut environment =
         merged_environment(&request.plan.environment, &request.program.environment);
-    if let Some(auth_proxy) = auth_proxy {
-        environment = merged_environment(&environment, &auth_proxy.environment);
+    if let Some(runtime_auth) = runtime_auth {
+        environment = merged_environment(&environment, &runtime_auth.runtime_environment);
     }
     for (key, value) in environment {
         args.push("--env".to_string());
@@ -298,7 +294,7 @@ mod tests {
     use std::time::Duration;
 
     use super::build_oci_process_invocation;
-    use crate::kernel::runtime::execution::auth_proxy::OciAuthProxyLaunch;
+    use crate::kernel::runtime::execution::auth_sidecar::OciRuntimeAuthLaunch;
     use crate::kernel::runtime::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionRequest, NetworkMode,
         OciConfinementConfig, RuntimeProgramSpec, RuntimeSecretsMount, WorkspaceAccess,
@@ -314,7 +310,7 @@ mod tests {
                 args: vec!["exec".to_string(), "--json".to_string()],
                 environment: vec![("MODEL".to_string(), "gpt-5-codex".to_string())],
                 stdin: "hello".to_string(),
-                auth_proxy: None,
+                auth: None,
             },
             runtime_secrets_mount: Some(RuntimeSecretsMount {
                 source: "/home/mosh/.lionclaw/config/runtime-secrets.env".into(),
@@ -425,7 +421,7 @@ mod tests {
                     args: Vec::new(),
                     environment: Vec::new(),
                     stdin: String::new(),
-                    auth_proxy: None,
+                    auth: None,
                 },
                 runtime_secrets_mount: None,
                 runtime_auth_home: None,
@@ -460,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn oci_backend_applies_auth_proxy_network_and_environment_overrides() {
+    fn oci_backend_runs_join_runtime_auth_pod_and_merges_runtime_env() {
         let invocation = build_oci_process_invocation(
             &ExecutionRequest {
                 plan: sample_plan(),
@@ -468,28 +464,30 @@ mod tests {
                 runtime_secrets_mount: None,
                 runtime_auth_home: None,
             },
-            Some(&OciAuthProxyLaunch {
-                environment: vec![(
+            Some(&OciRuntimeAuthLaunch {
+                pod_name: Some("lionclaw-pod".to_string()),
+                runtime_environment: vec![(
                     "LIONCLAW_CODEX_OPENAI_PROXY_TOKEN".to_string(),
                     "placeholder".to_string(),
                 )],
-                network_override: Some("slirp4netns:allow_host_loopback=true".to_string()),
             }),
         )
         .expect("invocation");
 
-        assert!(invocation.args.windows(2).any(|pair| {
-            pair == [
-                "--network".to_string(),
-                "slirp4netns:allow_host_loopback=true".to_string(),
-            ]
-        }));
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|pair| { pair == ["--pod".to_string(), "lionclaw-pod".to_string(),] }));
         assert!(invocation.args.windows(2).any(|pair| {
             pair == [
                 "--env".to_string(),
                 "LIONCLAW_CODEX_OPENAI_PROXY_TOKEN=placeholder".to_string(),
             ]
         }));
+        assert!(
+            !invocation.args.iter().any(|arg| arg == "--network"),
+            "runtime auth pod should replace direct network mode wiring"
+        );
     }
 
     #[test]

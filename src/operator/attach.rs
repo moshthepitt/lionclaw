@@ -112,6 +112,13 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
     binaries: &StackBinaryPaths,
 ) -> Result<ChannelAttachSpec> {
     let initial_config = crate::operator::config::OperatorConfig::load(home).await?;
+    let requested_runtime_id = requested_runtime_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let initial_runtime_id = resolve_runtime_id(&initial_config, requested_runtime_id.as_deref())?;
+    validate_runtime_launch_prerequisites(home, &initial_config, &initial_runtime_id).await?;
     let expected_config_fingerprint = daemon_compat_fingerprint(&initial_config);
     let home_id = home.ensure_home_id().await?;
     let mut started_services = false;
@@ -124,15 +131,13 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
     .await?
     {
         DaemonClassification::Absent => {
-            let runtime_id = initial_config.resolve_runtime_id(requested_runtime_id.as_deref())?;
             started_services = true;
-            up(home, manager, &runtime_id, binaries).await?
+            up(home, manager, &initial_runtime_id, binaries).await?
         }
         DaemonClassification::SameHome => apply(home).await?,
         DaemonClassification::SameHomeDifferentConfig => {
-            let runtime_id = initial_config.resolve_runtime_id(requested_runtime_id.as_deref())?;
             started_services = true;
-            up(home, manager, &runtime_id, binaries).await?
+            up(home, manager, &initial_runtime_id, binaries).await?
         }
         DaemonClassification::SameHomeDifferentProject => {
             return Err(anyhow!(
@@ -178,9 +183,6 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
         ));
     }
 
-    let resolved_runtime_id = resolve_runtime_id(&applied.config, requested_runtime_id.as_deref())?;
-    validate_runtime_launch_prerequisites(home, &applied.config, &resolved_runtime_id).await?;
-
     let locked_skill = applied.lockfile.find_skill(&channel.skill).ok_or_else(|| {
         anyhow!(
             "channel '{}' skill '{}' is not installed",
@@ -189,11 +191,7 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
         )
     })?;
     let worker_path = resolve_worker_entrypoint(home, &locked_skill.snapshot_dir)?;
-    let effective_runtime_id = match requested_runtime_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    let effective_runtime_id = match requested_runtime_id.as_deref() {
         Some(runtime_id) => Some(applied.config.resolve_runtime_id(Some(runtime_id))?),
         None => None,
     };
@@ -302,6 +300,7 @@ mod tests {
                 daemon_compat_fingerprint, ChannelLaunchMode, ManagedChannelConfig,
                 ManagedSkillConfig, OperatorConfig, RuntimeProfileConfig,
             },
+            lockfile::OperatorLockfile,
             services::{FakeServiceManager, ServiceManager},
         },
     };
@@ -455,6 +454,11 @@ mod tests {
 
         assert!(err.to_string().contains("runtime-auth.env"));
         assert!(err.to_string().contains("OPENAI_API_KEY"));
+        let lockfile = OperatorLockfile::load(&home).await.expect("load lockfile");
+        assert!(
+            lockfile.skills.is_empty() && lockfile.channels.is_empty(),
+            "auth preflight should fail before attach apply/up lockfile materialization"
+        );
     }
 
     #[cfg(unix)]
