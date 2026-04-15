@@ -101,6 +101,8 @@ class TerminalChannelApp(App[None]):
         )
         self._initial_stream_start_after_sequence: int | None = None
         self._first_stream_pull = True
+        self._focus_input_requested = True
+        self._input_was_disabled = True
 
     def compose(self) -> ComposeResult:
         yield Static(id="pairing-banner")
@@ -335,6 +337,7 @@ class TerminalChannelApp(App[None]):
                     self.state.clear_transient_view()
                 self.state.status_lines.clear()
                 self.state.status_lines.append("[status] peer approved")
+                self._focus_input_requested = True
             return
 
         if previous_status == "approved" and current_status == "blocked":
@@ -348,12 +351,30 @@ class TerminalChannelApp(App[None]):
         )
         self.query_one("#transcript-view", Static).update(self.state.transcript_text())
         self.query_one("#thinking-view", Static).update(self.state.reasoning_text())
-        self.query_one("#input", Input).disabled = self.state.input_disabled()
+        input_widget = self.query_one("#input", Input)
+        input_is_disabled = self.state.input_disabled()
+        input_widget.disabled = input_is_disabled
+        self._focus_input_if_enabled(input_widget, self._input_was_disabled)
+        self._input_was_disabled = input_is_disabled
 
         status_log = self.query_one("#status-log", RichLog)
         status_log.clear()
         for line in self.state.status_text().splitlines():
             status_log.write(line)
+
+    def _focus_input_if_enabled(
+        self,
+        input_widget: Input,
+        input_was_disabled: bool,
+    ) -> None:
+        if input_widget.disabled:
+            return
+        if self.focused is input_widget:
+            self._focus_input_requested = False
+            return
+        if self.focused is None or self._focus_input_requested or input_was_disabled:
+            input_widget.focus()
+        self._focus_input_requested = False
 
     def _apply_inbound_response(
         self,
