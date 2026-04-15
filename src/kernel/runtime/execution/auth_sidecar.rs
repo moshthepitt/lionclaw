@@ -210,17 +210,28 @@ fn codex_runtime_args_prefix(auth_mode: CodexHostAuthMode) -> Vec<String> {
 }
 
 fn build_pod_create_invocation(engine: &str, pod_name: &str) -> ProcessInvocation {
+    let mut args = vec![
+        "pod".to_string(),
+        "create".to_string(),
+        "--name".to_string(),
+        pod_name.to_string(),
+        "--network".to_string(),
+        "private".to_string(),
+        "--no-hosts".to_string(),
+    ];
+
+    #[cfg(unix)]
+    {
+        // Keep the pod in the invoking user's namespace so the runtime
+        // container can write LionClaw's host bind mounts without depending on
+        // image-specific UID luck under rootless Podman.
+        args.push("--userns".to_string());
+        args.push("keep-id".to_string());
+    }
+
     ProcessInvocation {
         executable: engine.to_string(),
-        args: vec![
-            "pod".to_string(),
-            "create".to_string(),
-            "--name".to_string(),
-            pod_name.to_string(),
-            "--network".to_string(),
-            "private".to_string(),
-            "--no-hosts".to_string(),
-        ],
+        args,
         working_dir: None,
         environment: Vec::new(),
         input: String::new(),
@@ -526,18 +537,20 @@ mod tests {
         let invocation = build_pod_create_invocation("podman", "lionclaw-pod");
 
         assert_eq!(invocation.executable, "podman");
-        assert_eq!(
-            invocation.args,
-            vec![
-                "pod".to_string(),
-                "create".to_string(),
-                "--name".to_string(),
-                "lionclaw-pod".to_string(),
-                "--network".to_string(),
-                "private".to_string(),
-                "--no-hosts".to_string(),
-            ]
-        );
+        assert!(invocation.args.starts_with(&[
+            "pod".to_string(),
+            "create".to_string(),
+            "--name".to_string(),
+            "lionclaw-pod".to_string(),
+            "--network".to_string(),
+            "private".to_string(),
+            "--no-hosts".to_string(),
+        ]));
+        #[cfg(unix)]
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--userns".to_string(), "keep-id".to_string()]));
     }
 
     #[test]

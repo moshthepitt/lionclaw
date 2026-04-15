@@ -1185,7 +1185,7 @@ case "${command_name}" in
         --rm|--interactive|--read-only|--detach)
           shift
           ;;
-        --network|--workdir|--tmpfs|--env|--secret|--memory|--cpus|--pids-limit|--pod|--name)
+        --network|--workdir|--tmpfs|--env|--secret|--memory|--cpus|--pids-limit|--pod|--name|--userns|--user)
           shift 2
           ;;
         --volume)
