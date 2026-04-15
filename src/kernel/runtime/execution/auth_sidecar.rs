@@ -31,7 +31,7 @@ const PRIVATE_SELINUX_RELABEL: &str = "Z";
 // pinning one of those digests breaks launchability on other host
 // architectures. The untrusted runtime image remains operator-managed and
 // separate.
-const CODEX_AUTH_SIDECAR_IMAGE: &str = "docker.io/library/haproxy:3.3.5-alpine";
+const CODEX_AUTH_SIDECAR_IMAGE: &str = "docker.io/library/haproxy:3.3.6-alpine";
 const SIDECAR_CONFIG_CONTAINER_DIR: &str = "/usr/local/etc/haproxy";
 const HAPROXY_CONFIG_FILE_NAME: &str = "haproxy.cfg";
 const HAPROXY_ADMIN_SOCKET_CONTAINER_PATH: &str = "/tmp/lionclaw-haproxy-admin.sock";

@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use tokio::time::timeout;
+use tokio::{runtime::Handle, time::timeout};
 
 use super::{
     auth_sidecar::{start_for_oci_execution, OciRuntimeAuthLaunch},
@@ -15,6 +15,7 @@ use super::{
     process::{run_process_streaming, ProcessInvocation},
     OciConfinementConfig,
 };
+use crate::kernel::runtime::RuntimeSecretsMount;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OciExecutionBackend;
@@ -60,7 +61,7 @@ impl ExecutionBackend for OciExecutionBackend {
         request: ExecutionRequest,
         stdout: ExecutionStdoutSender,
     ) -> Result<ExecutionOutput> {
-        ensure_runtime_secrets_registered(&request).await?;
+        let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
         let prepared = prepare_oci_process_launch(&request)?;
         let runtime_auth = start_for_oci_execution(&request).await?;
         let invocation =
@@ -74,11 +75,16 @@ impl ExecutionBackend for OciExecutionBackend {
             Some(auth) => auth.shutdown().await,
             None => Ok(()),
         };
+        let runtime_secrets_cleanup_result = match runtime_secrets {
+            Some(cleanup) => cleanup.shutdown().await,
+            None => Ok(()),
+        };
 
-        match (result, shutdown_result) {
-            (Ok(output), Ok(())) => Ok(output),
-            (Err(err), _) => Err(err),
-            (Ok(_), Err(err)) => Err(err),
+        match (result, shutdown_result, runtime_secrets_cleanup_result) {
+            (Ok(output), Ok(()), Ok(())) => Ok(output),
+            (Err(err), _, _) => Err(err),
+            (Ok(_), Err(err), _) => Err(err),
+            (Ok(_), Ok(()), Err(err)) => Err(err),
         }
     }
 }
@@ -351,25 +357,15 @@ fn build_oci_process_invocation(
     }
 }
 
-async fn ensure_runtime_secrets_registered(request: &ExecutionRequest) -> Result<()> {
+async fn ensure_runtime_secrets_registered(
+    request: &ExecutionRequest,
+) -> Result<Option<OciRuntimeSecretsSession>> {
     let Some(mount) = request.runtime_secrets_mount.as_ref() else {
-        return Ok(());
+        return Ok(None);
     };
     let engine = request.plan.confinement.oci().engine.clone();
     let output = run_process_streaming(
-        &ProcessInvocation {
-            executable: engine.clone(),
-            args: vec![
-                "secret".to_string(),
-                "create".to_string(),
-                "--replace".to_string(),
-                mount.mounted_name(),
-                path_to_arg(&mount.source)?,
-            ],
-            working_dir: None,
-            environment: Vec::new(),
-            input: String::new(),
-        },
+        &build_runtime_secret_create_invocation(&engine, mount)?,
         |_| Ok(()),
     )
     .await
@@ -381,7 +377,12 @@ async fn ensure_runtime_secrets_registered(request: &ExecutionRequest) -> Result
     })?;
 
     if output.success() {
-        return Ok(());
+        return Ok(Some(OciRuntimeSecretsSession {
+            cleanup: Some(OciRuntimeSecretsCleanup {
+                engine,
+                secret_name: mount.mounted_name(),
+            }),
+        }));
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -393,6 +394,112 @@ async fn ensure_runtime_secrets_registered(request: &ExecutionRequest) -> Result
     }
 
     bail!("failed to register OCI runtime secrets: {}", stderr)
+}
+
+#[derive(Debug)]
+struct OciRuntimeSecretsCleanup {
+    engine: String,
+    secret_name: String,
+}
+
+#[derive(Debug)]
+struct OciRuntimeSecretsSession {
+    cleanup: Option<OciRuntimeSecretsCleanup>,
+}
+
+impl OciRuntimeSecretsSession {
+    async fn shutdown(mut self) -> Result<()> {
+        let Some(cleanup) = self.cleanup.take() else {
+            return Ok(());
+        };
+        cleanup.shutdown().await
+    }
+}
+
+impl Drop for OciRuntimeSecretsSession {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup.spawn();
+        }
+    }
+}
+
+impl OciRuntimeSecretsCleanup {
+    async fn shutdown(self) -> Result<()> {
+        let output = run_oci_preflight_command(
+            &build_runtime_secret_remove_invocation(&self.engine, &self.secret_name),
+            &format!("remove OCI runtime secret '{}'", self.secret_name),
+            OCI_IMAGE_PROBE_TIMEOUT,
+        )
+        .await?;
+
+        if output.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            bail!(
+                "failed to remove OCI runtime secret '{}'; OCI engine exited with code {:?}",
+                self.secret_name,
+                output.exit_code
+            );
+        }
+
+        bail!(
+            "failed to remove OCI runtime secret '{}': {}",
+            self.secret_name,
+            stderr
+        )
+    }
+
+    fn spawn(self) {
+        if let Ok(handle) = Handle::try_current() {
+            handle.spawn(async move {
+                let _ = self.shutdown().await;
+            });
+            return;
+        }
+
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new(&self.engine)
+                .args(["secret", "rm", &self.secret_name])
+                .status();
+        });
+    }
+}
+
+fn build_runtime_secret_create_invocation(
+    engine: &str,
+    mount: &RuntimeSecretsMount,
+) -> Result<ProcessInvocation> {
+    Ok(ProcessInvocation {
+        executable: engine.to_string(),
+        args: vec![
+            "secret".to_string(),
+            "create".to_string(),
+            "--replace".to_string(),
+            mount.mounted_name(),
+            path_to_arg(&mount.source)?,
+        ],
+        working_dir: None,
+        environment: Vec::new(),
+        input: String::new(),
+    })
+}
+
+fn build_runtime_secret_remove_invocation(engine: &str, secret_name: &str) -> ProcessInvocation {
+    ProcessInvocation {
+        executable: engine.to_string(),
+        args: vec![
+            "secret".to_string(),
+            "rm".to_string(),
+            secret_name.to_string(),
+        ],
+        working_dir: None,
+        environment: Vec::new(),
+        input: String::new(),
+    }
 }
 
 fn path_to_arg(path: &Path) -> Result<String> {
@@ -489,15 +596,21 @@ fn merged_environment(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
-    use super::{build_oci_process_invocation, prepare_oci_process_launch};
+    use super::{build_oci_process_invocation, prepare_oci_process_launch, OciExecutionBackend};
     use crate::kernel::runtime::execution::auth_sidecar::OciRuntimeAuthLaunch;
+    use crate::kernel::runtime::execution::backend::ExecutionBackend;
     use crate::kernel::runtime::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionRequest, NetworkMode,
         OciConfinementConfig, RuntimeProgramSpec, RuntimeSecretsMount, WorkspaceAccess,
     };
     use crate::kernel::runtime::{MountAccess, MountSpec};
+    use tempfile::tempdir;
+    use tokio::sync::mpsc;
 
     #[test]
     fn oci_backend_builds_podman_run_invocation() {
@@ -726,6 +839,90 @@ mod tests {
         assert!(err
             .to_string()
             .contains("is not inside any configured runtime mount"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oci_backend_removes_runtime_secret_after_turn_completion() {
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("podman.log");
+        let engine_path = temp_dir.path().join("podman-stub.sh");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+set -eu
+echo "$@" >> "{log_path}"
+case "${{1:-}}" in
+  secret)
+    exit 0
+    ;;
+  run)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"#,
+            log_path = log_path.display()
+        );
+        fs::write(&engine_path, script).expect("write engine");
+        let mut permissions = fs::metadata(&engine_path)
+            .expect("engine metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&engine_path, permissions).expect("chmod engine");
+
+        let request = ExecutionRequest {
+            plan: EffectiveExecutionPlan {
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: engine_path.display().to_string(),
+                    ..sample_plan().confinement.oci().clone()
+                }),
+                ..sample_plan()
+            },
+            program: RuntimeProgramSpec {
+                executable: "codex".to_string(),
+                args: vec!["exec".to_string(), "--json".to_string()],
+                environment: Vec::new(),
+                stdin: "hello".to_string(),
+                auth: None,
+            },
+            runtime_secrets_mount: Some(RuntimeSecretsMount {
+                source: temp_dir.path().join("runtime-secrets.env"),
+            }),
+            codex_home_override: None,
+        };
+        fs::write(
+            request
+                .runtime_secrets_mount
+                .as_ref()
+                .expect("mount")
+                .source
+                .as_path(),
+            "TOKEN=value\n",
+        )
+        .expect("write runtime secrets");
+
+        let (stdout_tx, _stdout_rx) = mpsc::unbounded_channel();
+        OciExecutionBackend
+            .execute_streaming(request.clone(), stdout_tx)
+            .await
+            .expect("execute");
+
+        let log = fs::read_to_string(&log_path).expect("read log");
+        let secret_name = request
+            .runtime_secrets_mount
+            .as_ref()
+            .expect("mount")
+            .mounted_name();
+        assert!(
+            log.contains(&format!("secret create --replace {}", secret_name)),
+            "secret create should be logged: {log}"
+        );
+        assert!(
+            log.contains(&format!("secret rm {}", secret_name)),
+            "secret remove should be logged: {log}"
+        );
     }
 
     fn sample_plan() -> EffectiveExecutionPlan {
