@@ -69,13 +69,12 @@ use super::{
     },
     policy::{Capability, PolicyStore, Scope},
     runtime::{
-        execute_program_backed_turn, register_builtin_runtime_adapters,
-        validate_runtime_auth_prerequisites, EffectiveExecutionPlan, ExecutionPlanPurpose,
-        ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset,
-        HiddenTurnSupport, RuntimeAdapter, RuntimeCapabilityRequest, RuntimeCapabilityResult,
-        RuntimeEvent, RuntimeExecutionProfile, RuntimeMessageLane, RuntimeRegistry,
-        RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
-        RuntimeTurnMode, RuntimeTurnResult,
+        execute_program_backed_turn, register_builtin_runtime_adapters, EffectiveExecutionPlan,
+        ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
+        ExecutionPreset, HiddenTurnSupport, RuntimeAdapter, RuntimeCapabilityRequest,
+        RuntimeCapabilityResult, RuntimeEvent, RuntimeExecutionProfile, RuntimeMessageLane,
+        RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput,
+        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -219,9 +218,14 @@ impl Kernel {
         &self,
         runtime_id: &str,
     ) -> Result<(), KernelError> {
-        validate_runtime_auth_prerequisites(
+        let profile = self.execution_planner.runtime_profile(runtime_id);
+        let Some(profile) = profile else {
+            return Ok(());
+        };
+        crate::kernel::runtime::validate_runtime_launch_prerequisites(
             runtime_id,
-            self.execution_planner.required_runtime_auth(runtime_id),
+            &profile.confinement,
+            profile.required_runtime_auth,
             self.codex_home_override.as_deref(),
         )
         .await

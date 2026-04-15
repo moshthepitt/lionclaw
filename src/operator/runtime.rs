@@ -6,8 +6,9 @@ use anyhow::{anyhow, Result};
 use crate::home::LionClawHome;
 use crate::kernel::{
     runtime::{
-        validate_runtime_auth_prerequisites, CodexRuntimeAdapter, CodexRuntimeConfig,
-        OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig, RuntimeExecutionProfile,
+        validate_runtime_launch_prerequisites as validate_kernel_runtime_launch_prerequisites,
+        CodexRuntimeAdapter, CodexRuntimeConfig, OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig,
+        RuntimeExecutionProfile,
     },
     Kernel,
 };
@@ -102,8 +103,9 @@ pub async fn validate_runtime_launch_prerequisites(
     let profile = config
         .runtime(runtime_id)
         .ok_or_else(|| anyhow!("runtime profile '{}' is not configured", runtime_id))?;
-    validate_runtime_auth_prerequisites(
+    validate_kernel_runtime_launch_prerequisites(
         runtime_id,
+        profile.confinement(),
         profile.required_runtime_auth(),
         operator_codex_home_override(home).as_deref(),
     )
@@ -137,14 +139,19 @@ mod tests {
     use crate::operator::config::{OperatorConfig, RuntimeProfileConfig};
 
     #[cfg(unix)]
-    fn fake_podman() -> (tempfile::TempDir, String) {
+    fn fake_podman_with_body(body: &str) -> (tempfile::TempDir, String) {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let path = temp_dir.path().join("podman");
-        std::fs::write(&path, "#!/usr/bin/env bash\n").expect("write file");
+        std::fs::write(&path, body).expect("write file");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         (temp_dir, path.to_string_lossy().to_string())
+    }
+
+    #[cfg(unix)]
+    fn fake_podman() -> (tempfile::TempDir, String) {
+        fake_podman_with_body("#!/usr/bin/env bash\n")
     }
 
     #[cfg(unix)]
@@ -341,5 +348,114 @@ mod tests {
         validate_runtime_launch_prerequisites(&home, &config, "codex")
             .await
             .expect("runtime auth should validate");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_launch_prereqs_pull_pinned_sidecar_when_missing() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let log_path = temp_dir.path().join("podman.log");
+        let script = format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"${{1:-}}\" = \"image\" ] && [ \"${{2:-}}\" = \"exists\" ]; then\n  if [[ \"${{3:-}}\" == docker.io/library/haproxy:* ]]; then\n    exit 1\n  fi\n  exit 0\nfi\nif [ \"${{1:-}}\" = \"pull\" ] && [[ \"${{2:-}}\" == docker.io/library/haproxy:* ]]; then\n  exit 0\nfi\nexit 0\n",
+            log_path.display()
+        );
+        let (_podman_dir, engine) = fake_podman_with_body(&script);
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        write_test_codex_auth(
+            &home,
+            json!({
+                "OPENAI_API_KEY": null,
+                "last_refresh": Utc::now().to_rfc3339(),
+                "tokens": {
+                    "access_token": format!("a.{}.c", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                        serde_json::to_vec(&json!({ "exp": (Utc::now() + ChronoDuration::hours(1)).timestamp() }))
+                            .expect("jwt payload")
+                    )),
+                    "refresh_token": "refresh-test"
+                }
+            }),
+        )
+        .await;
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine));
+
+        validate_runtime_launch_prerequisites(&home, &config, "codex")
+            .await
+            .expect("missing sidecar image should be pulled");
+
+        let log = std::fs::read_to_string(&log_path).expect("read podman log");
+        assert!(log.contains("image exists ghcr.io/lionclaw/codex-runtime:latest"));
+        assert!(log.contains("image exists docker.io/library/haproxy:3.3.5-alpine@sha256:"));
+        assert!(log.contains("pull docker.io/library/haproxy:3.3.5-alpine@sha256:"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_launch_prereqs_fail_when_runtime_image_is_missing_locally() {
+        let script = "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"exists\" ]; then\n  exit 1\nfi\nexit 0\n";
+        let (_podman_dir, engine) = fake_podman_with_body(script);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        write_test_codex_auth(
+            &home,
+            json!({
+                "OPENAI_API_KEY": null,
+                "last_refresh": Utc::now().to_rfc3339(),
+                "tokens": {
+                    "access_token": format!("a.{}.c", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                        serde_json::to_vec(&json!({ "exp": (Utc::now() + ChronoDuration::hours(1)).timestamp() }))
+                            .expect("jwt payload")
+                    )),
+                    "refresh_token": "refresh-test"
+                }
+            }),
+        )
+        .await;
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine));
+
+        let err = validate_runtime_launch_prerequisites(&home, &config, "codex")
+            .await
+            .expect_err("missing runtime image should fail before launch");
+        assert!(err
+            .to_string()
+            .contains("configured runtime image 'ghcr.io/lionclaw/codex-runtime:latest' for runtime 'codex' is not available locally"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_launch_prereqs_fail_when_pinned_sidecar_pull_fails() {
+        let script = "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"exists\" ]; then\n  if [[ \"${3:-}\" == docker.io/library/haproxy:* ]]; then\n    exit 1\n  fi\n  exit 0\nfi\nif [ \"${1:-}\" = \"pull\" ] && [[ \"${2:-}\" == docker.io/library/haproxy:* ]]; then\n  echo 'network denied' >&2\n  exit 1\nfi\nexit 0\n";
+        let (_podman_dir, engine) = fake_podman_with_body(script);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        write_test_codex_auth(
+            &home,
+            json!({
+                "OPENAI_API_KEY": null,
+                "last_refresh": Utc::now().to_rfc3339(),
+                "tokens": {
+                    "access_token": format!("a.{}.c", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                        serde_json::to_vec(&json!({ "exp": (Utc::now() + ChronoDuration::hours(1)).timestamp() }))
+                            .expect("jwt payload")
+                    )),
+                    "refresh_token": "refresh-test"
+                }
+            }),
+        )
+        .await;
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine));
+
+        let err = validate_runtime_launch_prerequisites(&home, &config, "codex")
+            .await
+            .expect_err("failed sidecar pull should fail before launch");
+        assert!(err
+            .to_string()
+            .contains("failed to pull pinned Codex auth sidecar image"));
+        assert!(err.to_string().contains("network denied"));
     }
 }

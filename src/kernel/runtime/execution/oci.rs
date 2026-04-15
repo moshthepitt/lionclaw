@@ -6,8 +6,10 @@ use async_trait::async_trait;
 use super::{
     auth_sidecar::{start_for_oci_execution, OciRuntimeAuthLaunch},
     backend::{ExecutionBackend, ExecutionOutput, ExecutionRequest, ExecutionStdoutSender},
-    plan::{ConfinementBackend, MountAccess, MountSpec, NetworkMode},
+    codex_auth_sidecar_image_ref,
+    plan::{ConfinementBackend, MountAccess, MountSpec, NetworkMode, RuntimeAuthKind},
     process::{run_process_streaming, ProcessInvocation},
+    OciConfinementConfig,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -57,6 +59,46 @@ impl ExecutionBackend for OciExecutionBackend {
             (Ok(_), Err(err)) => Err(err),
         }
     }
+}
+
+pub async fn validate_oci_launch_prerequisites(
+    runtime_id: &str,
+    confinement: &OciConfinementConfig,
+    required_auth: Option<RuntimeAuthKind>,
+) -> Result<()> {
+    let image = confinement.image.as_deref().ok_or_else(|| {
+        anyhow!(
+            "runtime '{}' requires a Podman runtime image in its confinement config",
+            runtime_id
+        )
+    })?;
+
+    // The runtime image is operator-managed, so launch preflight requires it to
+    // exist locally instead of pulling an arbitrary mutable reference behind the
+    // user's back.
+    ensure_oci_image_exists(
+        &confinement.engine,
+        image,
+        format!(
+            "configured runtime image '{}' for runtime '{}'",
+            image, runtime_id
+        ),
+    )
+    .await?;
+
+    if required_auth == Some(RuntimeAuthKind::Codex) {
+        // The auth sidecar image is part of LionClaw's trusted boundary and is
+        // pinned in code. We auto-pull it when missing so local interactive
+        // Codex launches stay command-first instead of requiring separate setup.
+        ensure_oci_image_pulled(
+            &confinement.engine,
+            codex_auth_sidecar_image_ref(),
+            "pinned Codex auth sidecar image".to_string(),
+        )
+        .await?;
+    }
+
+    Ok(())
 }
 
 fn prepare_oci_process_launch(request: &ExecutionRequest) -> Result<PreparedOciProcessLaunch> {
@@ -133,6 +175,67 @@ fn prepare_oci_process_launch(request: &ExecutionRequest) -> Result<PreparedOciP
         program_args: request.program.args.clone(),
         stdin: request.program.stdin.clone(),
     })
+}
+
+async fn ensure_oci_image_exists(engine: &str, image: &str, description: String) -> Result<()> {
+    match run_oci_image_exists(engine, image).await? {
+        true => Ok(()),
+        false => bail!(
+            "{} is not available locally; build or pull it before running LionClaw",
+            description
+        ),
+    }
+}
+
+async fn ensure_oci_image_pulled(engine: &str, image: &str, description: String) -> Result<()> {
+    if run_oci_image_exists(engine, image).await? {
+        return Ok(());
+    }
+
+    let output = run_process_streaming(
+        &ProcessInvocation {
+            executable: engine.to_string(),
+            args: vec!["pull".to_string(), image.to_string()],
+            working_dir: None,
+            environment: Vec::new(),
+            input: String::new(),
+        },
+        |_| Ok(()),
+    )
+    .await
+    .with_context(|| format!("failed to pull {}", description))?;
+
+    if output.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        bail!(
+            "failed to pull {}; OCI engine exited with code {:?}",
+            description,
+            output.exit_code
+        );
+    }
+
+    bail!("failed to pull {}: {}", description, stderr)
+}
+
+async fn run_oci_image_exists(engine: &str, image: &str) -> Result<bool> {
+    let output = run_process_streaming(
+        &ProcessInvocation {
+            executable: engine.to_string(),
+            args: vec!["image".to_string(), "exists".to_string(), image.to_string()],
+            working_dir: None,
+            environment: Vec::new(),
+            input: String::new(),
+        },
+        |_| Ok(()),
+    )
+    .await
+    .with_context(|| format!("failed to inspect OCI image '{}'", image))?;
+
+    Ok(output.success())
 }
 
 fn build_oci_process_invocation(

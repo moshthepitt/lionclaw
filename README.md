@@ -234,17 +234,22 @@ the sidecar holds the discovered host bearer token and swaps it onto
 `api.openai.com/v1` or `chatgpt.com/backend-api/codex`, depending on how Codex
 is authenticated locally. The raw host auth is not mounted into the runtime
 container, and the pod is created with its own private network namespace
-rather than host loopback access. If Codex is not logged in yet, sign in once
-locally with `codex login` and rerun LionClaw.
+rather than host loopback access. The runtime container uses the configured
+runtime image, while the HAProxy sidecar runs from a LionClaw-managed pinned
+official image that LionClaw preflights and pulls automatically when it is
+missing. If Codex is not logged in yet, sign in once locally with
+`codex login` and rerun LionClaw.
 
 `lionclaw runtime add` configures the runtime command that runs inside the
 runtime image, plus the concrete host `podman` executable and image LionClaw
 uses to launch it. The shared runtime image definition lives at
-`containers/runtime/Containerfile` and currently installs both `codex` and
-`opencode`. LionClaw runtime compatibility keys assume the configured image
-reference is treated as immutable; when the runtime bits change, rebuild under a
-new image tag. Execution policy remains config-owned in LionClaw state, not
-ambient shell state.
+`containers/runtime/Containerfile` and currently installs `codex` and
+`opencode`. Confined Codex turns also depend on a pinned HAProxy sidecar image
+owned by LionClaw itself rather than user config. LionClaw runtime
+compatibility keys assume the configured runtime image reference is treated as
+immutable; when the runtime bits change, rebuild under a new image tag.
+Execution policy remains config-owned in LionClaw state, not ambient shell
+state.
 
 `lionclaw service up` persists the project root you launch it from so the
 background daemon, session reuse, and confined runtimes keep operating on that

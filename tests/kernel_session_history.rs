@@ -1,4 +1,5 @@
 use std::{
+    os::unix::fs::PermissionsExt,
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -1018,7 +1019,7 @@ async fn runtime_profile_change_invalidates_resumable_state() {
             workspace_name: Some("main".to_string()),
             runtime_execution_profiles: [(
                 "resumable".to_string(),
-                test_runtime_profile("runtime-v1"),
+                test_runtime_profile(&env, "runtime-v1"),
             )]
             .into_iter()
             .collect(),
@@ -1070,7 +1071,7 @@ async fn runtime_profile_change_invalidates_resumable_state() {
             workspace_name: Some("main".to_string()),
             runtime_execution_profiles: [(
                 "resumable".to_string(),
-                test_runtime_profile("runtime-v2"),
+                test_runtime_profile(&env, "runtime-v2"),
             )]
             .into_iter()
             .collect(),
@@ -1550,9 +1551,13 @@ struct TestEnv {
     temp_dir: TempDir,
 }
 
-fn test_runtime_profile(compatibility_key: &str) -> RuntimeExecutionProfile {
+fn test_runtime_profile(env: &TestEnv, compatibility_key: &str) -> RuntimeExecutionProfile {
     RuntimeExecutionProfile {
-        confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
+        confinement: ConfinementConfig::Oci(OciConfinementConfig {
+            engine: env.fake_podman_path().display().to_string(),
+            image: Some("ghcr.io/lionclaw/test-resumable-runtime:latest".to_string()),
+            ..OciConfinementConfig::default()
+        }),
         compatibility_key: compatibility_key.to_string(),
         required_runtime_auth: None,
     }
@@ -1571,6 +1576,16 @@ impl TestEnv {
 
     fn db_path(&self) -> PathBuf {
         self.path().join("lionclaw.db")
+    }
+
+    fn fake_podman_path(&self) -> PathBuf {
+        let path = self.path().join("podman");
+        if !path.exists() {
+            std::fs::write(&path, "#!/usr/bin/env bash\nexit 0\n").expect("write fake podman");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake podman");
+        }
+        path
     }
 }
 

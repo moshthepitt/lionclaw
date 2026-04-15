@@ -24,15 +24,16 @@ pub use adapters::{
 pub use builtins::{register_builtin_runtime_adapters, BUILTIN_RUNTIME_MOCK};
 pub use codex_host_auth::{resolve_codex_host_auth, CodexHostAuth, CodexHostAuthMode};
 pub use execution::{
-    ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionBackend,
-    ExecutionLimits, ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
-    ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, MountAccess, MountSpec, NetworkMode,
-    OciConfinementConfig, OciExecutionBackend, RuntimeAuthKind, RuntimeExecutionProfile,
-    RuntimeProgramSpec, RuntimeSecretsMount, WorkspaceAccess, BUILTIN_PRESET_EVERYDAY,
+    validate_oci_launch_prerequisites, ConfinementBackend, ConfinementConfig,
+    EffectiveExecutionPlan, EscapeClass, ExecutionBackend, ExecutionLimits, ExecutionOutput,
+    ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
+    ExecutionPreset, ExecutionRequest, MountAccess, MountSpec, NetworkMode, OciConfinementConfig,
+    OciExecutionBackend, RuntimeAuthKind, RuntimeExecutionProfile, RuntimeProgramSpec,
+    RuntimeSecretsMount, WorkspaceAccess, BUILTIN_PRESET_EVERYDAY,
     BUILTIN_PRESET_HIDDEN_COMPACTION,
 };
 
-pub async fn validate_runtime_auth_prerequisites(
+async fn validate_runtime_auth_prerequisites(
     runtime_id: &str,
     required_auth: Option<RuntimeAuthKind>,
     codex_home_override: Option<&Path>,
@@ -52,6 +53,21 @@ pub async fn validate_runtime_auth_prerequisites(
                     err
                 )
             }),
+    }
+}
+
+pub async fn validate_runtime_launch_prerequisites(
+    runtime_id: &str,
+    confinement: &ConfinementConfig,
+    required_auth: Option<RuntimeAuthKind>,
+    codex_home_override: Option<&Path>,
+) -> Result<()> {
+    validate_runtime_auth_prerequisites(runtime_id, required_auth, codex_home_override).await?;
+
+    match confinement {
+        ConfinementConfig::Oci(config) => {
+            validate_oci_launch_prerequisites(runtime_id, config, required_auth).await
+        }
     }
 }
 

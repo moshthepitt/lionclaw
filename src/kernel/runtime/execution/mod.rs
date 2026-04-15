@@ -10,10 +10,11 @@ pub mod plan;
 pub mod planner;
 pub(crate) mod process;
 
+pub(crate) use auth_sidecar::codex_auth_sidecar_image_ref;
 pub use backend::{
     execute_streaming, ExecutionBackend, ExecutionOutput, ExecutionRequest, RuntimeSecretsMount,
 };
-pub use oci::OciExecutionBackend;
+pub use oci::{validate_oci_launch_prerequisites, OciExecutionBackend};
 pub use plan::{
     ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionLimits,
     ExecutionPreset, MountAccess, MountSpec, NetworkMode, OciConfinementConfig, RuntimeAuthKind,

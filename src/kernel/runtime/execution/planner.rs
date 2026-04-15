@@ -239,6 +239,10 @@ impl ExecutionPlanner {
             .and_then(|profile| profile.required_runtime_auth)
     }
 
+    pub fn runtime_profile(&self, runtime_id: &str) -> Option<&RuntimeExecutionProfile> {
+        self.runtimes.get(runtime_id)
+    }
+
     fn build_mounts(
         &self,
         session_id: Option<Uuid>,

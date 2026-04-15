@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    os::unix::fs::PermissionsExt,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -1183,13 +1184,22 @@ async fn kernel_with_counting_codex_runtime(
     home: &LionClawHome,
     turn_calls: Arc<AtomicUsize>,
 ) -> Kernel {
+    let fake_podman = env.temp_dir.path().join("podman");
+    std::fs::write(&fake_podman, "#!/usr/bin/env bash\nexit 0\n").expect("write fake podman");
+    std::fs::set_permissions(&fake_podman, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake podman");
+
     let kernel = Kernel::new_with_options(
         &env.db_path(),
         KernelOptions {
             runtime_execution_profiles: BTreeMap::from([(
                 "codex".to_string(),
                 RuntimeExecutionProfile {
-                    confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
+                    confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                        engine: fake_podman.display().to_string(),
+                        image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                        ..OciConfinementConfig::default()
+                    }),
                     compatibility_key: "codex-auth".to_string(),
                     required_runtime_auth: Some(lionclaw::kernel::runtime::RuntimeAuthKind::Codex),
                 },
