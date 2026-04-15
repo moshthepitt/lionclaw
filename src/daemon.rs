@@ -35,7 +35,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .default_runtime_id
         .clone()
         .or_else(|| operator_config.defaults.runtime.clone());
-    let runtime_context = resolve_runtime_execution_context(&config.home, &operator_config).await?;
+    let runtime_context = resolve_runtime_execution_context(
+        &config.home,
+        &operator_config,
+        default_runtime_id.as_deref(),
+    )
+    .await?;
     let config_fingerprint = runtime_context.daemon_config_fingerprint.clone();
 
     let kernel = Arc::new(

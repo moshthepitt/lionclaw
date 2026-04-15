@@ -991,6 +991,66 @@ echo '{"type":"response.output_text.delta","text":"hello from opencode"}'
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn run_local_ignores_unselected_runtime_image_probe_failures() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let healthy_dir = temp_dir.path().join("healthy-runtime");
+        fs::create_dir_all(&healthy_dir).expect("healthy runtime dir");
+        let opencode_stub = healthy_dir.join("opencode-stub.sh");
+        write_script(
+            &opencode_stub,
+            r#"#!/usr/bin/env bash
+cat >/dev/null
+echo '{"type":"response.output_text.delta","text":"hello from opencode"}'
+"#,
+        );
+        let broken_podman = temp_dir.path().join("podman");
+        write_script(
+            &broken_podman,
+            r#"#!/usr/bin/env bash
+if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
+  echo "storage denied" >&2
+  exit 1
+fi
+exit 0
+"#,
+        );
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "codex".to_string(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: broken_podman.to_string_lossy().to_string(),
+                    image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+        config.upsert_runtime(
+            "opencode".to_string(),
+            stubbed_opencode_runtime(&opencode_stub),
+        );
+        config
+            .set_default_runtime("opencode")
+            .expect("set default runtime");
+        config.save(&home).await.expect("save config");
+
+        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut output = Vec::new();
+        run_local_with_io(&home, None, false, &mut input, &mut output)
+            .await
+            .expect("run local");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("runtime: opencode"));
+        assert!(output.contains("lionclaw> hello from opencode"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn run_local_streams_opencode_reasoning_and_answer_lanes() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));

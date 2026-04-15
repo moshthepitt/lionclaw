@@ -265,7 +265,8 @@ pub async fn up<M: ServiceManager>(
     binaries: &StackBinaryPaths,
 ) -> Result<ApplyResult> {
     let config = OperatorConfig::load(home).await?;
-    let runtime_context = resolve_runtime_execution_context(home, &config).await?;
+    let runtime_context =
+        resolve_runtime_execution_context(home, &config, Some(runtime_id)).await?;
     let home_id = home.ensure_home_id().await?;
     let project_root =
         resolve_project_workspace_root().context("failed to resolve project workspace root")?;
@@ -758,7 +759,8 @@ async fn open_kernel_with_project_root(
     project_workspace_root: Option<PathBuf>,
 ) -> Result<Kernel> {
     let workspace_root = config.workspace_root(home);
-    let runtime_context = resolve_runtime_execution_context(home, config).await?;
+    let runtime_context =
+        resolve_runtime_execution_context(home, config, default_runtime_id.as_deref()).await?;
     let kernel = Kernel::new_with_options(
         &home.db_path(),
         KernelOptions {
@@ -797,8 +799,8 @@ mod tests {
 
     use super::{
         apply, onboard, open_kernel, open_kernel_with_project_root, render_marker_file,
-        render_runtime_cache, resolve_worker_entrypoint, up, ApplyResult, OnboardBindSelection,
-        StackBinaryPaths,
+        render_runtime_cache, resolve_worker_entrypoint, status, up, ApplyResult,
+        OnboardBindSelection, StackBinaryPaths,
     };
     use crate::{
         config::resolve_project_workspace_root,
@@ -837,7 +839,7 @@ mod tests {
 
     async fn current_daemon_config_fingerprint(home: &LionClawHome) -> String {
         let config = OperatorConfig::load(home).await.expect("load config");
-        resolve_runtime_execution_context(home, &config)
+        resolve_runtime_execution_context(home, &config, config.defaults.runtime.as_deref())
             .await
             .expect("resolve runtime context")
             .daemon_config_fingerprint
@@ -1547,5 +1549,73 @@ mod tests {
             .await
             .expect_err("unknown listener should fail");
         assert!(err.to_string().contains("non-LionClaw listener"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn status_ignores_unselected_runtime_image_probe_failures() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+
+        let broken_podman = temp_dir.path().join("podman");
+        fs::write(
+            &broken_podman,
+            "#!/usr/bin/env bash\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"inspect\" ]; then\n  echo 'storage denied' >&2\n  exit 1\nfi\nexit 0\n",
+        )
+        .expect("write broken podman");
+        fs::set_permissions(&broken_podman, fs::Permissions::from_mode(0o755))
+            .expect("chmod broken podman");
+
+        let healthy_runtime = temp_dir.path().join("opencode-stub.sh");
+        fs::write(&healthy_runtime, "#!/usr/bin/env bash\ncat >/dev/null\n")
+            .expect("write runtime stub");
+        fs::set_permissions(&healthy_runtime, fs::Permissions::from_mode(0o755))
+            .expect("chmod runtime stub");
+
+        let mut config = OperatorConfig::load(&home).await.expect("load config");
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "codex".to_string(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: broken_podman.to_string_lossy().to_string(),
+                    image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+        config.upsert_runtime(
+            "opencode".to_string(),
+            RuntimeProfileConfig::OpenCode {
+                executable: healthy_runtime.to_string_lossy().to_string(),
+                model: None,
+                agent: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: ensure_fake_podman(&healthy_runtime)
+                        .to_string_lossy()
+                        .to_string(),
+                    image: Some("ghcr.io/lionclaw/test-opencode-runtime:latest".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+        config
+            .set_default_runtime("opencode")
+            .expect("set default runtime");
+        config.save(&home).await.expect("save config");
+        OperatorLockfile::default()
+            .save(&home)
+            .await
+            .expect("save lockfile");
+
+        let manager = FakeServiceManager::default();
+        let stack = status(&home, &manager).await.expect("status");
+
+        assert_eq!(stack.daemon_status, "not-found");
+        assert!(stack.channels.is_empty());
     }
 }

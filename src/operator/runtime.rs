@@ -71,18 +71,23 @@ pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConf
 pub async fn resolve_runtime_execution_context(
     home: &LionClawHome,
     config: &OperatorConfig,
+    selected_runtime_id: Option<&str>,
 ) -> Result<ResolvedRuntimeExecutionContext> {
     let codex_home_override = operator_codex_home_override(home)?;
-    let runtime_image_identities = resolve_runtime_image_identities(config).await?;
+    let runtime_image_identities =
+        resolve_runtime_image_identities(config, selected_runtime_id).await?;
     let execution_profiles = config
         .runtimes
         .iter()
         .map(|(id, runtime)| {
-            let image_identity = runtime_image_identities.get(id).map(String::as_str);
-            (
-                id.clone(),
-                runtime.execution_profile_with_image_identity(image_identity),
-            )
+            let profile = if selected_runtime_id == Some(id.as_str()) {
+                runtime.execution_profile_with_image_identity(
+                    runtime_image_identities.get(id).map(String::as_str),
+                )
+            } else {
+                runtime.execution_profile()
+            };
+            (id.clone(), profile)
         })
         .collect();
     let daemon_config_fingerprint = daemon_compat_fingerprint_with_runtime_context(
@@ -157,25 +162,29 @@ pub(crate) fn operator_codex_home_override(home: &LionClawHome) -> Result<Option
 
 async fn resolve_runtime_image_identities(
     config: &OperatorConfig,
+    selected_runtime_id: Option<&str>,
 ) -> Result<BTreeMap<String, String>> {
     let mut identities = BTreeMap::new();
-
-    for (runtime_id, runtime) in &config.runtimes {
-        let crate::kernel::runtime::ConfinementConfig::Oci(oci) = runtime.confinement();
-        let Some(image) = oci.image.as_deref() else {
-            continue;
-        };
-        let identity = resolve_oci_image_compatibility_identity(&oci.engine, image)
-            .await
-            .map_err(|err| {
-                anyhow!(
-                    "failed to resolve local OCI image identity for runtime '{}': {}",
-                    runtime_id,
-                    err
-                )
-            })?;
-        identities.insert(runtime_id.clone(), identity);
-    }
+    let Some(selected_runtime_id) = selected_runtime_id else {
+        return Ok(identities);
+    };
+    let Some(runtime) = config.runtime(selected_runtime_id) else {
+        return Ok(identities);
+    };
+    let crate::kernel::runtime::ConfinementConfig::Oci(oci) = runtime.confinement();
+    let Some(image) = oci.image.as_deref() else {
+        return Ok(identities);
+    };
+    let identity = resolve_oci_image_compatibility_identity(&oci.engine, image)
+        .await
+        .map_err(|err| {
+            anyhow!(
+                "failed to resolve local OCI image identity for runtime '{}': {}",
+                selected_runtime_id,
+                err
+            )
+        })?;
+    identities.insert(selected_runtime_id.to_string(), identity);
 
     Ok(identities)
 }
@@ -527,7 +536,7 @@ mod tests {
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine));
 
-        let left = resolve_runtime_execution_context(&home, &config)
+        let left = resolve_runtime_execution_context(&home, &config, Some("codex"))
             .await
             .expect("resolve left context");
 
@@ -536,7 +545,7 @@ mod tests {
         );
         config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine));
 
-        let right = resolve_runtime_execution_context(&home, &config)
+        let right = resolve_runtime_execution_context(&home, &config, Some("codex"))
             .await
             .expect("resolve right context");
 
