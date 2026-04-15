@@ -25,10 +25,11 @@ const UPSTREAM_BEARER_TOKEN_ENV: &str = "LIONCLAW_CODEX_UPSTREAM_BEARER_TOKEN";
 const CODEX_PROXY_TOKEN_ENV: &str = "LIONCLAW_CODEX_OPENAI_PROXY_TOKEN";
 const CODEX_PROXY_PORT: u16 = 38080;
 const HAPROXY_IMAGE: &str = "docker.io/library/haproxy:3.3.5-alpine";
-const SIDECAR_STATE_CONTAINER_DIR: &str = "/lionclaw-auth-sidecar";
+const SIDECAR_CONFIG_CONTAINER_DIR: &str = "/usr/local/etc/haproxy";
+const SIDECAR_RUN_CONTAINER_DIR: &str = "/var/lib/haproxy";
 const HAPROXY_CONFIG_FILE_NAME: &str = "haproxy.cfg";
 const HAPROXY_ADMIN_SOCKET_FILE_NAME: &str = "admin.sock";
-const HAPROXY_ADMIN_SOCKET_CONTAINER_PATH: &str = "/lionclaw-auth-sidecar/admin.sock";
+const HAPROXY_ADMIN_SOCKET_CONTAINER_PATH: &str = "/var/lib/haproxy/admin.sock";
 const CODEX_CONFIG_RELATIVE_PATH: &str = "home/.codex/config.toml";
 const SIDECAR_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SIDECAR_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -47,21 +48,36 @@ struct SidecarStateDir {
 
 impl SidecarStateDir {
     fn new() -> Result<Self> {
-        Ok(Self {
-            temp_dir: tempfile::tempdir().context("failed to create auth sidecar temp dir")?,
-        })
+        let temp_dir = tempfile::tempdir().context("failed to create auth sidecar temp dir")?;
+        let config_dir = temp_dir.path().join("config");
+        std::fs::create_dir(&config_dir)
+            .with_context(|| format!("failed to create {}", config_dir.display()))?;
+        let run_dir = temp_dir.path().join("run");
+        std::fs::create_dir(&run_dir)
+            .with_context(|| format!("failed to create {}", run_dir.display()))?;
+        set_sidecar_config_dir_permissions(&config_dir)?;
+        set_sidecar_run_dir_permissions(&run_dir)?;
+        Ok(Self { temp_dir })
     }
 
     fn root(&self) -> &Path {
         self.temp_dir.path()
     }
 
+    fn config_dir(&self) -> PathBuf {
+        self.root().join("config")
+    }
+
+    fn run_dir(&self) -> PathBuf {
+        self.root().join("run")
+    }
+
     fn config_path(&self) -> PathBuf {
-        self.root().join(HAPROXY_CONFIG_FILE_NAME)
+        self.config_dir().join(HAPROXY_CONFIG_FILE_NAME)
     }
 
     fn admin_socket_path(&self) -> PathBuf {
-        self.root().join(HAPROXY_ADMIN_SOCKET_FILE_NAME)
+        self.run_dir().join(HAPROXY_ADMIN_SOCKET_FILE_NAME)
     }
 }
 
@@ -158,7 +174,7 @@ async fn start_codex_sidecar(request: &ExecutionRequest) -> Result<OciRuntimeAut
         &engine,
         &pod_name,
         &proxy_name,
-        sidecar_state.root(),
+        &sidecar_state,
         host_auth.bearer_token(),
     )?;
 
@@ -230,7 +246,7 @@ fn build_sidecar_run_invocation(
     engine: &str,
     pod_name: &str,
     proxy_name: &str,
-    sidecar_state_root: &Path,
+    sidecar_state: &SidecarStateDir,
     upstream_bearer_token: &str,
 ) -> Result<ProcessInvocation> {
     Ok(ProcessInvocation {
@@ -245,7 +261,13 @@ fn build_sidecar_run_invocation(
             "--env".to_string(),
             UPSTREAM_BEARER_TOKEN_ENV.to_string(),
             "--volume".to_string(),
-            bind_mount_arg(sidecar_state_root, SIDECAR_STATE_CONTAINER_DIR, false)?,
+            bind_mount_arg(
+                &sidecar_state.config_dir(),
+                SIDECAR_CONFIG_CONTAINER_DIR,
+                true,
+            )?,
+            "--volume".to_string(),
+            bind_mount_arg(&sidecar_state.run_dir(), SIDECAR_RUN_CONTAINER_DIR, false)?,
             HAPROXY_IMAGE.to_string(),
         ],
         working_dir: None,
@@ -355,6 +377,7 @@ fn write_haproxy_config(
     );
     std::fs::write(sidecar_state.config_path(), contents)
         .with_context(|| format!("failed to write {}", sidecar_state.config_path().display()))?;
+    set_sidecar_config_file_permissions(&sidecar_state.config_path())?;
     Ok(())
 }
 
@@ -377,6 +400,42 @@ fn bind_mount_arg(source: &Path, target: &str, read_only: bool) -> Result<String
 
     let access = if read_only { "ro" } else { "rw" };
     Ok(format!("{source}:{target}:{access}"))
+}
+
+#[cfg(unix)]
+fn set_sidecar_config_dir_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).map_err(Into::into)
+}
+
+#[cfg(not(unix))]
+fn set_sidecar_config_dir_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_sidecar_config_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).map_err(Into::into)
+}
+
+#[cfg(not(unix))]
+fn set_sidecar_config_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_sidecar_run_dir_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o1777)).map_err(Into::into)
+}
+
+#[cfg(not(unix))]
+fn set_sidecar_run_dir_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -460,12 +519,22 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_run_invocation_mounts_only_sidecar_state_and_real_token() {
+    fn sidecar_run_invocation_mounts_default_config_dir_and_writable_run_dir() {
+        let sidecar_state = SidecarStateDir::new().expect("sidecar state");
+        let config_mount = bind_mount_arg(
+            &sidecar_state.config_dir(),
+            SIDECAR_CONFIG_CONTAINER_DIR,
+            true,
+        )
+        .expect("config mount");
+        let run_mount = bind_mount_arg(&sidecar_state.run_dir(), SIDECAR_RUN_CONTAINER_DIR, false)
+            .expect("run mount");
+
         let invocation = build_sidecar_run_invocation(
             "podman",
             "lionclaw-pod",
             "lionclaw-proxy",
-            Path::new("/tmp/lionclaw-auth-sidecar"),
+            &sidecar_state,
             "auth-real",
         )
         .expect("invocation");
@@ -489,12 +558,14 @@ mod tests {
                 "auth-real".to_string()
             )]
         );
-        assert!(invocation.args.windows(2).any(|pair| {
-            pair == [
-                "--volume".to_string(),
-                "/tmp/lionclaw-auth-sidecar:/lionclaw-auth-sidecar:rw".to_string(),
-            ]
-        }));
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--volume".to_string(), config_mount.clone()]));
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--volume".to_string(), run_mount.clone()]));
         assert_eq!(
             invocation.args.last().map(String::as_str),
             Some(HAPROXY_IMAGE)
@@ -503,16 +574,36 @@ mod tests {
 
     #[test]
     fn sidecar_run_invocation_rejects_colon_mount_sources() {
-        let err = build_sidecar_run_invocation(
-            "podman",
-            "lionclaw-pod",
-            "lionclaw-proxy",
+        let err = bind_mount_arg(
             Path::new("/tmp/lionclaw:auth-sidecar"),
-            "auth-real",
+            SIDECAR_RUN_CONTAINER_DIR,
+            false,
         )
         .expect_err("colon mount source should be rejected");
 
         assert!(err.to_string().contains("contains ':'"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_state_dir_uses_readable_config_and_writable_run_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let sidecar_state = SidecarStateDir::new().expect("sidecar state");
+
+        let config_mode = std::fs::metadata(sidecar_state.config_dir())
+            .expect("config metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        let run_mode = std::fs::metadata(sidecar_state.run_dir())
+            .expect("run metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+
+        assert_eq!(config_mode, 0o755);
+        assert_eq!(run_mode, 0o1777);
     }
 
     #[tokio::test]
@@ -556,6 +647,17 @@ mod tests {
         assert!(haproxy_config.contains("%[env(LIONCLAW_CODEX_UPSTREAM_BEARER_TOKEN)]"));
         assert!(haproxy_config.contains(HAPROXY_ADMIN_SOCKET_CONTAINER_PATH));
         assert!(!haproxy_config.contains("sk-real"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let config_mode = std::fs::metadata(sidecar_state.config_path())
+                .expect("config metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(config_mode, 0o644);
+        }
     }
 
     #[tokio::test]

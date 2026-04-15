@@ -1170,7 +1170,7 @@ case "${command_name}" in
     exit 0
     ;;
   run)
-    sidecar_state_dir=""
+    sidecar_run_dir=""
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --rm|--interactive|--read-only|--detach)
@@ -1181,8 +1181,8 @@ case "${command_name}" in
           ;;
         --volume)
           case "$2" in
-            *:/lionclaw-auth-sidecar:rw)
-              sidecar_state_dir="${2%%:*}"
+            *:/var/lib/haproxy:rw)
+              sidecar_run_dir="${2%%:*}"
               ;;
           esac
           shift 2
@@ -1200,8 +1200,8 @@ case "${command_name}" in
           ;;
       esac
     done
-    if [ "$#" -eq 0 ] && [ -n "$sidecar_state_dir" ]; then
-      setsid python3 -c 'import os, pathlib, socket, sys; state_dir = sys.argv[1]; socket_path = os.path.join(state_dir, "admin.sock"); pathlib.Path(socket_path).unlink(missing_ok=True); server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); server.bind(socket_path); server.listen(1); conn, _ = server.accept(); conn.recv(1024); conn.sendall(b"Name: fake-haproxy\n"); conn.close(); server.close()' "$sidecar_state_dir" >/dev/null 2>&1 < /dev/null &
+    if [ "$#" -eq 0 ] && [ -n "$sidecar_run_dir" ]; then
+      setsid python3 -c 'import os, pathlib, socket, sys; run_dir = sys.argv[1]; socket_path = os.path.join(run_dir, "admin.sock"); pathlib.Path(socket_path).unlink(missing_ok=True); server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); server.bind(socket_path); server.listen(1); conn, _ = server.accept(); conn.recv(1024); conn.sendall(b"Name: fake-haproxy\n"); conn.close(); server.close()' "$sidecar_run_dir" >/dev/null 2>&1 < /dev/null &
       exit 0
     fi
     if [ "$#" -eq 1 ]; then
