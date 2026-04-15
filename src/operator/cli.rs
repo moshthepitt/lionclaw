@@ -29,7 +29,10 @@ use crate::{
             resolve_stack_binaries, status, up, OnboardBindSelection,
         },
         run::run_local,
-        runtime::{resolve_runtime_id, validate_runtime_launch_prerequisites},
+        runtime::{
+            resolve_runtime_id, validate_runtime_availability,
+            validate_runtime_launch_prerequisites,
+        },
         services::SystemdUserServiceManager,
     },
 };
@@ -387,7 +390,7 @@ pub async fn run() -> Result<()> {
                 let profile = build_runtime_profile(&args, executable)?;
                 let mut config = OperatorConfig::load(&home).await?;
                 config.upsert_runtime(args.id.clone(), profile);
-                validate_runtime_launch_prerequisites(&home, &config, &args.id).await?;
+                validate_runtime_availability(&config, &args.id)?;
                 config.save(&home).await?;
                 println!("configured runtime {}", args.id);
             }

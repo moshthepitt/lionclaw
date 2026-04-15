@@ -107,6 +107,53 @@ pub async fn validate_oci_launch_prerequisites(
     Ok(())
 }
 
+pub async fn resolve_oci_image_compatibility_identity(engine: &str, image: &str) -> Result<String> {
+    let output = run_oci_preflight_command(
+        &ProcessInvocation {
+            executable: engine.to_string(),
+            args: vec![
+                "image".to_string(),
+                "inspect".to_string(),
+                "--format".to_string(),
+                "{{.Id}}".to_string(),
+                image.to_string(),
+            ],
+            working_dir: None,
+            environment: Vec::new(),
+            input: String::new(),
+        },
+        &format!("resolve OCI image identity for '{}'", image),
+        OCI_IMAGE_PROBE_TIMEOUT,
+    )
+    .await?;
+
+    if !output.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            bail!(
+                "failed to resolve OCI image identity for '{}'; OCI engine exited with code {:?}",
+                image,
+                output.exit_code
+            );
+        }
+        bail!(
+            "failed to resolve OCI image identity for '{}': {}",
+            image,
+            stderr
+        );
+    }
+
+    let identity = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if identity.is_empty() {
+        bail!(
+            "failed to resolve OCI image identity for '{}': empty OCI inspect output",
+            image
+        );
+    }
+
+    Ok(identity)
+}
+
 fn prepare_oci_process_launch(request: &ExecutionRequest) -> Result<PreparedOciProcessLaunch> {
     let config = request.plan.confinement.oci();
     let image = config.image.as_deref().ok_or_else(|| {

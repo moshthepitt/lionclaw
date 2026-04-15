@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 use crate::home::LionClawHome;
 use crate::kernel::{
     runtime::{
+        resolve_oci_image_compatibility_identity,
         validate_runtime_launch_prerequisites as validate_kernel_runtime_launch_prerequisites,
         CodexRuntimeAdapter, CodexRuntimeConfig, OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig,
         RuntimeExecutionProfile,
@@ -13,7 +14,16 @@ use crate::kernel::{
     Kernel,
 };
 
-use super::config::{OperatorConfig, RuntimeProfileConfig};
+use super::config::{
+    daemon_compat_fingerprint_with_runtime_context, OperatorConfig, RuntimeProfileConfig,
+};
+
+#[derive(Debug, Clone)]
+pub struct ResolvedRuntimeExecutionContext {
+    pub codex_home_override: Option<PathBuf>,
+    pub daemon_config_fingerprint: String,
+    pub execution_profiles: BTreeMap<String, RuntimeExecutionProfile>,
+}
 
 pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConfig) -> Result<()> {
     validate_configured_runtimes(config)?;
@@ -58,14 +68,34 @@ pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConf
     Ok(())
 }
 
-pub fn configured_runtime_execution_profiles(
+pub async fn resolve_runtime_execution_context(
+    home: &LionClawHome,
     config: &OperatorConfig,
-) -> BTreeMap<String, RuntimeExecutionProfile> {
-    config
+) -> Result<ResolvedRuntimeExecutionContext> {
+    let codex_home_override = operator_codex_home_override(home)?;
+    let runtime_image_identities = resolve_runtime_image_identities(config).await?;
+    let execution_profiles = config
         .runtimes
         .iter()
-        .map(|(id, runtime)| (id.clone(), runtime.execution_profile()))
-        .collect()
+        .map(|(id, runtime)| {
+            let image_identity = runtime_image_identities.get(id).map(String::as_str);
+            (
+                id.clone(),
+                runtime.execution_profile_with_image_identity(image_identity),
+            )
+        })
+        .collect();
+    let daemon_config_fingerprint = daemon_compat_fingerprint_with_runtime_context(
+        config,
+        codex_home_override.as_deref(),
+        &runtime_image_identities,
+    );
+
+    Ok(ResolvedRuntimeExecutionContext {
+        codex_home_override,
+        daemon_config_fingerprint,
+        execution_profiles,
+    })
 }
 
 pub fn resolve_runtime_id(config: &OperatorConfig, requested: Option<&str>) -> Result<String> {
@@ -103,25 +133,51 @@ pub async fn validate_runtime_launch_prerequisites(
     let profile = config
         .runtime(runtime_id)
         .ok_or_else(|| anyhow!("runtime profile '{}' is not configured", runtime_id))?;
+    let codex_home_override = operator_codex_home_override(home)?;
     validate_kernel_runtime_launch_prerequisites(
         runtime_id,
         profile.confinement(),
         profile.required_runtime_auth(),
-        operator_codex_home_override(home).as_deref(),
+        codex_home_override.as_deref(),
     )
     .await
 }
 
-pub(crate) fn operator_codex_home_override(home: &LionClawHome) -> Option<PathBuf> {
+pub(crate) fn operator_codex_home_override(home: &LionClawHome) -> Result<Option<PathBuf>> {
     #[cfg(test)]
     {
-        Some(home.root().join(".codex"))
+        Ok(Some(home.root().join(".codex")))
     }
     #[cfg(not(test))]
     {
         let _ = home;
-        None
+        crate::config::resolve_optional_env_override_path("CODEX_HOME").map_err(Into::into)
     }
+}
+
+async fn resolve_runtime_image_identities(
+    config: &OperatorConfig,
+) -> Result<BTreeMap<String, String>> {
+    let mut identities = BTreeMap::new();
+
+    for (runtime_id, runtime) in &config.runtimes {
+        let crate::kernel::runtime::ConfinementConfig::Oci(oci) = runtime.confinement();
+        let Some(image) = oci.image.as_deref() else {
+            continue;
+        };
+        let identity = resolve_oci_image_compatibility_identity(&oci.engine, image)
+            .await
+            .map_err(|err| {
+                anyhow!(
+                    "failed to resolve local OCI image identity for runtime '{}': {}",
+                    runtime_id,
+                    err
+                )
+            })?;
+        identities.insert(runtime_id.clone(), identity);
+    }
+
+    Ok(identities)
 }
 
 #[cfg(test)]
@@ -131,8 +187,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        validate_configured_runtimes, validate_runtime_availability,
-        validate_runtime_launch_prerequisites,
+        resolve_runtime_execution_context, validate_configured_runtimes,
+        validate_runtime_availability, validate_runtime_launch_prerequisites,
     };
     use crate::home::LionClawHome;
     use crate::kernel::runtime::{ConfinementConfig, OciConfinementConfig};
@@ -151,7 +207,9 @@ mod tests {
 
     #[cfg(unix)]
     fn fake_podman() -> (tempfile::TempDir, String) {
-        fake_podman_with_body("#!/usr/bin/env bash\n")
+        fake_podman_with_body(
+            "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"inspect\" ]; then\n  printf 'sha256:test-runtime-image\\n'\n  exit 0\nfi\nexit 0\n",
+        )
     }
 
     #[cfg(unix)]
@@ -455,5 +513,40 @@ mod tests {
         assert!(err.to_string().contains(
             "failed to inspect OCI image 'ghcr.io/lionclaw/codex-runtime:latest': storage denied"
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_execution_context_changes_when_local_image_identity_changes() {
+        let (_podman_dir, engine) = fake_podman_with_body(
+            "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"inspect\" ]; then\n  printf 'sha256:runtime-a\\n'\n  exit 0\nfi\nexit 0\n",
+        );
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine));
+
+        let left = resolve_runtime_execution_context(&home, &config)
+            .await
+            .expect("resolve left context");
+
+        let (_podman_dir, engine) = fake_podman_with_body(
+            "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"inspect\" ]; then\n  printf 'sha256:runtime-b\\n'\n  exit 0\nfi\nexit 0\n",
+        );
+        config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine));
+
+        let right = resolve_runtime_execution_context(&home, &config)
+            .await
+            .expect("resolve right context");
+
+        assert_ne!(
+            left.daemon_config_fingerprint,
+            right.daemon_config_fingerprint
+        );
+        assert_ne!(
+            left.execution_profiles["codex"].compatibility_key,
+            right.execution_profiles["codex"].compatibility_key
+        );
     }
 }

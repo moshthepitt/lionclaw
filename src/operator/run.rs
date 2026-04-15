@@ -1163,6 +1163,22 @@ command_name="${1:-}"
 shift || true
 
 case "${command_name}" in
+  image)
+    subcommand="${1:-}"
+    shift || true
+    case "${subcommand}" in
+      inspect)
+        printf 'sha256:test-runtime-image\n'
+        exit 0
+        ;;
+      exists)
+        exit 0
+        ;;
+      *)
+        exit 0
+        ;;
+    esac
+    ;;
   secret)
     exit 0
     ;;

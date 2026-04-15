@@ -12,7 +12,10 @@ pub(crate) mod runtime_auth;
 pub use backend::{
     execute_streaming, ExecutionBackend, ExecutionOutput, ExecutionRequest, RuntimeSecretsMount,
 };
-pub use oci::{validate_oci_launch_prerequisites, OciExecutionBackend};
+pub use oci::{
+    resolve_oci_image_compatibility_identity, validate_oci_launch_prerequisites,
+    OciExecutionBackend,
+};
 pub use plan::{
     ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionLimits,
     ExecutionPreset, MountAccess, MountSpec, NetworkMode, OciConfinementConfig, RuntimeAuthKind,

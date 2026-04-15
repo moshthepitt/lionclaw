@@ -55,7 +55,10 @@ podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .
 # 3. Initialize your local environment
 ./target/release/lionclaw onboard
 
-# 4. Attach a model and start executing
+# 4. Sign in to Codex once on the host
+codex login
+
+# 5. Attach a model and start executing
 ./target/release/lionclaw runtime add codex --kind codex --bin codex --image lionclaw-runtime:v1
 ./target/release/lionclaw run codex
 ```
@@ -240,15 +243,18 @@ into the container. If Codex is not logged in yet, sign in once locally with
 runtime image, plus the concrete host `podman` executable and image LionClaw
 uses to launch it. The shared runtime image definition lives at
 `containers/runtime/Containerfile` and currently installs `codex` and
-`opencode`. LionClaw runtime compatibility keys assume the configured runtime
-image reference is treated as immutable; when the runtime bits change, rebuild
-under a new image tag.
+`opencode`. `runtime add` validates the runtime profile itself, but the live
+host Codex login is only required when LionClaw actually launches Codex. Runtime
+compatibility keys include the resolved local OCI image identity, so rebuilding
+the same mutable tag creates a new compatibility boundary automatically.
 Execution policy remains config-owned in LionClaw state, not ambient shell
 state.
 
 `lionclaw service up` persists the project root you launch it from so the
 background daemon, session reuse, and confined runtimes keep operating on that
-same project.
+same project. If you launch `service up` with an explicit `CODEX_HOME`, LionClaw
+persists that override into the managed daemon environment so background jobs
+and channels keep using the same host Codex home you validated interactively.
 
 Daemon/service plumbing recognizes these env vars:
 

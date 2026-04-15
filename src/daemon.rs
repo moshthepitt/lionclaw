@@ -12,8 +12,8 @@ use crate::{
     home::runtime_project_partition_key,
     kernel::{Kernel, KernelOptions, RuntimeExecutionPolicy},
     operator::{
-        config::{daemon_compat_fingerprint, OperatorConfig},
-        runtime::{configured_runtime_execution_profiles, register_configured_runtimes},
+        config::OperatorConfig,
+        runtime::{register_configured_runtimes, resolve_runtime_execution_context},
     },
 };
 
@@ -31,11 +31,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| workspace_root.clone());
     let project_scope = runtime_project_partition_key(Some(project_workspace_root.as_path()));
-    let config_fingerprint = daemon_compat_fingerprint(&operator_config);
     let default_runtime_id = config
         .default_runtime_id
         .clone()
         .or_else(|| operator_config.defaults.runtime.clone());
+    let runtime_context = resolve_runtime_execution_context(&config.home, &operator_config).await?;
+    let config_fingerprint = runtime_context.daemon_config_fingerprint.clone();
 
     let kernel = Arc::new(
         Kernel::new_with_options(
@@ -53,9 +54,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 default_runtime_id,
                 default_preset_name: operator_config.defaults.preset.clone(),
                 execution_presets: operator_config.presets.clone(),
-                runtime_execution_profiles: configured_runtime_execution_profiles(&operator_config),
+                runtime_execution_profiles: runtime_context.execution_profiles,
                 runtime_secrets_home: Some(config.home.clone()),
-                codex_home_override: None,
+                codex_home_override: config.codex_home_override.clone(),
                 workspace_root: Some(workspace_root),
                 project_workspace_root: Some(project_workspace_root),
                 runtime_root: Some(config.home.runtime_dir()),

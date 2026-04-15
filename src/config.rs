@@ -15,6 +15,7 @@ pub struct Config {
     pub default_runtime_id: Option<String>,
     pub workspace_root: PathBuf,
     pub project_workspace_root: Option<PathBuf>,
+    pub codex_home_override: Option<PathBuf>,
 }
 
 impl Config {
@@ -59,6 +60,7 @@ impl Config {
             Some(path) => Some(canonicalize_project_workspace_root(path)?),
             None => resolve_project_workspace_root().ok(),
         };
+        let codex_home_override = resolve_optional_env_override_path("CODEX_HOME")?;
 
         Ok(Self {
             bind_addr,
@@ -69,8 +71,17 @@ impl Config {
             default_runtime_id,
             workspace_root,
             project_workspace_root,
+            codex_home_override,
         })
     }
+}
+
+pub fn resolve_optional_env_override_path(var: &str) -> std::io::Result<Option<PathBuf>> {
+    std::env::var_os(var)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(resolve_override_path)
+        .transpose()
 }
 
 pub fn resolve_project_workspace_root() -> std::io::Result<PathBuf> {
@@ -98,6 +109,20 @@ fn canonicalize_project_workspace_root(path: PathBuf) -> std::io::Result<PathBuf
     };
 
     resolved.canonicalize()
+}
+
+fn resolve_override_path(path: PathBuf) -> std::io::Result<PathBuf> {
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+
+    match resolved.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(resolved),
+        Err(err) => Err(err),
+    }
 }
 
 fn resolve_bind_addr(
@@ -137,8 +162,8 @@ fn join_host_port(host: &str, port: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonicalize_project_workspace_root, join_host_port, resolve_bind_addr, DEFAULT_BIND_HOST,
-        DEFAULT_BIND_PORT,
+        canonicalize_project_workspace_root, join_host_port, resolve_bind_addr,
+        resolve_optional_env_override_path, DEFAULT_BIND_HOST, DEFAULT_BIND_PORT,
     };
     use tempfile::tempdir;
 
@@ -188,5 +213,25 @@ mod tests {
             .expect("resolve absolute path");
 
         assert_eq!(resolved, project_root);
+    }
+
+    #[test]
+    fn resolve_optional_env_override_path_absolutizes_relative_values() {
+        let temp_dir = tempdir().expect("temp dir");
+        let project_root = temp_dir.path().join("project");
+        std::fs::create_dir_all(project_root.join(".codex")).expect("create codex home");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&project_root).expect("set cwd");
+        // SAFETY: tests in this module control this process env key.
+        unsafe { std::env::set_var("LIONCLAW_TEST_OVERRIDE_PATH", ".codex") };
+
+        let resolved = resolve_optional_env_override_path("LIONCLAW_TEST_OVERRIDE_PATH")
+            .expect("resolve env override");
+
+        // SAFETY: tests in this module control this process env key.
+        unsafe { std::env::remove_var("LIONCLAW_TEST_OVERRIDE_PATH") };
+        std::env::set_current_dir(original_dir).expect("restore cwd");
+
+        assert_eq!(resolved, Some(project_root.join(".codex")));
     }
 }

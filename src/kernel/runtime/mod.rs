@@ -24,12 +24,12 @@ pub use adapters::{
 pub use builtins::{register_builtin_runtime_adapters, BUILTIN_RUNTIME_MOCK};
 pub use codex_host_auth::{ensure_codex_host_auth_ready, sync_codex_home_into_runtime};
 pub use execution::{
-    validate_oci_launch_prerequisites, ConfinementBackend, ConfinementConfig,
-    EffectiveExecutionPlan, EscapeClass, ExecutionBackend, ExecutionLimits, ExecutionOutput,
-    ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
-    ExecutionPreset, ExecutionRequest, MountAccess, MountSpec, NetworkMode, OciConfinementConfig,
-    OciExecutionBackend, RuntimeAuthKind, RuntimeExecutionProfile, RuntimeProgramSpec,
-    RuntimeSecretsMount, WorkspaceAccess, BUILTIN_PRESET_EVERYDAY,
+    resolve_oci_image_compatibility_identity, validate_oci_launch_prerequisites,
+    ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionBackend,
+    ExecutionLimits, ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
+    ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, MountAccess, MountSpec, NetworkMode,
+    OciConfinementConfig, OciExecutionBackend, RuntimeAuthKind, RuntimeExecutionProfile,
+    RuntimeProgramSpec, RuntimeSecretsMount, WorkspaceAccess, BUILTIN_PRESET_EVERYDAY,
     BUILTIN_PRESET_HIDDEN_COMPACTION,
 };
 

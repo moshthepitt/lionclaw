@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{
     config::resolve_project_workspace_root,
@@ -10,18 +10,19 @@ use crate::{
     kernel::{Kernel, KernelOptions, RuntimeExecutionPolicy},
     operator::{
         config::{
-            daemon_compat_fingerprint, normalize_local_source, ChannelLaunchMode,
-            ManagedChannelConfig, ManagedSkillConfig, OperatorConfig,
+            normalize_local_source, ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig,
+            OperatorConfig,
         },
         daemon_probe::{classify_daemon, DaemonClassification},
         lockfile::{LockedChannel, LockedSkill, OperatorLockfile},
         runtime::{
-            configured_runtime_execution_profiles, operator_codex_home_override,
-            register_configured_runtimes, validate_runtime_launch_prerequisites,
+            register_configured_runtimes, resolve_runtime_execution_context,
+            validate_runtime_launch_prerequisites,
         },
         services::{
             channel_unit_name, render_channel_unit, render_daemon_unit, unit_status_is_active,
-            ChannelServiceSpec, ManagedServiceUnit, ServiceManager, DAEMON_UNIT_NAME,
+            ChannelServiceSpec, DaemonServiceSpec, ManagedServiceUnit, ServiceManager,
+            DAEMON_UNIT_NAME,
         },
         snapshot::{install_snapshot, InstalledSnapshot},
     },
@@ -264,11 +265,12 @@ pub async fn up<M: ServiceManager>(
     binaries: &StackBinaryPaths,
 ) -> Result<ApplyResult> {
     let config = OperatorConfig::load(home).await?;
+    let runtime_context = resolve_runtime_execution_context(home, &config).await?;
     let home_id = home.ensure_home_id().await?;
     let project_root =
         resolve_project_workspace_root().context("failed to resolve project workspace root")?;
     let project_scope = runtime_project_partition_key(Some(project_root.as_path()));
-    let expected_config_fingerprint = daemon_compat_fingerprint(&config);
+    let expected_config_fingerprint = runtime_context.daemon_config_fingerprint.clone();
     match classify_daemon(
         &config.daemon.bind,
         &home_id,
@@ -325,6 +327,8 @@ pub async fn up<M: ServiceManager>(
         &applied.lockfile,
         runtime_id,
         binaries,
+        &runtime_context.daemon_config_fingerprint,
+        runtime_context.codex_home_override.as_deref(),
     )?;
     let next_units = units
         .iter()
@@ -507,6 +511,8 @@ pub(crate) fn build_managed_units(
     lockfile: &OperatorLockfile,
     runtime_id: &str,
     binaries: &StackBinaryPaths,
+    config_fingerprint: &str,
+    codex_home_override: Option<&Path>,
 ) -> Result<Vec<ManagedServiceUnit>> {
     let mut units = Vec::new();
     let project_workspace_root = resolve_project_workspace_root()
@@ -514,11 +520,14 @@ pub(crate) fn build_managed_units(
     units.push(render_daemon_unit(
         home,
         &binaries.daemon_bin,
-        &config.daemon.bind,
-        runtime_id,
-        &config.daemon.workspace,
-        &project_workspace_root,
-        &daemon_compat_fingerprint(config),
+        DaemonServiceSpec {
+            bind_addr: &config.daemon.bind,
+            runtime_id,
+            workspace: &config.daemon.workspace,
+            project_workspace_root: &project_workspace_root,
+            config_fingerprint,
+            codex_home_override,
+        },
     ));
 
     let base_url = base_url_from_bind(&config.daemon.bind);
@@ -749,6 +758,7 @@ async fn open_kernel_with_project_root(
     project_workspace_root: Option<PathBuf>,
 ) -> Result<Kernel> {
     let workspace_root = config.workspace_root(home);
+    let runtime_context = resolve_runtime_execution_context(home, config).await?;
     let kernel = Kernel::new_with_options(
         &home.db_path(),
         KernelOptions {
@@ -759,9 +769,9 @@ async fn open_kernel_with_project_root(
             default_runtime_id: default_runtime_id.or_else(|| config.defaults.runtime.clone()),
             default_preset_name: config.defaults.preset.clone(),
             execution_presets: config.presets.clone(),
-            runtime_execution_profiles: configured_runtime_execution_profiles(config),
+            runtime_execution_profiles: runtime_context.execution_profiles,
             runtime_secrets_home: Some(home.clone()),
-            codex_home_override: operator_codex_home_override(home),
+            codex_home_override: runtime_context.codex_home_override,
             workspace_root: Some(workspace_root),
             project_workspace_root,
             runtime_root: Some(home.runtime_dir()),
@@ -800,10 +810,11 @@ mod tests {
         },
         operator::{
             config::{
-                daemon_compat_fingerprint, ChannelLaunchMode, ManagedChannelConfig,
-                ManagedSkillConfig, OperatorConfig, RuntimeProfileConfig,
+                ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig, OperatorConfig,
+                RuntimeProfileConfig,
             },
             lockfile::OperatorLockfile,
+            runtime::resolve_runtime_execution_context,
             services::{FakeServiceManager, ServiceManager, DAEMON_UNIT_NAME},
         },
         workspace::GENERATED_AGENTS_FILE,
@@ -825,7 +836,11 @@ mod tests {
     }
 
     async fn current_daemon_config_fingerprint(home: &LionClawHome) -> String {
-        daemon_compat_fingerprint(&OperatorConfig::load(home).await.expect("load config"))
+        let config = OperatorConfig::load(home).await.expect("load config");
+        resolve_runtime_execution_context(home, &config)
+            .await
+            .expect("resolve runtime context")
+            .daemon_config_fingerprint
     }
 
     #[cfg(unix)]
@@ -834,7 +849,11 @@ mod tests {
 
         let engine = reference.parent().expect("stub parent").join("podman");
         if !engine.exists() {
-            fs::write(&engine, "#!/usr/bin/env bash\nexit 0\n").expect("write fake podman");
+            fs::write(
+                &engine,
+                "#!/usr/bin/env bash\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"inspect\" ]; then\n  printf 'sha256:test-runtime-image\\n'\n  exit 0\nfi\nexit 0\n",
+            )
+            .expect("write fake podman");
             fs::set_permissions(&engine, fs::Permissions::from_mode(0o755))
                 .expect("chmod fake podman");
         }

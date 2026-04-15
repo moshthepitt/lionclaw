@@ -159,8 +159,9 @@ Normal user flow:
 
 1. `lionclaw onboard`
 2. `podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .`
-3. `lionclaw runtime add codex --kind codex --bin codex --image lionclaw-runtime:v1`
-4. `lionclaw run codex`
+3. `codex login`
+4. `lionclaw runtime add codex --kind codex --bin codex --image lionclaw-runtime:v1`
+5. `lionclaw run codex`
 
 Runtime definitions, execution presets, and confinement settings live in
 `~/.lionclaw/config/lionclaw.toml`, not in ad hoc shell configuration.
@@ -185,13 +186,14 @@ and stages session-local copies of `auth.json` and `config.toml` under
 using its official external-sandbox mode and talks upstream directly as it
 normally would. The real host Codex home never enters the runtime container.
 Interactive local runs honor `CODEX_HOME` when it is explicitly set in the
-current shell; background services currently use the default host Codex home.
+current shell, and `lionclaw service up` persists that same override into the
+managed daemon environment for background jobs and channels.
 If the host Codex login is missing, the fix is `codex login`, not a separate
 LionClaw auth file. The shared OCI runtime image definition lives in
 `containers/runtime/Containerfile` and currently installs `codex` and
-`opencode`. LionClaw runtime compatibility assumes configured runtime image
-references are treated as immutable; rebuild under a new image tag when runtime
-bits change.
+`opencode`. Runtime compatibility now includes the resolved local OCI image
+identity, so rebuilding the same mutable tag still produces a new compatibility
+boundary automatically.
 
 Inside `lionclaw run`, recovery stays command-first:
 

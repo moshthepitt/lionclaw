@@ -174,11 +174,12 @@ host auth when needed, then stage session-local copies of `auth.json` and
 inside the outer Podman boundary with its official external-sandbox mode
 enabled, and then talks upstream directly as it normally would. The real host
 Codex home is never mounted into the runtime container. `lionclaw run`
-inherits an interactive shell's `CODEX_HOME` when set; background services
-currently use the default host Codex home. LionClaw preflights the
-operator-managed runtime image only. Runtime compatibility assumes configured
-OCI runtime image references are treated as immutable; when runtime bits
-change, use a new image tag.
+inherits an interactive shell's `CODEX_HOME` when set, and `lionclaw service up`
+persists that same override into the managed daemon environment for background
+jobs and channels. LionClaw preflights the operator-managed runtime image only.
+Runtime compatibility includes the resolved local OCI image identity, so
+rebuilding the same mutable image tag still creates a new compatibility
+boundary automatically.
 
 Channel bridge layout:
 

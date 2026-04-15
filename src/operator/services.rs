@@ -20,6 +20,16 @@ pub struct ManagedServiceUnit {
     pub env_content: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DaemonServiceSpec<'a> {
+    pub bind_addr: &'a str,
+    pub runtime_id: &'a str,
+    pub workspace: &'a str,
+    pub project_workspace_root: &'a Path,
+    pub config_fingerprint: &'a str,
+    pub codex_home_override: Option<&'a Path>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChannelServiceSpec {
     pub channel_id: String,
@@ -38,38 +48,40 @@ pub fn unit_status_is_active(status: &str) -> bool {
 pub fn render_daemon_unit(
     home: &LionClawHome,
     daemon_bin: &Path,
-    bind_addr: &str,
-    runtime_id: &str,
-    workspace: &str,
-    project_workspace_root: &Path,
-    config_fingerprint: &str,
+    spec: DaemonServiceSpec<'_>,
 ) -> ManagedServiceUnit {
     let env_path = home.services_env_dir().join("lionclawd.env");
     let unit_path = home.services_systemd_dir().join(DAEMON_UNIT_NAME);
 
-    let (host, port) = parse_bind_addr(bind_addr);
-    let env_lines = [
+    let (host, port) = parse_bind_addr(spec.bind_addr);
+    let mut env_lines = vec![
         (
             "LIONCLAW_HOME".to_string(),
             home.root().display().to_string(),
         ),
-        ("LIONCLAW_BIND_ADDR".to_string(), bind_addr.to_string()),
+        ("LIONCLAW_BIND_ADDR".to_string(), spec.bind_addr.to_string()),
         ("LIONCLAW_HOST".to_string(), host),
         ("LIONCLAW_PORT".to_string(), port),
         (
             "LIONCLAW_DEFAULT_RUNTIME_ID".to_string(),
-            runtime_id.to_string(),
+            spec.runtime_id.to_string(),
         ),
-        ("LIONCLAW_WORKSPACE".to_string(), workspace.to_string()),
+        ("LIONCLAW_WORKSPACE".to_string(), spec.workspace.to_string()),
         (
             "LIONCLAW_WORKSPACE_ROOT".to_string(),
-            project_workspace_root.display().to_string(),
+            spec.project_workspace_root.display().to_string(),
         ),
         (
             "LIONCLAW_DAEMON_CONFIG_FINGERPRINT".to_string(),
-            config_fingerprint.to_string(),
+            spec.config_fingerprint.to_string(),
         ),
     ];
+    if let Some(codex_home_override) = spec.codex_home_override {
+        env_lines.push((
+            "CODEX_HOME".to_string(),
+            codex_home_override.display().to_string(),
+        ));
+    }
     let env_content = env_lines
         .iter()
         .map(|(key, value)| format!("{key}={}\n", escape_env_value(value)))
@@ -550,7 +562,7 @@ mod tests {
 
     use super::{
         channel_unit_name, path_entry_exists, prune_user_unit_dir, render_channel_unit,
-        render_daemon_unit, ChannelServiceSpec,
+        render_daemon_unit, ChannelServiceSpec, DaemonServiceSpec,
     };
 
     #[test]
@@ -567,11 +579,14 @@ mod tests {
         let daemon = render_daemon_unit(
             &home,
             Path::new("/tmp/bin/lionclawd"),
-            "127.0.0.1:8979",
-            "codex",
-            "main",
-            Path::new("/tmp/project"),
-            "daemon-compat-test",
+            DaemonServiceSpec {
+                bind_addr: "127.0.0.1:8979",
+                runtime_id: "codex",
+                workspace: "main",
+                project_workspace_root: Path::new("/tmp/project"),
+                config_fingerprint: "daemon-compat-test",
+                codex_home_override: Some(Path::new("/tmp/custom-codex-home")),
+            },
         );
         assert!(daemon.unit_content.contains("ExecStart=/tmp/bin/lionclawd"));
         assert!(daemon
@@ -584,6 +599,9 @@ mod tests {
         assert!(daemon
             .env_content
             .contains("LIONCLAW_DAEMON_CONFIG_FINGERPRINT=\"daemon-compat-test\""));
+        assert!(daemon
+            .env_content
+            .contains("CODEX_HOME=\"/tmp/custom-codex-home\""));
 
         let channel = render_channel_unit(
             &home,
