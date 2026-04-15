@@ -1,7 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use tokio::time::timeout;
 
 use super::{
     auth_sidecar::{start_for_oci_execution, OciRuntimeAuthLaunch},
@@ -14,6 +18,16 @@ use super::{
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OciExecutionBackend;
+
+#[cfg(test)]
+const OCI_IMAGE_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const OCI_IMAGE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+const OCI_IMAGE_PULL_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const OCI_IMAGE_PULL_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone)]
 struct PreparedOciProcessLaunch {
@@ -178,9 +192,9 @@ fn prepare_oci_process_launch(request: &ExecutionRequest) -> Result<PreparedOciP
 }
 
 async fn ensure_oci_image_exists(engine: &str, image: &str, description: String) -> Result<()> {
-    match run_oci_image_exists(engine, image).await? {
-        true => Ok(()),
-        false => bail!(
+    match run_oci_image_probe(engine, image).await? {
+        OciImageProbeResult::Present => Ok(()),
+        OciImageProbeResult::Missing => bail!(
             "{} is not available locally; build or pull it before running LionClaw",
             description
         ),
@@ -188,11 +202,12 @@ async fn ensure_oci_image_exists(engine: &str, image: &str, description: String)
 }
 
 async fn ensure_oci_image_pulled(engine: &str, image: &str, description: String) -> Result<()> {
-    if run_oci_image_exists(engine, image).await? {
-        return Ok(());
+    match run_oci_image_probe(engine, image).await? {
+        OciImageProbeResult::Present => return Ok(()),
+        OciImageProbeResult::Missing => {}
     }
 
-    let output = run_process_streaming(
+    let output = run_oci_preflight_command(
         &ProcessInvocation {
             executable: engine.to_string(),
             args: vec!["pull".to_string(), image.to_string()],
@@ -200,10 +215,10 @@ async fn ensure_oci_image_pulled(engine: &str, image: &str, description: String)
             environment: Vec::new(),
             input: String::new(),
         },
-        |_| Ok(()),
+        &format!("pull {}", description),
+        OCI_IMAGE_PULL_TIMEOUT,
     )
-    .await
-    .with_context(|| format!("failed to pull {}", description))?;
+    .await?;
 
     if output.success() {
         return Ok(());
@@ -221,8 +236,14 @@ async fn ensure_oci_image_pulled(engine: &str, image: &str, description: String)
     bail!("failed to pull {}: {}", description, stderr)
 }
 
-async fn run_oci_image_exists(engine: &str, image: &str) -> Result<bool> {
-    let output = run_process_streaming(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OciImageProbeResult {
+    Present,
+    Missing,
+}
+
+async fn run_oci_image_probe(engine: &str, image: &str) -> Result<OciImageProbeResult> {
+    let output = run_oci_preflight_command(
         &ProcessInvocation {
             executable: engine.to_string(),
             args: vec!["image".to_string(), "exists".to_string(), image.to_string()],
@@ -230,12 +251,52 @@ async fn run_oci_image_exists(engine: &str, image: &str) -> Result<bool> {
             environment: Vec::new(),
             input: String::new(),
         },
-        |_| Ok(()),
+        &format!("inspect OCI image '{}'", image),
+        OCI_IMAGE_PROBE_TIMEOUT,
+    )
+    .await?;
+
+    match output.exit_code {
+        Some(0) => Ok(OciImageProbeResult::Present),
+        Some(1) => Ok(OciImageProbeResult::Missing),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                bail!(
+                    "failed to inspect OCI image '{}'; OCI engine exited with code {:?}",
+                    image,
+                    output.exit_code
+                );
+            }
+            bail!("failed to inspect OCI image '{}': {}", image, stderr);
+        }
+    }
+}
+
+async fn run_oci_preflight_command(
+    invocation: &ProcessInvocation,
+    action: &str,
+    timeout_duration: Duration,
+) -> Result<super::process::ProcessOutput> {
+    match timeout(
+        timeout_duration,
+        run_process_streaming(invocation, |_| Ok(())),
     )
     .await
-    .with_context(|| format!("failed to inspect OCI image '{}'", image))?;
-
-    Ok(output.success())
+    {
+        Ok(result) => result.with_context(|| {
+            format!(
+                "failed to {} using OCI engine '{}'",
+                action, invocation.executable
+            )
+        }),
+        Err(_) => bail!(
+            "timed out after {}s while attempting to {} using OCI engine '{}'",
+            timeout_duration.as_secs_f32(),
+            action,
+            invocation.executable
+        ),
+    }
 }
 
 fn build_oci_process_invocation(
