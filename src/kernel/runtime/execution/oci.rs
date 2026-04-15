@@ -346,6 +346,9 @@ fn build_oci_process_invocation(
 
     args.push(prepared.image);
     args.push(prepared.program_executable);
+    if let Some(runtime_auth) = runtime_auth {
+        args.extend(runtime_auth.runtime_args_prefix.iter().cloned());
+    }
     args.extend(prepared.program_args);
 
     ProcessInvocation {
@@ -606,7 +609,8 @@ mod tests {
     use crate::kernel::runtime::execution::backend::ExecutionBackend;
     use crate::kernel::runtime::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionRequest, NetworkMode,
-        OciConfinementConfig, RuntimeProgramSpec, RuntimeSecretsMount, WorkspaceAccess,
+        OciConfinementConfig, RuntimeAuthKind, RuntimeProgramSpec, RuntimeSecretsMount,
+        WorkspaceAccess,
     };
     use crate::kernel::runtime::{MountAccess, MountSpec};
     use tempfile::tempdir;
@@ -775,7 +779,13 @@ mod tests {
     fn oci_backend_runs_join_runtime_auth_pod_and_merges_runtime_env() {
         let request = ExecutionRequest {
             plan: sample_plan(),
-            program: RuntimeProgramSpec::default(),
+            program: RuntimeProgramSpec {
+                executable: "/usr/local/bin/codex".to_string(),
+                args: vec!["exec".to_string(), "--json".to_string()],
+                environment: Vec::new(),
+                stdin: String::new(),
+                auth: Some(RuntimeAuthKind::Codex),
+            },
             runtime_secrets_mount: None,
             codex_home_override: None,
         };
@@ -785,9 +795,13 @@ mod tests {
             Some(&OciRuntimeAuthLaunch {
                 pod_name: Some("lionclaw-pod".to_string()),
                 runtime_environment: vec![(
-                    "LIONCLAW_CODEX_OPENAI_PROXY_TOKEN".to_string(),
+                    "OPENAI_API_KEY".to_string(),
                     "placeholder".to_string(),
                 )],
+                runtime_args_prefix: vec![
+                    "-c".to_string(),
+                    "openai_base_url=\"http://127.0.0.1:38080/v1\"".to_string(),
+                ],
             }),
         );
 
@@ -798,9 +812,24 @@ mod tests {
         assert!(invocation.args.windows(2).any(|pair| {
             pair == [
                 "--env".to_string(),
-                "LIONCLAW_CODEX_OPENAI_PROXY_TOKEN=placeholder".to_string(),
+                "OPENAI_API_KEY=placeholder".to_string(),
             ]
         }));
+        let executable_index = invocation
+            .args
+            .iter()
+            .position(|arg| arg == "/usr/local/bin/codex")
+            .expect("executable arg");
+        assert_eq!(
+            &invocation.args[executable_index..executable_index + 5],
+            &[
+                "/usr/local/bin/codex".to_string(),
+                "-c".to_string(),
+                "openai_base_url=\"http://127.0.0.1:38080/v1\"".to_string(),
+                "exec".to_string(),
+                "--json".to_string(),
+            ]
+        );
         assert!(
             !invocation.args.iter().any(|arg| arg == "--network"),
             "runtime auth pod should replace direct network mode wiring"

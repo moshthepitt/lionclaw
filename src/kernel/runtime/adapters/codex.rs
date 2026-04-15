@@ -1,8 +1,12 @@
 use std::sync::RwLock;
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -87,10 +91,16 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
 
     fn build_turn_program(&self, input: &RuntimeTurnInput) -> Result<RuntimeProgramSpec> {
         let session = get_runtime_session(&self.sessions, &input.runtime_session_id)?;
+        let host_model = self
+            .config
+            .model
+            .as_deref()
+            .map(str::to_string)
+            .or_else(|| resolve_host_codex_model_from_home(None));
 
         Ok(RuntimeProgramSpec {
             executable: self.config.executable.clone(),
-            args: build_codex_exec_args(&self.config, session.resumes_existing_session),
+            args: build_codex_exec_args(host_model.as_deref(), session.resumes_existing_session),
             environment: Vec::new(),
             stdin: input.prompt.clone(),
             auth: Some(RuntimeAuthKind::Codex),
@@ -143,10 +153,7 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
     }
 }
 
-fn build_codex_exec_args(
-    config: &CodexRuntimeConfig,
-    resumes_existing_session: bool,
-) -> Vec<String> {
+fn build_codex_exec_args(model: Option<&str>, resumes_existing_session: bool) -> Vec<String> {
     let mut args = if resumes_existing_session {
         vec![
             "exec".to_string(),
@@ -158,7 +165,7 @@ fn build_codex_exec_args(
         vec!["exec".to_string(), "--json".to_string()]
     };
 
-    if let Some(model) = &config.model {
+    if let Some(model) = model {
         args.push("--model".to_string());
         args.push(model.to_string());
     }
@@ -168,6 +175,32 @@ fn build_codex_exec_args(
     }
 
     args
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexHostConfigFile {
+    #[serde(default)]
+    model: Option<String>,
+}
+
+fn resolve_host_codex_model_from_home(codex_home_override: Option<&Path>) -> Option<String> {
+    let codex_home = codex_home_override
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            std::env::var_os("CODEX_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .map(|home| home.join(".codex"))
+        })?;
+    let config_path = codex_home.join("config.toml");
+    let raw = std::fs::read_to_string(config_path).ok()?;
+    let config = toml::from_str::<CodexHostConfigFile>(&raw).ok()?;
+    config.model.filter(|value| !value.trim().is_empty())
 }
 
 fn get_runtime_session(
@@ -642,8 +675,10 @@ mod tests {
     };
 
     use super::{
-        build_codex_exec_args, parse_codex_stdout, CodexRuntimeAdapter, CodexRuntimeConfig,
+        build_codex_exec_args, parse_codex_stdout, resolve_host_codex_model_from_home,
+        CodexRuntimeAdapter, CodexRuntimeConfig,
     };
+    use tempfile::tempdir;
     use uuid::Uuid;
 
     #[tokio::test]
@@ -720,13 +755,7 @@ mod tests {
 
     #[test]
     fn codex_exec_args_only_include_protocol_fields() {
-        let args = build_codex_exec_args(
-            &CodexRuntimeConfig {
-                executable: "codex".to_string(),
-                model: Some("gpt-5-codex".to_string()),
-            },
-            false,
-        );
+        let args = build_codex_exec_args(Some("gpt-5-codex"), false);
 
         assert_eq!(
             args,
@@ -741,13 +770,7 @@ mod tests {
 
     #[test]
     fn codex_resume_args_request_last_session_and_read_prompt_from_stdin() {
-        let args = build_codex_exec_args(
-            &CodexRuntimeConfig {
-                executable: "codex".to_string(),
-                model: Some("gpt-5-codex".to_string()),
-            },
-            true,
-        );
+        let args = build_codex_exec_args(Some("gpt-5-codex"), true);
 
         assert_eq!(
             args,
@@ -759,6 +782,34 @@ mod tests {
                 "--model".to_string(),
                 "gpt-5-codex".to_string(),
                 "-".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_args_fall_back_to_host_codex_model_when_runtime_model_is_unset() {
+        let temp_dir = tempdir().expect("temp dir");
+        std::fs::write(
+            temp_dir.path().join("config.toml"),
+            "model = \"gpt-5-codex\"\n",
+        )
+        .expect("write host config");
+
+        assert_eq!(
+            resolve_host_codex_model_from_home(Some(temp_dir.path())).as_deref(),
+            Some("gpt-5-codex")
+        );
+
+        assert_eq!(
+            build_codex_exec_args(
+                resolve_host_codex_model_from_home(Some(temp_dir.path())).as_deref(),
+                false,
+            ),
+            vec![
+                "exec".to_string(),
+                "--json".to_string(),
+                "--model".to_string(),
+                "gpt-5-codex".to_string(),
             ]
         );
     }

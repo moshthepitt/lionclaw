@@ -164,6 +164,8 @@ Normal user flow:
 
 Runtime definitions, execution presets, and confinement settings live in
 `~/.lionclaw/config/lionclaw.toml`, not in ad hoc shell configuration.
+If a Codex runtime profile leaves `model` unset, LionClaw falls back to the
+host Codex model for that launch instead of introducing a separate default.
 For now, runtime network policy is intentionally coarse:
 `network-mode = "on"` or `network-mode = "none"`. `on` means the runtime gets a
 private container network, not host networking.

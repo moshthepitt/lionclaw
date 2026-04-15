@@ -64,6 +64,8 @@ podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .
 LionClaw keeps its own continuity, runtime state, services, and config under
 `LIONCLAW_HOME`, while the confined runtime sees the project itself at
 `/workspace`.
+If the runtime profile leaves `model` unset, LionClaw reuses the current host
+Codex model for that launch instead of forcing a second model setting.
 
 Continue the latest local session for the current project instead of starting fresh:
 
