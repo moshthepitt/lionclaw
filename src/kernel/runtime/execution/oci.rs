@@ -146,8 +146,6 @@ fn prepare_oci_process_launch(request: &ExecutionRequest) -> Result<PreparedOciP
         "--interactive".to_string(),
     ];
 
-    append_bind_mount_identity_args(&mut args);
-
     if config.read_only_rootfs {
         args.push("--read-only".to_string());
     }
@@ -209,18 +207,22 @@ fn prepare_oci_process_launch(request: &ExecutionRequest) -> Result<PreparedOciP
     })
 }
 
-fn append_bind_mount_identity_args(args: &mut Vec<String>) {
+fn append_bind_mount_identity_args(args: &mut Vec<String>, joins_auth_pod: bool) {
     #[cfg(unix)]
     {
         // LionClaw bind-mounts host workspace/runtime paths into confined
         // containers. Under rootless Podman, leaving user namespaces implicit
         // can make those mounts unreadable or unwritable to a non-root image
-        // user even though the local operator owns the files. We therefore run
-        // the runtime container as the invoking local user under keep-id so
-        // the container sees the same writable identity as the host paths it
-        // is given.
-        args.push("--userns".to_string());
-        args.push("keep-id".to_string());
+        // user even though the local operator owns the files. Standalone
+        // containers therefore need `--userns keep-id` plus an explicit local
+        // uid/gid. When joining a pod, however, Podman treats userns as a
+        // pod-level setting and rejects re-specifying it on the joined
+        // container, so pod-joined runtimes inherit the pod userns and only
+        // get the explicit local uid/gid.
+        if !joins_auth_pod {
+            args.push("--userns".to_string());
+            args.push("keep-id".to_string());
+        }
         args.push("--user".to_string());
         args.push(format!("{}:{}", getuid().as_raw(), getgid().as_raw()));
     }
@@ -339,6 +341,11 @@ fn build_oci_process_invocation(
     runtime_auth: Option<&OciRuntimeAuthLaunch>,
 ) -> ProcessInvocation {
     let mut args = prepared.args;
+    let joins_auth_pod = runtime_auth
+        .and_then(|auth| auth.pod_name.as_deref())
+        .is_some();
+
+    append_bind_mount_identity_args(&mut args, joins_auth_pod);
 
     if let Some(pod_name) = runtime_auth.and_then(|auth| auth.pod_name.as_deref()) {
         args.push("--pod".to_string());
@@ -670,13 +677,20 @@ mod tests {
             "run".to_string(),
             "--rm".to_string(),
             "--interactive".to_string(),
-            "--userns".to_string(),
-            "keep-id".to_string(),
-            "--user".to_string(),
-            #[cfg(unix)]
-            format!("{}:{}", getuid().as_raw(), getgid().as_raw()),
-            "--read-only".to_string(),
         ]));
+        #[cfg(unix)]
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--userns".to_string(), "keep-id".to_string()]));
+        #[cfg(unix)]
+        assert!(invocation.args.windows(2).any(|pair| {
+            pair == [
+                "--user".to_string(),
+                format!("{}:{}", getuid().as_raw(), getgid().as_raw()),
+            ]
+        }));
+        assert!(invocation.args.iter().any(|arg| arg == "--read-only"));
         assert!(invocation
             .args
             .windows(2)
@@ -838,7 +852,7 @@ mod tests {
             .windows(2)
             .any(|pair| { pair == ["--pod".to_string(), "lionclaw-pod".to_string(),] }));
         #[cfg(unix)]
-        assert!(invocation
+        assert!(!invocation
             .args
             .windows(2)
             .any(|pair| { pair == ["--userns".to_string(), "keep-id".to_string(),] }));
