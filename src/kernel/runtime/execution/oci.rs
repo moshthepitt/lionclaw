@@ -10,11 +10,10 @@ use rustix::process::{getgid, getuid};
 use tokio::{runtime::Handle, time::timeout};
 
 use super::{
-    auth_sidecar::{start_for_oci_execution, OciRuntimeAuthLaunch},
     backend::{ExecutionBackend, ExecutionOutput, ExecutionRequest, ExecutionStdoutSender},
-    codex_auth_sidecar_image_ref,
     plan::{ConfinementBackend, MountAccess, MountSpec, NetworkMode, RuntimeAuthKind},
     process::{run_process_streaming, ProcessInvocation},
+    runtime_auth::prepare_runtime_auth,
     OciConfinementConfig,
 };
 use crate::kernel::runtime::RuntimeSecretsMount;
@@ -26,11 +25,6 @@ pub struct OciExecutionBackend;
 const OCI_IMAGE_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 #[cfg(not(test))]
 const OCI_IMAGE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[cfg(test)]
-const OCI_IMAGE_PULL_TIMEOUT: Duration = Duration::from_millis(250);
-#[cfg(not(test))]
-const OCI_IMAGE_PULL_TIMEOUT: Duration = Duration::from_secs(20);
 
 // LionClaw bind-mounts local workspace and runtime state into confined OCI
 // containers. On SELinux hosts those mounts are unreadable by default unless
@@ -64,29 +58,23 @@ impl ExecutionBackend for OciExecutionBackend {
         stdout: ExecutionStdoutSender,
     ) -> Result<ExecutionOutput> {
         let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
+        let runtime_auth_environment = prepare_runtime_auth(&request).await?;
         let prepared = prepare_oci_process_launch(&request)?;
-        let runtime_auth = start_for_oci_execution(&request).await?;
-        let invocation =
-            build_oci_process_invocation(prepared, runtime_auth.as_ref().map(|auth| auth.launch()));
+        let invocation = build_oci_process_invocation(prepared, &runtime_auth_environment);
         let result = run_process_streaming(&invocation, move |line| {
             let _ = stdout.send(line.to_string());
             Ok(())
         })
         .await;
-        let shutdown_result = match runtime_auth {
-            Some(auth) => auth.shutdown().await,
-            None => Ok(()),
-        };
         let runtime_secrets_cleanup_result = match runtime_secrets {
             Some(cleanup) => cleanup.shutdown().await,
             None => Ok(()),
         };
 
-        match (result, shutdown_result, runtime_secrets_cleanup_result) {
-            (Ok(output), Ok(()), Ok(())) => Ok(output),
-            (Err(err), _, _) => Err(err),
-            (Ok(_), Err(err), _) => Err(err),
-            (Ok(_), Ok(()), Err(err)) => Err(err),
+        match (result, runtime_secrets_cleanup_result) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Err(err), _) => Err(err),
+            (Ok(_), Err(err)) => Err(err),
         }
     }
 }
@@ -94,7 +82,7 @@ impl ExecutionBackend for OciExecutionBackend {
 pub async fn validate_oci_launch_prerequisites(
     runtime_id: &str,
     confinement: &OciConfinementConfig,
-    required_auth: Option<RuntimeAuthKind>,
+    _required_auth: Option<RuntimeAuthKind>,
 ) -> Result<()> {
     let image = confinement.image.as_deref().ok_or_else(|| {
         anyhow!(
@@ -115,18 +103,6 @@ pub async fn validate_oci_launch_prerequisites(
         ),
     )
     .await?;
-
-    if required_auth == Some(RuntimeAuthKind::Codex) {
-        // The auth sidecar image is part of LionClaw's trusted boundary and is
-        // pinned in code. We auto-pull it when missing so local interactive
-        // Codex launches stay command-first instead of requiring separate setup.
-        ensure_oci_image_pulled(
-            &confinement.engine,
-            codex_auth_sidecar_image_ref(),
-            "pinned Codex auth sidecar image".to_string(),
-        )
-        .await?;
-    }
 
     Ok(())
 }
@@ -207,22 +183,17 @@ fn prepare_oci_process_launch(request: &ExecutionRequest) -> Result<PreparedOciP
     })
 }
 
-fn append_bind_mount_identity_args(args: &mut Vec<String>, joins_auth_pod: bool) {
+fn append_bind_mount_identity_args(args: &mut Vec<String>) {
     #[cfg(unix)]
     {
         // LionClaw bind-mounts host workspace/runtime paths into confined
         // containers. Under rootless Podman, leaving user namespaces implicit
         // can make those mounts unreadable or unwritable to a non-root image
-        // user even though the local operator owns the files. Standalone
-        // containers therefore need `--userns keep-id` plus an explicit local
-        // uid/gid. When joining a pod, however, Podman treats userns as a
-        // pod-level setting and rejects re-specifying it on the joined
-        // container, so pod-joined runtimes inherit the pod userns and only
-        // get the explicit local uid/gid.
-        if !joins_auth_pod {
-            args.push("--userns".to_string());
-            args.push("keep-id".to_string());
-        }
+        // user even though the local operator owns the files. LionClaw's
+        // canonical standalone runtime contract is therefore explicit keep-id
+        // userns plus the invoking local uid/gid.
+        args.push("--userns".to_string());
+        args.push("keep-id".to_string());
         args.push("--user".to_string());
         args.push(format!("{}:{}", getuid().as_raw(), getgid().as_raw()));
     }
@@ -236,41 +207,6 @@ async fn ensure_oci_image_exists(engine: &str, image: &str, description: String)
             description
         ),
     }
-}
-
-async fn ensure_oci_image_pulled(engine: &str, image: &str, description: String) -> Result<()> {
-    match run_oci_image_probe(engine, image).await? {
-        OciImageProbeResult::Present => return Ok(()),
-        OciImageProbeResult::Missing => {}
-    }
-
-    let output = run_oci_preflight_command(
-        &ProcessInvocation {
-            executable: engine.to_string(),
-            args: vec!["pull".to_string(), image.to_string()],
-            working_dir: None,
-            environment: Vec::new(),
-            input: String::new(),
-        },
-        &format!("pull {}", description),
-        OCI_IMAGE_PULL_TIMEOUT,
-    )
-    .await?;
-
-    if output.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if stderr.is_empty() {
-        bail!(
-            "failed to pull {}; OCI engine exited with code {:?}",
-            description,
-            output.exit_code
-        );
-    }
-
-    bail!("failed to pull {}: {}", description, stderr)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,35 +274,25 @@ async fn run_oci_preflight_command(
 
 fn build_oci_process_invocation(
     prepared: PreparedOciProcessLaunch,
-    runtime_auth: Option<&OciRuntimeAuthLaunch>,
+    runtime_auth_environment: &[(String, String)],
 ) -> ProcessInvocation {
     let mut args = prepared.args;
-    let joins_auth_pod = runtime_auth
-        .and_then(|auth| auth.pod_name.as_deref())
-        .is_some();
 
-    append_bind_mount_identity_args(&mut args, joins_auth_pod);
+    append_bind_mount_identity_args(&mut args);
 
-    if let Some(pod_name) = runtime_auth.and_then(|auth| auth.pod_name.as_deref()) {
-        args.push("--pod".to_string());
-        args.push(pod_name.to_string());
-    } else {
-        match prepared.network_mode {
-            NetworkMode::None => {
-                args.push("--network".to_string());
-                args.push("none".to_string());
-            }
-            NetworkMode::On => {
-                args.push("--network".to_string());
-                args.push("private".to_string());
-            }
+    match prepared.network_mode {
+        NetworkMode::None => {
+            args.push("--network".to_string());
+            args.push("none".to_string());
+        }
+        NetworkMode::On => {
+            args.push("--network".to_string());
+            args.push("private".to_string());
         }
     }
 
     let mut environment = prepared.environment;
-    if let Some(runtime_auth) = runtime_auth {
-        environment = merged_environment(&environment, &runtime_auth.runtime_environment);
-    }
+    environment = merged_environment(&environment, runtime_auth_environment);
     for (key, value) in environment {
         args.push("--env".to_string());
         args.push(format!("{key}={value}"));
@@ -374,9 +300,6 @@ fn build_oci_process_invocation(
 
     args.push(prepared.image);
     args.push(prepared.program_executable);
-    if let Some(runtime_auth) = runtime_auth {
-        args.extend(runtime_auth.runtime_args_prefix.iter().cloned());
-    }
     args.extend(prepared.program_args);
 
     ProcessInvocation {
@@ -633,12 +556,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{build_oci_process_invocation, prepare_oci_process_launch, OciExecutionBackend};
-    use crate::kernel::runtime::execution::auth_sidecar::OciRuntimeAuthLaunch;
     use crate::kernel::runtime::execution::backend::ExecutionBackend;
     use crate::kernel::runtime::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionRequest, NetworkMode,
-        OciConfinementConfig, RuntimeAuthKind, RuntimeProgramSpec, RuntimeSecretsMount,
-        WorkspaceAccess,
+        OciConfinementConfig, RuntimeProgramSpec, RuntimeSecretsMount, WorkspaceAccess,
     };
     use crate::kernel::runtime::{MountAccess, MountSpec};
     #[cfg(unix)]
@@ -665,7 +586,7 @@ mod tests {
 
         let invocation = build_oci_process_invocation(
             prepare_oci_process_launch(&request).expect("prepare"),
-            None,
+            &[],
         );
 
         assert_eq!(invocation.executable, "podman");
@@ -788,7 +709,7 @@ mod tests {
 
         let invocation = build_oci_process_invocation(
             prepare_oci_process_launch(&request).expect("prepare"),
-            None,
+            &[],
         );
 
         assert!(invocation
@@ -808,7 +729,7 @@ mod tests {
 
         let invocation = build_oci_process_invocation(
             prepare_oci_process_launch(&request).expect("prepare"),
-            None,
+            &[],
         );
 
         assert!(invocation
@@ -818,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn oci_backend_runs_join_runtime_auth_pod_and_merges_runtime_env() {
+    fn oci_backend_merges_runtime_auth_environment() {
         let request = ExecutionRequest {
             plan: sample_plan(),
             program: RuntimeProgramSpec {
@@ -826,7 +747,7 @@ mod tests {
                 args: vec!["exec".to_string(), "--json".to_string()],
                 environment: Vec::new(),
                 stdin: String::new(),
-                auth: Some(RuntimeAuthKind::Codex),
+                auth: None,
             },
             runtime_secrets_mount: None,
             codex_home_override: None,
@@ -834,28 +755,9 @@ mod tests {
 
         let invocation = build_oci_process_invocation(
             prepare_oci_process_launch(&request).expect("prepare"),
-            Some(&OciRuntimeAuthLaunch {
-                pod_name: Some("lionclaw-pod".to_string()),
-                runtime_environment: vec![(
-                    "OPENAI_API_KEY".to_string(),
-                    "placeholder".to_string(),
-                )],
-                runtime_args_prefix: vec![
-                    "-c".to_string(),
-                    "openai_base_url=\"http://127.0.0.1:38080/v1\"".to_string(),
-                ],
-            }),
+            &[("CODEX_HOME".to_string(), "/runtime/home/.codex".to_string())],
         );
 
-        assert!(invocation
-            .args
-            .windows(2)
-            .any(|pair| { pair == ["--pod".to_string(), "lionclaw-pod".to_string(),] }));
-        #[cfg(unix)]
-        assert!(!invocation
-            .args
-            .windows(2)
-            .any(|pair| { pair == ["--userns".to_string(), "keep-id".to_string(),] }));
         #[cfg(unix)]
         assert!(invocation.args.windows(2).any(|pair| {
             pair == [
@@ -866,27 +768,15 @@ mod tests {
         assert!(invocation.args.windows(2).any(|pair| {
             pair == [
                 "--env".to_string(),
-                "OPENAI_API_KEY=placeholder".to_string(),
+                "CODEX_HOME=/runtime/home/.codex".to_string(),
             ]
         }));
-        let executable_index = invocation
-            .args
-            .iter()
-            .position(|arg| arg == "/usr/local/bin/codex")
-            .expect("executable arg");
-        assert_eq!(
-            &invocation.args[executable_index..executable_index + 5],
-            &[
-                "/usr/local/bin/codex".to_string(),
-                "-c".to_string(),
-                "openai_base_url=\"http://127.0.0.1:38080/v1\"".to_string(),
-                "exec".to_string(),
-                "--json".to_string(),
-            ]
-        );
         assert!(
-            !invocation.args.iter().any(|arg| arg == "--network"),
-            "runtime auth pod should replace direct network mode wiring"
+            invocation
+                .args
+                .windows(2)
+                .any(|pair| { pair == ["--network".to_string(), "private".to_string()] }),
+            "direct runtime launch should keep explicit network wiring"
         );
     }
 

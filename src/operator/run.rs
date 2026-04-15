@@ -1166,19 +1166,6 @@ case "${command_name}" in
   secret)
     exit 0
     ;;
-  pod)
-    exit 0
-    ;;
-  inspect)
-    printf 'running\n'
-    exit 0
-    ;;
-  exec)
-    exit 0
-    ;;
-  logs)
-    exit 0
-    ;;
   run)
     while [ "$#" -gt 0 ]; do
       case "$1" in

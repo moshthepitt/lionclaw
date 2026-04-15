@@ -1,12 +1,9 @@
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::RwLock;
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -91,16 +88,13 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
 
     fn build_turn_program(&self, input: &RuntimeTurnInput) -> Result<RuntimeProgramSpec> {
         let session = get_runtime_session(&self.sessions, &input.runtime_session_id)?;
-        let host_model = self
-            .config
-            .model
-            .as_deref()
-            .map(str::to_string)
-            .or_else(|| resolve_host_codex_model_from_home(None));
 
         Ok(RuntimeProgramSpec {
             executable: self.config.executable.clone(),
-            args: build_codex_exec_args(host_model.as_deref(), session.resumes_existing_session),
+            args: build_codex_exec_args(
+                self.config.model.as_deref(),
+                session.resumes_existing_session,
+            ),
             environment: Vec::new(),
             stdin: input.prompt.clone(),
             auth: Some(RuntimeAuthKind::Codex),
@@ -154,16 +148,22 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
 }
 
 fn build_codex_exec_args(model: Option<&str>, resumes_existing_session: bool) -> Vec<String> {
-    let mut args = if resumes_existing_session {
-        vec![
-            "exec".to_string(),
-            "resume".to_string(),
-            "--last".to_string(),
-            "--json".to_string(),
-        ]
-    } else {
-        vec!["exec".to_string(), "--json".to_string()]
-    };
+    let mut args = vec!["exec".to_string()];
+
+    if resumes_existing_session {
+        args.push("resume".to_string());
+    }
+
+    // LionClaw already provides the outer confinement boundary via Podman, so
+    // Codex should use its official external-sandbox mode rather than trying
+    // to nest bubblewrap inside the container.
+    args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+
+    if resumes_existing_session {
+        args.push("--last".to_string());
+    }
+
+    args.push("--json".to_string());
 
     if let Some(model) = model {
         args.push("--model".to_string());
@@ -175,32 +175,6 @@ fn build_codex_exec_args(model: Option<&str>, resumes_existing_session: bool) ->
     }
 
     args
-}
-
-#[derive(Debug, Deserialize)]
-struct CodexHostConfigFile {
-    #[serde(default)]
-    model: Option<String>,
-}
-
-fn resolve_host_codex_model_from_home(codex_home_override: Option<&Path>) -> Option<String> {
-    let codex_home = codex_home_override
-        .map(Path::to_path_buf)
-        .or_else(|| {
-            std::env::var_os("CODEX_HOME")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-        })
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .map(|home| home.join(".codex"))
-        })?;
-    let config_path = codex_home.join("config.toml");
-    let raw = std::fs::read_to_string(config_path).ok()?;
-    let config = toml::from_str::<CodexHostConfigFile>(&raw).ok()?;
-    config.model.filter(|value| !value.trim().is_empty())
 }
 
 fn get_runtime_session(
@@ -675,10 +649,8 @@ mod tests {
     };
 
     use super::{
-        build_codex_exec_args, parse_codex_stdout, resolve_host_codex_model_from_home,
-        CodexRuntimeAdapter, CodexRuntimeConfig,
+        build_codex_exec_args, parse_codex_stdout, CodexRuntimeAdapter, CodexRuntimeConfig,
     };
-    use tempfile::tempdir;
     use uuid::Uuid;
 
     #[tokio::test]
@@ -713,6 +685,7 @@ mod tests {
             program.args,
             vec![
                 "exec".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
                 "--json".to_string(),
                 "--model".to_string(),
                 "gpt-5-codex".to_string(),
@@ -761,6 +734,7 @@ mod tests {
             args,
             vec![
                 "exec".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
                 "--json".to_string(),
                 "--model".to_string(),
                 "gpt-5-codex".to_string(),
@@ -777,6 +751,7 @@ mod tests {
             vec![
                 "exec".to_string(),
                 "resume".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
                 "--last".to_string(),
                 "--json".to_string(),
                 "--model".to_string(),
@@ -787,29 +762,13 @@ mod tests {
     }
 
     #[test]
-    fn codex_args_fall_back_to_host_codex_model_when_runtime_model_is_unset() {
-        let temp_dir = tempdir().expect("temp dir");
-        std::fs::write(
-            temp_dir.path().join("config.toml"),
-            "model = \"gpt-5-codex\"\n",
-        )
-        .expect("write host config");
-
+    fn codex_args_omit_model_when_runtime_model_is_unset() {
         assert_eq!(
-            resolve_host_codex_model_from_home(Some(temp_dir.path())).as_deref(),
-            Some("gpt-5-codex")
-        );
-
-        assert_eq!(
-            build_codex_exec_args(
-                resolve_host_codex_model_from_home(Some(temp_dir.path())).as_deref(),
-                false,
-            ),
+            build_codex_exec_args(None, false),
             vec![
                 "exec".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
                 "--json".to_string(),
-                "--model".to_string(),
-                "gpt-5-codex".to_string(),
             ]
         );
     }

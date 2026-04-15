@@ -150,7 +150,6 @@ Goal: reach secure-first runtime boundary comparable to IronClaw principles.
 
 - [ ] Add Wasmtime sandbox path for untrusted tool execution.
 - [ ] Add rootless container execution backend for heavier workloads.
-- [ ] Add mandatory outbound proxy mode for runtime network calls.
 - [ ] Add egress allowlist policy (host + scheme + optional path constraints).
 - [ ] Add secret broker issuing scoped short-lived credentials.
 - [ ] Add request/response leak detection for brokered secret flows.

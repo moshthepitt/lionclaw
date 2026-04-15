@@ -169,23 +169,16 @@ LionClaw hardens the config directory to `0700` and the runtime secret file to
 
 Host-only runtime auth comes from the host runtime itself. Confined Codex turns
 read the host Codex auth store, normally `~/.codex/auth.json`, refresh that
-host auth when needed, write a session-scoped `~/.codex/config.toml` under
-`/runtime/home`, create a short-lived private Podman pod, start a tiny HAProxy
-sidecar in that pod from a LionClaw-managed version-pinned official image
-reference, and then
-launch the runtime container into the same pod-local network namespace. Codex
-talks to the sidecar over pod-local loopback, the runtime container only sees
-a runtime-specific one-time placeholder bearer token, and the sidecar swaps
-that placeholder for the discovered host bearer only on `POST /responses`
-before forwarding upstream over TLS to either `api.openai.com/v1` or
-`chatgpt.com/backend-api/codex`, depending on the local Codex auth mode. The
-raw host auth never enters the runtime container, and the pod path does not
-require host loopback reachability. `lionclaw run` inherits an interactive
-shell's `CODEX_HOME` when set; background services currently use the default
-host Codex home. LionClaw preflights the operator-managed runtime image and
-auto-pulls the version-pinned sidecar image reference when it is missing. Runtime compatibility
-assumes configured OCI runtime image references are treated as immutable; when
-runtime bits change, use a new image tag.
+host auth when needed, then stage session-local copies of `auth.json` and
+`config.toml` under `/runtime/home/.codex` before the turn starts. Codex runs
+inside the outer Podman boundary with its official external-sandbox mode
+enabled, and then talks upstream directly as it normally would. The real host
+Codex home is never mounted into the runtime container. `lionclaw run`
+inherits an interactive shell's `CODEX_HOME` when set; background services
+currently use the default host Codex home. LionClaw preflights the
+operator-managed runtime image only. Runtime compatibility assumes configured
+OCI runtime image references are treated as immutable; when runtime bits
+change, use a new image tag.
 
 Channel bridge layout:
 
@@ -348,6 +341,6 @@ Queued channel turns emit machine-stable status/error codes through the same str
 
 1. Wasmtime execution boundary.
 2. Alternative confinement backends beyond the shipped OCI path.
-3. Egress proxy with allowlist enforcement.
+3. Stronger egress policy and allowlist enforcement.
 4. Secret broker issuing scoped, short-lived credentials for non-runtime-visible secrets.
 5. Skill source pinning + signatures.

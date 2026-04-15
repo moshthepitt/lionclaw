@@ -22,7 +22,7 @@ pub use adapters::{
     OpenCodeRuntimeConfig,
 };
 pub use builtins::{register_builtin_runtime_adapters, BUILTIN_RUNTIME_MOCK};
-pub use codex_host_auth::{resolve_codex_host_auth, CodexHostAuth, CodexHostAuthMode};
+pub use codex_host_auth::{ensure_codex_host_auth_ready, sync_codex_home_into_runtime};
 pub use execution::{
     validate_oci_launch_prerequisites, ConfinementBackend, ConfinementConfig,
     EffectiveExecutionPlan, EscapeClass, ExecutionBackend, ExecutionLimits, ExecutionOutput,
@@ -43,9 +43,8 @@ async fn validate_runtime_auth_prerequisites(
     };
 
     match required_auth {
-        RuntimeAuthKind::Codex => resolve_codex_host_auth(codex_home_override)
+        RuntimeAuthKind::Codex => ensure_codex_host_auth_ready(codex_home_override)
             .await
-            .map(|_| ())
             .map_err(|err| {
                 anyhow!(
                     "configured runtime profile '{}' requires {}",

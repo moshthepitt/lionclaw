@@ -3,14 +3,12 @@
 //! This module owns execution planning, backend launch contracts, and shared
 //! process utilities so confinement policy stays out of individual adapters.
 
-pub(crate) mod auth_sidecar;
 pub mod backend;
 pub mod oci;
 pub mod plan;
 pub mod planner;
 pub(crate) mod process;
-
-pub(crate) use auth_sidecar::codex_auth_sidecar_image_ref;
+pub(crate) mod runtime_auth;
 pub use backend::{
     execute_streaming, ExecutionBackend, ExecutionOutput, ExecutionRequest, RuntimeSecretsMount,
 };

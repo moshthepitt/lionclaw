@@ -179,25 +179,15 @@ file to owner-only permissions on Unix before loading it.
 
 Host-only runtime auth comes from the host Codex login itself. Today the
 confined Codex path reads the host Codex auth store, normally
-`~/.codex/auth.json`, preflights it before launch, starts a short-lived
-private Podman pod with a tiny HAProxy sidecar, injects a runtime-specific
-one-time placeholder token into the runtime container, and swaps that
-placeholder for the discovered host bearer only inside the sidecar on
-`POST /responses`. Codex talks to the sidecar over pod-local loopback, and
-LionClaw routes that traffic to either `api.openai.com/v1` or
-`chatgpt.com/backend-api/codex` depending on how the host Codex login is
-authenticated. The raw host auth never enters the runtime container and the
-runtime does not need host loopback reachability. Interactive local runs honor
-`CODEX_HOME` when it is explicitly set in the current shell; background
-services currently use the default host Codex home. If the host Codex login is
-missing, the fix is `codex login`, not a separate LionClaw auth file. The
-HAProxy sidecar runs from a LionClaw-managed version-pinned official image
-reference, while the
-runtime itself runs from the operator-configured runtime image. LionClaw
-preflights the runtime image and auto-pulls the version-pinned sidecar image
-reference when it is
-missing. The
-shared OCI runtime image definition lives in
+`~/.codex/auth.json`, preflights it before launch, refreshes it when needed,
+and stages session-local copies of `auth.json` and `config.toml` under
+`/runtime/home/.codex`. Codex then runs in LionClaw's outer Podman sandbox
+using its official external-sandbox mode and talks upstream directly as it
+normally would. The real host Codex home never enters the runtime container.
+Interactive local runs honor `CODEX_HOME` when it is explicitly set in the
+current shell; background services currently use the default host Codex home.
+If the host Codex login is missing, the fix is `codex login`, not a separate
+LionClaw auth file. The shared OCI runtime image definition lives in
 `containers/runtime/Containerfile` and currently installs `codex` and
 `opencode`. LionClaw runtime compatibility assumes configured runtime image
 references are treated as immutable; rebuild under a new image tag when runtime

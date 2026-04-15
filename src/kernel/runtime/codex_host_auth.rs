@@ -17,11 +17,8 @@ use uuid::Uuid;
 
 const CODEX_HOME_ENV: &str = "CODEX_HOME";
 const CODEX_AUTH_FILE_NAME: &str = "auth.json";
+const CODEX_CONFIG_FILE_NAME: &str = "config.toml";
 const CODEX_AUTH_LOCK_FILE_NAME: &str = ".lionclaw-auth.lock";
-const CHATGPT_CODEX_BASE_PATH: &str = "/backend-api/codex";
-const CHATGPT_CODEX_HOST: &str = "chatgpt.com";
-const OPENAI_API_BASE_PATH: &str = "/v1";
-const OPENAI_API_HOST: &str = "api.openai.com";
 const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const ACCESS_TOKEN_REFRESH_SKEW: Duration = Duration::seconds(120);
@@ -29,60 +26,10 @@ const ACCESS_TOKEN_FALLBACK_TTL: Duration = Duration::hours(1);
 const OPENAI_OAUTH_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const OPENAI_OAUTH_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CodexHostAuthMode {
-    OpenAiApi,
-    ChatGpt,
-}
-
-impl CodexHostAuthMode {
-    pub fn upstream_host(self) -> &'static str {
-        match self {
-            Self::OpenAiApi => OPENAI_API_HOST,
-            Self::ChatGpt => CHATGPT_CODEX_HOST,
-        }
-    }
-
-    pub fn upstream_base_path(self) -> &'static str {
-        match self {
-            Self::OpenAiApi => OPENAI_API_BASE_PATH,
-            Self::ChatGpt => CHATGPT_CODEX_BASE_PATH,
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct CodexHostAuth {
-    mode: CodexHostAuthMode,
-    bearer_token: String,
-}
-
-impl std::fmt::Debug for CodexHostAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CodexHostAuth")
-            .field("mode", &self.mode)
-            .field("bearer_token", &"<redacted>")
-            .finish()
-    }
-}
-
-impl CodexHostAuth {
-    fn new(mode: CodexHostAuthMode, bearer_token: String) -> Self {
-        Self { mode, bearer_token }
-    }
-
-    pub fn mode(&self) -> CodexHostAuthMode {
-        self.mode
-    }
-
-    pub fn bearer_token(&self) -> &str {
-        &self.bearer_token
-    }
-}
-
 #[derive(Debug, Clone)]
 struct CodexAuthStore {
     auth_path: PathBuf,
+    config_path: PathBuf,
     lock_path: PathBuf,
 }
 
@@ -103,6 +50,7 @@ impl CodexAuthStore {
             .ok_or_else(|| anyhow!("could not resolve host Codex home; HOME is not set"))?;
         Ok(Self {
             auth_path: codex_home.join(CODEX_AUTH_FILE_NAME),
+            config_path: codex_home.join(CODEX_CONFIG_FILE_NAME),
             lock_path: codex_home.join(CODEX_AUTH_LOCK_FILE_NAME),
         })
     }
@@ -177,6 +125,33 @@ impl CodexAuthStore {
             .await
             .with_context(|| format!("failed to stat {}", self.auth_path.display()))
     }
+
+    async fn read_optional_config(&self) -> Result<Option<Vec<u8>>> {
+        let metadata = match tokio::fs::symlink_metadata(&self.config_path).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to stat {}", self.config_path.display()));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "host Codex config file '{}' must not be a symlink",
+                self.config_path.display()
+            );
+        }
+        if !metadata.file_type().is_file() {
+            bail!(
+                "host Codex config file '{}' must be a regular file",
+                self.config_path.display()
+            );
+        }
+        let contents = tokio::fs::read(&self.config_path)
+            .await
+            .with_context(|| format!("failed to read {}", self.config_path.display()))?;
+        Ok(Some(contents))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,24 +187,66 @@ struct OpenAiRefreshResponse {
     refresh_token: Option<String>,
 }
 
-pub async fn resolve_codex_host_auth(codex_home_override: Option<&Path>) -> Result<CodexHostAuth> {
-    resolve_codex_host_auth_with_refresh_url(codex_home_override, OPENAI_OAUTH_TOKEN_URL).await
+pub async fn ensure_codex_host_auth_ready(codex_home_override: Option<&Path>) -> Result<()> {
+    load_ready_codex_home(codex_home_override, OPENAI_OAUTH_TOKEN_URL)
+        .await
+        .map(|_| ())
 }
 
-async fn resolve_codex_host_auth_with_refresh_url(
+pub async fn sync_codex_home_into_runtime(
+    runtime_state_root: &Path,
+    codex_home_override: Option<&Path>,
+) -> Result<()> {
+    let ready = load_ready_codex_home(codex_home_override, OPENAI_OAUTH_TOKEN_URL).await?;
+    let runtime_codex_home = runtime_state_root.join("home").join(".codex");
+    ensure_runtime_codex_directory(&runtime_codex_home).await?;
+    write_runtime_codex_file(
+        &runtime_codex_home.join(CODEX_AUTH_FILE_NAME),
+        serde_json::to_vec_pretty(&ready.auth).context("failed to encode synced Codex auth")?,
+    )
+    .await?;
+    match ready.config_contents {
+        Some(config_contents) => {
+            write_runtime_codex_file(
+                &runtime_codex_home.join(CODEX_CONFIG_FILE_NAME),
+                config_contents,
+            )
+            .await?;
+        }
+        None => {
+            remove_runtime_codex_file_if_exists(&runtime_codex_home.join(CODEX_CONFIG_FILE_NAME))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ReadyCodexHome {
+    auth: CodexAuthFile,
+    config_contents: Option<Vec<u8>>,
+}
+
+async fn load_ready_codex_home(
     codex_home_override: Option<&Path>,
     refresh_url: &str,
-) -> Result<CodexHostAuth> {
+) -> Result<ReadyCodexHome> {
     let store = CodexAuthStore::resolve(codex_home_override)?;
     let (auth, modified_at) = store.read().await?;
-    if let Some(auth) = resolve_existing_codex_host_auth(&store, &auth, modified_at)? {
-        return Ok(auth);
+    if !codex_auth_needs_refresh(&store, &auth, modified_at)? {
+        return Ok(ReadyCodexHome {
+            auth,
+            config_contents: store.read_optional_config().await?,
+        });
     }
 
     let _lock = store.lock().await?;
     let (mut auth, modified_at) = store.read().await?;
-    if let Some(auth) = resolve_existing_codex_host_auth(&store, &auth, modified_at)? {
-        return Ok(auth);
+    if !codex_auth_needs_refresh(&store, &auth, modified_at)? {
+        return Ok(ReadyCodexHome {
+            auth,
+            config_contents: store.read_optional_config().await?,
+        });
     }
 
     let refresh_token = auth
@@ -242,15 +259,10 @@ async fn resolve_codex_host_auth_with_refresh_url(
     let refreshed = refresh_codex_tokens(refresh_url, &refresh_token).await?;
     apply_refreshed_codex_tokens(&mut auth, refreshed)?;
     store.write(&auth).await?;
-    let access_token = auth
-        .tokens
-        .as_ref()
-        .and_then(|tokens| nonempty(tokens.access_token.as_deref()))
-        .ok_or_else(|| missing_codex_auth(&store))?;
-    Ok(CodexHostAuth::new(
-        CodexHostAuthMode::ChatGpt,
-        access_token.to_string(),
-    ))
+    Ok(ReadyCodexHome {
+        auth,
+        config_contents: store.read_optional_config().await?,
+    })
 }
 
 fn missing_codex_auth(store: &CodexAuthStore) -> anyhow::Error {
@@ -260,16 +272,13 @@ fn missing_codex_auth(store: &CodexAuthStore) -> anyhow::Error {
     )
 }
 
-fn resolve_existing_codex_host_auth(
+fn codex_auth_needs_refresh(
     store: &CodexAuthStore,
     auth: &CodexAuthFile,
     modified_at: Option<DateTime<Utc>>,
-) -> Result<Option<CodexHostAuth>> {
-    if let Some(api_key) = nonempty(auth.openai_api_key.as_deref()) {
-        return Ok(Some(CodexHostAuth::new(
-            CodexHostAuthMode::OpenAiApi,
-            api_key.to_string(),
-        )));
+) -> Result<bool> {
+    if nonempty(auth.openai_api_key.as_deref()).is_some() {
+        return Ok(false);
     }
 
     let access_token = auth
@@ -277,14 +286,11 @@ fn resolve_existing_codex_host_auth(
         .as_ref()
         .and_then(|tokens| nonempty(tokens.access_token.as_deref()))
         .ok_or_else(|| missing_codex_auth(store))?;
-    if token_needs_refresh(access_token, auth.last_refresh.as_deref(), modified_at) {
-        return Ok(None);
-    }
-
-    Ok(Some(CodexHostAuth::new(
-        CodexHostAuthMode::ChatGpt,
-        access_token.to_string(),
-    )))
+    Ok(token_needs_refresh(
+        access_token,
+        auth.last_refresh.as_deref(),
+        modified_at,
+    ))
 }
 
 fn token_needs_refresh(
@@ -504,6 +510,119 @@ async fn harden_private_file_permissions(
     Ok(())
 }
 
+async fn ensure_runtime_codex_directory(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+        ensure_runtime_directory_component(parent).await?;
+    }
+
+    tokio::fs::create_dir_all(path)
+        .await
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    ensure_runtime_directory_component(path).await
+}
+
+async fn ensure_runtime_directory_component(path: &Path) -> Result<()> {
+    let metadata = tokio::fs::symlink_metadata(path)
+        .await
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "runtime Codex home path '{}' must not be a symlink",
+            path.display()
+        );
+    }
+    if !metadata.is_dir() {
+        bail!(
+            "runtime Codex home path '{}' must be a directory",
+            path.display()
+        );
+    }
+    set_runtime_codex_dir_permissions(path).await
+}
+
+async fn write_runtime_codex_file(path: &Path, contents: Vec<u8>) -> Result<()> {
+    let temp_path = path.with_file_name(format!(
+        ".lionclaw-runtime-codex-{}.tmp",
+        Uuid::new_v4().simple()
+    ));
+    write_private_temp_file(&temp_path, contents, private_file_permissions()).await?;
+    if let Err(err) = tokio::fs::rename(&temp_path, path).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(err).with_context(|| format!("failed to replace {}", path.display()));
+    }
+    set_runtime_codex_file_permissions(path).await
+}
+
+#[cfg(unix)]
+fn private_file_permissions() -> std::fs::Permissions {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::Permissions::from_mode(0o600)
+}
+
+#[cfg(not(unix))]
+fn private_file_permissions() -> std::fs::Permissions {
+    std::fs::metadata(".")
+        .map(|metadata| metadata.permissions())
+        .unwrap_or_else(|_| std::fs::Permissions::readonly())
+}
+
+async fn remove_runtime_codex_file_if_exists(path: &Path) -> Result<()> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "runtime Codex file '{}' must not be a symlink",
+                    path.display()
+                );
+            }
+            if !metadata.file_type().is_file() {
+                bail!(
+                    "runtime Codex file '{}' must be a regular file",
+                    path.display()
+                );
+            }
+            tokio::fs::remove_file(path)
+                .await
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+            Ok(())
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
+    }
+}
+
+#[cfg(unix)]
+async fn set_runtime_codex_dir_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .await
+        .with_context(|| format!("failed to chmod {}", path.display()))
+}
+
+#[cfg(not(unix))]
+async fn set_runtime_codex_dir_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn set_runtime_codex_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .with_context(|| format!("failed to chmod {}", path.display()))
+}
+
+#[cfg(not(unix))]
+async fn set_runtime_codex_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -537,8 +656,18 @@ mod tests {
         .expect("write auth file");
     }
 
+    async fn write_runtime_file(path: &Path, contents: &str) {
+        let parent = path.parent().expect("runtime file parent");
+        tokio::fs::create_dir_all(parent)
+            .await
+            .expect("create runtime parent");
+        tokio::fs::write(path, contents)
+            .await
+            .expect("write runtime file");
+    }
+
     #[tokio::test]
-    async fn resolves_openai_api_key_from_auth_file() {
+    async fn ensures_openai_api_key_auth_is_ready() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let codex_home = temp_dir.path().join(".codex");
         write_auth_file(
@@ -547,23 +676,20 @@ mod tests {
                 "OPENAI_API_KEY": "sk-test",
                 "tokens": {
                     "access_token": fake_jwt(Utc::now() + Duration::minutes(30)),
-                    "refresh_token": "refresh-test",
+                    "refresh_token": "refresh-test"
                 }
             }),
         )
         .await;
 
-        let auth = resolve_codex_host_auth(Some(&codex_home))
+        ensure_codex_host_auth_ready(Some(&codex_home))
             .await
-            .expect("resolve auth");
-
-        assert_eq!(auth.mode(), CodexHostAuthMode::OpenAiApi);
-        assert_eq!(auth.bearer_token(), "sk-test");
+            .expect("auth should validate");
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn resolves_openai_api_key_from_read_only_codex_home_without_lock_file() {
+    async fn ensures_openai_api_key_from_read_only_codex_home_without_lock_file() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -583,17 +709,14 @@ mod tests {
         std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o500))
             .expect("chmod codex home");
 
-        let auth = resolve_codex_host_auth(Some(&codex_home))
+        ensure_codex_host_auth_ready(Some(&codex_home))
             .await
-            .expect("resolve auth");
-
-        assert_eq!(auth.mode(), CodexHostAuthMode::OpenAiApi);
-        assert_eq!(auth.bearer_token(), "sk-test");
+            .expect("auth should validate");
         assert!(!codex_home.join(CODEX_AUTH_LOCK_FILE_NAME).exists());
     }
 
     #[tokio::test]
-    async fn resolves_chatgpt_token_from_auth_file() {
+    async fn ensures_chatgpt_token_auth_is_ready() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let codex_home = temp_dir.path().join(".codex");
         write_auth_file(
@@ -609,17 +732,14 @@ mod tests {
         )
         .await;
 
-        let auth = resolve_codex_host_auth(Some(&codex_home))
+        ensure_codex_host_auth_ready(Some(&codex_home))
             .await
-            .expect("resolve auth");
-
-        assert_eq!(auth.mode(), CodexHostAuthMode::ChatGpt);
-        assert!(auth.bearer_token().contains('.'));
+            .expect("auth should validate");
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn resolves_fresh_chatgpt_token_from_read_only_codex_home_without_lock_file() {
+    async fn ensures_fresh_chatgpt_token_from_read_only_codex_home_without_lock_file() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -643,12 +763,9 @@ mod tests {
         std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o500))
             .expect("chmod codex home");
 
-        let auth = resolve_codex_host_auth(Some(&codex_home))
+        ensure_codex_host_auth_ready(Some(&codex_home))
             .await
-            .expect("resolve auth");
-
-        assert_eq!(auth.mode(), CodexHostAuthMode::ChatGpt);
-        assert!(auth.bearer_token().contains('.'));
+            .expect("auth should validate");
         assert!(!codex_home.join(CODEX_AUTH_LOCK_FILE_NAME).exists());
     }
 
@@ -693,17 +810,12 @@ mod tests {
             .expect("serve refresh endpoint");
         });
 
-        let auth = resolve_codex_host_auth_with_refresh_url(
-            Some(&codex_home),
-            &format!("http://{address}/oauth/token"),
-        )
-        .await
-        .expect("resolve auth");
+        load_ready_codex_home(Some(&codex_home), &format!("http://{address}/oauth/token"))
+            .await
+            .expect("resolve auth");
 
         server.abort();
 
-        assert_eq!(auth.mode(), CodexHostAuthMode::ChatGpt);
-        assert_ne!(auth.bearer_token(), stale_access);
         let written = tokio::fs::read_to_string(codex_home.join(CODEX_AUTH_FILE_NAME))
             .await
             .expect("read auth file");
@@ -759,16 +871,14 @@ mod tests {
 
         let refresh_url = format!("http://{address}/oauth/token");
         let (first, second) = tokio::join!(
-            resolve_codex_host_auth_with_refresh_url(Some(&codex_home), &refresh_url),
-            resolve_codex_host_auth_with_refresh_url(Some(&codex_home), &refresh_url),
+            load_ready_codex_home(Some(&codex_home), &refresh_url),
+            load_ready_codex_home(Some(&codex_home), &refresh_url),
         );
 
         server.abort();
 
-        let first = first.expect("first auth");
-        let second = second.expect("second auth");
-        assert_eq!(first.mode(), CodexHostAuthMode::ChatGpt);
-        assert_eq!(second.mode(), CodexHostAuthMode::ChatGpt);
+        let _first = first.expect("first auth");
+        let _second = second.expect("second auth");
         assert_eq!(refresh_hits.load(Ordering::SeqCst), 1);
 
         let written = tokio::fs::read_to_string(codex_home.join(CODEX_AUTH_FILE_NAME))
@@ -828,11 +938,9 @@ mod tests {
         )
         .expect("chmod auth");
 
-        let auth = resolve_codex_host_auth(Some(&codex_home))
+        ensure_codex_host_auth_ready(Some(&codex_home))
             .await
-            .expect("resolve auth");
-
-        assert_eq!(auth.mode(), CodexHostAuthMode::OpenAiApi);
+            .expect("auth should validate");
         let mode = std::fs::metadata(codex_home.join(CODEX_AUTH_FILE_NAME))
             .expect("metadata")
             .permissions()
@@ -884,7 +992,7 @@ mod tests {
             .expect("write real auth");
         symlink(&real, codex_home.join(CODEX_AUTH_FILE_NAME)).expect("symlink auth");
 
-        let err = resolve_codex_host_auth(Some(&codex_home))
+        let err = ensure_codex_host_auth_ready(Some(&codex_home))
             .await
             .expect_err("symlinked auth should fail");
         assert!(err.to_string().contains("must not be a symlink"));
@@ -895,10 +1003,84 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let codex_home = temp_dir.path().join(".codex");
 
-        let err = resolve_codex_host_auth(Some(&codex_home))
+        let err = ensure_codex_host_auth_ready(Some(&codex_home))
             .await
             .expect_err("missing auth should fail");
         assert!(err.to_string().contains("codex login"));
         assert!(err.to_string().contains("auth.json"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn syncs_host_auth_and_config_into_runtime_home_and_removes_stale_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let codex_home = temp_dir.path().join(".codex");
+        let runtime_root = temp_dir.path().join("runtime");
+        write_auth_file(
+            &codex_home,
+            json!({
+                "OPENAI_API_KEY": "sk-test"
+            }),
+        )
+        .await;
+        tokio::fs::write(
+            codex_home.join(CODEX_CONFIG_FILE_NAME),
+            b"model = \"gpt-5.4\"\n",
+        )
+        .await
+        .expect("write config");
+
+        sync_codex_home_into_runtime(&runtime_root, Some(&codex_home))
+            .await
+            .expect("sync runtime home");
+
+        let runtime_codex_home = runtime_root.join("home").join(".codex");
+        let copied_auth = tokio::fs::read_to_string(runtime_codex_home.join(CODEX_AUTH_FILE_NAME))
+            .await
+            .expect("read copied auth");
+        let copied_config =
+            tokio::fs::read_to_string(runtime_codex_home.join(CODEX_CONFIG_FILE_NAME))
+                .await
+                .expect("read copied config");
+        assert!(copied_auth.contains("\"OPENAI_API_KEY\": \"sk-test\""));
+        assert_eq!(copied_config, "model = \"gpt-5.4\"\n");
+
+        let auth_mode = std::fs::metadata(runtime_codex_home.join(CODEX_AUTH_FILE_NAME))
+            .expect("runtime auth metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let config_mode = std::fs::metadata(runtime_codex_home.join(CODEX_CONFIG_FILE_NAME))
+            .expect("runtime config metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let dir_mode = std::fs::metadata(&runtime_codex_home)
+            .expect("runtime dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(auth_mode, 0o600);
+        assert_eq!(config_mode, 0o600);
+        assert_eq!(dir_mode, 0o700);
+
+        tokio::fs::remove_file(codex_home.join(CODEX_CONFIG_FILE_NAME))
+            .await
+            .expect("remove host config");
+        write_runtime_file(
+            &runtime_codex_home.join(CODEX_CONFIG_FILE_NAME),
+            "stale = true\n",
+        )
+        .await;
+
+        sync_codex_home_into_runtime(&runtime_root, Some(&codex_home))
+            .await
+            .expect("resync runtime home");
+        assert!(
+            !runtime_codex_home.join(CODEX_CONFIG_FILE_NAME).exists(),
+            "missing host config should remove stale runtime copy"
+        );
     }
 }
