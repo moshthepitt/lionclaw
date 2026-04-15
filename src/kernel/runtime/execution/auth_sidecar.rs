@@ -3,10 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::UnixStream,
     runtime::Handle,
-    time::{sleep, timeout, Duration, Instant},
+    time::{sleep, Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -24,6 +22,7 @@ const RUNTIME_MOUNT_TARGET: &str = "/runtime";
 const UPSTREAM_BEARER_TOKEN_ENV: &str = "LIONCLAW_CODEX_UPSTREAM_BEARER_TOKEN";
 const CODEX_PROXY_TOKEN_ENV: &str = "LIONCLAW_CODEX_OPENAI_PROXY_TOKEN";
 const CODEX_PROXY_PORT: u16 = 38080;
+const PRIVATE_SELINUX_RELABEL: &str = "Z";
 // The auth sidecar is part of LionClaw's trusted computing base, not a user-
 // configurable runtime detail. We therefore keep the official HAProxy
 // reference pinned in code as part of the LionClaw release contract. This is a
@@ -34,14 +33,11 @@ const CODEX_PROXY_PORT: u16 = 38080;
 // separate.
 const CODEX_AUTH_SIDECAR_IMAGE: &str = "docker.io/library/haproxy:3.3.5-alpine";
 const SIDECAR_CONFIG_CONTAINER_DIR: &str = "/usr/local/etc/haproxy";
-const SIDECAR_RUN_CONTAINER_DIR: &str = "/var/lib/haproxy";
 const HAPROXY_CONFIG_FILE_NAME: &str = "haproxy.cfg";
-const HAPROXY_ADMIN_SOCKET_FILE_NAME: &str = "admin.sock";
-const HAPROXY_ADMIN_SOCKET_CONTAINER_PATH: &str = "/var/lib/haproxy/admin.sock";
+const HAPROXY_ADMIN_SOCKET_CONTAINER_PATH: &str = "/tmp/lionclaw-haproxy-admin.sock";
 const CODEX_CONFIG_RELATIVE_PATH: &str = "home/.codex/config.toml";
 const SIDECAR_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SIDECAR_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const SIDECAR_READY_IO_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OciRuntimeAuthLaunch {
@@ -60,11 +56,7 @@ impl SidecarStateDir {
         let config_dir = temp_dir.path().join("config");
         std::fs::create_dir(&config_dir)
             .with_context(|| format!("failed to create {}", config_dir.display()))?;
-        let run_dir = temp_dir.path().join("run");
-        std::fs::create_dir(&run_dir)
-            .with_context(|| format!("failed to create {}", run_dir.display()))?;
         set_sidecar_config_dir_permissions(&config_dir)?;
-        set_sidecar_run_dir_permissions(&run_dir)?;
         Ok(Self { temp_dir })
     }
 
@@ -76,16 +68,8 @@ impl SidecarStateDir {
         self.root().join("config")
     }
 
-    fn run_dir(&self) -> PathBuf {
-        self.root().join("run")
-    }
-
     fn config_path(&self) -> PathBuf {
         self.config_dir().join(HAPROXY_CONFIG_FILE_NAME)
-    }
-
-    fn admin_socket_path(&self) -> PathBuf {
-        self.run_dir().join(HAPROXY_ADMIN_SOCKET_FILE_NAME)
     }
 }
 
@@ -93,7 +77,7 @@ impl SidecarStateDir {
 struct OciRuntimeAuthCleanup {
     engine: String,
     pod_name: String,
-    sidecar_state: SidecarStateDir,
+    _sidecar_state: SidecarStateDir,
 }
 
 impl OciRuntimeAuthCleanup {
@@ -199,7 +183,7 @@ async fn start_codex_sidecar(request: &ExecutionRequest) -> Result<OciRuntimeAut
     let cleanup = OciRuntimeAuthCleanup {
         engine: engine.clone(),
         pod_name: pod_name.clone(),
-        sidecar_state,
+        _sidecar_state: sidecar_state,
     };
 
     if let Err(err) = run_oci_admin_command(&sidecar_run_invocation, "start auth sidecar").await {
@@ -207,7 +191,7 @@ async fn start_codex_sidecar(request: &ExecutionRequest) -> Result<OciRuntimeAut
         return Err(err);
     }
 
-    if let Err(err) = wait_for_sidecar_ready(cleanup.sidecar_state.admin_socket_path()).await {
+    if let Err(err) = wait_for_sidecar_ready(&engine, &proxy_name).await {
         let _ = cleanup.shutdown().await;
         return Err(err);
     }
@@ -277,9 +261,8 @@ fn build_sidecar_run_invocation(
                 &sidecar_state.config_dir(),
                 SIDECAR_CONFIG_CONTAINER_DIR,
                 true,
+                Some(PRIVATE_SELINUX_RELABEL),
             )?,
-            "--volume".to_string(),
-            bind_mount_arg(&sidecar_state.run_dir(), SIDECAR_RUN_CONTAINER_DIR, false)?,
             CODEX_AUTH_SIDECAR_IMAGE.to_string(),
         ],
         working_dir: None,
@@ -291,38 +274,125 @@ fn build_sidecar_run_invocation(
     })
 }
 
-async fn wait_for_sidecar_ready(admin_socket_path: PathBuf) -> Result<()> {
+async fn wait_for_sidecar_ready(engine: &str, proxy_name: &str) -> Result<()> {
     let start = Instant::now();
     let mut last_error: Option<anyhow::Error> = None;
 
     while start.elapsed() < SIDECAR_READY_TIMEOUT {
-        match probe_sidecar_admin_socket(&admin_socket_path).await {
-            Ok(()) => return Ok(()),
+        match inspect_sidecar_status(engine, proxy_name).await {
+            Ok(SidecarStatus::Running) => {
+                match probe_sidecar_socket_inside_container(engine, proxy_name).await {
+                    Ok(()) => return Ok(()),
+                    Err(err) => last_error = Some(err),
+                }
+            }
+            Ok(SidecarStatus::Exited(status)) => {
+                let detail = sidecar_failure_detail(
+                    engine,
+                    proxy_name,
+                    &format!("container exited with status '{status}'"),
+                )
+                .await;
+                bail!("auth sidecar failed readiness probe: {}", detail);
+            }
+            Ok(SidecarStatus::Other(status)) => {
+                last_error = Some(anyhow!(
+                    "sidecar container is in unexpected state '{}'",
+                    status
+                ));
+            }
             Err(err) => last_error = Some(err),
         }
         sleep(SIDECAR_READY_POLL_INTERVAL).await;
     }
 
-    let detail = last_error
-        .map(|err| err.to_string())
-        .unwrap_or_else(|| "sidecar did not become ready".to_string());
+    let detail = sidecar_failure_detail(
+        engine,
+        proxy_name,
+        &last_error
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "sidecar did not become ready".to_string()),
+    )
+    .await;
     bail!("auth sidecar failed readiness probe: {}", detail)
 }
 
-async fn probe_sidecar_admin_socket(admin_socket_path: &Path) -> Result<()> {
-    let mut stream = UnixStream::connect(admin_socket_path)
-        .await
-        .with_context(|| format!("failed to connect to {}", admin_socket_path.display()))?;
-    stream
-        .write_all(b"show info\n")
-        .await
-        .context("failed to write auth sidecar readiness probe")?;
-    let mut response = [0u8; 1];
-    match timeout(SIDECAR_READY_IO_TIMEOUT, stream.read(&mut response)).await {
-        Ok(Ok(read)) if read > 0 => Ok(()),
-        Ok(Ok(_)) => bail!("auth sidecar readiness probe returned no data"),
-        Ok(Err(err)) => Err(err).context("failed to read auth sidecar readiness probe"),
-        Err(_) => bail!("auth sidecar readiness probe timed out"),
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SidecarStatus {
+    Running,
+    Exited(String),
+    Other(String),
+}
+
+async fn inspect_sidecar_status(engine: &str, proxy_name: &str) -> Result<SidecarStatus> {
+    let output = run_oci_admin_command(
+        &ProcessInvocation {
+            executable: engine.to_string(),
+            args: vec![
+                "inspect".to_string(),
+                "--format".to_string(),
+                "{{.State.Status}}".to_string(),
+                proxy_name.to_string(),
+            ],
+            working_dir: None,
+            environment: Vec::new(),
+            input: String::new(),
+        },
+        "inspect auth sidecar status",
+    )
+    .await?;
+
+    let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    match status.as_str() {
+        "running" => Ok(SidecarStatus::Running),
+        "exited" | "stopped" | "dead" => Ok(SidecarStatus::Exited(status)),
+        _ => Ok(SidecarStatus::Other(status)),
+    }
+}
+
+async fn probe_sidecar_socket_inside_container(engine: &str, proxy_name: &str) -> Result<()> {
+    run_oci_admin_command(
+        &ProcessInvocation {
+            executable: engine.to_string(),
+            args: vec![
+                "exec".to_string(),
+                proxy_name.to_string(),
+                "/bin/sh".to_string(),
+                "-ec".to_string(),
+                format!("test -S {HAPROXY_ADMIN_SOCKET_CONTAINER_PATH}"),
+            ],
+            working_dir: None,
+            environment: Vec::new(),
+            input: String::new(),
+        },
+        "probe auth sidecar readiness",
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn sidecar_failure_detail(engine: &str, proxy_name: &str, fallback: &str) -> String {
+    match run_oci_admin_command(
+        &ProcessInvocation {
+            executable: engine.to_string(),
+            args: vec!["logs".to_string(), proxy_name.to_string()],
+            working_dir: None,
+            environment: Vec::new(),
+            input: String::new(),
+        },
+        "read auth sidecar logs",
+    )
+    .await
+    {
+        Ok(output) => {
+            let logs = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if logs.is_empty() {
+                fallback.to_string()
+            } else {
+                format!("{fallback}; sidecar logs: {logs}")
+            }
+        }
+        Err(_) => fallback.to_string(),
     }
 }
 
@@ -393,7 +463,12 @@ fn write_haproxy_config(
     Ok(())
 }
 
-fn bind_mount_arg(source: &Path, target: &str, read_only: bool) -> Result<String> {
+fn bind_mount_arg(
+    source: &Path,
+    target: &str,
+    read_only: bool,
+    selinux_relabel: Option<&str>,
+) -> Result<String> {
     let source = source
         .to_str()
         .ok_or_else(|| anyhow!("mount source '{}' is not valid UTF-8", source.display()))?;
@@ -410,8 +485,11 @@ fn bind_mount_arg(source: &Path, target: &str, read_only: bool) -> Result<String
         );
     }
 
-    let access = if read_only { "ro" } else { "rw" };
-    Ok(format!("{source}:{target}:{access}"))
+    let mut options = vec![if read_only { "ro" } else { "rw" }];
+    if let Some(label) = selinux_relabel {
+        options.push(label);
+    }
+    Ok(format!("{source}:{target}:{}", options.join(",")))
 }
 
 #[cfg(unix)]
@@ -438,18 +516,6 @@ fn set_sidecar_config_file_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn set_sidecar_run_dir_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o1777)).map_err(Into::into)
-}
-
-#[cfg(not(unix))]
-fn set_sidecar_run_dir_permissions(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -458,7 +524,7 @@ mod tests {
     use chrono::Utc;
     use serde_json::json;
     use tempfile::tempdir;
-    use tokio::{net::UnixListener, sync::Mutex};
+    use tokio::sync::Mutex;
 
     use super::*;
     use crate::kernel::runtime::{
@@ -531,16 +597,15 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_run_invocation_mounts_default_config_dir_and_writable_run_dir() {
+    fn sidecar_run_invocation_mounts_relabelled_default_config_dir() {
         let sidecar_state = SidecarStateDir::new().expect("sidecar state");
         let config_mount = bind_mount_arg(
             &sidecar_state.config_dir(),
             SIDECAR_CONFIG_CONTAINER_DIR,
             true,
+            Some(PRIVATE_SELINUX_RELABEL),
         )
         .expect("config mount");
-        let run_mount = bind_mount_arg(&sidecar_state.run_dir(), SIDECAR_RUN_CONTAINER_DIR, false)
-            .expect("run mount");
 
         let invocation = build_sidecar_run_invocation(
             "podman",
@@ -574,10 +639,6 @@ mod tests {
             .args
             .windows(2)
             .any(|pair| pair == ["--volume".to_string(), config_mount.clone()]));
-        assert!(invocation
-            .args
-            .windows(2)
-            .any(|pair| pair == ["--volume".to_string(), run_mount.clone()]));
         assert_eq!(
             invocation.args.last().map(String::as_str),
             Some(CODEX_AUTH_SIDECAR_IMAGE)
@@ -588,8 +649,9 @@ mod tests {
     fn sidecar_run_invocation_rejects_colon_mount_sources() {
         let err = bind_mount_arg(
             Path::new("/tmp/lionclaw:auth-sidecar"),
-            SIDECAR_RUN_CONTAINER_DIR,
+            SIDECAR_CONFIG_CONTAINER_DIR,
             false,
+            None,
         )
         .expect_err("colon mount source should be rejected");
 
@@ -598,7 +660,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn sidecar_state_dir_uses_readable_config_and_writable_run_permissions() {
+    fn sidecar_state_dir_uses_readable_config_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
         let sidecar_state = SidecarStateDir::new().expect("sidecar state");
@@ -608,14 +670,8 @@ mod tests {
             .permissions()
             .mode()
             & 0o7777;
-        let run_mode = std::fs::metadata(sidecar_state.run_dir())
-            .expect("run metadata")
-            .permissions()
-            .mode()
-            & 0o7777;
 
         assert_eq!(config_mode, 0o755);
-        assert_eq!(run_mode, 0o1777);
     }
 
     #[tokio::test]
@@ -717,29 +773,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_sidecar_ready_accepts_admin_socket_response() {
-        let temp_dir = tempdir().expect("temp dir");
-        let admin_socket = temp_dir.path().join("admin.sock");
-        let ready_flag = Arc::new(Mutex::new(false));
-        let ready_flag_task = ready_flag.clone();
+    async fn wait_for_sidecar_ready_accepts_running_exec_probe() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
 
-        let listener = UnixListener::bind(&admin_socket).expect("bind admin socket");
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept probe");
-            let mut request = [0u8; 16];
-            let _ = stream.read(&mut request).await.expect("read probe");
-            stream
-                .write_all(b"Name: HAProxy\n")
+            let temp_dir = tempdir().expect("temp dir");
+            let log_path = temp_dir.path().join("podman.log");
+            let ready = Arc::new(Mutex::new(false));
+            let ready_for_thread = ready.clone();
+            let script_path = temp_dir.path().join("podman");
+            std::fs::write(
+                &script_path,
+                format!(
+                    "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"${{1:-}}\" = \"inspect\" ]; then\n  printf 'running\\n'\n  exit 0\nfi\nif [ \"${{1:-}}\" = \"exec\" ]; then\n  printf 'ready\\n' >> \"{}\"\n  exit 0\nfi\nif [ \"${{1:-}}\" = \"logs\" ]; then\n  exit 0\nfi\nexit 0\n",
+                    log_path.display(),
+                    log_path.display(),
+                ),
+            )
+            .expect("write script");
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+
+            wait_for_sidecar_ready(&script_path.to_string_lossy(), "lionclaw-auth")
                 .await
-                .expect("write probe response");
-            *ready_flag_task.lock().await = true;
-        });
-
-        wait_for_sidecar_ready(admin_socket)
-            .await
-            .expect("sidecar ready");
-        server.await.expect("server join");
-        assert!(*ready_flag.lock().await);
+                .expect("sidecar ready");
+            *ready_for_thread.lock().await = true;
+            assert!(*ready.lock().await);
+            let log = std::fs::read_to_string(&log_path).expect("read log");
+            assert!(log.contains("inspect --format {{.State.Status}} lionclaw-auth"));
+            assert!(log.contains(
+                "exec lionclaw-auth /bin/sh -ec test -S /tmp/lionclaw-haproxy-admin.sock"
+            ));
+        }
     }
 
     #[tokio::test]
