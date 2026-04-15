@@ -441,7 +441,7 @@ fn runtime_mount_fs(mounts: &[MountSpec]) -> Result<ContinuityFs> {
 
 fn write_codex_config(runtime_mount_fs: &ContinuityFs, auth_mode: CodexHostAuthMode) -> Result<()> {
     let contents = format!(
-        "[model_providers.openai]\nbase_url = \"http://127.0.0.1:{CODEX_PROXY_PORT}{base_path}\"\nenv_key = \"{CODEX_PROXY_TOKEN_ENV}\"\nwire_api = \"responses\"\n",
+        "[model_providers.openai]\nname = \"openai\"\nbase_url = \"http://127.0.0.1:{CODEX_PROXY_PORT}{base_path}\"\nenv_key = \"{CODEX_PROXY_TOKEN_ENV}\"\nwire_api = \"responses\"\n",
         base_path = auth_mode.upstream_base_path(),
     );
     runtime_mount_fs.write_string(Path::new(CODEX_CONFIG_RELATIVE_PATH), &contents)
@@ -703,6 +703,7 @@ mod tests {
         let codex_config = tokio::fs::read_to_string(runtime_root.join(CODEX_CONFIG_RELATIVE_PATH))
             .await
             .expect("read codex config");
+        assert!(codex_config.contains("name = \"openai\""));
         assert!(codex_config.contains("http://127.0.0.1:38080/v1"));
         assert!(codex_config.contains(CODEX_PROXY_TOKEN_ENV));
         assert!(!codex_config.contains(UPSTREAM_BEARER_TOKEN_ENV));
@@ -762,6 +763,7 @@ mod tests {
         let codex_config = tokio::fs::read_to_string(runtime_root.join(CODEX_CONFIG_RELATIVE_PATH))
             .await
             .expect("read codex config");
+        assert!(codex_config.contains("name = \"openai\""));
         assert!(codex_config.contains("http://127.0.0.1:38080/backend-api/codex"));
         assert!(codex_config.contains(CODEX_PROXY_TOKEN_ENV));
 

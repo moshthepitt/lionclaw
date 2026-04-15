@@ -29,6 +29,14 @@ const OCI_IMAGE_PULL_TIMEOUT: Duration = Duration::from_millis(250);
 #[cfg(not(test))]
 const OCI_IMAGE_PULL_TIMEOUT: Duration = Duration::from_secs(20);
 
+// LionClaw bind-mounts local workspace and runtime state into confined OCI
+// containers. On SELinux hosts those mounts are unreadable by default unless
+// Podman relabels them for the container context, so we make private relabeling
+// part of the canonical volume contract instead of special-casing individual
+// mounts like /runtime.
+const READ_ONLY_BIND_MOUNT_OPTIONS: &str = "ro,Z";
+const READ_WRITE_BIND_MOUNT_OPTIONS: &str = "rw,Z";
+
 #[derive(Debug, Clone)]
 struct PreparedOciProcessLaunch {
     engine: String,
@@ -453,8 +461,8 @@ fn format_volume_spec(mount: &MountSpec) -> Result<String> {
     }
 
     let access = match mount.access {
-        MountAccess::ReadOnly => "ro",
-        MountAccess::ReadWrite => "rw",
+        MountAccess::ReadOnly => READ_ONLY_BIND_MOUNT_OPTIONS,
+        MountAccess::ReadWrite => READ_WRITE_BIND_MOUNT_OPTIONS,
     };
     Ok(format!("{source}:{}:{access}", mount.target))
 }
@@ -531,25 +539,25 @@ mod tests {
         assert!(invocation.args.windows(2).any(|pair| {
             pair == [
                 "--volume".to_string(),
-                "/host/workspace:/workspace:rw".to_string(),
+                "/host/workspace:/workspace:rw,Z".to_string(),
             ]
         }));
         assert!(invocation.args.windows(2).any(|pair| {
             pair == [
                 "--volume".to_string(),
-                "/host/runtime/codex/dev:/runtime:rw".to_string(),
+                "/host/runtime/codex/dev:/runtime:rw,Z".to_string(),
             ]
         }));
         assert!(invocation.args.windows(2).any(|pair| {
             pair == [
                 "--volume".to_string(),
-                "/host/runtime/codex/dev/drafts:/drafts:rw".to_string(),
+                "/host/runtime/codex/dev/drafts:/drafts:rw,Z".to_string(),
             ]
         }));
         assert!(invocation
             .args
             .windows(2)
-            .any(|pair| { pair == ["--volume".to_string(), "/host/refs:/refs:ro".to_string()] }));
+            .any(|pair| { pair == ["--volume".to_string(), "/host/refs:/refs:ro,Z".to_string()] }));
         assert!(invocation
             .args
             .windows(2)
