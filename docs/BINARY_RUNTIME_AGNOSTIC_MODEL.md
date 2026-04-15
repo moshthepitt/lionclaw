@@ -189,9 +189,11 @@ runtime does not need host loopback reachability. Interactive local runs honor
 `CODEX_HOME` when it is explicitly set in the current shell; background
 services currently use the default host Codex home. If the host Codex login is
 missing, the fix is `codex login`, not a separate LionClaw auth file. The
-HAProxy sidecar runs from a LionClaw-managed pinned official image, while the
+HAProxy sidecar runs from a LionClaw-managed version-pinned official image
+reference, while the
 runtime itself runs from the operator-configured runtime image. LionClaw
-preflights the runtime image and auto-pulls the pinned sidecar image when it is
+preflights the runtime image and auto-pulls the version-pinned sidecar image
+reference when it is
 missing. The
 shared OCI runtime image definition lives in
 `containers/runtime/Containerfile` and currently installs `codex` and

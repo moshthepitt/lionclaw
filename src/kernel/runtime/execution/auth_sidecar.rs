@@ -25,11 +25,14 @@ const UPSTREAM_BEARER_TOKEN_ENV: &str = "LIONCLAW_CODEX_UPSTREAM_BEARER_TOKEN";
 const CODEX_PROXY_TOKEN_ENV: &str = "LIONCLAW_CODEX_OPENAI_PROXY_TOKEN";
 const CODEX_PROXY_PORT: u16 = 38080;
 // The auth sidecar is part of LionClaw's trusted computing base, not a user-
-// configurable runtime detail. We pin the exact official image in code so the
-// sidecar bits are part of the LionClaw release contract and cannot be swapped
-// out by mutable config while still keeping the untrusted runtime image
-// operator-managed and separate.
-const CODEX_AUTH_SIDECAR_IMAGE: &str = "docker.io/library/haproxy:3.3.5-alpine@sha256:dafcb6c1eb87b9fd188272e4c49deaad96e1d9d9d1d6d9e6f5228d7fb37aa837";
+// configurable runtime detail. We therefore keep the official HAProxy
+// reference pinned in code as part of the LionClaw release contract. This is a
+// version-pinned multi-arch tag rather than a single image-manifest digest:
+// official multi-arch images publish different per-platform digests, and
+// pinning one of those digests breaks launchability on other host
+// architectures. The untrusted runtime image remains operator-managed and
+// separate.
+const CODEX_AUTH_SIDECAR_IMAGE: &str = "docker.io/library/haproxy:3.3.5-alpine";
 const SIDECAR_CONFIG_CONTAINER_DIR: &str = "/usr/local/etc/haproxy";
 const SIDECAR_RUN_CONTAINER_DIR: &str = "/var/lib/haproxy";
 const HAPROXY_CONFIG_FILE_NAME: &str = "haproxy.cfg";

@@ -386,8 +386,8 @@ mod tests {
 
         let log = std::fs::read_to_string(&log_path).expect("read podman log");
         assert!(log.contains("image exists ghcr.io/lionclaw/codex-runtime:latest"));
-        assert!(log.contains("image exists docker.io/library/haproxy:3.3.5-alpine@sha256:"));
-        assert!(log.contains("pull docker.io/library/haproxy:3.3.5-alpine@sha256:"));
+        assert!(log.contains("image exists docker.io/library/haproxy:3.3.5-alpine"));
+        assert!(log.contains("pull docker.io/library/haproxy:3.3.5-alpine"));
     }
 
     #[cfg(unix)]
