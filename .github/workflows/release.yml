@@ -33,9 +33,7 @@ jobs:
       - name: Fetch tags
         run: git fetch --tags --force
 
-      - uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          components: rustfmt,clippy
+      - uses: ./.github/actions/setup-rust
 
       - name: Resolve release version
         id: version
