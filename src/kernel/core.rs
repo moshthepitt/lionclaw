@@ -5518,19 +5518,6 @@ impl Kernel {
                 if let Err(err) = self.channel_state.complete_turn(turn.turn_id).await {
                     warn!(?err, turn_id = %turn.turn_id, "failed to mark queued channel turn complete");
                 }
-                self.append_audit_event_best_effort(
-                    "channel.turn.completed",
-                    Some(turn.session_id),
-                    "kernel",
-                    json!({
-                        "turn_id": turn.turn_id,
-                        "channel_id": turn.channel_id,
-                        "peer_id": turn.peer_id,
-                        "runtime_id": response.runtime_id,
-                        "assistant_text_len": response.assistant_text.len(),
-                    }),
-                )
-                .await;
                 if let Some(stream_context) = self
                     .channel_stream_context_for_session(
                         turn.session_id,
@@ -5562,6 +5549,19 @@ impl Kernel {
                         warn!(?err, turn_id = %turn.turn_id, "failed to emit queued turn completion event");
                     }
                 }
+                self.append_audit_event_best_effort(
+                    "channel.turn.completed",
+                    Some(turn.session_id),
+                    "kernel",
+                    json!({
+                        "turn_id": turn.turn_id,
+                        "channel_id": turn.channel_id,
+                        "peer_id": turn.peer_id,
+                        "runtime_id": response.runtime_id,
+                        "assistant_text_len": response.assistant_text.len(),
+                    }),
+                )
+                .await;
             }
             Err(err) => {
                 let code = match err {

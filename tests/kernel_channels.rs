@@ -1384,7 +1384,7 @@ async fn channel_runtime_error_event_persists_failed_turn_and_supports_continue(
         .expect("queue failing turn");
     assert_eq!(queued.session_id, Some(session.session_id));
 
-    wait_for_session_turn_count(&kernel, session.session_id, 1).await;
+    wait_for_audit_event_count(&kernel, "channel.turn.failed", 1).await;
     let history = kernel
         .session_history(SessionHistoryRequest {
             session_id: session.session_id,
