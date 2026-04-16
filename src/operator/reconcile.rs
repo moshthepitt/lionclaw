@@ -7,7 +7,7 @@ use crate::{
     config::resolve_project_workspace_root,
     contracts::{ChannelBindRequest, ChannelPeerApproveRequest, ChannelPeerResponse, TrustTier},
     home::{runtime_project_partition_key, LionClawHome},
-    kernel::{Kernel, KernelOptions, RuntimeExecutionPolicy},
+    kernel::{Kernel, KernelError, KernelOptions, RuntimeExecutionPolicy},
     operator::{
         config::{
             normalize_local_source, ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig,
@@ -241,10 +241,7 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
 
     for old_skill in &previous_lock.skills {
         if !next_skill_ids.contains(old_skill.skill_id.as_str()) {
-            kernel
-                .disable_skill(old_skill.skill_id.clone())
-                .await
-                .map_err(to_anyhow)?;
+            disable_stale_skill_if_present(&kernel, &old_skill.skill_id).await?;
         }
     }
 
@@ -787,9 +784,23 @@ fn to_anyhow(err: crate::kernel::KernelError) -> anyhow::Error {
     anyhow!(err.to_string())
 }
 
+async fn disable_stale_skill_if_present(kernel: &Kernel, skill_id: &str) -> Result<()> {
+    let Err(err) = kernel.disable_skill(skill_id.to_string()).await else {
+        return Ok(());
+    };
+
+    match err {
+        KernelError::NotFound(_) => Ok(()),
+        other => Err(to_anyhow(other)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use axum::{routing::get, Json, Router};
     use serde_json::json;
@@ -842,8 +853,29 @@ mod tests {
             .daemon_config_fingerprint
     }
 
+    fn write_channel_skill_fixture(root: &Path, name: &str, description: &str) -> PathBuf {
+        let skill_source = root.join(name);
+        fs::create_dir_all(skill_source.join("scripts")).expect("skill dir");
+        fs::write(
+            skill_source.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n"),
+        )
+        .expect("skill md");
+        fs::write(skill_source.join("scripts/worker"), "#!/usr/bin/env bash\n").expect("worker");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                skill_source.join("scripts/worker"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod worker");
+        }
+        skill_source
+    }
+
     #[cfg(unix)]
-    fn ensure_fake_podman(reference: &std::path::Path) -> std::path::PathBuf {
+    fn ensure_fake_podman(reference: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
         let engine = reference.parent().expect("stub parent").join("podman");
@@ -859,7 +891,7 @@ mod tests {
         engine
     }
 
-    fn test_codex_runtime(runtime_stub: &std::path::Path) -> RuntimeProfileConfig {
+    fn test_codex_runtime(runtime_stub: &Path) -> RuntimeProfileConfig {
         RuntimeProfileConfig::Codex {
             executable: "codex".to_string(),
             model: None,
@@ -992,23 +1024,7 @@ mod tests {
             fs::set_permissions(&runtime_stub, permissions).expect("chmod runtime stub");
         }
 
-        let skill_source = temp_dir.path().join("channel-telegram");
-        fs::create_dir_all(skill_source.join("scripts")).expect("skill dir");
-        fs::write(
-            skill_source.join("SKILL.md"),
-            "---\nname: channel-telegram\ndescription: test\n---\n",
-        )
-        .expect("skill md");
-        fs::write(skill_source.join("scripts/worker"), "#!/usr/bin/env bash\n").expect("worker");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                skill_source.join("scripts/worker"),
-                fs::Permissions::from_mode(0o755),
-            )
-            .expect("chmod worker");
-        }
+        let skill_source = write_channel_skill_fixture(temp_dir.path(), "channel-telegram", "test");
 
         config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
             .into_iter()
@@ -1186,23 +1202,7 @@ mod tests {
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         onboard(&home, None).await.expect("onboard");
 
-        let skill_source = temp_dir.path().join("channel-telegram");
-        fs::create_dir_all(skill_source.join("scripts")).expect("skill dir");
-        fs::write(
-            skill_source.join("SKILL.md"),
-            "---\nname: channel-telegram\ndescription: test\n---\n",
-        )
-        .expect("skill md");
-        fs::write(skill_source.join("scripts/worker"), "#!/usr/bin/env bash\n").expect("worker");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                skill_source.join("scripts/worker"),
-                fs::Permissions::from_mode(0o755),
-            )
-            .expect("chmod worker");
-        }
+        let skill_source = write_channel_skill_fixture(temp_dir.path(), "channel-telegram", "test");
 
         let mut config = OperatorConfig {
             skills: vec![ManagedSkillConfig {
@@ -1250,6 +1250,55 @@ mod tests {
             .expect("load binding")
             .expect("binding remains for audit history");
         assert!(!binding.enabled, "stale channel binding should be disabled");
+    }
+
+    #[tokio::test]
+    async fn apply_tolerates_stale_lockfile_skill_missing_from_kernel_db() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+
+        let skill_source = write_channel_skill_fixture(temp_dir.path(), "channel-telegram", "test");
+
+        let mut config = OperatorConfig {
+            skills: vec![ManagedSkillConfig {
+                alias: "telegram".to_string(),
+                source: skill_source.to_string_lossy().to_string(),
+                reference: "local".to_string(),
+                enabled: true,
+            }],
+            channels: vec![ManagedChannelConfig {
+                id: "telegram".to_string(),
+                skill: "telegram".to_string(),
+                enabled: true,
+                launch_mode: ChannelLaunchMode::Service,
+                required_env: Vec::new(),
+            }],
+            ..OperatorConfig::default()
+        };
+        config.save(&home).await.expect("save config");
+        let applied = apply(&home).await.expect("apply channel");
+        assert_eq!(applied.lockfile.skills.len(), 1);
+
+        tokio::fs::remove_file(home.db_path())
+            .await
+            .expect("remove kernel db");
+
+        config.skills.clear();
+        config.channels.clear();
+        config.save(&home).await.expect("save empty config");
+
+        apply(&home).await.expect("apply stale lockfile cleanup");
+
+        let lockfile = OperatorLockfile::load(&home).await.expect("load lockfile");
+        assert!(
+            lockfile.skills.is_empty(),
+            "lockfile should converge after stale skill cleanup"
+        );
+        assert!(
+            lockfile.channels.is_empty(),
+            "lockfile should converge after stale channel cleanup"
+        );
     }
 
     #[tokio::test]
