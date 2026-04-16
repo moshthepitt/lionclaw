@@ -22,10 +22,7 @@ use crate::kernel::runtime::RuntimeSecretsMount;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OciExecutionBackend;
 
-#[cfg(test)]
-const OCI_IMAGE_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
-#[cfg(not(test))]
-const OCI_IMAGE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const OCI_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 
 // LionClaw bind-mounts local workspace and runtime state into confined OCI
 // containers. On SELinux hosts those mounts are unreadable by default unless
@@ -124,7 +121,7 @@ pub async fn resolve_oci_image_compatibility_identity(engine: &str, image: &str)
             input: String::new(),
         },
         &format!("resolve OCI image identity for '{image}'"),
-        OCI_IMAGE_PROBE_TIMEOUT,
+        OCI_PREFLIGHT_TIMEOUT,
     )
     .await?;
 
@@ -265,7 +262,7 @@ async fn run_oci_image_probe(engine: &str, image: &str) -> Result<OciImageProbeR
             input: String::new(),
         },
         &format!("inspect OCI image '{image}'"),
-        OCI_IMAGE_PROBE_TIMEOUT,
+        OCI_PREFLIGHT_TIMEOUT,
     )
     .await?;
 
@@ -423,7 +420,7 @@ impl OciRuntimeSecretsCleanup {
         let output = run_oci_preflight_command(
             &build_runtime_secret_remove_invocation(&self.engine, &self.secret_name),
             &format!("remove OCI runtime secret '{}'", self.secret_name),
-            OCI_IMAGE_PROBE_TIMEOUT,
+            OCI_PREFLIGHT_TIMEOUT,
         )
         .await?;
 
