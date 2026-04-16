@@ -5,7 +5,7 @@ runs:
   steps:
     - name: Install Rust toolchain
       shell: bash
-      run: rustup toolchain install --no-self-update
+      run: rustup toolchain install --component rustfmt --component clippy --no-self-update
 
     - name: Show Rust toolchain
       shell: bash
