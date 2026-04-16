@@ -158,11 +158,15 @@ Background operation is explicit. If you want long-running channels and auto-res
 Normal user flow:
 
 1. `lionclaw onboard`
-2. `lionclaw runtime add codex --kind codex --bin codex --image ghcr.io/lionclaw/codex-runtime:v1`
-3. `lionclaw run codex`
+2. `podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .`
+3. `codex login`
+4. `lionclaw runtime add codex --kind codex --bin codex --image lionclaw-runtime:v1`
+5. `lionclaw run codex`
 
 Runtime definitions, execution presets, and confinement settings live in
 `~/.lionclaw/config/lionclaw.toml`, not in ad hoc shell configuration.
+If a Codex runtime profile leaves `model` unset, LionClaw falls back to the
+host Codex model for that launch instead of introducing a separate default.
 For now, runtime network policy is intentionally coarse:
 `network-mode = "on"` or `network-mode = "none"`. `on` means the runtime gets a
 private container network, not host networking.
@@ -173,6 +177,23 @@ Presets either mount that whole file or mount no runtime secrets at all with
 `/run/secrets/` with a LionClaw-managed name that starts with
 `lionclaw-runtime-secrets-` inside the confined runtime. LionClaw hardens that
 file to owner-only permissions on Unix before loading it.
+
+Host-only runtime auth comes from the host Codex login itself. Today the
+confined Codex path reads the host Codex auth store, normally
+`~/.codex/auth.json`, preflights it before launch, refreshes it when needed,
+and stages session-local copies of `auth.json` and `config.toml` under
+`/runtime/home/.codex`. Codex then runs in LionClaw's outer Podman sandbox
+using its official external-sandbox mode and talks upstream directly as it
+normally would. The real host Codex home never enters the runtime container.
+Interactive local runs honor `CODEX_HOME` when it is explicitly set in the
+current shell, and `lionclaw service up` persists that same override into the
+managed daemon environment for background jobs and channels.
+If the host Codex login is missing, the fix is `codex login`, not a separate
+LionClaw auth file. The shared OCI runtime image definition lives in
+`containers/runtime/Containerfile` and currently installs `codex` and
+`opencode`. Runtime compatibility now includes the resolved local OCI image
+identity, so rebuilding the same mutable tag still produces a new compatibility
+boundary automatically.
 
 Inside `lionclaw run`, recovery stays command-first:
 

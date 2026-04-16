@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -10,6 +14,7 @@ use super::policy::Capability;
 
 pub mod adapters;
 pub mod builtins;
+mod codex_host_auth;
 pub mod execution;
 
 pub use adapters::{
@@ -17,14 +22,53 @@ pub use adapters::{
     OpenCodeRuntimeConfig,
 };
 pub use builtins::{register_builtin_runtime_adapters, BUILTIN_RUNTIME_MOCK};
+pub use codex_host_auth::{ensure_codex_host_auth_ready, sync_codex_home_into_runtime};
 pub use execution::{
+    resolve_oci_image_compatibility_identity, validate_oci_launch_prerequisites,
     ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionBackend,
     ExecutionLimits, ExecutionOutput, ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner,
     ExecutionPlannerConfig, ExecutionPreset, ExecutionRequest, MountAccess, MountSpec, NetworkMode,
-    OciConfinementConfig, OciExecutionBackend, RuntimeExecutionProfile, RuntimeProgramSpec,
-    RuntimeSecretsMount, WorkspaceAccess, BUILTIN_PRESET_EVERYDAY,
+    OciConfinementConfig, OciExecutionBackend, RuntimeAuthKind, RuntimeExecutionProfile,
+    RuntimeProgramSpec, RuntimeSecretsMount, WorkspaceAccess, BUILTIN_PRESET_EVERYDAY,
     BUILTIN_PRESET_HIDDEN_COMPACTION,
 };
+
+async fn validate_runtime_auth_prerequisites(
+    runtime_id: &str,
+    required_auth: Option<RuntimeAuthKind>,
+    codex_home_override: Option<&Path>,
+) -> Result<()> {
+    let Some(required_auth) = required_auth else {
+        return Ok(());
+    };
+
+    match required_auth {
+        RuntimeAuthKind::Codex => ensure_codex_host_auth_ready(codex_home_override)
+            .await
+            .map_err(|err| {
+                anyhow!(
+                    "configured runtime profile '{}' requires {}",
+                    runtime_id,
+                    err
+                )
+            }),
+    }
+}
+
+pub async fn validate_runtime_launch_prerequisites(
+    runtime_id: &str,
+    confinement: &ConfinementConfig,
+    required_auth: Option<RuntimeAuthKind>,
+    codex_home_override: Option<&Path>,
+) -> Result<()> {
+    validate_runtime_auth_prerequisites(runtime_id, required_auth, codex_home_override).await?;
+
+    match confinement {
+        ConfinementConfig::Oci(config) => {
+            validate_oci_launch_prerequisites(runtime_id, config, required_auth).await
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RuntimeAdapterInfo {
@@ -200,6 +244,7 @@ pub async fn execute_program_backed_turn(
     adapter: &(dyn RuntimeAdapter + Send + Sync),
     plan: EffectiveExecutionPlan,
     runtime_secrets_mount: Option<RuntimeSecretsMount>,
+    codex_home_override: Option<PathBuf>,
     input: RuntimeTurnInput,
     events: RuntimeEventSender,
 ) -> Result<RuntimeTurnResult> {
@@ -210,6 +255,7 @@ pub async fn execute_program_backed_turn(
             plan,
             program,
             runtime_secrets_mount,
+            codex_home_override,
         },
         stdout_tx,
     );

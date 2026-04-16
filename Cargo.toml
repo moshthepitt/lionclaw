@@ -8,6 +8,7 @@ license = "MIT"
 anyhow = "1.0"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["macros", "json"] }
+base64 = "0.22"
 chrono-tz = "0.10"
 cron = "0.12"
 http-body-util = "0.1"
@@ -20,8 +21,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid", "json", "migrate"] }
-rustix = { version = "1.1", features = ["fs"] }
+rustix = { version = "1.1", features = ["fs", "process"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 thiserror = "1.0"
+tempfile = "3.12"
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "signal", "net", "fs", "process"] }
 toml = "0.8"
 tower-http = { version = "0.5", features = ["trace"] }
@@ -29,6 +32,3 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.8", features = ["serde", "v4", "v5"] }
 which = "7.0"
-
-[dev-dependencies]
-tempfile = "3.12"

@@ -40,6 +40,7 @@ pub struct ExecutionRequest {
     pub plan: EffectiveExecutionPlan,
     pub program: RuntimeProgramSpec,
     pub runtime_secrets_mount: Option<RuntimeSecretsMount>,
+    pub codex_home_override: Option<PathBuf>,
 }
 
 impl fmt::Debug for ExecutionRequest {
@@ -48,6 +49,7 @@ impl fmt::Debug for ExecutionRequest {
             .field("plan", &self.plan)
             .field("program", &self.program)
             .field("runtime_secrets_mount", &self.runtime_secrets_mount)
+            .field("codex_home_override", &self.codex_home_override)
             .finish()
     }
 }
@@ -111,16 +113,19 @@ mod tests {
                     args: vec!["exec".to_string()],
                     environment: vec![("OPENAI_API_KEY".to_string(), "sk-secret".to_string())],
                     stdin: "hello".to_string(),
+                    auth: None,
                 },
                 runtime_secrets_mount: Some(super::RuntimeSecretsMount {
                     source: "/tmp/runtime-secrets.env".into(),
                 }),
+                codex_home_override: Some("/tmp/test-codex-home".into()),
             }
         );
 
         assert!(!debug.contains("ghp_secret"));
         assert!(!debug.contains("sk-secret"));
         assert!(!debug.contains("hello"));
+        assert!(debug.contains("codex_home_override"));
     }
 
     #[test]

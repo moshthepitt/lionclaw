@@ -35,8 +35,8 @@ that complexity into the core.
 
 LionClaw records a durable audit trail for the actions that pass through the
 core. You can inspect what the model executed, when it executed it, and why the
-system allowed it. No hidden background magic, no invisible sidecar doing work
-behind your back.
+system allowed it. No hidden background actions, no invisible worker mutating
+state behind your back.
 
 ## Spin Up Your Orchestrator
 
@@ -49,11 +49,17 @@ git clone https://github.com/moshthepitt/lionclaw.git
 cd lionclaw
 cargo build --release
 
-# 2. Initialize your local environment
+# 2. Build the shared runtime image with an immutable tag
+podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .
+
+# 3. Initialize your local environment
 ./target/release/lionclaw onboard
 
-# 3. Attach a model and start executing
-./target/release/lionclaw runtime add codex --kind codex --bin codex --image ghcr.io/lionclaw/codex-runtime:v1
+# 4. Sign in to Codex once on the host
+codex login
+
+# 5. Attach a model and start executing
+./target/release/lionclaw runtime add codex --kind codex --bin codex --image lionclaw-runtime:v1
 ./target/release/lionclaw run codex
 ```
 
@@ -61,6 +67,8 @@ cargo build --release
 LionClaw keeps its own continuity, runtime state, services, and config under
 `LIONCLAW_HOME`, while the confined runtime sees the project itself at
 `/workspace`.
+If the runtime profile leaves `model` unset, LionClaw reuses the current host
+Codex model for that launch instead of forcing a second model setting.
 
 Continue the latest local session for the current project instead of starting fresh:
 
@@ -219,14 +227,34 @@ When mounted, Podman places it under `/run/secrets/` with a LionClaw-managed
 name that starts with `lionclaw-runtime-secrets-`. Keep the source file
 owner-only; LionClaw hardens it to `0600` on Unix before handing it to Podman.
 
+Host-only runtime auth for confined Codex runs comes from the host Codex login
+state. LionClaw reads the host Codex auth store, normally
+`~/.codex/auth.json`,
+preflights that host auth before Codex launch paths, refreshes it when needed,
+and stages a session-local copy of `auth.json` and `config.toml` under
+`/runtime/home/.codex` inside the confined runtime state. Codex then talks
+upstream directly as it normally would, while LionClaw provides the outer
+Podman confinement boundary and launches Codex in its official
+external-sandbox mode. The real host `~/.codex` directory is never mounted
+into the container. If Codex is not logged in yet, sign in once locally with
+`codex login` and rerun LionClaw.
+
 `lionclaw runtime add` configures the runtime command that runs inside the
 runtime image, plus the concrete host `podman` executable and image LionClaw
-uses to launch it. Execution policy remains config-owned in LionClaw state, not
-ambient shell state.
+uses to launch it. The shared runtime image definition lives at
+`containers/runtime/Containerfile` and currently installs `codex` and
+`opencode`. `runtime add` validates the runtime profile itself, but the live
+host Codex login is only required when LionClaw actually launches Codex. Runtime
+compatibility keys include the resolved local OCI image identity, so rebuilding
+the same mutable tag creates a new compatibility boundary automatically.
+Execution policy remains config-owned in LionClaw state, not ambient shell
+state.
 
 `lionclaw service up` persists the project root you launch it from so the
 background daemon, session reuse, and confined runtimes keep operating on that
-same project.
+same project. If you launch `service up` with an explicit `CODEX_HOME`, LionClaw
+persists that override into the managed daemon environment so background jobs
+and channels keep using the same host Codex home you validated interactively.
 
 Daemon/service plumbing recognizes these env vars:
 
@@ -242,6 +270,7 @@ Dive deeper:
 - [Architecture](docs/ARCHITECTURE.md) - how the trusted core isolates state, policy, and runtime control
 - [Binary Model](docs/BINARY_RUNTIME_AGNOSTIC_MODEL.md) - the product and runtime model behind `lionclaw run`
 - [Continuity Model](docs/CONTINUITY_MODEL.md) - how LionClaw keeps visible assistant continuity without hidden memory state
+- [Manual QA](docs/MANUAL_QA.md) - repeatable live smoke process for runtime, daemon, terminal, jobs, secrets, and project isolation
 - [Release Process](docs/RELEASE.md) - how releases are prepared and published
 - [Roadmap](docs/ROADMAP.md) - what comes next, from channel skills to background automation
 - [Scripts](scripts/README.md) - helper scripts for local setup and testing

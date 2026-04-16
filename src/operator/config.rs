@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::home::{
     daemon_compat_partition_key, runtime_profile_partition_key, LionClawHome, DEFAULT_WORKSPACE,
 };
-use crate::kernel::runtime::{ConfinementConfig, ExecutionPreset, RuntimeExecutionProfile};
+use crate::kernel::runtime::{
+    ConfinementConfig, ExecutionPreset, RuntimeAuthKind, RuntimeExecutionProfile,
+};
 use crate::kernel::skills::sanitize_skill_name;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -234,11 +236,28 @@ struct DaemonCompatConfig {
     workspace_name: String,
     default_runtime_id: Option<String>,
     default_preset_name: Option<String>,
+    codex_home_override: Option<String>,
     execution_presets: BTreeMap<String, ExecutionPreset>,
     runtime_profiles: BTreeMap<String, RuntimeProfileConfig>,
+    runtime_image_identities: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeCompatConfig {
+    version: u32,
+    profile: RuntimeProfileConfig,
+    runtime_auth_identity: Option<String>,
 }
 
 pub fn daemon_compat_fingerprint(config: &OperatorConfig) -> String {
+    daemon_compat_fingerprint_with_runtime_context(config, None, &BTreeMap::new())
+}
+
+pub fn daemon_compat_fingerprint_with_runtime_context(
+    config: &OperatorConfig,
+    codex_home_override: Option<&Path>,
+    runtime_image_identities: &BTreeMap<String, String>,
+) -> String {
     let mut normalized = config.clone();
     normalized.normalize();
     let encoded = serde_json::to_vec(&DaemonCompatConfig {
@@ -246,8 +265,10 @@ pub fn daemon_compat_fingerprint(config: &OperatorConfig) -> String {
         workspace_name: normalized.daemon.workspace.clone(),
         default_runtime_id: normalized.defaults.runtime.clone(),
         default_preset_name: normalized.defaults.preset.clone(),
+        codex_home_override: codex_home_override.map(|path| path.display().to_string()),
         execution_presets: normalized.presets,
         runtime_profiles: normalized.runtimes,
+        runtime_image_identities: runtime_image_identities.clone(),
     })
     .expect("daemon compatibility config should always serialize");
     daemon_compat_partition_key(&encoded)
@@ -389,18 +410,66 @@ impl RuntimeProfileConfig {
         }
     }
 
-    pub fn execution_profile(&self) -> RuntimeExecutionProfile {
-        RuntimeExecutionProfile {
-            confinement: self.confinement().clone(),
-            compatibility_key: self.compatibility_key(),
+    pub fn required_runtime_auth(&self) -> Option<RuntimeAuthKind> {
+        match self {
+            Self::Codex {
+                confinement: ConfinementConfig::Oci(_),
+                ..
+            } => Some(RuntimeAuthKind::Codex),
+            Self::OpenCode { .. } => None,
         }
     }
 
+    pub fn execution_profile(&self) -> RuntimeExecutionProfile {
+        self.execution_profile_with_runtime_context(None, None)
+    }
+
+    pub fn execution_profile_with_image_identity(
+        &self,
+        image_identity: Option<&str>,
+    ) -> RuntimeExecutionProfile {
+        self.execution_profile_with_runtime_context(image_identity, None)
+    }
+
+    pub fn execution_profile_with_runtime_context(
+        &self,
+        image_identity: Option<&str>,
+        runtime_auth_identity: Option<&str>,
+    ) -> RuntimeExecutionProfile {
+        RuntimeExecutionProfile::new(
+            self.confinement().clone(),
+            self.compatibility_base_key(runtime_auth_identity),
+            image_identity.map(str::to_string),
+            self.required_runtime_auth(),
+        )
+    }
+
     pub fn compatibility_key(&self) -> String {
+        self.compatibility_key_with_runtime_context(None, None)
+    }
+
+    pub fn compatibility_key_with_image_identity(&self, image_identity: Option<&str>) -> String {
+        self.compatibility_key_with_runtime_context(image_identity, None)
+    }
+
+    pub fn compatibility_key_with_runtime_context(
+        &self,
+        image_identity: Option<&str>,
+        runtime_auth_identity: Option<&str>,
+    ) -> String {
+        self.execution_profile_with_runtime_context(image_identity, runtime_auth_identity)
+            .compatibility_key
+    }
+
+    fn compatibility_base_key(&self, runtime_auth_identity: Option<&str>) -> String {
         let mut normalized = self.clone();
         normalized.normalize();
-        let encoded = serde_json::to_vec(&normalized)
-            .expect("runtime profile config should always serialize");
+        let encoded = serde_json::to_vec(&RuntimeCompatConfig {
+            version: 1,
+            profile: normalized,
+            runtime_auth_identity: runtime_auth_identity.map(str::to_string),
+        })
+        .expect("runtime profile config should always serialize");
         runtime_profile_partition_key(&encoded)
     }
 
@@ -624,10 +693,13 @@ fn ensure_podman_executable(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeMap, path::Path};
+
     use super::{
-        daemon_compat_fingerprint, derive_skill_alias, normalize_host_executable,
-        normalize_local_source, normalize_runtime_command, validate_host_executable,
-        ChannelLaunchMode, ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig,
+        daemon_compat_fingerprint, daemon_compat_fingerprint_with_runtime_context,
+        derive_skill_alias, normalize_host_executable, normalize_local_source,
+        normalize_runtime_command, validate_host_executable, ChannelLaunchMode,
+        ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig,
     };
     use crate::kernel::runtime::{
         ConfinementConfig, ExecutionPreset, NetworkMode, OciConfinementConfig, WorkspaceAccess,
@@ -766,6 +838,40 @@ mod tests {
     }
 
     #[test]
+    fn runtime_compatibility_key_changes_when_image_identity_changes() {
+        let runtime = RuntimeProfileConfig::Codex {
+            executable: "codex".to_string(),
+            model: None,
+            confinement: sample_confinement(),
+        };
+
+        assert_ne!(
+            runtime.compatibility_key_with_image_identity(Some("sha256:left")),
+            runtime.compatibility_key_with_image_identity(Some("sha256:right"))
+        );
+    }
+
+    #[test]
+    fn runtime_compatibility_key_changes_when_codex_home_identity_changes() {
+        let runtime = RuntimeProfileConfig::Codex {
+            executable: "codex".to_string(),
+            model: None,
+            confinement: sample_confinement(),
+        };
+
+        assert_ne!(
+            runtime.compatibility_key_with_runtime_context(
+                Some("sha256:runtime"),
+                Some("codex-home:/tmp/codex-a"),
+            ),
+            runtime.compatibility_key_with_runtime_context(
+                Some("sha256:runtime"),
+                Some("codex-home:/tmp/codex-b"),
+            )
+        );
+    }
+
+    #[test]
     fn daemon_compat_fingerprint_changes_when_default_runtime_changes() {
         let runtime = RuntimeProfileConfig::Codex {
             executable: "codex".to_string(),
@@ -807,6 +913,51 @@ mod tests {
         assert_ne!(
             daemon_compat_fingerprint(&left),
             daemon_compat_fingerprint(&right)
+        );
+    }
+
+    #[test]
+    fn daemon_compat_fingerprint_changes_when_codex_home_override_changes() {
+        let runtime = RuntimeProfileConfig::Codex {
+            executable: "codex".to_string(),
+            model: None,
+            confinement: sample_confinement(),
+        };
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), runtime);
+
+        assert_ne!(
+            daemon_compat_fingerprint_with_runtime_context(
+                &config,
+                Some(Path::new("/tmp/codex-a")),
+                &BTreeMap::new(),
+            ),
+            daemon_compat_fingerprint_with_runtime_context(
+                &config,
+                Some(Path::new("/tmp/codex-b")),
+                &BTreeMap::new(),
+            )
+        );
+    }
+
+    #[test]
+    fn daemon_compat_fingerprint_changes_when_runtime_image_identity_changes() {
+        let runtime = RuntimeProfileConfig::Codex {
+            executable: "codex".to_string(),
+            model: None,
+            confinement: sample_confinement(),
+        };
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), runtime);
+
+        let mut left = BTreeMap::new();
+        left.insert("codex".to_string(), "sha256:left".to_string());
+        let mut right = BTreeMap::new();
+        right.insert("codex".to_string(), "sha256:right".to_string());
+
+        assert_ne!(
+            daemon_compat_fingerprint_with_runtime_context(&config, None, &left),
+            daemon_compat_fingerprint_with_runtime_context(&config, None, &right)
         );
     }
 

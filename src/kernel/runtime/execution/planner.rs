@@ -1,13 +1,15 @@
 use std::{collections::BTreeMap, fmt, path::PathBuf, time::Duration};
 
+use serde::Serialize;
 use uuid::Uuid;
 
+use crate::home::runtime_profile_partition_key;
 use crate::home::{runtime_project_drafts_dir_from_parts, runtime_session_state_dir_from_parts};
 use crate::kernel::runtime_policy::{RuntimeExecutionPolicy, RuntimeExecutionRequest};
 
 use super::plan::{
     ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset, MountAccess, MountSpec,
-    OciConfinementConfig, WorkspaceAccess,
+    OciConfinementConfig, RuntimeAuthKind, WorkspaceAccess,
 };
 
 pub const BUILTIN_PRESET_EVERYDAY: &str = "everyday";
@@ -19,16 +21,69 @@ const DRAFTS_MOUNT_TARGET: &str = "/drafts";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeExecutionProfile {
     pub confinement: ConfinementConfig,
+    pub compatibility_base_key: String,
     pub compatibility_key: String,
+    pub image_identity: Option<String>,
+    pub required_runtime_auth: Option<RuntimeAuthKind>,
 }
 
 impl Default for RuntimeExecutionProfile {
     fn default() -> Self {
+        let compatibility_base_key = "runtime-default".to_string();
         Self {
             confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
-            compatibility_key: "runtime-default".to_string(),
+            compatibility_key: runtime_compatibility_key(&compatibility_base_key, None),
+            compatibility_base_key,
+            image_identity: None,
+            required_runtime_auth: None,
         }
     }
+}
+
+impl RuntimeExecutionProfile {
+    pub fn new(
+        confinement: ConfinementConfig,
+        compatibility_base_key: String,
+        image_identity: Option<String>,
+        required_runtime_auth: Option<RuntimeAuthKind>,
+    ) -> Self {
+        let compatibility_key =
+            runtime_compatibility_key(&compatibility_base_key, image_identity.as_deref());
+        Self {
+            confinement,
+            compatibility_base_key,
+            compatibility_key,
+            image_identity,
+            required_runtime_auth,
+        }
+    }
+
+    pub fn with_image_identity(mut self, image_identity: String) -> Self {
+        self.compatibility_key =
+            runtime_compatibility_key(&self.compatibility_base_key, Some(&image_identity));
+        self.image_identity = Some(image_identity);
+        self
+    }
+}
+
+#[derive(Serialize)]
+struct RuntimeImageCompatibilityConfig<'a> {
+    version: u32,
+    compatibility_base_key: &'a str,
+    image_identity: &'a str,
+}
+
+fn runtime_compatibility_key(compatibility_base_key: &str, image_identity: Option<&str>) -> String {
+    let Some(image_identity) = image_identity else {
+        return compatibility_base_key.to_string();
+    };
+    let encoded = serde_json::to_vec(&RuntimeImageCompatibilityConfig {
+        version: 1,
+        compatibility_base_key,
+        image_identity,
+    })
+    .expect("runtime image compatibility config should always serialize");
+    runtime_profile_partition_key(&encoded)
 }
 
 #[derive(Clone)]
@@ -128,6 +183,19 @@ impl ExecutionPlanner {
     }
 
     pub fn plan(&self, request: ExecutionPlanRequest) -> Result<EffectiveExecutionPlan, String> {
+        let runtime_profile = self
+            .runtimes
+            .get(&request.runtime_id)
+            .cloned()
+            .unwrap_or_default();
+        self.plan_with_runtime_profile(request, runtime_profile)
+    }
+
+    pub fn plan_with_runtime_profile(
+        &self,
+        request: ExecutionPlanRequest,
+        runtime_profile: RuntimeExecutionProfile,
+    ) -> Result<EffectiveExecutionPlan, String> {
         let execution_context = self.policy.evaluate(
             &request.runtime_id,
             RuntimeExecutionRequest::new(
@@ -138,11 +206,6 @@ impl ExecutionPlanner {
             self.default_idle_timeout,
             self.default_hard_timeout,
         )?;
-        let runtime_profile = self
-            .runtimes
-            .get(&request.runtime_id)
-            .cloned()
-            .unwrap_or_default();
         let (preset_name, preset) =
             self.resolve_preset(request.preset_name.as_deref(), request.purpose)?;
         let mounts = self.build_mounts(
@@ -229,6 +292,16 @@ impl ExecutionPlanner {
             BUILTIN_PRESET_EVERYDAY.to_string(),
             ExecutionPreset::default(),
         ))
+    }
+
+    pub fn required_runtime_auth(&self, runtime_id: &str) -> Option<RuntimeAuthKind> {
+        self.runtimes
+            .get(runtime_id)
+            .and_then(|profile| profile.required_runtime_auth)
+    }
+
+    pub fn runtime_profile(&self, runtime_id: &str) -> Option<&RuntimeExecutionProfile> {
+        self.runtimes.get(runtime_id)
     }
 
     fn build_mounts(
@@ -450,13 +523,15 @@ mod tests {
         };
         let runtimes = [(
             "codex".to_string(),
-            RuntimeExecutionProfile {
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+            RuntimeExecutionProfile::new(
+                ConfinementConfig::Oci(OciConfinementConfig {
                     additional_mounts: vec![extra_mount.clone()],
                     ..OciConfinementConfig::default()
                 }),
-                compatibility_key: "runtime-codex-v1".to_string(),
-            },
+                "runtime-codex-v1".to_string(),
+                None,
+                None,
+            ),
         )]
         .into_iter()
         .collect();

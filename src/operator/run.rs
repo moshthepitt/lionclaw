@@ -18,7 +18,7 @@ use crate::{
     kernel::Kernel,
     operator::{
         reconcile::{apply, onboard, open_runtime_kernel, render_runtime_cache},
-        runtime::{resolve_runtime_id, validate_runtime_availability},
+        runtime::{resolve_runtime_id, validate_runtime_launch_prerequisites},
     },
 };
 
@@ -49,9 +49,10 @@ pub(crate) async fn run_local_with_io<R: BufRead, W: Write>(
     output: &mut W,
 ) -> Result<()> {
     onboard(home, None).await?;
+    let config = crate::operator::config::OperatorConfig::load(home).await?;
+    let runtime_id = resolve_runtime_id(&config, requested_runtime.as_deref())?;
+    validate_runtime_launch_prerequisites(home, &config, &runtime_id).await?;
     let applied = apply(home).await?;
-    let runtime_id = resolve_runtime_id(&applied.config, requested_runtime.as_deref())?;
-    validate_runtime_availability(&applied.config, &runtime_id)?;
     render_runtime_cache(home, &applied.config, &applied.lockfile, &runtime_id).await?;
 
     let kernel = open_runtime_kernel(home, &applied.config, Some(runtime_id.clone())).await?;
@@ -497,7 +498,10 @@ mod tests {
             runtime::{ConfinementConfig, OciConfinementConfig},
             Kernel, KernelOptions,
         },
-        operator::config::{OperatorConfig, RuntimeProfileConfig},
+        operator::{
+            config::{ManagedSkillConfig, OperatorConfig, RuntimeProfileConfig},
+            lockfile::OperatorLockfile,
+        },
     };
 
     #[cfg(unix)]
@@ -517,6 +521,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
+        write_codex_runtime_auth(&home).await;
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
         let mut output = Vec::new();
@@ -560,6 +565,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
+        write_codex_runtime_auth(&home).await;
 
         let mut first_input = Cursor::new(b"hello\n/exit\n".to_vec());
         let mut first_output = Vec::new();
@@ -605,6 +611,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
+        write_codex_runtime_auth(&home).await;
 
         let mut first_input = Cursor::new(b"hello\n/exit\n".to_vec());
         let mut first_output = Vec::new();
@@ -684,6 +691,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
+        write_codex_runtime_auth(&home).await;
         let pool = Db::connect_file(&home.db_path())
             .await
             .expect("connect db")
@@ -778,6 +786,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
+        write_codex_runtime_auth(&home).await;
 
         let mut input = Cursor::new(b"/reset\n/exit\n".to_vec());
         let mut output = Vec::new();
@@ -814,6 +823,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
+        write_codex_runtime_auth(&home).await;
 
         let mut input = Cursor::new(b"/exit\n".to_vec());
         let mut output = Vec::new();
@@ -873,6 +883,51 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         assert!(err.to_string().contains("configured runtime profile"));
     }
 
+    #[tokio::test]
+    async fn run_local_errors_when_codex_runtime_auth_is_missing() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let stub = temp_dir.path().join("codex-stub.sh");
+        fs::write(&stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(&stub, permissions).expect("chmod");
+        }
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
+        let skill_source = temp_dir.path().join("test-skill");
+        fs::create_dir_all(&skill_source).expect("skill dir");
+        fs::write(
+            skill_source.join("SKILL.md"),
+            "---\nname: test-skill\ndescription: test\n---\n",
+        )
+        .expect("skill md");
+        config.skills.push(ManagedSkillConfig {
+            alias: "test-skill".to_string(),
+            source: skill_source.display().to_string(),
+            reference: "local".to_string(),
+            enabled: true,
+        });
+        config.save(&home).await.expect("save config");
+
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let err = run_local_with_io(&home, None, false, &mut input, &mut output)
+            .await
+            .expect_err("missing runtime auth should error");
+
+        assert!(err.to_string().contains("codex login"));
+        assert!(err.to_string().contains("auth.json"));
+        let lockfile = OperatorLockfile::load(&home).await.expect("load lockfile");
+        assert!(
+            lockfile.skills.is_empty(),
+            "auth preflight should fail before apply() installs skill snapshots"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn run_local_streams_codex_reasoning_and_answer_lanes() {
@@ -891,6 +946,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
+        write_codex_runtime_auth(&home).await;
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
         let mut output = Vec::new();
@@ -931,6 +987,66 @@ echo '{"type":"response.output_text.delta","text":"hello from opencode"}'
         assert!(output.contains("runtime: opencode"));
         assert!(output.contains("lionclaw> hello from opencode"));
         assert!(!output.contains("[status] opencode event: response.output_text.delta"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_local_ignores_unselected_runtime_image_probe_failures() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let healthy_dir = temp_dir.path().join("healthy-runtime");
+        fs::create_dir_all(&healthy_dir).expect("healthy runtime dir");
+        let opencode_stub = healthy_dir.join("opencode-stub.sh");
+        write_script(
+            &opencode_stub,
+            r#"#!/usr/bin/env bash
+cat >/dev/null
+echo '{"type":"response.output_text.delta","text":"hello from opencode"}'
+"#,
+        );
+        let broken_podman = temp_dir.path().join("podman");
+        write_script(
+            &broken_podman,
+            r#"#!/usr/bin/env bash
+if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
+  echo "storage denied" >&2
+  exit 1
+fi
+exit 0
+"#,
+        );
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "codex".to_string(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: broken_podman.to_string_lossy().to_string(),
+                    image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+        config.upsert_runtime(
+            "opencode".to_string(),
+            stubbed_opencode_runtime(&opencode_stub),
+        );
+        config
+            .set_default_runtime("opencode")
+            .expect("set default runtime");
+        config.save(&home).await.expect("save config");
+
+        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut output = Vec::new();
+        run_local_with_io(&home, None, false, &mut input, &mut output)
+            .await
+            .expect("run local");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("runtime: opencode"));
+        assert!(output.contains("lionclaw> hello from opencode"));
     }
 
     #[cfg(unix)]
@@ -1016,6 +1132,7 @@ exit 7
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
         config.save(&home).await.expect("save config");
+        write_codex_runtime_auth(&home).await;
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
         let mut output = Vec::new();
@@ -1106,16 +1223,35 @@ command_name="${1:-}"
 shift || true
 
 case "${command_name}" in
+  image)
+    subcommand="${1:-}"
+    shift || true
+    case "${subcommand}" in
+      inspect)
+        printf 'sha256:test-runtime-image\n'
+        exit 0
+        ;;
+      exists)
+        exit 0
+        ;;
+      *)
+        exit 0
+        ;;
+    esac
+    ;;
   secret)
     exit 0
     ;;
   run)
     while [ "$#" -gt 0 ]; do
       case "$1" in
-        --rm|--interactive|--read-only)
+        --rm|--interactive|--read-only|--detach)
           shift
           ;;
-        --network|--workdir|--volume|--tmpfs|--env|--secret|--memory|--cpus|--pids-limit)
+        --network|--workdir|--tmpfs|--env|--secret|--memory|--cpus|--pids-limit|--pod|--name|--userns|--user)
+          shift 2
+          ;;
+        --volume)
           shift 2
           ;;
         --)
@@ -1131,6 +1267,9 @@ case "${command_name}" in
           ;;
       esac
     done
+    if [ "$#" -eq 1 ]; then
+      exit 0
+    fi
     exec "$@"
     ;;
   *)
@@ -1153,6 +1292,21 @@ esac
                 ..OciConfinementConfig::default()
             }),
         }
+    }
+
+    async fn write_codex_runtime_auth(home: &LionClawHome) {
+        let codex_home = home.root().join(".codex");
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create codex home");
+        tokio::fs::write(
+            codex_home.join("auth.json"),
+            r#"{
+  "OPENAI_API_KEY": "sk-test"
+}"#,
+        )
+        .await
+        .expect("write codex runtime auth");
     }
 
     fn stubbed_opencode_runtime(executable: &std::path::Path) -> RuntimeProfileConfig {

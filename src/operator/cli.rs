@@ -29,7 +29,10 @@ use crate::{
             resolve_stack_binaries, status, up, OnboardBindSelection,
         },
         run::run_local,
-        runtime::resolve_runtime_id,
+        runtime::{
+            resolve_runtime_id, validate_runtime_availability,
+            validate_runtime_launch_prerequisites,
+        },
         services::SystemdUserServiceManager,
     },
 };
@@ -387,6 +390,7 @@ pub async fn run() -> Result<()> {
                 let profile = build_runtime_profile(&args, executable)?;
                 let mut config = OperatorConfig::load(&home).await?;
                 config.upsert_runtime(args.id.clone(), profile);
+                validate_runtime_availability(&config, &args.id)?;
                 config.save(&home).await?;
                 println!("configured runtime {}", args.id);
             }
@@ -725,10 +729,10 @@ pub async fn run() -> Result<()> {
             }
         }
         Command::Job { command } => {
-            let applied = apply(&home).await?;
+            let config = OperatorConfig::load(&home).await?;
             match command {
                 JobCommand::Run(args) => {
-                    let kernel = open_runtime_kernel(&home, &applied.config, None).await?;
+                    let kernel = open_runtime_kernel(&home, &config, None).await?;
                     let job_id = parse_job_id(&args.job_id)?;
                     let response = kernel.run_job_now(JobRefRequest { job_id }).await?;
                     println!(
@@ -737,136 +741,140 @@ pub async fn run() -> Result<()> {
                     );
                 }
                 JobCommand::Tick => {
-                    let kernel = open_runtime_kernel(&home, &applied.config, None).await?;
+                    let kernel = open_runtime_kernel(&home, &config, None).await?;
                     let response = kernel.scheduler_tick().await?;
                     println!("claimed {} scheduled runs", response.claimed_runs);
                 }
-                other => {
-                    let kernel = open_kernel(&home, &applied.config, None).await?;
-                    match other {
-                        JobCommand::Add(args) => {
-                            let args = *args;
-                            let runtime_id =
-                                resolve_runtime_id(&applied.config, args.runtime.as_deref())?;
-                            let prompt_text =
-                                load_job_prompt(args.prompt, args.prompt_file).await?;
-                            let schedule =
-                                parse_job_schedule_spec(&args.schedule, args.tz.as_deref())?;
-                            let delivery = match (args.deliver_channel, args.deliver_peer) {
-                                (None, None) => None,
-                                (Some(channel_id), Some(peer_id)) => {
-                                    Some(crate::contracts::JobDeliveryTargetDto {
-                                        channel_id,
-                                        peer_id,
-                                    })
-                                }
-                                _ => {
-                                    return Err(anyhow!(
+                other => match other {
+                    JobCommand::Add(args) => {
+                        let args = *args;
+                        let runtime_id = resolve_runtime_id(&config, args.runtime.as_deref())?;
+                        validate_runtime_launch_prerequisites(&home, &config, &runtime_id).await?;
+                        let applied = apply(&home).await?;
+                        let kernel = open_kernel(&home, &applied.config, None).await?;
+                        let prompt_text = load_job_prompt(args.prompt, args.prompt_file).await?;
+                        let schedule = parse_job_schedule_spec(&args.schedule, args.tz.as_deref())?;
+                        let delivery = match (args.deliver_channel, args.deliver_peer) {
+                            (None, None) => None,
+                            (Some(channel_id), Some(peer_id)) => {
+                                Some(crate::contracts::JobDeliveryTargetDto {
+                                    channel_id,
+                                    peer_id,
+                                })
+                            }
+                            _ => {
+                                return Err(anyhow!(
                                         "--deliver-channel and --deliver-peer must be provided together"
                                     ));
-                                }
-                            };
-                            let skill_ids = resolve_job_skill_ids(&applied.lockfile, &args.skills)?;
-                            let response = kernel
-                                .create_job(JobCreateRequest {
-                                    name: args.name,
-                                    runtime_id,
-                                    schedule,
-                                    prompt_text,
-                                    skill_ids,
-                                    allow_capabilities: args.allow_capabilities,
-                                    delivery,
-                                    retry_attempts: args.retry_attempts,
-                                })
-                                .await?;
-                            println!(
-                                "created job {} next_run_at={}",
-                                response.job.job_id,
-                                response
-                                    .job
-                                    .next_run_at
-                                    .map(|value| value.to_rfc3339())
-                                    .unwrap_or_else(|| "-".to_string())
-                            );
-                        }
-                        JobCommand::Ls => {
-                            for job in kernel.list_jobs().await?.jobs {
-                                println!(
-                                    "job={} enabled={} runtime={} next_run_at={} status={}",
-                                    job.job_id,
-                                    job.enabled,
-                                    job.runtime_id,
-                                    job.next_run_at
-                                        .map(|value| value.to_rfc3339())
-                                        .unwrap_or_else(|| "-".to_string()),
-                                    job.last_status
-                                        .map(|value| value.as_str().to_string())
-                                        .unwrap_or_else(|| "-".to_string()),
-                                );
                             }
-                        }
-                        JobCommand::Show(args) => {
-                            let job_id = parse_job_id(&args.job_id)?;
-                            let job = kernel.get_job(job_id).await?.job;
-                            println!("job={}", job.job_id);
-                            println!("name={}", job.name);
-                            println!("enabled={}", job.enabled);
-                            println!("runtime={}", job.runtime_id);
+                        };
+                        let skill_ids = resolve_job_skill_ids(&applied.lockfile, &args.skills)?;
+                        let response = kernel
+                            .create_job(JobCreateRequest {
+                                name: args.name,
+                                runtime_id,
+                                schedule,
+                                prompt_text,
+                                skill_ids,
+                                allow_capabilities: args.allow_capabilities,
+                                delivery,
+                                retry_attempts: args.retry_attempts,
+                            })
+                            .await?;
+                        println!(
+                            "created job {} next_run_at={}",
+                            response.job.job_id,
+                            response
+                                .job
+                                .next_run_at
+                                .map(|value| value.to_rfc3339())
+                                .unwrap_or_else(|| "-".to_string())
+                        );
+                    }
+                    JobCommand::Ls => {
+                        let kernel = open_kernel(&home, &config, None).await?;
+                        for job in kernel.list_jobs().await?.jobs {
                             println!(
-                                "next_run_at={}",
+                                "job={} enabled={} runtime={} next_run_at={} status={}",
+                                job.job_id,
+                                job.enabled,
+                                job.runtime_id,
                                 job.next_run_at
                                     .map(|value| value.to_rfc3339())
-                                    .unwrap_or_else(|| "-".to_string())
+                                    .unwrap_or_else(|| "-".to_string()),
+                                job.last_status
+                                    .map(|value| value.as_str().to_string())
+                                    .unwrap_or_else(|| "-".to_string()),
                             );
+                        }
+                    }
+                    JobCommand::Show(args) => {
+                        let kernel = open_kernel(&home, &config, None).await?;
+                        let job_id = parse_job_id(&args.job_id)?;
+                        let job = kernel.get_job(job_id).await?.job;
+                        println!("job={}", job.job_id);
+                        println!("name={}", job.name);
+                        println!("enabled={}", job.enabled);
+                        println!("runtime={}", job.runtime_id);
+                        println!(
+                            "next_run_at={}",
+                            job.next_run_at
+                                .map(|value| value.to_rfc3339())
+                                .unwrap_or_else(|| "-".to_string())
+                        );
+                        println!(
+                            "delivery={}",
+                            job.delivery
+                                .map(|value| format!("{}:{}", value.channel_id, value.peer_id))
+                                .unwrap_or_else(|| "-".to_string())
+                        );
+                    }
+                    JobCommand::Pause(args) => {
+                        let kernel = open_kernel(&home, &config, None).await?;
+                        let job_id = parse_job_id(&args.job_id)?;
+                        let response = kernel.pause_job(job_id).await?;
+                        println!("paused {}", response.job.job_id);
+                    }
+                    JobCommand::Resume(args) => {
+                        let kernel = open_kernel(&home, &config, None).await?;
+                        let job_id = parse_job_id(&args.job_id)?;
+                        let response = kernel.resume_job(job_id).await?;
+                        println!(
+                            "resumed {} next_run_at={}",
+                            response.job.job_id,
+                            response
+                                .job
+                                .next_run_at
+                                .map(|value| value.to_rfc3339())
+                                .unwrap_or_else(|| "-".to_string())
+                        );
+                    }
+                    JobCommand::Rm(args) => {
+                        let kernel = open_kernel(&home, &config, None).await?;
+                        let job_id = parse_job_id(&args.job_id)?;
+                        let response = kernel.remove_job(job_id).await?;
+                        println!(
+                            "{} {}",
+                            if response.removed {
+                                "removed"
+                            } else {
+                                "left unchanged"
+                            },
+                            response.job_id
+                        );
+                    }
+                    JobCommand::Runs(args) => {
+                        let kernel = open_kernel(&home, &config, None).await?;
+                        let job_id = parse_job_id(&args.job_id)?;
+                        for run in kernel
+                            .list_job_runs(JobRunsRequest {
+                                job_id,
+                                limit: Some(args.limit),
+                            })
+                            .await?
+                            .runs
+                        {
                             println!(
-                                "delivery={}",
-                                job.delivery
-                                    .map(|value| format!("{}:{}", value.channel_id, value.peer_id))
-                                    .unwrap_or_else(|| "-".to_string())
-                            );
-                        }
-                        JobCommand::Pause(args) => {
-                            let job_id = parse_job_id(&args.job_id)?;
-                            let response = kernel.pause_job(job_id).await?;
-                            println!("paused {}", response.job.job_id);
-                        }
-                        JobCommand::Resume(args) => {
-                            let job_id = parse_job_id(&args.job_id)?;
-                            let response = kernel.resume_job(job_id).await?;
-                            println!(
-                                "resumed {} next_run_at={}",
-                                response.job.job_id,
-                                response
-                                    .job
-                                    .next_run_at
-                                    .map(|value| value.to_rfc3339())
-                                    .unwrap_or_else(|| "-".to_string())
-                            );
-                        }
-                        JobCommand::Rm(args) => {
-                            let job_id = parse_job_id(&args.job_id)?;
-                            let response = kernel.remove_job(job_id).await?;
-                            println!(
-                                "{} {}",
-                                if response.removed {
-                                    "removed"
-                                } else {
-                                    "left unchanged"
-                                },
-                                response.job_id
-                            );
-                        }
-                        JobCommand::Runs(args) => {
-                            let job_id = parse_job_id(&args.job_id)?;
-                            for run in kernel
-                                .list_job_runs(JobRunsRequest {
-                                    job_id,
-                                    limit: Some(args.limit),
-                                })
-                                .await?
-                                .runs
-                            {
-                                println!(
                                     "run={} attempt={} trigger={:?} status={:?} started_at={} session={} turn={} error={}",
                                     run.run_id,
                                     run.attempt_no,
@@ -881,11 +889,10 @@ pub async fn run() -> Result<()> {
                                         .unwrap_or_else(|| "-".to_string()),
                                     run.error_text.unwrap_or_else(|| "-".to_string()),
                                 );
-                            }
                         }
-                        JobCommand::Run(_) | JobCommand::Tick => unreachable!(),
                     }
-                }
+                    JobCommand::Run(_) | JobCommand::Tick => unreachable!(),
+                },
             }
         }
     }

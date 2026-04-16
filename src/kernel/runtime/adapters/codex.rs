@@ -1,5 +1,6 @@
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::RwLock;
-use std::{collections::HashMap, path::Path};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -7,8 +8,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::kernel::runtime::{
-    ExecutionOutput, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
-    RuntimeEventSender, RuntimeMessageLane, RuntimeProgramSpec, RuntimeSessionHandle,
+    ExecutionOutput, RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthKind, RuntimeCapabilityResult,
+    RuntimeEvent, RuntimeEventSender, RuntimeMessageLane, RuntimeProgramSpec, RuntimeSessionHandle,
     RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
 };
 
@@ -90,9 +91,13 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
 
         Ok(RuntimeProgramSpec {
             executable: self.config.executable.clone(),
-            args: build_codex_exec_args(&self.config, session.resumes_existing_session),
+            args: build_codex_exec_args(
+                self.config.model.as_deref(),
+                session.resumes_existing_session,
+            ),
             environment: Vec::new(),
             stdin: input.prompt.clone(),
+            auth: Some(RuntimeAuthKind::Codex),
         })
     }
 
@@ -142,25 +147,31 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
     }
 }
 
-fn build_codex_exec_args(
-    config: &CodexRuntimeConfig,
-    resumes_existing_session: bool,
-) -> Vec<String> {
-    let mut args = if resumes_existing_session {
-        vec![
-            "exec".to_string(),
-            "resume".to_string(),
-            "--last".to_string(),
-            "--json".to_string(),
-            "-".to_string(),
-        ]
-    } else {
-        vec!["exec".to_string(), "--json".to_string()]
-    };
+fn build_codex_exec_args(model: Option<&str>, resumes_existing_session: bool) -> Vec<String> {
+    let mut args = vec!["exec".to_string()];
 
-    if let Some(model) = &config.model {
+    if resumes_existing_session {
+        args.push("resume".to_string());
+    }
+
+    // LionClaw already provides the outer confinement boundary via Podman, so
+    // Codex should use its official external-sandbox mode rather than trying
+    // to nest bubblewrap inside the container.
+    args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+
+    if resumes_existing_session {
+        args.push("--last".to_string());
+    }
+
+    args.push("--json".to_string());
+
+    if let Some(model) = model {
         args.push("--model".to_string());
         args.push(model.to_string());
+    }
+
+    if resumes_existing_session {
+        args.push("-".to_string());
     }
 
     args
@@ -208,7 +219,9 @@ fn parse_codex_output_line(line: &str) -> Vec<RuntimeEvent> {
 
     let mut events = Vec::new();
     if let Ok(json) = serde_json::from_str::<Value>(line) {
-        parse_codex_json_event(&mut events, &json);
+        if codex_event_type(&json).is_some() {
+            parse_codex_json_event(&mut events, &json);
+        }
     } else {
         events.push(RuntimeEvent::MessageDelta {
             lane: RuntimeMessageLane::Answer,
@@ -219,30 +232,44 @@ fn parse_codex_output_line(line: &str) -> Vec<RuntimeEvent> {
 }
 
 fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
-    let event_type = json.get("type").and_then(Value::as_str);
+    let payload = codex_event_payload(json);
+    let event_type = codex_event_type(json);
     match event_type {
         Some("thread.started") => {
-            if let Some(thread_id) = json.get("thread_id").and_then(Value::as_str) {
+            if let Some(thread_id) = payload.get("thread_id").and_then(Value::as_str) {
                 events.push(RuntimeEvent::Status {
                     code: None,
                     text: format!("codex thread started: {}", thread_id),
                 });
             }
         }
-        Some("turn.started") => {
+        Some("turn.started") | Some("turn_started") | Some("task_started") => {
             events.push(RuntimeEvent::Status {
                 code: None,
                 text: "codex turn started".to_string(),
             });
         }
-        Some("turn.completed") => {
+        Some("turn.completed") | Some("turn_complete") => {
             events.push(RuntimeEvent::Status {
                 code: None,
                 text: "codex turn completed".to_string(),
             });
         }
+        Some("task_complete") => {
+            if let Some(text) = codex_event_text(payload, &["last_agent_message"]) {
+                events.push(RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text,
+                });
+            }
+            events.push(RuntimeEvent::Status {
+                code: None,
+                text: "codex turn completed".to_string(),
+            });
+            events.push(RuntimeEvent::Done);
+        }
         Some("turn.failed") => {
-            let message = json
+            let message = payload
                 .pointer("/error/message")
                 .and_then(Value::as_str)
                 .unwrap_or("codex turn failed");
@@ -251,8 +278,16 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
                 text: format!("codex: {}", message),
             });
         }
+        Some("turn_aborted") => {
+            let message = codex_event_text(payload, &["reason"])
+                .unwrap_or_else(|| "codex turn aborted".to_string());
+            events.push(RuntimeEvent::Error {
+                code: Some("runtime.error".to_string()),
+                text: format!("codex: {}", message),
+            });
+        }
         Some("error") => {
-            let message = json
+            let message = payload
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("codex stream error");
@@ -261,23 +296,183 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
                 text: format!("codex: {}", message),
             });
         }
-        Some("item.started") | Some("item.updated") | Some("item.completed") => {
-            if let Some(item) = json.get("item") {
+        Some("stream_error") => {
+            let message = codex_event_text(payload, &["message", "details"])
+                .unwrap_or_else(|| "codex stream error".to_string());
+            events.push(RuntimeEvent::Error {
+                code: Some("runtime.error".to_string()),
+                text: format!("codex: {}", message),
+            });
+        }
+        Some("agent_message_delta") | Some("agent_message_content_delta") => {
+            if let Some(text) = codex_event_text(payload, &["delta", "text", "content"]) {
+                events.push(RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text,
+                });
+            }
+        }
+        Some("agent_message") => {
+            if let Some(text) = codex_event_text(payload, &["message", "text", "content"]) {
+                events.push(RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text,
+                });
+            }
+        }
+        Some("agent_reasoning_delta")
+        | Some("agent_reasoning_raw_content_delta")
+        | Some("reasoning_content_delta") => {
+            if let Some(text) = codex_event_text(payload, &["delta", "text", "content"]) {
+                events.push(RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Reasoning,
+                    text,
+                });
+            }
+        }
+        Some("agent_reasoning") | Some("agent_reasoning_raw_content") => {
+            if let Some(text) = codex_event_text(
+                payload,
+                &["text", "content", "reasoning_text", "raw_content"],
+            ) {
+                events.push(RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Reasoning,
+                    text,
+                });
+            }
+        }
+        Some("agent_reasoning_section_break")
+        | Some("session_configured")
+        | Some("token_count") => {}
+        Some("exec_command_begin") => {
+            let command = codex_event_text(payload, &["parsed_cmd", "command"])
+                .unwrap_or_else(|| "command".to_string());
+            events.push(RuntimeEvent::Status {
+                code: None,
+                text: format!("codex command '{}'", truncate_status_detail(&command)),
+            });
+        }
+        Some("exec_command_end") => {
+            let exit_code = payload
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            events.push(RuntimeEvent::Status {
+                code: None,
+                text: format!("codex command completed (exit {})", exit_code),
+            });
+        }
+        Some("web_search_begin") => {
+            events.push(RuntimeEvent::Status {
+                code: None,
+                text: "codex web search".to_string(),
+            });
+        }
+        Some("web_search_end") => {
+            events.push(RuntimeEvent::Status {
+                code: None,
+                text: describe_codex_web_search(payload),
+            });
+        }
+        Some("patch_apply_begin") => {
+            events.push(RuntimeEvent::Status {
+                code: None,
+                text: "codex patch apply".to_string(),
+            });
+        }
+        Some("patch_apply_end") => {
+            let status = payload
+                .get("success")
+                .and_then(Value::as_bool)
+                .map(|value| if value { "succeeded" } else { "failed" })
+                .unwrap_or("completed");
+            events.push(RuntimeEvent::Status {
+                code: None,
+                text: format!("codex patch apply ({})", status),
+            });
+        }
+        Some("item.started")
+        | Some("item.updated")
+        | Some("item.completed")
+        | Some("item_started")
+        | Some("item_updated")
+        | Some("item_completed") => {
+            if let Some(item) = payload.get("item") {
                 parse_codex_item(events, item);
             }
         }
-        Some(other) => {
-            events.push(RuntimeEvent::Status {
-                code: None,
-                text: format!("codex event: {}", other),
-            });
+        Some(_) | None => {}
+    }
+}
+
+fn codex_event_payload(json: &Value) -> &Value {
+    json.get("msg").unwrap_or(json)
+}
+
+fn codex_event_type(json: &Value) -> Option<&str> {
+    json.get("msg")
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        .or_else(|| json.get("type").and_then(Value::as_str))
+}
+
+fn codex_event_text(payload: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(value) = payload.get(*key) {
+            if let Some(text) = collect_codex_text(value, 0) {
+                return Some(text);
+            }
         }
-        None => {
-            events.push(RuntimeEvent::Status {
-                code: None,
-                text: "codex event missing type".to_string(),
-            });
+    }
+    None
+}
+
+fn collect_codex_text(value: &Value, depth: usize) -> Option<String> {
+    if depth > 6 {
+        return None;
+    }
+
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
         }
+        Value::Array(values) => {
+            let parts: Vec<String> = values
+                .iter()
+                .filter_map(|value| collect_codex_text(value, depth + 1))
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(""))
+            }
+        }
+        Value::Object(map) => {
+            for key in [
+                "delta",
+                "text",
+                "content",
+                "message",
+                "last_agent_message",
+                "reasoning_text",
+                "raw_content",
+                "summary_text",
+            ] {
+                if let Some(value) = map.get(key) {
+                    if let Some(text) = collect_codex_text(value, depth + 1) {
+                        return Some(text);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -490,6 +685,7 @@ mod tests {
             program.args,
             vec![
                 "exec".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
                 "--json".to_string(),
                 "--model".to_string(),
                 "gpt-5-codex".to_string(),
@@ -497,6 +693,10 @@ mod tests {
         );
         assert!(program.environment.is_empty());
         assert_eq!(program.stdin, "hello");
+        assert_eq!(
+            program.auth,
+            Some(crate::kernel::runtime::RuntimeAuthKind::Codex)
+        );
 
         adapter.close(&handle).await.expect("close");
     }
@@ -528,18 +728,13 @@ mod tests {
 
     #[test]
     fn codex_exec_args_only_include_protocol_fields() {
-        let args = build_codex_exec_args(
-            &CodexRuntimeConfig {
-                executable: "codex".to_string(),
-                model: Some("gpt-5-codex".to_string()),
-            },
-            false,
-        );
+        let args = build_codex_exec_args(Some("gpt-5-codex"), false);
 
         assert_eq!(
             args,
             vec![
                 "exec".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
                 "--json".to_string(),
                 "--model".to_string(),
                 "gpt-5-codex".to_string(),
@@ -549,24 +744,31 @@ mod tests {
 
     #[test]
     fn codex_resume_args_request_last_session_and_read_prompt_from_stdin() {
-        let args = build_codex_exec_args(
-            &CodexRuntimeConfig {
-                executable: "codex".to_string(),
-                model: Some("gpt-5-codex".to_string()),
-            },
-            true,
-        );
+        let args = build_codex_exec_args(Some("gpt-5-codex"), true);
 
         assert_eq!(
             args,
             vec![
                 "exec".to_string(),
                 "resume".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
                 "--last".to_string(),
                 "--json".to_string(),
-                "-".to_string(),
                 "--model".to_string(),
                 "gpt-5-codex".to_string(),
+                "-".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_args_omit_model_when_runtime_model_is_unset() {
+        assert_eq!(
+            build_codex_exec_args(None, false),
+            vec![
+                "exec".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "--json".to_string(),
             ]
         );
     }
@@ -611,5 +813,47 @@ mod tests {
             RuntimeEvent::Status { code: None, text }
                 if text == "codex web search 'weather: Nairobi, Kenya' (search)"
         ));
+    }
+
+    #[test]
+    fn codex_stdout_parses_nested_msg_events_and_final_answer() {
+        let events = parse_codex_stdout(
+            br#"{"cwd":"/workspace","model":"gpt-5"}
+{"id":"0","msg":{"type":"task_started"}}
+{"id":"1","msg":{"type":"agent_reasoning_delta","delta":"Thinking..."}}
+{"id":"2","msg":{"type":"task_complete","last_agent_message":"Done."}}"#,
+        );
+
+        assert_eq!(
+            events.len(),
+            5,
+            "expected started, reasoning, answer, status, done"
+        );
+        assert!(matches!(
+            &events[0],
+            RuntimeEvent::Status { code: None, text } if text == "codex turn started"
+        ));
+        assert!(matches!(
+            &events[1],
+            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Reasoning, text } if text == "Thinking..."
+        ));
+        assert!(matches!(
+            &events[2],
+            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text } if text == "Done."
+        ));
+        assert!(matches!(
+            &events[3],
+            RuntimeEvent::Status { code: None, text } if text == "codex turn completed"
+        ));
+        assert!(matches!(&events[4], RuntimeEvent::Done));
+    }
+
+    #[test]
+    fn codex_stdout_ignores_non_event_json_objects() {
+        let events = parse_codex_stdout(br#"{"cwd":"/workspace","model":"gpt-5"}"#);
+        assert!(
+            events.is_empty(),
+            "non-event JSON should not surface as status spam"
+        );
     }
 }

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{
     config::resolve_project_workspace_root,
@@ -10,18 +10,19 @@ use crate::{
     kernel::{Kernel, KernelOptions, RuntimeExecutionPolicy},
     operator::{
         config::{
-            daemon_compat_fingerprint, normalize_local_source, ChannelLaunchMode,
-            ManagedChannelConfig, ManagedSkillConfig, OperatorConfig,
+            normalize_local_source, ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig,
+            OperatorConfig,
         },
         daemon_probe::{classify_daemon, DaemonClassification},
         lockfile::{LockedChannel, LockedSkill, OperatorLockfile},
         runtime::{
-            configured_runtime_execution_profiles, register_configured_runtimes,
-            validate_runtime_availability,
+            register_configured_runtimes, resolve_runtime_execution_context,
+            validate_runtime_launch_prerequisites,
         },
         services::{
             channel_unit_name, render_channel_unit, render_daemon_unit, unit_status_is_active,
-            ChannelServiceSpec, ManagedServiceUnit, ServiceManager, DAEMON_UNIT_NAME,
+            ChannelServiceSpec, DaemonServiceSpec, ManagedServiceUnit, ServiceManager,
+            DAEMON_UNIT_NAME,
         },
         snapshot::{install_snapshot, InstalledSnapshot},
     },
@@ -264,11 +265,13 @@ pub async fn up<M: ServiceManager>(
     binaries: &StackBinaryPaths,
 ) -> Result<ApplyResult> {
     let config = OperatorConfig::load(home).await?;
+    let runtime_context =
+        resolve_runtime_execution_context(home, &config, Some(runtime_id)).await?;
     let home_id = home.ensure_home_id().await?;
     let project_root =
         resolve_project_workspace_root().context("failed to resolve project workspace root")?;
     let project_scope = runtime_project_partition_key(Some(project_root.as_path()));
-    let expected_config_fingerprint = daemon_compat_fingerprint(&config);
+    let expected_config_fingerprint = runtime_context.daemon_config_fingerprint.clone();
     match classify_daemon(
         &config.daemon.bind,
         &home_id,
@@ -316,8 +319,8 @@ pub async fn up<M: ServiceManager>(
     }
 
     let previous_units = managed_unit_names(home)?;
+    validate_runtime_launch_prerequisites(home, &config, runtime_id).await?;
     let applied = apply(home).await?;
-    validate_runtime_availability(&applied.config, runtime_id)?;
     render_runtime_cache(home, &applied.config, &applied.lockfile, runtime_id).await?;
     let units = build_managed_units(
         home,
@@ -325,6 +328,8 @@ pub async fn up<M: ServiceManager>(
         &applied.lockfile,
         runtime_id,
         binaries,
+        &runtime_context.daemon_config_fingerprint,
+        runtime_context.codex_home_override.as_deref(),
     )?;
     let next_units = units
         .iter()
@@ -507,6 +512,8 @@ pub(crate) fn build_managed_units(
     lockfile: &OperatorLockfile,
     runtime_id: &str,
     binaries: &StackBinaryPaths,
+    config_fingerprint: &str,
+    codex_home_override: Option<&Path>,
 ) -> Result<Vec<ManagedServiceUnit>> {
     let mut units = Vec::new();
     let project_workspace_root = resolve_project_workspace_root()
@@ -514,11 +521,14 @@ pub(crate) fn build_managed_units(
     units.push(render_daemon_unit(
         home,
         &binaries.daemon_bin,
-        &config.daemon.bind,
-        runtime_id,
-        &config.daemon.workspace,
-        &project_workspace_root,
-        &daemon_compat_fingerprint(config),
+        DaemonServiceSpec {
+            bind_addr: &config.daemon.bind,
+            runtime_id,
+            workspace: &config.daemon.workspace,
+            project_workspace_root: &project_workspace_root,
+            config_fingerprint,
+            codex_home_override,
+        },
     ));
 
     let base_url = base_url_from_bind(&config.daemon.bind);
@@ -749,6 +759,8 @@ async fn open_kernel_with_project_root(
     project_workspace_root: Option<PathBuf>,
 ) -> Result<Kernel> {
     let workspace_root = config.workspace_root(home);
+    let runtime_context =
+        resolve_runtime_execution_context(home, config, default_runtime_id.as_deref()).await?;
     let kernel = Kernel::new_with_options(
         &home.db_path(),
         KernelOptions {
@@ -759,8 +771,9 @@ async fn open_kernel_with_project_root(
             default_runtime_id: default_runtime_id.or_else(|| config.defaults.runtime.clone()),
             default_preset_name: config.defaults.preset.clone(),
             execution_presets: config.presets.clone(),
-            runtime_execution_profiles: configured_runtime_execution_profiles(config),
+            runtime_execution_profiles: runtime_context.execution_profiles,
             runtime_secrets_home: Some(home.clone()),
+            codex_home_override: runtime_context.codex_home_override,
             workspace_root: Some(workspace_root),
             project_workspace_root,
             runtime_root: Some(home.runtime_dir()),
@@ -786,8 +799,8 @@ mod tests {
 
     use super::{
         apply, onboard, open_kernel, open_kernel_with_project_root, render_marker_file,
-        render_runtime_cache, resolve_worker_entrypoint, up, ApplyResult, OnboardBindSelection,
-        StackBinaryPaths,
+        render_runtime_cache, resolve_worker_entrypoint, status, up, ApplyResult,
+        OnboardBindSelection, StackBinaryPaths,
     };
     use crate::{
         config::resolve_project_workspace_root,
@@ -799,10 +812,11 @@ mod tests {
         },
         operator::{
             config::{
-                daemon_compat_fingerprint, ChannelLaunchMode, ManagedChannelConfig,
-                ManagedSkillConfig, OperatorConfig, RuntimeProfileConfig,
+                ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig, OperatorConfig,
+                RuntimeProfileConfig,
             },
             lockfile::OperatorLockfile,
+            runtime::resolve_runtime_execution_context,
             services::{FakeServiceManager, ServiceManager, DAEMON_UNIT_NAME},
         },
         workspace::GENERATED_AGENTS_FILE,
@@ -824,7 +838,11 @@ mod tests {
     }
 
     async fn current_daemon_config_fingerprint(home: &LionClawHome) -> String {
-        daemon_compat_fingerprint(&OperatorConfig::load(home).await.expect("load config"))
+        let config = OperatorConfig::load(home).await.expect("load config");
+        resolve_runtime_execution_context(home, &config, config.defaults.runtime.as_deref())
+            .await
+            .expect("resolve runtime context")
+            .daemon_config_fingerprint
     }
 
     #[cfg(unix)]
@@ -833,7 +851,11 @@ mod tests {
 
         let engine = reference.parent().expect("stub parent").join("podman");
         if !engine.exists() {
-            fs::write(&engine, "#!/usr/bin/env bash\nexit 0\n").expect("write fake podman");
+            fs::write(
+                &engine,
+                "#!/usr/bin/env bash\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"inspect\" ]; then\n  printf 'sha256:test-runtime-image\\n'\n  exit 0\nfi\nexit 0\n",
+            )
+            .expect("write fake podman");
             fs::set_permissions(&engine, fs::Permissions::from_mode(0o755))
                 .expect("chmod fake podman");
         }
@@ -852,6 +874,21 @@ mod tests {
                 ..OciConfinementConfig::default()
             }),
         }
+    }
+
+    async fn write_test_codex_auth(home: &LionClawHome) {
+        let codex_home = home.root().join(".codex");
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create codex home");
+        tokio::fs::write(
+            codex_home.join("auth.json"),
+            r#"{
+  "OPENAI_API_KEY": "sk-test"
+}"#,
+        )
+        .await
+        .expect("write auth file");
     }
 
     #[tokio::test]
@@ -948,6 +985,7 @@ mod tests {
         let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
             .await
             .expect("onboard");
+        write_test_codex_auth(&home).await;
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
         #[cfg(unix)]
@@ -1013,6 +1051,60 @@ mod tests {
         assert!(home
             .runtime_project_drafts_dir("codex", "main", &project_workspace_root)
             .exists());
+    }
+
+    #[tokio::test]
+    async fn up_rejects_missing_codex_runtime_auth() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
+        let runtime_stub = temp_dir.path().join("codex-stub.sh");
+        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(&runtime_stub, permissions).expect("chmod runtime stub");
+        }
+
+        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
+            .into_iter()
+            .collect();
+        let skill_source = temp_dir.path().join("test-skill");
+        fs::create_dir_all(&skill_source).expect("skill dir");
+        fs::write(
+            skill_source.join("SKILL.md"),
+            "---\nname: test-skill\ndescription: test\n---\n",
+        )
+        .expect("skill md");
+        config.skills.push(ManagedSkillConfig {
+            alias: "test-skill".to_string(),
+            source: skill_source.display().to_string(),
+            reference: "local".to_string(),
+            enabled: true,
+        });
+        config.save(&home).await.expect("save config");
+
+        let err = up(
+            &home,
+            &FakeServiceManager::default(),
+            "codex",
+            &StackBinaryPaths {
+                daemon_bin: "/tmp/lionclawd".into(),
+            },
+        )
+        .await
+        .expect_err("missing runtime auth should fail");
+
+        assert!(err.to_string().contains("codex login"));
+        assert!(err.to_string().contains("auth.json"));
+        let lockfile = OperatorLockfile::load(&home).await.expect("load lockfile");
+        assert!(
+            lockfile.skills.is_empty(),
+            "auth preflight should fail before apply() installs skill snapshots"
+        );
     }
 
     #[tokio::test]
@@ -1142,6 +1234,7 @@ mod tests {
             required_env: Vec::new(),
         }];
         config.save(&home).await.expect("save config");
+        write_test_codex_auth(&home).await;
         OperatorLockfile::default()
             .save(&home)
             .await
@@ -1319,6 +1412,7 @@ mod tests {
             .into_iter()
             .collect();
         config.save(&home).await.expect("save config");
+        write_test_codex_auth(&home).await;
 
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
@@ -1382,6 +1476,7 @@ mod tests {
             .into_iter()
             .collect();
         config.save(&home).await.expect("save config");
+        write_test_codex_auth(&home).await;
 
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
@@ -1454,5 +1549,73 @@ mod tests {
             .await
             .expect_err("unknown listener should fail");
         assert!(err.to_string().contains("non-LionClaw listener"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn status_ignores_unselected_runtime_image_probe_failures() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+
+        let broken_podman = temp_dir.path().join("podman");
+        fs::write(
+            &broken_podman,
+            "#!/usr/bin/env bash\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"inspect\" ]; then\n  echo 'storage denied' >&2\n  exit 1\nfi\nexit 0\n",
+        )
+        .expect("write broken podman");
+        fs::set_permissions(&broken_podman, fs::Permissions::from_mode(0o755))
+            .expect("chmod broken podman");
+
+        let healthy_runtime = temp_dir.path().join("opencode-stub.sh");
+        fs::write(&healthy_runtime, "#!/usr/bin/env bash\ncat >/dev/null\n")
+            .expect("write runtime stub");
+        fs::set_permissions(&healthy_runtime, fs::Permissions::from_mode(0o755))
+            .expect("chmod runtime stub");
+
+        let mut config = OperatorConfig::load(&home).await.expect("load config");
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "codex".to_string(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: broken_podman.to_string_lossy().to_string(),
+                    image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+        config.upsert_runtime(
+            "opencode".to_string(),
+            RuntimeProfileConfig::OpenCode {
+                executable: healthy_runtime.to_string_lossy().to_string(),
+                model: None,
+                agent: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: ensure_fake_podman(&healthy_runtime)
+                        .to_string_lossy()
+                        .to_string(),
+                    image: Some("ghcr.io/lionclaw/test-opencode-runtime:latest".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+        config
+            .set_default_runtime("opencode")
+            .expect("set default runtime");
+        config.save(&home).await.expect("save config");
+        OperatorLockfile::default()
+            .save(&home)
+            .await
+            .expect("save lockfile");
+
+        let manager = FakeServiceManager::default();
+        let stack = status(&home, &manager).await.expect("status");
+
+        assert_eq!(stack.daemon_status, "not-found");
+        assert!(stack.channels.is_empty());
     }
 }

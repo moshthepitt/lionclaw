@@ -9,10 +9,13 @@ use crate::{
     home::runtime_project_partition_key,
     home::LionClawHome,
     operator::{
-        config::daemon_compat_fingerprint,
         config::ChannelLaunchMode,
         daemon_probe::{classify_daemon, wait_for_same_home_daemon, DaemonClassification},
         reconcile::{apply, base_url_from_bind, resolve_worker_entrypoint, up, StackBinaryPaths},
+        runtime::{
+            resolve_runtime_execution_context, resolve_runtime_id,
+            validate_runtime_launch_prerequisites,
+        },
         services::ServiceManager,
     },
 };
@@ -111,7 +114,17 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
     binaries: &StackBinaryPaths,
 ) -> Result<ChannelAttachSpec> {
     let initial_config = crate::operator::config::OperatorConfig::load(home).await?;
-    let expected_config_fingerprint = daemon_compat_fingerprint(&initial_config);
+    let requested_runtime_id = requested_runtime_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let initial_runtime_id = resolve_runtime_id(&initial_config, requested_runtime_id.as_deref())?;
+    validate_runtime_launch_prerequisites(home, &initial_config, &initial_runtime_id).await?;
+    let expected_config_fingerprint =
+        resolve_runtime_execution_context(home, &initial_config, Some(&initial_runtime_id))
+            .await?
+            .daemon_config_fingerprint;
     let home_id = home.ensure_home_id().await?;
     let mut started_services = false;
     let applied = match classify_daemon(
@@ -123,15 +136,13 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
     .await?
     {
         DaemonClassification::Absent => {
-            let runtime_id = initial_config.resolve_runtime_id(requested_runtime_id.as_deref())?;
             started_services = true;
-            up(home, manager, &runtime_id, binaries).await?
+            up(home, manager, &initial_runtime_id, binaries).await?
         }
         DaemonClassification::SameHome => apply(home).await?,
         DaemonClassification::SameHomeDifferentConfig => {
-            let runtime_id = initial_config.resolve_runtime_id(requested_runtime_id.as_deref())?;
             started_services = true;
-            up(home, manager, &runtime_id, binaries).await?
+            up(home, manager, &initial_runtime_id, binaries).await?
         }
         DaemonClassification::SameHomeDifferentProject => {
             return Err(anyhow!(
@@ -185,11 +196,7 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
         )
     })?;
     let worker_path = resolve_worker_entrypoint(home, &locked_skill.snapshot_dir)?;
-    let effective_runtime_id = match requested_runtime_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    let effective_runtime_id = match requested_runtime_id.as_deref() {
         Some(runtime_id) => Some(applied.config.resolve_runtime_id(Some(runtime_id))?),
         None => None,
     };
@@ -295,9 +302,11 @@ mod tests {
         kernel::runtime::{ConfinementConfig, OciConfinementConfig},
         operator::{
             config::{
-                daemon_compat_fingerprint, ChannelLaunchMode, ManagedChannelConfig,
-                ManagedSkillConfig, OperatorConfig, RuntimeProfileConfig,
+                ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig, OperatorConfig,
+                RuntimeProfileConfig,
             },
+            lockfile::OperatorLockfile,
+            runtime::resolve_runtime_execution_context,
             services::{FakeServiceManager, ServiceManager},
         },
     };
@@ -314,8 +323,15 @@ mod tests {
         runtime_project_partition_key(Some(project_root.as_path()))
     }
 
-    fn current_config_fingerprint(config: &OperatorConfig) -> String {
-        daemon_compat_fingerprint(config)
+    async fn current_config_fingerprint(
+        home: &LionClawHome,
+        config: &OperatorConfig,
+        runtime_id: Option<&str>,
+    ) -> String {
+        resolve_runtime_execution_context(home, config, runtime_id)
+            .await
+            .expect("resolve runtime context")
+            .daemon_config_fingerprint
     }
 
     #[cfg(unix)]
@@ -340,11 +356,26 @@ mod tests {
         crate::operator::reconcile::onboard(&home, None)
             .await
             .expect("onboard");
+        let codex_home = home.root().join(".codex");
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create codex home");
+        tokio::fs::write(
+            codex_home.join("auth.json"),
+            r#"{
+  "OPENAI_API_KEY": "sk-test"
+}"#,
+        )
+        .await
+        .expect("write runtime auth");
 
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         write_executable(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n");
         let podman = temp_dir.path().join("podman");
-        write_executable(&podman, "#!/usr/bin/env bash\nexit 0\n");
+        write_executable(
+            &podman,
+            "#!/usr/bin/env bash\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"inspect\" ]; then\n  printf 'sha256:test-runtime-image\\n'\n  exit 0\nfi\nexit 0\n",
+        );
 
         let skill_source = temp_dir.path().join("channel-terminal");
         fs::create_dir_all(skill_source.join("scripts")).expect("skill dir");
@@ -427,6 +458,37 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn prepare_channel_attach_rejects_missing_codex_runtime_auth() {
+        let (_temp_dir, home, manager) =
+            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        let codex_home = home.root().join(".codex");
+        tokio::fs::write(codex_home.join("auth.json"), "{}")
+            .await
+            .expect("rewrite runtime auth");
+
+        let err = prepare_channel_attach(
+            &home,
+            &manager,
+            "terminal".to_string(),
+            Some("mosh".to_string()),
+            Some("codex".to_string()),
+            &current_project_scope(),
+            &binaries(),
+        )
+        .await
+        .expect_err("missing runtime auth should fail");
+
+        assert!(err.to_string().contains("codex login"));
+        assert!(err.to_string().contains("auth.json"));
+        let lockfile = OperatorLockfile::load(&home).await.expect("load lockfile");
+        assert!(
+            lockfile.skills.is_empty() && lockfile.channels.is_empty(),
+            "auth preflight should fail before attach apply/up lockfile materialization"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn prepare_channel_attach_builds_ephemeral_tail_env_and_starts_services() {
         let (_temp_dir, home, manager) =
             seed_interactive_channel(ChannelLaunchMode::Interactive).await;
@@ -485,7 +547,7 @@ mod tests {
         let config = OperatorConfig::load(&home).await.expect("load config");
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
-        let config_fingerprint = current_config_fingerprint(&config);
+        let config_fingerprint = current_config_fingerprint(&home, &config, Some("codex")).await;
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",
@@ -535,7 +597,7 @@ mod tests {
         let config = OperatorConfig::load(&home).await.expect("load config");
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
-        let config_fingerprint = current_config_fingerprint(&config);
+        let config_fingerprint = current_config_fingerprint(&home, &config, Some("codex")).await;
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",
@@ -648,7 +710,7 @@ mod tests {
         let config = OperatorConfig::load(&home).await.expect("load config");
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
-        let config_fingerprint = current_config_fingerprint(&config);
+        let config_fingerprint = current_config_fingerprint(&home, &config, Some("codex")).await;
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",
@@ -699,7 +761,7 @@ mod tests {
             seed_interactive_channel(ChannelLaunchMode::Interactive).await;
         let config = OperatorConfig::load(&home).await.expect("load config");
         let bind_addr = config.daemon.bind.clone();
-        let config_fingerprint = current_config_fingerprint(&config);
+        let config_fingerprint = current_config_fingerprint(&home, &config, Some("codex")).await;
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",
@@ -777,7 +839,7 @@ mod tests {
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
         let home_root = home.root().display().to_string();
-        let config_fingerprint = current_config_fingerprint(&config);
+        let config_fingerprint = current_config_fingerprint(&home, &config, Some("codex")).await;
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",

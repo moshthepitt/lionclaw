@@ -8,15 +8,18 @@ pub mod oci;
 pub mod plan;
 pub mod planner;
 pub(crate) mod process;
-
+pub(crate) mod runtime_auth;
 pub use backend::{
     execute_streaming, ExecutionBackend, ExecutionOutput, ExecutionRequest, RuntimeSecretsMount,
 };
-pub use oci::OciExecutionBackend;
+pub use oci::{
+    resolve_oci_image_compatibility_identity, validate_oci_launch_prerequisites,
+    OciExecutionBackend,
+};
 pub use plan::{
     ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionLimits,
-    ExecutionPreset, MountAccess, MountSpec, NetworkMode, OciConfinementConfig, RuntimeProgramSpec,
-    WorkspaceAccess,
+    ExecutionPreset, MountAccess, MountSpec, NetworkMode, OciConfinementConfig, RuntimeAuthKind,
+    RuntimeProgramSpec, WorkspaceAccess,
 };
 pub use planner::{
     ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,

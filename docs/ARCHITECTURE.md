@@ -167,6 +167,20 @@ that starts with `lionclaw-runtime-secrets-`.
 LionClaw hardens the config directory to `0700` and the runtime secret file to
 `0600` on Unix before loading it.
 
+Host-only runtime auth comes from the host runtime itself. Confined Codex turns
+read the host Codex auth store, normally `~/.codex/auth.json`, refresh that
+host auth when needed, then stage session-local copies of `auth.json` and
+`config.toml` under `/runtime/home/.codex` before the turn starts. Codex runs
+inside the outer Podman boundary with its official external-sandbox mode
+enabled, and then talks upstream directly as it normally would. The real host
+Codex home is never mounted into the runtime container. `lionclaw run`
+inherits an interactive shell's `CODEX_HOME` when set, and `lionclaw service up`
+persists that same override into the managed daemon environment for background
+jobs and channels. LionClaw preflights the operator-managed runtime image only.
+Runtime compatibility includes the resolved local OCI image identity, so
+rebuilding the same mutable image tag still creates a new compatibility
+boundary automatically.
+
 Channel bridge layout:
 
 - `kernel/channel_state.rs`: durable channel bindings/peers/offsets/messages + stream event/cursor storage.
@@ -189,6 +203,9 @@ Operator launch model:
 - `launch_mode=interactive`: channel worker is foreground-only and started with `lionclaw channel attach <id>`.
 - Worker entrypoint resolution requires `scripts/worker`.
 - `LIONCLAW_HOME` gets a stable machine-owned `config/home-id`; attach and service flows only reuse a daemon when `/v0/daemon/info` reports the same `home_id`, current project scope, and daemon-compat fingerprint.
+- For Codex, leaving the runtime profile `model` unset means "use the host
+  Codex model for this launch" rather than inventing a second LionClaw-only
+  model source.
 
 Adding a new adapter:
 
@@ -325,6 +342,6 @@ Queued channel turns emit machine-stable status/error codes through the same str
 
 1. Wasmtime execution boundary.
 2. Alternative confinement backends beyond the shipped OCI path.
-3. Egress proxy with allowlist enforcement.
+3. Stronger egress policy and allowlist enforcement.
 4. Secret broker issuing scoped, short-lived credentials for non-runtime-visible secrets.
 5. Skill source pinning + signatures.

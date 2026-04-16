@@ -1,6 +1,8 @@
 import unittest
 import asyncio
 
+from textual.widgets import Input
+
 from lionclaw_channel_terminal.api import (
     InboundResponse,
     PeerState,
@@ -264,6 +266,21 @@ class _PairingRefreshApi(_InteractiveApi):
         return self.latest_snapshot
 
 
+class _MountedApi(_PairingRefreshApi):
+    def __init__(self) -> None:
+        super().__init__(peer_state=PeerState(status="approved", trust_tier="main"))
+
+    async def pull_stream(self, start_after_sequence: int | None = None):
+        await asyncio.sleep(3600)
+        return [], None
+
+    async def ack_stream(self, through_sequence: int) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+
 def _make_app() -> TerminalChannelApp:
     return TerminalChannelApp(
         AppConfig(
@@ -281,6 +298,44 @@ def _make_app() -> TerminalChannelApp:
 
 
 class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mount_focuses_enabled_input(self):
+        app = _make_app()
+        app.api = _MountedApi()
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertTrue(app.query_one(Input).has_focus)
+
+    async def test_pairing_approval_refocuses_input_without_stealing_on_every_render(self):
+        app = _make_app()
+        api = _MountedApi()
+        api.peer_state = PeerState(status="pending", pairing_code="123456")
+        app.api = api
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertTrue(app.query_one(Input).has_focus)
+
+            await pilot.press("tab")
+            await pilot.pause()
+            self.assertFalse(app.query_one(Input).has_focus)
+
+            api.peer_state = PeerState(status="approved", trust_tier="main")
+            await app.refresh_pairing_state()
+            await pilot.pause()
+            self.assertTrue(app.query_one(Input).has_focus)
+
+            await pilot.press("tab")
+            await pilot.pause()
+            self.assertFalse(app.query_one(Input).has_focus)
+
+            app._render_views()
+            await pilot.pause()
+            self.assertFalse(
+                app.query_one(Input).has_focus,
+                "ordinary redraws should not steal focus back from another widget",
+            )
+
     async def test_submit_text_keeps_local_echo_when_send_fails(self):
         app = _make_app()
         app.api = _FailingApi()

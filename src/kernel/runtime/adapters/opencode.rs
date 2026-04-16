@@ -99,6 +99,7 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
             ),
             environment: Vec::new(),
             stdin: String::new(),
+            auth: None,
         })
     }
 

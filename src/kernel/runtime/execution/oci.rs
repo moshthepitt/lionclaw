@@ -1,16 +1,51 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+#[cfg(unix)]
+use rustix::process::{getgid, getuid};
+use tokio::{runtime::Handle, time::timeout};
+use tracing::warn;
 
 use super::{
     backend::{ExecutionBackend, ExecutionOutput, ExecutionRequest, ExecutionStdoutSender},
-    plan::{ConfinementBackend, MountAccess, MountSpec, NetworkMode},
+    plan::{ConfinementBackend, MountAccess, MountSpec, NetworkMode, RuntimeAuthKind},
     process::{run_process_streaming, ProcessInvocation},
+    runtime_auth::prepare_runtime_auth,
+    OciConfinementConfig,
 };
+use crate::kernel::runtime::RuntimeSecretsMount;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OciExecutionBackend;
+
+#[cfg(test)]
+const OCI_IMAGE_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const OCI_IMAGE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+// LionClaw bind-mounts local workspace and runtime state into confined OCI
+// containers. On SELinux hosts those mounts are unreadable by default unless
+// Podman relabels them for the container context, so we make private relabeling
+// part of the canonical volume contract instead of special-casing individual
+// mounts like /runtime.
+const READ_ONLY_BIND_MOUNT_OPTIONS: &str = "ro,Z";
+const READ_WRITE_BIND_MOUNT_OPTIONS: &str = "rw,Z";
+
+#[derive(Debug, Clone)]
+struct PreparedOciProcessLaunch {
+    engine: String,
+    args: Vec<String>,
+    network_mode: NetworkMode,
+    environment: Vec<(String, String)>,
+    image: String,
+    program_executable: String,
+    program_args: Vec<String>,
+    stdin: String,
+}
 
 #[async_trait]
 impl ExecutionBackend for OciExecutionBackend {
@@ -23,19 +58,111 @@ impl ExecutionBackend for OciExecutionBackend {
         request: ExecutionRequest,
         stdout: ExecutionStdoutSender,
     ) -> Result<ExecutionOutput> {
-        ensure_runtime_secrets_registered(&request).await?;
-        let invocation = build_oci_process_invocation(&request)?;
-        run_process_streaming(&invocation, move |line| {
+        let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
+        let runtime_auth_environment = prepare_runtime_auth(&request).await?;
+        let prepared = prepare_oci_process_launch(&request)?;
+        let invocation = build_oci_process_invocation(prepared, &runtime_auth_environment);
+        let result = run_process_streaming(&invocation, move |line| {
             let _ = stdout.send(line.to_string());
             Ok(())
         })
-        .await
+        .await;
+        let runtime_secrets_cleanup_result = match runtime_secrets {
+            Some(cleanup) => cleanup.shutdown().await,
+            None => Ok(()),
+        };
+
+        match (result, runtime_secrets_cleanup_result) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Ok(output), Err(err)) => {
+                warn!(
+                    error = %err,
+                    "runtime secret cleanup failed after successful OCI runtime turn"
+                );
+                Ok(output)
+            }
+            (Err(err), _) => Err(err),
+        }
     }
 }
 
-fn build_oci_process_invocation(request: &ExecutionRequest) -> Result<ProcessInvocation> {
-    let config = request.plan.confinement.oci();
+pub async fn validate_oci_launch_prerequisites(
+    runtime_id: &str,
+    confinement: &OciConfinementConfig,
+    _required_auth: Option<RuntimeAuthKind>,
+) -> Result<()> {
+    let image = confinement.image.as_deref().ok_or_else(|| {
+        anyhow!(
+            "runtime '{}' requires a Podman runtime image in its confinement config",
+            runtime_id
+        )
+    })?;
 
+    // The runtime image is operator-managed, so launch preflight requires it to
+    // exist locally instead of pulling an arbitrary mutable reference behind the
+    // user's back.
+    ensure_oci_image_exists(
+        &confinement.engine,
+        image,
+        format!(
+            "configured runtime image '{}' for runtime '{}'",
+            image, runtime_id
+        ),
+    )
+    .await?;
+
+    Ok(())
+}
+
+pub async fn resolve_oci_image_compatibility_identity(engine: &str, image: &str) -> Result<String> {
+    let output = run_oci_preflight_command(
+        &ProcessInvocation {
+            executable: engine.to_string(),
+            args: vec![
+                "image".to_string(),
+                "inspect".to_string(),
+                "--format".to_string(),
+                "{{.Id}}".to_string(),
+                image.to_string(),
+            ],
+            working_dir: None,
+            environment: Vec::new(),
+            input: String::new(),
+        },
+        &format!("resolve OCI image identity for '{}'", image),
+        OCI_IMAGE_PROBE_TIMEOUT,
+    )
+    .await?;
+
+    if !output.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            bail!(
+                "failed to resolve OCI image identity for '{}'; OCI engine exited with code {:?}",
+                image,
+                output.exit_code
+            );
+        }
+        bail!(
+            "failed to resolve OCI image identity for '{}': {}",
+            image,
+            stderr
+        );
+    }
+
+    let identity = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if identity.is_empty() {
+        bail!(
+            "failed to resolve OCI image identity for '{}': empty OCI inspect output",
+            image
+        );
+    }
+
+    Ok(identity)
+}
+
+fn prepare_oci_process_launch(request: &ExecutionRequest) -> Result<PreparedOciProcessLaunch> {
+    let config = request.plan.confinement.oci();
     let image = config.image.as_deref().ok_or_else(|| {
         anyhow!(
             "runtime '{}' requires a Podman runtime image in its confinement config",
@@ -51,17 +178,6 @@ fn build_oci_process_invocation(request: &ExecutionRequest) -> Result<ProcessInv
 
     if config.read_only_rootfs {
         args.push("--read-only".to_string());
-    }
-
-    match request.plan.network_mode {
-        NetworkMode::None => {
-            args.push("--network".to_string());
-            args.push("none".to_string());
-        }
-        NetworkMode::On => {
-            args.push("--network".to_string());
-            args.push("private".to_string());
-        }
     }
 
     if let Some(working_dir) = request.plan.working_dir.as_deref() {
@@ -89,11 +205,7 @@ fn build_oci_process_invocation(request: &ExecutionRequest) -> Result<ProcessInv
         args.push(value.to_string());
     }
 
-    for (key, value) in merged_environment(&request.plan.environment, &request.program.environment)
-    {
-        args.push("--env".to_string());
-        args.push(format!("{key}={value}"));
-    }
+    let environment = merged_environment(&request.plan.environment, &request.program.environment);
 
     if let Some(runtime_secrets_mount) = &request.runtime_secrets_mount {
         args.push("--secret".to_string());
@@ -113,38 +225,155 @@ fn build_oci_process_invocation(request: &ExecutionRequest) -> Result<ProcessInv
         args.push(pids_limit.to_string());
     }
 
-    args.push(image.to_string());
-    args.push(request.program.executable.clone());
-    args.extend(request.program.args.clone());
-
-    Ok(ProcessInvocation {
-        executable: config.engine.clone(),
+    Ok(PreparedOciProcessLaunch {
+        engine: config.engine.clone(),
         args,
-        working_dir: None,
-        environment: Vec::new(),
-        input: request.program.stdin.clone(),
+        network_mode: request.plan.network_mode,
+        environment,
+        image: image.to_string(),
+        program_executable: request.program.executable.clone(),
+        program_args: request.program.args.clone(),
+        stdin: request.program.stdin.clone(),
     })
 }
 
-async fn ensure_runtime_secrets_registered(request: &ExecutionRequest) -> Result<()> {
-    let Some(mount) = request.runtime_secrets_mount.as_ref() else {
-        return Ok(());
-    };
-    let engine = request.plan.confinement.oci().engine.clone();
-    let output = run_process_streaming(
+fn append_bind_mount_identity_args(args: &mut Vec<String>) {
+    #[cfg(unix)]
+    {
+        // LionClaw bind-mounts host workspace/runtime paths into confined
+        // containers. Under rootless Podman, leaving user namespaces implicit
+        // can make those mounts unreadable or unwritable to a non-root image
+        // user even though the local operator owns the files. LionClaw's
+        // canonical standalone runtime contract is therefore explicit keep-id
+        // userns plus the invoking local uid/gid.
+        args.push("--userns".to_string());
+        args.push("keep-id".to_string());
+        args.push("--user".to_string());
+        args.push(format!("{}:{}", getuid().as_raw(), getgid().as_raw()));
+    }
+}
+
+async fn ensure_oci_image_exists(engine: &str, image: &str, description: String) -> Result<()> {
+    match run_oci_image_probe(engine, image).await? {
+        OciImageProbeResult::Present => Ok(()),
+        OciImageProbeResult::Missing => bail!(
+            "{} is not available locally; build or pull it before running LionClaw",
+            description
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OciImageProbeResult {
+    Present,
+    Missing,
+}
+
+async fn run_oci_image_probe(engine: &str, image: &str) -> Result<OciImageProbeResult> {
+    let output = run_oci_preflight_command(
         &ProcessInvocation {
-            executable: engine.clone(),
-            args: vec![
-                "secret".to_string(),
-                "create".to_string(),
-                "--replace".to_string(),
-                mount.mounted_name(),
-                path_to_arg(&mount.source)?,
-            ],
+            executable: engine.to_string(),
+            args: vec!["image".to_string(), "exists".to_string(), image.to_string()],
             working_dir: None,
             environment: Vec::new(),
             input: String::new(),
         },
+        &format!("inspect OCI image '{}'", image),
+        OCI_IMAGE_PROBE_TIMEOUT,
+    )
+    .await?;
+
+    match output.exit_code {
+        Some(0) => Ok(OciImageProbeResult::Present),
+        Some(1) => Ok(OciImageProbeResult::Missing),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                bail!(
+                    "failed to inspect OCI image '{}'; OCI engine exited with code {:?}",
+                    image,
+                    output.exit_code
+                );
+            }
+            bail!("failed to inspect OCI image '{}': {}", image, stderr);
+        }
+    }
+}
+
+async fn run_oci_preflight_command(
+    invocation: &ProcessInvocation,
+    action: &str,
+    timeout_duration: Duration,
+) -> Result<super::process::ProcessOutput> {
+    match timeout(
+        timeout_duration,
+        run_process_streaming(invocation, |_| Ok(())),
+    )
+    .await
+    {
+        Ok(result) => result.with_context(|| {
+            format!(
+                "failed to {} using OCI engine '{}'",
+                action, invocation.executable
+            )
+        }),
+        Err(_) => bail!(
+            "timed out after {}s while attempting to {} using OCI engine '{}'",
+            timeout_duration.as_secs_f32(),
+            action,
+            invocation.executable
+        ),
+    }
+}
+
+fn build_oci_process_invocation(
+    prepared: PreparedOciProcessLaunch,
+    runtime_auth_environment: &[(String, String)],
+) -> ProcessInvocation {
+    let mut args = prepared.args;
+
+    append_bind_mount_identity_args(&mut args);
+
+    match prepared.network_mode {
+        NetworkMode::None => {
+            args.push("--network".to_string());
+            args.push("none".to_string());
+        }
+        NetworkMode::On => {
+            args.push("--network".to_string());
+            args.push("private".to_string());
+        }
+    }
+
+    let mut environment = prepared.environment;
+    environment = merged_environment(&environment, runtime_auth_environment);
+    for (key, value) in environment {
+        args.push("--env".to_string());
+        args.push(format!("{key}={value}"));
+    }
+
+    args.push(prepared.image);
+    args.push(prepared.program_executable);
+    args.extend(prepared.program_args);
+
+    ProcessInvocation {
+        executable: prepared.engine,
+        args,
+        working_dir: None,
+        environment: Vec::new(),
+        input: prepared.stdin,
+    }
+}
+
+async fn ensure_runtime_secrets_registered(
+    request: &ExecutionRequest,
+) -> Result<Option<OciRuntimeSecretsSession>> {
+    let Some(mount) = request.runtime_secrets_mount.as_ref() else {
+        return Ok(None);
+    };
+    let engine = request.plan.confinement.oci().engine.clone();
+    let output = run_process_streaming(
+        &build_runtime_secret_create_invocation(&engine, mount)?,
         |_| Ok(()),
     )
     .await
@@ -156,7 +385,12 @@ async fn ensure_runtime_secrets_registered(request: &ExecutionRequest) -> Result
     })?;
 
     if output.success() {
-        return Ok(());
+        return Ok(Some(OciRuntimeSecretsSession {
+            cleanup: Some(OciRuntimeSecretsCleanup {
+                engine,
+                secret_name: mount.mounted_name(),
+            }),
+        }));
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -168,6 +402,112 @@ async fn ensure_runtime_secrets_registered(request: &ExecutionRequest) -> Result
     }
 
     bail!("failed to register OCI runtime secrets: {}", stderr)
+}
+
+#[derive(Debug)]
+struct OciRuntimeSecretsCleanup {
+    engine: String,
+    secret_name: String,
+}
+
+#[derive(Debug)]
+struct OciRuntimeSecretsSession {
+    cleanup: Option<OciRuntimeSecretsCleanup>,
+}
+
+impl OciRuntimeSecretsSession {
+    async fn shutdown(mut self) -> Result<()> {
+        let Some(cleanup) = self.cleanup.take() else {
+            return Ok(());
+        };
+        cleanup.shutdown().await
+    }
+}
+
+impl Drop for OciRuntimeSecretsSession {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup.spawn();
+        }
+    }
+}
+
+impl OciRuntimeSecretsCleanup {
+    async fn shutdown(self) -> Result<()> {
+        let output = run_oci_preflight_command(
+            &build_runtime_secret_remove_invocation(&self.engine, &self.secret_name),
+            &format!("remove OCI runtime secret '{}'", self.secret_name),
+            OCI_IMAGE_PROBE_TIMEOUT,
+        )
+        .await?;
+
+        if output.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            bail!(
+                "failed to remove OCI runtime secret '{}'; OCI engine exited with code {:?}",
+                self.secret_name,
+                output.exit_code
+            );
+        }
+
+        bail!(
+            "failed to remove OCI runtime secret '{}': {}",
+            self.secret_name,
+            stderr
+        )
+    }
+
+    fn spawn(self) {
+        if let Ok(handle) = Handle::try_current() {
+            handle.spawn(async move {
+                let _ = self.shutdown().await;
+            });
+            return;
+        }
+
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new(&self.engine)
+                .args(["secret", "rm", &self.secret_name])
+                .status();
+        });
+    }
+}
+
+fn build_runtime_secret_create_invocation(
+    engine: &str,
+    mount: &RuntimeSecretsMount,
+) -> Result<ProcessInvocation> {
+    Ok(ProcessInvocation {
+        executable: engine.to_string(),
+        args: vec![
+            "secret".to_string(),
+            "create".to_string(),
+            "--replace".to_string(),
+            mount.mounted_name(),
+            path_to_arg(&mount.source)?,
+        ],
+        working_dir: None,
+        environment: Vec::new(),
+        input: String::new(),
+    })
+}
+
+fn build_runtime_secret_remove_invocation(engine: &str, secret_name: &str) -> ProcessInvocation {
+    ProcessInvocation {
+        executable: engine.to_string(),
+        args: vec![
+            "secret".to_string(),
+            "rm".to_string(),
+            secret_name.to_string(),
+        ],
+        working_dir: None,
+        environment: Vec::new(),
+        input: String::new(),
+    }
 }
 
 fn path_to_arg(path: &Path) -> Result<String> {
@@ -236,8 +576,8 @@ fn format_volume_spec(mount: &MountSpec) -> Result<String> {
     }
 
     let access = match mount.access {
-        MountAccess::ReadOnly => "ro",
-        MountAccess::ReadWrite => "rw",
+        MountAccess::ReadOnly => READ_ONLY_BIND_MOUNT_OPTIONS,
+        MountAccess::ReadWrite => READ_WRITE_BIND_MOUNT_OPTIONS,
     };
     Ok(format!("{source}:{}:{access}", mount.target))
 }
@@ -264,14 +604,22 @@ fn merged_environment(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
-    use super::build_oci_process_invocation;
+    use super::{build_oci_process_invocation, prepare_oci_process_launch, OciExecutionBackend};
+    use crate::kernel::runtime::execution::backend::ExecutionBackend;
     use crate::kernel::runtime::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionRequest, NetworkMode,
         OciConfinementConfig, RuntimeProgramSpec, RuntimeSecretsMount, WorkspaceAccess,
     };
     use crate::kernel::runtime::{MountAccess, MountSpec};
+    #[cfg(unix)]
+    use rustix::process::{getgid, getuid};
+    use tempfile::tempdir;
+    use tokio::sync::mpsc;
 
     #[test]
     fn oci_backend_builds_podman_run_invocation() {
@@ -282,13 +630,18 @@ mod tests {
                 args: vec!["exec".to_string(), "--json".to_string()],
                 environment: vec![("MODEL".to_string(), "gpt-5-codex".to_string())],
                 stdin: "hello".to_string(),
+                auth: None,
             },
             runtime_secrets_mount: Some(RuntimeSecretsMount {
                 source: "/home/mosh/.lionclaw/config/runtime-secrets.env".into(),
             }),
+            codex_home_override: None,
         };
 
-        let invocation = build_oci_process_invocation(&request).expect("invocation");
+        let invocation = build_oci_process_invocation(
+            prepare_oci_process_launch(&request).expect("prepare"),
+            &[],
+        );
 
         assert_eq!(invocation.executable, "podman");
         assert_eq!(invocation.working_dir, None);
@@ -299,8 +652,20 @@ mod tests {
             "run".to_string(),
             "--rm".to_string(),
             "--interactive".to_string(),
-            "--read-only".to_string(),
         ]));
+        #[cfg(unix)]
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--userns".to_string(), "keep-id".to_string()]));
+        #[cfg(unix)]
+        assert!(invocation.args.windows(2).any(|pair| {
+            pair == [
+                "--user".to_string(),
+                format!("{}:{}", getuid().as_raw(), getgid().as_raw()),
+            ]
+        }));
+        assert!(invocation.args.iter().any(|arg| arg == "--read-only"));
         assert!(invocation
             .args
             .windows(2)
@@ -308,25 +673,25 @@ mod tests {
         assert!(invocation.args.windows(2).any(|pair| {
             pair == [
                 "--volume".to_string(),
-                "/host/workspace:/workspace:rw".to_string(),
+                "/host/workspace:/workspace:rw,Z".to_string(),
             ]
         }));
         assert!(invocation.args.windows(2).any(|pair| {
             pair == [
                 "--volume".to_string(),
-                "/host/runtime/codex/dev:/runtime:rw".to_string(),
+                "/host/runtime/codex/dev:/runtime:rw,Z".to_string(),
             ]
         }));
         assert!(invocation.args.windows(2).any(|pair| {
             pair == [
                 "--volume".to_string(),
-                "/host/runtime/codex/dev/drafts:/drafts:rw".to_string(),
+                "/host/runtime/codex/dev/drafts:/drafts:rw,Z".to_string(),
             ]
         }));
         assert!(invocation
             .args
             .windows(2)
-            .any(|pair| { pair == ["--volume".to_string(), "/host/refs:/refs:ro".to_string()] }));
+            .any(|pair| { pair == ["--volume".to_string(), "/host/refs:/refs:ro,Z".to_string()] }));
         assert!(invocation
             .args
             .windows(2)
@@ -383,17 +748,23 @@ mod tests {
         let mut plan = sample_plan();
         plan.network_mode = NetworkMode::None;
 
-        let invocation = build_oci_process_invocation(&ExecutionRequest {
+        let request = ExecutionRequest {
             plan,
             program: RuntimeProgramSpec {
                 executable: "codex".to_string(),
                 args: Vec::new(),
                 environment: Vec::new(),
                 stdin: String::new(),
+                auth: None,
             },
             runtime_secrets_mount: None,
-        })
-        .expect("invocation");
+            codex_home_override: None,
+        };
+
+        let invocation = build_oci_process_invocation(
+            prepare_oci_process_launch(&request).expect("prepare"),
+            &[],
+        );
 
         assert!(invocation
             .args
@@ -403,12 +774,17 @@ mod tests {
 
     #[test]
     fn oci_backend_adds_private_network_flag_for_on_mode() {
-        let invocation = build_oci_process_invocation(&ExecutionRequest {
+        let request = ExecutionRequest {
             plan: sample_plan(),
             program: RuntimeProgramSpec::default(),
             runtime_secrets_mount: None,
-        })
-        .expect("invocation");
+            codex_home_override: None,
+        };
+
+        let invocation = build_oci_process_invocation(
+            prepare_oci_process_launch(&request).expect("prepare"),
+            &[],
+        );
 
         assert!(invocation
             .args
@@ -417,14 +793,57 @@ mod tests {
     }
 
     #[test]
+    fn oci_backend_merges_runtime_auth_environment() {
+        let request = ExecutionRequest {
+            plan: sample_plan(),
+            program: RuntimeProgramSpec {
+                executable: "/usr/local/bin/codex".to_string(),
+                args: vec!["exec".to_string(), "--json".to_string()],
+                environment: Vec::new(),
+                stdin: String::new(),
+                auth: None,
+            },
+            runtime_secrets_mount: None,
+            codex_home_override: None,
+        };
+
+        let invocation = build_oci_process_invocation(
+            prepare_oci_process_launch(&request).expect("prepare"),
+            &[("CODEX_HOME".to_string(), "/runtime/home/.codex".to_string())],
+        );
+
+        #[cfg(unix)]
+        assert!(invocation.args.windows(2).any(|pair| {
+            pair == [
+                "--user".to_string(),
+                format!("{}:{}", getuid().as_raw(), getgid().as_raw()),
+            ]
+        }));
+        assert!(invocation.args.windows(2).any(|pair| {
+            pair == [
+                "--env".to_string(),
+                "CODEX_HOME=/runtime/home/.codex".to_string(),
+            ]
+        }));
+        assert!(
+            invocation
+                .args
+                .windows(2)
+                .any(|pair| { pair == ["--network".to_string(), "private".to_string()] }),
+            "direct runtime launch should keep explicit network wiring"
+        );
+    }
+
+    #[test]
     fn oci_backend_rejects_missing_image() {
         let mut plan = sample_plan();
         plan.confinement.oci_mut().image = None;
 
-        let err = build_oci_process_invocation(&ExecutionRequest {
+        let err = prepare_oci_process_launch(&ExecutionRequest {
             plan,
             program: RuntimeProgramSpec::default(),
             runtime_secrets_mount: None,
+            codex_home_override: None,
         })
         .expect_err("missing image should fail");
 
@@ -436,16 +855,178 @@ mod tests {
         let mut plan = sample_plan();
         plan.working_dir = Some("/outside".to_string());
 
-        let err = build_oci_process_invocation(&ExecutionRequest {
+        let err = prepare_oci_process_launch(&ExecutionRequest {
             plan,
             program: RuntimeProgramSpec::default(),
             runtime_secrets_mount: None,
+            codex_home_override: None,
         })
         .expect_err("working dir should fail");
 
         assert!(err
             .to_string()
             .contains("is not inside any configured runtime mount"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oci_backend_removes_runtime_secret_after_turn_completion() {
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("podman.log");
+        let engine_path = temp_dir.path().join("podman-stub.sh");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+set -eu
+echo "$@" >> "{log_path}"
+case "${{1:-}}" in
+  secret)
+    exit 0
+    ;;
+  run)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"#,
+            log_path = log_path.display()
+        );
+        fs::write(&engine_path, script).expect("write engine");
+        let mut permissions = fs::metadata(&engine_path)
+            .expect("engine metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&engine_path, permissions).expect("chmod engine");
+
+        let request = ExecutionRequest {
+            plan: EffectiveExecutionPlan {
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: engine_path.display().to_string(),
+                    ..sample_plan().confinement.oci().clone()
+                }),
+                ..sample_plan()
+            },
+            program: RuntimeProgramSpec {
+                executable: "codex".to_string(),
+                args: vec!["exec".to_string(), "--json".to_string()],
+                environment: Vec::new(),
+                stdin: "hello".to_string(),
+                auth: None,
+            },
+            runtime_secrets_mount: Some(RuntimeSecretsMount {
+                source: temp_dir.path().join("runtime-secrets.env"),
+            }),
+            codex_home_override: None,
+        };
+        fs::write(
+            request
+                .runtime_secrets_mount
+                .as_ref()
+                .expect("mount")
+                .source
+                .as_path(),
+            "TOKEN=value\n",
+        )
+        .expect("write runtime secrets");
+
+        let (stdout_tx, _stdout_rx) = mpsc::unbounded_channel();
+        OciExecutionBackend
+            .execute_streaming(request.clone(), stdout_tx)
+            .await
+            .expect("execute");
+
+        let log = fs::read_to_string(&log_path).expect("read log");
+        let secret_name = request
+            .runtime_secrets_mount
+            .as_ref()
+            .expect("mount")
+            .mounted_name();
+        assert!(
+            log.contains(&format!("secret create --replace {}", secret_name)),
+            "secret create should be logged: {log}"
+        );
+        assert!(
+            log.contains(&format!("secret rm {}", secret_name)),
+            "secret remove should be logged: {log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oci_backend_does_not_fail_successful_turn_when_runtime_secret_cleanup_races() {
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("podman.log");
+        let engine_path = temp_dir.path().join("podman-stub.sh");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+set -eu
+echo "$@" >> "{log_path}"
+if [ "${{1:-}}" = "secret" ] && [ "${{2:-}}" = "rm" ]; then
+  echo "secret not found" >&2
+  exit 1
+fi
+case "${{1:-}}" in
+  secret|run) exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+            log_path = log_path.display()
+        );
+        fs::write(&engine_path, script).expect("write engine");
+        let mut permissions = fs::metadata(&engine_path)
+            .expect("engine metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&engine_path, permissions).expect("chmod engine");
+
+        let request = ExecutionRequest {
+            plan: EffectiveExecutionPlan {
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: engine_path.display().to_string(),
+                    ..sample_plan().confinement.oci().clone()
+                }),
+                ..sample_plan()
+            },
+            program: RuntimeProgramSpec {
+                executable: "codex".to_string(),
+                args: vec!["exec".to_string(), "--json".to_string()],
+                environment: Vec::new(),
+                stdin: "hello".to_string(),
+                auth: None,
+            },
+            runtime_secrets_mount: Some(RuntimeSecretsMount {
+                source: temp_dir.path().join("runtime-secrets.env"),
+            }),
+            codex_home_override: None,
+        };
+        fs::write(
+            request
+                .runtime_secrets_mount
+                .as_ref()
+                .expect("mount")
+                .source
+                .as_path(),
+            "TOKEN=value\n",
+        )
+        .expect("write runtime secrets");
+
+        let (stdout_tx, _stdout_rx) = mpsc::unbounded_channel();
+        OciExecutionBackend
+            .execute_streaming(request.clone(), stdout_tx)
+            .await
+            .expect("successful turn should not fail on cleanup race");
+
+        let log = fs::read_to_string(&log_path).expect("read log");
+        let secret_name = request
+            .runtime_secrets_mount
+            .as_ref()
+            .expect("mount")
+            .mounted_name();
+        assert!(
+            log.contains(&format!("secret rm {}", secret_name)),
+            "secret remove should still be attempted: {log}"
+        );
     }
 
     fn sample_plan() -> EffectiveExecutionPlan {

@@ -69,12 +69,13 @@ use super::{
     },
     policy::{Capability, PolicyStore, Scope},
     runtime::{
-        execute_program_backed_turn, register_builtin_runtime_adapters, EffectiveExecutionPlan,
-        ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
-        ExecutionPreset, HiddenTurnSupport, RuntimeAdapter, RuntimeCapabilityRequest,
-        RuntimeCapabilityResult, RuntimeEvent, RuntimeExecutionProfile, RuntimeMessageLane,
-        RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput,
-        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
+        execute_program_backed_turn, register_builtin_runtime_adapters,
+        resolve_oci_image_compatibility_identity, EffectiveExecutionPlan, ExecutionPlanPurpose,
+        ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset,
+        HiddenTurnSupport, RuntimeAdapter, RuntimeCapabilityRequest, RuntimeCapabilityResult,
+        RuntimeEvent, RuntimeExecutionProfile, RuntimeMessageLane, RuntimeRegistry,
+        RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
+        RuntimeTurnMode, RuntimeTurnResult,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -104,6 +105,7 @@ pub struct KernelOptions {
     pub execution_presets: BTreeMap<String, ExecutionPreset>,
     pub runtime_execution_profiles: BTreeMap<String, RuntimeExecutionProfile>,
     pub runtime_secrets_home: Option<LionClawHome>,
+    pub codex_home_override: Option<PathBuf>,
     pub workspace_root: Option<PathBuf>,
     pub project_workspace_root: Option<PathBuf>,
     pub runtime_root: Option<PathBuf>,
@@ -125,6 +127,7 @@ impl fmt::Debug for KernelOptions {
                 &self.runtime_execution_profiles,
             )
             .field("runtime_secrets_home", &self.runtime_secrets_home)
+            .field("codex_home_override", &self.codex_home_override)
             .field("workspace_root", &self.workspace_root)
             .field("project_workspace_root", &self.project_workspace_root)
             .field("runtime_root", &self.runtime_root)
@@ -145,6 +148,7 @@ impl Default for KernelOptions {
             execution_presets: BTreeMap::new(),
             runtime_execution_profiles: BTreeMap::new(),
             runtime_secrets_home: None,
+            codex_home_override: None,
             workspace_root: None,
             project_workspace_root: None,
             runtime_root: None,
@@ -175,6 +179,7 @@ pub struct Kernel {
     execution_planner: ExecutionPlanner,
     default_runtime_id: Option<String>,
     runtime_secrets_home: Option<LionClawHome>,
+    codex_home_override: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
     project_workspace_root: Option<PathBuf>,
     session_scope: String,
@@ -208,6 +213,24 @@ impl Kernel {
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("session not found".to_string()))
+    }
+
+    pub(super) async fn validate_runtime_launch_prerequisites(
+        &self,
+        runtime_id: &str,
+    ) -> Result<(), KernelError> {
+        let profile = self.execution_planner.runtime_profile(runtime_id);
+        let Some(profile) = profile else {
+            return Ok(());
+        };
+        crate::kernel::runtime::validate_runtime_launch_prerequisites(
+            runtime_id,
+            &profile.confinement,
+            profile.required_runtime_auth,
+            self.codex_home_override.as_deref(),
+        )
+        .await
+        .map_err(|err| KernelError::Runtime(err.to_string()))
     }
 
     pub async fn new(db_path: &Path) -> anyhow::Result<Self> {
@@ -279,6 +302,7 @@ impl Kernel {
             execution_planner,
             default_runtime_id: options.default_runtime_id,
             runtime_secrets_home: options.runtime_secrets_home,
+            codex_home_override: options.codex_home_override,
             workspace_root: options.workspace_root,
             project_workspace_root: options.project_workspace_root,
             session_scope,
@@ -1598,6 +1622,15 @@ impl Kernel {
                 runtime_id
             )));
         }
+        if let Err(err) = self
+            .validate_runtime_launch_prerequisites(&runtime_id)
+            .await
+        {
+            return Err(match err {
+                KernelError::Runtime(message) => KernelError::BadRequest(message),
+                other => other,
+            });
+        }
 
         let schedule = job_schedule_from_dto(req.schedule)
             .map_err(|err| KernelError::BadRequest(err.to_string()))?;
@@ -1881,6 +1914,8 @@ impl Kernel {
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("job not found".to_string()))?;
+        self.validate_runtime_launch_prerequisites(&existing.runtime_id)
+            .await?;
         let claimed = self
             .jobs
             .claim_manual_run(req.job_id, Utc::now())
@@ -2362,6 +2397,8 @@ impl Kernel {
                 },
             )
             .await?;
+        self.validate_runtime_launch_prerequisites(runtime_id)
+            .await?;
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
                 session_id: Uuid::new_v4(),
@@ -2387,6 +2424,7 @@ impl Kernel {
                         adapter.as_ref(),
                         execution_plan,
                         runtime_secrets_mount,
+                        self.codex_home_override.clone(),
                         turn_input,
                         event_tx,
                     )
@@ -3003,7 +3041,7 @@ impl Kernel {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::BTreeMap, fs};
 
     use tempfile::tempdir;
     use tokio::time::{sleep, Duration};
@@ -3076,6 +3114,85 @@ mod tests {
             .expect("resolve runtime secrets mount")
             .expect("runtime secrets mount");
         assert_eq!(mount.source, home.runtime_secrets_env_path());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_plan_resolves_image_identity_for_launched_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let fake_podman = temp_dir.path().join("podman");
+        fs::write(
+            &fake_podman,
+            "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"inspect\" ]; then\n  printf 'sha256:runtime-current\\n'\n  exit 0\nfi\nexit 1\n",
+        )
+        .expect("write fake podman");
+        fs::set_permissions(&fake_podman, fs::Permissions::from_mode(0o755))
+            .expect("chmod fake podman");
+
+        let runtime_root = temp_dir.path().join("runtime");
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(&runtime_root).expect("runtime root");
+        fs::create_dir_all(&workspace_root).expect("workspace root");
+        let runtime_profile = RuntimeExecutionProfile::new(
+            crate::kernel::runtime::ConfinementConfig::Oci(
+                crate::kernel::runtime::OciConfinementConfig {
+                    engine: fake_podman.display().to_string(),
+                    image: Some("ghcr.io/lionclaw/runtime:current".to_string()),
+                    ..crate::kernel::runtime::OciConfinementConfig::default()
+                },
+            ),
+            "runtime-base".to_string(),
+            None,
+            None,
+        );
+        let expected_compatibility_key = runtime_profile
+            .clone()
+            .with_image_identity("sha256:runtime-current".to_string())
+            .compatibility_key;
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_execution_profiles: BTreeMap::from([(
+                    "secondary".to_string(),
+                    runtime_profile,
+                )]),
+                runtime_root: Some(runtime_root),
+                workspace_name: Some("main".to_string()),
+                project_workspace_root: Some(workspace_root),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+
+        let plan = kernel
+            .resolve_runtime_execution_plan(
+                Uuid::new_v4(),
+                "secondary",
+                ExecutionPlanRequest {
+                    session_id: Some(Uuid::new_v4()),
+                    runtime_id: "secondary".to_string(),
+                    purpose: ExecutionPlanPurpose::Interactive,
+                    preset_name: None,
+                    working_dir: None,
+                    env_passthrough_keys: Vec::new(),
+                    timeout_ms: None,
+                },
+            )
+            .await
+            .expect("resolve plan");
+
+        let runtime_mount = plan
+            .mounts
+            .iter()
+            .find(|mount| mount.target == "/runtime")
+            .expect("runtime mount");
+        assert!(runtime_mount
+            .source
+            .to_string_lossy()
+            .contains(&expected_compatibility_key));
     }
 
     #[tokio::test]
@@ -4279,6 +4396,8 @@ impl Kernel {
                     timeout_ms: runtime_timeout_ms,
                 },
             )
+            .await?;
+        self.validate_runtime_launch_prerequisites(&runtime_id)
             .await?;
         if kind == SessionTurnKind::Retry {
             self.reset_runtime_plan_state(&execution_plan).await?;
@@ -5546,8 +5665,14 @@ impl Kernel {
         let request_working_dir = request.working_dir.clone();
         let request_timeout_ms = request.timeout_ms;
         let request_env = request.env_passthrough_keys.clone();
+        let runtime_profile = self
+            .resolve_runtime_execution_profile_for_launch(runtime_id)
+            .await?;
 
-        match self.execution_planner.plan(request) {
+        match self
+            .execution_planner
+            .plan_with_runtime_profile(request, runtime_profile)
+        {
             Ok(plan) => {
                 self.audit
                     .append(
@@ -5607,6 +5732,30 @@ impl Kernel {
                 )))
             }
         }
+    }
+
+    async fn resolve_runtime_execution_profile_for_launch(
+        &self,
+        runtime_id: &str,
+    ) -> Result<RuntimeExecutionProfile, KernelError> {
+        let profile = self
+            .execution_planner
+            .runtime_profile(runtime_id)
+            .cloned()
+            .unwrap_or_default();
+        let config = profile.confinement.oci();
+        let Some(image) = config.image.as_deref() else {
+            return Ok(profile);
+        };
+        let image_identity = resolve_oci_image_compatibility_identity(&config.engine, image)
+            .await
+            .map_err(|err| {
+                KernelError::Runtime(format!(
+                    "failed to resolve local OCI image identity for runtime '{}': {}",
+                    runtime_id, err
+                ))
+            })?;
+        Ok(profile.with_image_identity(image_identity))
     }
 
     async fn resolve_runtime_secrets_mount(
@@ -5704,6 +5853,7 @@ impl Kernel {
                 error_code: "runtime.error".to_string(),
                 error_text: err.to_string(),
             })?;
+        let codex_home_override = self.codex_home_override.clone();
         let mut turn_task = tokio::spawn(async move {
             match adapter_for_task.turn_mode() {
                 RuntimeTurnMode::Direct => adapter_for_task.turn(input, event_tx).await,
@@ -5712,6 +5862,7 @@ impl Kernel {
                         adapter_for_task.as_ref(),
                         execution_plan,
                         runtime_secrets_mount,
+                        codex_home_override,
                         input,
                         event_tx,
                     )

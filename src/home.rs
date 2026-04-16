@@ -59,31 +59,7 @@ impl LionClawHome {
     }
 
     pub async fn resolve_runtime_secrets_file(&self) -> Result<Option<PathBuf>> {
-        let path = self.runtime_secrets_env_path();
-        let metadata = match tokio::fs::symlink_metadata(&path).await {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(err) => {
-                return Err(err).with_context(|| format!("failed to stat {}", path.display()));
-            }
-        };
-        if metadata.file_type().is_symlink() {
-            return Err(anyhow!(
-                "runtime secrets file '{}' cannot be a symlink",
-                path.display()
-            ));
-        }
-        if !metadata.file_type().is_file() {
-            return Err(anyhow!(
-                "runtime secrets path '{}' must be a regular file",
-                path.display()
-            ));
-        }
-        harden_runtime_secret_permissions(&path).await?;
-        let canonical = tokio::fs::canonicalize(&path)
-            .await
-            .with_context(|| format!("failed to canonicalize {}", path.display()))?;
-        Ok(Some(canonical))
+        resolve_private_env_file(&self.runtime_secrets_env_path(), "runtime secrets").await
     }
 
     pub fn home_id_path(&self) -> PathBuf {
@@ -321,12 +297,13 @@ fn default_home_root() -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-async fn harden_runtime_secret_permissions(path: &Path) -> Result<()> {
+async fn harden_private_env_file_permissions(path: &Path, label: &str) -> Result<()> {
     use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
     let config_dir = path.parent().ok_or_else(|| {
         anyhow!(
-            "runtime secrets file '{}' does not have a parent directory",
+            "{} file '{}' does not have a parent directory",
+            label,
             path.display()
         )
     })?;
@@ -356,8 +333,37 @@ async fn harden_runtime_secret_permissions(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-async fn harden_runtime_secret_permissions(_path: &Path) -> Result<()> {
+async fn harden_private_env_file_permissions(_path: &Path, _label: &str) -> Result<()> {
     Ok(())
+}
+
+async fn resolve_private_env_file(path: &Path, label: &str) -> Result<Option<PathBuf>> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "{} file '{}' cannot be a symlink",
+            label,
+            path.display()
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(anyhow!(
+            "{} path '{}' must be a regular file",
+            label,
+            path.display()
+        ));
+    }
+    harden_private_env_file_permissions(path, label).await?;
+    let canonical = tokio::fs::canonicalize(path)
+        .await
+        .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+    Ok(Some(canonical))
 }
 
 #[cfg(test)]
