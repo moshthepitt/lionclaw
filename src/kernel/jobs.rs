@@ -78,7 +78,7 @@ impl FromStr for SchedulerJobTriggerKind {
             "manual" => Ok(Self::Manual),
             "retry" => Ok(Self::Retry),
             "recovery" => Ok(Self::Recovery),
-            other => Err(format!("invalid scheduler job trigger kind '{}'", other)),
+            other => Err(format!("invalid scheduler job trigger kind '{other}'")),
         }
     }
 }
@@ -115,7 +115,7 @@ impl FromStr for SchedulerJobRunStatus {
             "failed" => Ok(Self::Failed),
             "dead_letter" => Ok(Self::DeadLetter),
             "interrupted" => Ok(Self::Interrupted),
-            other => Err(format!("invalid scheduler job run status '{}'", other)),
+            other => Err(format!("invalid scheduler job run status '{other}'")),
         }
     }
 }
@@ -149,7 +149,7 @@ impl FromStr for SchedulerJobDeliveryStatus {
             "delivered" => Ok(Self::Delivered),
             "failed" => Ok(Self::Failed),
             "not_requested" => Ok(Self::NotRequested),
-            other => Err(format!("invalid scheduler job delivery status '{}'", other)),
+            other => Err(format!("invalid scheduler job delivery status '{other}'")),
         }
     }
 }
@@ -1272,7 +1272,7 @@ pub fn compute_initial_next_run(
             anchor_ms,
         } => {
             let anchor = ms_to_datetime(*anchor_ms)
-                .ok_or_else(|| anyhow!("invalid interval anchor '{}'", anchor_ms))?;
+                .ok_or_else(|| anyhow!("invalid interval anchor '{anchor_ms}'"))?;
             Ok(Some(compute_interval_next(*every_ms, anchor, now)?))
         }
         JobSchedule::Cron { expr, timezone } => Ok(Some(compute_cron_next(expr, timezone, now)?)),
@@ -1349,15 +1349,14 @@ fn compute_cron_next_after(
 ) -> Result<DateTime<Utc>> {
     let tz = timezone
         .parse::<Tz>()
-        .with_context(|| format!("invalid cron timezone '{}'", timezone))?;
+        .with_context(|| format!("invalid cron timezone '{timezone}'"))?;
     let schedule = Schedule::from_str(&normalize_cron_expression(expr)?)
-        .with_context(|| format!("invalid cron expression '{}'", expr))?;
+        .with_context(|| format!("invalid cron expression '{expr}'"))?;
     let mut base = reference.with_timezone(&tz);
     loop {
         let Some(next) = schedule.after(&base).next() else {
             return Err(anyhow!(
-                "cron expression '{}' did not yield a next occurrence",
-                expr
+                "cron expression '{expr}' did not yield a next occurrence"
             ));
         };
         let next_utc = next.with_timezone(&Utc);
@@ -1372,9 +1371,9 @@ pub fn normalize_cron_expression(expr: &str) -> Result<String> {
     let trimmed = expr.trim();
     let field_count = trimmed.split_whitespace().count();
     match field_count {
-        5 => Ok(format!("0 {}", trimmed)),
+        5 => Ok(format!("0 {trimmed}")),
         6 | 7 => Ok(trimmed.to_string()),
-        _ => Err(anyhow!("invalid cron expression '{}'", expr)),
+        _ => Err(anyhow!("invalid cron expression '{expr}'")),
     }
 }
 
@@ -1393,7 +1392,7 @@ fn map_job_row(row: SqliteRow) -> Result<SchedulerJobRecord> {
     let updated_at_ms: i64 = row.get("updated_at_ms");
 
     let job_id = Uuid::parse_str(&job_id_raw)
-        .with_context(|| format!("invalid scheduler job id '{}'", job_id_raw))?;
+        .with_context(|| format!("invalid scheduler job id '{job_id_raw}'"))?;
     let schedule: JobSchedule =
         serde_json::from_str(&schedule_json).context("failed to decode scheduler job schedule")?;
     let skill_ids: Vec<String> =
@@ -1406,7 +1405,7 @@ fn map_job_row(row: SqliteRow) -> Result<SchedulerJobRecord> {
         .as_deref()
         .map(|value| {
             Uuid::parse_str(value)
-                .with_context(|| format!("invalid scheduler running run id '{}'", value))
+                .with_context(|| format!("invalid scheduler running run id '{value}'"))
         })
         .transpose()?;
 
@@ -1420,16 +1419,16 @@ fn map_job_row(row: SqliteRow) -> Result<SchedulerJobRecord> {
         skill_ids,
         delivery,
         retry_attempts: u32::try_from(retry_attempts_raw)
-            .with_context(|| format!("invalid retry_attempts '{}'", retry_attempts_raw))?,
+            .with_context(|| format!("invalid retry_attempts '{retry_attempts_raw}'"))?,
         next_run_at: next_run_at_ms
             .map(|value| {
-                ms_to_datetime(value).ok_or_else(|| anyhow!("invalid next_run_at_ms '{}'", value))
+                ms_to_datetime(value).ok_or_else(|| anyhow!("invalid next_run_at_ms '{value}'"))
             })
             .transpose()?,
         running_run_id,
         last_run_at: last_run_at_ms
             .map(|value| {
-                ms_to_datetime(value).ok_or_else(|| anyhow!("invalid last_run_at_ms '{}'", value))
+                ms_to_datetime(value).ok_or_else(|| anyhow!("invalid last_run_at_ms '{value}'"))
             })
             .transpose()?,
         last_status: last_status_raw
@@ -1438,15 +1437,12 @@ fn map_job_row(row: SqliteRow) -> Result<SchedulerJobRecord> {
             .transpose()?,
         last_error: row.get("last_error"),
         consecutive_failures: u32::try_from(consecutive_failures_raw).with_context(|| {
-            format!(
-                "invalid scheduler job consecutive_failures '{}'",
-                consecutive_failures_raw
-            )
+            format!("invalid scheduler job consecutive_failures '{consecutive_failures_raw}'")
         })?,
         created_at: ms_to_datetime(created_at_ms)
-            .ok_or_else(|| anyhow!("invalid created_at_ms '{}'", created_at_ms))?,
+            .ok_or_else(|| anyhow!("invalid created_at_ms '{created_at_ms}'"))?,
         updated_at: ms_to_datetime(updated_at_ms)
-            .ok_or_else(|| anyhow!("invalid updated_at_ms '{}'", updated_at_ms))?,
+            .ok_or_else(|| anyhow!("invalid updated_at_ms '{updated_at_ms}'"))?,
     })
 }
 
@@ -1465,23 +1461,23 @@ fn map_run_row(row: SqliteRow) -> Result<SchedulerJobRunRecord> {
 
     Ok(SchedulerJobRunRecord {
         run_id: Uuid::parse_str(&run_id_raw)
-            .with_context(|| format!("invalid scheduler run id '{}'", run_id_raw))?,
+            .with_context(|| format!("invalid scheduler run id '{run_id_raw}'"))?,
         job_id: Uuid::parse_str(&job_id_raw)
-            .with_context(|| format!("invalid scheduler job id '{}'", job_id_raw))?,
+            .with_context(|| format!("invalid scheduler job id '{job_id_raw}'"))?,
         attempt_no: u32::try_from(attempt_no_raw)
-            .with_context(|| format!("invalid scheduler attempt_no '{}'", attempt_no_raw))?,
+            .with_context(|| format!("invalid scheduler attempt_no '{attempt_no_raw}'"))?,
         trigger_kind: SchedulerJobTriggerKind::from_str(&trigger_kind_raw)
             .map_err(|err| anyhow!(err))?,
         scheduled_for: scheduled_for_ms
             .map(|value| {
-                ms_to_datetime(value).ok_or_else(|| anyhow!("invalid scheduled_for_ms '{}'", value))
+                ms_to_datetime(value).ok_or_else(|| anyhow!("invalid scheduled_for_ms '{value}'"))
             })
             .transpose()?,
         started_at: ms_to_datetime(started_at_ms)
-            .ok_or_else(|| anyhow!("invalid started_at_ms '{}'", started_at_ms))?,
+            .ok_or_else(|| anyhow!("invalid started_at_ms '{started_at_ms}'"))?,
         finished_at: finished_at_ms
             .map(|value| {
-                ms_to_datetime(value).ok_or_else(|| anyhow!("invalid finished_at_ms '{}'", value))
+                ms_to_datetime(value).ok_or_else(|| anyhow!("invalid finished_at_ms '{value}'"))
             })
             .transpose()?,
         status: SchedulerJobRunStatus::from_str(&status_raw).map_err(|err| anyhow!(err))?,
@@ -1489,14 +1485,14 @@ fn map_run_row(row: SqliteRow) -> Result<SchedulerJobRunRecord> {
             .as_deref()
             .map(|value| {
                 Uuid::parse_str(value)
-                    .with_context(|| format!("invalid scheduler run session_id '{}'", value))
+                    .with_context(|| format!("invalid scheduler run session_id '{value}'"))
             })
             .transpose()?,
         turn_id: turn_id_raw
             .as_deref()
             .map(|value| {
                 Uuid::parse_str(value)
-                    .with_context(|| format!("invalid scheduler run turn_id '{}'", value))
+                    .with_context(|| format!("invalid scheduler run turn_id '{value}'"))
             })
             .transpose()?,
         delivery_status: delivery_status_raw

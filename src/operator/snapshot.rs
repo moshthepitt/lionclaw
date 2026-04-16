@@ -38,7 +38,7 @@ pub fn install_snapshot(
     let (name, _) = parse_skill_frontmatter(&skill_md);
     let hash = hash_directory(&source_path)?;
     let skill_id = derive_skill_id(&name, &hash);
-    let snapshot_dir_name = format!("{}@{}", skill_id, hash);
+    let snapshot_dir_name = format!("{skill_id}@{hash}");
     let snapshot_abs_dir = home.skills_dir().join(&snapshot_dir_name);
 
     if !snapshot_abs_dir.exists() {
@@ -51,7 +51,7 @@ pub fn install_snapshot(
         reference: reference.to_string(),
         skill_id,
         hash,
-        snapshot_rel_dir: format!("skills/{}", snapshot_dir_name),
+        snapshot_rel_dir: format!("skills/{snapshot_dir_name}"),
         snapshot_abs_dir,
         skill_md,
     })
@@ -60,7 +60,7 @@ pub fn install_snapshot(
 pub fn resolve_local_source(source_uri: &str) -> Result<PathBuf> {
     let raw = source_uri
         .strip_prefix("local:")
-        .ok_or_else(|| anyhow!("unsupported skill source '{}'", source_uri))?;
+        .ok_or_else(|| anyhow!("unsupported skill source '{source_uri}'"))?;
     let path = PathBuf::from(raw);
     if !path.is_dir() {
         return Err(anyhow!(

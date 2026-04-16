@@ -117,17 +117,17 @@ impl AuditLog {
                 let timestamp_ms: i64 = row.get("timestamp_ms");
 
                 let event_id = Uuid::parse_str(&event_id_raw)
-                    .with_context(|| format!("invalid event id '{}'", event_id_raw))?;
+                    .with_context(|| format!("invalid event id '{event_id_raw}'"))?;
                 let session_id = session_id_raw
                     .map(|value| {
                         Uuid::parse_str(&value)
-                            .with_context(|| format!("invalid session id '{}'", value))
+                            .with_context(|| format!("invalid session id '{value}'"))
                     })
                     .transpose()?;
                 let details = serde_json::from_str(&details_raw)
-                    .with_context(|| format!("invalid audit details '{}'", details_raw))?;
+                    .with_context(|| format!("invalid audit details '{details_raw}'"))?;
                 let timestamp = ms_to_datetime(timestamp_ms)
-                    .ok_or_else(|| anyhow!("invalid timestamp_ms '{}'", timestamp_ms))?;
+                    .ok_or_else(|| anyhow!("invalid timestamp_ms '{timestamp_ms}'"))?;
 
                 Ok(AuditEvent {
                     event_id,

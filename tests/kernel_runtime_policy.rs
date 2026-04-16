@@ -113,7 +113,7 @@ async fn runtime_policy_denies_unallowed_env_passthrough() {
                 "deny reason should mention policy restriction"
             );
         }
-        other => panic!("unexpected error variant: {}", other),
+        other => panic!("unexpected error variant: {other}"),
     }
 
     let deny_events = kernel

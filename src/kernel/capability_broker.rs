@@ -78,8 +78,7 @@ impl FilesystemBroker {
             .with_context(|| format!("failed to read metadata for '{}'", resolved.display()))?;
         if metadata.len() > FS_READ_MAX_BYTES {
             return Err(anyhow!(
-                "fs.read rejects files larger than {} bytes",
-                FS_READ_MAX_BYTES
+                "fs.read rejects files larger than {FS_READ_MAX_BYTES} bytes"
             ));
         }
 
@@ -121,7 +120,7 @@ impl FilesystemBroker {
         let requested = self.resolve_requested_path(raw_path)?;
         let parent = requested
             .parent()
-            .ok_or_else(|| anyhow!("path '{}' must include a parent directory", raw_path))?;
+            .ok_or_else(|| anyhow!("path '{raw_path}' must include a parent directory"))?;
         let canonical_parent = parent
             .canonicalize()
             .with_context(|| format!("parent directory '{}' does not exist", parent.display()))?;
@@ -129,7 +128,7 @@ impl FilesystemBroker {
 
         let file_name = requested
             .file_name()
-            .ok_or_else(|| anyhow!("path '{}' must include a file name", raw_path))?;
+            .ok_or_else(|| anyhow!("path '{raw_path}' must include a file name"))?;
 
         Ok(canonical_parent.join(file_name))
     }

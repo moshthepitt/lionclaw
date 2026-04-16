@@ -430,7 +430,7 @@ async fn active_continuity_global_slices_are_bounded_to_recent_items() {
         let _ = kernel
             .turn_session(SessionTurnRequest {
                 session_id: session.session_id,
-                user_text: format!("fail turn {}", index),
+                user_text: format!("fail turn {index}"),
                 runtime_id: Some("boom".to_string()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
@@ -857,7 +857,7 @@ async fn older_turns_are_compacted_into_prompt_context() {
         kernel
             .turn_session(SessionTurnRequest {
                 session_id: session.session_id,
-                user_text: format!("continuity-marker turn {}", index),
+                user_text: format!("continuity-marker turn {index}"),
                 runtime_id: Some("capture".to_string()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
@@ -928,8 +928,7 @@ async fn continuity_surface_lists_searches_and_manages_proposals_and_loops() {
             .turn_session(SessionTurnRequest {
                 session_id: session.session_id,
                 user_text: format!(
-                    "continuity-marker review turn {} in src/kernel/continuity.rs",
-                    index
+                    "continuity-marker review turn {index} in src/kernel/continuity.rs"
                 ),
                 runtime_id: Some("capture".to_string()),
                 runtime_working_dir: None,
@@ -1186,7 +1185,7 @@ async fn unsafe_runtimes_do_not_receive_hidden_compaction_prompts() {
         kernel
             .turn_session(SessionTurnRequest {
                 session_id: session.session_id,
-                user_text: format!("turn {}", index),
+                user_text: format!("turn {index}"),
                 runtime_id: Some("unsafe-capture".to_string()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
@@ -1244,7 +1243,7 @@ async fn compaction_failures_are_audited_without_failing_completed_turns() {
                 user_text: if index == 0 {
                     "continuity-marker turn 0".to_string()
                 } else {
-                    format!("turn {}", index)
+                    format!("turn {index}")
                 },
                 runtime_id: Some("capture".to_string()),
                 runtime_working_dir: None,
@@ -1474,7 +1473,7 @@ async fn merged_and_resolved_items_do_not_reappear_without_new_reintroduction() 
                 user_text: if index == 0 {
                     "continuity-marker seed turn 0".to_string()
                 } else {
-                    format!("seed turn {}", index)
+                    format!("seed turn {index}")
                 },
                 runtime_id: Some("capture".to_string()),
                 runtime_working_dir: None,
@@ -1546,7 +1545,7 @@ async fn merged_and_resolved_items_do_not_reappear_without_new_reintroduction() 
         kernel
             .turn_session(SessionTurnRequest {
                 session_id: session.session_id,
-                user_text: format!("follow-up turn {}", index),
+                user_text: format!("follow-up turn {index}"),
                 runtime_id: Some("capture-empty".to_string()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
@@ -1628,7 +1627,7 @@ async fn merged_and_resolved_items_do_not_reappear_from_other_sessions() {
                 user_text: if index == 0 {
                     "continuity-marker first session turn 0".to_string()
                 } else {
-                    format!("first session turn {}", index)
+                    format!("first session turn {index}")
                 },
                 runtime_id: Some("capture".to_string()),
                 runtime_working_dir: None,
@@ -1643,7 +1642,7 @@ async fn merged_and_resolved_items_do_not_reappear_from_other_sessions() {
                 user_text: if index == 0 {
                     "continuity-marker second session turn 0".to_string()
                 } else {
-                    format!("second session turn {}", index)
+                    format!("second session turn {index}")
                 },
                 runtime_id: Some("capture".to_string()),
                 runtime_working_dir: None,
@@ -1682,7 +1681,7 @@ async fn merged_and_resolved_items_do_not_reappear_from_other_sessions() {
         kernel
             .turn_session(SessionTurnRequest {
                 session_id: second.session_id,
-                user_text: format!("second session follow-up turn {}", index),
+                user_text: format!("second session follow-up turn {index}"),
                 runtime_id: Some("capture-empty".to_string()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
@@ -1745,7 +1744,7 @@ async fn merged_and_resolved_items_can_reappear_when_later_compaction_reintroduc
                 user_text: if index == 0 {
                     "continuity-marker seed turn 0".to_string()
                 } else {
-                    format!("seed turn {}", index)
+                    format!("seed turn {index}")
                 },
                 runtime_id: Some("capture".to_string()),
                 runtime_working_dir: None,
@@ -1788,7 +1787,7 @@ async fn merged_and_resolved_items_can_reappear_when_later_compaction_reintroduc
         kernel
             .turn_session(SessionTurnRequest {
                 session_id: session.session_id,
-                user_text: format!("continuity-marker reintroduce turn {}", index),
+                user_text: format!("continuity-marker reintroduce turn {index}"),
                 runtime_id: Some("capture".to_string()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
@@ -1936,12 +1935,11 @@ async fn continuity_lists_reject_symlinked_continuity_roots() {
 async fn install_enabled_skill(kernel: &Kernel, name: &str) -> String {
     let skill = kernel
         .install_skill(SkillInstallRequest {
-            source: format!("local/{}", name),
+            source: format!("local/{name}"),
             reference: Some("main".to_string()),
-            hash: Some(format!("{}-hash", name)),
+            hash: Some(format!("{name}-hash")),
             skill_md: Some(format!(
-                "---\nname: {}\ndescription: Handles {}\n---",
-                name, name
+                "---\nname: {name}\ndescription: Handles {name}\n---"
             )),
             snapshot_path: None,
         })
@@ -1964,7 +1962,7 @@ async fn install_enabled_skill(kernel: &Kernel, name: &str) -> String {
 }
 
 async fn install_and_bind_channel(kernel: &Kernel, channel_id: &str) {
-    let skill_id = install_enabled_skill(kernel, &format!("channel-{}", channel_id)).await;
+    let skill_id = install_enabled_skill(kernel, &format!("channel-{channel_id}")).await;
     kernel
         .bind_channel(ChannelBindRequest {
             channel_id: channel_id.to_string(),
@@ -2232,7 +2230,7 @@ impl RuntimeAdapter for CapturePromptAdapter {
         self.capability_results
             .lock()
             .expect("results lock")
-            .push(results.clone());
+            .push(results);
         let _ = events.send(RuntimeEvent::MessageDelta {
             lane: RuntimeMessageLane::Answer,
             text: self.reply.clone(),

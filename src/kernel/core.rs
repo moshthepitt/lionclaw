@@ -606,8 +606,7 @@ impl Kernel {
 
         if !binding.enabled {
             return Err(KernelError::Conflict(format!(
-                "channel '{}' binding is disabled",
-                channel_id
+                "channel '{channel_id}' binding is disabled"
             )));
         }
         self.require_channel_peer_approved(channel_id, peer_id)
@@ -1526,9 +1525,9 @@ impl Kernel {
         }
 
         let capability = Capability::from_str(&req.capability)
-            .map_err(|err| KernelError::BadRequest(format!("invalid capability: {}", err)))?;
+            .map_err(|err| KernelError::BadRequest(format!("invalid capability: {err}")))?;
         let scope = Scope::from_str(&req.scope)
-            .map_err(|err| KernelError::BadRequest(format!("invalid scope: {}", err)))?;
+            .map_err(|err| KernelError::BadRequest(format!("invalid scope: {err}")))?;
 
         if let Some(ttl) = req.ttl_seconds {
             if ttl <= 0 {
@@ -1618,8 +1617,7 @@ impl Kernel {
 
         if self.runtime.get(&runtime_id).await.is_none() {
             return Err(KernelError::NotFound(format!(
-                "runtime adapter '{}' not found",
-                runtime_id
+                "runtime adapter '{runtime_id}' not found"
             )));
         }
         if let Err(err) = self
@@ -1647,8 +1645,7 @@ impl Kernel {
         for skill_id in &skill_ids {
             if self.skills.get(skill_id).await.map_err(internal)?.is_none() {
                 return Err(KernelError::NotFound(format!(
-                    "skill '{}' not found",
-                    skill_id
+                    "skill '{skill_id}' not found"
                 )));
             }
         }
@@ -1656,7 +1653,7 @@ impl Kernel {
         let mut allowed_capabilities = Vec::new();
         for raw in req.allow_capabilities {
             let capability = Capability::from_str(&raw).map_err(|err| {
-                KernelError::BadRequest(format!("invalid capability '{}': {}", raw, err))
+                KernelError::BadRequest(format!("invalid capability '{raw}': {err}"))
             })?;
             if capability == Capability::SchedulerRun {
                 return Err(KernelError::BadRequest(
@@ -2042,7 +2039,7 @@ impl Kernel {
         layout
             .append_daily_event(ContinuityEvent {
                 at: Utc::now(),
-                title: format!("Pairing required for {}/{}", channel_id, peer_id),
+                title: format!("Pairing required for {channel_id}/{peer_id}"),
                 details: vec![format!("pairing code {}", pairing_code)],
             })
             .await
@@ -2374,12 +2371,11 @@ impl Kernel {
         prompt: String,
     ) -> Result<String, KernelError> {
         let adapter = self.runtime.get(runtime_id).await.ok_or_else(|| {
-            KernelError::NotFound(format!("runtime adapter '{}' not found", runtime_id))
+            KernelError::NotFound(format!("runtime adapter '{runtime_id}' not found"))
         })?;
         if adapter.hidden_turn_support() != HiddenTurnSupport::SideEffectFree {
             return Err(KernelError::Runtime(format!(
-                "runtime '{}' does not support side-effect-free hidden compaction",
-                runtime_id
+                "runtime '{runtime_id}' does not support side-effect-free hidden compaction"
             )));
         }
         let execution_plan = self
@@ -3923,7 +3919,7 @@ fn draft_action_error(relative_path: &str, err: anyhow::Error) -> KernelError {
         .downcast_ref::<std::io::Error>()
         .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
     {
-        KernelError::NotFound(format!("draft '{}' was not found", relative_path))
+        KernelError::NotFound(format!("draft '{relative_path}' was not found"))
     } else {
         internal(err)
     }
@@ -4049,7 +4045,7 @@ fn split_text_chunks(content: &str, max_len: usize) -> Vec<String> {
 fn generate_pairing_code() -> String {
     let bytes = *Uuid::new_v4().as_bytes();
     let number = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 1_000_000;
-    format!("{:06}", number)
+    format!("{number:06}")
 }
 
 fn assistant_text_from_events(events: &[RuntimeEvent]) -> String {
@@ -4380,7 +4376,7 @@ impl Kernel {
 
         let runtime_id = self.resolve_runtime_id(requested_runtime_id.as_deref())?;
         let adapter = self.runtime.get(&runtime_id).await.ok_or_else(|| {
-            KernelError::NotFound(format!("runtime adapter '{}' not found", runtime_id))
+            KernelError::NotFound(format!("runtime adapter '{runtime_id}' not found"))
         })?;
         let execution_plan = self
             .resolve_runtime_execution_plan(
@@ -5319,7 +5315,7 @@ impl Kernel {
                     .fail_queued_turn(
                         &turn,
                         "queue.failed",
-                        &format!("failed to resolve stream context: {}", err),
+                        &format!("failed to resolve stream context: {err}"),
                         None,
                     )
                     .await;
@@ -5727,8 +5723,7 @@ impl Kernel {
                     .map_err(internal)?;
 
                 Err(KernelError::BadRequest(format!(
-                    "runtime execution plan denied request: {}",
-                    reason
+                    "runtime execution plan denied request: {reason}"
                 )))
             }
         }
@@ -5751,8 +5746,7 @@ impl Kernel {
             .await
             .map_err(|err| {
                 KernelError::Runtime(format!(
-                    "failed to resolve local OCI image identity for runtime '{}': {}",
-                    runtime_id, err
+                    "failed to resolve local OCI image identity for runtime '{runtime_id}': {err}"
                 ))
             })?;
         Ok(profile.with_image_identity(image_identity))
@@ -5993,7 +5987,7 @@ impl Kernel {
                             })
                         }
                         Err(err) => {
-                            let message = format!("runtime turn task failed: {}", err);
+                            let message = format!("runtime turn task failed: {err}");
                             self.audit
                                 .append(
                                     "runtime.turn.error",
@@ -6037,7 +6031,7 @@ impl Kernel {
                     };
                 }
                 _ = &mut idle_sleep => {
-                    let reason = format!("turn idle timed out after {} ms", idle_timeout_ms);
+                    let reason = format!("turn idle timed out after {idle_timeout_ms} ms");
                     return self
                         .abort_runtime_turn(RuntimeTurnAbortExecution {
                             adapter: adapter.as_ref(),
@@ -6055,7 +6049,7 @@ impl Kernel {
                         .await;
                 }
                 _ = &mut hard_sleep => {
-                    let reason = format!("turn exceeded hard timeout after {} ms", hard_timeout_ms);
+                    let reason = format!("turn exceeded hard timeout after {hard_timeout_ms} ms");
                     return self
                         .abort_runtime_turn(RuntimeTurnAbortExecution {
                             adapter: adapter.as_ref(),
@@ -6249,13 +6243,12 @@ impl Kernel {
             .await
             .map_err(internal)?
             .ok_or_else(|| {
-                KernelError::NotFound(format!("channel '{}' is not bound to a skill", channel_id))
+                KernelError::NotFound(format!("channel '{channel_id}' is not bound to a skill"))
             })?;
 
         if !binding.enabled {
             return Err(KernelError::Conflict(format!(
-                "channel '{}' binding is disabled",
-                channel_id
+                "channel '{channel_id}' binding is disabled"
             )));
         }
 
@@ -6324,7 +6317,7 @@ impl Kernel {
                             }
                         }
                         Err(err) => {
-                            reason = Some(format!("invalid scope from runtime: {}", err));
+                            reason = Some(format!("invalid scope from runtime: {err}"));
                         }
                     },
                     None => {
@@ -6387,16 +6380,14 @@ impl Kernel {
                                         Err(err) => {
                                             let detail = err.to_string();
                                             execution_error = Some(detail.clone());
-                                            reason = Some(format!(
-                                                "broker execution failed: {}",
-                                                detail
-                                            ));
+                                            reason =
+                                                Some(format!("broker execution failed: {detail}"));
                                         }
                                     }
                                 }
                                 Err(detail) => {
                                     execution_error = Some(detail.clone());
-                                    reason = Some(format!("broker execution failed: {}", detail));
+                                    reason = Some(format!("broker execution failed: {detail}"));
                                 }
                             }
                         } else {
@@ -6407,7 +6398,7 @@ impl Kernel {
                     Err(err) => {
                         let detail = err.to_string();
                         execution_error = Some(detail.clone());
-                        reason = Some(format!("broker execution failed: {}", detail));
+                        reason = Some(format!("broker execution failed: {detail}"));
                     }
                 }
             }

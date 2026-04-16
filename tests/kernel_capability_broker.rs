@@ -470,12 +470,11 @@ async fn prepare_session_with_skill(
 
     let skill = kernel
         .install_skill(SkillInstallRequest {
-            source: format!("local/{}", skill_name),
+            source: format!("local/{skill_name}"),
             reference: Some("main".to_string()),
-            hash: Some(format!("{}-hash", skill_name)),
+            hash: Some(format!("{skill_name}-hash")),
             skill_md: Some(format!(
-                "---\nname: {}\ndescription: {}\n---",
-                skill_name, skill_description
+                "---\nname: {skill_name}\ndescription: {skill_description}\n---"
             )),
             snapshot_path: None,
         })

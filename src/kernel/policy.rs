@@ -47,7 +47,7 @@ impl FromStr for Capability {
             "secret.request" => Ok(Self::SecretRequest),
             "channel.send" => Ok(Self::ChannelSend),
             "scheduler.run" => Ok(Self::SchedulerRun),
-            other => Err(format!("unsupported capability '{}'", other)),
+            other => Err(format!("unsupported capability '{other}'")),
         }
     }
 }
@@ -66,10 +66,10 @@ impl Scope {
     pub fn as_str(&self) -> String {
         match self {
             Self::Any => "*".to_string(),
-            Self::Job(id) => format!("job:{}", id),
-            Self::Session(id) => format!("session:{}", id),
-            Self::Channel(id) => format!("channel:{}", id),
-            Self::Runtime(id) => format!("runtime:{}", id),
+            Self::Job(id) => format!("job:{id}"),
+            Self::Session(id) => format!("session:{id}"),
+            Self::Channel(id) => format!("channel:{id}"),
+            Self::Runtime(id) => format!("runtime:{id}"),
             Self::Exact(raw) => raw.clone(),
         }
     }
@@ -89,12 +89,12 @@ impl FromStr for Scope {
         if let Some(rest) = value.strip_prefix("job:") {
             return Uuid::parse_str(rest)
                 .map(Self::Job)
-                .map_err(|_| format!("invalid job scope '{}'", value));
+                .map_err(|_| format!("invalid job scope '{value}'"));
         }
         if let Some(rest) = value.strip_prefix("session:") {
             return Uuid::parse_str(rest)
                 .map(Self::Session)
-                .map_err(|_| format!("invalid session scope '{}'", value));
+                .map_err(|_| format!("invalid session scope '{value}'"));
         }
         if let Some(rest) = value.strip_prefix("channel:") {
             if rest.trim().is_empty() {
@@ -167,7 +167,7 @@ impl PolicyStore {
             .await
             .context("failed to validate skill existence for grant")?;
         if skill_exists.is_none() {
-            return Err(anyhow!("skill '{}' not found", skill_id));
+            return Err(anyhow!("skill '{skill_id}' not found"));
         }
 
         let created_at_ms = now_ms();
@@ -301,15 +301,15 @@ fn map_grant_row(row: SqliteRow) -> Result<Grant> {
     let expires_at_ms: Option<i64> = row.get("expires_at_ms");
 
     let grant_id = Uuid::parse_str(&grant_id_raw)
-        .with_context(|| format!("invalid grant id '{}'", grant_id_raw))?;
+        .with_context(|| format!("invalid grant id '{grant_id_raw}'"))?;
     let capability = Capability::from_str(&capability_raw)
-        .map_err(|err| anyhow!("invalid capability: {}", err))?;
-    let scope = Scope::from_str(&scope_raw).map_err(|err| anyhow!("invalid scope: {}", err))?;
+        .map_err(|err| anyhow!("invalid capability: {err}"))?;
+    let scope = Scope::from_str(&scope_raw).map_err(|err| anyhow!("invalid scope: {err}"))?;
     let created_at = ms_to_datetime(created_at_ms)
-        .ok_or_else(|| anyhow!("invalid created_at_ms '{}'", created_at_ms))?;
+        .ok_or_else(|| anyhow!("invalid created_at_ms '{created_at_ms}'"))?;
     let expires_at = expires_at_ms
         .map(|value| {
-            ms_to_datetime(value).ok_or_else(|| anyhow!("invalid expires_at_ms '{}'", value))
+            ms_to_datetime(value).ok_or_else(|| anyhow!("invalid expires_at_ms '{value}'"))
         })
         .transpose()?;
 
@@ -367,7 +367,7 @@ mod tests {
     #[test]
     fn parses_scopes() {
         let id = uuid::Uuid::new_v4();
-        let parsed = Scope::from_str(&format!("session:{}", id)).expect("scope");
+        let parsed = Scope::from_str(&format!("session:{id}")).expect("scope");
         assert!(matches!(parsed, Scope::Session(value) if value == id));
 
         let parsed = Scope::from_str("channel:telegram").expect("scope");

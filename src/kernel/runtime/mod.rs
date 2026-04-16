@@ -45,13 +45,7 @@ async fn validate_runtime_auth_prerequisites(
     match required_auth {
         RuntimeAuthKind::Codex => ensure_codex_host_auth_ready(codex_home_override)
             .await
-            .map_err(|err| {
-                anyhow!(
-                    "configured runtime profile '{}' requires {}",
-                    runtime_id,
-                    err
-                )
-            }),
+            .map_err(|err| anyhow!("configured runtime profile '{runtime_id}' requires {err}")),
     }
 }
 
@@ -197,13 +191,13 @@ pub trait RuntimeAdapter: Send + Sync {
     ) -> String {
         let code = output.exit_code.unwrap_or(1);
         if let Some(text) = observed_error_text.filter(|text| !text.trim().is_empty()) {
-            format!("runtime process exited with code {}: {}", code, text)
+            format!("runtime process exited with code {code}: {text}")
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if stderr.is_empty() {
-                format!("runtime process exited with code {}", code)
+                format!("runtime process exited with code {code}")
             } else {
-                format!("runtime process exited with code {}: {}", code, stderr)
+                format!("runtime process exited with code {code}: {stderr}")
             }
         }
     }

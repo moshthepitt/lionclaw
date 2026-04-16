@@ -191,7 +191,7 @@ mod tests {
     fn wraps_ipv6_host_when_joining() {
         assert_eq!(
             join_host_port("::1", DEFAULT_BIND_PORT),
-            format!("[::1]:{}", DEFAULT_BIND_PORT)
+            format!("[::1]:{DEFAULT_BIND_PORT}")
         );
     }
 

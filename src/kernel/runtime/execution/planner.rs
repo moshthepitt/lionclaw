@@ -271,7 +271,7 @@ impl ExecutionPlanner {
                 .presets
                 .get(name)
                 .cloned()
-                .ok_or_else(|| format!("preset '{}' is not configured", name))?;
+                .ok_or_else(|| format!("preset '{name}' is not configured"))?;
             return Ok((name.to_string(), preset));
         }
 
@@ -281,10 +281,11 @@ impl ExecutionPlanner {
             .map(str::trim)
             .filter(|name| !name.is_empty())
         {
-            let preset =
-                self.presets.get(default_name).cloned().ok_or_else(|| {
-                    format!("default preset '{}' is not configured", default_name)
-                })?;
+            let preset = self
+                .presets
+                .get(default_name)
+                .cloned()
+                .ok_or_else(|| format!("default preset '{default_name}' is not configured"))?;
             return Ok((default_name.to_string(), preset));
         }
 
@@ -426,18 +427,18 @@ fn build_runtime_environment(
 
     if has_runtime_mount {
         passthrough_environment.extend([
-            ("HOME".to_string(), format!("{}/home", RUNTIME_MOUNT_TARGET)),
+            ("HOME".to_string(), format!("{RUNTIME_MOUNT_TARGET}/home")),
             (
                 "XDG_CONFIG_HOME".to_string(),
-                format!("{}/home/.config", RUNTIME_MOUNT_TARGET),
+                format!("{RUNTIME_MOUNT_TARGET}/home/.config"),
             ),
             (
                 "XDG_CACHE_HOME".to_string(),
-                format!("{}/home/.cache", RUNTIME_MOUNT_TARGET),
+                format!("{RUNTIME_MOUNT_TARGET}/home/.cache"),
             ),
             (
                 "XDG_STATE_HOME".to_string(),
-                format!("{}/home/.local/state", RUNTIME_MOUNT_TARGET),
+                format!("{RUNTIME_MOUNT_TARGET}/home/.local/state"),
             ),
             (
                 "LIONCLAW_RUNTIME_DIR".to_string(),

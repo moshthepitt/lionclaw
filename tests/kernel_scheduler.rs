@@ -144,7 +144,7 @@ async fn create_job_rejects_missing_runtime_auth_before_persisting() {
             assert!(message.contains("codex login"));
             assert!(message.contains("auth.json"));
         }
-        other => panic!("unexpected error variant: {}", other),
+        other => panic!("unexpected error variant: {other}"),
     }
 
     let jobs = kernel.list_jobs().await.expect("list jobs");
@@ -192,7 +192,7 @@ async fn manual_job_run_rejects_missing_runtime_auth_before_launch() {
             assert!(message.contains("codex login"));
             assert!(message.contains("auth.json"));
         }
-        other => panic!("unexpected error variant: {}", other),
+        other => panic!("unexpected error variant: {other}"),
     }
     assert_eq!(turn_calls.load(Ordering::SeqCst), 0);
     let runs = kernel

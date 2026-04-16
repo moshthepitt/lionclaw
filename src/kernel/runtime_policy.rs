@@ -138,12 +138,12 @@ fn resolve_working_dir(
 
     let requested = resolve_requested_dir(raw_working_dir)?;
     let requested_canonical = canonicalize_if_exists(&requested)
-        .map_err(|err| format!("runtime working directory is invalid: {}", err))?;
+        .map_err(|err| format!("runtime working directory is invalid: {err}"))?;
 
     let mut allowed = false;
     for root in allowed_roots {
         let root_canonical =
-            canonicalize_if_exists(root).map_err(|err| format!("invalid policy root: {}", err))?;
+            canonicalize_if_exists(root).map_err(|err| format!("invalid policy root: {err}"))?;
         if requested_canonical == root_canonical || requested_canonical.starts_with(&root_canonical)
         {
             allowed = true;
@@ -168,7 +168,7 @@ fn resolve_requested_dir(raw: &str) -> Result<PathBuf, String> {
     }
 
     let cwd =
-        std::env::current_dir().map_err(|err| format!("failed to read current dir: {}", err))?;
+        std::env::current_dir().map_err(|err| format!("failed to read current dir: {err}"))?;
     Ok(cwd.join(requested))
 }
 
@@ -190,8 +190,7 @@ fn resolve_environment(
         }
         if !allowed_keys.contains(&normalized) {
             return Err(format!(
-                "runtime_env_passthrough key '{}' is not allowed by policy",
-                normalized
+                "runtime_env_passthrough key '{normalized}' is not allowed by policy"
             ));
         }
         if !deduped.insert(normalized.clone()) {

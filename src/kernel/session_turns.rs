@@ -203,9 +203,9 @@ impl SessionTurnStore {
                 let turn_id_raw: String = row.get("turn_id");
                 let session_id_raw: String = row.get("session_id");
                 let turn_id = Uuid::parse_str(&turn_id_raw)
-                    .with_context(|| format!("invalid interrupted turn_id '{}'", turn_id_raw))?;
+                    .with_context(|| format!("invalid interrupted turn_id '{turn_id_raw}'"))?;
                 let session_id = Uuid::parse_str(&session_id_raw).with_context(|| {
-                    format!("invalid interrupted session_id '{}'", session_id_raw)
+                    format!("invalid interrupted session_id '{session_id_raw}'")
                 })?;
                 Ok(InterruptedSessionTurn {
                     turn_id,
@@ -339,20 +339,20 @@ fn map_session_turn_row(row: SqliteRow) -> Result<SessionTurnRecord> {
     let finished_at_ms: Option<i64> = row.get("finished_at_ms");
 
     let turn_id = Uuid::parse_str(&turn_id_raw)
-        .with_context(|| format!("invalid turn_id '{}'", turn_id_raw))?;
+        .with_context(|| format!("invalid turn_id '{turn_id_raw}'"))?;
     let session_id = Uuid::parse_str(&session_id_raw)
-        .with_context(|| format!("invalid session_id '{}'", session_id_raw))?;
+        .with_context(|| format!("invalid session_id '{session_id_raw}'"))?;
     let sequence_no = u64::try_from(sequence_no_raw)
-        .with_context(|| format!("invalid sequence_no '{}'", sequence_no_raw))?;
+        .with_context(|| format!("invalid sequence_no '{sequence_no_raw}'"))?;
     let kind = SessionTurnKind::from_str(&kind_raw)
-        .map_err(|err| anyhow!("invalid session turn kind: {}", err))?;
+        .map_err(|err| anyhow!("invalid session turn kind: {err}"))?;
     let status = SessionTurnStatus::from_str(&status_raw)
-        .map_err(|err| anyhow!("invalid session turn status: {}", err))?;
+        .map_err(|err| anyhow!("invalid session turn status: {err}"))?;
     let started_at = ms_to_datetime(started_at_ms)
-        .ok_or_else(|| anyhow!("invalid started_at_ms '{}'", started_at_ms))?;
+        .ok_or_else(|| anyhow!("invalid started_at_ms '{started_at_ms}'"))?;
     let finished_at = finished_at_ms
         .map(|value| {
-            ms_to_datetime(value).ok_or_else(|| anyhow!("invalid finished_at_ms '{}'", value))
+            ms_to_datetime(value).ok_or_else(|| anyhow!("invalid finished_at_ms '{value}'"))
         })
         .transpose()?;
 

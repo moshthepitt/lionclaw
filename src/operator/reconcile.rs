@@ -635,8 +635,7 @@ pub(crate) async fn render_runtime_cache(
 
     let rendered = render_marker_file(
         &format!(
-            "# LionClaw Generated Agent Context\n\nThis file is generated for runtime '{}'.\n",
-            runtime_id
+            "# LionClaw Generated Agent Context\n\nThis file is generated for runtime '{runtime_id}'.\n"
         ),
         &sections.join("\n\n"),
     );
@@ -678,7 +677,7 @@ pub(crate) fn base_url_from_bind(bind: &str) -> String {
             }
         }
     } else {
-        format!("http://{}", bind)
+        format!("http://{bind}")
     }
 }
 

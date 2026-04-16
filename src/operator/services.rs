@@ -38,7 +38,7 @@ pub struct ChannelServiceSpec {
 }
 
 pub fn channel_unit_name(channel_id: &str) -> String {
-    format!("lionclaw-channel-{}.service", channel_id)
+    format!("lionclaw-channel-{channel_id}.service")
 }
 
 pub fn unit_status_is_active(status: &str) -> bool {
@@ -270,7 +270,7 @@ impl ServiceManager for SystemdUserServiceManager {
             if stderr.contains("No journal files were found") || stderr.contains("No entries") {
                 return Ok(String::new());
             }
-            return Err(anyhow!("journalctl failed: {}", stderr));
+            return Err(anyhow!("journalctl failed: {stderr}"));
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -386,7 +386,7 @@ fn escape_env_value(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n");
-    format!("\"{}\"", escaped)
+    format!("\"{escaped}\"")
 }
 
 fn prune_stale_generated_files(
@@ -543,7 +543,7 @@ async fn run_command<const N: usize>(program: &str, args: [&str; N]) -> Result<S
         .args(args)
         .output()
         .await
-        .with_context(|| format!("failed to run {}", program))?;
+        .with_context(|| format!("failed to run {program}"))?;
 
     if !output.status.success() {
         return Err(anyhow!(

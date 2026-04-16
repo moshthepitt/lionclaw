@@ -187,7 +187,7 @@ impl SkillStore {
 fn map_skill_row(row: SqliteRow) -> Result<SkillRecord> {
     let installed_at_ms: i64 = row.get("installed_at_ms");
     let installed_at = ms_to_datetime(installed_at_ms)
-        .ok_or_else(|| anyhow!("invalid installed_at_ms '{}'", installed_at_ms))?;
+        .ok_or_else(|| anyhow!("invalid installed_at_ms '{installed_at_ms}'"))?;
 
     let enabled_raw: i64 = row.get("enabled");
     let enabled = enabled_raw != 0;

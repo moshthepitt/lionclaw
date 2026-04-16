@@ -36,7 +36,7 @@ impl FromStr for ChannelPeerStatus {
             "pending" => Ok(Self::Pending),
             "approved" => Ok(Self::Approved),
             "blocked" => Ok(Self::Blocked),
-            other => Err(format!("invalid channel peer status '{}'", other)),
+            other => Err(format!("invalid channel peer status '{other}'")),
         }
     }
 }
@@ -115,7 +115,7 @@ impl FromStr for ChannelStreamEventKind {
             "status" => Ok(Self::Status),
             "error" => Ok(Self::Error),
             "done" => Ok(Self::Done),
-            other => Err(format!("invalid channel stream event kind '{}'", other)),
+            other => Err(format!("invalid channel stream event kind '{other}'")),
         }
     }
 }
@@ -142,7 +142,7 @@ impl FromStr for StreamMessageLane {
         match value {
             "answer" => Ok(Self::Answer),
             "reasoning" => Ok(Self::Reasoning),
-            other => Err(format!("invalid stream message lane '{}'", other)),
+            other => Err(format!("invalid stream message lane '{other}'")),
         }
     }
 }
@@ -191,7 +191,7 @@ impl FromStr for MessageDirection {
         match value {
             "inbound" => Ok(Self::Inbound),
             "outbound" => Ok(Self::Outbound),
-            other => Err(format!("invalid message direction '{}'", other)),
+            other => Err(format!("invalid message direction '{other}'")),
         }
     }
 }
@@ -224,7 +224,7 @@ impl FromStr for ChannelTurnStatus {
             "running" => Ok(Self::Running),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
-            other => Err(format!("invalid channel turn status '{}'", other)),
+            other => Err(format!("invalid channel turn status '{other}'")),
         }
     }
 }
@@ -582,7 +582,7 @@ impl ChannelStateStore {
                     update_id,
                     content: content.to_string(),
                     created_at: ms_to_datetime(now)
-                        .ok_or_else(|| anyhow!("invalid created_at_ms '{}'", now))?,
+                        .ok_or_else(|| anyhow!("invalid created_at_ms '{now}'"))?,
                 }))
             }
             Err(err) => {
@@ -883,7 +883,7 @@ impl ChannelStateStore {
         }
 
         let turn_id = Uuid::parse_str(&turn_id_raw)
-            .with_context(|| format!("invalid claimed turn id '{}'", turn_id_raw))?;
+            .with_context(|| format!("invalid claimed turn id '{turn_id_raw}'"))?;
         self.get_turn(turn_id).await
     }
 
@@ -984,7 +984,7 @@ impl ChannelStateStore {
             let status: String = row.get("status");
             let count_raw: i64 = row.get("count");
             let count = u64::try_from(count_raw)
-                .with_context(|| format!("invalid channel peer count '{}'", count_raw))?;
+                .with_context(|| format!("invalid channel peer count '{count_raw}'"))?;
             match status.as_str() {
                 "pending" => pending_peer_count = count,
                 "approved" => approved_peer_count = count,
@@ -997,14 +997,14 @@ impl ChannelStateStore {
             .get::<Option<i64>, _>("latest_inbound_at_ms")
             .map(|value| {
                 ms_to_datetime(value)
-                    .ok_or_else(|| anyhow!("invalid latest_inbound_at_ms '{}'", value))
+                    .ok_or_else(|| anyhow!("invalid latest_inbound_at_ms '{value}'"))
             })
             .transpose()?;
         let latest_outbound_at = latest_row
             .get::<Option<i64>, _>("latest_outbound_at_ms")
             .map(|value| {
                 ms_to_datetime(value)
-                    .ok_or_else(|| anyhow!("invalid latest_outbound_at_ms '{}'", value))
+                    .ok_or_else(|| anyhow!("invalid latest_outbound_at_ms '{value}'"))
             })
             .transpose()?;
 
@@ -1022,10 +1022,10 @@ impl ChannelStateStore {
 fn map_binding_row(row: SqliteRow) -> Result<ChannelBindingRecord> {
     let updated_at_ms: i64 = row.get("updated_at_ms");
     let updated_at = ms_to_datetime(updated_at_ms)
-        .ok_or_else(|| anyhow!("invalid updated_at_ms '{}'", updated_at_ms))?;
+        .ok_or_else(|| anyhow!("invalid updated_at_ms '{updated_at_ms}'"))?;
     let config_json: String = row.get("config_json");
     let config = serde_json::from_str(&config_json)
-        .with_context(|| format!("invalid config_json '{}'", config_json))?;
+        .with_context(|| format!("invalid config_json '{config_json}'"))?;
 
     Ok(ChannelBindingRecord {
         channel_id: row.get("channel_id"),
@@ -1043,13 +1043,13 @@ fn map_peer_row(row: SqliteRow) -> Result<ChannelPeerRecord> {
     let updated_at_ms: i64 = row.get("updated_at_ms");
 
     let status = ChannelPeerStatus::from_str(&status_raw)
-        .map_err(|err| anyhow!("invalid channel peer status: {}", err))?;
-    let trust_tier = TrustTier::from_str(&trust_tier_raw)
-        .map_err(|err| anyhow!("invalid trust tier: {}", err))?;
+        .map_err(|err| anyhow!("invalid channel peer status: {err}"))?;
+    let trust_tier =
+        TrustTier::from_str(&trust_tier_raw).map_err(|err| anyhow!("invalid trust tier: {err}"))?;
     let first_seen = ms_to_datetime(first_seen_ms)
-        .ok_or_else(|| anyhow!("invalid first_seen_ms '{}'", first_seen_ms))?;
+        .ok_or_else(|| anyhow!("invalid first_seen_ms '{first_seen_ms}'"))?;
     let updated_at = ms_to_datetime(updated_at_ms)
-        .ok_or_else(|| anyhow!("invalid updated_at_ms '{}'", updated_at_ms))?;
+        .ok_or_else(|| anyhow!("invalid updated_at_ms '{updated_at_ms}'"))?;
 
     Ok(ChannelPeerRecord {
         channel_id: row.get("channel_id"),
@@ -1065,21 +1065,21 @@ fn map_peer_row(row: SqliteRow) -> Result<ChannelPeerRecord> {
 fn map_stream_event_row(row: SqliteRow) -> Result<ChannelStreamEventRecord> {
     let created_at_ms: i64 = row.get("created_at_ms");
     let created_at = ms_to_datetime(created_at_ms)
-        .ok_or_else(|| anyhow!("invalid created_at_ms '{}'", created_at_ms))?;
+        .ok_or_else(|| anyhow!("invalid created_at_ms '{created_at_ms}'"))?;
     let session_id_raw: String = row.get("session_id");
     let session_id = Uuid::parse_str(&session_id_raw)
-        .map_err(|err| anyhow!("invalid session_id '{}': {}", session_id_raw, err))?;
+        .map_err(|err| anyhow!("invalid session_id '{session_id_raw}': {err}"))?;
     let turn_id_raw: String = row.get("turn_id");
     let turn_id = Uuid::parse_str(&turn_id_raw)
-        .map_err(|err| anyhow!("invalid turn_id '{}': {}", turn_id_raw, err))?;
+        .map_err(|err| anyhow!("invalid turn_id '{turn_id_raw}': {err}"))?;
     let kind_raw: String = row.get("kind");
     let kind = ChannelStreamEventKind::from_str(&kind_raw)
-        .map_err(|err| anyhow!("invalid channel stream event kind: {}", err))?;
+        .map_err(|err| anyhow!("invalid channel stream event kind: {err}"))?;
     let lane = row
         .get::<Option<String>, _>("lane")
         .map(|raw| {
             StreamMessageLane::from_str(&raw)
-                .map_err(|err| anyhow!("invalid stream message lane: {}", err))
+                .map_err(|err| anyhow!("invalid stream message lane: {err}"))
         })
         .transpose()?;
 
@@ -1102,11 +1102,11 @@ fn map_message_row(row: SqliteRow) -> Result<ChannelMessageRecord> {
     let direction_raw: String = row.get("direction");
     let created_at_ms: i64 = row.get("created_at_ms");
     let message_id = Uuid::parse_str(&message_id_raw)
-        .with_context(|| format!("invalid message_id '{}'", message_id_raw))?;
+        .with_context(|| format!("invalid message_id '{message_id_raw}'"))?;
     let direction = MessageDirection::from_str(&direction_raw)
-        .map_err(|err| anyhow!("invalid message direction: {}", err))?;
+        .map_err(|err| anyhow!("invalid message direction: {err}"))?;
     let created_at = ms_to_datetime(created_at_ms)
-        .ok_or_else(|| anyhow!("invalid created_at_ms '{}'", created_at_ms))?;
+        .ok_or_else(|| anyhow!("invalid created_at_ms '{created_at_ms}'"))?;
 
     Ok(ChannelMessageRecord {
         message_id,
@@ -1128,25 +1128,25 @@ fn map_turn_row(row: SqliteRow) -> Result<ChannelTurnRecord> {
     let queued_at_ms: i64 = row.get("queued_at_ms");
 
     let turn_id = Uuid::parse_str(&turn_id_raw)
-        .with_context(|| format!("invalid turn_id '{}'", turn_id_raw))?;
+        .with_context(|| format!("invalid turn_id '{turn_id_raw}'"))?;
     let session_id = Uuid::parse_str(&session_id_raw)
-        .with_context(|| format!("invalid session_id '{}'", session_id_raw))?;
+        .with_context(|| format!("invalid session_id '{session_id_raw}'"))?;
     let inbound_message_id = Uuid::parse_str(&inbound_message_id_raw)
-        .with_context(|| format!("invalid inbound_message_id '{}'", inbound_message_id_raw))?;
+        .with_context(|| format!("invalid inbound_message_id '{inbound_message_id_raw}'"))?;
     let status = ChannelTurnStatus::from_str(&status_raw)
-        .map_err(|err| anyhow!("invalid channel turn status: {}", err))?;
+        .map_err(|err| anyhow!("invalid channel turn status: {err}"))?;
     let queued_at = ms_to_datetime(queued_at_ms)
-        .ok_or_else(|| anyhow!("invalid queued_at_ms '{}'", queued_at_ms))?;
+        .ok_or_else(|| anyhow!("invalid queued_at_ms '{queued_at_ms}'"))?;
     let started_at = row
         .get::<Option<i64>, _>("started_at_ms")
         .map(|value| {
-            ms_to_datetime(value).ok_or_else(|| anyhow!("invalid started_at_ms '{}'", value))
+            ms_to_datetime(value).ok_or_else(|| anyhow!("invalid started_at_ms '{value}'"))
         })
         .transpose()?;
     let finished_at = row
         .get::<Option<i64>, _>("finished_at_ms")
         .map(|value| {
-            ms_to_datetime(value).ok_or_else(|| anyhow!("invalid finished_at_ms '{}'", value))
+            ms_to_datetime(value).ok_or_else(|| anyhow!("invalid finished_at_ms '{value}'"))
         })
         .transpose()?;
 

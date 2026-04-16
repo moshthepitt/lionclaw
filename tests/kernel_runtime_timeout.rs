@@ -76,7 +76,7 @@ async fn runtime_timeout_triggers_cancel_close_and_audit() {
                 "timeout error should include timeout reason"
             );
         }
-        other => panic!("unexpected error variant: {}", other),
+        other => panic!("unexpected error variant: {other}"),
     }
 
     assert_eq!(

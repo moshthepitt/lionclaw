@@ -146,14 +146,14 @@ async fn spawn_with_retry(
             {
                 if attempt == ETXTBUSY_RETRIES {
                     return Err(err).with_context(|| {
-                        format!("failed to spawn subprocess executable '{}'", executable)
+                        format!("failed to spawn subprocess executable '{executable}'")
                     });
                 }
                 tokio::time::sleep(Duration::from_millis(ETXTBUSY_BACKOFF_MS)).await;
             }
             Err(err) => {
                 return Err(err).with_context(|| {
-                    format!("failed to spawn subprocess executable '{}'", executable)
+                    format!("failed to spawn subprocess executable '{executable}'")
                 });
             }
         }

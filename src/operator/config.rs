@@ -138,10 +138,7 @@ impl OperatorConfig {
     pub fn resolve_runtime_id(&self, requested: Option<&str>) -> Result<String> {
         if let Some(runtime_id) = requested.map(str::trim).filter(|value| !value.is_empty()) {
             if !self.runtimes.contains_key(runtime_id) {
-                return Err(anyhow!(
-                    "runtime profile '{}' is not configured",
-                    runtime_id
-                ));
+                return Err(anyhow!("runtime profile '{runtime_id}' is not configured"));
             }
             return Ok(runtime_id.to_string());
         }
@@ -165,7 +162,7 @@ impl OperatorConfig {
 
     pub fn set_default_runtime(&mut self, id: &str) -> Result<()> {
         if !self.runtimes.contains_key(id) {
-            return Err(anyhow!("runtime profile '{}' is not configured", id));
+            return Err(anyhow!("runtime profile '{id}' is not configured"));
         }
         self.defaults.runtime = Some(id.to_string());
         self.normalize();
@@ -174,7 +171,7 @@ impl OperatorConfig {
 
     pub fn set_default_preset(&mut self, id: &str) -> Result<()> {
         if !self.presets.contains_key(id) {
-            return Err(anyhow!("preset '{}' is not configured", id));
+            return Err(anyhow!("preset '{id}' is not configured"));
         }
         self.defaults.preset = Some(id.to_string());
         self.normalize();
@@ -346,8 +343,7 @@ impl std::str::FromStr for ChannelLaunchMode {
             "service" => Ok(Self::Service),
             "interactive" => Ok(Self::Interactive),
             other => Err(format!(
-                "invalid channel launch mode '{}'; expected 'service' or 'interactive'",
-                other
+                "invalid channel launch mode '{other}'; expected 'service' or 'interactive'"
             )),
         }
     }
@@ -574,7 +570,7 @@ pub fn derive_skill_alias(source: &str) -> String {
 pub fn normalize_local_source(source: &str) -> Result<String> {
     let raw = source.strip_prefix("local:").unwrap_or(source);
     let absolute = std::fs::canonicalize(Path::new(raw))
-        .with_context(|| format!("failed to resolve source '{}'", source))?;
+        .with_context(|| format!("failed to resolve source '{source}'"))?;
     Ok(format!("local:{}", absolute.display()))
 }
 
@@ -605,7 +601,7 @@ pub fn normalize_host_executable(source: &str) -> Result<String> {
         normalize_executable_path(raw)?
     } else {
         which::which(raw)
-            .with_context(|| format!("failed to resolve host executable '{}'", source))?
+            .with_context(|| format!("failed to resolve host executable '{source}'"))?
     };
     validate_executable_path(&path)?;
     Ok(path.to_string_lossy().to_string())
@@ -649,8 +645,7 @@ pub fn validate_host_executable(source: &str) -> Result<()> {
 
     if !looks_like_path(raw) {
         return Err(anyhow!(
-            "host executable '{}' must be stored as an absolute or explicit path",
-            source
+            "host executable '{source}' must be stored as an absolute or explicit path"
         ));
     }
     validate_executable_path(&normalize_executable_path(raw)?)

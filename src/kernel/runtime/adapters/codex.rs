@@ -113,9 +113,9 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
         let code = output.exit_code.unwrap_or(1);
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if stderr.is_empty() {
-            format!("codex exec exited with code {}", code)
+            format!("codex exec exited with code {code}")
         } else {
-            format!("codex exec exited with code {}: {}", code, stderr)
+            format!("codex exec exited with code {code}: {stderr}")
         }
     }
 
@@ -186,7 +186,7 @@ fn get_runtime_session(
         .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
         .get(runtime_session_id)
         .copied()
-        .ok_or_else(|| anyhow!("runtime session '{}' not found", runtime_session_id))
+        .ok_or_else(|| anyhow!("runtime session '{runtime_session_id}' not found"))
 }
 
 fn runtime_session_is_ready(root: &Path) -> Result<bool> {
@@ -239,7 +239,7 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
             if let Some(thread_id) = payload.get("thread_id").and_then(Value::as_str) {
                 events.push(RuntimeEvent::Status {
                     code: None,
-                    text: format!("codex thread started: {}", thread_id),
+                    text: format!("codex thread started: {thread_id}"),
                 });
             }
         }
@@ -275,7 +275,7 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
                 .unwrap_or("codex turn failed");
             events.push(RuntimeEvent::Error {
                 code: Some("runtime.error".to_string()),
-                text: format!("codex: {}", message),
+                text: format!("codex: {message}"),
             });
         }
         Some("turn_aborted") => {
@@ -283,7 +283,7 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
                 .unwrap_or_else(|| "codex turn aborted".to_string());
             events.push(RuntimeEvent::Error {
                 code: Some("runtime.error".to_string()),
-                text: format!("codex: {}", message),
+                text: format!("codex: {message}"),
             });
         }
         Some("error") => {
@@ -293,7 +293,7 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
                 .unwrap_or("codex stream error");
             events.push(RuntimeEvent::Error {
                 code: Some("runtime.error".to_string()),
-                text: format!("codex: {}", message),
+                text: format!("codex: {message}"),
             });
         }
         Some("stream_error") => {
@@ -301,7 +301,7 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
                 .unwrap_or_else(|| "codex stream error".to_string());
             events.push(RuntimeEvent::Error {
                 code: Some("runtime.error".to_string()),
-                text: format!("codex: {}", message),
+                text: format!("codex: {message}"),
             });
         }
         Some("agent_message_delta") | Some("agent_message_content_delta") => {
@@ -360,7 +360,7 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
                 .unwrap_or_else(|| "unknown".to_string());
             events.push(RuntimeEvent::Status {
                 code: None,
-                text: format!("codex command completed (exit {})", exit_code),
+                text: format!("codex command completed (exit {exit_code})"),
             });
         }
         Some("web_search_begin") => {
@@ -389,7 +389,7 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
                 .unwrap_or("completed");
             events.push(RuntimeEvent::Status {
                 code: None,
-                text: format!("codex patch apply ({})", status),
+                text: format!("codex patch apply ({status})"),
             });
         }
         Some("item.started")
@@ -493,7 +493,7 @@ fn parse_codex_item(events: &mut Vec<RuntimeEvent>, item: &Value) {
                 .unwrap_or("codex item error");
             events.push(RuntimeEvent::Error {
                 code: Some("runtime.error".to_string()),
-                text: format!("codex: {}", message),
+                text: format!("codex: {message}"),
             });
         }
         Some("command_execution") => {
@@ -507,7 +507,7 @@ fn parse_codex_item(events: &mut Vec<RuntimeEvent>, item: &Value) {
                 .unwrap_or("unknown");
             events.push(RuntimeEvent::Status {
                 code: None,
-                text: format!("codex command '{}' ({})", command, status),
+                text: format!("codex command '{command}' ({status})"),
             });
         }
         Some("file_change") => {
@@ -517,7 +517,7 @@ fn parse_codex_item(events: &mut Vec<RuntimeEvent>, item: &Value) {
                 .unwrap_or("unknown");
             events.push(RuntimeEvent::Status {
                 code: None,
-                text: format!("codex file_change ({})", status),
+                text: format!("codex file_change ({status})"),
             });
         }
         Some("web_search") => {
@@ -576,7 +576,7 @@ fn describe_codex_web_search(item: &Value) -> String {
         (Some(query), None) => {
             format!("codex web search '{}'", truncate_status_detail(query))
         }
-        (None, Some(status)) => format!("codex web search ({})", status),
+        (None, Some(status)) => format!("codex web search ({status})"),
         (None, None) => "codex web search".to_string(),
     }
 }
@@ -590,9 +590,9 @@ fn normalize_web_search_status(raw: &str) -> &str {
 
 fn describe_codex_item(item_type: &str, item: &Value) -> String {
     if let Some(summary) = codex_item_summary(item) {
-        return format!("codex item {} ({})", item_type, summary);
+        return format!("codex item {item_type} ({summary})");
     }
-    format!("codex item: {}", item_type)
+    format!("codex item: {item_type}")
 }
 
 fn codex_item_summary(item: &Value) -> Option<String> {
@@ -638,7 +638,7 @@ fn truncate_status_detail(text: &str) -> String {
         return trimmed.to_string();
     }
     let shortened: String = trimmed.chars().take(MAX_LEN - 1).collect();
-    format!("{}…", shortened)
+    format!("{shortened}…")
 }
 
 #[cfg(test)]

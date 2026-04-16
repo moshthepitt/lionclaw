@@ -27,7 +27,7 @@ impl FromStr for TrustTier {
         match raw {
             "main" => Ok(Self::Main),
             "untrusted" => Ok(Self::Untrusted),
-            other => Err(format!("invalid trust tier '{}'", other)),
+            other => Err(format!("invalid trust tier '{other}'")),
         }
     }
 }
@@ -99,7 +99,7 @@ impl FromStr for SessionHistoryPolicy {
         match raw {
             "interactive" => Ok(Self::Interactive),
             "conservative" => Ok(Self::Conservative),
-            other => Err(format!("invalid history policy '{}'", other)),
+            other => Err(format!("invalid history policy '{other}'")),
         }
     }
 }
@@ -130,7 +130,7 @@ impl FromStr for SessionTurnKind {
             "normal" => Ok(Self::Normal),
             "retry" => Ok(Self::Retry),
             "continue" => Ok(Self::Continue),
-            other => Err(format!("invalid session turn kind '{}'", other)),
+            other => Err(format!("invalid session turn kind '{other}'")),
         }
     }
 }
@@ -170,7 +170,7 @@ impl FromStr for SessionTurnStatus {
             "timed_out" => Ok(Self::TimedOut),
             "cancelled" => Ok(Self::Cancelled),
             "interrupted" => Ok(Self::Interrupted),
-            other => Err(format!("invalid session turn status '{}'", other)),
+            other => Err(format!("invalid session turn status '{other}'")),
         }
     }
 }

@@ -92,10 +92,7 @@ pub async fn validate_oci_launch_prerequisites(
     _required_auth: Option<RuntimeAuthKind>,
 ) -> Result<()> {
     let image = confinement.image.as_deref().ok_or_else(|| {
-        anyhow!(
-            "runtime '{}' requires a Podman runtime image in its confinement config",
-            runtime_id
-        )
+        anyhow!("runtime '{runtime_id}' requires a Podman runtime image in its confinement config")
     })?;
 
     // The runtime image is operator-managed, so launch preflight requires it to
@@ -104,10 +101,7 @@ pub async fn validate_oci_launch_prerequisites(
     ensure_oci_image_exists(
         &confinement.engine,
         image,
-        format!(
-            "configured runtime image '{}' for runtime '{}'",
-            image, runtime_id
-        ),
+        format!("configured runtime image '{image}' for runtime '{runtime_id}'"),
     )
     .await?;
 
@@ -129,7 +123,7 @@ pub async fn resolve_oci_image_compatibility_identity(engine: &str, image: &str)
             environment: Vec::new(),
             input: String::new(),
         },
-        &format!("resolve OCI image identity for '{}'", image),
+        &format!("resolve OCI image identity for '{image}'"),
         OCI_IMAGE_PROBE_TIMEOUT,
     )
     .await?;
@@ -143,19 +137,12 @@ pub async fn resolve_oci_image_compatibility_identity(engine: &str, image: &str)
                 output.exit_code
             );
         }
-        bail!(
-            "failed to resolve OCI image identity for '{}': {}",
-            image,
-            stderr
-        );
+        bail!("failed to resolve OCI image identity for '{image}': {stderr}");
     }
 
     let identity = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if identity.is_empty() {
-        bail!(
-            "failed to resolve OCI image identity for '{}': empty OCI inspect output",
-            image
-        );
+        bail!("failed to resolve OCI image identity for '{image}': empty OCI inspect output");
     }
 
     Ok(identity)
@@ -257,8 +244,7 @@ async fn ensure_oci_image_exists(engine: &str, image: &str, description: String)
     match run_oci_image_probe(engine, image).await? {
         OciImageProbeResult::Present => Ok(()),
         OciImageProbeResult::Missing => bail!(
-            "{} is not available locally; build or pull it before running LionClaw",
-            description
+            "{description} is not available locally; build or pull it before running LionClaw"
         ),
     }
 }
@@ -278,7 +264,7 @@ async fn run_oci_image_probe(engine: &str, image: &str) -> Result<OciImageProbeR
             environment: Vec::new(),
             input: String::new(),
         },
-        &format!("inspect OCI image '{}'", image),
+        &format!("inspect OCI image '{image}'"),
         OCI_IMAGE_PROBE_TIMEOUT,
     )
     .await?;
@@ -295,7 +281,7 @@ async fn run_oci_image_probe(engine: &str, image: &str) -> Result<OciImageProbeR
                     output.exit_code
                 );
             }
-            bail!("failed to inspect OCI image '{}': {}", image, stderr);
+            bail!("failed to inspect OCI image '{image}': {stderr}");
         }
     }
 }
@@ -401,7 +387,7 @@ async fn ensure_runtime_secrets_registered(
         );
     }
 
-    bail!("failed to register OCI runtime secrets: {}", stderr)
+    bail!("failed to register OCI runtime secrets: {stderr}")
 }
 
 #[derive(Debug)]
@@ -943,11 +929,11 @@ esac
             .expect("mount")
             .mounted_name();
         assert!(
-            log.contains(&format!("secret create --replace {}", secret_name)),
+            log.contains(&format!("secret create --replace {secret_name}")),
             "secret create should be logged: {log}"
         );
         assert!(
-            log.contains(&format!("secret rm {}", secret_name)),
+            log.contains(&format!("secret rm {secret_name}")),
             "secret remove should be logged: {log}"
         );
     }
@@ -1024,7 +1010,7 @@ esac
             .expect("mount")
             .mounted_name();
         assert!(
-            log.contains(&format!("secret rm {}", secret_name)),
+            log.contains(&format!("secret rm {secret_name}")),
             "secret remove should still be attempted: {log}"
         );
     }

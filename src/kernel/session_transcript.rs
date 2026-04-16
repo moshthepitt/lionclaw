@@ -315,7 +315,7 @@ pub fn parse_compaction_summary_state(raw: &str) -> Result<CompactionSummaryStat
     let json_text = extract_json_object(raw)
         .ok_or_else(|| anyhow!("runtime did not return a compaction summary JSON object"))?;
     let mut state: CompactionSummaryState = serde_json::from_str(&json_text)
-        .map_err(|err| anyhow!("invalid compaction summary JSON: {}", err))?;
+        .map_err(|err| anyhow!("invalid compaction summary JSON: {err}"))?;
     normalize_compaction_summary_state(&mut state);
     Ok(state)
 }
@@ -452,20 +452,16 @@ pub fn format_failure_note(status: SessionTurnStatus, error_text: Option<&str>) 
     let reason = error_text.unwrap_or("no additional error text recorded");
     match status {
         SessionTurnStatus::TimedOut => format!(
-            "The previous assistant turn timed out before completion. Recorded error: {}",
-            reason
+            "The previous assistant turn timed out before completion. Recorded error: {reason}"
         ),
         SessionTurnStatus::Failed => format!(
-            "The previous assistant turn failed before completion. Recorded error: {}",
-            reason
+            "The previous assistant turn failed before completion. Recorded error: {reason}"
         ),
         SessionTurnStatus::Cancelled => format!(
-            "The previous assistant turn was cancelled before completion. Recorded error: {}",
-            reason
+            "The previous assistant turn was cancelled before completion. Recorded error: {reason}"
         ),
         SessionTurnStatus::Interrupted => format!(
-            "The previous assistant turn was interrupted before completion. Recorded error: {}",
-            reason
+            "The previous assistant turn was interrupted before completion. Recorded error: {reason}"
         ),
         SessionTurnStatus::Completed => "The previous assistant turn completed.".to_string(),
         SessionTurnStatus::Running => {
@@ -540,7 +536,7 @@ fn push_string_section(lines: &mut Vec<String>, title: &str, values: &[String]) 
     }
 
     lines.push(String::new());
-    lines.push(format!("### {}", title));
+    lines.push(format!("### {title}"));
     for value in values {
         lines.push(format!("- {}", value.trim()));
     }
@@ -1315,7 +1311,7 @@ mod tests {
     fn merge_keeps_newest_capped_memory_proposals_and_open_loops() {
         let previous_proposals = (0..COMPACTION_LIST_KEEP)
             .map(|index| super::CompactionMemoryProposal {
-                title: format!("Proposal {}", index),
+                title: format!("Proposal {index}"),
                 rationale: "existing".to_string(),
                 entries: vec![format!("entry {}", index)],
             })
@@ -1338,9 +1334,9 @@ mod tests {
 
         let previous_loops = (0..COMPACTION_LIST_KEEP)
             .map(|index| super::CompactionOpenLoop {
-                title: format!("Loop {}", index),
-                summary: format!("summary {}", index),
-                next_step: format!("next {}", index),
+                title: format!("Loop {index}"),
+                summary: format!("summary {index}"),
+                next_step: format!("next {index}"),
             })
             .collect::<Vec<_>>();
         let merged_loops = merge_unique_open_loops(
