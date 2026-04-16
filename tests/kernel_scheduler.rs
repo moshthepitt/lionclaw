@@ -1185,7 +1185,11 @@ async fn kernel_with_counting_codex_runtime(
     turn_calls: Arc<AtomicUsize>,
 ) -> Kernel {
     let fake_podman = env.temp_dir.path().join("podman");
-    std::fs::write(&fake_podman, "#!/usr/bin/env bash\nexit 0\n").expect("write fake podman");
+    std::fs::write(
+        &fake_podman,
+        "#!/usr/bin/env bash\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"inspect\" ]; then\n  printf 'sha256:test-runtime-image\\n'\n  exit 0\nfi\nexit 0\n",
+    )
+    .expect("write fake podman");
     std::fs::set_permissions(&fake_podman, std::fs::Permissions::from_mode(0o755))
         .expect("chmod fake podman");
 
@@ -1194,15 +1198,16 @@ async fn kernel_with_counting_codex_runtime(
         KernelOptions {
             runtime_execution_profiles: BTreeMap::from([(
                 "codex".to_string(),
-                RuntimeExecutionProfile {
-                    confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                RuntimeExecutionProfile::new(
+                    ConfinementConfig::Oci(OciConfinementConfig {
                         engine: fake_podman.display().to_string(),
                         image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
                         ..OciConfinementConfig::default()
                     }),
-                    compatibility_key: "codex-auth".to_string(),
-                    required_runtime_auth: Some(lionclaw::kernel::runtime::RuntimeAuthKind::Codex),
-                },
+                    "codex-auth".to_string(),
+                    None,
+                    Some(lionclaw::kernel::runtime::RuntimeAuthKind::Codex),
+                ),
             )]),
             codex_home_override: Some(home.root().join(".codex")),
             ..KernelOptions::default()

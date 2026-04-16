@@ -242,6 +242,13 @@ struct DaemonCompatConfig {
     runtime_image_identities: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeCompatConfig {
+    version: u32,
+    profile: RuntimeProfileConfig,
+    runtime_auth_identity: Option<String>,
+}
+
 pub fn daemon_compat_fingerprint(config: &OperatorConfig) -> String {
     daemon_compat_fingerprint_with_runtime_context(config, None, &BTreeMap::new())
 }
@@ -414,29 +421,55 @@ impl RuntimeProfileConfig {
     }
 
     pub fn execution_profile(&self) -> RuntimeExecutionProfile {
-        self.execution_profile_with_image_identity(None)
+        self.execution_profile_with_runtime_context(None, None)
     }
 
     pub fn execution_profile_with_image_identity(
         &self,
         image_identity: Option<&str>,
     ) -> RuntimeExecutionProfile {
-        RuntimeExecutionProfile {
-            confinement: self.confinement().clone(),
-            compatibility_key: self.compatibility_key_with_image_identity(image_identity),
-            required_runtime_auth: self.required_runtime_auth(),
-        }
+        self.execution_profile_with_runtime_context(image_identity, None)
+    }
+
+    pub fn execution_profile_with_runtime_context(
+        &self,
+        image_identity: Option<&str>,
+        runtime_auth_identity: Option<&str>,
+    ) -> RuntimeExecutionProfile {
+        RuntimeExecutionProfile::new(
+            self.confinement().clone(),
+            self.compatibility_base_key(runtime_auth_identity),
+            image_identity.map(str::to_string),
+            self.required_runtime_auth(),
+        )
     }
 
     pub fn compatibility_key(&self) -> String {
-        self.compatibility_key_with_image_identity(None)
+        self.compatibility_key_with_runtime_context(None, None)
     }
 
     pub fn compatibility_key_with_image_identity(&self, image_identity: Option<&str>) -> String {
+        self.compatibility_key_with_runtime_context(image_identity, None)
+    }
+
+    pub fn compatibility_key_with_runtime_context(
+        &self,
+        image_identity: Option<&str>,
+        runtime_auth_identity: Option<&str>,
+    ) -> String {
+        self.execution_profile_with_runtime_context(image_identity, runtime_auth_identity)
+            .compatibility_key
+    }
+
+    fn compatibility_base_key(&self, runtime_auth_identity: Option<&str>) -> String {
         let mut normalized = self.clone();
         normalized.normalize();
-        let encoded = serde_json::to_vec(&(normalized, image_identity))
-            .expect("runtime profile config should always serialize");
+        let encoded = serde_json::to_vec(&RuntimeCompatConfig {
+            version: 1,
+            profile: normalized,
+            runtime_auth_identity: runtime_auth_identity.map(str::to_string),
+        })
+        .expect("runtime profile config should always serialize");
         runtime_profile_partition_key(&encoded)
     }
 
@@ -815,6 +848,26 @@ mod tests {
         assert_ne!(
             runtime.compatibility_key_with_image_identity(Some("sha256:left")),
             runtime.compatibility_key_with_image_identity(Some("sha256:right"))
+        );
+    }
+
+    #[test]
+    fn runtime_compatibility_key_changes_when_codex_home_identity_changes() {
+        let runtime = RuntimeProfileConfig::Codex {
+            executable: "codex".to_string(),
+            model: None,
+            confinement: sample_confinement(),
+        };
+
+        assert_ne!(
+            runtime.compatibility_key_with_runtime_context(
+                Some("sha256:runtime"),
+                Some("codex-home:/tmp/codex-a"),
+            ),
+            runtime.compatibility_key_with_runtime_context(
+                Some("sha256:runtime"),
+                Some("codex-home:/tmp/codex-b"),
+            )
         );
     }
 

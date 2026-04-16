@@ -69,12 +69,13 @@ use super::{
     },
     policy::{Capability, PolicyStore, Scope},
     runtime::{
-        execute_program_backed_turn, register_builtin_runtime_adapters, EffectiveExecutionPlan,
-        ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
-        ExecutionPreset, HiddenTurnSupport, RuntimeAdapter, RuntimeCapabilityRequest,
-        RuntimeCapabilityResult, RuntimeEvent, RuntimeExecutionProfile, RuntimeMessageLane,
-        RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput,
-        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
+        execute_program_backed_turn, register_builtin_runtime_adapters,
+        resolve_oci_image_compatibility_identity, EffectiveExecutionPlan, ExecutionPlanPurpose,
+        ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset,
+        HiddenTurnSupport, RuntimeAdapter, RuntimeCapabilityRequest, RuntimeCapabilityResult,
+        RuntimeEvent, RuntimeExecutionProfile, RuntimeMessageLane, RuntimeRegistry,
+        RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
+        RuntimeTurnMode, RuntimeTurnResult,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -3040,7 +3041,7 @@ impl Kernel {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::BTreeMap, fs};
 
     use tempfile::tempdir;
     use tokio::time::{sleep, Duration};
@@ -3113,6 +3114,85 @@ mod tests {
             .expect("resolve runtime secrets mount")
             .expect("runtime secrets mount");
         assert_eq!(mount.source, home.runtime_secrets_env_path());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_plan_resolves_image_identity_for_launched_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let fake_podman = temp_dir.path().join("podman");
+        fs::write(
+            &fake_podman,
+            "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"inspect\" ]; then\n  printf 'sha256:runtime-current\\n'\n  exit 0\nfi\nexit 1\n",
+        )
+        .expect("write fake podman");
+        fs::set_permissions(&fake_podman, fs::Permissions::from_mode(0o755))
+            .expect("chmod fake podman");
+
+        let runtime_root = temp_dir.path().join("runtime");
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(&runtime_root).expect("runtime root");
+        fs::create_dir_all(&workspace_root).expect("workspace root");
+        let runtime_profile = RuntimeExecutionProfile::new(
+            crate::kernel::runtime::ConfinementConfig::Oci(
+                crate::kernel::runtime::OciConfinementConfig {
+                    engine: fake_podman.display().to_string(),
+                    image: Some("ghcr.io/lionclaw/runtime:current".to_string()),
+                    ..crate::kernel::runtime::OciConfinementConfig::default()
+                },
+            ),
+            "runtime-base".to_string(),
+            None,
+            None,
+        );
+        let expected_compatibility_key = runtime_profile
+            .clone()
+            .with_image_identity("sha256:runtime-current".to_string())
+            .compatibility_key;
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                runtime_execution_profiles: BTreeMap::from([(
+                    "secondary".to_string(),
+                    runtime_profile,
+                )]),
+                runtime_root: Some(runtime_root),
+                workspace_name: Some("main".to_string()),
+                project_workspace_root: Some(workspace_root),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+
+        let plan = kernel
+            .resolve_runtime_execution_plan(
+                Uuid::new_v4(),
+                "secondary",
+                ExecutionPlanRequest {
+                    session_id: Some(Uuid::new_v4()),
+                    runtime_id: "secondary".to_string(),
+                    purpose: ExecutionPlanPurpose::Interactive,
+                    preset_name: None,
+                    working_dir: None,
+                    env_passthrough_keys: Vec::new(),
+                    timeout_ms: None,
+                },
+            )
+            .await
+            .expect("resolve plan");
+
+        let runtime_mount = plan
+            .mounts
+            .iter()
+            .find(|mount| mount.target == "/runtime")
+            .expect("runtime mount");
+        assert!(runtime_mount
+            .source
+            .to_string_lossy()
+            .contains(&expected_compatibility_key));
     }
 
     #[tokio::test]
@@ -5585,8 +5665,14 @@ impl Kernel {
         let request_working_dir = request.working_dir.clone();
         let request_timeout_ms = request.timeout_ms;
         let request_env = request.env_passthrough_keys.clone();
+        let runtime_profile = self
+            .resolve_runtime_execution_profile_for_launch(runtime_id)
+            .await?;
 
-        match self.execution_planner.plan(request) {
+        match self
+            .execution_planner
+            .plan_with_runtime_profile(request, runtime_profile)
+        {
             Ok(plan) => {
                 self.audit
                     .append(
@@ -5646,6 +5732,30 @@ impl Kernel {
                 )))
             }
         }
+    }
+
+    async fn resolve_runtime_execution_profile_for_launch(
+        &self,
+        runtime_id: &str,
+    ) -> Result<RuntimeExecutionProfile, KernelError> {
+        let profile = self
+            .execution_planner
+            .runtime_profile(runtime_id)
+            .cloned()
+            .unwrap_or_default();
+        let config = profile.confinement.oci();
+        let Some(image) = config.image.as_deref() else {
+            return Ok(profile);
+        };
+        let image_identity = resolve_oci_image_compatibility_identity(&config.engine, image)
+            .await
+            .map_err(|err| {
+                KernelError::Runtime(format!(
+                    "failed to resolve local OCI image identity for runtime '{}': {}",
+                    runtime_id, err
+                ))
+            })?;
+        Ok(profile.with_image_identity(image_identity))
     }
 
     async fn resolve_runtime_secrets_mount(

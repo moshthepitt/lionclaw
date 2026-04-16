@@ -1552,15 +1552,16 @@ struct TestEnv {
 }
 
 fn test_runtime_profile(env: &TestEnv, compatibility_key: &str) -> RuntimeExecutionProfile {
-    RuntimeExecutionProfile {
-        confinement: ConfinementConfig::Oci(OciConfinementConfig {
+    RuntimeExecutionProfile::new(
+        ConfinementConfig::Oci(OciConfinementConfig {
             engine: env.fake_podman_path().display().to_string(),
             image: Some("ghcr.io/lionclaw/test-resumable-runtime:latest".to_string()),
             ..OciConfinementConfig::default()
         }),
-        compatibility_key: compatibility_key.to_string(),
-        required_runtime_auth: None,
-    }
+        compatibility_key.to_string(),
+        None,
+        None,
+    )
 }
 
 impl TestEnv {
@@ -1581,7 +1582,11 @@ impl TestEnv {
     fn fake_podman_path(&self) -> PathBuf {
         let path = self.path().join("podman");
         if !path.exists() {
-            std::fs::write(&path, "#!/usr/bin/env bash\nexit 0\n").expect("write fake podman");
+            std::fs::write(
+                &path,
+                "#!/usr/bin/env bash\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"inspect\" ]; then\n  printf 'sha256:test-runtime-image\\n'\n  exit 0\nfi\nexit 0\n",
+            )
+            .expect("write fake podman");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod fake podman");
         }

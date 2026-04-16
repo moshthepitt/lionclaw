@@ -1,5 +1,8 @@
 use std::sync::Arc;
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{anyhow, Result};
 
@@ -9,7 +12,7 @@ use crate::kernel::{
         resolve_oci_image_compatibility_identity,
         validate_runtime_launch_prerequisites as validate_kernel_runtime_launch_prerequisites,
         CodexRuntimeAdapter, CodexRuntimeConfig, OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig,
-        RuntimeExecutionProfile,
+        RuntimeAuthKind, RuntimeExecutionProfile,
     },
     Kernel,
 };
@@ -80,16 +83,20 @@ pub async fn resolve_runtime_execution_context(
         .runtimes
         .iter()
         .map(|(id, runtime)| {
+            let runtime_auth_identity =
+                runtime_auth_identity(runtime, codex_home_override.as_deref())?;
             let profile = if selected_runtime_id == Some(id.as_str()) {
-                runtime.execution_profile_with_image_identity(
+                runtime.execution_profile_with_runtime_context(
                     runtime_image_identities.get(id).map(String::as_str),
+                    runtime_auth_identity.as_deref(),
                 )
             } else {
-                runtime.execution_profile()
+                runtime
+                    .execution_profile_with_runtime_context(None, runtime_auth_identity.as_deref())
             };
-            (id.clone(), profile)
+            Ok((id.clone(), profile))
         })
-        .collect();
+        .collect::<Result<BTreeMap<_, _>>>()?;
     let daemon_config_fingerprint = daemon_compat_fingerprint_with_runtime_context(
         config,
         codex_home_override.as_deref(),
@@ -187,6 +194,42 @@ async fn resolve_runtime_image_identities(
     identities.insert(selected_runtime_id.to_string(), identity);
 
     Ok(identities)
+}
+
+fn runtime_auth_identity(
+    runtime: &RuntimeProfileConfig,
+    codex_home_override: Option<&Path>,
+) -> Result<Option<String>> {
+    match runtime.required_runtime_auth() {
+        Some(RuntimeAuthKind::Codex) => codex_home_identity(codex_home_override),
+        None => Ok(None),
+    }
+}
+
+fn codex_home_identity(codex_home_override: Option<&Path>) -> Result<Option<String>> {
+    let path = match codex_home_override {
+        Some(path) => path.to_path_buf(),
+        None => {
+            let Some(home) = std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+            else {
+                return Ok(None);
+            };
+            home.join(".codex")
+        }
+    };
+    normalize_identity_path(&path).map(Some)
+}
+
+fn normalize_identity_path(path: &Path) -> Result<String> {
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let normalized = resolved.canonicalize().unwrap_or(resolved);
+    Ok(format!("codex-home:{}", normalized.display()))
 }
 
 #[cfg(test)]
@@ -553,6 +596,32 @@ mod tests {
             left.daemon_config_fingerprint,
             right.daemon_config_fingerprint
         );
+        assert_ne!(
+            left.execution_profiles["codex"].compatibility_key,
+            right.execution_profiles["codex"].compatibility_key
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_execution_context_changes_when_codex_home_identity_changes() {
+        let (_podman_dir, engine) = fake_podman();
+        let left_temp = tempfile::tempdir().expect("left temp dir");
+        let right_temp = tempfile::tempdir().expect("right temp dir");
+        let left_home = LionClawHome::new(left_temp.path().join(".lionclaw"));
+        let right_home = LionClawHome::new(right_temp.path().join(".lionclaw"));
+        left_home.ensure_base_dirs().await.expect("left dirs");
+        right_home.ensure_base_dirs().await.expect("right dirs");
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine));
+
+        let left = resolve_runtime_execution_context(&left_home, &config, Some("codex"))
+            .await
+            .expect("resolve left context");
+        let right = resolve_runtime_execution_context(&right_home, &config, Some("codex"))
+            .await
+            .expect("resolve right context");
+
         assert_ne!(
             left.execution_profiles["codex"].compatibility_key,
             right.execution_profiles["codex"].compatibility_key
