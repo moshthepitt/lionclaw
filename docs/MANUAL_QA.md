@@ -15,6 +15,9 @@ Run this before merging behavior-changing work that touches:
 - runtime secrets, drafts, continuity, or session recovery
 
 Do not use production secrets. Use only dummy `runtime-secrets.env` values.
+The host Codex auth store for the pass is `${CODEX_HOME:-$HOME/.codex}`. If
+`CODEX_HOME` is set, keep it exported for every phase so direct runs and
+managed daemon runs validate the same host Codex home.
 
 ## Pass/Fail Rule
 
@@ -29,6 +32,18 @@ Stop early for a major blocker in a core phase:
 Model prompt-following variance, such as an extra explanatory line before the
 expected token, is not a blocker unless LionClaw mutated the prompt, replayed
 wrong context, or used the wrong project root.
+
+Record one line per phase while running the pass:
+
+```text
+phase:
+result: pass | fail | skipped
+evidence:
+notes:
+```
+
+Skipped phases must include the exact blocker, such as missing host Codex auth,
+Podman unavailable, systemd unavailable, or network unavailable.
 
 ## Scope
 
@@ -82,7 +97,8 @@ rustc -V
 cargo clippy -V
 podman --version
 git rev-parse HEAD
-stat "$HOME/.codex/auth.json"
+export HOST_CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+stat "$HOST_CODEX_HOME/auth.json"
 ```
 
 Expected:
@@ -231,7 +247,15 @@ cd "$PROJ_A"
 "$LIONCLAW_BIN" service logs
 
 bind=$(sed -n 's/^bind = "\(.*\)"$/\1/p' "$LIONCLAW_HOME/config/lionclaw.toml" | head -n1)
-curl -sS "http://$bind/v0/daemon/info"
+daemon_info=""
+for _ in $(seq 1 30); do
+  if daemon_info=$(curl -fsS "http://$bind/v0/daemon/info" 2>/dev/null); then
+    break
+  fi
+  sleep 1
+done
+printf '%s\n' "$daemon_info"
+test -n "$daemon_info"
 ```
 
 Expected:
@@ -252,7 +276,47 @@ Expected:
 - fails before REPL startup with a clear missing image error for
   `broken-codex`
 
-## Phase 6: Terminal Channel
+## Phase 6: Stale Config Restart And CODEX_HOME Persistence
+
+Record current daemon identity, then make a harmless config change while the
+managed daemon is running:
+
+```bash
+before_info=$(curl -sS "http://$bind/v0/daemon/info")
+printf '%s\n' "$before_info"
+
+"$LIONCLAW_BIN" runtime add codex-same-image \
+  --kind codex \
+  --bin codex \
+  --image lionclaw-runtime:v1
+"$LIONCLAW_BIN" service up --runtime codex
+
+after_info=""
+for _ in $(seq 1 30); do
+  if after_info=$(curl -fsS "http://$bind/v0/daemon/info" 2>/dev/null); then
+    break
+  fi
+  sleep 1
+done
+printf '%s\n' "$after_info"
+test -n "$after_info"
+grep -E '^(CODEX_HOME|LIONCLAW_DAEMON_CONFIG_FINGERPRINT)=' \
+  "$LIONCLAW_HOME/services/env/lionclawd.env" || true
+```
+
+Expected:
+
+- daemon remains reachable after `service up`
+- `config_fingerprint` changes after the config update
+- same `home_id` and `project_scope` are preserved
+- if `CODEX_HOME` was exported at the start of the pass, the generated daemon
+  env file contains that exact absolute path
+- if `CODEX_HOME` was not exported, the generated daemon env file does not add
+  a synthetic `CODEX_HOME`
+- the added unselected `codex-same-image` runtime does not affect subsequent
+  selected `codex` launches
+
+## Phase 7: Terminal Channel
 
 Attach from project A:
 
@@ -310,7 +374,7 @@ Expected:
 - completed terminal turns have `runtime_id=codex`
 - retry turn has `kind=retry`
 
-## Phase 7: Scheduler Job And Channel Delivery
+## Phase 8: Scheduler Job And Channel Delivery
 
 ```bash
 job_output=$("$LIONCLAW_BIN" job add live-qa-job \
@@ -326,7 +390,7 @@ job_id=$(printf '%s\n' "$job_output" | sed -n 's/^created job \([^ ]*\).*/\1/p')
 "$LIONCLAW_BIN" job run "$job_id"
 "$LIONCLAW_BIN" job runs "$job_id"
 "$LIONCLAW_BIN" continuity status
-find "$LIONCLAW_HOME/workspaces/main/continuity/artifacts" -type f -maxdepth 5 -print -exec sed -n '1,80p' {} \;
+find "$LIONCLAW_HOME/workspaces/main/continuity/artifacts" -maxdepth 5 -type f -print -exec sed -n '1,80p' {} \;
 ```
 
 Check channel delivery without relying on the interactive session:
@@ -353,7 +417,7 @@ Cleanup the job:
 "$LIONCLAW_BIN" job ls
 ```
 
-## Phase 8: Runtime Secrets
+## Phase 9: Runtime Secrets
 
 First change the fresh home to use a secrets-enabled preset. Edit
 `$LIONCLAW_HOME/config/lionclaw.toml` so it contains:
@@ -373,8 +437,15 @@ Reconcile the daemon and record the new fingerprint:
 
 ```bash
 "$LIONCLAW_BIN" service up --runtime codex
-sleep 2
-curl -sS "http://$bind/v0/daemon/info"
+daemon_info=""
+for _ in $(seq 1 30); do
+  if daemon_info=$(curl -fsS "http://$bind/v0/daemon/info" 2>/dev/null); then
+    break
+  fi
+  sleep 1
+done
+printf '%s\n' "$daemon_info"
+test -n "$daemon_info"
 ```
 
 Create dummy secrets after the daemon is already running:
@@ -384,7 +455,8 @@ mkdir -p "$LIONCLAW_HOME/config"
 printf 'DUMMY_RUNTIME_SECRET=manual-live-only\n' > "$LIONCLAW_HOME/config/runtime-secrets.env"
 chmod 0644 "$LIONCLAW_HOME/config/runtime-secrets.env"
 stat "$LIONCLAW_HOME/config/runtime-secrets.env"
-podman secret ls --format '{{.ID}} {{.Name}}' | sort
+secrets_before=$(mktemp)
+podman secret ls --format '{{.Name}}' | sort | tee "$secrets_before"
 ```
 
 Run a daemon-backed turn through the approved terminal peer:
@@ -398,22 +470,43 @@ curl -sS -X POST "http://$bind/v0/channels/inbound" \
 Poll:
 
 ```bash
-curl -sS "http://$bind/v0/sessions/latest?channel_id=terminal&peer_id=qa-terminal&history_policy=interactive"
+for _ in $(seq 1 90); do
+  latest=$(curl -sS "http://$bind/v0/sessions/latest?channel_id=terminal&peer_id=qa-terminal&history_policy=interactive")
+  printf '%s\n' "$latest"
+  if printf '%s' "$latest" | grep -q '"assistant_text":"yes"'; then
+    break
+  fi
+  sleep 1
+done
+
+# Wait until the turn is fully complete before judging cleanup.
+for _ in $(seq 1 30); do
+  latest=$(curl -sS "http://$bind/v0/sessions/latest?channel_id=terminal&peer_id=qa-terminal&history_policy=interactive")
+  printf '%s\n' "$latest"
+  if printf '%s' "$latest" | grep -Eq '"assistant_text":"yes".*"finished_at":"[^"]+"'; then
+    break
+  fi
+  sleep 1
+done
+
 stat "$LIONCLAW_HOME/config/runtime-secrets.env"
-podman secret ls --format '{{.ID}} {{.Name}}' | sort
+secrets_after=$(mktemp)
+podman secret ls --format '{{.Name}}' | sort | tee "$secrets_after"
+comm -13 "$secrets_before" "$secrets_after" | grep '^lionclaw-runtime-secrets-' || true
 ```
 
 Expected:
 
 - answer is `yes`
 - source file is hardened to owner-only permissions
-- no new Podman secret remains after the turn
+- after the turn is completed, the `comm` check prints no new
+  `lionclaw-runtime-secrets-*` names
 - secret contents never appear in logs or assistant output
 
 If an old `lionclaw-runtime-secrets-*` already existed before this phase, do not
 count it as a current regression unless a new one appears.
 
-## Phase 9: Same-Home Project Isolation
+## Phase 10: Same-Home Project Isolation
 
 Keep the project-A daemon running and switch to project B:
 
@@ -448,7 +541,7 @@ Expected:
 
 Exit with `/exit`.
 
-## Phase 10: Cleanup
+## Phase 11: Cleanup
 
 From project A:
 
@@ -462,6 +555,13 @@ Expected:
 
 - daemon is inactive/dead
 - no live containers remain for the completed turns
+- no new `lionclaw-runtime-secrets-*` Podman secret remains
+
+Check:
+
+```bash
+podman secret ls --format '{{.ID}} {{.Name}}' | sort
+```
 
 ## Optional Fault-Injection Checks
 
