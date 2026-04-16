@@ -1,0 +1,13 @@
+# Lint levels live in Cargo.toml. This file is for Clippy configuration values
+# that cannot be expressed through Cargo's lint tables.
+
+# LionClaw is an application/kernel, not a published Rust API crate. Let Clippy
+# suggest improvements even when they touch exported items.
+avoid-breaking-exported-api = false
+
+# Keep the strict profile focused on production code health. Tests may use
+# panic-oriented assertions and fixture setup without drowning out real issues.
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+allow-unwrap-in-tests = true

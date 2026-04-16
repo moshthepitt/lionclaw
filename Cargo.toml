@@ -4,6 +4,61 @@ version = "0.2.0"
 edition = "2021"
 license = "MIT"
 
+[lints.rust]
+future_incompatible = { level = "warn", priority = -1 }
+rust_2018_idioms = { level = "warn", priority = -1 }
+unsafe_code = "warn"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Production hazards: these should not land in the secure core by accident.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+undocumented_unsafe_blocks = "deny"
+
+# Panic-prone control flow. Kept at warn so existing debt is visible before
+# deciding where explicit panics are acceptable.
+expect_used = "warn"
+get_unwrap = "warn"
+indexing_slicing = "warn"
+panic = "warn"
+panic_in_result_fn = "warn"
+unwrap_in_result = "warn"
+unwrap_used = "warn"
+
+# Async/concurrency hazards.
+await_holding_invalid_type = "deny"
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+future_not_send = "warn"
+mutex_atomic = "warn"
+mutex_integer = "warn"
+rc_buffer = "warn"
+rc_mutex = "warn"
+
+# Resource, process, and audit hygiene.
+allow_attributes_without_reason = "warn"
+clone_on_ref_ptr = "warn"
+exit = "warn"
+let_underscore_must_use = "warn"
+mem_forget = "deny"
+pathbuf_init_then_push = "warn"
+unused_result_ok = "warn"
+
+# High-signal maintainability checks from pedantic/nursery/restriction.
+large_futures = "warn"
+large_stack_arrays = "warn"
+large_types_passed_by_value = "warn"
+redundant_clone = "warn"
+same_name_method = "warn"
+significant_drop_in_scrutinee = "warn"
+significant_drop_tightening = "warn"
+uninlined_format_args = "warn"
+unnecessary_sort_by = "warn"
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
