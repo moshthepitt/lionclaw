@@ -63,7 +63,7 @@ impl ExecutionBackend for OciExecutionBackend {
         let prepared = prepare_oci_process_launch(&request)?;
         let invocation = build_oci_process_invocation(prepared, &runtime_auth_environment);
         let result = run_process_streaming(&invocation, move |line| {
-            let _ = stdout.send(line.to_string());
+            drop(stdout.send(line.to_string()));
             Ok(())
         })
         .await;
@@ -450,15 +450,19 @@ impl OciRuntimeSecretsCleanup {
     fn spawn(self) {
         if let Ok(handle) = Handle::try_current() {
             handle.spawn(async move {
-                let _ = self.shutdown().await;
+                if let Err(err) = self.shutdown().await {
+                    warn!(?err, "failed to clean up runtime secrets");
+                }
             });
             return;
         }
 
         std::thread::spawn(move || {
-            let _ = std::process::Command::new(&self.engine)
-                .args(["secret", "rm", &self.secret_name])
-                .status();
+            drop(
+                std::process::Command::new(&self.engine)
+                    .args(["secret", "rm", &self.secret_name])
+                    .status(),
+            );
         });
     }
 }

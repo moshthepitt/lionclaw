@@ -96,7 +96,9 @@ fn hash_directory(root: &Path) -> Result<String> {
             if count == 0 {
                 break;
             }
-            hasher.update(&buffer[..count]);
+            if let Some(chunk) = buffer.get(..count) {
+                hasher.update(chunk);
+            }
         }
     }
 

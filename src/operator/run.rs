@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    io::{BufRead, Write},
+    io::{BufRead, BufReader, Write},
     path::Path,
 };
 
@@ -29,8 +29,8 @@ pub async fn run_local(
 ) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    let mut input = stdin.lock();
-    let mut output = stdout.lock();
+    let mut input = BufReader::new(stdin);
+    let mut output = stdout;
     run_local_with_io(
         home,
         requested_runtime,
@@ -41,7 +41,7 @@ pub async fn run_local(
     .await
 }
 
-pub(crate) async fn run_local_with_io<R: BufRead, W: Write>(
+pub(crate) async fn run_local_with_io<R: BufRead + Send, W: Write + Send>(
     home: &LionClawHome,
     requested_runtime: Option<String>,
     continue_last_session: bool,
@@ -71,7 +71,7 @@ pub(crate) async fn run_local_with_io<R: BufRead, W: Write>(
     .await
 }
 
-async fn run_repl<R: BufRead, W: Write>(
+async fn run_repl<R: BufRead + Send, W: Write + Send>(
     kernel: &Kernel,
     runtime_id: &str,
     project_workspace_root: &str,
@@ -197,7 +197,7 @@ async fn resolve_repl_session(
         .await
 }
 
-async fn render_session_history<W: Write>(
+async fn render_session_history<W: Write + Send>(
     kernel: &Kernel,
     session_id: uuid::Uuid,
     output: &mut W,
@@ -222,7 +222,7 @@ async fn render_session_history<W: Write>(
     Ok(())
 }
 
-async fn render_session_action<W: Write>(
+async fn render_session_action<W: Write + Send>(
     kernel: &Kernel,
     session_id: uuid::Uuid,
     runtime_id: &str,
@@ -282,7 +282,7 @@ fn partial_history_marker(status: SessionTurnStatus) -> &'static str {
     }
 }
 
-async fn render_streaming_turn<W: Write>(
+async fn render_streaming_turn<W: Write + Send>(
     kernel: &Kernel,
     session_id: uuid::Uuid,
     runtime_id: &str,
@@ -309,7 +309,7 @@ async fn render_streaming_future<W, F>(
     output: &mut W,
 ) -> Result<()>
 where
-    W: Write,
+    W: Write + Send,
     F: Future<Output = Result<crate::contracts::SessionTurnResponse, crate::kernel::KernelError>>
         + Unpin,
 {

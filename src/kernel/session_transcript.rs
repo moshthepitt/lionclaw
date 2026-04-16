@@ -864,7 +864,9 @@ where
             continue;
         };
         if let Some(index) = positions.get(&key).copied() {
-            merged[index] = item;
+            if let Some(slot) = merged.get_mut(index) {
+                *slot = item;
+            }
         } else {
             positions.insert(key, merged.len());
             merged.push(item);

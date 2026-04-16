@@ -130,7 +130,7 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
                 "codex adapter does not support runtime-side capability request resolution"
             ));
         }
-        let _ = events.send(RuntimeEvent::Done);
+        drop(events.send(RuntimeEvent::Done));
         Ok(())
     }
 

@@ -677,10 +677,12 @@ mod tests {
             &bind_addr,
         )
         .await;
-        manager.set_unit_status(
-            crate::operator::services::DAEMON_UNIT_NAME,
-            "loaded/active/running",
-        );
+        manager
+            .set_unit_status(
+                crate::operator::services::DAEMON_UNIT_NAME,
+                "loaded/active/running",
+            )
+            .expect("set unit status");
 
         let spec = prepare_channel_attach(
             &home,
@@ -696,7 +698,9 @@ mod tests {
 
         assert!(spec.started_services, "stale daemon should be reconciled");
         assert!(
-            manager.was_restarted(crate::operator::services::DAEMON_UNIT_NAME),
+            manager
+                .was_restarted(crate::operator::services::DAEMON_UNIT_NAME)
+                .expect("read restart state"),
             "managed daemon should be restarted when config fingerprint changes"
         );
     }

@@ -187,19 +187,20 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
 
     for old_channel in &previous_lock.channels {
         if !desired_channel_ids.contains(old_channel.id.as_str()) {
-            let _ = kernel
+            kernel
                 .bind_channel(ChannelBindRequest {
                     channel_id: old_channel.id.clone(),
                     skill_id: old_channel.skill_id.clone(),
                     enabled: Some(false),
                     config: Some(json!({})),
                 })
-                .await;
+                .await
+                .map_err(to_anyhow)?;
         }
     }
 
     for channel in &config.channels {
-        let (snapshot, skill_id) = installed_skills.get(&channel.skill).ok_or_else(|| {
+        let (_snapshot, skill_id) = installed_skills.get(&channel.skill).ok_or_else(|| {
             anyhow!(
                 "channel '{}' references missing skill alias '{}'",
                 channel.id,
@@ -224,7 +225,6 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
             }
         }
 
-        let _ = snapshot;
         kernel
             .bind_channel(ChannelBindRequest {
                 channel_id: channel.id.clone(),
@@ -246,7 +246,10 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
 
     for old_skill in &previous_lock.skills {
         if !next_skill_ids.contains(old_skill.skill_id.as_str()) {
-            let _ = kernel.disable_skill(old_skill.skill_id.clone()).await;
+            kernel
+                .disable_skill(old_skill.skill_id.clone())
+                .await
+                .map_err(to_anyhow)?;
         }
     }
 
@@ -1336,7 +1339,9 @@ mod tests {
         )
         .await;
         let manager = FakeServiceManager::default();
-        manager.set_unit_status(DAEMON_UNIT_NAME, "loaded/inactive/dead");
+        manager
+            .set_unit_status(DAEMON_UNIT_NAME, "loaded/inactive/dead")
+            .expect("set unit status");
         let binaries = StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         };
@@ -1442,7 +1447,9 @@ mod tests {
         )
         .await;
         let manager = FakeServiceManager::default();
-        manager.set_unit_status(DAEMON_UNIT_NAME, "loaded/active/running");
+        manager
+            .set_unit_status(DAEMON_UNIT_NAME, "loaded/active/running")
+            .expect("set unit status");
         let binaries = StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         };
@@ -1451,7 +1458,9 @@ mod tests {
             .await
             .expect("same-home managed daemon should be reused");
         assert!(
-            manager.was_restarted(DAEMON_UNIT_NAME),
+            manager
+                .was_restarted(DAEMON_UNIT_NAME)
+                .expect("read restart state"),
             "changed active daemon unit should be restarted"
         );
     }
@@ -1505,7 +1514,9 @@ mod tests {
         )
         .await;
         let manager = FakeServiceManager::default();
-        manager.set_unit_status(DAEMON_UNIT_NAME, "loaded/active/running");
+        manager
+            .set_unit_status(DAEMON_UNIT_NAME, "loaded/active/running")
+            .expect("set unit status");
         let binaries = StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         };
@@ -1514,7 +1525,9 @@ mod tests {
             .await
             .expect("stale managed daemon should be reconciled");
         assert!(
-            manager.was_restarted(DAEMON_UNIT_NAME),
+            manager
+                .was_restarted(DAEMON_UNIT_NAME)
+                .expect("read restart state"),
             "managed daemon should be restarted when daemon config fingerprint changes"
         );
     }

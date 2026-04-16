@@ -13,6 +13,7 @@ use tokio::{
     sync::{Mutex, Notify, RwLock},
     time::{sleep, timeout, Instant},
 };
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::contracts::{
@@ -318,36 +319,55 @@ impl Kernel {
     async fn bootstrap(&self) {
         register_builtin_runtime_adapters(&self.runtime).await;
         if let Some(layout) = &self.continuity {
-            let _ = layout.ensure_base_layout().await;
+            if let Err(err) = layout.ensure_base_layout().await {
+                warn!(
+                    ?err,
+                    "failed to ensure continuity base layout during bootstrap"
+                );
+            }
         }
         let reason = "turn interrupted by kernel restart";
         if let Ok(interrupted_turns) = self.session_turns.interrupt_running_turns(reason).await {
             for turn in &interrupted_turns {
-                let _ = self.sessions.record_turn(turn.session_id).await;
+                if let Err(err) = self.sessions.record_turn(turn.session_id).await {
+                    warn!(?err, session_id = %turn.session_id, "failed to touch interrupted session");
+                }
             }
-            let _ = self
-                .audit
-                .append(
-                    "session.turn.reconciled",
-                    None,
-                    Some("kernel".to_string()),
-                    json!({
-                        "status": "interrupted",
-                        "count": interrupted_turns.len(),
-                        "reason": reason,
-                    }),
-                )
-                .await;
+            self.append_audit_event_best_effort(
+                "session.turn.reconciled",
+                None,
+                "kernel",
+                json!({
+                    "status": "interrupted",
+                    "count": interrupted_turns.len(),
+                    "reason": reason,
+                }),
+            )
+            .await;
         }
-        let _ = self
+        if let Err(err) = self
             .channel_state
             .fail_running_turns("channel turn interrupted by restart")
-            .await;
-        let _ = self
+            .await
+        {
+            warn!(
+                ?err,
+                "failed to reconcile running channel turns during bootstrap"
+            );
+        }
+        if let Err(err) = self
             .jobs
             .interrupt_running_runs("scheduled job interrupted by kernel restart")
-            .await;
-        let _ = self.refresh_active_continuity().await;
+            .await
+        {
+            warn!(
+                ?err,
+                "failed to reconcile running scheduled jobs during bootstrap"
+            );
+        }
+        if let Err(err) = self.refresh_active_continuity().await {
+            warn!(?err, "failed to refresh active continuity during bootstrap");
+        }
     }
 
     pub async fn register_runtime_adapter(
@@ -558,7 +578,7 @@ impl Kernel {
             }
             SessionActionKind::ContinueLastPartial | SessionActionKind::RetryLastTurn => {
                 let session_lock = self.session_lock(req.session_id).await;
-                let guard = session_lock.clone().lock_owned().await;
+                let guard = Arc::clone(&session_lock).lock_owned().await;
                 let (session, execution) = self
                     .prepare_session_action_execution(req.session_id, req.action, None, None)
                     .await?;
@@ -567,7 +587,9 @@ impl Kernel {
                 let kernel = self.clone();
                 tokio::spawn(async move {
                     let _guard = guard;
-                    let _ = kernel.execute_session_turn(&session, execution).await;
+                    if let Err(err) = kernel.execute_session_turn(&session, execution).await {
+                        warn!(?err, session_id = %session.session_id, turn_id = %turn_id, "session action turn failed");
+                    }
                 });
                 Ok(SessionActionResponse {
                     session_id: response_session_id,
@@ -578,15 +600,20 @@ impl Kernel {
     }
 
     async fn session_lock(&self, session_id: Uuid) -> Arc<Mutex<()>> {
-        if let Some(lock) = self.session_locks.read().await.get(&session_id).cloned() {
+        let existing_lock = {
+            let locks = self.session_locks.read().await;
+            locks.get(&session_id).cloned()
+        };
+        if let Some(lock) = existing_lock {
             return lock;
         }
 
         let mut locks = self.session_locks.write().await;
-        locks
-            .entry(session_id)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+        Arc::clone(
+            locks
+                .entry(session_id)
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
     }
 
     async fn resolve_session_open_trust_tier(
@@ -1306,11 +1333,17 @@ impl Kernel {
                     )
                     .await
                     .map_err(internal)?;
-                let _ = self
+                if let Err(err) = self
                     .record_pairing_pending_continuity(&channel_id, &peer_id, &pending.pairing_code)
-                    .await;
+                    .await
+                {
+                    warn!(
+                        ?err,
+                        channel_id, peer_id, "failed to record pending pairing continuity"
+                    );
+                }
 
-                let _ = self
+                if let Err(err) = self
                     .emit_channel_message(
                         &channel_id,
                         &peer_id,
@@ -1321,7 +1354,10 @@ impl Kernel {
                             pending.pairing_code
                         ),
                     )
-                    .await;
+                    .await
+                {
+                    warn!(?err, channel_id, peer_id, "failed to emit pending pairing message");
+                }
 
                 self.audit
                     .append(
@@ -1348,7 +1384,7 @@ impl Kernel {
 
         match peer.status {
             ChannelPeerStatus::Pending => {
-                let _ = self
+                if let Err(err) = self
                     .emit_channel_message(
                         &channel_id,
                         &peer_id,
@@ -1359,7 +1395,10 @@ impl Kernel {
                             peer.pairing_code
                         ),
                     )
-                    .await;
+                    .await
+                {
+                    warn!(?err, channel_id, peer_id, "failed to emit pending peer message");
+                }
                 self.audit
                     .append(
                         "channel.inbound.rejected",
@@ -2144,11 +2183,10 @@ impl Kernel {
         let previous_summary_state = previous_compaction
             .as_ref()
             .map(|record| record.summary_state.clone());
-        let runtime_id = turns
-            .last()
-            .expect("compaction turn set is not empty")
-            .runtime_id
-            .as_str();
+        let Some(last_turn) = turns.last() else {
+            return Ok(());
+        };
+        let runtime_id = last_turn.runtime_id.as_str();
         let summary_state = self
             .build_compaction_summary_state(
                 session.session_id,
@@ -2176,19 +2214,17 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
-        let _ = self
-            .audit
-            .append(
-                "session.compacted",
-                Some(session.session_id),
-                Some("kernel".to_string()),
-                json!({
-                    "compaction_id": record.compaction_id,
-                    "start_sequence_no": record.start_sequence_no,
-                    "through_sequence_no": record.through_sequence_no,
-                }),
-            )
-            .await;
+        self.append_audit_event_best_effort(
+            "session.compacted",
+            Some(session.session_id),
+            "kernel",
+            json!({
+                "compaction_id": record.compaction_id,
+                "start_sequence_no": record.start_sequence_no,
+                "through_sequence_no": record.through_sequence_no,
+            }),
+        )
+        .await;
         Ok(())
     }
 
@@ -2200,17 +2236,15 @@ impl Kernel {
             Ok(()) => return,
             Err(err) => err.to_string(),
         };
-        let _ = self
-            .audit
-            .append(
-                "session.compaction.failed",
-                Some(session.session_id),
-                Some("kernel".to_string()),
-                json!({
-                    "error": error_text,
-                }),
-            )
-            .await;
+        self.append_audit_event_best_effort(
+            "session.compaction.failed",
+            Some(session.session_id),
+            "kernel",
+            json!({
+                "error": error_text,
+            }),
+        )
+        .await;
     }
 
     async fn refresh_active_continuity(&self) -> Result<(), KernelError> {
@@ -2314,28 +2348,33 @@ impl Kernel {
                     });
                 }
             }
-            let _ = self
-                .audit
-                .append(
-                    "continuity.refresh_failed",
-                    session_id,
-                    Some(actor.to_string()),
-                    details,
-                )
-                .await;
+            self.append_audit_event_best_effort(
+                "continuity.refresh_failed",
+                session_id,
+                actor,
+                details,
+            )
+            .await;
         }
     }
 
     async fn append_audit_event_best_effort(
         &self,
         event_type: &str,
+        session_id: Option<Uuid>,
         actor: &str,
         details: serde_json::Value,
     ) {
-        let _ = self
+        if let Err(err) = self
             .audit
-            .append(event_type, None, Some(actor.to_string()), details)
-            .await;
+            .append(event_type, session_id, Some(actor.to_string()), details)
+            .await
+        {
+            warn!(
+                ?err,
+                event_type, actor, "failed to append best-effort audit event"
+            );
+        }
     }
 
     async fn build_compaction_summary_state(
@@ -2442,9 +2481,12 @@ impl Kernel {
             }
             Ok(Err(err)) => Err(KernelError::Runtime(err.to_string())),
             Err(_) => {
-                let _ = adapter
+                if let Err(err) = adapter
                     .cancel(&handle, Some("compaction summarizer timed out".to_string()))
-                    .await;
+                    .await
+                {
+                    warn!(?err, "failed to cancel timed-out compaction summarizer");
+                }
                 Err(KernelError::RuntimeTimeout(
                     "compaction summarizer timed out".to_string(),
                 ))
@@ -2531,18 +2573,16 @@ impl Kernel {
             }),
         )
         .await;
-        let _ = self
-            .audit
-            .append(
-                "session.compaction.flush",
-                Some(session.session_id),
-                Some("kernel".to_string()),
-                json!({
-                    "memory_proposal_count": proposal_paths.len(),
-                    "open_loop_count": loop_paths.len(),
-                }),
-            )
-            .await;
+        self.append_audit_event_best_effort(
+            "session.compaction.flush",
+            Some(session.session_id),
+            "kernel",
+            json!({
+                "memory_proposal_count": proposal_paths.len(),
+                "open_loop_count": loop_paths.len(),
+            }),
+        )
+        .await;
         Ok(())
     }
 
@@ -2741,6 +2781,7 @@ impl Kernel {
         .await;
         self.append_audit_event_best_effort(
             "continuity.draft.promoted",
+            None,
             actor,
             json!({
                 "runtime_id": runtime_id,
@@ -2781,6 +2822,7 @@ impl Kernel {
             .map_err(|err| draft_action_error(&req.relative_path, err))?;
         self.append_audit_event_best_effort(
             "continuity.draft.discarded",
+            None,
             actor,
             json!({
                 "runtime_id": runtime_id,
@@ -2851,6 +2893,7 @@ impl Kernel {
         .await;
         self.append_audit_event_best_effort(
             "continuity.memory_proposal.merged",
+            None,
             actor,
             json!({
                 "archived_path": archived_path,
@@ -2903,6 +2946,7 @@ impl Kernel {
         .await;
         self.append_audit_event_best_effort(
             "continuity.memory_proposal.rejected",
+            None,
             actor,
             json!({
                 "archived_path": archived_path,
@@ -2970,6 +3014,7 @@ impl Kernel {
         .await;
         self.append_audit_event_best_effort(
             "continuity.open_loop.resolved",
+            None,
             actor,
             json!({
                 "archived_path": archived_path,
@@ -3528,7 +3573,7 @@ mod tests {
             .expect("insert compaction");
 
         let session_lock = kernel.session_lock(session_id).await;
-        let guard = session_lock.clone().lock_owned().await;
+        let guard = Arc::clone(&session_lock).lock_owned().await;
         let remove_kernel = kernel.clone();
         let remove_task = tokio::spawn(async move {
             remove_kernel
@@ -3595,7 +3640,7 @@ mod tests {
             .expect("insert compaction");
 
         let session_lock = kernel.session_lock(session_id).await;
-        let guard = session_lock.clone().lock_owned().await;
+        let guard = Arc::clone(&session_lock).lock_owned().await;
         let remove_kernel = kernel.clone();
         let remove_task = tokio::spawn(async move {
             remove_kernel
@@ -4451,7 +4496,7 @@ impl Kernel {
 
         let turn_result = self
             .execute_runtime_turn(RuntimeTurnExecution {
-                adapter: adapter.clone(),
+                adapter: Arc::clone(&adapter),
                 turn_id,
                 runtime_id: &runtime_id,
                 session_id: session.session_id,
@@ -4473,14 +4518,17 @@ impl Kernel {
             Ok(output) => output,
             Err(turn_err) => {
                 self.clear_runtime_session_ready(&execution_plan).await;
-                let _ = self
+                if let Err(err) = self
                     .close_runtime_session(
-                        adapter.clone(),
+                        Arc::clone(&adapter),
                         &runtime_id,
                         session.session_id,
                         &handle,
                     )
-                    .await;
+                    .await
+                {
+                    warn!(?err, runtime_id, session_id = %session.session_id, "failed to close runtime session after turn error");
+                }
                 let assistant_text = assistant_text_from_events(&turn_err.events);
                 self.persist_failed_session_turn(
                     session,
@@ -4499,8 +4547,7 @@ impl Kernel {
 
         let pre_followup_assistant = assistant_text_from_events(&runtime_turn.events);
         if !pre_followup_assistant.is_empty() {
-            let _ = self
-                .session_turns
+            self.session_turns
                 .checkpoint_assistant_text(turn_id, &pre_followup_assistant)
                 .await
                 .map_err(internal)?;
@@ -4523,7 +4570,7 @@ impl Kernel {
                     .await?;
                 let followup_events = self
                     .execute_runtime_capability_followup(RuntimeCapabilityFollowupExecution {
-                        adapter: adapter.clone(),
+                        adapter: Arc::clone(&adapter),
                         turn_id,
                         runtime_id: &runtime_id,
                         session_id: session.session_id,
@@ -4543,7 +4590,12 @@ impl Kernel {
         .await;
 
         let close_result = self
-            .close_runtime_session(adapter.clone(), &runtime_id, session.session_id, &handle)
+            .close_runtime_session(
+                Arc::clone(&adapter),
+                &runtime_id,
+                session.session_id,
+                &handle,
+            )
             .await;
         let runtime_events = match (runtime_events_result, close_result) {
             (Ok(events), Ok(())) => events,
@@ -4731,19 +4783,17 @@ impl Kernel {
             .record_session_failure_continuity(session, persisted_turn.turn_id, status, &error_text)
             .await
         {
-            let _ = self
-                .audit
-                .append(
-                    "session.failure_continuity.failed",
-                    Some(session.session_id),
-                    Some("kernel".to_string()),
-                    json!({
-                        "turn_id": persisted_turn.turn_id,
-                        "status": status.as_str(),
-                        "error": err.to_string(),
-                    }),
-                )
-                .await;
+            self.append_audit_event_best_effort(
+                "session.failure_continuity.failed",
+                Some(session.session_id),
+                "kernel",
+                json!({
+                    "turn_id": persisted_turn.turn_id,
+                    "status": status.as_str(),
+                    "error": err.to_string(),
+                }),
+            )
+            .await;
         }
         Ok(())
     }
@@ -4861,11 +4911,14 @@ impl Kernel {
         let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
             return;
         };
-        let _ = tokio::fs::write(
+        if let Err(err) = tokio::fs::write(
             runtime_state_root.join(RUNTIME_SESSION_READY_MARKER),
             b"ready\n",
         )
-        .await;
+        .await
+        {
+            warn!(?err, path = %runtime_state_root.display(), "failed to mark runtime session ready");
+        }
     }
 
     async fn clear_runtime_session_ready(&self, plan: &EffectiveExecutionPlan) {
@@ -5008,21 +5061,20 @@ impl Kernel {
     }
 
     async fn channel_stream_notifier(&self, channel_id: &str) -> Arc<Notify> {
-        if let Some(existing) = self
-            .channel_stream_notifiers
-            .read()
-            .await
-            .get(channel_id)
-            .cloned()
-        {
+        let existing = {
+            let notifiers = self.channel_stream_notifiers.read().await;
+            notifiers.get(channel_id).cloned()
+        };
+        if let Some(existing) = existing {
             return existing;
         }
 
         let mut notifiers = self.channel_stream_notifiers.write().await;
-        notifiers
-            .entry(channel_id.to_string())
-            .or_insert_with(|| Arc::new(Notify::new()))
-            .clone()
+        Arc::clone(
+            notifiers
+                .entry(channel_id.to_string())
+                .or_insert_with(|| Arc::new(Notify::new())),
+        )
     }
 
     async fn notify_channel_stream(&self, channel_id: &str) {
@@ -5080,7 +5132,7 @@ impl Kernel {
 
     fn emit_local_stream_event(&self, sink: &Option<RuntimeEventSink>, event: &RuntimeEvent) {
         if let Some(sink) = sink {
-            let _ = sink.send(to_stream_event_view(event.clone()));
+            drop(sink.send(to_stream_event_view(event.clone())));
         }
     }
 
@@ -5257,19 +5309,17 @@ impl Kernel {
                 {
                     Ok(value) => value,
                     Err(err) => {
-                        let _ = self
-                            .audit
-                            .append(
-                                "channel.turn.claim_failed",
-                                None,
-                                Some("kernel".to_string()),
-                                json!({
-                                    "channel_id": channel_id,
-                                    "peer_id": peer_id,
-                                    "error": err.to_string(),
-                                }),
-                            )
-                            .await;
+                        self.append_audit_event_best_effort(
+                            "channel.turn.claim_failed",
+                            None,
+                            "kernel",
+                            json!({
+                                "channel_id": channel_id,
+                                "peer_id": peer_id,
+                                "error": err.to_string(),
+                            }),
+                        )
+                        .await;
                         self.channel_turn_workers.write().await.remove(&worker_key);
                         return;
                     }
@@ -5311,19 +5361,22 @@ impl Kernel {
         {
             Ok(value) => value,
             Err(err) => {
-                let _ = self
+                if let Err(fail_err) = self
                     .fail_queued_turn(
                         &turn,
                         "queue.failed",
                         &format!("failed to resolve stream context: {err}"),
                         None,
                     )
-                    .await;
+                    .await
+                {
+                    warn!(?fail_err, turn_id = %turn.turn_id, "failed to mark queued turn failed");
+                }
                 return;
             }
         };
 
-        let _ = self
+        if let Err(err) = self
             .emit_runtime_event(
                 &stream_context,
                 &None,
@@ -5332,23 +5385,24 @@ impl Kernel {
                     text: "turn started".to_string(),
                 },
             )
-            .await;
+            .await
+        {
+            warn!(?err, turn_id = %turn.turn_id, "failed to emit queued turn start event");
+        }
 
-        let _ = self
-            .audit
-            .append(
-                "channel.turn.started",
-                Some(turn.session_id),
-                Some("kernel".to_string()),
-                json!({
-                    "turn_id": turn.turn_id,
-                    "channel_id": turn.channel_id,
-                    "peer_id": turn.peer_id,
-                    "runtime_id": turn.runtime_id,
-                    "inbound_message_id": turn.inbound_message_id,
-                }),
-            )
-            .await;
+        self.append_audit_event_best_effort(
+            "channel.turn.started",
+            Some(turn.session_id),
+            "kernel",
+            json!({
+                "turn_id": turn.turn_id,
+                "channel_id": turn.channel_id,
+                "peer_id": turn.peer_id,
+                "runtime_id": turn.runtime_id,
+                "inbound_message_id": turn.inbound_message_id,
+            }),
+        )
+        .await;
 
         let inbound_message = match self
             .channel_state
@@ -5358,20 +5412,26 @@ impl Kernel {
         {
             Ok(Some(message)) => message,
             Ok(None) => {
-                let _ = self
+                if let Err(err) = self
                     .fail_queued_turn(
                         &turn,
                         "queue.failed",
                         "queued inbound message no longer exists",
                         stream_context,
                     )
-                    .await;
+                    .await
+                {
+                    warn!(?err, turn_id = %turn.turn_id, "failed to mark missing-message queued turn failed");
+                }
                 return;
             }
             Err(err) => {
-                let _ = self
+                if let Err(fail_err) = self
                     .fail_queued_turn(&turn, "queue.failed", &err.to_string(), stream_context)
-                    .await;
+                    .await
+                {
+                    warn!(?fail_err, turn_id = %turn.turn_id, "failed to mark queued turn failed after message load error");
+                }
                 return;
             }
         };
@@ -5384,20 +5444,26 @@ impl Kernel {
         {
             Ok(Some(session)) => session,
             Ok(None) => {
-                let _ = self
+                if let Err(err) = self
                     .fail_queued_turn(
                         &turn,
                         "queue.failed",
                         "queued session no longer exists",
                         stream_context,
                     )
-                    .await;
+                    .await
+                {
+                    warn!(?err, turn_id = %turn.turn_id, "failed to mark missing-session queued turn failed");
+                }
                 return;
             }
             Err(err) => {
-                let _ = self
+                if let Err(fail_err) = self
                     .fail_queued_turn(&turn, "queue.failed", &err.to_string(), stream_context)
-                    .await;
+                    .await
+                {
+                    warn!(?fail_err, turn_id = %turn.turn_id, "failed to mark queued turn failed after session load error");
+                }
                 return;
             }
         };
@@ -5424,22 +5490,22 @@ impl Kernel {
 
         match result {
             Ok(response) => {
-                let _ = self.channel_state.complete_turn(turn.turn_id).await;
-                let _ = self
-                    .audit
-                    .append(
-                        "channel.turn.completed",
-                        Some(turn.session_id),
-                        Some("kernel".to_string()),
-                        json!({
-                            "turn_id": turn.turn_id,
-                            "channel_id": turn.channel_id,
-                            "peer_id": turn.peer_id,
-                            "runtime_id": response.runtime_id,
-                            "assistant_text_len": response.assistant_text.len(),
-                        }),
-                    )
-                    .await;
+                if let Err(err) = self.channel_state.complete_turn(turn.turn_id).await {
+                    warn!(?err, turn_id = %turn.turn_id, "failed to mark queued channel turn complete");
+                }
+                self.append_audit_event_best_effort(
+                    "channel.turn.completed",
+                    Some(turn.session_id),
+                    "kernel",
+                    json!({
+                        "turn_id": turn.turn_id,
+                        "channel_id": turn.channel_id,
+                        "peer_id": turn.peer_id,
+                        "runtime_id": response.runtime_id,
+                        "assistant_text_len": response.assistant_text.len(),
+                    }),
+                )
+                .await;
                 if let Some(stream_context) = self
                     .channel_stream_context_for_session(
                         turn.session_id,
@@ -5451,7 +5517,7 @@ impl Kernel {
                     .ok()
                     .flatten()
                 {
-                    let _ = self
+                    if let Err(err) = self
                         .emit_runtime_event(
                             &Some(stream_context.clone()),
                             &None,
@@ -5460,10 +5526,16 @@ impl Kernel {
                                 text: "turn completed".to_string(),
                             },
                         )
-                        .await;
-                    let _ = self
+                        .await
+                    {
+                        warn!(?err, turn_id = %turn.turn_id, "failed to emit queued turn completion status");
+                    }
+                    if let Err(err) = self
                         .emit_runtime_event(&Some(stream_context), &None, RuntimeEvent::Done)
-                        .await;
+                        .await
+                    {
+                        warn!(?err, turn_id = %turn.turn_id, "failed to emit queued turn completion event");
+                    }
                 }
             }
             Err(err) => {
@@ -5472,9 +5544,12 @@ impl Kernel {
                     KernelError::Runtime(_) => "runtime.error",
                     _ => "queue.failed",
                 };
-                let _ = self
+                if let Err(fail_err) = self
                     .fail_queued_turn(&turn, code, &err.to_string(), stream_context)
-                    .await;
+                    .await
+                {
+                    warn!(?fail_err, turn_id = %turn.turn_id, "failed to mark queued turn failed after execution error");
+                }
             }
         }
     }
@@ -5837,7 +5912,7 @@ impl Kernel {
         }
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let adapter_for_task = adapter.clone();
+        let adapter_for_task = Arc::clone(&adapter);
         let runtime_secrets_mount = self
             .resolve_runtime_secrets_mount(&execution_plan)
             .await
@@ -6109,7 +6184,7 @@ impl Kernel {
         }
 
         turn_task.abort();
-        let _ = turn_task.await;
+        drop(turn_task.await);
 
         self.audit
             .append(

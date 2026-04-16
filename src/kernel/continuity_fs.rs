@@ -13,6 +13,7 @@ use rustix::{
     fs::{mkdirat, openat, renameat, unlinkat, AtFlags, Dir, Mode, OFlags},
     io::Errno,
 };
+use tracing::warn;
 use uuid::Uuid;
 
 const DIR_MODE: Mode = Mode::from_raw_mode(0o755);
@@ -483,7 +484,14 @@ impl ContinuityFs {
         })();
 
         if write_result.is_err() {
-            let _ = unlinkat(parent, temp_path, AtFlags::empty());
+            match unlinkat(parent, temp_path, AtFlags::empty()) {
+                Ok(()) => {}
+                Err(err) => warn!(
+                    ?err,
+                    temp_name = %Path::new(&temp_name).display(),
+                    "failed to remove temporary continuity file"
+                ),
+            }
         }
         write_result
     }

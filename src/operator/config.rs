@@ -257,7 +257,7 @@ pub fn daemon_compat_fingerprint_with_runtime_context(
 ) -> String {
     let mut normalized = config.clone();
     normalized.normalize();
-    let encoded = serde_json::to_vec(&DaemonCompatConfig {
+    let encoded = compatibility_digest_bytes(&DaemonCompatConfig {
         version: 1,
         workspace_name: normalized.daemon.workspace.clone(),
         default_runtime_id: normalized.defaults.runtime.clone(),
@@ -266,8 +266,7 @@ pub fn daemon_compat_fingerprint_with_runtime_context(
         execution_presets: normalized.presets,
         runtime_profiles: normalized.runtimes,
         runtime_image_identities: runtime_image_identities.clone(),
-    })
-    .expect("daemon compatibility config should always serialize");
+    });
     daemon_compat_partition_key(&encoded)
 }
 
@@ -460,12 +459,11 @@ impl RuntimeProfileConfig {
     fn compatibility_base_key(&self, runtime_auth_identity: Option<&str>) -> String {
         let mut normalized = self.clone();
         normalized.normalize();
-        let encoded = serde_json::to_vec(&RuntimeCompatConfig {
+        let encoded = compatibility_digest_bytes(&RuntimeCompatConfig {
             version: 1,
             profile: normalized,
             runtime_auth_identity: runtime_auth_identity.map(str::to_string),
-        })
-        .expect("runtime profile config should always serialize");
+        });
         runtime_profile_partition_key(&encoded)
     }
 
@@ -521,6 +519,17 @@ impl RuntimeProfileConfig {
                     .filter(|value| !value.is_empty());
                 normalize_confinement_config(confinement);
             }
+        }
+    }
+}
+
+fn compatibility_digest_bytes<T: Serialize>(value: &T) -> Vec<u8> {
+    match serde_json::to_vec(value) {
+        Ok(encoded) => encoded,
+        Err(err) => {
+            let mut encoded = b"compatibility-serialization-error\0".to_vec();
+            encoded.extend_from_slice(err.to_string().as_bytes());
+            encoded
         }
     }
 }

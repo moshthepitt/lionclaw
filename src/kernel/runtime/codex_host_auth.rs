@@ -83,7 +83,7 @@ impl CodexAuthStore {
         ));
         write_private_temp_file(&temp_path, encoded, metadata.permissions()).await?;
         if let Err(err) = tokio::fs::rename(&temp_path, &self.auth_path).await {
-            let _ = tokio::fs::remove_file(&temp_path).await;
+            drop(tokio::fs::remove_file(&temp_path).await);
             return Err(err).with_context(|| {
                 format!(
                     "failed to replace refreshed Codex auth at {}",
@@ -550,7 +550,7 @@ async fn write_runtime_codex_file(path: &Path, contents: Vec<u8>) -> Result<()> 
     ));
     write_private_temp_file(&temp_path, contents, private_file_permissions()).await?;
     if let Err(err) = tokio::fs::rename(&temp_path, path).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
+        drop(tokio::fs::remove_file(&temp_path).await);
         return Err(err).with_context(|| format!("failed to replace {}", path.display()));
     }
     set_runtime_codex_file_permissions(path).await
@@ -846,14 +846,14 @@ mod tests {
             .await
             .expect("bind listener");
         let address = listener.local_addr().expect("local addr");
-        let refresh_hits_server = refresh_hits.clone();
+        let refresh_hits_server = Arc::clone(&refresh_hits);
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
                 Router::new().route(
                     "/oauth/token",
                     post(move |Form(_form): Form<BTreeMap<String, String>>| {
-                        let refresh_hits = refresh_hits_server.clone();
+                        let refresh_hits = Arc::clone(&refresh_hits_server);
                         async move {
                             refresh_hits.fetch_add(1, Ordering::SeqCst);
                             tokio::time::sleep(StdDuration::from_millis(50)).await;

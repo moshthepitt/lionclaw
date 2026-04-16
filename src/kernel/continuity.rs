@@ -229,13 +229,17 @@ impl ContinuityLayout {
     }
 
     async fn fs(&self) -> Result<Arc<ContinuityFs>> {
-        let mut guard = self.fs.lock().await;
-        if guard.is_none() {
-            *guard = Some(Arc::new(ContinuityFs::bootstrap(&self.workspace_root)?));
-        }
-        Ok(Arc::clone(
-            guard.as_ref().expect("continuity fs initialized"),
-        ))
+        let fs = {
+            let mut guard = self.fs.lock().await;
+            if let Some(fs) = guard.as_ref() {
+                return Ok(Arc::clone(fs));
+            }
+
+            let fs = Arc::new(ContinuityFs::bootstrap(&self.workspace_root)?);
+            *guard = Some(Arc::clone(&fs));
+            fs
+        };
+        Ok(fs)
     }
 
     pub async fn ensure_base_layout(&self) -> Result<()> {
@@ -1186,7 +1190,15 @@ fn snippet_from_source_window(
     let window_start = start_char.saturating_sub(context_chars);
     let window_end = (end_char + context_chars).min(boundaries.len() - 1);
 
-    content[boundaries[window_start]..boundaries[window_end]]
+    let Some(&start_byte) = boundaries.get(window_start) else {
+        return String::new();
+    };
+    let Some(&end_byte) = boundaries.get(window_end) else {
+        return String::new();
+    };
+    content
+        .get(start_byte..end_byte)
+        .unwrap_or_default()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")

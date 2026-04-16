@@ -1,6 +1,5 @@
 use std::{collections::BTreeMap, fmt, path::PathBuf, time::Duration};
 
-use serde::Serialize;
 use uuid::Uuid;
 
 use crate::home::runtime_profile_partition_key;
@@ -66,24 +65,20 @@ impl RuntimeExecutionProfile {
     }
 }
 
-#[derive(Serialize)]
-struct RuntimeImageCompatibilityConfig<'a> {
-    version: u32,
-    compatibility_base_key: &'a str,
-    image_identity: &'a str,
-}
-
 fn runtime_compatibility_key(compatibility_base_key: &str, image_identity: Option<&str>) -> String {
     let Some(image_identity) = image_identity else {
         return compatibility_base_key.to_string();
     };
-    let encoded = serde_json::to_vec(&RuntimeImageCompatibilityConfig {
-        version: 1,
-        compatibility_base_key,
-        image_identity,
-    })
-    .expect("runtime image compatibility config should always serialize");
+    let mut encoded = Vec::new();
+    push_compatibility_key_part(&mut encoded, "runtime-image-compat-v1");
+    push_compatibility_key_part(&mut encoded, compatibility_base_key);
+    push_compatibility_key_part(&mut encoded, image_identity);
     runtime_profile_partition_key(&encoded)
+}
+
+fn push_compatibility_key_part(encoded: &mut Vec<u8>, value: &str) {
+    encoded.extend_from_slice(&value.len().to_le_bytes());
+    encoded.extend_from_slice(value.as_bytes());
 }
 
 #[derive(Clone)]

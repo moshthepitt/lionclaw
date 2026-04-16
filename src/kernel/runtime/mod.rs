@@ -318,7 +318,7 @@ fn observe_program_output_line(
         if let RuntimeEvent::Error { text, .. } = &event {
             *last_error_text = Some(text.clone());
         }
-        let _ = events.send(event);
+        drop(events.send(event));
     }
 }
 
@@ -336,7 +336,7 @@ fn finish_program_backed_turn(
     }
 
     if !saw_done {
-        let _ = events.send(RuntimeEvent::Done);
+        drop(events.send(RuntimeEvent::Done));
     }
 
     Ok(RuntimeTurnResult {

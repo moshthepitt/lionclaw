@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use tokio::process::Command;
+use tracing::warn;
 
 use crate::home::LionClawHome;
 
@@ -228,7 +229,9 @@ impl ServiceManager for SystemdUserServiceManager {
 
     async fn down_units(&self, units: &[String]) -> Result<()> {
         for unit in units {
-            let _ = run_systemctl(["--user", "disable", "--now", unit]).await;
+            if let Err(err) = run_systemctl(["--user", "disable", "--now", unit]).await {
+                warn!(?err, unit, "failed to stop systemd user unit");
+            }
         }
         Ok(())
     }
@@ -285,19 +288,25 @@ pub struct FakeServiceManager {
 }
 
 impl FakeServiceManager {
-    pub fn set_unit_status(&self, unit: impl Into<String>, status: impl Into<String>) {
+    pub fn set_unit_status(
+        &self,
+        unit: impl Into<String>,
+        status: impl Into<String>,
+    ) -> Result<()> {
         self.states
             .lock()
-            .expect("states lock")
+            .map_err(|_| anyhow!("states lock poisoned"))?
             .insert(unit.into(), status.into());
+        Ok(())
     }
 
-    pub fn was_restarted(&self, unit: &str) -> bool {
-        self.restarted
+    pub fn was_restarted(&self, unit: &str) -> Result<bool> {
+        Ok(self
+            .restarted
             .lock()
-            .expect("restarted lock")
+            .map_err(|_| anyhow!("restarted lock poisoned"))?
             .iter()
-            .any(|value| value == unit)
+            .any(|value| value == unit))
     }
 }
 
@@ -308,56 +317,89 @@ impl ServiceManager for FakeServiceManager {
         _home: &LionClawHome,
         units: &[ManagedServiceUnit],
     ) -> Result<Vec<String>> {
-        let mut stored = self.units.lock().expect("units lock");
-        let mut changed = Vec::new();
-        for unit in units {
-            let was_changed = stored
-                .get(&unit.name)
-                .map(|existing| {
-                    existing.unit_content != unit.unit_content
-                        || existing.env_content != unit.env_content
-                })
-                .unwrap_or(true);
-            stored.insert(unit.name.clone(), unit.clone());
-            if was_changed {
-                changed.push(unit.name.clone());
+        let changed = {
+            let mut stored = self
+                .units
+                .lock()
+                .map_err(|_| anyhow!("units lock poisoned"))?;
+            let mut changed = Vec::new();
+            for unit in units {
+                let was_changed = stored
+                    .get(&unit.name)
+                    .map(|existing| {
+                        existing.unit_content != unit.unit_content
+                            || existing.env_content != unit.env_content
+                    })
+                    .unwrap_or(true);
+                stored.insert(unit.name.clone(), unit.clone());
+                if was_changed {
+                    changed.push(unit.name.clone());
+                }
             }
-        }
+            drop(stored);
+            changed
+        };
         Ok(changed)
     }
 
     async fn up_units(&self, units: &[String]) -> Result<()> {
-        let mut states = self.states.lock().expect("states lock");
-        for unit in units {
-            states.insert(unit.clone(), "loaded/active/running".to_string());
+        {
+            let mut states = self
+                .states
+                .lock()
+                .map_err(|_| anyhow!("states lock poisoned"))?;
+            for unit in units {
+                states.insert(unit.clone(), "loaded/active/running".to_string());
+            }
         }
         Ok(())
     }
 
     async fn restart_units(&self, units: &[String]) -> Result<()> {
-        let mut states = self.states.lock().expect("states lock");
-        let mut restarted = self.restarted.lock().expect("restarted lock");
-        for unit in units {
-            states.insert(unit.clone(), "loaded/active/running".to_string());
-            restarted.push(unit.clone());
+        {
+            let mut states = self
+                .states
+                .lock()
+                .map_err(|_| anyhow!("states lock poisoned"))?;
+            let mut restarted = self
+                .restarted
+                .lock()
+                .map_err(|_| anyhow!("restarted lock poisoned"))?;
+            for unit in units {
+                states.insert(unit.clone(), "loaded/active/running".to_string());
+                restarted.push(unit.clone());
+            }
+            drop(restarted);
+            drop(states);
         }
         Ok(())
     }
 
     async fn down_units(&self, units: &[String]) -> Result<()> {
-        let mut states = self.states.lock().expect("states lock");
-        for unit in units {
-            states.insert(unit.clone(), "loaded/inactive/dead".to_string());
+        {
+            let mut states = self
+                .states
+                .lock()
+                .map_err(|_| anyhow!("states lock poisoned"))?;
+            for unit in units {
+                states.insert(unit.clone(), "loaded/inactive/dead".to_string());
+            }
         }
         Ok(())
     }
 
     async fn unit_status(&self, unit: &str) -> Result<String> {
-        let states = self.states.lock().expect("states lock");
-        Ok(states
-            .get(unit)
-            .cloned()
-            .unwrap_or_else(|| "not-found".to_string()))
+        let status = {
+            let states = self
+                .states
+                .lock()
+                .map_err(|_| anyhow!("states lock poisoned"))?;
+            states
+                .get(unit)
+                .cloned()
+                .unwrap_or_else(|| "not-found".to_string())
+        };
+        Ok(status)
     }
 
     async fn logs(&self, units: &[String], _lines: usize) -> Result<String> {
@@ -534,7 +576,7 @@ fn is_missing_unit_error(err: &anyhow::Error) -> bool {
 }
 
 async fn run_systemctl<const N: usize>(args: [&str; N]) -> Result<()> {
-    let _ = run_command("systemctl", args).await?;
+    run_command("systemctl", args).await?;
     Ok(())
 }
 
