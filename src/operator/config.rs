@@ -523,15 +523,12 @@ impl RuntimeProfileConfig {
     }
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "compatibility digest structs contain only infallibly serializable fields"
+)]
 fn compatibility_digest_bytes<T: Serialize>(value: &T) -> Vec<u8> {
-    match serde_json::to_vec(value) {
-        Ok(encoded) => encoded,
-        Err(err) => {
-            let mut encoded = b"compatibility-serialization-error\0".to_vec();
-            encoded.extend_from_slice(err.to_string().as_bytes());
-            encoded
-        }
-    }
+    serde_json::to_vec(value).expect("compatibility digest inputs are infallibly serializable")
 }
 
 fn normalize_execution_preset(_preset: &mut ExecutionPreset) {}

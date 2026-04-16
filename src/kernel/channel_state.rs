@@ -306,6 +306,28 @@ impl ChannelStateStore {
         row.map(map_binding_row).transpose()
     }
 
+    pub async fn set_binding_enabled(
+        &self,
+        channel_id: &str,
+        enabled: bool,
+    ) -> Result<Option<ChannelBindingRecord>> {
+        let result = sqlx::query(
+            "UPDATE channel_bindings SET enabled = ?1, updated_at_ms = ?2 WHERE channel_id = ?3",
+        )
+        .bind(if enabled { 1 } else { 0 })
+        .bind(now_ms())
+        .bind(channel_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to update channel binding enabled state")?;
+
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        self.get_binding(channel_id).await
+    }
+
     pub async fn list_bindings(&self) -> Result<Vec<ChannelBindingRecord>> {
         let rows = sqlx::query(
             "SELECT channel_id, skill_id, enabled, config_json, updated_at_ms \

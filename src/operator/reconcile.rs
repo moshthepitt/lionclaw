@@ -188,12 +188,7 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
     for old_channel in &previous_lock.channels {
         if !desired_channel_ids.contains(old_channel.id.as_str()) {
             kernel
-                .bind_channel(ChannelBindRequest {
-                    channel_id: old_channel.id.clone(),
-                    skill_id: old_channel.skill_id.clone(),
-                    enabled: Some(false),
-                    config: Some(json!({})),
-                })
+                .disable_channel_binding(&old_channel.id, "operator")
                 .await
                 .map_err(to_anyhow)?;
         }
@@ -1183,6 +1178,78 @@ mod tests {
             2,
             "old revisions remain installed for auditability"
         );
+    }
+
+    #[tokio::test]
+    async fn apply_disables_stale_channel_even_when_old_skill_is_disabled() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+
+        let skill_source = temp_dir.path().join("channel-telegram");
+        fs::create_dir_all(skill_source.join("scripts")).expect("skill dir");
+        fs::write(
+            skill_source.join("SKILL.md"),
+            "---\nname: channel-telegram\ndescription: test\n---\n",
+        )
+        .expect("skill md");
+        fs::write(skill_source.join("scripts/worker"), "#!/usr/bin/env bash\n").expect("worker");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                skill_source.join("scripts/worker"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod worker");
+        }
+
+        let mut config = OperatorConfig {
+            skills: vec![ManagedSkillConfig {
+                alias: "telegram".to_string(),
+                source: skill_source.to_string_lossy().to_string(),
+                reference: "local".to_string(),
+                enabled: true,
+            }],
+            channels: vec![ManagedChannelConfig {
+                id: "telegram".to_string(),
+                skill: "telegram".to_string(),
+                enabled: true,
+                launch_mode: ChannelLaunchMode::Service,
+                required_env: Vec::new(),
+            }],
+            ..OperatorConfig::default()
+        };
+        config.save(&home).await.expect("save config");
+        let applied = apply(&home).await.expect("apply channel");
+
+        let kernel = Kernel::new_with_options(
+            &home.db_path(),
+            KernelOptions {
+                default_runtime_id: None,
+                workspace_root: Some(home.workspace_dir("main")),
+                project_workspace_root: Some(home.workspace_dir("main")),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel");
+        kernel
+            .disable_skill(applied.lockfile.skills[0].skill_id.clone())
+            .await
+            .expect("disable old skill");
+
+        config.skills.clear();
+        config.channels.clear();
+        config.save(&home).await.expect("save empty config");
+        apply(&home).await.expect("apply stale cleanup");
+
+        let binding = kernel
+            .get_channel_binding("telegram")
+            .await
+            .expect("load binding")
+            .expect("binding remains for audit history");
+        assert!(!binding.enabled, "stale channel binding should be disabled");
     }
 
     #[tokio::test]

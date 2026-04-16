@@ -5,7 +5,7 @@ use anyhow::anyhow;
 use chrono::Utc;
 use serde_json::json;
 use tokio::{sync::oneshot, time::sleep};
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::contracts::{JobTickResponse, SessionHistoryPolicy, SessionOpenRequest, TrustTier};
@@ -464,7 +464,9 @@ struct AttemptFailureContext {
 impl TickLeaseRenewal {
     async fn stop(mut self) -> Result<(), KernelError> {
         if let Some(stop_tx) = self.stop_tx.take() {
-            if stop_tx.send(()).is_err() {}
+            if stop_tx.send(()).is_err() {
+                debug!("tick lease renewal task already stopped");
+            }
         }
         let renewal_result = self.handle.await.map_err(|err| internal(err.into()))?;
         renewal_result.map_err(internal)?;

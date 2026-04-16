@@ -654,8 +654,7 @@ impl Kernel {
             return Ok(());
         }
 
-        let _ = self
-            .require_channel_peer_approved(&session.channel_id, &session.peer_id)
+        self.require_channel_peer_approved(&session.channel_id, &session.peer_id)
             .await?;
         Ok(())
     }
@@ -971,6 +970,39 @@ impl Kernel {
             .collect::<Vec<_>>();
 
         Ok(ChannelListResponse { bindings })
+    }
+
+    pub async fn disable_channel_binding(
+        &self,
+        channel_id: &str,
+        actor: &str,
+    ) -> Result<Option<ChannelBindResponse>, KernelError> {
+        let binding = self
+            .channel_state
+            .set_binding_enabled(channel_id, false)
+            .await
+            .map_err(internal)?;
+
+        let Some(binding) = binding else {
+            return Ok(None);
+        };
+
+        self.audit
+            .append(
+                "channel.binding.disable",
+                None,
+                Some(actor.to_string()),
+                json!({
+                    "channel_id": binding.channel_id,
+                    "skill_id": binding.skill_id,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+
+        Ok(Some(ChannelBindResponse {
+            binding: to_channel_binding_view(binding),
+        }))
     }
 
     pub async fn list_channel_peers(
@@ -3070,8 +3102,7 @@ impl Kernel {
             if !remove_from_summary_state(&mut record.summary_state, cleanup_key) {
                 continue;
             }
-            let _ = self
-                .session_compactions
+            self.session_compactions
                 .replace_summary_state(record.compaction_id, &record.summary_state)
                 .await
                 .map_err(internal)?;
@@ -4652,8 +4683,7 @@ impl Kernel {
             .await?;
             return Err(kernel_error_for_turn_status(status, error_text));
         }
-        let _ = self
-            .session_turns
+        self.session_turns
             .complete_turn(
                 turn_id,
                 SessionTurnCompletion {
@@ -4665,8 +4695,7 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
-        let _ = self
-            .sessions
+        self.sessions
             .record_turn(session.session_id)
             .await
             .map_err(internal)?;
@@ -4759,8 +4788,7 @@ impl Kernel {
     ) -> Result<(), KernelError> {
         let status = session_turn_status_for_error_code(&error_code);
 
-        let _ = self
-            .session_turns
+        self.session_turns
             .complete_turn(
                 persisted_turn.turn_id,
                 SessionTurnCompletion {
@@ -4772,8 +4800,7 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
-        let _ = self
-            .sessions
+        self.sessions
             .record_turn(session.session_id)
             .await
             .map_err(internal)?;
@@ -5161,15 +5188,13 @@ impl Kernel {
             return Ok(());
         }
 
-        let _ = self
-            .session_turns
+        self.session_turns
             .checkpoint_assistant_text(turn_id, &checkpoints.assistant_text)
             .await
             .map_err(internal)?;
         if stream_context.is_some() {
             if let Some(sequence) = checkpoints.last_answer_sequence {
-                let _ = self
-                    .channel_state
+                self.channel_state
                     .update_answer_checkpoint_sequence(turn_id, sequence)
                     .await
                     .map_err(internal)?;

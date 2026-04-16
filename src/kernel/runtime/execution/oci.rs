@@ -458,11 +458,24 @@ impl OciRuntimeSecretsCleanup {
         }
 
         std::thread::spawn(move || {
-            drop(
-                std::process::Command::new(&self.engine)
-                    .args(["secret", "rm", &self.secret_name])
-                    .status(),
-            );
+            match std::process::Command::new(&self.engine)
+                .args(["secret", "rm", &self.secret_name])
+                .status()
+            {
+                Ok(status) if status.success() => {}
+                Ok(status) => warn!(
+                    engine = %self.engine,
+                    secret_name = %self.secret_name,
+                    status = %status,
+                    "runtime secret cleanup command failed"
+                ),
+                Err(err) => warn!(
+                    ?err,
+                    engine = %self.engine,
+                    secret_name = %self.secret_name,
+                    "failed to run runtime secret cleanup command"
+                ),
+            }
         });
     }
 }

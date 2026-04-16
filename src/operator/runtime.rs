@@ -151,14 +151,13 @@ pub async fn validate_runtime_launch_prerequisites(
     .await
 }
 
-pub(crate) fn operator_codex_home_override(home: &LionClawHome) -> Result<Option<PathBuf>> {
+pub(crate) fn operator_codex_home_override(_home: &LionClawHome) -> Result<Option<PathBuf>> {
     #[cfg(test)]
     {
-        Ok(Some(home.root().join(".codex")))
+        Ok(Some(_home.root().join(".codex")))
     }
     #[cfg(not(test))]
     {
-        let _ = home;
         crate::config::resolve_optional_env_override_path("CODEX_HOME").map_err(Into::into)
     }
 }
