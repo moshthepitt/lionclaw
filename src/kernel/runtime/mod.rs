@@ -45,13 +45,7 @@ async fn validate_runtime_auth_prerequisites(
     match required_auth {
         RuntimeAuthKind::Codex => ensure_codex_host_auth_ready(codex_home_override)
             .await
-            .map_err(|err| {
-                anyhow!(
-                    "configured runtime profile '{}' requires {}",
-                    runtime_id,
-                    err
-                )
-            }),
+            .map_err(|err| anyhow!("configured runtime profile '{runtime_id}' requires {err}")),
     }
 }
 
@@ -197,13 +191,13 @@ pub trait RuntimeAdapter: Send + Sync {
     ) -> String {
         let code = output.exit_code.unwrap_or(1);
         if let Some(text) = observed_error_text.filter(|text| !text.trim().is_empty()) {
-            format!("runtime process exited with code {}: {}", code, text)
+            format!("runtime process exited with code {code}: {text}")
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if stderr.is_empty() {
-                format!("runtime process exited with code {}", code)
+                format!("runtime process exited with code {code}")
             } else {
-                format!("runtime process exited with code {}: {}", code, stderr)
+                format!("runtime process exited with code {code}: {stderr}")
             }
         }
     }
@@ -324,7 +318,7 @@ fn observe_program_output_line(
         if let RuntimeEvent::Error { text, .. } = &event {
             *last_error_text = Some(text.clone());
         }
-        let _ = events.send(event);
+        drop(events.send(event));
     }
 }
 
@@ -342,7 +336,7 @@ fn finish_program_backed_turn(
     }
 
     if !saw_done {
-        let _ = events.send(RuntimeEvent::Done);
+        drop(events.send(RuntimeEvent::Done));
     }
 
     Ok(RuntimeTurnResult {

@@ -450,8 +450,7 @@ pub async fn run() -> Result<()> {
                         })
                         .count();
                     println!(
-                        "started LionClaw services with runtime {} ({} channels)",
-                        runtime_id, managed_channels
+                        "started LionClaw services with runtime {runtime_id} ({managed_channels} channels)"
                     );
                 }
                 ServiceCommand::Down => {
@@ -489,7 +488,7 @@ pub async fn run() -> Result<()> {
                     .alias
                     .unwrap_or_else(|| derive_skill_alias(&args.source));
                 add_skill(&home, alias.clone(), args.source, args.reference).await?;
-                println!("registered skill {}", alias);
+                println!("registered skill {alias}");
             }
             SkillCommand::Rm(args) => {
                 let removed = remove_skill(&home, &args.alias).await?;
@@ -952,7 +951,7 @@ fn resolve_job_skill_ids(lockfile: &OperatorLockfile, requested: &[String]) -> R
 }
 
 fn parse_job_id(raw: &str) -> Result<uuid::Uuid> {
-    uuid::Uuid::parse_str(raw.trim()).map_err(|_| anyhow!("invalid job id '{}'", raw))
+    uuid::Uuid::parse_str(raw.trim()).map_err(|_| anyhow!("invalid job id '{raw}'"))
 }
 
 fn parse_job_schedule_spec(raw: &str, timezone: Option<&str>) -> Result<JobScheduleDto> {
@@ -999,22 +998,22 @@ fn parse_job_duration_ms(raw: &str) -> Result<u64> {
     let trimmed = raw.trim().to_ascii_lowercase();
     let split_at = trimmed
         .find(|ch: char| !ch.is_ascii_digit())
-        .ok_or_else(|| anyhow!("invalid duration '{}'", raw))?;
+        .ok_or_else(|| anyhow!("invalid duration '{raw}'"))?;
     let (number, unit) = trimmed.split_at(split_at);
     let value = number
         .parse::<u64>()
-        .map_err(|_| anyhow!("invalid duration '{}'", raw))?;
+        .map_err(|_| anyhow!("invalid duration '{raw}'"))?;
     let multiplier = match unit {
         "ms" => 1_u64,
         "s" | "sec" | "secs" | "second" | "seconds" => 1_000,
         "m" | "min" | "mins" | "minute" | "minutes" => 60_000,
         "h" | "hr" | "hrs" | "hour" | "hours" => 3_600_000,
         "d" | "day" | "days" => 86_400_000,
-        _ => return Err(anyhow!("invalid duration unit '{}'", raw)),
+        _ => return Err(anyhow!("invalid duration unit '{raw}'")),
     };
     value
         .checked_mul(multiplier)
-        .ok_or_else(|| anyhow!("duration '{}' is too large", raw))
+        .ok_or_else(|| anyhow!("duration '{raw}' is too large"))
 }
 
 fn build_runtime_profile(
@@ -1041,8 +1040,7 @@ fn build_runtime_profile(
             })
         }
         other => Err(anyhow!(
-            "unsupported runtime kind '{}'; expected 'codex' or 'opencode'",
-            other
+            "unsupported runtime kind '{other}'; expected 'codex' or 'opencode'"
         )),
     }
 }

@@ -176,9 +176,9 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
         .channels
         .iter()
         .find(|channel| channel.id == channel_id)
-        .ok_or_else(|| anyhow!("channel '{}' is not configured", channel_id))?;
+        .ok_or_else(|| anyhow!("channel '{channel_id}' is not configured"))?;
     if !channel.enabled {
-        return Err(anyhow!("channel '{}' is disabled", channel_id));
+        return Err(anyhow!("channel '{channel_id}' is disabled"));
     }
     if channel.launch_mode != ChannelLaunchMode::Interactive {
         return Err(anyhow!(
@@ -222,7 +222,7 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
         ("LIONCLAW_PEER_ID".to_string(), peer_id.clone()),
         (
             "LIONCLAW_CONSUMER_ID".to_string(),
-            format!("interactive:{}:{}:{}", channel_id, peer_id, attach_id),
+            format!("interactive:{channel_id}:{peer_id}:{attach_id}"),
         ),
         ("LIONCLAW_STREAM_START_MODE".to_string(), "tail".to_string()),
     ]);
@@ -677,10 +677,12 @@ mod tests {
             &bind_addr,
         )
         .await;
-        manager.set_unit_status(
-            crate::operator::services::DAEMON_UNIT_NAME,
-            "loaded/active/running",
-        );
+        manager
+            .set_unit_status(
+                crate::operator::services::DAEMON_UNIT_NAME,
+                "loaded/active/running",
+            )
+            .expect("set unit status");
 
         let spec = prepare_channel_attach(
             &home,
@@ -696,7 +698,9 @@ mod tests {
 
         assert!(spec.started_services, "stale daemon should be reconciled");
         assert!(
-            manager.was_restarted(crate::operator::services::DAEMON_UNIT_NAME),
+            manager
+                .was_restarted(crate::operator::services::DAEMON_UNIT_NAME)
+                .expect("read restart state"),
             "managed daemon should be restarted when config fingerprint changes"
         );
     }

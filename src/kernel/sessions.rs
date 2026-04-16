@@ -183,20 +183,20 @@ fn map_session_row(row: SqliteRow) -> Result<Session> {
     let turn_count_raw: i64 = row.get("turn_count");
 
     let session_id = Uuid::parse_str(&session_id_raw)
-        .with_context(|| format!("invalid uuid '{}'", session_id_raw))?;
-    let trust_tier = TrustTier::from_str(&trust_tier_raw)
-        .map_err(|err| anyhow!("invalid trust tier: {}", err))?;
+        .with_context(|| format!("invalid uuid '{session_id_raw}'"))?;
+    let trust_tier =
+        TrustTier::from_str(&trust_tier_raw).map_err(|err| anyhow!("invalid trust tier: {err}"))?;
     let history_policy = SessionHistoryPolicy::from_str(&history_policy_raw)
-        .map_err(|err| anyhow!("invalid history policy: {}", err))?;
+        .map_err(|err| anyhow!("invalid history policy: {err}"))?;
     let created_at = ms_to_datetime(created_at_ms)
-        .ok_or_else(|| anyhow!("invalid created_at_ms '{}'", created_at_ms))?;
+        .ok_or_else(|| anyhow!("invalid created_at_ms '{created_at_ms}'"))?;
     let last_activity_at = last_activity_at_ms
         .map(|value| {
-            ms_to_datetime(value).ok_or_else(|| anyhow!("invalid last_activity_at_ms '{}'", value))
+            ms_to_datetime(value).ok_or_else(|| anyhow!("invalid last_activity_at_ms '{value}'"))
         })
         .transpose()?;
     let turn_count = u64::try_from(turn_count_raw)
-        .with_context(|| format!("invalid turn_count '{}'", turn_count_raw))?;
+        .with_context(|| format!("invalid turn_count '{turn_count_raw}'"))?;
 
     Ok(Session {
         session_id,

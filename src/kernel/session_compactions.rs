@@ -157,7 +157,7 @@ impl SessionCompactionStore {
         rows.into_iter()
             .map(|raw| {
                 Uuid::parse_str(&raw)
-                    .with_context(|| format!("invalid session_id '{}' in session compactions", raw))
+                    .with_context(|| format!("invalid session_id '{raw}' in session compactions"))
             })
             .collect()
     }
@@ -208,23 +208,19 @@ fn map_compaction_row(row: SqliteRow) -> Result<SessionCompactionRecord> {
 
     Ok(SessionCompactionRecord {
         compaction_id: Uuid::parse_str(&compaction_id_raw)
-            .with_context(|| format!("invalid compaction_id '{}'", compaction_id_raw))?,
+            .with_context(|| format!("invalid compaction_id '{compaction_id_raw}'"))?,
         session_id: Uuid::parse_str(&session_id_raw)
-            .with_context(|| format!("invalid session_id '{}'", session_id_raw))?,
+            .with_context(|| format!("invalid session_id '{session_id_raw}'"))?,
         start_sequence_no: u64::try_from(start_sequence_no_raw)
-            .with_context(|| format!("invalid start_sequence_no '{}'", start_sequence_no_raw))?,
-        through_sequence_no: u64::try_from(through_sequence_no_raw).with_context(|| {
-            format!("invalid through_sequence_no '{}'", through_sequence_no_raw)
-        })?,
+            .with_context(|| format!("invalid start_sequence_no '{start_sequence_no_raw}'"))?,
+        through_sequence_no: u64::try_from(through_sequence_no_raw)
+            .with_context(|| format!("invalid through_sequence_no '{through_sequence_no_raw}'"))?,
         summary_text: row.get("summary_text"),
         summary_state: serde_json::from_str(&summary_state_json).with_context(|| {
-            format!(
-                "invalid session compaction summary_state_json '{}'",
-                summary_state_json
-            )
+            format!("invalid session compaction summary_state_json '{summary_state_json}'")
         })?,
         created_at: ms_to_datetime(created_at_ms)
-            .ok_or_else(|| anyhow!("invalid created_at_ms '{}'", created_at_ms))?,
+            .ok_or_else(|| anyhow!("invalid created_at_ms '{created_at_ms}'"))?,
     })
 }
 

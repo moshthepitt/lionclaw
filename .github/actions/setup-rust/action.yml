@@ -1,0 +1,15 @@
+name: Setup Rust
+description: Install the Rust toolchain declared by rust-toolchain.toml.
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      shell: bash
+      run: rustup toolchain install --component rustfmt --component clippy --no-self-update
+
+    - name: Show Rust toolchain
+      shell: bash
+      run: |
+        rustup show active-toolchain
+        rustc --version
+        cargo clippy --version

@@ -138,10 +138,7 @@ impl OperatorConfig {
     pub fn resolve_runtime_id(&self, requested: Option<&str>) -> Result<String> {
         if let Some(runtime_id) = requested.map(str::trim).filter(|value| !value.is_empty()) {
             if !self.runtimes.contains_key(runtime_id) {
-                return Err(anyhow!(
-                    "runtime profile '{}' is not configured",
-                    runtime_id
-                ));
+                return Err(anyhow!("runtime profile '{runtime_id}' is not configured"));
             }
             return Ok(runtime_id.to_string());
         }
@@ -165,7 +162,7 @@ impl OperatorConfig {
 
     pub fn set_default_runtime(&mut self, id: &str) -> Result<()> {
         if !self.runtimes.contains_key(id) {
-            return Err(anyhow!("runtime profile '{}' is not configured", id));
+            return Err(anyhow!("runtime profile '{id}' is not configured"));
         }
         self.defaults.runtime = Some(id.to_string());
         self.normalize();
@@ -174,7 +171,7 @@ impl OperatorConfig {
 
     pub fn set_default_preset(&mut self, id: &str) -> Result<()> {
         if !self.presets.contains_key(id) {
-            return Err(anyhow!("preset '{}' is not configured", id));
+            return Err(anyhow!("preset '{id}' is not configured"));
         }
         self.defaults.preset = Some(id.to_string());
         self.normalize();
@@ -220,9 +217,8 @@ impl OperatorConfig {
                 Some((id, runtime))
             })
             .collect();
-        self.skills
-            .sort_by(|left, right| left.alias.cmp(&right.alias));
-        self.channels.sort_by(|left, right| left.id.cmp(&right.id));
+        self.skills.sort_by_key(|skill| skill.alias.clone());
+        self.channels.sort_by_key(|channel| channel.id.clone());
         for channel in &mut self.channels {
             channel.required_env.sort();
             channel.required_env.dedup();
@@ -260,7 +256,7 @@ pub fn daemon_compat_fingerprint_with_runtime_context(
 ) -> String {
     let mut normalized = config.clone();
     normalized.normalize();
-    let encoded = serde_json::to_vec(&DaemonCompatConfig {
+    let encoded = compatibility_digest_bytes(&DaemonCompatConfig {
         version: 1,
         workspace_name: normalized.daemon.workspace.clone(),
         default_runtime_id: normalized.defaults.runtime.clone(),
@@ -269,8 +265,7 @@ pub fn daemon_compat_fingerprint_with_runtime_context(
         execution_presets: normalized.presets,
         runtime_profiles: normalized.runtimes,
         runtime_image_identities: runtime_image_identities.clone(),
-    })
-    .expect("daemon compatibility config should always serialize");
+    });
     daemon_compat_partition_key(&encoded)
 }
 
@@ -346,8 +341,7 @@ impl std::str::FromStr for ChannelLaunchMode {
             "service" => Ok(Self::Service),
             "interactive" => Ok(Self::Interactive),
             other => Err(format!(
-                "invalid channel launch mode '{}'; expected 'service' or 'interactive'",
-                other
+                "invalid channel launch mode '{other}'; expected 'service' or 'interactive'"
             )),
         }
     }
@@ -464,12 +458,11 @@ impl RuntimeProfileConfig {
     fn compatibility_base_key(&self, runtime_auth_identity: Option<&str>) -> String {
         let mut normalized = self.clone();
         normalized.normalize();
-        let encoded = serde_json::to_vec(&RuntimeCompatConfig {
+        let encoded = compatibility_digest_bytes(&RuntimeCompatConfig {
             version: 1,
             profile: normalized,
             runtime_auth_identity: runtime_auth_identity.map(str::to_string),
-        })
-        .expect("runtime profile config should always serialize");
+        });
         runtime_profile_partition_key(&encoded)
     }
 
@@ -529,6 +522,14 @@ impl RuntimeProfileConfig {
     }
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "compatibility digest structs contain only infallibly serializable fields"
+)]
+fn compatibility_digest_bytes<T: Serialize>(value: &T) -> Vec<u8> {
+    serde_json::to_vec(value).expect("compatibility digest inputs are infallibly serializable")
+}
+
 fn normalize_execution_preset(_preset: &mut ExecutionPreset) {}
 
 fn normalize_confinement_config(config: &mut ConfinementConfig) {
@@ -574,7 +575,7 @@ pub fn derive_skill_alias(source: &str) -> String {
 pub fn normalize_local_source(source: &str) -> Result<String> {
     let raw = source.strip_prefix("local:").unwrap_or(source);
     let absolute = std::fs::canonicalize(Path::new(raw))
-        .with_context(|| format!("failed to resolve source '{}'", source))?;
+        .with_context(|| format!("failed to resolve source '{source}'"))?;
     Ok(format!("local:{}", absolute.display()))
 }
 
@@ -605,7 +606,7 @@ pub fn normalize_host_executable(source: &str) -> Result<String> {
         normalize_executable_path(raw)?
     } else {
         which::which(raw)
-            .with_context(|| format!("failed to resolve host executable '{}'", source))?
+            .with_context(|| format!("failed to resolve host executable '{source}'"))?
     };
     validate_executable_path(&path)?;
     Ok(path.to_string_lossy().to_string())
@@ -649,8 +650,7 @@ pub fn validate_host_executable(source: &str) -> Result<()> {
 
     if !looks_like_path(raw) {
         return Err(anyhow!(
-            "host executable '{}' must be stored as an absolute or explicit path",
-            source
+            "host executable '{source}' must be stored as an absolute or explicit path"
         ));
     }
     validate_executable_path(&normalize_executable_path(raw)?)

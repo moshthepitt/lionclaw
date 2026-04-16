@@ -125,7 +125,7 @@ async fn listener_is_present(bind_addr: &str) -> bool {
 async fn get_json<T: DeserializeOwned>(bind_addr: &str, path: &str) -> Result<ProbeJsonResult<T>> {
     let uri: Uri = format!("http://{bind_addr}{path}")
         .parse()
-        .with_context(|| format!("invalid daemon probe URI for '{}{}'", bind_addr, path))?;
+        .with_context(|| format!("invalid daemon probe URI for '{bind_addr}{path}'"))?;
     let client = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
     let request = Request::builder()
         .method("GET")

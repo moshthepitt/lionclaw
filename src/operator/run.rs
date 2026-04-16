@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    io::{BufRead, Write},
+    io::{BufRead, BufReader, Write},
     path::Path,
 };
 
@@ -29,8 +29,8 @@ pub async fn run_local(
 ) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    let mut input = stdin.lock();
-    let mut output = stdout.lock();
+    let mut input = BufReader::new(stdin);
+    let mut output = stdout;
     run_local_with_io(
         home,
         requested_runtime,
@@ -41,7 +41,7 @@ pub async fn run_local(
     .await
 }
 
-pub(crate) async fn run_local_with_io<R: BufRead, W: Write>(
+pub(crate) async fn run_local_with_io<R: BufRead + Send, W: Write + Send>(
     home: &LionClawHome,
     requested_runtime: Option<String>,
     continue_last_session: bool,
@@ -57,7 +57,7 @@ pub(crate) async fn run_local_with_io<R: BufRead, W: Write>(
 
     let kernel = open_runtime_kernel(home, &applied.config, Some(runtime_id.clone())).await?;
     let project_workspace_root = resolve_project_workspace_root()
-        .map_err(|err| anyhow!("failed to resolve project workspace root: {}", err))?;
+        .map_err(|err| anyhow!("failed to resolve project workspace root: {err}"))?;
     let peer_id = local_peer_id_for_project(&project_workspace_root);
     run_repl(
         &kernel,
@@ -71,7 +71,7 @@ pub(crate) async fn run_local_with_io<R: BufRead, W: Write>(
     .await
 }
 
-async fn run_repl<R: BufRead, W: Write>(
+async fn run_repl<R: BufRead + Send, W: Write + Send>(
     kernel: &Kernel,
     runtime_id: &str,
     project_workspace_root: &str,
@@ -87,8 +87,7 @@ async fn run_repl<R: BufRead, W: Write>(
 
     writeln!(
         output,
-        "LionClaw interactive mode\nruntime: {}\nproject: {}\nType /continue, /retry, /reset, or /exit.\n",
-        runtime_id, project_workspace_root
+        "LionClaw interactive mode\nruntime: {runtime_id}\nproject: {project_workspace_root}\nType /continue, /retry, /reset, or /exit.\n"
     )?;
 
     if continue_last_session {
@@ -198,7 +197,7 @@ async fn resolve_repl_session(
         .await
 }
 
-async fn render_session_history<W: Write>(
+async fn render_session_history<W: Write + Send>(
     kernel: &Kernel,
     session_id: uuid::Uuid,
     output: &mut W,
@@ -223,7 +222,7 @@ async fn render_session_history<W: Write>(
     Ok(())
 }
 
-async fn render_session_action<W: Write>(
+async fn render_session_action<W: Write + Send>(
     kernel: &Kernel,
     session_id: uuid::Uuid,
     runtime_id: &str,
@@ -262,7 +261,7 @@ fn render_session_history_turn<W: Write>(turn: &SessionTurnView, output: &mut W)
         write_prefixed_lines(output, "lionclaw> ", &turn.assistant_text)?;
     }
     if let Some(error_text) = turn.error_text.as_deref() {
-        writeln!(output, "[error] {}", error_text)?;
+        writeln!(output, "[error] {error_text}")?;
     }
     Ok(())
 }
@@ -283,7 +282,7 @@ fn partial_history_marker(status: SessionTurnStatus) -> &'static str {
     }
 }
 
-async fn render_streaming_turn<W: Write>(
+async fn render_streaming_turn<W: Write + Send>(
     kernel: &Kernel,
     session_id: uuid::Uuid,
     runtime_id: &str,
@@ -310,7 +309,7 @@ async fn render_streaming_future<W, F>(
     output: &mut W,
 ) -> Result<()>
 where
-    W: Write,
+    W: Write + Send,
     F: Future<Output = Result<crate::contracts::SessionTurnResponse, crate::kernel::KernelError>>
         + Unpin,
 {
@@ -405,7 +404,7 @@ where
             }
         }
         if !error_seen {
-            writeln!(output, "error: {}", err)?;
+            writeln!(output, "error: {err}")?;
             output.flush()?;
         }
     }
@@ -451,14 +450,14 @@ fn render_turn_event<W: Write>(event: &StreamEventDto, output: &mut W) -> Result
             write_prefixed_lines(output, "thinking> ", text)?;
         }
         (StreamEventKindDto::Status, _, Some(text)) => {
-            writeln!(output, "[status] {}", text)?;
+            writeln!(output, "[status] {text}")?;
         }
         (StreamEventKindDto::Error, _, Some(text)) => {
-            writeln!(output, "[error] {}", text)?;
+            writeln!(output, "[error] {text}")?;
         }
         (StreamEventKindDto::Done, _, _) | (_, _, None) => {}
         (_, _, Some(text)) => {
-            writeln!(output, "{}", text)?;
+            writeln!(output, "{text}")?;
         }
     }
 
@@ -467,12 +466,12 @@ fn render_turn_event<W: Write>(event: &StreamEventDto, output: &mut W) -> Result
 
 fn write_prefixed_lines<W: Write>(output: &mut W, prefix: &str, text: &str) -> Result<()> {
     if text.is_empty() {
-        writeln!(output, "{}", prefix)?;
+        writeln!(output, "{prefix}")?;
         return Ok(());
     }
 
     for line in text.lines() {
-        writeln!(output, "{}{}", prefix, line)?;
+        writeln!(output, "{prefix}{line}")?;
     }
 
     Ok(())

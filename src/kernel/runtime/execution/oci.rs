@@ -22,10 +22,7 @@ use crate::kernel::runtime::RuntimeSecretsMount;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OciExecutionBackend;
 
-#[cfg(test)]
-const OCI_IMAGE_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
-#[cfg(not(test))]
-const OCI_IMAGE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const OCI_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 
 // LionClaw bind-mounts local workspace and runtime state into confined OCI
 // containers. On SELinux hosts those mounts are unreadable by default unless
@@ -60,10 +57,15 @@ impl ExecutionBackend for OciExecutionBackend {
     ) -> Result<ExecutionOutput> {
         let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
         let runtime_auth_environment = prepare_runtime_auth(&request).await?;
-        let prepared = prepare_oci_process_launch(&request)?;
+        let prepared = prepare_oci_process_launch(
+            &request,
+            runtime_secrets
+                .as_ref()
+                .map(|secrets| secrets.secret_name.as_str()),
+        )?;
         let invocation = build_oci_process_invocation(prepared, &runtime_auth_environment);
         let result = run_process_streaming(&invocation, move |line| {
-            let _ = stdout.send(line.to_string());
+            drop(stdout.send(line.to_string()));
             Ok(())
         })
         .await;
@@ -92,10 +94,7 @@ pub async fn validate_oci_launch_prerequisites(
     _required_auth: Option<RuntimeAuthKind>,
 ) -> Result<()> {
     let image = confinement.image.as_deref().ok_or_else(|| {
-        anyhow!(
-            "runtime '{}' requires a Podman runtime image in its confinement config",
-            runtime_id
-        )
+        anyhow!("runtime '{runtime_id}' requires a Podman runtime image in its confinement config")
     })?;
 
     // The runtime image is operator-managed, so launch preflight requires it to
@@ -104,10 +103,7 @@ pub async fn validate_oci_launch_prerequisites(
     ensure_oci_image_exists(
         &confinement.engine,
         image,
-        format!(
-            "configured runtime image '{}' for runtime '{}'",
-            image, runtime_id
-        ),
+        format!("configured runtime image '{image}' for runtime '{runtime_id}'"),
     )
     .await?;
 
@@ -129,8 +125,8 @@ pub async fn resolve_oci_image_compatibility_identity(engine: &str, image: &str)
             environment: Vec::new(),
             input: String::new(),
         },
-        &format!("resolve OCI image identity for '{}'", image),
-        OCI_IMAGE_PROBE_TIMEOUT,
+        &format!("resolve OCI image identity for '{image}'"),
+        OCI_PREFLIGHT_TIMEOUT,
     )
     .await?;
 
@@ -143,25 +139,21 @@ pub async fn resolve_oci_image_compatibility_identity(engine: &str, image: &str)
                 output.exit_code
             );
         }
-        bail!(
-            "failed to resolve OCI image identity for '{}': {}",
-            image,
-            stderr
-        );
+        bail!("failed to resolve OCI image identity for '{image}': {stderr}");
     }
 
     let identity = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if identity.is_empty() {
-        bail!(
-            "failed to resolve OCI image identity for '{}': empty OCI inspect output",
-            image
-        );
+        bail!("failed to resolve OCI image identity for '{image}': empty OCI inspect output");
     }
 
     Ok(identity)
 }
 
-fn prepare_oci_process_launch(request: &ExecutionRequest) -> Result<PreparedOciProcessLaunch> {
+fn prepare_oci_process_launch(
+    request: &ExecutionRequest,
+    runtime_secret_name: Option<&str>,
+) -> Result<PreparedOciProcessLaunch> {
     let config = request.plan.confinement.oci();
     let image = config.image.as_deref().ok_or_else(|| {
         anyhow!(
@@ -207,9 +199,18 @@ fn prepare_oci_process_launch(request: &ExecutionRequest) -> Result<PreparedOciP
 
     let environment = merged_environment(&request.plan.environment, &request.program.environment);
 
-    if let Some(runtime_secrets_mount) = &request.runtime_secrets_mount {
-        args.push("--secret".to_string());
-        args.push(runtime_secrets_mount.mounted_name());
+    match (&request.runtime_secrets_mount, runtime_secret_name) {
+        (Some(_), Some(secret_name)) => {
+            args.push("--secret".to_string());
+            args.push(secret_name.to_string());
+        }
+        (Some(_), None) => {
+            bail!("runtime secrets mount requires a registered OCI secret name");
+        }
+        (None, Some(_)) => {
+            bail!("registered OCI secret name provided without a runtime secrets mount");
+        }
+        (None, None) => {}
     }
 
     if let Some(memory_limit) = config.limits.memory_limit.as_deref() {
@@ -257,8 +258,7 @@ async fn ensure_oci_image_exists(engine: &str, image: &str, description: String)
     match run_oci_image_probe(engine, image).await? {
         OciImageProbeResult::Present => Ok(()),
         OciImageProbeResult::Missing => bail!(
-            "{} is not available locally; build or pull it before running LionClaw",
-            description
+            "{description} is not available locally; build or pull it before running LionClaw"
         ),
     }
 }
@@ -278,8 +278,8 @@ async fn run_oci_image_probe(engine: &str, image: &str) -> Result<OciImageProbeR
             environment: Vec::new(),
             input: String::new(),
         },
-        &format!("inspect OCI image '{}'", image),
-        OCI_IMAGE_PROBE_TIMEOUT,
+        &format!("inspect OCI image '{image}'"),
+        OCI_PREFLIGHT_TIMEOUT,
     )
     .await?;
 
@@ -295,7 +295,7 @@ async fn run_oci_image_probe(engine: &str, image: &str) -> Result<OciImageProbeR
                     output.exit_code
                 );
             }
-            bail!("failed to inspect OCI image '{}': {}", image, stderr);
+            bail!("failed to inspect OCI image '{image}': {stderr}");
         }
     }
 }
@@ -372,8 +372,9 @@ async fn ensure_runtime_secrets_registered(
         return Ok(None);
     };
     let engine = request.plan.confinement.oci().engine.clone();
+    let secret_name = mount.fresh_mounted_name();
     let output = run_process_streaming(
-        &build_runtime_secret_create_invocation(&engine, mount)?,
+        &build_runtime_secret_create_invocation(&engine, mount, &secret_name)?,
         |_| Ok(()),
     )
     .await
@@ -386,9 +387,10 @@ async fn ensure_runtime_secrets_registered(
 
     if output.success() {
         return Ok(Some(OciRuntimeSecretsSession {
+            secret_name: secret_name.clone(),
             cleanup: Some(OciRuntimeSecretsCleanup {
                 engine,
-                secret_name: mount.mounted_name(),
+                secret_name,
             }),
         }));
     }
@@ -401,7 +403,7 @@ async fn ensure_runtime_secrets_registered(
         );
     }
 
-    bail!("failed to register OCI runtime secrets: {}", stderr)
+    bail!("failed to register OCI runtime secrets: {stderr}")
 }
 
 #[derive(Debug)]
@@ -412,6 +414,7 @@ struct OciRuntimeSecretsCleanup {
 
 #[derive(Debug)]
 struct OciRuntimeSecretsSession {
+    secret_name: String,
     cleanup: Option<OciRuntimeSecretsCleanup>,
 }
 
@@ -437,7 +440,7 @@ impl OciRuntimeSecretsCleanup {
         let output = run_oci_preflight_command(
             &build_runtime_secret_remove_invocation(&self.engine, &self.secret_name),
             &format!("remove OCI runtime secret '{}'", self.secret_name),
-            OCI_IMAGE_PROBE_TIMEOUT,
+            OCI_PREFLIGHT_TIMEOUT,
         )
         .await?;
 
@@ -464,15 +467,32 @@ impl OciRuntimeSecretsCleanup {
     fn spawn(self) {
         if let Ok(handle) = Handle::try_current() {
             handle.spawn(async move {
-                let _ = self.shutdown().await;
+                if let Err(err) = self.shutdown().await {
+                    warn!(?err, "failed to clean up runtime secrets");
+                }
             });
             return;
         }
 
         std::thread::spawn(move || {
-            let _ = std::process::Command::new(&self.engine)
+            match std::process::Command::new(&self.engine)
                 .args(["secret", "rm", &self.secret_name])
-                .status();
+                .status()
+            {
+                Ok(status) if status.success() => {}
+                Ok(status) => warn!(
+                    engine = %self.engine,
+                    secret_name = %self.secret_name,
+                    status = %status,
+                    "runtime secret cleanup command failed"
+                ),
+                Err(err) => warn!(
+                    ?err,
+                    engine = %self.engine,
+                    secret_name = %self.secret_name,
+                    "failed to run runtime secret cleanup command"
+                ),
+            }
         });
     }
 }
@@ -480,14 +500,14 @@ impl OciRuntimeSecretsCleanup {
 fn build_runtime_secret_create_invocation(
     engine: &str,
     mount: &RuntimeSecretsMount,
+    secret_name: &str,
 ) -> Result<ProcessInvocation> {
     Ok(ProcessInvocation {
         executable: engine.to_string(),
         args: vec![
             "secret".to_string(),
             "create".to_string(),
-            "--replace".to_string(),
-            mount.mounted_name(),
+            secret_name.to_string(),
             path_to_arg(&mount.source)?,
         ],
         working_dir: None,
@@ -610,7 +630,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{build_oci_process_invocation, prepare_oci_process_launch, OciExecutionBackend};
-    use crate::kernel::runtime::execution::backend::ExecutionBackend;
+    use crate::kernel::runtime::execution::backend::{
+        ExecutionBackend, RUNTIME_SECRETS_NAME_PREFIX,
+    };
     use crate::kernel::runtime::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionRequest, NetworkMode,
         OciConfinementConfig, RuntimeProgramSpec, RuntimeSecretsMount, WorkspaceAccess,
@@ -638,8 +660,13 @@ mod tests {
             codex_home_override: None,
         };
 
+        let secret_name = request
+            .runtime_secrets_mount
+            .as_ref()
+            .expect("runtime secrets mount")
+            .mounted_name();
         let invocation = build_oci_process_invocation(
-            prepare_oci_process_launch(&request).expect("prepare"),
+            prepare_oci_process_launch(&request, Some(&secret_name)).expect("prepare"),
             &[],
         );
 
@@ -762,7 +789,7 @@ mod tests {
         };
 
         let invocation = build_oci_process_invocation(
-            prepare_oci_process_launch(&request).expect("prepare"),
+            prepare_oci_process_launch(&request, None).expect("prepare"),
             &[],
         );
 
@@ -782,7 +809,7 @@ mod tests {
         };
 
         let invocation = build_oci_process_invocation(
-            prepare_oci_process_launch(&request).expect("prepare"),
+            prepare_oci_process_launch(&request, None).expect("prepare"),
             &[],
         );
 
@@ -808,7 +835,7 @@ mod tests {
         };
 
         let invocation = build_oci_process_invocation(
-            prepare_oci_process_launch(&request).expect("prepare"),
+            prepare_oci_process_launch(&request, None).expect("prepare"),
             &[("CODEX_HOME".to_string(), "/runtime/home/.codex".to_string())],
         );
 
@@ -839,12 +866,15 @@ mod tests {
         let mut plan = sample_plan();
         plan.confinement.oci_mut().image = None;
 
-        let err = prepare_oci_process_launch(&ExecutionRequest {
-            plan,
-            program: RuntimeProgramSpec::default(),
-            runtime_secrets_mount: None,
-            codex_home_override: None,
-        })
+        let err = prepare_oci_process_launch(
+            &ExecutionRequest {
+                plan,
+                program: RuntimeProgramSpec::default(),
+                runtime_secrets_mount: None,
+                codex_home_override: None,
+            },
+            None,
+        )
         .expect_err("missing image should fail");
 
         assert!(err.to_string().contains("requires a Podman runtime image"));
@@ -855,12 +885,15 @@ mod tests {
         let mut plan = sample_plan();
         plan.working_dir = Some("/outside".to_string());
 
-        let err = prepare_oci_process_launch(&ExecutionRequest {
-            plan,
-            program: RuntimeProgramSpec::default(),
-            runtime_secrets_mount: None,
-            codex_home_override: None,
-        })
+        let err = prepare_oci_process_launch(
+            &ExecutionRequest {
+                plan,
+                program: RuntimeProgramSpec::default(),
+                runtime_secrets_mount: None,
+                codex_home_override: None,
+            },
+            None,
+        )
         .expect_err("working dir should fail");
 
         assert!(err
@@ -937,17 +970,28 @@ esac
             .expect("execute");
 
         let log = fs::read_to_string(&log_path).expect("read log");
-        let secret_name = request
-            .runtime_secrets_mount
-            .as_ref()
-            .expect("mount")
-            .mounted_name();
+        let create_line = log
+            .lines()
+            .find(|line| line.starts_with("secret create "))
+            .expect("secret create should be logged");
         assert!(
-            log.contains(&format!("secret create --replace {}", secret_name)),
-            "secret create should be logged: {log}"
+            !create_line.contains("--replace"),
+            "secret create should be compatible with old Podman versions: {log}"
+        );
+        let secret_name = create_line
+            .split_whitespace()
+            .nth(2)
+            .expect("secret name in create command");
+        assert!(
+            secret_name.starts_with(RUNTIME_SECRETS_NAME_PREFIX),
+            "secret name should be LionClaw-managed: {log}"
         );
         assert!(
-            log.contains(&format!("secret rm {}", secret_name)),
+            log.contains(&format!("--secret {secret_name}")),
+            "run should mount the created secret: {log}"
+        );
+        assert!(
+            log.contains(&format!("secret rm {secret_name}")),
             "secret remove should be logged: {log}"
         );
     }
@@ -1024,7 +1068,7 @@ esac
             .expect("mount")
             .mounted_name();
         assert!(
-            log.contains(&format!("secret rm {}", secret_name)),
+            log.contains(&format!("secret rm {secret_name}")),
             "secret remove should still be attempted: {log}"
         );
     }

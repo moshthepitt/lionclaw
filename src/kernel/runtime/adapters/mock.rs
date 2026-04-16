@@ -43,10 +43,10 @@ impl RuntimeAdapter for MockRuntimeAdapter {
         input: RuntimeTurnInput,
         events: RuntimeEventSender,
     ) -> Result<RuntimeTurnResult> {
-        let _ = events.send(RuntimeEvent::Status {
+        drop(events.send(RuntimeEvent::Status {
             code: None,
             text: "mock runtime started turn".to_string(),
-        });
+        }));
 
         let skill_context = if input.selected_skills.is_empty() {
             "no skill context selected".to_string()
@@ -54,10 +54,10 @@ impl RuntimeAdapter for MockRuntimeAdapter {
             format!("selected skills: {}", input.selected_skills.join(", "))
         };
 
-        let _ = events.send(RuntimeEvent::MessageDelta {
+        drop(events.send(RuntimeEvent::MessageDelta {
             lane: RuntimeMessageLane::Answer,
             text: format!("[mock] {} | prompt: {}", skill_context, input.prompt),
-        });
+        }));
 
         let mut capability_requests = Vec::new();
         if let Some(skill_id) = input.selected_skills.first() {
@@ -76,15 +76,15 @@ impl RuntimeAdapter for MockRuntimeAdapter {
         }
 
         if capability_requests.is_empty() {
-            let _ = events.send(RuntimeEvent::Done);
+            drop(events.send(RuntimeEvent::Done));
         } else {
-            let _ = events.send(RuntimeEvent::Status {
+            drop(events.send(RuntimeEvent::Status {
                 code: None,
                 text: format!(
                     "mock runtime requested {} capability checks",
                     capability_requests.len()
                 ),
-            });
+            }));
         }
 
         Ok(RuntimeTurnResult {
@@ -100,18 +100,18 @@ impl RuntimeAdapter for MockRuntimeAdapter {
     ) -> Result<()> {
         for result in results {
             let verdict = if result.allowed { "granted" } else { "denied" };
-            let _ = events.send(RuntimeEvent::Status {
+            drop(events.send(RuntimeEvent::Status {
                 code: None,
                 text: format!("capability:{}:{}", result.request_id, verdict),
-            });
+            }));
             if let Some(reason) = result.reason {
-                let _ = events.send(RuntimeEvent::Status {
+                drop(events.send(RuntimeEvent::Status {
                     code: None,
                     text: format!("capability:{}:reason:{}", result.request_id, reason),
-                });
+                }));
             }
         }
-        let _ = events.send(RuntimeEvent::Done);
+        drop(events.send(RuntimeEvent::Done));
         Ok(())
     }
 

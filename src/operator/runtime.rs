@@ -125,14 +125,10 @@ pub fn validate_configured_runtimes(config: &OperatorConfig) -> Result<()> {
 pub fn validate_runtime_availability(config: &OperatorConfig, runtime_id: &str) -> Result<()> {
     let profile = config
         .runtime(runtime_id)
-        .ok_or_else(|| anyhow!("runtime profile '{}' is not configured", runtime_id))?;
-    profile.validate().map_err(|err| {
-        anyhow!(
-            "configured runtime profile '{}' is invalid: {}",
-            runtime_id,
-            err
-        )
-    })?;
+        .ok_or_else(|| anyhow!("runtime profile '{runtime_id}' is not configured"))?;
+    profile
+        .validate()
+        .map_err(|err| anyhow!("configured runtime profile '{runtime_id}' is invalid: {err}"))?;
     Ok(())
 }
 
@@ -144,7 +140,7 @@ pub async fn validate_runtime_launch_prerequisites(
     validate_runtime_availability(config, runtime_id)?;
     let profile = config
         .runtime(runtime_id)
-        .ok_or_else(|| anyhow!("runtime profile '{}' is not configured", runtime_id))?;
+        .ok_or_else(|| anyhow!("runtime profile '{runtime_id}' is not configured"))?;
     let codex_home_override = operator_codex_home_override(home)?;
     validate_kernel_runtime_launch_prerequisites(
         runtime_id,
@@ -155,14 +151,13 @@ pub async fn validate_runtime_launch_prerequisites(
     .await
 }
 
-pub(crate) fn operator_codex_home_override(home: &LionClawHome) -> Result<Option<PathBuf>> {
+pub(crate) fn operator_codex_home_override(_home: &LionClawHome) -> Result<Option<PathBuf>> {
     #[cfg(test)]
     {
-        Ok(Some(home.root().join(".codex")))
+        Ok(Some(_home.root().join(".codex")))
     }
     #[cfg(not(test))]
     {
-        let _ = home;
         crate::config::resolve_optional_env_override_path("CODEX_HOME").map_err(Into::into)
     }
 }
@@ -186,9 +181,7 @@ async fn resolve_runtime_image_identities(
         .await
         .map_err(|err| {
             anyhow!(
-                "failed to resolve local OCI image identity for runtime '{}': {}",
-                selected_runtime_id,
-                err
+                "failed to resolve local OCI image identity for runtime '{selected_runtime_id}': {err}"
             )
         })?;
     identities.insert(selected_runtime_id.to_string(), identity);

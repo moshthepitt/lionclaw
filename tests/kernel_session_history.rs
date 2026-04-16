@@ -1280,7 +1280,6 @@ impl RuntimeAdapter for ResumableCaptureAdapter {
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_state_root = input
             .runtime_state_root
-            .clone()
             .expect("runtime state root should be provided");
         let resumes_existing_session = runtime_state_root
             .join(RUNTIME_SESSION_READY_MARKER)
@@ -1346,7 +1345,6 @@ impl RuntimeAdapter for ResumableFlakyAdapter {
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_state_root = input
             .runtime_state_root
-            .clone()
             .expect("runtime state root should be provided");
         let resumes_existing_session = runtime_state_root
             .join(RUNTIME_SESSION_READY_MARKER)
@@ -1420,7 +1418,6 @@ impl RuntimeAdapter for ResumeAfterFailureAdapter {
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_state_root = input
             .runtime_state_root
-            .clone()
             .expect("runtime state root should be provided");
         let resumes_existing_session = runtime_state_root
             .join(RUNTIME_SESSION_READY_MARKER)

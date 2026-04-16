@@ -4,6 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use super::oci::OciExecutionBackend;
 use super::plan::{ConfinementBackend, EffectiveExecutionPlan, RuntimeProgramSpec};
@@ -23,6 +24,12 @@ impl RuntimeSecretsMount {
             RUNTIME_SECRETS_NAME_PREFIX,
             &hex::encode(digest)[..12]
         )
+    }
+
+    pub fn fresh_mounted_name(&self) -> String {
+        let stable_name = self.mounted_name();
+        let nonce = Uuid::new_v4().simple().to_string();
+        format!("{}-{}", stable_name, &nonce[..12])
     }
 }
 
@@ -145,5 +152,21 @@ mod tests {
         assert!(mount
             .mounted_name()
             .starts_with(RUNTIME_SECRETS_NAME_PREFIX));
+    }
+
+    #[test]
+    fn runtime_secrets_fresh_mount_name_preserves_prefix_and_avoids_reuse() {
+        let mount = RuntimeSecretsMount {
+            source: "/tmp/home-a/config/runtime-secrets.env".into(),
+        };
+
+        let first = mount.fresh_mounted_name();
+        let second = mount.fresh_mounted_name();
+
+        assert_ne!(first, second);
+        assert!(first.starts_with(RUNTIME_SECRETS_NAME_PREFIX));
+        assert!(second.starts_with(RUNTIME_SECRETS_NAME_PREFIX));
+        assert!(first.starts_with(&mount.mounted_name()));
+        assert!(second.starts_with(&mount.mounted_name()));
     }
 }

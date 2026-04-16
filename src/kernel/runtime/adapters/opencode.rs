@@ -128,9 +128,9 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
             .or(stderr_detail);
 
         if let Some(detail) = detail {
-            format!("opencode run exited with code {}: {}", code, detail)
+            format!("opencode run exited with code {code}: {detail}")
         } else {
-            format!("opencode run exited with code {}", code)
+            format!("opencode run exited with code {code}")
         }
     }
 
@@ -145,7 +145,7 @@ impl RuntimeAdapter for OpenCodeRuntimeAdapter {
                 "opencode adapter does not support runtime-side capability request resolution"
             ));
         }
-        let _ = events.send(RuntimeEvent::Done);
+        drop(events.send(RuntimeEvent::Done));
         Ok(())
     }
 
@@ -201,7 +201,7 @@ fn get_runtime_session(
         .map_err(|_| anyhow!("opencode runtime session state lock poisoned"))?
         .get(runtime_session_id)
         .copied()
-        .ok_or_else(|| anyhow!("runtime session '{}' not found", runtime_session_id))
+        .ok_or_else(|| anyhow!("runtime session '{runtime_session_id}' not found"))
 }
 
 fn runtime_session_is_ready(root: &Path) -> Result<bool> {
@@ -248,7 +248,7 @@ fn parse_opencode_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
     if let Some(message) = extract_error_message(json) {
         events.push(RuntimeEvent::Error {
             code: Some("runtime.error".to_string()),
-            text: format!("opencode: {}", message),
+            text: format!("opencode: {message}"),
         });
         return;
     }
@@ -377,7 +377,7 @@ fn describe_opencode_status(json: &Value) -> Option<String> {
         return None;
     }
 
-    Some(format!("opencode event: {}", event_type))
+    Some(format!("opencode event: {event_type}"))
 }
 
 fn collect_texts(value: &Value) -> Vec<String> {
@@ -446,7 +446,7 @@ mod tests {
 
         let program = adapter
             .build_turn_program(&RuntimeTurnInput {
-                runtime_session_id: handle.runtime_session_id.clone(),
+                runtime_session_id: handle.runtime_session_id,
                 prompt: "hello".to_string(),
                 selected_skills: Vec::new(),
             })

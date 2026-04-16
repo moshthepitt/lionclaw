@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     api::build_router,
@@ -72,7 +72,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .await?,
     );
     register_configured_runtimes(&kernel, &operator_config).await?;
-    let scheduler_kernel = kernel.clone();
+    let scheduler_kernel = Arc::clone(&kernel);
     tokio::spawn(async move {
         scheduler_kernel.run_scheduler_loop().await;
     });
@@ -115,5 +115,7 @@ pub fn init_tracing() {
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        warn!(?err, "failed to listen for shutdown signal");
+    }
 }

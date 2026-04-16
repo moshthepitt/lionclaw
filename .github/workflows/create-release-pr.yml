@@ -34,9 +34,7 @@ jobs:
           fetch-depth: 0
           ref: main
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt,clippy
+      - uses: ./.github/actions/setup-rust
 
       - name: Verify main before bumping
         run: bash ./scripts/ci.sh

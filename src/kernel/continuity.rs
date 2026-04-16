@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     collections::BTreeSet,
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -229,13 +230,17 @@ impl ContinuityLayout {
     }
 
     async fn fs(&self) -> Result<Arc<ContinuityFs>> {
-        let mut guard = self.fs.lock().await;
-        if guard.is_none() {
-            *guard = Some(Arc::new(ContinuityFs::bootstrap(&self.workspace_root)?));
-        }
-        Ok(Arc::clone(
-            guard.as_ref().expect("continuity fs initialized"),
-        ))
+        let fs = {
+            let mut guard = self.fs.lock().await;
+            if let Some(fs) = guard.as_ref() {
+                return Ok(Arc::clone(fs));
+            }
+
+            let fs = Arc::new(ContinuityFs::bootstrap(&self.workspace_root)?);
+            *guard = Some(Arc::clone(&fs));
+            fs
+        };
+        Ok(fs)
     }
 
     pub async fn ensure_base_layout(&self) -> Result<()> {
@@ -304,7 +309,7 @@ impl ContinuityLayout {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            content.push_str(&format!("- Summary: {}\n", summary));
+            content.push_str(&format!("- Summary: {summary}\n"));
         }
         if let Some(source) = artifact
             .source
@@ -312,7 +317,7 @@ impl ContinuityLayout {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            content.push_str(&format!("- Source: {}\n", source));
+            content.push_str(&format!("- Source: {source}\n"));
         }
         content.push_str("\n## Body\n\n");
         content.push_str(artifact.body.trim());
@@ -327,7 +332,7 @@ impl ContinuityLayout {
         let file_name = Path::new(file_name)
             .file_name()
             .and_then(|value| value.to_str())
-            .ok_or_else(|| anyhow!("artifact file name '{}' is invalid", file_name))?;
+            .ok_or_else(|| anyhow!("artifact file name '{file_name}' is invalid"))?;
         let at = Utc::now();
         let relative = self
             .artifacts_rel_dir()
@@ -373,7 +378,7 @@ impl ContinuityLayout {
         let updated_at = Utc::now();
         let mut content = format!("# {}\n\n", loop_draft.title.trim());
         content.push_str("- Status: open\n");
-        content.push_str(&format!("- Key: {}\n", cleanup_key));
+        content.push_str(&format!("- Key: {cleanup_key}\n"));
         content.push_str(&format!("- Updated: {} UTC\n", updated_at.to_rfc3339()));
         if let Some(source) = loop_draft
             .source
@@ -381,7 +386,7 @@ impl ContinuityLayout {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            content.push_str(&format!("- Source: {}\n", source));
+            content.push_str(&format!("- Source: {source}\n"));
         }
         if !loop_draft.summary.trim().is_empty() {
             content.push_str(&format!("- Summary: {}\n", loop_draft.summary.trim()));
@@ -444,7 +449,7 @@ impl ContinuityLayout {
 
         let mut content = format!("# Memory Proposal: {}\n\n", proposal.title.trim());
         content.push_str("- Status: proposed\n");
-        content.push_str(&format!("- Key: {}\n", cleanup_key));
+        content.push_str(&format!("- Key: {cleanup_key}\n"));
         content.push_str(&format!("- Proposed: {} UTC\n", Utc::now().to_rfc3339()));
         if let Some(source) = proposal
             .source
@@ -452,14 +457,14 @@ impl ContinuityLayout {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            content.push_str(&format!("- Source: {}\n", source));
+            content.push_str(&format!("- Source: {source}\n"));
         }
         if !proposal.rationale.trim().is_empty() {
             content.push_str(&format!("- Rationale: {}\n", proposal.rationale.trim()));
         }
         content.push_str("\n## Candidate Entries\n");
         for entry in &entries {
-            content.push_str(&format!("- {}\n", entry));
+            content.push_str(&format!("- {entry}\n"));
         }
         content.push('\n');
 
@@ -846,12 +851,12 @@ impl ContinuityLayout {
                 Component::Normal(value) => normalized.push(value),
                 Component::CurDir => {}
                 Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                    bail!("continuity path '{}' is invalid", trimmed);
+                    bail!("continuity path '{trimmed}' is invalid");
                 }
             }
         }
         if normalized.as_os_str().is_empty() {
-            bail!("continuity path '{}' is invalid", trimmed);
+            bail!("continuity path '{trimmed}' is invalid");
         }
         Ok(normalized)
     }
@@ -861,10 +866,7 @@ impl ContinuityLayout {
         if path == self.memory_rel_path() || path.starts_with(self.continuity_rel_dir()) {
             Ok(path)
         } else {
-            bail!(
-                "continuity path '{}' is outside canonical continuity files",
-                relative_path
-            );
+            bail!("continuity path '{relative_path}' is outside canonical continuity files");
         }
     }
 
@@ -906,7 +908,7 @@ impl ContinuityLayout {
             content.push('\n');
         }
         for entry in new_entries {
-            content.push_str(&format!("- {}\n", entry));
+            content.push_str(&format!("- {entry}\n"));
         }
         fs.write_string(&path, &content)
     }
@@ -940,7 +942,7 @@ impl ContinuityLayout {
                 Err(err) => return Err(err),
             }
         }
-        dated.sort_by(|left, right| right.cmp(left));
+        dated.sort_by_key(|entry| Reverse(entry.clone()));
         Ok(dated.into_iter().map(|(_, path)| path).collect())
     }
 }
@@ -949,7 +951,7 @@ fn push_list_section(sections: &mut Vec<String>, title: &str, items: &[String]) 
     if items.is_empty() {
         return;
     }
-    let mut body = format!("## {}", title);
+    let mut body = format!("## {title}");
     for item in items {
         body.push_str(&format!("\n- {}", item.trim()));
     }
@@ -966,7 +968,7 @@ fn extract_heading(content: &str) -> Option<String> {
 }
 
 fn metadata_value(content: &str, key: &str) -> Option<String> {
-    let prefix = format!("- {}:", key);
+    let prefix = format!("- {key}:");
     content
         .lines()
         .map(str::trim)
@@ -977,7 +979,7 @@ fn metadata_value(content: &str, key: &str) -> Option<String> {
 }
 
 fn bullet_section(content: &str, title: &str) -> Vec<String> {
-    let marker = format!("## {}", title);
+    let marker = format!("## {title}");
     let Some((_, tail)) = content.split_once(&marker) else {
         return Vec::new();
     };
@@ -1095,7 +1097,7 @@ pub(crate) fn title_file_name(title: &str) -> String {
         &Uuid::from_u128(0x5f026ae9551b4d3ea511f0f2d74cf241),
         normalized.as_bytes(),
     );
-    format!("{}--{}.md", slug, key)
+    format!("{slug}--{key}.md")
 }
 
 fn archive_file_name(source: &Path) -> Result<String> {
@@ -1189,7 +1191,15 @@ fn snippet_from_source_window(
     let window_start = start_char.saturating_sub(context_chars);
     let window_end = (end_char + context_chars).min(boundaries.len() - 1);
 
-    content[boundaries[window_start]..boundaries[window_end]]
+    let Some(&start_byte) = boundaries.get(window_start) else {
+        return String::new();
+    };
+    let Some(&end_byte) = boundaries.get(window_end) else {
+        return String::new();
+    };
+    content
+        .get(start_byte..end_byte)
+        .unwrap_or_default()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -1224,8 +1234,8 @@ fn replace_or_insert_metadata(
         .position(|line| line.trim().starts_with("## "))
         .unwrap_or(lines.len());
     let trailing_sections = lines.split_off(section_start);
-    let primary_prefix = format!("- {}:", primary_key);
-    let secondary_prefix = format!("- {}:", secondary_key);
+    let primary_prefix = format!("- {primary_key}:");
+    let secondary_prefix = format!("- {secondary_key}:");
     let mut metadata = Vec::with_capacity(lines.len() + 2);
     for line in lines {
         let trimmed = line.trim();
@@ -1234,8 +1244,8 @@ fn replace_or_insert_metadata(
         }
         metadata.push(line);
     }
-    metadata.push(format!("- {}: {}", primary_key, primary_value));
-    metadata.push(format!("- {}: {}", secondary_key, secondary_value));
+    metadata.push(format!("- {primary_key}: {primary_value}"));
+    metadata.push(format!("- {secondary_key}: {secondary_value}"));
     metadata.extend(trailing_sections);
 
     let mut rendered = metadata.join("\n");

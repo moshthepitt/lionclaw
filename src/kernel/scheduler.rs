@@ -5,6 +5,7 @@ use anyhow::anyhow;
 use chrono::Utc;
 use serde_json::json;
 use tokio::{sync::oneshot, time::sleep};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::contracts::{JobTickResponse, SessionHistoryPolicy, SessionOpenRequest, TrustTier};
@@ -79,7 +80,7 @@ impl SchedulerEngine {
     pub async fn run_loop(&self, kernel: Arc<Kernel>) {
         loop {
             if let Err(err) = self.tick(&kernel).await {
-                let _ = kernel
+                if let Err(audit_err) = kernel
                     .audit_log()
                     .append(
                         "scheduler.tick.failed",
@@ -87,7 +88,14 @@ impl SchedulerEngine {
                         Some("kernel".to_string()),
                         json!({"error": err.to_string()}),
                     )
-                    .await;
+                    .await
+                {
+                    warn!(
+                        ?audit_err,
+                        ?err,
+                        "failed to append scheduler tick failure audit event"
+                    );
+                }
             }
             sleep(self.config.tick_interval).await;
         }
@@ -134,14 +142,17 @@ impl SchedulerEngine {
                 }
                 Ok(AttemptOutcome::Finished(result)) => return Ok(*result),
                 Err(err) => {
-                    let _ = kernel
+                    if let Err(interrupt_err) = kernel
                         .job_store()
                         .interrupt_run(
                             current_run.run_id,
                             &format!("scheduled job execution failed unexpectedly: {err}"),
                         )
-                        .await;
-                    let _ = kernel
+                        .await
+                    {
+                        warn!(?interrupt_err, run_id = %current_run.run_id, "failed to interrupt failed scheduled job run");
+                    }
+                    if let Err(audit_err) = kernel
                         .audit_log()
                         .append(
                             "job.run.execution_failed",
@@ -153,7 +164,10 @@ impl SchedulerEngine {
                                 "error": err.to_string(),
                             }),
                         )
-                        .await;
+                        .await
+                    {
+                        warn!(?audit_err, run_id = %current_run.run_id, "failed to append scheduled job execution failure audit event");
+                    }
                     return Err(err);
                 }
             }
@@ -174,7 +188,7 @@ impl SchedulerEngine {
         else {
             return Ok(None);
         };
-        let _ = kernel
+        if let Err(err) = kernel
             .audit_log()
             .append(
                 "job.run.claimed",
@@ -186,7 +200,10 @@ impl SchedulerEngine {
                     "trigger_kind": claimed_job.run.trigger_kind.as_str(),
                 }),
             )
-            .await;
+            .await
+        {
+            warn!(?err, job_id = %claimed_job.job.job_id, run_id = %claimed_job.run.run_id, "failed to append scheduled job claim audit event");
+        }
         Ok(Some(claimed_job))
     }
 
@@ -263,7 +280,7 @@ impl SchedulerEngine {
                     .ok_or_else(|| {
                         KernelError::NotFound("scheduled job run disappeared".to_string())
                     })?;
-                let _ = kernel
+                if let Err(err) = kernel
                     .audit_log()
                     .append(
                         "job.run.completed",
@@ -276,10 +293,16 @@ impl SchedulerEngine {
                             "delivery_status": delivery_status.as_str(),
                         }),
                     )
-                    .await;
-                let _ = kernel
+                    .await
+                {
+                    warn!(?err, job_id = %job.job_id, run_id = %final_run.run_id, "failed to append scheduled job completion audit event");
+                }
+                if let Err(err) = kernel
                     .record_scheduler_continuity_success(job, &final_run, &response.assistant_text)
-                    .await;
+                    .await
+                {
+                    warn!(?err, job_id = %job.job_id, run_id = %final_run.run_id, "failed to record scheduled job success continuity");
+                }
                 Ok(AttemptOutcome::Finished(Box::new((updated_job, final_run))))
             }
             Err(err) => {
@@ -316,7 +339,7 @@ impl SchedulerEngine {
                 .ok_or_else(|| {
                     KernelError::Conflict("scheduled retry could not be started".to_string())
                 })?;
-            let _ = kernel
+            if let Err(err) = kernel
                 .audit_log()
                 .append(
                     "job.run.retry",
@@ -328,7 +351,10 @@ impl SchedulerEngine {
                         "attempt_no": next_run.attempt_no,
                     }),
                 )
-                .await;
+                .await
+            {
+                warn!(?err, job_id = %job.job_id, run_id = %next_run.run_id, "failed to append scheduled job retry audit event");
+            }
             return Ok(AttemptOutcome::Retry(next_run));
         }
 
@@ -365,9 +391,11 @@ impl SchedulerEngine {
             "delivery_status": delivery_status.as_str(),
         });
         if let Some(failure_phase) = context.failure_phase {
-            audit_details["failure_phase"] = json!(failure_phase);
+            if let Some(details) = audit_details.as_object_mut() {
+                details.insert("failure_phase".to_string(), json!(failure_phase));
+            }
         }
-        let _ = kernel
+        if let Err(err) = kernel
             .audit_log()
             .append(
                 "job.run.failed",
@@ -375,10 +403,16 @@ impl SchedulerEngine {
                 Some("scheduler".to_string()),
                 audit_details,
             )
-            .await;
-        let _ = kernel
+            .await
+        {
+            warn!(?err, job_id = %job.job_id, run_id = %final_run.run_id, "failed to append scheduled job failure audit event");
+        }
+        if let Err(err) = kernel
             .record_scheduler_continuity_failure(job, &final_run, &error_text)
-            .await;
+            .await
+        {
+            warn!(?err, job_id = %job.job_id, run_id = %final_run.run_id, "failed to record scheduled job failure continuity");
+        }
         Ok(AttemptOutcome::Finished(Box::new((updated_job, final_run))))
     }
 
@@ -430,7 +464,9 @@ struct AttemptFailureContext {
 impl TickLeaseRenewal {
     async fn stop(mut self) -> Result<(), KernelError> {
         if let Some(stop_tx) = self.stop_tx.take() {
-            let _ = stop_tx.send(());
+            if stop_tx.send(()).is_err() {
+                debug!("tick lease renewal task already stopped");
+            }
         }
         let renewal_result = self.handle.await.map_err(|err| internal(err.into()))?;
         renewal_result.map_err(internal)?;

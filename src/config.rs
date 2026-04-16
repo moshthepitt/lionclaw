@@ -77,7 +77,13 @@ impl Config {
 }
 
 pub fn resolve_optional_env_override_path(var: &str) -> std::io::Result<Option<PathBuf>> {
-    std::env::var_os(var)
+    resolve_optional_override_path(std::env::var_os(var))
+}
+
+fn resolve_optional_override_path(
+    value: Option<std::ffi::OsString>,
+) -> std::io::Result<Option<PathBuf>> {
+    value
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .map(resolve_override_path)
@@ -163,7 +169,7 @@ fn join_host_port(host: &str, port: &str) -> String {
 mod tests {
     use super::{
         canonicalize_project_workspace_root, join_host_port, resolve_bind_addr,
-        resolve_optional_env_override_path, DEFAULT_BIND_HOST, DEFAULT_BIND_PORT,
+        resolve_optional_override_path, DEFAULT_BIND_HOST, DEFAULT_BIND_PORT,
     };
     use tempfile::tempdir;
 
@@ -191,7 +197,7 @@ mod tests {
     fn wraps_ipv6_host_when_joining() {
         assert_eq!(
             join_host_port("::1", DEFAULT_BIND_PORT),
-            format!("[::1]:{}", DEFAULT_BIND_PORT)
+            format!("[::1]:{DEFAULT_BIND_PORT}")
         );
     }
 
@@ -222,14 +228,10 @@ mod tests {
         std::fs::create_dir_all(project_root.join(".codex")).expect("create codex home");
         let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&project_root).expect("set cwd");
-        // SAFETY: tests in this module control this process env key.
-        unsafe { std::env::set_var("LIONCLAW_TEST_OVERRIDE_PATH", ".codex") };
 
-        let resolved = resolve_optional_env_override_path("LIONCLAW_TEST_OVERRIDE_PATH")
-            .expect("resolve env override");
+        let resolved =
+            resolve_optional_override_path(Some(".codex".into())).expect("resolve env override");
 
-        // SAFETY: tests in this module control this process env key.
-        unsafe { std::env::remove_var("LIONCLAW_TEST_OVERRIDE_PATH") };
         std::env::set_current_dir(original_dir).expect("restore cwd");
 
         assert_eq!(resolved, Some(project_root.join(".codex")));

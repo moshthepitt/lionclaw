@@ -1,0 +1,36 @@
+name: rust-stable-preview
+
+on:
+  schedule:
+    - cron: "0 12 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-stable-preview
+  cancel-in-progress: true
+
+jobs:
+  stable-preview:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install latest stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy --no-self-update
+
+      - name: Show Rust toolchain
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: |
+          rustup show active-toolchain
+          rustc --version
+          cargo clippy --version
+
+      - name: Run CI on latest stable Rust
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: bash ./scripts/ci.sh
