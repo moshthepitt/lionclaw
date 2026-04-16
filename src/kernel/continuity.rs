@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     collections::BTreeSet,
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -941,7 +942,7 @@ impl ContinuityLayout {
                 Err(err) => return Err(err),
             }
         }
-        dated.sort_by(|left, right| right.cmp(left));
+        dated.sort_by_key(|entry| Reverse(entry.clone()));
         Ok(dated.into_iter().map(|(_, path)| path).collect())
     }
 }

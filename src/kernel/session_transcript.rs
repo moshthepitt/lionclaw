@@ -101,12 +101,7 @@ pub fn repair_turns(
     mut turns: Vec<SessionTurnRecord>,
     mode: TranscriptMode,
 ) -> Vec<SessionTurnRecord> {
-    turns.sort_by(|left, right| {
-        left.sequence_no
-            .cmp(&right.sequence_no)
-            .then_with(|| left.started_at.cmp(&right.started_at))
-            .then_with(|| left.turn_id.cmp(&right.turn_id))
-    });
+    turns.sort_by_key(|turn| (turn.sequence_no, turn.started_at, turn.turn_id));
 
     let map_running_to_interrupted = matches!(mode, TranscriptMode::Prompt(_));
     let mut seen_turn_ids = HashSet::new();

@@ -28,6 +28,22 @@ await_holding_refcell_ref = "deny"
 exit = "warn"
 mem_forget = "deny"
 
+# CI-stable default Clippy lints that should be visible in the project profile.
+cloned_ref_to_slice_refs = "warn"
+confusing_method_to_numeric_cast = "warn"
+disallowed_fields = "warn"
+doc_suspicious_footnotes = "warn"
+infallible_try_from = "warn"
+manual_checked_ops = "warn"
+manual_is_multiple_of = "warn"
+manual_take = "warn"
+possible_missing_else = "warn"
+redundant_iter_cloned = "warn"
+replace_box = "warn"
+unnecessary_sort_by = "deny"
+unnecessary_option_map_or_else = "warn"
+useless_concat = "warn"
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"

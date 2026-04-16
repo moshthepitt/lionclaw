@@ -1,3 +1,5 @@
+use std::cmp::Reverse;
+
 use crate::kernel::skills::SkillRecord;
 
 #[derive(Debug, Default, Clone)]
@@ -41,7 +43,7 @@ impl SkillSelector {
             .filter(|(_, score)| *score > 0)
             .collect::<Vec<_>>();
 
-        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.sort_by_key(|(_, score)| Reverse(*score));
         scored.into_iter().take(3).map(|(id, _)| id).collect()
     }
 }

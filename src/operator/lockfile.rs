@@ -57,9 +57,8 @@ impl OperatorLockfile {
     }
 
     pub fn normalize(&mut self) {
-        self.skills
-            .sort_by(|left, right| left.alias.cmp(&right.alias));
-        self.channels.sort_by(|left, right| left.id.cmp(&right.id));
+        self.skills.sort_by_key(|skill| skill.alias.clone());
+        self.channels.sort_by_key(|channel| channel.id.clone());
     }
 }
 

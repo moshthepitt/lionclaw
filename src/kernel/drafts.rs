@@ -19,7 +19,7 @@ pub fn list_outputs(root: &Path) -> Result<Vec<DraftOutput>> {
 
     let mut outputs = Vec::new();
     collect_outputs(root, Path::new(""), &mut outputs)?;
-    outputs.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    outputs.sort_by_key(|output| output.relative_path.clone());
     Ok(outputs)
 }
 

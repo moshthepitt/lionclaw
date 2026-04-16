@@ -34,7 +34,7 @@ jobs:
           fetch-depth: 0
           ref: main
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt,clippy
 
