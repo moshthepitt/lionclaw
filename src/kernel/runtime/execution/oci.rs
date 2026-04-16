@@ -8,6 +8,7 @@ use async_trait::async_trait;
 #[cfg(unix)]
 use rustix::process::{getgid, getuid};
 use tokio::{runtime::Handle, time::timeout};
+use tracing::warn;
 
 use super::{
     backend::{ExecutionBackend, ExecutionOutput, ExecutionRequest, ExecutionStdoutSender},
@@ -73,8 +74,14 @@ impl ExecutionBackend for OciExecutionBackend {
 
         match (result, runtime_secrets_cleanup_result) {
             (Ok(output), Ok(())) => Ok(output),
+            (Ok(output), Err(err)) => {
+                warn!(
+                    error = %err,
+                    "runtime secret cleanup failed after successful OCI runtime turn"
+                );
+                Ok(output)
+            }
             (Err(err), _) => Err(err),
-            (Ok(_), Err(err)) => Err(err),
         }
     }
 }
@@ -942,6 +949,83 @@ esac
         assert!(
             log.contains(&format!("secret rm {}", secret_name)),
             "secret remove should be logged: {log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oci_backend_does_not_fail_successful_turn_when_runtime_secret_cleanup_races() {
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("podman.log");
+        let engine_path = temp_dir.path().join("podman-stub.sh");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+set -eu
+echo "$@" >> "{log_path}"
+if [ "${{1:-}}" = "secret" ] && [ "${{2:-}}" = "rm" ]; then
+  echo "secret not found" >&2
+  exit 1
+fi
+case "${{1:-}}" in
+  secret|run) exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+            log_path = log_path.display()
+        );
+        fs::write(&engine_path, script).expect("write engine");
+        let mut permissions = fs::metadata(&engine_path)
+            .expect("engine metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&engine_path, permissions).expect("chmod engine");
+
+        let request = ExecutionRequest {
+            plan: EffectiveExecutionPlan {
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: engine_path.display().to_string(),
+                    ..sample_plan().confinement.oci().clone()
+                }),
+                ..sample_plan()
+            },
+            program: RuntimeProgramSpec {
+                executable: "codex".to_string(),
+                args: vec!["exec".to_string(), "--json".to_string()],
+                environment: Vec::new(),
+                stdin: "hello".to_string(),
+                auth: None,
+            },
+            runtime_secrets_mount: Some(RuntimeSecretsMount {
+                source: temp_dir.path().join("runtime-secrets.env"),
+            }),
+            codex_home_override: None,
+        };
+        fs::write(
+            request
+                .runtime_secrets_mount
+                .as_ref()
+                .expect("mount")
+                .source
+                .as_path(),
+            "TOKEN=value\n",
+        )
+        .expect("write runtime secrets");
+
+        let (stdout_tx, _stdout_rx) = mpsc::unbounded_channel();
+        OciExecutionBackend
+            .execute_streaming(request.clone(), stdout_tx)
+            .await
+            .expect("successful turn should not fail on cleanup race");
+
+        let log = fs::read_to_string(&log_path).expect("read log");
+        let secret_name = request
+            .runtime_secrets_mount
+            .as_ref()
+            .expect("mount")
+            .mounted_name();
+        assert!(
+            log.contains(&format!("secret rm {}", secret_name)),
+            "secret remove should still be attempted: {log}"
         );
     }
 
