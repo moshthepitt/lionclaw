@@ -1,9 +1,19 @@
 # Manual QA Live Pass
 
-This is the repeatable live manual QA process for LionClaw. It validates the
-real Codex runtime path under real Podman confinement, real host Codex auth,
-real daemon reuse, and real channel/job flows. It is not a unit-test
-substitute.
+This is the repeatable live manual QA process for LionClaw.
+
+It validates the product thesis: a real agent CLI, specifically Codex in this
+pass, running through LionClaw's local boundary with real Podman confinement,
+real host Codex auth, real daemon reuse, and real channel/job flows.
+
+This is not testing a fake LionClaw reimplementation of Codex tools. File
+reads, file edits, shell behavior, and other agent-native work are expected to
+come from Codex itself inside the confined runtime. LionClaw is responsible for
+the boundary around that work: project mount, runtime state, drafts, network
+mode, staged auth, runtime secrets, timeouts, sessions, channels, jobs, and
+audit-visible kernel decisions.
+
+This pass is not a unit-test substitute.
 
 Run this before merging behavior-changing work that touches:
 
@@ -13,6 +23,21 @@ Run this before merging behavior-changing work that touches:
 - daemon compatibility, service reuse, or project scoping
 - `lionclaw run`, `service up`, `channel attach`, terminal channels, or jobs
 - runtime secrets, drafts, continuity, or session recovery
+
+## What This Pass Proves
+
+- `lionclaw run <runtime>` is the everyday local Claw path, exercised here
+  with Codex.
+- Codex runs as Codex, through its normal CLI/auth behavior, inside LionClaw's
+  outer runtime boundary.
+- The real host Codex home is not mounted into the runtime container.
+- Project isolation is based on the current project root mounted at
+  `/workspace`.
+- Runtime-private state is scoped and resumable without becoming canonical
+  LionClaw continuity.
+- Channel and scheduler flows invoke the selected runtime instead of using a
+  separate assistant path.
+- Runtime-visible secrets are explicit and cleaned up after the pass.
 
 Do not use production secrets. Use only dummy `runtime-secrets.env` values.
 The host Codex auth store for the pass is `${CODEX_HOME:-$HOME/.codex}`. If

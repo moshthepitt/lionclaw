@@ -3,7 +3,8 @@
 This directory contains the sharp tools.
 
 ## Why this exists
-Most users should stay on the main `lionclaw` path.
+Most users should stay on the main `lionclaw` path: register a real agent
+runtime, run it through LionClaw, and add channels or jobs through the CLI.
 
 These scripts are here for the moments when you want direct control over install, bind, and worker startup. Manual setup. Debugging. Tight feedback loops.
 

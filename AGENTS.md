@@ -1,13 +1,15 @@
 # AGENTS.md
 
 ## Purpose
-This repository builds LionClaw as a secure-first local agent kernel.
+This repository builds LionClaw as a secure-first local Claw: a small trusted
+kernel that runs real agent CLIs inside an explicit local boundary.
 Contributors (human or AI) should follow the workflow and quality gates below.
 
 ## Source of Truth
 - Project overview: `README.md`
 - v0 scope and constraints: `docs/V0_PLAN.md`
 - architecture and contracts: `docs/ARCHITECTURE.md`
+- runtime model: `docs/RUNTIME_MODEL.md`
 - milestone plan: `docs/ROADMAP.md`
 
 ## Working Rules
@@ -25,7 +27,8 @@ Contributors (human or AI) should follow the workflow and quality gates below.
 - Encode validation intent in types and request/response contracts.
 - Keep module boundaries explicit (`sessions`, `skills`, `policy`, `runtime`, `channels`, `audit`).
 - Default to deny for capability checks unless explicit grants exist.
-- Treat policy and audit as first-class concerns for every privileged action.
+- Treat policy and audit as first-class concerns for LionClaw-owned privileged
+  actions and runtime boundary decisions.
 - Build tests as composable scenarios with reusable setup helpers.
 - When behavior changes, update tests and docs in the same change.
 
@@ -36,13 +39,14 @@ Contributors (human or AI) should follow the workflow and quality gates below.
 - Raw HTTP is for workers, tests, and debugging only; never document it as normal usage.
 - `systemd --user` is deployment/admin plumbing for background services and many channels, not the default local interactive path.
 - Runtime configuration must live in LionClaw state/config, not rely on accidental shell PATH or session env.
-- LionClaw owns the product entrypoint; runtimes are engines behind it.
+- LionClaw owns the product entrypoint; runtimes are real agent harnesses behind it.
+- LionClaw owns the boundary, not every private tool step inside a program-backed runtime.
 - Channels remain external skills/workers; do not absorb transport logic into Rust core to paper over UX gaps.
 - Product-facing docs must be command-first and readable without architecture context.
 - Internal implementation names such as `lionclawd`, `kernel`, and raw HTTP APIs should appear in product docs only when operationally necessary.
 - The README first screen must explain LionClaw in user terms and avoid “not X / not Y” framing.
 - Product-facing docs should lead with the problem, the stance, and the command the reader runs.
-- The README should preserve the core thesis: keep the trusted core small, and make everything beyond that core a skill.
+- The README should preserve the core thesis: Claws turn agents into assistants; LionClaw runs real agents under a small trusted core and explicit local boundary.
 
 ## Required Verification Commands
 Run from repository root before considering work complete:
