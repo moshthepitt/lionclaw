@@ -1,22 +1,14 @@
 # LionClaw
 
-LionClaw is a personal AI assistant you can leave running on your own machine.
+LionClaw is a personal AI assistant that runs locally on your machine.
 
-It turns agent CLIs into something persistent: an assistant with memory,
-scheduled jobs, channels, local project context, and a controlled workspace.
-The agent still does the real work. LionClaw gives it a home, a boundary, and
-a record of what the system allowed.
+It takes standard agent CLIs and makes them persistent. Instead of running one-off commands, you get an assistant with memory, scheduled jobs, local project context, and a controlled workspace.
 
-Claws are a new layer above AI agents. They take an interactive coding or
-reasoning agent and give it presence: continuity, channels, scheduling,
-credentials, local context, and long-running workflows. LionClaw keeps that
-shape, but changes the security model. It runs capable agents directly inside
-a local boundary you control instead of replacing them with a giant assistant
-framework.
+The agent still does the heavy lifting. LionClaw just gives it a home, a strict security boundary, and an audit log of what the system allowed it to do.
 
-LionClaw currently supports Unix-like systems only. The trusted filesystem and
-service assumptions in the current kernel target Linux/macOS-style Unix
-environments; Windows support is out of scope for now.
+Think of it as a new layer for AI. Instead of replacing your tools with a bloated assistant framework, LionClaw wraps the interactive coding and reasoning agents you already use. It gives them presence (continuity, credentials, and long-running workflows) while keeping them locked inside a local environment you dictate.
+
+Note: LionClaw currently supports Unix-like systems (Linux/macOS) only. Windows is out of scope.
 
 ## Why LionClaw
 
