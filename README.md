@@ -2,42 +2,58 @@
 
 LionClaw is a personal AI assistant that runs locally on your machine.
 
-It takes standard agent CLIs and makes them persistent. Instead of running one-off commands, you get an assistant with memory, scheduled jobs, local project context, and a controlled workspace.
+It gives standard agent CLIs a durable home. You still use the real agent, but
+LionClaw adds memory, scheduled jobs, local project context, explicit
+credentials, and a controlled workspace around it.
 
-The agent still does the heavy lifting. LionClaw just gives it a home, a strict security boundary, and an audit log of what the system allowed it to do.
+The agent does the heavy lifting. LionClaw provides the security boundary,
+session state, runtime launch path, and audit log for the decisions it owns.
 
-Think of it as a new layer for AI. Instead of replacing your tools with a bloated assistant framework, LionClaw wraps the interactive coding and reasoning agents you already use. It gives them presence (continuity, credentials, and long-running workflows) while keeping them locked inside a local environment you dictate.
+Think of it as a new layer for AI: a local home for the interactive coding and
+reasoning agents you already use. LionClaw gives them presence, continuity,
+credentials, and long-running workflows while keeping them inside an
+environment you define.
 
 Note: LionClaw currently supports Unix-like systems (Linux/macOS) only. Windows is out of scope.
 
 ## Why LionClaw
 
-A personal assistant that can read files, run commands, send messages, use
-credentials, and stay online is useful. It is also dangerous.
+An AI assistant that can read files, run commands, use your credentials, and
+stay online is a powerful local operator. It is also a serious security
+boundary problem.
 
-LionClaw's bet is simple:
+LionClaw gives that operator a home you control: real agent runtimes,
+persistent context, scheduled work, explicit credentials, and a narrow local
+sandbox around every run.
 
-- **Use the real agent** - supported runtimes run through their normal CLI
-  paths. LionClaw does not rebuild their tool loops.
-- **Keep the core small** - policy, state, runtime launch, audit, sessions,
-  channels, and jobs live in the trusted core.
-- **Confine the work** - the selected agent sees only the mounted workspace,
-  runtime state, drafts area, network mode, and secrets LionClaw grants.
-- **Add persistence** - sessions, continuation, scheduled jobs, and channel
-  delivery survive beyond one terminal prompt.
-- **Grow through skills** - channels and integrations stay outside the Rust
-  core instead of turning it into a feature monolith.
+Here is the bet LionClaw makes:
 
-Supported runtimes today include Codex and OpenCode. The commands below use
-Codex as the quick-start example because its host-auth path is the most
-heavily exercised live path, but the product model is runtime-agnostic:
-register a runtime, select it for a run, and LionClaw applies the same local
-contract around it.
+- Run the real agents. Supported runtimes use their native CLI paths, so
+  Codex, OpenCode, and future runtimes keep their own capabilities and
+  workflows.
+- Keep the core small. The trusted Rust core focuses on policy, state,
+  auditing, runtime launch, sessions, and jobs.
+- Control the blast radius. A run sees only the workspace, network mode,
+  runtime state, and secrets LionClaw explicitly grants.
+- Keep context alive. Sessions, scheduled jobs, and channels survive beyond one
+  terminal prompt.
+- Extend without bloat. Channels and integrations live as skills outside the
+  core, so LionClaw can grow without turning into a feature monolith.
 
-LionClaw owns the boundary, not every thought inside it. The selected agent may
-run its own tools inside the sandbox. LionClaw decides the outer contract:
-what gets mounted, what network exists, which credentials appear, what session
-is active, which channel invoked it, and what kernel decisions are recorded.
+### Bring Your Own Runtime
+
+LionClaw currently supports Codex and OpenCode. The quick start uses Codex as
+one concrete example because its host-auth path is the most exercised route
+today. The model is runtime-agnostic: register a runtime, choose it for a run,
+and LionClaw applies the same local contract around it.
+
+### The Boundary Contract
+
+LionClaw owns the boundary, not every thought inside it.
+
+The selected agent can use its own tools inside the sandbox. LionClaw decides
+what directories are mounted, what network exists, which credentials appear,
+what session is active, and which boundary decisions are recorded.
 
 ## Quick Start
 
