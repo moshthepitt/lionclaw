@@ -431,7 +431,7 @@ home id, current project scope, and daemon-compat fingerprint.
 - Skill source pinning, provenance, signatures, and update review.
 - Alternative confinement backends beyond the shipped OCI path.
 - Wasmtime or equivalent sandbox path for untrusted helper tools, not as the
-  primary Codex/OpenCode runtime path.
+  primary program-backed runtime path.
 - Runtime image provenance and security audit reporting.
 
 ## Adding A Runtime

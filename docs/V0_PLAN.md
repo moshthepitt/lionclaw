@@ -14,7 +14,7 @@ It:
 2. compiles and enforces runtime execution plans,
 3. keeps durable LionClaw sessions and turn history,
 4. projects assistant identity, continuity, and selected skill context into the runtime,
-5. supports program-backed Codex and OpenCode-style runtimes,
+5. supports Codex and OpenCode as program-backed runtimes,
 6. treats channels as external skill workers,
 7. runs time-based jobs in isolated scheduler sessions,
 8. records audit events for kernel-owned decisions and boundary crossings.
