@@ -150,8 +150,8 @@ putting words in a prompt.
 LionClaw can run time-based jobs in fresh isolated sessions and optionally
 deliver the final result back through a channel.
 
-For a local terminal briefing loop, keep the terminal channel open in one shell
-and create the recurring job from another shell. `channel attach` starts the
+After registering a runtime, keep the terminal channel open in one shell and
+create the recurring job from another shell. `channel attach` starts the
 foreground worker and owns that terminal until you exit it.
 
 Terminal A:
@@ -249,7 +249,8 @@ That command bootstraps a fresh test home on its own loopback bind, configures
 the runtime and terminal channel, starts the managed daemon if needed, and
 attaches it in your current TTY.
 
-Manual equivalent:
+For an existing LionClaw home with a configured runtime, the manual channel
+steps are:
 
 ```bash
 ./target/release/lionclaw skill add skills/channel-terminal --alias terminal

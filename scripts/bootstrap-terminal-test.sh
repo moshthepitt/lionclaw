@@ -9,7 +9,7 @@ Create or refresh a LionClaw home for manual terminal-channel testing, then
 attach the interactive terminal channel in the current TTY.
 
 Arguments:
-  lionclaw-home   Path to the LionClaw home to create or reuse
+  home            Path to the LionClaw home to create or reuse
   runtime-id      Optional runtime id to configure (default: codex)
   runtime-command Optional runtime command or executable (default: runtime-id)
   channel-id      Optional channel id to attach (default: terminal)
