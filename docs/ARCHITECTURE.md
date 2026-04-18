@@ -8,9 +8,9 @@ contract around that work: sessions, channels, scheduled jobs, continuity,
 runtime configuration, confinement, policy, and audit.
 
 LionClaw currently targets Unix-like systems only. The direct `lionclaw run`
-path is designed for Linux/macOS-style Unix environments. Managed background
-service mode currently uses systemd user services; launchd support is a future
-portability item.
+path is designed for Linux/macOS-style Unix environments. Managed daemon paths,
+including service mode and channel auto-start, currently use systemd user
+services; launchd support is a future portability item.
 
 ## System Shape
 
@@ -394,7 +394,9 @@ manually by the operator.
   through the platform service manager. The current implementation uses systemd
   user services.
 - `launch_mode=interactive`: channel worker is foreground-only and started
-  with `lionclaw channel attach <id>`.
+  with `lionclaw channel attach <id>`. If no compatible daemon is already
+  running, the attach path starts the daemon through the same systemd-backed
+  manager.
 
 Worker entrypoint resolution requires `scripts/worker`.
 

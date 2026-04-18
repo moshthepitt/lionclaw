@@ -17,7 +17,11 @@ Arguments:
 Environment:
   LIONCLAW_RUNTIME_IMAGE  Runtime image to configure/build (default: lionclaw-runtime:v1)
   LIONCLAW_RUNTIME_KIND   Runtime kind to configure (default: inferred from runtime-id)
-  LIONCLAW_SKIP_IMAGE_BUILD=1 skips building the runtime image when it is missing
+  LIONCLAW_SKIP_IMAGE_BUILD=1 requires the runtime image to already exist
+
+Prerequisites:
+  podman
+  systemd user services for the channel attach daemon auto-start path
 EOF
 }
 
@@ -75,6 +79,14 @@ ensure_runtime_image() {
   podman build -t "$image" -f containers/runtime/Containerfile .
 }
 
+ensure_systemd_user() {
+  command -v systemctl >/dev/null 2>&1 || die "systemd user services are required for this helper"
+
+  if ! systemctl --user show-environment >/dev/null 2>&1; then
+    die "systemd user services are unavailable; this helper needs them to auto-start the LionClaw daemon"
+  fi
+}
+
 if [[ $# -lt 1 || $# -gt 4 ]]; then
   usage >&2
   exit 64
@@ -90,6 +102,8 @@ runtime_image="${LIONCLAW_RUNTIME_IMAGE:-lionclaw-runtime:v1}"
 
 cd "$repo_root"
 export LIONCLAW_HOME="$lionclaw_home"
+
+ensure_systemd_user
 
 mkdir -p "$LIONCLAW_HOME"
 cargo build --bins

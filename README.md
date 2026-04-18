@@ -15,8 +15,9 @@ credentials, and long-running workflows while keeping them inside an
 environment you define.
 
 Note: LionClaw's direct `lionclaw run` path currently supports Unix-like
-systems (Linux/macOS). Managed background service mode currently requires
-Linux with systemd user services. Windows is out of scope.
+systems (Linux/macOS). Managed daemon paths, including `service up` and channel
+auto-start, currently require Linux with systemd user services. Windows is out
+of scope.
 
 ## Why LionClaw
 
@@ -237,14 +238,16 @@ LionClaw and the selected runtime keep separate continuity layers:
 When you want LionClaw somewhere other than the direct CLI path, install a
 channel skill.
 
-For a local channel in your current terminal:
+For a local channel in your current terminal on Linux with systemd user
+services:
 
 ```bash
 ./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e
 ```
 
 That command bootstraps a fresh test home on its own loopback bind, configures
-the terminal channel, and attaches it in your current TTY.
+the runtime and terminal channel, starts the managed daemon if needed, and
+attaches it in your current TTY.
 
 Manual equivalent:
 
@@ -255,7 +258,8 @@ Manual equivalent:
 ```
 
 `channel attach` opens the worker in your current TTY. If needed, it starts
-LionClaw for you, restores the latest interactive terminal session for that
+LionClaw for you through the managed daemon path, which currently uses systemd
+user services. It restores the latest interactive terminal session for that
 peer, resumes any still-running answer stream from the last durable checkpoint,
 and prints the pairing code and approval command on first contact. It only
 reuses a daemon when that daemon belongs to the same `LIONCLAW_HOME`, current

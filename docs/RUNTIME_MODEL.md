@@ -301,9 +301,10 @@ Operator-facing paths:
 - `lionclaw service status`
 - `lionclaw service logs`
 
-Background operation is explicit. If you want long-running channels and
-auto-restart, LionClaw uses the platform service manager for that job. The
-current managed-service implementation uses systemd user services.
+Background operation is explicit. If you want long-running channels,
+auto-restart, or channel attach to start the daemon for you, LionClaw uses the
+platform service manager for that job. The current managed-service
+implementation uses systemd user services.
 
 Raw HTTP is for workers, tests, and debugging. It is not the normal operator
 experience.
