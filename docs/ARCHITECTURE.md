@@ -7,9 +7,10 @@ The agent does the reasoning and tool use. LionClaw gives it the local
 contract around that work: sessions, channels, scheduled jobs, continuity,
 runtime configuration, confinement, policy, and audit.
 
-LionClaw currently targets Unix-like systems only. The trusted filesystem
-boundary and service assumptions are designed for Linux/macOS-style Unix
-environments.
+LionClaw currently targets Unix-like systems only. The direct `lionclaw run`
+path is designed for Linux/macOS-style Unix environments. Managed background
+service mode currently uses systemd user services; launchd support is a future
+portability item.
 
 ## System Shape
 
@@ -209,11 +210,12 @@ under `/run/secrets/` with a LionClaw-managed name that starts with
 `lionclaw-runtime-secrets-`. LionClaw hardens the config directory to `0700`
 and the runtime secret file to `0600` on Unix before loading it.
 
-Host-only runtime auth comes from the host runtime itself. Confined Codex turns
-read the host Codex auth store, normally `~/.codex/auth.json`, refresh that
-host auth when needed, then stage session-local copies of `auth.json` and
-`config.toml` under `/runtime/home/.codex` before launch. The real host Codex
-home is never mounted into the runtime container.
+Host-only runtime auth comes from the host runtime itself. Before a confined
+Codex turn, LionClaw reads the host Codex auth store, normally
+`~/.codex/auth.json`, refreshes that host auth when needed, then stages
+session-local copies of `auth.json` and `config.toml` under
+`/runtime/home/.codex` before launch. The real host Codex home is never mounted
+into the runtime container.
 
 `lionclaw run` inherits an interactive shell's `CODEX_HOME` when set, and
 `lionclaw service up` persists that same override into the managed daemon
@@ -389,7 +391,8 @@ manually by the operator.
 ## Operator Launch Model
 
 - `launch_mode=service`: channel worker is supervised by `lionclaw service up`
-  through the platform service manager.
+  through the platform service manager. The current implementation uses systemd
+  user services.
 - `launch_mode=interactive`: channel worker is foreground-only and started
   with `lionclaw channel attach <id>`.
 

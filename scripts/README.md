@@ -12,7 +12,9 @@ Use them when you mean it.
 
 ## Available scripts
 - `ci.sh`: runs the local CI gate, mirrors the GitHub Actions `ci` workflow, and is the preferred pre-push verification entrypoint.
-- `bootstrap-terminal-test.sh`: bootstraps or refreshes a manual terminal-channel test home, gives a fresh home its own loopback bind, configures the runtime and terminal channel, then attaches it in the current TTY.
+- `bootstrap-terminal-test.sh`: bootstraps or refreshes a manual terminal-channel
+  test home, gives a fresh home its own loopback bind, configures the runtime
+  image and terminal channel, then attaches it in the current TTY.
 - `install-channel-skill.sh`: installs a channel skill, enables it, binds it to a channel, and optionally starts the channel worker. It uses `scripts/worker` when present and otherwise uses `scripts/worker.sh`.
 - `attach-terminal-test.sh`: rebuilds LionClaw, stops managed services for a specific `LIONCLAW_HOME`, and attaches the interactive terminal channel in the current TTY.
 
@@ -60,11 +62,21 @@ Fresh terminal-channel test home in one command:
 ./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e
 ```
 
-That command uses `lionclaw onboard --bind auto` for a fresh home, so manual test homes do not collide with another LionClaw daemon already using the default bind.
+That command uses `lionclaw onboard --bind auto` for a fresh home, so manual
+test homes do not collide with another LionClaw daemon already using the
+default bind. It configures the runtime with `lionclaw-runtime:v1` and builds
+that shared local image first when it is missing.
 
 Override the runtime id, command, or channel:
 ```bash
 ./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e work codex terminal
+```
+
+Override the runtime image or kind with environment variables:
+```bash
+LIONCLAW_RUNTIME_IMAGE=lionclaw-runtime:v2 \
+LIONCLAW_RUNTIME_KIND=opencode \
+  ./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e opencode opencode terminal
 ```
 
 Rebuild + restart + attach the terminal test channel:

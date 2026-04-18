@@ -270,10 +270,11 @@ it read-only under `/run/secrets/` with a LionClaw-managed name beginning with
 and the runtime secret file to `0600` on Unix before loading it.
 
 Host-only runtime auth comes from the host runtime itself. For Codex, the
-operator signs in with `codex login`. Confined Codex turns read the host Codex
-auth store, refresh host auth when needed, and stage session-local copies of
-`auth.json` and `config.toml` under `/runtime/home/.codex` before launch. The
-real host Codex home is never mounted into the runtime container.
+operator signs in with `codex login`. Before a confined Codex turn, LionClaw
+reads the host Codex auth store, refreshes host auth when needed, and stages
+session-local copies of `auth.json` and `config.toml` under
+`/runtime/home/.codex` before launch. The real host Codex home is never mounted
+into the runtime container.
 
 Codex runs inside LionClaw's outer Podman boundary with its official
 external-sandbox mode enabled, then talks upstream directly as it normally
@@ -301,7 +302,8 @@ Operator-facing paths:
 - `lionclaw service logs`
 
 Background operation is explicit. If you want long-running channels and
-auto-restart, LionClaw uses the platform service manager for that job.
+auto-restart, LionClaw uses the platform service manager for that job. The
+current managed-service implementation uses systemd user services.
 
 Raw HTTP is for workers, tests, and debugging. It is not the normal operator
 experience.
@@ -313,7 +315,7 @@ It currently installs Codex and OpenCode plus basic CLI dependencies such as
 `bash`, `git`, `openssh-client`, and `ripgrep`.
 
 Runtime compatibility includes the resolved local OCI image identity, so
-rebuilding the same mutable tag still creates a new compatibility boundary
+rebuilding the same stable local tag still creates a new compatibility boundary
 automatically.
 
 ## Implementation Checklist Anchor

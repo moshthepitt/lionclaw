@@ -14,7 +14,9 @@ reasoning agents you already use. LionClaw gives them presence, continuity,
 credentials, and long-running workflows while keeping them inside an
 environment you define.
 
-Note: LionClaw currently supports Unix-like systems (Linux/macOS) only. Windows is out of scope.
+Note: LionClaw's direct `lionclaw run` path currently supports Unix-like
+systems (Linux/macOS). Managed background service mode currently requires
+Linux with systemd user services. Windows is out of scope.
 
 ## Why LionClaw
 
@@ -66,7 +68,7 @@ git clone https://github.com/moshthepitt/lionclaw.git
 cd lionclaw
 cargo build --release
 
-# 2. Build the shared runtime image with an immutable tag
+# 2. Build the shared runtime image with a stable local tag
 podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .
 
 # 3. Initialize your local environment
@@ -147,20 +149,36 @@ putting words in a prompt.
 LionClaw can run time-based jobs in fresh isolated sessions and optionally
 deliver the final result back through a channel.
 
-For a local terminal briefing loop:
+For a local terminal briefing loop, keep the terminal channel open in one shell
+and create the recurring job from another shell. `channel attach` starts the
+foreground worker and owns that terminal until you exit it.
+
+Terminal A:
 
 ```bash
 export LIONCLAW_RUNTIME=codex
+export LIONCLAW_PEER="${USER:-local}"
+
 ./target/release/lionclaw skill add skills/channel-terminal --alias terminal
 ./target/release/lionclaw channel add terminal --launch interactive
-./target/release/lionclaw channel attach terminal --runtime "$LIONCLAW_RUNTIME"
+./target/release/lionclaw channel attach terminal \
+  --runtime "$LIONCLAW_RUNTIME" \
+  --peer "$LIONCLAW_PEER"
+```
+
+On first contact, approve the peer with the command printed by the terminal
+worker. Then, in Terminal B:
+
+```bash
+export LIONCLAW_RUNTIME=codex
+export LIONCLAW_PEER="${USER:-local}"
 
 ./target/release/lionclaw job add daily-brief \
   --runtime "$LIONCLAW_RUNTIME" \
   --schedule "every 1d" \
   --prompt "Inspect the current workspace and send me a short engineering brief with risks, drift, and next steps." \
   --deliver-channel terminal \
-  --deliver-peer mosh
+  --deliver-peer "$LIONCLAW_PEER"
 ```
 
 Inspect or control jobs with:
@@ -259,7 +277,8 @@ For Telegram:
 ./target/release/lionclaw channel add telegram
 ```
 
-Run channels or automation in the background with service mode:
+On Linux systems with systemd user services, run channels or automation in the
+background with service mode:
 
 ```bash
 TELEGRAM_BOT_TOKEN=... ./target/release/lionclaw service up --runtime <runtime>
@@ -324,7 +343,7 @@ runtime image, plus the concrete host `podman` executable and image LionClaw
 uses to launch it. The shared runtime image definition lives at
 `containers/runtime/Containerfile` and currently installs Codex and OpenCode.
 Runtime compatibility keys include the resolved local OCI image identity, so
-rebuilding the same mutable tag creates a new compatibility boundary
+rebuilding the same stable local tag creates a new compatibility boundary
 automatically.
 
 ## Docs
