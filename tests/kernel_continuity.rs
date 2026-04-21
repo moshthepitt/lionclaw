@@ -1,6 +1,10 @@
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
 };
 
 use anyhow::{anyhow, Result};
@@ -1308,6 +1312,79 @@ async fn compaction_failures_are_audited_without_failing_completed_turns() {
 }
 
 #[tokio::test]
+async fn hidden_compaction_uses_short_internal_timeout() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            runtime_turn_idle_timeout: Duration::from_secs(60),
+            runtime_turn_hard_timeout: Duration::from_secs(60 * 60),
+            hidden_compaction_turn_timeout: Duration::from_millis(25),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let cancel_calls = Arc::new(AtomicUsize::new(0));
+    kernel
+        .register_runtime_adapter(
+            "hanging-compaction",
+            Arc::new(HangingHiddenCompactionAdapter {
+                cancel_calls: cancel_calls.clone(),
+            }),
+        )
+        .await;
+
+    let session = open_local_session(&kernel, "hanging-compaction-peer").await;
+    for index in 0..13 {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            kernel.turn_session(SessionTurnRequest {
+                session_id: session.session_id,
+                user_text: format!("seed turn {index}"),
+                runtime_id: Some("hanging-compaction".to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            }),
+        )
+        .await
+        .expect("seed turn should not wait on the long hard timeout")
+        .expect("seed turn succeeds");
+    }
+
+    cancel_calls.store(0, Ordering::SeqCst);
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        kernel.turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "trigger hidden compaction timeout".to_string(),
+            runtime_id: Some("hanging-compaction".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        }),
+    )
+    .await
+    .expect("hidden compaction should use its short timeout")
+    .expect("foreground turn should still succeed");
+
+    assert_eq!(response.assistant_text, "captured");
+    assert_eq!(
+        cancel_calls.load(Ordering::SeqCst),
+        1,
+        "timed-out hidden compaction should be cancelled"
+    );
+}
+
+#[tokio::test]
 async fn continuity_mutations_are_audited() {
     let env = TestEnv::new();
     bootstrap_workspace(&env.workspace_root())
@@ -2240,6 +2317,73 @@ impl RuntimeAdapter for CapturePromptAdapter {
     }
 
     async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct HangingHiddenCompactionAdapter {
+    cancel_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl RuntimeAdapter for HangingHiddenCompactionAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "hanging-compaction".to_string(),
+            version: "0.1".to_string(),
+            healthy: true,
+        }
+    }
+
+    fn hidden_turn_support(&self) -> HiddenTurnSupport {
+        HiddenTurnSupport::SideEffectFree
+    }
+
+    async fn session_start(
+        &self,
+        _input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("hanging-compaction-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn turn(
+        &self,
+        input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        if input.selected_skills.is_empty()
+            && input.prompt.contains("lionclaw_compaction_handoff_v1")
+        {
+            std::future::pending::<()>().await;
+        }
+
+        let _ = events.send(RuntimeEvent::MessageDelta {
+            lane: RuntimeMessageLane::Answer,
+            text: "captured".to_string(),
+        });
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(RuntimeTurnResult::default())
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        events: RuntimeEventSender,
+    ) -> Result<()> {
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
+    }
+
+    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 

@@ -69,25 +69,25 @@ impl RuntimeExecutionPolicy {
             &rule.allowed_env_passthrough_keys,
         )?;
 
-        let requested_timeout = request
-            .timeout_ms
-            .map(Duration::from_millis)
-            .unwrap_or(default_idle_timeout);
-
-        if requested_timeout < rule.min_timeout || requested_timeout > rule.max_timeout {
-            return Err(format!(
-                "requested timeout {} ms is outside policy bounds ({}..={} ms)",
-                requested_timeout.as_millis(),
-                rule.min_timeout.as_millis(),
-                rule.max_timeout.as_millis()
-            ));
+        let requested_timeout = request.timeout_ms.map(Duration::from_millis);
+        if let Some(timeout) = requested_timeout {
+            if timeout < rule.min_timeout || timeout > rule.max_timeout {
+                return Err(format!(
+                    "requested timeout {} ms is outside policy bounds ({}..={} ms)",
+                    timeout.as_millis(),
+                    rule.min_timeout.as_millis(),
+                    rule.max_timeout.as_millis()
+                ));
+            }
         }
+
+        let idle_timeout = requested_timeout.unwrap_or(default_idle_timeout);
 
         Ok(RuntimeExecutionContext {
             working_dir,
             environment,
-            idle_timeout: requested_timeout,
-            hard_timeout: default_hard_timeout.max(requested_timeout),
+            idle_timeout,
+            hard_timeout: default_hard_timeout.max(idle_timeout),
         })
     }
 }

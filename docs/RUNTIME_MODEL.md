@@ -292,6 +292,7 @@ Operator-facing paths:
 - `lionclaw runtime add ...`
 - `lionclaw run [runtime]`
 - `lionclaw run --continue-last-session [runtime]`
+- `lionclaw run --timeout 4h [runtime]`
 - `lionclaw skill add ...`
 - `lionclaw channel add ...`
 - `lionclaw channel attach ...`
@@ -308,6 +309,12 @@ implementation uses systemd user services.
 
 Raw HTTP is for workers, tests, and debugging. It is not the normal operator
 experience.
+
+Runtime turns use two kernel-enforced timers. The idle timeout detects a stalled
+runtime with no output; the hard timeout is the absolute safety ceiling. Local
+interactive runs default to 5 minutes idle and 2 hours hard. The `--timeout`
+option sets the hard ceiling for `lionclaw run`; LionClaw derives the idle timer
+from that value while keeping the kernel as the source of truth.
 
 ## Current Runtime Image
 

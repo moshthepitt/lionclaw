@@ -176,6 +176,8 @@ side-effect-free hidden summarization, LionClaw can update that handoff through
 a strict schema. Otherwise it falls back to deterministic kernel-side
 compaction. That keeps the core small without letting hidden runtime behavior
 become the memory authority.
+Hidden summarization is best effort and uses its own short kernel-enforced
+timeout, 30 seconds by default, independent of longer user-turn safety limits.
 
 Continuity search is backed by a derived SQLite FTS index inside
 `lionclaw.db`. The canonical source of truth remains the assistant-home

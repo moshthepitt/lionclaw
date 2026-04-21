@@ -136,6 +136,65 @@ async fn runtime_policy_denies_unallowed_env_passthrough() {
     );
 }
 
+#[tokio::test]
+async fn runtime_policy_does_not_reject_kernel_default_timeout() {
+    let env = TestEnv::new();
+    let rule = RuntimeExecutionRule {
+        working_dir_roots: vec![env.path().to_path_buf()],
+        allowed_env_passthrough_keys: BTreeSet::new(),
+        min_timeout: Duration::from_millis(10),
+        max_timeout: Duration::from_millis(100),
+    };
+
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            runtime_turn_idle_timeout: Duration::from_millis(600),
+            runtime_turn_hard_timeout: Duration::from_millis(1_200),
+            runtime_execution_policy: RuntimeExecutionPolicy::default().with_rule("mock", rule),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "local-cli".to_string(),
+            peer_id: "runtime-policy-default-timeout".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: None,
+        })
+        .await
+        .expect("open session");
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "run with kernel timeout defaults".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("kernel defaults should not be denied by per-request timeout policy");
+
+    let policy_events = kernel
+        .query_audit(
+            Some(session.session_id),
+            Some("runtime.plan.allow".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query plan audit");
+    assert_eq!(
+        policy_events.events[0].details["effective_timeout_ms"].as_u64(),
+        Some(600)
+    );
+}
+
 struct TestEnv {
     temp_dir: TempDir,
 }

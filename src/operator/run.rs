@@ -17,34 +17,57 @@ use crate::{
     home::{runtime_project_partition_key, LionClawHome},
     kernel::Kernel,
     operator::{
-        reconcile::{apply, onboard, open_runtime_kernel, render_runtime_cache},
+        reconcile::{apply, onboard, open_runtime_kernel_with_timeouts, render_runtime_cache},
         runtime::{resolve_runtime_id, validate_runtime_launch_prerequisites},
     },
+    runtime_timeouts::RuntimeTurnTimeouts,
 };
 
 pub async fn run_local(
     home: &LionClawHome,
     requested_runtime: Option<String>,
     continue_last_session: bool,
+    timeout_override: Option<RuntimeTurnTimeouts>,
 ) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut input = BufReader::new(stdin);
     let mut output = stdout;
-    run_local_with_io(
+    run_local_with_io_and_timeouts(
         home,
         requested_runtime,
         continue_last_session,
+        timeout_override,
         &mut input,
         &mut output,
     )
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn run_local_with_io<R: BufRead + Send, W: Write + Send>(
     home: &LionClawHome,
     requested_runtime: Option<String>,
     continue_last_session: bool,
+    input: &mut R,
+    output: &mut W,
+) -> Result<()> {
+    run_local_with_io_and_timeouts(
+        home,
+        requested_runtime,
+        continue_last_session,
+        None,
+        input,
+        output,
+    )
+    .await
+}
+
+pub(crate) async fn run_local_with_io_and_timeouts<R: BufRead + Send, W: Write + Send>(
+    home: &LionClawHome,
+    requested_runtime: Option<String>,
+    continue_last_session: bool,
+    timeout_override: Option<RuntimeTurnTimeouts>,
     input: &mut R,
     output: &mut W,
 ) -> Result<()> {
@@ -55,15 +78,26 @@ pub(crate) async fn run_local_with_io<R: BufRead + Send, W: Write + Send>(
     let applied = apply(home).await?;
     render_runtime_cache(home, &applied.config, &applied.lockfile, &runtime_id).await?;
 
-    let kernel = open_runtime_kernel(home, &applied.config, Some(runtime_id.clone())).await?;
+    let effective_timeouts = timeout_override.unwrap_or_else(RuntimeTurnTimeouts::interactive);
+    let kernel = open_runtime_kernel_with_timeouts(
+        home,
+        &applied.config,
+        Some(runtime_id.clone()),
+        Some(effective_timeouts),
+    )
+    .await?;
     let project_workspace_root = resolve_project_workspace_root()
         .map_err(|err| anyhow!("failed to resolve project workspace root: {err}"))?;
     let peer_id = local_peer_id_for_project(&project_workspace_root);
+    let project_workspace_root = project_workspace_root.display().to_string();
     run_repl(
         &kernel,
-        &runtime_id,
-        &project_workspace_root.display().to_string(),
-        &peer_id,
+        ReplContext {
+            runtime_id: &runtime_id,
+            project_workspace_root: &project_workspace_root,
+            peer_id: &peer_id,
+            timeouts: effective_timeouts,
+        },
         continue_last_session,
         input,
         output,
@@ -71,23 +105,32 @@ pub(crate) async fn run_local_with_io<R: BufRead + Send, W: Write + Send>(
     .await
 }
 
+struct ReplContext<'a> {
+    runtime_id: &'a str,
+    project_workspace_root: &'a str,
+    peer_id: &'a str,
+    timeouts: RuntimeTurnTimeouts,
+}
+
 async fn run_repl<R: BufRead + Send, W: Write + Send>(
     kernel: &Kernel,
-    runtime_id: &str,
-    project_workspace_root: &str,
-    peer_id: &str,
+    context: ReplContext<'_>,
     continue_last_session: bool,
     input: &mut R,
     output: &mut W,
 ) -> Result<()> {
-    let mut session_id = resolve_repl_session(kernel, peer_id, continue_last_session)
+    let mut session_id = resolve_repl_session(kernel, context.peer_id, continue_last_session)
         .await
         .map_err(kernel_to_anyhow)?
         .session_id;
 
     writeln!(
         output,
-        "LionClaw interactive mode\nruntime: {runtime_id}\nproject: {project_workspace_root}\nType /continue, /retry, /reset, or /exit.\n"
+        "LionClaw interactive mode\nruntime: {}\nproject: {}\ntimeout: idle {}, hard {}\nType /continue, /retry, /reset, or /exit.\n",
+        context.runtime_id,
+        context.project_workspace_root,
+        crate::runtime_timeouts::format_duration(context.timeouts.idle),
+        crate::runtime_timeouts::format_duration(context.timeouts.hard),
     )?;
 
     if continue_last_session {
@@ -115,7 +158,7 @@ async fn run_repl<R: BufRead + Send, W: Write + Send>(
             render_session_action(
                 kernel,
                 session_id,
-                runtime_id,
+                context.runtime_id,
                 SessionActionKind::ContinueLastPartial,
                 output,
             )
@@ -126,7 +169,7 @@ async fn run_repl<R: BufRead + Send, W: Write + Send>(
             render_session_action(
                 kernel,
                 session_id,
-                runtime_id,
+                context.runtime_id,
                 SessionActionKind::RetryLastTurn,
                 output,
             )
@@ -146,7 +189,7 @@ async fn run_repl<R: BufRead + Send, W: Write + Send>(
             continue;
         }
 
-        render_streaming_turn(kernel, session_id, runtime_id, trimmed, output).await?;
+        render_streaming_turn(kernel, session_id, context.runtime_id, trimmed, output).await?;
     }
 
     Ok(())
@@ -487,6 +530,7 @@ mod tests {
 
     use super::{
         local_peer_id_for_project, render_turn_stream, resolve_repl_session, run_local_with_io,
+        run_local_with_io_and_timeouts,
     };
     use crate::{
         config::resolve_project_workspace_root,
@@ -501,6 +545,7 @@ mod tests {
             config::{ManagedSkillConfig, OperatorConfig, RuntimeProfileConfig},
             lockfile::OperatorLockfile,
         },
+        runtime_timeouts::RuntimeTurnTimeouts,
     };
 
     #[cfg(unix)]
@@ -545,6 +590,52 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             .expect("fetch count");
         let count: i64 = row.get("count");
         assert_eq!(count, 1, "run should create one kernel session");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_local_timeout_override_sets_kernel_turn_limit() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let stub = temp_dir.path().join("codex-stub.sh");
+        write_script(
+            &stub,
+            r#"#!/usr/bin/env bash
+cat >/dev/null
+sleep 1
+"#,
+        );
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
+        config.save(&home).await.expect("save config");
+        write_codex_runtime_auth(&home).await;
+
+        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut output = Vec::new();
+        run_local_with_io_and_timeouts(
+            &home,
+            None,
+            false,
+            Some(RuntimeTurnTimeouts::with_hard_timeout(
+                std::time::Duration::from_millis(60),
+            )),
+            &mut input,
+            &mut output,
+        )
+        .await
+        .expect("run local");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(
+            output.contains("timeout: idle 60ms, hard 60ms"),
+            "REPL should print the effective timeout budget: {output}"
+        );
+        assert!(
+            output.contains("[error] Runtime reached the 60ms safety limit.")
+                || output.contains("[error] Runtime idle timed out after 60ms with no output."),
+            "timeout should use the override instead of the default: {output}"
+        );
     }
 
     #[cfg(unix)]

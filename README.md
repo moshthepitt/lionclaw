@@ -105,6 +105,14 @@ Continue the latest local session for the current project:
 ./target/release/lionclaw run --continue-last-session <runtime>
 ```
 
+Long turns are bounded by two kernel-enforced timers: an idle timeout for stalled
+runtimes and a hard safety limit. The local interactive default is 5 minutes idle
+and 2 hours hard. For unusually long work, raise the hard limit:
+
+```bash
+./target/release/lionclaw run --timeout 4h <runtime>
+```
+
 Inside the interactive REPL:
 
 - `/continue` resumes from a partial timed-out, failed, cancelled, or interrupted assistant answer

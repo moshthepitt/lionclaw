@@ -38,4 +38,5 @@ pub mod daemon;
 pub mod home;
 pub mod kernel;
 pub mod operator;
+pub mod runtime_timeouts;
 pub mod workspace;

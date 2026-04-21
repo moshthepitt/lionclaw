@@ -26,6 +26,7 @@ use crate::{
         },
         snapshot::{install_snapshot, InstalledSnapshot},
     },
+    runtime_timeouts::RuntimeTurnTimeouts,
     workspace::{bootstrap_workspace, read_workspace_sections, GENERATED_AGENTS_FILE},
 };
 
@@ -727,13 +728,22 @@ pub(crate) async fn open_kernel(
     config: &OperatorConfig,
     default_runtime_id: Option<String>,
 ) -> Result<Kernel> {
-    open_kernel_with_project_root(home, config, default_runtime_id, None).await
+    open_kernel_with_project_root(home, config, default_runtime_id, None, None).await
 }
 
 pub(crate) async fn open_runtime_kernel(
     home: &LionClawHome,
     config: &OperatorConfig,
     default_runtime_id: Option<String>,
+) -> Result<Kernel> {
+    open_runtime_kernel_with_timeouts(home, config, default_runtime_id, None).await
+}
+
+pub(crate) async fn open_runtime_kernel_with_timeouts(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+    default_runtime_id: Option<String>,
+    timeout_override: Option<RuntimeTurnTimeouts>,
 ) -> Result<Kernel> {
     let project_workspace_root =
         resolve_project_workspace_root().context("failed to resolve project workspace root")?;
@@ -742,6 +752,7 @@ pub(crate) async fn open_runtime_kernel(
         config,
         default_runtime_id,
         Some(project_workspace_root),
+        timeout_override,
     )
     .await
 }
@@ -751,13 +762,17 @@ async fn open_kernel_with_project_root(
     config: &OperatorConfig,
     default_runtime_id: Option<String>,
     project_workspace_root: Option<PathBuf>,
+    timeout_override: Option<RuntimeTurnTimeouts>,
 ) -> Result<Kernel> {
     let workspace_root = config.workspace_root(home);
     let runtime_context =
         resolve_runtime_execution_context(home, config, default_runtime_id.as_deref()).await?;
+    let timeouts = timeout_override.unwrap_or_else(RuntimeTurnTimeouts::interactive);
     let kernel = Kernel::new_with_options(
         &home.db_path(),
         KernelOptions {
+            runtime_turn_idle_timeout: timeouts.idle,
+            runtime_turn_hard_timeout: timeouts.hard,
             runtime_execution_policy: project_workspace_root
                 .clone()
                 .map(RuntimeExecutionPolicy::for_working_dir_root)
@@ -980,7 +995,7 @@ mod tests {
         open_kernel(&home, &config, None)
             .await
             .expect("state kernel should open without a project root");
-        open_kernel_with_project_root(&home, &config, None, None)
+        open_kernel_with_project_root(&home, &config, None, None, None)
             .await
             .expect("state kernel helper should allow a missing project root");
     }

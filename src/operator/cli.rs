@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{str::FromStr, time::Duration};
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
@@ -35,6 +35,7 @@ use crate::{
         },
         services::SystemdUserServiceManager,
     },
+    runtime_timeouts::{parse_duration, RuntimeTurnTimeouts},
 };
 
 #[derive(Debug, Parser)]
@@ -80,6 +81,12 @@ enum Command {
 struct RunArgs {
     #[arg(long)]
     continue_last_session: bool,
+    #[arg(
+        long,
+        value_parser = parse_runtime_timeout,
+        help = "Runtime safety limit for each turn, such as 30m, 2h, or 7200s"
+    )]
+    timeout: Option<Duration>,
     runtime: Option<String>,
 }
 
@@ -382,7 +389,14 @@ pub async fn run() -> Result<()> {
             );
         }
         Command::Run(args) => {
-            run_local(&home, args.runtime, args.continue_last_session).await?;
+            let timeout_override = args.timeout.map(RuntimeTurnTimeouts::with_hard_timeout);
+            run_local(
+                &home,
+                args.runtime,
+                args.continue_last_session,
+                timeout_override,
+            )
+            .await?;
         }
         Command::Runtime { command } => match *command {
             RuntimeCommand::Add(args) => {
@@ -908,6 +922,10 @@ fn parse_onboard_bind(raw: &str) -> Result<OnboardBindSelection> {
         return Ok(OnboardBindSelection::Auto);
     }
     Ok(OnboardBindSelection::Explicit(bind.to_string()))
+}
+
+fn parse_runtime_timeout(raw: &str) -> std::result::Result<Duration, String> {
+    parse_duration(raw)
 }
 
 async fn load_job_prompt(prompt: Option<String>, prompt_file: Option<String>) -> Result<String> {
