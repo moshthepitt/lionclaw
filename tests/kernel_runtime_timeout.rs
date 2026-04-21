@@ -165,6 +165,90 @@ async fn runtime_activity_resets_idle_timeout() {
     );
 }
 
+#[tokio::test]
+async fn runtime_hard_timeout_reports_safety_limit_and_audit_kind() {
+    let sandbox = TestEnv::new();
+    let kernel = Kernel::new_with_options(
+        &sandbox.db_path(),
+        KernelOptions {
+            runtime_turn_idle_timeout: Duration::from_millis(100),
+            runtime_turn_hard_timeout: Duration::from_millis(250),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    kernel
+        .register_runtime_adapter(
+            "chatty",
+            Arc::new(ChattyRuntimeAdapter {
+                idle_gap: Duration::from_millis(10),
+                event_count: 100,
+            }),
+        )
+        .await;
+
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "local-cli".to_string(),
+            peer_id: "hard-timeout-peer".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: None,
+        })
+        .await
+        .expect("open session");
+
+    let err = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "keep producing events until the hard ceiling".to_string(),
+            runtime_id: Some("chatty".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect_err("turn should hit the hard timeout");
+
+    match err {
+        KernelError::RuntimeTimeout(message) => {
+            assert!(
+                message.contains("safety limit"),
+                "hard timeout should be explained as a safety limit"
+            );
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+
+    let timeout_events = kernel
+        .query_audit(
+            Some(session.session_id),
+            Some("runtime.turn.timeout".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query timeout audit");
+
+    assert_eq!(timeout_events.events.len(), 1, "one timeout event expected");
+    assert_eq!(
+        timeout_events.events[0].details["runtime_id"].as_str(),
+        Some("chatty"),
+        "timeout audit should include runtime id"
+    );
+    assert_eq!(
+        timeout_events.events[0].details["timeout_kind"].as_str(),
+        Some("hard"),
+        "timeout audit should distinguish hard timeout"
+    );
+    assert_eq!(
+        timeout_events.events[0].details["timeout_ms"].as_u64(),
+        Some(250),
+        "timeout audit should include the hard timeout budget"
+    );
+}
+
 struct SlowRuntimeAdapter {
     cancel_calls: Arc<AtomicUsize>,
     close_calls: Arc<AtomicUsize>,

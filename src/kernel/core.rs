@@ -45,6 +45,7 @@ use crate::{
         runtime_project_drafts_dir_from_parts, runtime_project_generated_agents_path_from_parts,
         runtime_project_partition_key, LionClawHome, RUNTIME_SESSION_READY_MARKER,
     },
+    runtime_timeouts::{format_duration, RuntimeTurnTimeouts},
     workspace::{read_workspace_sections, GENERATED_AGENTS_FILE},
 };
 
@@ -95,11 +96,13 @@ use super::{
 };
 
 const ACTIVE_GLOBAL_SLICE_LIMIT: usize = 5;
+const HIDDEN_COMPACTION_TURN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct KernelOptions {
     pub runtime_turn_idle_timeout: Duration,
     pub runtime_turn_hard_timeout: Duration,
+    pub hidden_compaction_turn_timeout: Duration,
     pub runtime_execution_policy: RuntimeExecutionPolicy,
     pub default_runtime_id: Option<String>,
     pub default_preset_name: Option<String>,
@@ -119,6 +122,10 @@ impl fmt::Debug for KernelOptions {
         f.debug_struct("KernelOptions")
             .field("runtime_turn_idle_timeout", &self.runtime_turn_idle_timeout)
             .field("runtime_turn_hard_timeout", &self.runtime_turn_hard_timeout)
+            .field(
+                "hidden_compaction_turn_timeout",
+                &self.hidden_compaction_turn_timeout,
+            )
             .field("runtime_execution_policy", &self.runtime_execution_policy)
             .field("default_runtime_id", &self.default_runtime_id)
             .field("default_preset_name", &self.default_preset_name)
@@ -140,9 +147,11 @@ impl fmt::Debug for KernelOptions {
 
 impl Default for KernelOptions {
     fn default() -> Self {
+        let timeouts = RuntimeTurnTimeouts::interactive();
         Self {
-            runtime_turn_idle_timeout: Duration::from_secs(120),
-            runtime_turn_hard_timeout: Duration::from_secs(600),
+            runtime_turn_idle_timeout: timeouts.idle,
+            runtime_turn_hard_timeout: timeouts.hard,
+            hidden_compaction_turn_timeout: HIDDEN_COMPACTION_TURN_TIMEOUT,
             runtime_execution_policy: RuntimeExecutionPolicy::default(),
             default_runtime_id: None,
             default_preset_name: None,
@@ -187,6 +196,7 @@ pub struct Kernel {
     runtime_root: Option<PathBuf>,
     workspace_name: Option<String>,
     continuity: Option<ContinuityLayout>,
+    hidden_compaction_turn_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +264,11 @@ impl Kernel {
                 .runtime_turn_hard_timeout
                 .max(runtime_turn_idle_timeout)
         };
+        let hidden_compaction_turn_timeout = if options.hidden_compaction_turn_timeout.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            options.hidden_compaction_turn_timeout
+        };
         let capability_broker =
             if let Some(project_workspace_root) = options.project_workspace_root.clone() {
                 CapabilityBroker::new(project_workspace_root)
@@ -310,6 +325,7 @@ impl Kernel {
             runtime_root: options.runtime_root,
             workspace_name: options.workspace_name,
             continuity,
+            hidden_compaction_turn_timeout,
         };
 
         kernel.bootstrap().await;
@@ -2449,6 +2465,7 @@ impl Kernel {
                 "runtime '{runtime_id}' does not support side-effect-free hidden compaction"
             )));
         }
+        let hidden_compaction_turn_timeout = self.hidden_compaction_turn_timeout;
         let execution_plan = self
             .resolve_runtime_execution_plan(
                 session_id,
@@ -2460,7 +2477,7 @@ impl Kernel {
                     preset_name: None,
                     working_dir: None,
                     env_passthrough_keys: Vec::new(),
-                    timeout_ms: Some(30_000),
+                    timeout_ms: Some(hidden_compaction_turn_timeout.as_millis() as u64),
                 },
             )
             .await?;
@@ -2483,7 +2500,7 @@ impl Kernel {
             selected_skills: Vec::new(),
         };
         let runtime_secrets_mount = self.resolve_runtime_secrets_mount(&execution_plan).await?;
-        let turn_outcome = timeout(execution_plan.hard_timeout, async {
+        let turn_outcome = timeout(hidden_compaction_turn_timeout, async {
             match adapter.turn_mode() {
                 RuntimeTurnMode::Direct => adapter.turn(turn_input, event_tx).await,
                 RuntimeTurnMode::ProgramBacked => {
@@ -6131,7 +6148,10 @@ impl Kernel {
                     };
                 }
                 _ = &mut idle_sleep => {
-                    let reason = format!("turn idle timed out after {idle_timeout_ms} ms");
+                    let reason = format!(
+                        "Runtime idle timed out after {} with no output.",
+                        format_duration(idle_timeout)
+                    );
                     return self
                         .abort_runtime_turn(RuntimeTurnAbortExecution {
                             adapter: adapter.as_ref(),
@@ -6149,7 +6169,10 @@ impl Kernel {
                         .await;
                 }
                 _ = &mut hard_sleep => {
-                    let reason = format!("turn exceeded hard timeout after {hard_timeout_ms} ms");
+                    let reason = format!(
+                        "Runtime reached the {} safety limit.",
+                        format_duration(hard_timeout)
+                    );
                     return self
                         .abort_runtime_turn(RuntimeTurnAbortExecution {
                             adapter: adapter.as_ref(),

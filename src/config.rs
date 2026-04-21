@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::home::{LionClawHome, DEFAULT_WORKSPACE};
+use crate::runtime_timeouts::RuntimeTurnTimeouts;
 
 const DEFAULT_BIND_HOST: &str = "127.0.0.1";
 const DEFAULT_BIND_PORT: &str = "8979";
@@ -31,18 +32,12 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|_| home.db_path());
 
-        let runtime_turn_idle_timeout_ms = std::env::var("LIONCLAW_RUNTIME_TURN_IDLE_TIMEOUT_MS")
-            .ok()
-            .or_else(|| std::env::var("LIONCLAW_RUNTIME_TURN_TIMEOUT_MS").ok())
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(120_000);
-        let runtime_turn_hard_timeout_ms = std::env::var("LIONCLAW_RUNTIME_TURN_HARD_TIMEOUT_MS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .map(|value| value.max(runtime_turn_idle_timeout_ms))
-            .unwrap_or_else(|| runtime_turn_idle_timeout_ms.max(600_000));
+        let (runtime_turn_idle_timeout_ms, runtime_turn_hard_timeout_ms) =
+            resolve_runtime_turn_timeout_ms(
+                std::env::var("LIONCLAW_RUNTIME_TURN_IDLE_TIMEOUT_MS").ok(),
+                std::env::var("LIONCLAW_RUNTIME_TURN_TIMEOUT_MS").ok(),
+                std::env::var("LIONCLAW_RUNTIME_TURN_HARD_TIMEOUT_MS").ok(),
+            );
 
         let default_runtime_id = std::env::var("LIONCLAW_DEFAULT_RUNTIME_ID")
             .ok()
@@ -74,6 +69,27 @@ impl Config {
             codex_home_override,
         })
     }
+}
+
+fn resolve_runtime_turn_timeout_ms(
+    idle_timeout_ms: Option<String>,
+    legacy_idle_timeout_ms: Option<String>,
+    hard_timeout_ms: Option<String>,
+) -> (u64, u64) {
+    let default_timeouts = RuntimeTurnTimeouts::daemon();
+    let idle_timeout_ms = idle_timeout_ms
+        .or(legacy_idle_timeout_ms)
+        .and_then(parse_positive_millis)
+        .unwrap_or(default_timeouts.idle.as_millis() as u64);
+    let hard_timeout_ms = hard_timeout_ms
+        .and_then(parse_positive_millis)
+        .map(|value| value.max(idle_timeout_ms))
+        .unwrap_or_else(|| (default_timeouts.hard.as_millis() as u64).max(idle_timeout_ms));
+    (idle_timeout_ms, hard_timeout_ms)
+}
+
+fn parse_positive_millis(raw: String) -> Option<u64> {
+    raw.parse::<u64>().ok().filter(|value| *value > 0)
 }
 
 pub fn resolve_optional_env_override_path(var: &str) -> std::io::Result<Option<PathBuf>> {
@@ -169,7 +185,8 @@ fn join_host_port(host: &str, port: &str) -> String {
 mod tests {
     use super::{
         canonicalize_project_workspace_root, join_host_port, resolve_bind_addr,
-        resolve_optional_override_path, DEFAULT_BIND_HOST, DEFAULT_BIND_PORT,
+        resolve_optional_override_path, resolve_runtime_turn_timeout_ms, DEFAULT_BIND_HOST,
+        DEFAULT_BIND_PORT,
     };
     use tempfile::tempdir;
 
@@ -235,5 +252,41 @@ mod tests {
         std::env::set_current_dir(original_dir).expect("restore cwd");
 
         assert_eq!(resolved, Some(project_root.join(".codex")));
+    }
+
+    #[test]
+    fn runtime_turn_timeout_env_uses_daemon_defaults() {
+        assert_eq!(
+            resolve_runtime_turn_timeout_ms(None, None, None),
+            (10 * 60 * 1_000, 4 * 60 * 60 * 1_000)
+        );
+    }
+
+    #[test]
+    fn runtime_turn_timeout_env_accepts_legacy_idle_value() {
+        assert_eq!(
+            resolve_runtime_turn_timeout_ms(None, Some("900000".to_string()), None),
+            (15 * 60 * 1_000, 4 * 60 * 60 * 1_000)
+        );
+    }
+
+    #[test]
+    fn runtime_turn_timeout_env_accepts_explicit_hard_value() {
+        assert_eq!(
+            resolve_runtime_turn_timeout_ms(None, None, Some("1800000".to_string())),
+            (10 * 60 * 1_000, 30 * 60 * 1_000)
+        );
+    }
+
+    #[test]
+    fn runtime_turn_timeout_env_clamps_hard_to_idle() {
+        assert_eq!(
+            resolve_runtime_turn_timeout_ms(
+                Some("900000".to_string()),
+                None,
+                Some("120000".to_string())
+            ),
+            (15 * 60 * 1_000, 15 * 60 * 1_000)
+        );
     }
 }
