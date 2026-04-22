@@ -246,6 +246,20 @@ impl SkillStore {
     }
 
     async fn set_alias(&self, skill_id: &str, alias: &str) -> Result<SkillRecord> {
+        if let Some(skill) = self.get(skill_id).await? {
+            if skill.enabled {
+                if let Some(existing) = self.find_enabled_by_alias(alias).await? {
+                    if existing.skill_id != skill.skill_id {
+                        return Err(SkillAliasConflict {
+                            alias: alias.to_string(),
+                            existing_skill_id: existing.skill_id,
+                        }
+                        .into());
+                    }
+                }
+            }
+        }
+
         sqlx::query("UPDATE skills SET alias = ?2 WHERE skill_id = ?1")
             .bind(skill_id)
             .bind(alias)

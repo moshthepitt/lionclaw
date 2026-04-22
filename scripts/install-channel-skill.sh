@@ -14,7 +14,7 @@ Options:
   --skill-ref REF        Skill reference (default: local)
   --runtime-id ID        Optional runtime override exported to worker env (default: omitted)
   --lionclaw-bin PATH    LionClaw CLI to use (default: lionclaw)
-  --start-worker         Start the canonical snapshot's scripts/worker after install+bind
+  --start-worker         Start the canonical snapshot's worker after install+bind
   -h, --help             Show help
 
 Environment pass-through for worker:
@@ -104,7 +104,16 @@ PY
     exit 1
   fi
 
-  printf '%s\n' "$home_root/$snapshot_dir/scripts/worker"
+  local snapshot_root="$home_root/$snapshot_dir"
+  for candidate in "$snapshot_root/scripts/worker" "$snapshot_root/scripts/worker.sh"; do
+    if [[ -f "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  echo "worker entrypoint is missing under canonical snapshot; expected scripts/worker or scripts/worker.sh" >&2
+  exit 1
 }
 
 require_cmd sed
@@ -141,10 +150,6 @@ if [[ "$START_WORKER" == true ]]; then
   require_cmd curl
   curl -fsS "$BASE_URL/health" >/dev/null
   WORKER="$(resolve_snapshot_worker)"
-  if [[ ! -f "$WORKER" ]]; then
-    echo "worker entrypoint is missing under canonical snapshot; expected scripts/worker" >&2
-    exit 1
-  fi
   if [[ ! -x "$WORKER" ]]; then
     chmod +x "$WORKER" 2>/dev/null || true
   fi

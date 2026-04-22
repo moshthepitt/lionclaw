@@ -4124,6 +4124,8 @@ fn internal(err: anyhow::Error) -> KernelError {
 fn skill_install_error(err: anyhow::Error) -> KernelError {
     if let Some(err) = err.downcast_ref::<SkillAliasValidationError>() {
         KernelError::BadRequest(err.to_string())
+    } else if let Some(err) = err.downcast_ref::<SkillAliasConflict>() {
+        KernelError::Conflict(err.to_string())
     } else {
         internal(err)
     }

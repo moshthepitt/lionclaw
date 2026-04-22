@@ -142,9 +142,36 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
     let kernel = open_kernel(home, &config, None).await?;
     let mut next_lock = OperatorLockfile::default();
     let mut installed_skills = BTreeMap::new();
+    let mut desired_skills = Vec::new();
+    let mut snapshot_aliases = BTreeMap::new();
 
     for skill in &config.skills {
+        validate_skill_alias(&skill.alias)?;
         let snapshot = install_snapshot(home, &skill.alias, &skill.source, &skill.reference)?;
+        let snapshot_key = (
+            snapshot.source_uri.clone(),
+            snapshot.reference.clone(),
+            snapshot.hash.clone(),
+        );
+        if let Some(existing_alias) = snapshot_aliases.insert(snapshot_key, skill.alias.clone()) {
+            return Err(anyhow!(
+                "skill snapshot is configured under both '{}' and '{}'; remove one alias",
+                existing_alias,
+                skill.alias
+            ));
+        }
+        desired_skills.push((skill, snapshot));
+    }
+
+    for (skill, snapshot) in desired_skills {
+        if let Some(old_skill) = previous_lock.find_skill(&skill.alias).filter(|old_skill| {
+            old_skill.source != snapshot.source_uri
+                || old_skill.reference != snapshot.reference
+                || old_skill.hash != snapshot.hash
+        }) {
+            disable_stale_skill_if_present(&kernel, &old_skill.skill_id).await?;
+        }
+
         let installed = kernel
             .install_skill(crate::contracts::SkillInstallRequest {
                 source: snapshot.source_uri.clone(),
@@ -833,7 +860,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        apply, onboard, open_kernel, open_kernel_with_project_root, render_marker_file,
+        add_skill, apply, onboard, open_kernel, open_kernel_with_project_root, render_marker_file,
         render_runtime_cache, resolve_worker_entrypoint, status, up, ApplyResult,
         OnboardBindSelection, StackBinaryPaths,
     };
@@ -1220,6 +1247,110 @@ mod tests {
             skills.len(),
             2,
             "old revisions remain installed for auditability"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_add_reassigns_source_to_new_alias_without_internal_conflict() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+
+        let terminal_source =
+            write_channel_skill_fixture(temp_dir.path(), "channel-terminal", "terminal");
+        let telegram_source =
+            write_channel_skill_fixture(temp_dir.path(), "channel-telegram", "telegram");
+
+        add_skill(
+            &home,
+            "alpha".to_string(),
+            terminal_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("add alpha");
+        add_skill(
+            &home,
+            "beta".to_string(),
+            telegram_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("add beta");
+        apply(&home).await.expect("apply original aliases");
+
+        add_skill(
+            &home,
+            "beta".to_string(),
+            terminal_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("reassign terminal to beta");
+        let applied = apply(&home).await.expect("apply reassigned alias");
+
+        assert_eq!(applied.config.skills.len(), 1);
+        assert_eq!(applied.lockfile.skills.len(), 1);
+        assert_eq!(applied.lockfile.skills[0].alias, "beta");
+
+        let kernel = Kernel::new_with_options(
+            &home.db_path(),
+            KernelOptions {
+                default_runtime_id: None,
+                workspace_root: Some(home.workspace_dir("main")),
+                project_workspace_root: Some(home.workspace_dir("main")),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel");
+        let enabled = kernel
+            .list_skills()
+            .await
+            .expect("list skills")
+            .skills
+            .into_iter()
+            .filter(|skill| skill.enabled)
+            .collect::<Vec<_>>();
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].alias, "beta");
+        assert_eq!(enabled[0].skill_id, applied.lockfile.skills[0].skill_id);
+    }
+
+    #[tokio::test]
+    async fn apply_rejects_duplicate_snapshot_aliases() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+
+        let skill_source = write_channel_skill_fixture(temp_dir.path(), "channel-terminal", "test");
+        let source = skill_source.to_string_lossy().to_string();
+        let config = OperatorConfig {
+            skills: vec![
+                ManagedSkillConfig {
+                    alias: "alpha".to_string(),
+                    source: source.clone(),
+                    reference: "local".to_string(),
+                    enabled: true,
+                },
+                ManagedSkillConfig {
+                    alias: "beta".to_string(),
+                    source,
+                    reference: "local".to_string(),
+                    enabled: true,
+                },
+            ],
+            ..OperatorConfig::default()
+        };
+        config.save(&home).await.expect("save config");
+
+        let err = apply(&home)
+            .await
+            .expect_err("duplicate snapshot aliases should be rejected");
+        assert!(
+            err.to_string()
+                .contains("configured under both 'alpha' and 'beta'"),
+            "unexpected error: {err}"
         );
     }
 
