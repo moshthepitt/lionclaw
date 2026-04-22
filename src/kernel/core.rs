@@ -4682,10 +4682,17 @@ impl Kernel {
             SelectedSkillMode::Auto => self.selector.select(&prompt_user_text, &enabled_skills),
             SelectedSkillMode::Explicit(skill_ids) => skill_ids,
         };
+        let enabled_skill_ids = enabled_skills
+            .iter()
+            .map(|skill| skill.skill_id.as_str())
+            .collect::<HashSet<_>>();
         let any_scope = Scope::Any;
 
         let mut allowed_skills = Vec::new();
         for skill_id in selected_skill_ids {
+            if !enabled_skill_ids.contains(skill_id.as_str()) {
+                continue;
+            }
             let allowed_for_scope = self
                 .policy
                 .is_allowed(&skill_id, Capability::SkillUse, &default_policy_scope)

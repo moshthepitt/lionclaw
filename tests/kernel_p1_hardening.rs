@@ -426,6 +426,44 @@ async fn install_rejects_invalid_alias_as_bad_request() {
     }
 }
 
+#[tokio::test]
+async fn install_reuses_existing_skill_for_same_content_identity() {
+    let sandbox = temp_env();
+    let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
+    let skill_md = "---\nname: duplicate-content\ndescription: same content\n---\n";
+
+    let first = kernel
+        .install_skill(SkillInstallRequest {
+            source: "local/duplicate-one".to_string(),
+            alias: "duplicate-one".to_string(),
+            reference: Some("main".to_string()),
+            hash: Some("same-content-hash".to_string()),
+            skill_md: Some(skill_md.to_string()),
+            snapshot_path: None,
+        })
+        .await
+        .expect("install first source");
+    let second = kernel
+        .install_skill(SkillInstallRequest {
+            source: "local/duplicate-two".to_string(),
+            alias: "duplicate-two".to_string(),
+            reference: Some("main".to_string()),
+            hash: Some("same-content-hash".to_string()),
+            skill_md: Some(skill_md.to_string()),
+            snapshot_path: None,
+        })
+        .await
+        .expect("install same content from second source");
+
+    assert_eq!(second.skill_id, first.skill_id);
+    assert_eq!(second.alias, "duplicate-two");
+
+    let listed = kernel.list_skills().await.expect("list skills");
+    assert_eq!(listed.skills.len(), 1);
+    assert_eq!(listed.skills[0].skill_id, first.skill_id);
+    assert_eq!(listed.skills[0].alias, "duplicate-two");
+}
+
 struct TestEnv {
     temp_dir: TempDir,
 }

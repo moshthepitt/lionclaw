@@ -132,6 +132,12 @@ impl SkillStore {
                 }
                 return self.set_alias(&existing.skill_id, &alias).await;
             }
+            if let Some(existing) = self.get(&skill_id).await? {
+                if existing.alias == alias {
+                    return Ok(existing);
+                }
+                return self.set_alias(&existing.skill_id, &alias).await;
+            }
             return Err(err).context("failed to insert skill");
         }
 

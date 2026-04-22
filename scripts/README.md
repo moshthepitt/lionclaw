@@ -29,7 +29,6 @@ Run the same checks as GitHub CI:
 For channel-install scripts, prerequisites are:
 - `lionclaw` on `PATH`, or `--lionclaw-bin /path/to/lionclaw`
 - LionClaw running when `--start-worker` is used (default `http://127.0.0.1:8979`)
-- `sed` and `tr`
 - `curl` and `python3` with `tomllib` when `--start-worker` is used
 - A valid skill folder with `SKILL.md`
 

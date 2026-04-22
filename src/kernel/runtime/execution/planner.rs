@@ -6,6 +6,7 @@ use uuid::Uuid;
 use crate::home::runtime_profile_partition_key;
 use crate::home::{runtime_project_drafts_dir_from_parts, runtime_session_state_dir_from_parts};
 use crate::kernel::runtime_policy::{RuntimeExecutionPolicy, RuntimeExecutionRequest};
+use crate::kernel::skills::validate_skill_alias;
 
 use super::plan::{
     ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset, MountAccess, MountSpec,
@@ -410,7 +411,7 @@ fn is_selected_skill_mount_target(target: &str) -> bool {
     target
         .strip_prefix(SKILLS_MOUNT_TARGET_ROOT)
         .and_then(|suffix| suffix.strip_prefix('/'))
-        .is_some_and(|alias| !alias.is_empty() && !alias.contains('/'))
+        .is_some_and(|alias| !alias.contains('/') && validate_skill_alias(alias).is_ok())
 }
 
 fn validate_selected_skill_mounts(mounts: &[MountSpec]) -> Result<(), String> {
@@ -762,6 +763,47 @@ mod tests {
             err.contains("must be read-only"),
             "unexpected planner error: {err}"
         );
+    }
+
+    #[test]
+    fn planner_rejects_selected_skill_mounts_with_invalid_alias_targets() {
+        let sandbox = tempdir().expect("temp dir");
+        let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: RuntimeExecutionPolicy::default(),
+            default_preset_name: None,
+            presets: BTreeMap::new(),
+            runtimes: BTreeMap::new(),
+            workspace_root: None,
+            project_workspace_root: None,
+            runtime_root: None,
+            workspace_name: None,
+            default_idle_timeout: Duration::from_secs(30),
+            default_hard_timeout: Duration::from_secs(90),
+        });
+
+        for target in ["/lionclaw/skills/..", "/lionclaw/skills/not path safe"] {
+            let err = planner
+                .plan(ExecutionPlanRequest {
+                    session_id: Some(Uuid::nil()),
+                    runtime_id: "codex".to_string(),
+                    purpose: ExecutionPlanPurpose::Interactive,
+                    preset_name: None,
+                    working_dir: None,
+                    env_passthrough_keys: Vec::new(),
+                    selected_skill_mounts: vec![MountSpec {
+                        source: sandbox.path().join(".lionclaw/skills/terminal"),
+                        target: target.to_string(),
+                        access: MountAccess::ReadOnly,
+                    }],
+                    timeout_ms: None,
+                })
+                .expect_err("selected skill mount targets must use valid skill aliases");
+
+            assert!(
+                err.contains("must be under /lionclaw/skills/<alias>"),
+                "unexpected planner error for {target}: {err}"
+            );
+        }
     }
 
     #[test]

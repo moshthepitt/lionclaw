@@ -155,12 +155,9 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
             ));
         }
         let snapshot = install_snapshot(home, &skill.alias, &skill.source, &skill.reference)?;
-        let snapshot_key = (
-            snapshot.source_uri.clone(),
-            snapshot.reference.clone(),
-            snapshot.hash.clone(),
-        );
-        if let Some(existing_alias) = snapshot_aliases.insert(snapshot_key, skill.alias.clone()) {
+        if let Some(existing_alias) =
+            snapshot_aliases.insert(snapshot.skill_id.clone(), skill.alias.clone())
+        {
             return Err(anyhow!(
                 "skill snapshot is configured under both '{}' and '{}'; remove one alias",
                 existing_alias,
@@ -1325,7 +1322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_rejects_duplicate_snapshot_aliases() {
+    async fn apply_rejects_duplicate_skill_snapshots() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         onboard(&home, None).await.expect("onboard");
@@ -1343,7 +1340,7 @@ mod tests {
                 ManagedSkillConfig {
                     alias: "beta".to_string(),
                     source,
-                    reference: "local".to_string(),
+                    reference: "other-ref".to_string(),
                     enabled: true,
                 },
             ],
@@ -1353,7 +1350,7 @@ mod tests {
 
         let err = apply(&home)
             .await
-            .expect_err("duplicate snapshot aliases should be rejected");
+            .expect_err("duplicate skill snapshots should be rejected");
         assert!(
             err.to_string()
                 .contains("configured under both 'alpha' and 'beta'"),

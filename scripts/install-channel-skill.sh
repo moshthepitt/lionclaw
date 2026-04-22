@@ -10,7 +10,7 @@ Options:
   --base-url URL         LionClaw base URL (default: http://127.0.0.1:8979)
   --channel-id ID        Channel ID to bind (default: telegram)
   --skill-source PATH    Skill source path (default: skills/channel-telegram)
-  --skill-alias ALIAS    Skill alias to register and bind (default: derived from source)
+  --skill-alias ALIAS    Skill alias to register and bind (default: channel id)
   --skill-ref REF        Skill reference (default: local)
   --runtime-id ID        Optional runtime override exported to worker env (default: omitted)
   --lionclaw-bin PATH    LionClaw CLI to use (default: lionclaw)
@@ -58,19 +58,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-derive_skill_alias() {
-  local source="$1"
-  local raw="${source#local:}"
-  raw="${raw%/}"
-  raw="${raw##*/}"
-  raw="${raw#channel-}"
-  raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+|-+$//g')"
-  if [[ -z "$raw" ]]; then
-    raw="skill"
-  fi
-  printf '%s' "$raw"
-}
-
 resolve_snapshot_worker() {
   local home_root="${LIONCLAW_HOME:-$HOME/.lionclaw}"
   local lock_path="$home_root/config/lionclaw.lock"
@@ -115,8 +102,6 @@ PY
   exit 1
 }
 
-require_cmd sed
-require_cmd tr
 require_cmd "$LIONCLAW_BIN"
 
 SKILL_MD_PATH="$SKILL_SOURCE/SKILL.md"
@@ -126,7 +111,7 @@ if [[ ! -f "$SKILL_MD_PATH" ]]; then
 fi
 
 if [[ -z "$SKILL_ALIAS" ]]; then
-  SKILL_ALIAS="$(derive_skill_alias "$SKILL_SOURCE")"
+  SKILL_ALIAS="$CHANNEL_ID"
 fi
 
 "$LIONCLAW_BIN" skill add "$SKILL_SOURCE" --alias "$SKILL_ALIAS" --reference "$SKILL_REF" >/dev/null
