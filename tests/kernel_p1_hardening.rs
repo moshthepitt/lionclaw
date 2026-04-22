@@ -357,32 +357,25 @@ async fn enable_rejects_reusing_alias_for_different_skill() {
     let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
 
     let first = kernel
-        .install_skill(SkillInstallRequest {
-            source: "local/first-skill".to_string(),
-            alias: "shared-alias".to_string(),
-            reference: Some("main".to_string()),
-            hash: Some("first-hash".to_string()),
-            skill_md: Some("---\nname: first-skill\ndescription: first skill\n---\n".to_string()),
-            snapshot_path: None,
-        })
+        .install_skill(skill_install_request(
+            "local/first-skill",
+            "shared-alias",
+            "first-hash",
+        ))
         .await
         .expect("install first skill");
+    let second = kernel
+        .install_skill(skill_install_request(
+            "local/second-skill",
+            "shared-alias",
+            "second-hash",
+        ))
+        .await
+        .expect("install second disabled skill revision");
     kernel
         .enable_skill(first.skill_id)
         .await
         .expect("enable first skill");
-
-    let second = kernel
-        .install_skill(SkillInstallRequest {
-            source: "local/second-skill".to_string(),
-            alias: "shared-alias".to_string(),
-            reference: Some("main".to_string()),
-            hash: Some("second-hash".to_string()),
-            skill_md: Some("---\nname: second-skill\ndescription: second skill\n---\n".to_string()),
-            snapshot_path: None,
-        })
-        .await
-        .expect("install second disabled skill revision");
 
     let err = kernel
         .enable_skill(second.skill_id)
@@ -395,6 +388,87 @@ async fn enable_rejects_reusing_alias_for_different_skill() {
             "unexpected conflict: {message}"
         ),
         other => panic!("expected alias conflict, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn install_rejects_enabled_alias_reuse_as_conflict() {
+    let sandbox = temp_env();
+    let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
+
+    let first = kernel
+        .install_skill(skill_install_request(
+            "local/first-enabled-alias",
+            "active-alias",
+            "first-enabled-alias-hash",
+        ))
+        .await
+        .expect("install first skill");
+    kernel
+        .enable_skill(first.skill_id)
+        .await
+        .expect("enable first skill");
+
+    let err = kernel
+        .install_skill(skill_install_request(
+            "local/second-enabled-alias",
+            "active-alias",
+            "second-enabled-alias-hash",
+        ))
+        .await
+        .expect_err("enabled alias reuse should fail during install");
+
+    match err {
+        KernelError::Conflict(message) => assert!(
+            message.contains("skill alias 'active-alias' is already enabled"),
+            "unexpected conflict: {message}"
+        ),
+        other => panic!("expected conflict, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn install_rejects_retitling_disabled_skill_to_enabled_alias() {
+    let sandbox = temp_env();
+    let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
+
+    let active = kernel
+        .install_skill(skill_install_request(
+            "local/active-skill",
+            "active-alias",
+            "active-skill-hash",
+        ))
+        .await
+        .expect("install active skill");
+    kernel
+        .enable_skill(active.skill_id)
+        .await
+        .expect("enable active skill");
+
+    kernel
+        .install_skill(skill_install_request(
+            "local/disabled-skill",
+            "disabled-alias",
+            "disabled-skill-hash",
+        ))
+        .await
+        .expect("install disabled skill");
+
+    let err = kernel
+        .install_skill(skill_install_request(
+            "local/disabled-skill",
+            "active-alias",
+            "disabled-skill-hash",
+        ))
+        .await
+        .expect_err("disabled skill alias update should respect enabled aliases");
+
+    match err {
+        KernelError::Conflict(message) => assert!(
+            message.contains("skill alias 'active-alias' is already enabled"),
+            "unexpected conflict: {message}"
+        ),
+        other => panic!("expected conflict, got {other:?}"),
     }
 }
 
@@ -477,6 +551,20 @@ impl TestEnv {
 fn temp_env() -> TestEnv {
     TestEnv {
         temp_dir: tempfile::tempdir().expect("create temp dir"),
+    }
+}
+
+fn skill_install_request(source: &str, alias: &str, hash: &str) -> SkillInstallRequest {
+    let name = source.split('/').next_back().unwrap_or(alias);
+    SkillInstallRequest {
+        source: source.to_string(),
+        alias: alias.to_string(),
+        reference: Some("main".to_string()),
+        hash: Some(hash.to_string()),
+        skill_md: Some(format!(
+            "---\nname: {name}\ndescription: {name} skill\n---\n"
+        )),
+        snapshot_path: None,
     }
 }
 

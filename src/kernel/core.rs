@@ -3319,7 +3319,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selected_skill_mounts_skip_skill_root_and_files() {
+    async fn selected_skill_mounts_skip_non_snapshot_paths() {
         let temp_dir = tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         home.ensure_base_dirs().await.expect("base dirs");
@@ -3327,6 +3327,10 @@ mod tests {
         tokio::fs::write(&snapshot_file, "not a directory")
             .await
             .expect("write snapshot file");
+        let nested_snapshot = home.skills_dir().join("snapshot").join("nested");
+        tokio::fs::create_dir_all(&nested_snapshot)
+            .await
+            .expect("create nested snapshot path");
 
         let kernel = Kernel::new_with_options(
             &temp_dir.path().join("lionclaw.db"),
@@ -3359,9 +3363,24 @@ mod tests {
             })
             .await
             .expect("install file skill");
+        let nested_skill = kernel
+            .install_skill(crate::contracts::SkillInstallRequest {
+                source: "local:/tmp/nested-skill".to_string(),
+                alias: "nested-skill".to_string(),
+                reference: Some("local".to_string()),
+                hash: Some("nested-hash".to_string()),
+                skill_md: Some("---\nname: nested\ndescription: nested skill\n---\n".to_string()),
+                snapshot_path: Some(nested_snapshot.to_string_lossy().to_string()),
+            })
+            .await
+            .expect("install nested skill");
 
         let (mounts, asset_paths) = kernel
-            .resolve_selected_skill_mounts(&[root_skill.skill_id, file_skill.skill_id])
+            .resolve_selected_skill_mounts(&[
+                root_skill.skill_id,
+                file_skill.skill_id,
+                nested_skill.skill_id,
+            ])
             .await
             .expect("resolve skill mounts");
 
@@ -5229,22 +5248,13 @@ impl Kernel {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(internal(err.into())),
         };
-        if source == snapshot_root {
-            warn!(
-                skill_id = %skill.skill_id,
-                alias = %skill.alias,
-                snapshot_path = %source.display(),
-                "skipping selected skill snapshot that points at the skill root"
-            );
-            return Ok(None);
-        }
-        if !source.starts_with(snapshot_root) {
+        if source.parent() != Some(snapshot_root) {
             warn!(
                 skill_id = %skill.skill_id,
                 alias = %skill.alias,
                 snapshot_path = %source.display(),
                 snapshot_root = %snapshot_root.display(),
-                "skipping selected skill snapshot outside LionClaw skill root"
+                "skipping selected skill snapshot outside canonical LionClaw snapshot directory"
             );
             return Ok(None);
         }

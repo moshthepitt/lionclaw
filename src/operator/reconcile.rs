@@ -736,6 +736,22 @@ pub(crate) fn resolve_worker_entrypoint(
     ))
 }
 
+pub(crate) async fn resolve_installed_skill_worker_entrypoint(
+    home: &LionClawHome,
+    alias: &str,
+) -> Result<PathBuf> {
+    validate_skill_alias(alias)?;
+    let lockfile = OperatorLockfile::load(home).await?;
+    let locked_skill = lockfile
+        .find_skill(alias)
+        .ok_or_else(|| anyhow!("skill alias '{alias}' is not installed; run 'lionclaw apply'"))?;
+    if !locked_skill.enabled {
+        return Err(anyhow!("skill alias '{alias}' is disabled"));
+    }
+
+    resolve_worker_entrypoint(home, &locked_skill.snapshot_dir)
+}
+
 fn resolve_locked_snapshot_dir(home: &LionClawHome, snapshot_dir: &str) -> Result<PathBuf> {
     let snapshot_path = Path::new(snapshot_dir);
     let mut components = snapshot_path.components();
@@ -881,8 +897,8 @@ mod tests {
 
     use super::{
         add_skill, apply, onboard, open_kernel, open_kernel_with_project_root, render_marker_file,
-        render_runtime_cache, resolve_worker_entrypoint, status, up, ApplyResult,
-        OnboardBindSelection, StackBinaryPaths,
+        render_runtime_cache, resolve_installed_skill_worker_entrypoint, resolve_worker_entrypoint,
+        status, up, ApplyResult, OnboardBindSelection, StackBinaryPaths,
     };
     use crate::{
         config::resolve_project_workspace_root,
@@ -897,7 +913,7 @@ mod tests {
                 ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig, OperatorConfig,
                 RuntimeProfileConfig,
             },
-            lockfile::OperatorLockfile,
+            lockfile::{LockedSkill, OperatorLockfile},
             runtime::resolve_runtime_execution_context,
             services::{FakeServiceManager, ServiceManager, DAEMON_UNIT_NAME},
         },
@@ -1119,6 +1135,42 @@ mod tests {
 
         let err = resolve_worker_entrypoint(&home, snapshot_dir).expect_err("should fail");
         assert!(err.to_string().contains("expected 'scripts/worker'"));
+    }
+
+    #[tokio::test]
+    async fn installed_skill_worker_entrypoint_uses_locked_alias() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let snapshot_dir = "skills/example";
+        let worker = home
+            .root()
+            .join(snapshot_dir)
+            .join("scripts")
+            .join("worker");
+        fs::create_dir_all(worker.parent().expect("worker parent")).expect("scripts dir");
+        fs::write(&worker, "#!/usr/bin/env bash\n").expect("worker");
+
+        OperatorLockfile {
+            skills: vec![LockedSkill {
+                alias: "telegram".to_string(),
+                source: "local:skills/channel-telegram".to_string(),
+                reference: "local".to_string(),
+                skill_id: "channel-telegram-hash".to_string(),
+                hash: "hash".to_string(),
+                snapshot_dir: snapshot_dir.to_string(),
+                enabled: true,
+            }],
+            ..OperatorLockfile::default()
+        }
+        .save(&home)
+        .await
+        .expect("save lockfile");
+
+        let resolved = resolve_installed_skill_worker_entrypoint(&home, "telegram")
+            .await
+            .expect("resolve worker");
+
+        assert_eq!(resolved, worker);
     }
 
     #[tokio::test]

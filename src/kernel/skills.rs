@@ -99,6 +99,16 @@ impl SkillStore {
         }
 
         let skill_id = derive_skill_id(&name, &hash);
+        if let Some(existing) = self.find_enabled_by_alias(&input.alias).await? {
+            if existing.skill_id != skill_id {
+                return Err(SkillAliasConflict {
+                    alias: input.alias,
+                    existing_skill_id: existing.skill_id,
+                }
+                .into());
+            }
+        }
+
         let installed_at_ms = now_ms();
         let alias = input.alias;
         let snapshot_path = input.snapshot_path.unwrap_or_default();
@@ -252,17 +262,13 @@ impl SkillStore {
     }
 
     async fn set_alias(&self, skill_id: &str, alias: &str) -> Result<SkillRecord> {
-        if let Some(skill) = self.get(skill_id).await? {
-            if skill.enabled {
-                if let Some(existing) = self.find_enabled_by_alias(alias).await? {
-                    if existing.skill_id != skill.skill_id {
-                        return Err(SkillAliasConflict {
-                            alias: alias.to_string(),
-                            existing_skill_id: existing.skill_id,
-                        }
-                        .into());
-                    }
+        if let Some(existing) = self.find_enabled_by_alias(alias).await? {
+            if existing.skill_id != skill_id {
+                return Err(SkillAliasConflict {
+                    alias: alias.to_string(),
+                    existing_skill_id: existing.skill_id,
                 }
+                .into());
             }
         }
 
