@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::{
     config::resolve_project_workspace_root,
@@ -646,7 +646,8 @@ pub(crate) async fn render_runtime_cache(
     }
 
     for skill in lockfile.skills.iter().filter(|skill| skill.enabled) {
-        let skill_md_path = home.root().join(&skill.snapshot_dir).join("SKILL.md");
+        let skill_md_path =
+            resolve_locked_snapshot_dir(home, &skill.snapshot_dir)?.join("SKILL.md");
         if tokio::fs::try_exists(&skill_md_path)
             .await
             .with_context(|| format!("failed to stat {}", skill_md_path.display()))?
@@ -723,9 +724,9 @@ pub(crate) fn resolve_worker_entrypoint(
     home: &LionClawHome,
     snapshot_dir: &str,
 ) -> Result<PathBuf> {
-    let snapshot_root = home.root().join(snapshot_dir);
+    let snapshot_root = resolve_locked_snapshot_dir(home, snapshot_dir)?;
     let candidate = snapshot_root.join("scripts/worker");
-    if candidate.exists() {
+    if candidate.is_file() {
         return Ok(candidate);
     }
 
@@ -733,6 +734,23 @@ pub(crate) fn resolve_worker_entrypoint(
         "worker entrypoint is missing under '{}'; expected 'scripts/worker'",
         snapshot_root.display()
     ))
+}
+
+fn resolve_locked_snapshot_dir(home: &LionClawHome, snapshot_dir: &str) -> Result<PathBuf> {
+    let snapshot_path = Path::new(snapshot_dir);
+    if snapshot_path.as_os_str().is_empty()
+        || snapshot_path.is_absolute()
+        || !snapshot_path.starts_with("skills")
+        || snapshot_path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(anyhow!(
+            "locked skill snapshot_dir '{snapshot_dir}' must be relative under skills/"
+        ));
+    }
+
+    Ok(home.root().join(snapshot_path))
 }
 
 fn managed_unit_names(home: &LionClawHome) -> Result<Vec<String>> {
@@ -1060,6 +1078,43 @@ mod tests {
         let scripts_dir = home.root().join(snapshot_dir).join("scripts");
         fs::create_dir_all(&scripts_dir).expect("scripts dir");
         fs::write(scripts_dir.join("worker.sh"), "#!/usr/bin/env bash\n").expect("worker");
+
+        let err = resolve_worker_entrypoint(&home, snapshot_dir).expect_err("should fail");
+        assert!(err.to_string().contains("expected 'scripts/worker'"));
+    }
+
+    #[test]
+    fn worker_entrypoint_rejects_lockfile_paths_outside_skill_snapshots() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+
+        for snapshot_dir in [
+            "../outside",
+            "/tmp/outside",
+            "runtime/example",
+            "skills/../outside",
+        ] {
+            let err = resolve_worker_entrypoint(&home, snapshot_dir)
+                .expect_err("snapshot path should stay under skills/");
+            assert!(
+                err.to_string().contains("must be relative under skills/"),
+                "unexpected error for {snapshot_dir}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_entrypoint_rejects_directory_worker_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let snapshot_dir = "skills/example";
+        fs::create_dir_all(
+            home.root()
+                .join(snapshot_dir)
+                .join("scripts")
+                .join("worker"),
+        )
+        .expect("worker directory");
 
         let err = resolve_worker_entrypoint(&home, snapshot_dir).expect_err("should fail");
         assert!(err.to_string().contains("expected 'scripts/worker'"));
