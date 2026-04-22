@@ -143,10 +143,17 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
     let mut next_lock = OperatorLockfile::default();
     let mut installed_skills = BTreeMap::new();
     let mut desired_skills = Vec::new();
+    let mut desired_aliases = BTreeSet::new();
     let mut snapshot_aliases = BTreeMap::new();
 
     for skill in &config.skills {
         validate_skill_alias(&skill.alias)?;
+        if !desired_aliases.insert(skill.alias.clone()) {
+            return Err(anyhow!(
+                "skill alias '{}' is configured more than once",
+                skill.alias
+            ));
+        }
         let snapshot = install_snapshot(home, &skill.alias, &skill.source, &skill.reference)?;
         let snapshot_key = (
             snapshot.source_uri.clone(),
@@ -1350,6 +1357,45 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("configured under both 'alpha' and 'beta'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_rejects_duplicate_skill_aliases() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+
+        let terminal_source =
+            write_channel_skill_fixture(temp_dir.path(), "channel-terminal", "terminal");
+        let telegram_source =
+            write_channel_skill_fixture(temp_dir.path(), "channel-telegram", "telegram");
+        let config = OperatorConfig {
+            skills: vec![
+                ManagedSkillConfig {
+                    alias: "shared".to_string(),
+                    source: terminal_source.to_string_lossy().to_string(),
+                    reference: "local".to_string(),
+                    enabled: true,
+                },
+                ManagedSkillConfig {
+                    alias: "shared".to_string(),
+                    source: telegram_source.to_string_lossy().to_string(),
+                    reference: "local".to_string(),
+                    enabled: true,
+                },
+            ],
+            ..OperatorConfig::default()
+        };
+        config.save(&home).await.expect("save config");
+
+        let err = apply(&home)
+            .await
+            .expect_err("duplicate aliases should be rejected");
+        assert!(
+            err.to_string()
+                .contains("skill alias 'shared' is configured more than once"),
             "unexpected error: {err}"
         );
     }

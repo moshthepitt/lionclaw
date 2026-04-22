@@ -3270,6 +3270,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_skill_mounts_skip_skill_root_and_files() {
+        let temp_dir = tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        let snapshot_file = home.skills_dir().join("not-a-snapshot");
+        tokio::fs::write(&snapshot_file, "not a directory")
+            .await
+            .expect("write snapshot file");
+
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                skill_snapshot_root: Some(home.skills_dir()),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let root_skill = kernel
+            .install_skill(crate::contracts::SkillInstallRequest {
+                source: "local:/tmp/root-skill".to_string(),
+                alias: "root-skill".to_string(),
+                reference: Some("local".to_string()),
+                hash: Some("root-hash".to_string()),
+                skill_md: Some("---\nname: root\ndescription: root skill\n---\n".to_string()),
+                snapshot_path: Some(home.skills_dir().to_string_lossy().to_string()),
+            })
+            .await
+            .expect("install root skill");
+        let file_skill = kernel
+            .install_skill(crate::contracts::SkillInstallRequest {
+                source: "local:/tmp/file-skill".to_string(),
+                alias: "file-skill".to_string(),
+                reference: Some("local".to_string()),
+                hash: Some("file-hash".to_string()),
+                skill_md: Some("---\nname: file\ndescription: file skill\n---\n".to_string()),
+                snapshot_path: Some(snapshot_file.to_string_lossy().to_string()),
+            })
+            .await
+            .expect("install file skill");
+
+        let (mounts, asset_paths) = kernel
+            .resolve_selected_skill_mounts(&[root_skill.skill_id, file_skill.skill_id])
+            .await
+            .expect("resolve skill mounts");
+
+        assert!(mounts.is_empty());
+        assert!(asset_paths.is_empty());
+    }
+
+    #[tokio::test]
     async fn runtime_secrets_mount_resolves_runtime_secrets_file_on_demand() {
         let temp_dir = tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
@@ -4594,6 +4645,7 @@ impl Kernel {
             }
         }
         allowed_skills.sort();
+        allowed_skills.dedup();
         let (selected_skill_mounts, selected_skill_asset_paths) =
             self.resolve_selected_skill_mounts(&allowed_skills).await?;
 
@@ -5068,6 +5120,15 @@ impl Kernel {
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => return Err(internal(err.into())),
             };
+            if source == snapshot_root {
+                warn!(
+                    skill_id = %skill.skill_id,
+                    alias = %skill.alias,
+                    snapshot_path = %source.display(),
+                    "skipping selected skill snapshot that points at the skill root"
+                );
+                continue;
+            }
             if !source.starts_with(&snapshot_root) {
                 warn!(
                     skill_id = %skill.skill_id,
@@ -5075,6 +5136,18 @@ impl Kernel {
                     snapshot_path = %source.display(),
                     snapshot_root = %snapshot_root.display(),
                     "skipping selected skill snapshot outside LionClaw skill root"
+                );
+                continue;
+            }
+            let metadata = tokio::fs::metadata(&source)
+                .await
+                .map_err(|err| internal(err.into()))?;
+            if !metadata.is_dir() {
+                warn!(
+                    skill_id = %skill.skill_id,
+                    alias = %skill.alias,
+                    snapshot_path = %source.display(),
+                    "skipping selected skill snapshot that is not a directory"
                 );
                 continue;
             }
