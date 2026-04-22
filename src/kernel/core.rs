@@ -3270,6 +3270,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_skill_context_uses_stored_metadata_when_snapshot_is_outside_skill_root() {
+        let temp_dir = tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        let outside_snapshot = temp_dir.path().join("outside-skill");
+        tokio::fs::create_dir_all(&outside_snapshot)
+            .await
+            .expect("create outside snapshot");
+        tokio::fs::write(
+            outside_snapshot.join("SKILL.md"),
+            "---\nname: outside\ndescription: outside snapshot text\n---\n",
+        )
+        .await
+        .expect("write outside skill md");
+
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                skill_snapshot_root: Some(home.skills_dir()),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel init");
+        let installed = kernel
+            .install_skill(crate::contracts::SkillInstallRequest {
+                source: "local:/tmp/outside-skill".to_string(),
+                alias: "outside".to_string(),
+                reference: Some("local".to_string()),
+                hash: Some("hash".to_string()),
+                skill_md: Some(
+                    "---\nname: outside\ndescription: stored metadata text\n---\n".to_string(),
+                ),
+                snapshot_path: Some(outside_snapshot.to_string_lossy().to_string()),
+            })
+            .await
+            .expect("install skill");
+
+        let sections = kernel
+            .build_prompt_sections(std::slice::from_ref(&installed.skill_id), &BTreeMap::new())
+            .await
+            .expect("build prompt sections");
+        let rendered = sections.join("\n\n");
+
+        assert!(rendered.contains("stored metadata text"));
+        assert!(!rendered.contains("outside snapshot text"));
+    }
+
+    #[tokio::test]
     async fn selected_skill_mounts_skip_skill_root_and_files() {
         let temp_dir = tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
@@ -3993,6 +4042,14 @@ fn to_continuity_memory_proposal_view(
         rationale: proposal.rationale,
         entries: proposal.entries,
     }
+}
+
+fn stored_skill_context(skill: &super::skills::SkillRecord) -> Option<String> {
+    skill
+        .skill_md
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn to_job_view(job: SchedulerJobRecord) -> JobView {
@@ -5088,16 +5145,8 @@ impl Kernel {
         &self,
         selected_skill_ids: &[String],
     ) -> Result<(Vec<MountSpec>, BTreeMap<String, String>), KernelError> {
-        let Some(snapshot_root) = self.skill_snapshot_root.as_ref() else {
+        let Some(snapshot_root) = self.canonical_skill_snapshot_root().await? else {
             return Ok((Vec::new(), BTreeMap::new()));
-        };
-
-        let snapshot_root = match tokio::fs::canonicalize(snapshot_root).await {
-            Ok(path) => path,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((Vec::new(), BTreeMap::new()));
-            }
-            Err(err) => return Err(internal(err.into())),
         };
 
         let mut selected = Vec::new();
@@ -5111,46 +5160,12 @@ impl Kernel {
                     skill.skill_id
                 ))
             })?;
-            let Some(snapshot_path) = skill.snapshot_path.as_ref() else {
+            let Some(source) = self
+                .resolve_skill_snapshot_dir(&snapshot_root, &skill)
+                .await?
+            else {
                 continue;
             };
-
-            let source = match tokio::fs::canonicalize(snapshot_path).await {
-                Ok(path) => path,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(internal(err.into())),
-            };
-            if source == snapshot_root {
-                warn!(
-                    skill_id = %skill.skill_id,
-                    alias = %skill.alias,
-                    snapshot_path = %source.display(),
-                    "skipping selected skill snapshot that points at the skill root"
-                );
-                continue;
-            }
-            if !source.starts_with(&snapshot_root) {
-                warn!(
-                    skill_id = %skill.skill_id,
-                    alias = %skill.alias,
-                    snapshot_path = %source.display(),
-                    snapshot_root = %snapshot_root.display(),
-                    "skipping selected skill snapshot outside LionClaw skill root"
-                );
-                continue;
-            }
-            let metadata = tokio::fs::metadata(&source)
-                .await
-                .map_err(|err| internal(err.into()))?;
-            if !metadata.is_dir() {
-                warn!(
-                    skill_id = %skill.skill_id,
-                    alias = %skill.alias,
-                    snapshot_path = %source.display(),
-                    "skipping selected skill snapshot that is not a directory"
-                );
-                continue;
-            }
 
             selected.push((
                 skill.alias.clone(),
@@ -5179,6 +5194,67 @@ impl Kernel {
         }
 
         Ok((mounts, mount_paths))
+    }
+
+    async fn canonical_skill_snapshot_root(&self) -> Result<Option<PathBuf>, KernelError> {
+        let Some(snapshot_root) = self.skill_snapshot_root.as_ref() else {
+            return Ok(None);
+        };
+
+        match tokio::fs::canonicalize(snapshot_root).await {
+            Ok(path) => Ok(Some(path)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(internal(err.into())),
+        }
+    }
+
+    async fn resolve_skill_snapshot_dir(
+        &self,
+        snapshot_root: &Path,
+        skill: &super::skills::SkillRecord,
+    ) -> Result<Option<PathBuf>, KernelError> {
+        let Some(snapshot_path) = skill.snapshot_path.as_ref() else {
+            return Ok(None);
+        };
+
+        let source = match tokio::fs::canonicalize(snapshot_path).await {
+            Ok(path) => path,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(internal(err.into())),
+        };
+        if source == snapshot_root {
+            warn!(
+                skill_id = %skill.skill_id,
+                alias = %skill.alias,
+                snapshot_path = %source.display(),
+                "skipping selected skill snapshot that points at the skill root"
+            );
+            return Ok(None);
+        }
+        if !source.starts_with(snapshot_root) {
+            warn!(
+                skill_id = %skill.skill_id,
+                alias = %skill.alias,
+                snapshot_path = %source.display(),
+                snapshot_root = %snapshot_root.display(),
+                "skipping selected skill snapshot outside LionClaw skill root"
+            );
+            return Ok(None);
+        }
+        let metadata = tokio::fs::metadata(&source)
+            .await
+            .map_err(|err| internal(err.into()))?;
+        if !metadata.is_dir() {
+            warn!(
+                skill_id = %skill.skill_id,
+                alias = %skill.alias,
+                snapshot_path = %source.display(),
+                "skipping selected skill snapshot that is not a directory"
+            );
+            return Ok(None);
+        }
+
+        Ok(Some(source))
     }
 
     async fn materialize_runtime_plan(
@@ -6030,8 +6106,15 @@ impl Kernel {
         &self,
         skill: &super::skills::SkillRecord,
     ) -> Result<Option<String>, KernelError> {
-        if let Some(snapshot_path) = skill.snapshot_path.as_ref() {
-            let skill_md_path = Path::new(snapshot_path).join("SKILL.md");
+        let stored_context = || stored_skill_context(skill);
+        if let Some(snapshot_root) = self.canonical_skill_snapshot_root().await? {
+            let Some(snapshot_dir) = self
+                .resolve_skill_snapshot_dir(&snapshot_root, skill)
+                .await?
+            else {
+                return Ok(stored_context());
+            };
+            let skill_md_path = snapshot_dir.join("SKILL.md");
             if tokio::fs::try_exists(&skill_md_path)
                 .await
                 .map_err(|err| internal(err.into()))?
@@ -6045,11 +6128,7 @@ impl Kernel {
             }
         }
 
-        Ok(skill
-            .skill_md
-            .as_ref()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()))
+        Ok(stored_context())
     }
 
     async fn load_session_history_views(

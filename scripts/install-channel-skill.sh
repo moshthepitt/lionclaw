@@ -105,14 +105,13 @@ PY
   fi
 
   local snapshot_root="$home_root/$snapshot_dir"
-  for candidate in "$snapshot_root/scripts/worker" "$snapshot_root/scripts/worker.sh"; do
-    if [[ -f "$candidate" ]]; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
+  local worker="$snapshot_root/scripts/worker"
+  if [[ -f "$worker" ]]; then
+    printf '%s\n' "$worker"
+    return 0
+  fi
 
-  echo "worker entrypoint is missing under canonical snapshot; expected scripts/worker or scripts/worker.sh" >&2
+  echo "worker entrypoint is missing under canonical snapshot; expected scripts/worker" >&2
   exit 1
 }
 

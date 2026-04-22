@@ -220,7 +220,7 @@ impl ExecutionPlanner {
             &runtime_profile,
             &request.selected_skill_mounts,
             request.purpose,
-        );
+        )?;
         let limits = match &runtime_profile.confinement {
             ConfinementConfig::Oci(config) => config.limits.clone(),
         };
@@ -322,9 +322,9 @@ impl ExecutionPlanner {
         runtime_profile: &RuntimeExecutionProfile,
         selected_skill_mounts: &[MountSpec],
         purpose: ExecutionPlanPurpose,
-    ) -> Vec<MountSpec> {
+    ) -> Result<Vec<MountSpec>, String> {
         if purpose == ExecutionPlanPurpose::HiddenCompaction {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let mut mounts = Vec::new();
@@ -371,13 +371,24 @@ impl ExecutionPlanner {
             });
         }
 
+        validate_selected_skill_mounts(selected_skill_mounts)?;
         mounts.extend(selected_skill_mounts.iter().cloned());
 
         match &runtime_profile.confinement {
-            ConfinementConfig::Oci(config) => mounts.extend(config.additional_mounts.clone()),
+            ConfinementConfig::Oci(config) => {
+                for mount in &config.additional_mounts {
+                    if is_skills_mount_target(&mount.target) {
+                        return Err(format!(
+                            "runtime additional mount target '{}' is reserved for selected skill assets",
+                            mount.target
+                        ));
+                    }
+                    mounts.push(mount.clone());
+                }
+            }
         }
 
-        mounts
+        Ok(mounts)
     }
 }
 
@@ -393,6 +404,31 @@ fn is_skills_mount_target(target: &str) -> bool {
         || target
             .strip_prefix(SKILLS_MOUNT_TARGET_ROOT)
             .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn is_selected_skill_mount_target(target: &str) -> bool {
+    target
+        .strip_prefix(SKILLS_MOUNT_TARGET_ROOT)
+        .and_then(|suffix| suffix.strip_prefix('/'))
+        .is_some_and(|alias| !alias.is_empty() && !alias.contains('/'))
+}
+
+fn validate_selected_skill_mounts(mounts: &[MountSpec]) -> Result<(), String> {
+    for mount in mounts {
+        if !is_selected_skill_mount_target(&mount.target) {
+            return Err(format!(
+                "selected skill mount target '{}' must be under {SKILLS_MOUNT_TARGET_ROOT}/<alias>",
+                mount.target
+            ));
+        }
+        if mount.access != MountAccess::ReadOnly {
+            return Err(format!(
+                "selected skill mount target '{}' must be read-only",
+                mount.target
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn runtime_session_shape_key(preset: &ExecutionPreset) -> String {
@@ -687,6 +723,98 @@ mod tests {
             .environment
             .iter()
             .any(|(key, value)| { key == "LIONCLAW_SKILLS_DIR" && value == "/lionclaw/skills" }));
+    }
+
+    #[test]
+    fn planner_rejects_selected_skill_mounts_that_are_not_read_only() {
+        let sandbox = tempdir().expect("temp dir");
+        let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: RuntimeExecutionPolicy::default(),
+            default_preset_name: None,
+            presets: BTreeMap::new(),
+            runtimes: BTreeMap::new(),
+            workspace_root: None,
+            project_workspace_root: None,
+            runtime_root: None,
+            workspace_name: None,
+            default_idle_timeout: Duration::from_secs(30),
+            default_hard_timeout: Duration::from_secs(90),
+        });
+
+        let err = planner
+            .plan(ExecutionPlanRequest {
+                session_id: Some(Uuid::nil()),
+                runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::Interactive,
+                preset_name: None,
+                working_dir: None,
+                env_passthrough_keys: Vec::new(),
+                selected_skill_mounts: vec![MountSpec {
+                    source: sandbox.path().join(".lionclaw/skills/terminal"),
+                    target: "/lionclaw/skills/terminal".to_string(),
+                    access: MountAccess::ReadWrite,
+                }],
+                timeout_ms: None,
+            })
+            .expect_err("selected skill mounts must be read-only");
+
+        assert!(
+            err.contains("must be read-only"),
+            "unexpected planner error: {err}"
+        );
+    }
+
+    #[test]
+    fn planner_rejects_runtime_mounts_in_skill_namespace() {
+        let sandbox = tempdir().expect("temp dir");
+        let runtimes = [(
+            "codex".to_string(),
+            RuntimeExecutionProfile::new(
+                ConfinementConfig::Oci(OciConfinementConfig {
+                    additional_mounts: vec![MountSpec {
+                        source: sandbox.path().join("override"),
+                        target: "/lionclaw/skills/terminal".to_string(),
+                        access: MountAccess::ReadWrite,
+                    }],
+                    ..OciConfinementConfig::default()
+                }),
+                "runtime-codex-v1".to_string(),
+                None,
+                None,
+            ),
+        )]
+        .into_iter()
+        .collect();
+        let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: RuntimeExecutionPolicy::default(),
+            default_preset_name: None,
+            presets: BTreeMap::new(),
+            runtimes,
+            workspace_root: None,
+            project_workspace_root: None,
+            runtime_root: None,
+            workspace_name: None,
+            default_idle_timeout: Duration::from_secs(30),
+            default_hard_timeout: Duration::from_secs(90),
+        });
+
+        let err = planner
+            .plan(ExecutionPlanRequest {
+                session_id: Some(Uuid::nil()),
+                runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::Interactive,
+                preset_name: None,
+                working_dir: None,
+                env_passthrough_keys: Vec::new(),
+                selected_skill_mounts: Vec::new(),
+                timeout_ms: None,
+            })
+            .expect_err("skill namespace is reserved for kernel-selected skill mounts");
+
+        assert!(
+            err.contains("reserved for selected skill assets"),
+            "unexpected planner error: {err}"
+        );
     }
 
     #[test]

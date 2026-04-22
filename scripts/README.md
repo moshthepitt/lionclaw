@@ -17,8 +17,7 @@ Use them when you mean it.
   image and terminal channel, then attaches it in the current TTY.
 - `install-channel-skill.sh`: wraps the canonical `lionclaw skill add`,
   `lionclaw channel add`, and `lionclaw apply` flow for a channel skill, then
-  optionally starts the worker from the installed snapshot's `scripts/worker`
-  or `scripts/worker.sh`.
+  optionally starts the worker from the installed snapshot's `scripts/worker`.
 - `attach-terminal-test.sh`: rebuilds LionClaw, stops managed services for a specific `LIONCLAW_HOME`, and attaches the interactive terminal channel in the current TTY.
 
 ## Usage
