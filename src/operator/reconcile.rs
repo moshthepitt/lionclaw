@@ -738,15 +738,13 @@ pub(crate) fn resolve_worker_entrypoint(
 
 fn resolve_locked_snapshot_dir(home: &LionClawHome, snapshot_dir: &str) -> Result<PathBuf> {
     let snapshot_path = Path::new(snapshot_dir);
-    if snapshot_path.as_os_str().is_empty()
-        || snapshot_path.is_absolute()
-        || !snapshot_path.starts_with("skills")
-        || snapshot_path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-    {
+    let mut components = snapshot_path.components();
+    let valid = matches!(components.next(), Some(Component::Normal(value)) if value == "skills")
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none();
+    if snapshot_path.is_absolute() || !valid {
         return Err(anyhow!(
-            "locked skill snapshot_dir '{snapshot_dir}' must be relative under skills/"
+            "locked skill snapshot_dir '{snapshot_dir}' must be a relative skills/<snapshot> path"
         ));
     }
 
@@ -1092,12 +1090,15 @@ mod tests {
             "../outside",
             "/tmp/outside",
             "runtime/example",
+            "skills",
             "skills/../outside",
+            "skills/example/nested",
         ] {
             let err = resolve_worker_entrypoint(&home, snapshot_dir)
                 .expect_err("snapshot path should stay under skills/");
             assert!(
-                err.to_string().contains("must be relative under skills/"),
+                err.to_string()
+                    .contains("must be a relative skills/<snapshot> path"),
                 "unexpected error for {snapshot_dir}: {err}"
             );
         }

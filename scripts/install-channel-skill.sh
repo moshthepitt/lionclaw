@@ -62,32 +62,67 @@ resolve_snapshot_worker() {
   local home_root="${LIONCLAW_HOME:-$HOME/.lionclaw}"
   local lock_path="$home_root/config/lionclaw.lock"
   local snapshot_dir
+  local snapshot_name
 
   if [[ ! -f "$lock_path" ]]; then
     echo "missing LionClaw lockfile after apply: $lock_path" >&2
     exit 1
   fi
 
-  require_cmd python3
-  snapshot_dir="$(python3 - "$lock_path" "$SKILL_ALIAS" <<'PY'
-import pathlib
-import sys
-import tomllib
-
-lock_path = pathlib.Path(sys.argv[1])
-alias = sys.argv[2]
-lockfile = tomllib.loads(lock_path.read_text())
-for skill in lockfile.get("skills", []):
-    if skill.get("alias") == alias:
-        print(skill.get("snapshot_dir", ""))
-        break
-else:
-    raise SystemExit(f"skill alias not found in lockfile: {alias}")
-PY
-)"
+  require_cmd awk
+  snapshot_dir="$(awk -v wanted_alias="$SKILL_ALIAS" '
+    /^\[\[skills\]\]$/ {
+      if (in_skill && alias == wanted_alias) {
+        print snapshot_dir
+        found = 1
+        exit
+      }
+      in_skill = 1
+      alias = ""
+      snapshot_dir = ""
+      next
+    }
+    /^\[\[/ {
+      if (in_skill && alias == wanted_alias) {
+        print snapshot_dir
+        found = 1
+        exit
+      }
+      in_skill = 0
+      next
+    }
+    in_skill && $1 == "alias" && $2 == "=" {
+      value = $0
+      sub(/^[^\"]*\"/, "", value)
+      sub(/\".*$/, "", value)
+      alias = value
+      next
+    }
+    in_skill && $1 == "snapshot_dir" && $2 == "=" {
+      value = $0
+      sub(/^[^\"]*\"/, "", value)
+      sub(/\".*$/, "", value)
+      snapshot_dir = value
+      next
+    }
+    END {
+      if (!found && in_skill && alias == wanted_alias) {
+        print snapshot_dir
+      }
+    }
+  ' "$lock_path")"
 
   if [[ -z "$snapshot_dir" ]]; then
     echo "lockfile has no snapshot_dir for skill alias '$SKILL_ALIAS'" >&2
+    exit 1
+  fi
+  snapshot_name="${snapshot_dir#skills/}"
+  if [[ "$snapshot_name" == "$snapshot_dir" \
+    || -z "$snapshot_name" \
+    || "$snapshot_name" == "." \
+    || "$snapshot_name" == ".." \
+    || "$snapshot_name" == */* ]]; then
+    echo "locked skill snapshot_dir must be a relative skills/<snapshot> path: $snapshot_dir" >&2
     exit 1
   fi
 
