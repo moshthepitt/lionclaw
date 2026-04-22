@@ -4,7 +4,7 @@ use lionclaw::{
     contracts::{
         PolicyGrantRequest, SessionOpenRequest, SessionTurnRequest, SkillInstallRequest, TrustTier,
     },
-    kernel::Kernel,
+    kernel::{Kernel, KernelError},
 };
 use tempfile::TempDir;
 use tokio::time::{sleep, Duration};
@@ -389,11 +389,41 @@ async fn enable_rejects_reusing_alias_for_different_skill() {
         .await
         .expect_err("same alias must not identify two enabled skills");
 
-    assert!(
-        err.to_string()
-            .contains("skill alias 'shared-alias' is already enabled"),
-        "unexpected error: {err}"
-    );
+    match err {
+        KernelError::Conflict(message) => assert!(
+            message.contains("skill alias 'shared-alias' is already enabled"),
+            "unexpected conflict: {message}"
+        ),
+        other => panic!("expected alias conflict, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn install_rejects_invalid_alias_as_bad_request() {
+    let sandbox = temp_env();
+    let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
+
+    let err = kernel
+        .install_skill(SkillInstallRequest {
+            source: "local/invalid-alias".to_string(),
+            alias: "not path safe".to_string(),
+            reference: Some("main".to_string()),
+            hash: Some("invalid-alias-hash".to_string()),
+            skill_md: Some(
+                "---\nname: invalid-alias\ndescription: invalid alias\n---\n".to_string(),
+            ),
+            snapshot_path: None,
+        })
+        .await
+        .expect_err("invalid alias should be a caller error");
+
+    match err {
+        KernelError::BadRequest(message) => assert!(
+            message.contains("may only contain ASCII"),
+            "unexpected bad request: {message}"
+        ),
+        other => panic!("expected bad request, got {other:?}"),
+    }
 }
 
 struct TestEnv {

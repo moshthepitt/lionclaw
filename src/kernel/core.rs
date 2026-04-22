@@ -92,7 +92,10 @@ use super::{
     },
     session_turns::{NewSessionTurn, SessionTurnCompletion, SessionTurnRecord, SessionTurnStore},
     sessions::SessionStore,
-    skills::{validate_skill_alias, SkillInstallInput, SkillStore},
+    skills::{
+        validate_skill_alias, SkillAliasConflict, SkillAliasValidationError, SkillInstallInput,
+        SkillStore,
+    },
 };
 
 const ACTIVE_GLOBAL_SLICE_LIMIT: usize = 5;
@@ -836,7 +839,7 @@ impl Kernel {
                 snapshot_path: req.snapshot_path,
             })
             .await
-            .map_err(internal)?;
+            .map_err(skill_install_error)?;
 
         self.audit
             .append(
@@ -880,7 +883,7 @@ impl Kernel {
             .skills
             .set_enabled(&skill_id, true)
             .await
-            .map_err(internal)?
+            .map_err(skill_toggle_error)?
             .ok_or_else(|| KernelError::NotFound("skill not found".to_string()))?;
 
         self.audit
@@ -4116,6 +4119,22 @@ fn to_stream_event_view(event: RuntimeEvent) -> StreamEventDto {
 
 fn internal(err: anyhow::Error) -> KernelError {
     KernelError::Internal(err.to_string())
+}
+
+fn skill_install_error(err: anyhow::Error) -> KernelError {
+    if let Some(err) = err.downcast_ref::<SkillAliasValidationError>() {
+        KernelError::BadRequest(err.to_string())
+    } else {
+        internal(err)
+    }
+}
+
+fn skill_toggle_error(err: anyhow::Error) -> KernelError {
+    if let Some(err) = err.downcast_ref::<SkillAliasConflict>() {
+        KernelError::Conflict(err.to_string())
+    } else {
+        internal(err)
+    }
 }
 
 fn draft_request_error(err: anyhow::Error) -> KernelError {
