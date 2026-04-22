@@ -157,6 +157,13 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
             .await
             .map_err(to_anyhow)?;
 
+        if let Some(old_skill) = previous_lock
+            .find_skill(&skill.alias)
+            .filter(|old_skill| old_skill.skill_id != installed.skill_id)
+        {
+            disable_stale_skill_if_present(&kernel, &old_skill.skill_id).await?;
+        }
+
         if skill.enabled {
             kernel
                 .enable_skill(installed.skill_id.clone())

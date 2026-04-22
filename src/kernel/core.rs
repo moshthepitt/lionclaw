@@ -3203,7 +3203,7 @@ mod tests {
             .expect("install skill");
 
         let (mounts, asset_paths) = kernel
-            .resolve_selected_skill_mounts(&[installed.skill_id.clone()])
+            .resolve_selected_skill_mounts(std::slice::from_ref(&installed.skill_id))
             .await
             .expect("resolve skill mounts");
 
@@ -3258,7 +3258,7 @@ mod tests {
             .expect("install skill");
 
         let (mounts, asset_paths) = kernel
-            .resolve_selected_skill_mounts(&[installed.skill_id.clone()])
+            .resolve_selected_skill_mounts(std::slice::from_ref(&installed.skill_id))
             .await
             .expect("resolve skill mounts");
 
@@ -5077,8 +5077,7 @@ impl Kernel {
         for (alias, skill_id, mount) in selected {
             if let Some(existing_skill_id) = aliases.insert(alias.clone(), skill_id.clone()) {
                 return Err(KernelError::Conflict(format!(
-                    "selected skills '{}' and '{}' share alias '{}'",
-                    existing_skill_id, skill_id, alias
+                    "selected skills '{existing_skill_id}' and '{skill_id}' share alias '{alias}'"
                 )));
             }
             mount_paths.insert(skill_id, mount.target.clone());

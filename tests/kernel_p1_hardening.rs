@@ -351,6 +351,51 @@ description: Handles idempotent operations
     );
 }
 
+#[tokio::test]
+async fn enable_rejects_reusing_alias_for_different_skill() {
+    let sandbox = temp_env();
+    let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
+
+    let first = kernel
+        .install_skill(SkillInstallRequest {
+            source: "local/first-skill".to_string(),
+            alias: "shared-alias".to_string(),
+            reference: Some("main".to_string()),
+            hash: Some("first-hash".to_string()),
+            skill_md: Some("---\nname: first-skill\ndescription: first skill\n---\n".to_string()),
+            snapshot_path: None,
+        })
+        .await
+        .expect("install first skill");
+    kernel
+        .enable_skill(first.skill_id)
+        .await
+        .expect("enable first skill");
+
+    let second = kernel
+        .install_skill(SkillInstallRequest {
+            source: "local/second-skill".to_string(),
+            alias: "shared-alias".to_string(),
+            reference: Some("main".to_string()),
+            hash: Some("second-hash".to_string()),
+            skill_md: Some("---\nname: second-skill\ndescription: second skill\n---\n".to_string()),
+            snapshot_path: None,
+        })
+        .await
+        .expect("install second disabled skill revision");
+
+    let err = kernel
+        .enable_skill(second.skill_id)
+        .await
+        .expect_err("same alias must not identify two enabled skills");
+
+    assert!(
+        err.to_string()
+            .contains("skill alias 'shared-alias' is already enabled"),
+        "unexpected error: {err}"
+    );
+}
+
 struct TestEnv {
     temp_dir: TempDir,
 }

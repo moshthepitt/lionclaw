@@ -132,6 +132,20 @@ impl SkillStore {
     }
 
     pub async fn set_enabled(&self, skill_id: &str, enabled: bool) -> Result<Option<SkillRecord>> {
+        if enabled {
+            if let Some(skill) = self.get(skill_id).await? {
+                if let Some(existing) = self.find_enabled_by_alias(&skill.alias).await? {
+                    if existing.skill_id != skill.skill_id {
+                        let alias = &skill.alias;
+                        let existing_skill_id = &existing.skill_id;
+                        return Err(anyhow!(
+                            "skill alias '{alias}' is already enabled by '{existing_skill_id}'"
+                        ));
+                    }
+                }
+            }
+        }
+
         let changed = sqlx::query("UPDATE skills SET enabled = ?2 WHERE skill_id = ?1")
             .bind(skill_id)
             .bind(if enabled { 1 } else { 0 })
@@ -191,6 +205,20 @@ impl SkillStore {
         .fetch_optional(&self.pool)
         .await
         .context("failed to query skill by provenance")?;
+
+        row.map(map_skill_row).transpose()
+    }
+
+    async fn find_enabled_by_alias(&self, alias: &str) -> Result<Option<SkillRecord>> {
+        let row = sqlx::query(
+            "SELECT skill_id, alias, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms \
+             FROM skills \
+             WHERE alias = ?1 AND enabled = 1",
+        )
+        .bind(alias)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query enabled skill by alias")?;
 
         row.map(map_skill_row).transpose()
     }
@@ -282,25 +310,21 @@ pub fn sanitize_skill_name(name: &str) -> String {
 pub fn validate_skill_alias(alias: &str) -> Result<()> {
     let trimmed = alias.trim();
     if alias != trimmed {
-        return Err(anyhow!(
-            "skill alias '{}' has surrounding whitespace",
-            alias
-        ));
+        return Err(anyhow!("skill alias '{alias}' has surrounding whitespace"));
     }
     let alias = trimmed;
     if alias.is_empty() {
         return Err(anyhow!("skill alias is required"));
     }
     if matches!(alias, "." | "..") {
-        return Err(anyhow!("skill alias '{}' is not path-safe", alias));
+        return Err(anyhow!("skill alias '{alias}' is not path-safe"));
     }
     if alias
         .chars()
         .any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
     {
         return Err(anyhow!(
-            "skill alias '{}' may only contain ASCII letters, numbers, '.', '_' and '-'",
-            alias
+            "skill alias '{alias}' may only contain ASCII letters, numbers, '.', '_' and '-'"
         ));
     }
     Ok(())
