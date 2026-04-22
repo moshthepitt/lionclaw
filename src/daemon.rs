@@ -65,6 +65,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 workspace_root: Some(workspace_root),
                 project_workspace_root: Some(project_workspace_root),
                 runtime_root: Some(config.home.runtime_dir()),
+                skill_snapshot_root: Some(config.home.skills_dir()),
                 workspace_name: Some(operator_config.daemon.workspace.clone()),
                 ..KernelOptions::default()
             },

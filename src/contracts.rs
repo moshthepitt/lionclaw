@@ -300,6 +300,7 @@ pub struct SessionTurnResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillInstallRequest {
     pub source: String,
+    pub alias: String,
     pub reference: Option<String>,
     pub hash: Option<String>,
     pub skill_md: Option<String>,
@@ -310,6 +311,7 @@ pub struct SkillInstallRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillInstallResponse {
     pub skill_id: String,
+    pub alias: String,
     pub name: String,
     pub hash: String,
     pub enabled: bool,
@@ -318,6 +320,7 @@ pub struct SkillInstallResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillView {
     pub skill_id: String,
+    pub alias: String,
     pub name: String,
     pub description: String,
     pub source: String,

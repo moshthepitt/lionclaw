@@ -30,6 +30,7 @@ async fn channel_bind_requires_enabled_skill() {
     let skill = kernel
         .install_skill(SkillInstallRequest {
             source: "local/channel-skill".to_string(),
+            alias: "channel-skill".to_string(),
             reference: Some("main".to_string()),
             hash: Some("channel-skill-hash".to_string()),
             skill_md: Some(
@@ -78,6 +79,7 @@ async fn channel_peer_must_be_approved_before_inbound_turn_executes() {
     let skill = kernel
         .install_skill(SkillInstallRequest {
             source: "local/channel-inbound-skill".to_string(),
+            alias: "channel-inbound-skill".to_string(),
             reference: Some("main".to_string()),
             hash: Some("channel-inbound-skill-hash".to_string()),
             skill_md: Some(
@@ -254,6 +256,7 @@ async fn channel_stream_pull_and_ack_round_trip() {
     let skill = kernel
         .install_skill(SkillInstallRequest {
             source: "local/channel-outbox-skill".to_string(),
+            alias: "channel-outbox-skill".to_string(),
             reference: Some("main".to_string()),
             hash: Some("channel-outbox-skill-hash".to_string()),
             skill_md: Some(
@@ -361,6 +364,7 @@ async fn channel_stream_tail_starts_from_current_head() {
     let skill = kernel
         .install_skill(SkillInstallRequest {
             source: "local/channel-tail-skill".to_string(),
+            alias: "channel-tail-skill".to_string(),
             reference: Some("main".to_string()),
             hash: Some("channel-tail-skill-hash".to_string()),
             skill_md: Some(
@@ -452,6 +456,7 @@ async fn channel_stream_long_poll_wakes_for_new_events() {
     let skill = kernel
         .install_skill(SkillInstallRequest {
             source: "local/channel-wait-skill".to_string(),
+            alias: "channel-wait-skill".to_string(),
             reference: Some("main".to_string()),
             hash: Some("channel-wait-skill-hash".to_string()),
             skill_md: Some(
@@ -1009,6 +1014,7 @@ async fn install_and_bind_channel(
     let skill = kernel
         .install_skill(SkillInstallRequest {
             source: format!("local/{skill_name}"),
+            alias: skill_name.to_string(),
             reference: Some("main".to_string()),
             hash: Some(format!("{skill_name}-hash")),
             skill_md: Some(format!(

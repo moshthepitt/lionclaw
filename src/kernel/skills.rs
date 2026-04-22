@@ -8,6 +8,7 @@ use crate::kernel::db::{ms_to_datetime, now_ms};
 #[derive(Debug, Clone)]
 pub struct SkillRecord {
     pub skill_id: String,
+    pub alias: String,
     pub name: String,
     pub description: String,
     pub source: String,
@@ -22,6 +23,7 @@ pub struct SkillRecord {
 #[derive(Debug)]
 pub struct SkillInstallInput {
     pub source: String,
+    pub alias: String,
     pub reference: Option<String>,
     pub hash: Option<String>,
     pub skill_md: Option<String>,
@@ -39,6 +41,8 @@ impl SkillStore {
     }
 
     pub async fn install(&self, input: SkillInstallInput) -> Result<SkillRecord> {
+        validate_skill_alias(&input.alias)?;
+
         let (name, description) = input
             .skill_md
             .as_deref()
@@ -66,20 +70,25 @@ impl SkillStore {
             .find_by_provenance(&input.source, &reference_key, &hash)
             .await?
         {
-            return Ok(existing);
+            if existing.alias == input.alias {
+                return Ok(existing);
+            }
+            return self.set_alias(&existing.skill_id, &input.alias).await;
         }
 
         let skill_id = derive_skill_id(&name, &hash);
         let installed_at_ms = now_ms();
+        let alias = input.alias;
         let snapshot_path = input.snapshot_path.unwrap_or_default();
         let skill_md = input.skill_md.unwrap_or_default();
 
         let insert_result = sqlx::query(
             "INSERT INTO skills \
-             (skill_id, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
+             (skill_id, alias, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)",
         )
         .bind(&skill_id)
+        .bind(&alias)
         .bind(&name)
         .bind(&description)
         .bind(&input.source)
@@ -96,7 +105,10 @@ impl SkillStore {
                 .find_by_provenance(&input.source, &reference_key, &hash)
                 .await?
             {
-                return Ok(existing);
+                if existing.alias == alias {
+                    return Ok(existing);
+                }
+                return self.set_alias(&existing.skill_id, &alias).await;
             }
             return Err(err).context("failed to insert skill");
         }
@@ -108,7 +120,7 @@ impl SkillStore {
 
     pub async fn list(&self) -> Result<Vec<SkillRecord>> {
         let rows = sqlx::query(
-            "SELECT skill_id, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms \
+            "SELECT skill_id, alias, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms \
              FROM skills \
              ORDER BY installed_at_ms ASC",
         )
@@ -136,7 +148,7 @@ impl SkillStore {
 
     pub async fn get(&self, skill_id: &str) -> Result<Option<SkillRecord>> {
         let row = sqlx::query(
-            "SELECT skill_id, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms \
+            "SELECT skill_id, alias, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms \
              FROM skills \
              WHERE skill_id = ?1",
         )
@@ -150,7 +162,7 @@ impl SkillStore {
 
     pub async fn list_enabled(&self) -> Result<Vec<SkillRecord>> {
         let rows = sqlx::query(
-            "SELECT skill_id, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms \
+            "SELECT skill_id, alias, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms \
              FROM skills \
              WHERE enabled = 1 \
              ORDER BY installed_at_ms ASC",
@@ -169,7 +181,7 @@ impl SkillStore {
         hash: &str,
     ) -> Result<Option<SkillRecord>> {
         let row = sqlx::query(
-            "SELECT skill_id, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms \
+            "SELECT skill_id, alias, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms \
              FROM skills \
              WHERE source = ?1 AND reference = ?2 AND hash = ?3",
         )
@@ -181,6 +193,19 @@ impl SkillStore {
         .context("failed to query skill by provenance")?;
 
         row.map(map_skill_row).transpose()
+    }
+
+    async fn set_alias(&self, skill_id: &str, alias: &str) -> Result<SkillRecord> {
+        sqlx::query("UPDATE skills SET alias = ?2 WHERE skill_id = ?1")
+            .bind(skill_id)
+            .bind(alias)
+            .execute(&self.pool)
+            .await
+            .context("failed to update skill alias")?;
+
+        self.get(skill_id)
+            .await?
+            .ok_or_else(|| anyhow!("skill disappeared immediately after alias update"))
     }
 }
 
@@ -215,6 +240,7 @@ fn map_skill_row(row: SqliteRow) -> Result<SkillRecord> {
 
     Ok(SkillRecord {
         skill_id: row.get("skill_id"),
+        alias: row.get("alias"),
         name: row.get("name"),
         description: row.get("description"),
         source: row.get("source"),
@@ -251,6 +277,33 @@ pub fn sanitize_skill_name(name: &str) -> String {
     } else {
         out
     }
+}
+
+pub fn validate_skill_alias(alias: &str) -> Result<()> {
+    let trimmed = alias.trim();
+    if alias != trimmed {
+        return Err(anyhow!(
+            "skill alias '{}' has surrounding whitespace",
+            alias
+        ));
+    }
+    let alias = trimmed;
+    if alias.is_empty() {
+        return Err(anyhow!("skill alias is required"));
+    }
+    if matches!(alias, "." | "..") {
+        return Err(anyhow!("skill alias '{}' is not path-safe", alias));
+    }
+    if alias
+        .chars()
+        .any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
+    {
+        return Err(anyhow!(
+            "skill alias '{}' may only contain ASCII letters, numbers, '.', '_' and '-'",
+            alias
+        ));
+    }
+    Ok(())
 }
 
 pub fn derive_skill_id(name: &str, hash: &str) -> String {
@@ -291,7 +344,9 @@ pub fn parse_skill_frontmatter(content: &str) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_skill_id, parse_skill_frontmatter, sanitize_skill_name};
+    use super::{
+        derive_skill_id, parse_skill_frontmatter, sanitize_skill_name, validate_skill_alias,
+    };
 
     #[test]
     fn parses_name_and_description() {
@@ -314,5 +369,14 @@ body"#;
             "channel-telegram-0123456789ab"
         );
         assert_eq!(sanitize_skill_name("Channel Telegram"), "channel-telegram");
+    }
+
+    #[test]
+    fn validates_path_safe_skill_aliases() {
+        validate_skill_alias("terminal").expect("valid alias");
+        validate_skill_alias("channel.terminal_1").expect("valid alias");
+        validate_skill_alias(" terminal").expect_err("leading whitespace");
+        validate_skill_alias("../terminal").expect_err("path traversal");
+        validate_skill_alias("telegram/channel").expect_err("slash");
     }
 }

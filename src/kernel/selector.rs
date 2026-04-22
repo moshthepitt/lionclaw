@@ -60,6 +60,7 @@ mod tests {
         let selector = SkillSelector::new();
         let skills = vec![SkillRecord {
             skill_id: "email-123".to_string(),
+            alias: "email-helper".to_string(),
             name: "email-helper".to_string(),
             description: "Draft and refine email replies".to_string(),
             source: "local".to_string(),

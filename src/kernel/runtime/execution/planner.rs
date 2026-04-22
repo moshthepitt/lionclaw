@@ -9,7 +9,7 @@ use crate::kernel::runtime_policy::{RuntimeExecutionPolicy, RuntimeExecutionRequ
 
 use super::plan::{
     ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset, MountAccess, MountSpec,
-    OciConfinementConfig, RuntimeAuthKind, WorkspaceAccess,
+    OciConfinementConfig, RuntimeAuthKind, WorkspaceAccess, SKILLS_MOUNT_TARGET_ROOT,
 };
 
 pub const BUILTIN_PRESET_EVERYDAY: &str = "everyday";
@@ -129,6 +129,7 @@ pub struct ExecutionPlanRequest {
     pub preset_name: Option<String>,
     pub working_dir: Option<String>,
     pub env_passthrough_keys: Vec<String>,
+    pub selected_skill_mounts: Vec<MountSpec>,
     pub timeout_ms: Option<u64>,
 }
 
@@ -217,6 +218,7 @@ impl ExecutionPlanner {
             &request.runtime_id,
             &preset,
             &runtime_profile,
+            &request.selected_skill_mounts,
             request.purpose,
         );
         let limits = match &runtime_profile.confinement {
@@ -233,6 +235,9 @@ impl ExecutionPlanner {
             mounts
                 .iter()
                 .any(|mount| mount.target == DRAFTS_MOUNT_TARGET),
+            mounts
+                .iter()
+                .any(|mount| is_skills_mount_target(&mount.target)),
         );
         let working_dir = execution_context
             .working_dir
@@ -315,6 +320,7 @@ impl ExecutionPlanner {
         runtime_id: &str,
         preset: &ExecutionPreset,
         runtime_profile: &RuntimeExecutionProfile,
+        selected_skill_mounts: &[MountSpec],
         purpose: ExecutionPlanPurpose,
     ) -> Vec<MountSpec> {
         if purpose == ExecutionPlanPurpose::HiddenCompaction {
@@ -365,6 +371,8 @@ impl ExecutionPlanner {
             });
         }
 
+        mounts.extend(selected_skill_mounts.iter().cloned());
+
         match &runtime_profile.confinement {
             ConfinementConfig::Oci(config) => mounts.extend(config.additional_mounts.clone()),
         }
@@ -378,6 +386,13 @@ fn workspace_access_to_mount_access(access: WorkspaceAccess) -> MountAccess {
         WorkspaceAccess::ReadOnly => MountAccess::ReadOnly,
         WorkspaceAccess::ReadWrite => MountAccess::ReadWrite,
     }
+}
+
+fn is_skills_mount_target(target: &str) -> bool {
+    target == SKILLS_MOUNT_TARGET_ROOT
+        || target
+            .strip_prefix(SKILLS_MOUNT_TARGET_ROOT)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn runtime_session_shape_key(preset: &ExecutionPreset) -> String {
@@ -421,6 +436,7 @@ fn build_runtime_environment(
     has_workspace_mount: bool,
     has_runtime_mount: bool,
     has_drafts_mount: bool,
+    has_skills_mount: bool,
 ) -> Vec<(String, String)> {
     if has_workspace_mount {
         passthrough_environment.push((
@@ -455,6 +471,13 @@ fn build_runtime_environment(
         passthrough_environment.push((
             "LIONCLAW_DRAFTS_DIR".to_string(),
             DRAFTS_MOUNT_TARGET.to_string(),
+        ));
+    }
+
+    if has_skills_mount {
+        passthrough_environment.push((
+            "LIONCLAW_SKILLS_DIR".to_string(),
+            SKILLS_MOUNT_TARGET_ROOT.to_string(),
         ));
     }
 
@@ -503,6 +526,7 @@ mod tests {
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
+                selected_skill_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("plan");
@@ -561,6 +585,7 @@ mod tests {
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
+                selected_skill_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("plan");
@@ -624,6 +649,47 @@ mod tests {
     }
 
     #[test]
+    fn planner_mounts_selected_skill_snapshots_read_only() {
+        let sandbox = tempdir().expect("temp dir");
+        let skill_mount = MountSpec {
+            source: sandbox.path().join(".lionclaw/skills/terminal"),
+            target: "/lionclaw/skills/terminal".to_string(),
+            access: MountAccess::ReadOnly,
+        };
+        let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: RuntimeExecutionPolicy::default(),
+            default_preset_name: None,
+            presets: BTreeMap::new(),
+            runtimes: BTreeMap::new(),
+            workspace_root: Some(sandbox.path().join("workspace")),
+            project_workspace_root: Some(sandbox.path().join("project")),
+            runtime_root: Some(sandbox.path().join("runtime")),
+            workspace_name: Some("main".to_string()),
+            default_idle_timeout: Duration::from_secs(30),
+            default_hard_timeout: Duration::from_secs(90),
+        });
+
+        let plan = planner
+            .plan(ExecutionPlanRequest {
+                session_id: Some(Uuid::nil()),
+                runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::Interactive,
+                preset_name: None,
+                working_dir: None,
+                env_passthrough_keys: Vec::new(),
+                selected_skill_mounts: vec![skill_mount.clone()],
+                timeout_ms: None,
+            })
+            .expect("plan");
+
+        assert!(plan.mounts.iter().any(|mount| mount == &skill_mount));
+        assert!(plan
+            .environment
+            .iter()
+            .any(|(key, value)| { key == "LIONCLAW_SKILLS_DIR" && value == "/lionclaw/skills" }));
+    }
+
+    #[test]
     fn planner_rejects_unknown_default_preset() {
         let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
             policy: RuntimeExecutionPolicy::default(),
@@ -646,6 +712,7 @@ mod tests {
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
+                selected_skill_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect_err("plan should fail");
@@ -696,6 +763,7 @@ mod tests {
                 preset_name: None,
                 working_dir: Some(child.to_string_lossy().to_string()),
                 env_passthrough_keys: Vec::new(),
+                selected_skill_mounts: Vec::new(),
                 timeout_ms: Some(45_000),
             })
             .expect("plan");
@@ -742,6 +810,7 @@ mod tests {
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
+                selected_skill_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("plan");
@@ -776,6 +845,7 @@ mod tests {
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
+                selected_skill_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("plan");
@@ -830,6 +900,7 @@ mod tests {
                 preset_name: Some("plain".to_string()),
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
+                selected_skill_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("plain plan");
@@ -841,6 +912,7 @@ mod tests {
                 preset_name: Some("secreted".to_string()),
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
+                selected_skill_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("secreted plan");
@@ -895,6 +967,11 @@ mod tests {
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
+                selected_skill_mounts: vec![MountSpec {
+                    source: sandbox.path().join(".lionclaw/skills/terminal"),
+                    target: "/lionclaw/skills/terminal".to_string(),
+                    access: MountAccess::ReadOnly,
+                }],
                 timeout_ms: None,
             })
             .expect("plan");

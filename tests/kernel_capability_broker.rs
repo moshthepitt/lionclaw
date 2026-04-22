@@ -471,6 +471,7 @@ async fn prepare_session_with_skill(
     let skill = kernel
         .install_skill(SkillInstallRequest {
             source: format!("local/{skill_name}"),
+            alias: skill_name.to_string(),
             reference: Some("main".to_string()),
             hash: Some(format!("{skill_name}-hash")),
             skill_md: Some(format!(

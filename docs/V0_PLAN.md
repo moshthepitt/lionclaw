@@ -86,7 +86,7 @@ Implemented v0 security model:
 
 - Unix-only trusted filesystem assumptions.
 - Runtime launches go through the shared execution planner.
-- Confined runtimes see `/workspace`, `/runtime`, and `/drafts`.
+- Confined runtimes see `/workspace`, `/runtime`, `/drafts`, and selected read-only skill assets.
 - Runtime network mode is coarse: `on` or `none`.
 - Runtime-visible secrets are mounted only when the selected preset allows it.
 - The runtime secret file is hardened to owner-only permissions on Unix.

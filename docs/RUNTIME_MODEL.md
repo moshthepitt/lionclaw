@@ -221,10 +221,12 @@ The everyday confined layout is mount-first:
 - `/workspace`: the current project or task root
 - `/runtime`: runtime-private writable state
 - `/drafts`: runtime-private draft/output area
+- `/lionclaw/skills/<alias>`: selected skill snapshot assets mounted read-only
 
 The planner injects stable runtime-private environment defaults such as
-`HOME=/runtime/home` and `LIONCLAW_DRAFTS_DIR=/drafts`, so engine-specific
-caches and config stay out of assistant continuity.
+`HOME=/runtime/home`, `LIONCLAW_DRAFTS_DIR=/drafts`, and
+`LIONCLAW_SKILLS_DIR=/lionclaw/skills` when selected skills have mounted
+assets, so engine-specific caches and config stay out of assistant continuity.
 
 ## Runtime State And Continuation
 

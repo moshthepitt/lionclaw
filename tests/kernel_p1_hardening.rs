@@ -390,6 +390,11 @@ async fn install_skill(
     kernel
         .install_skill(SkillInstallRequest {
             source: source.to_string(),
+            alias: source
+                .split('/')
+                .next_back()
+                .unwrap_or("test-skill")
+                .to_string(),
             reference: Some("main".to_string()),
             hash: Some("fixed-hash".to_string()),
             skill_md: Some(skill_md.to_string()),

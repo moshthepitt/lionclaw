@@ -1073,6 +1073,7 @@ async fn install_enabled_skill(kernel: &Kernel, skill_name: &str) -> String {
     let installed = kernel
         .install_skill(SkillInstallRequest {
             source: format!("local/{skill_name}"),
+            alias: skill_name.to_string(),
             reference: Some("main".to_string()),
             hash: Some(format!("{skill_name}-hash")),
             skill_md: Some(format!(

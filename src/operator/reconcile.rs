@@ -7,7 +7,9 @@ use crate::{
     config::resolve_project_workspace_root,
     contracts::{ChannelBindRequest, ChannelPeerApproveRequest, ChannelPeerResponse, TrustTier},
     home::{runtime_project_partition_key, LionClawHome},
-    kernel::{Kernel, KernelError, KernelOptions, RuntimeExecutionPolicy},
+    kernel::{
+        skills::validate_skill_alias, Kernel, KernelError, KernelOptions, RuntimeExecutionPolicy,
+    },
     operator::{
         config::{
             normalize_local_source, ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig,
@@ -87,6 +89,7 @@ pub async fn add_skill(
     source: String,
     reference: String,
 ) -> Result<()> {
+    validate_skill_alias(&alias)?;
     let mut config = OperatorConfig::load(home).await?;
     let source = normalize_local_source(&source)?;
     config.upsert_skill(ManagedSkillConfig {
@@ -145,6 +148,7 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
         let installed = kernel
             .install_skill(crate::contracts::SkillInstallRequest {
                 source: snapshot.source_uri.clone(),
+                alias: skill.alias.clone(),
                 reference: Some(snapshot.reference.clone()),
                 hash: Some(snapshot.hash.clone()),
                 skill_md: Some(snapshot.skill_md.clone()),
@@ -786,6 +790,7 @@ async fn open_kernel_with_project_root(
             workspace_root: Some(workspace_root),
             project_workspace_root,
             runtime_root: Some(home.runtime_dir()),
+            skill_snapshot_root: Some(home.skills_dir()),
             workspace_name: Some(config.daemon.workspace.clone()),
             ..KernelOptions::default()
         },
