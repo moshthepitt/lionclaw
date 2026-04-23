@@ -167,6 +167,7 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
         desired_skills.push((skill, snapshot));
     }
 
+    let existing_skills = kernel.list_skills().await.map_err(to_anyhow)?.skills;
     for (skill, snapshot) in desired_skills {
         if let Some(old_skill) = previous_lock.find_skill(&skill.alias).filter(|old_skill| {
             old_skill.source != snapshot.source_uri
@@ -174,6 +175,13 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
                 || old_skill.hash != snapshot.hash
         }) {
             disable_stale_skill_if_present(&kernel, &old_skill.skill_id).await?;
+        }
+        for existing in existing_skills.iter().filter(|existing| {
+            existing.enabled
+                && existing.alias == skill.alias
+                && existing.skill_id != snapshot.skill_id
+        }) {
+            disable_stale_skill_if_present(&kernel, &existing.skill_id).await?;
         }
 
         let installed = kernel
@@ -726,14 +734,20 @@ pub(crate) fn resolve_worker_entrypoint(
 ) -> Result<PathBuf> {
     let snapshot_root = resolve_locked_snapshot_dir(home, snapshot_dir)?;
     let candidate = snapshot_root.join("scripts/worker");
-    if candidate.is_file() {
-        return Ok(candidate);
+    if !candidate.is_file() {
+        return Err(anyhow!(
+            "worker entrypoint is missing under '{}'; expected 'scripts/worker'",
+            snapshot_root.display()
+        ));
+    }
+    if !is_executable_file(&candidate)? {
+        return Err(anyhow!(
+            "worker entrypoint '{}' is not executable",
+            candidate.display()
+        ));
     }
 
-    Err(anyhow!(
-        "worker entrypoint is missing under '{}'; expected 'scripts/worker'",
-        snapshot_root.display()
-    ))
+    Ok(candidate)
 }
 
 pub(crate) async fn resolve_installed_skill_worker_entrypoint(
@@ -765,6 +779,22 @@ fn resolve_locked_snapshot_dir(home: &LionClawHome, snapshot_dir: &str) -> Resul
     }
 
     Ok(home.root().join(snapshot_path))
+}
+
+fn is_executable_file(path: &Path) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("failed to stat worker entrypoint {}", path.display()))?;
+        Ok(metadata.permissions().mode() & 0o111 != 0)
+    }
+
+    #[cfg(not(unix))]
+    {
+        Ok(path.is_file())
+    }
 }
 
 fn managed_unit_names(home: &LionClawHome) -> Result<Vec<String>> {
@@ -902,7 +932,7 @@ mod tests {
     };
     use crate::{
         config::resolve_project_workspace_root,
-        contracts::DaemonInfoResponse,
+        contracts::{DaemonInfoResponse, SkillInstallRequest},
         home::{runtime_project_partition_key, LionClawHome},
         kernel::{
             runtime::{ConfinementConfig, OciConfinementConfig},
@@ -951,17 +981,19 @@ mod tests {
             format!("---\nname: {name}\ndescription: {description}\n---\n"),
         )
         .expect("skill md");
-        fs::write(skill_source.join("scripts/worker"), "#!/usr/bin/env bash\n").expect("worker");
+        let worker = skill_source.join("scripts/worker");
+        fs::write(&worker, "#!/usr/bin/env bash\n").expect("worker");
+        make_executable(&worker);
+        skill_source
+    }
+
+    fn make_executable(path: &Path) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                skill_source.join("scripts/worker"),
-                fs::Permissions::from_mode(0o755),
-            )
-            .expect("chmod worker");
+
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
         }
-        skill_source
     }
 
     #[cfg(unix)]
@@ -1137,6 +1169,27 @@ mod tests {
         assert!(err.to_string().contains("expected 'scripts/worker'"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn worker_entrypoint_rejects_non_executable_worker() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let snapshot_dir = "skills/example";
+        let worker = home
+            .root()
+            .join(snapshot_dir)
+            .join("scripts")
+            .join("worker");
+        fs::create_dir_all(worker.parent().expect("worker parent")).expect("scripts dir");
+        fs::write(&worker, "#!/usr/bin/env bash\n").expect("worker");
+
+        let err = resolve_worker_entrypoint(&home, snapshot_dir).expect_err("should fail");
+        assert!(
+            err.to_string().contains("is not executable"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn installed_skill_worker_entrypoint_uses_locked_alias() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -1149,6 +1202,7 @@ mod tests {
             .join("worker");
         fs::create_dir_all(worker.parent().expect("worker parent")).expect("scripts dir");
         fs::write(&worker, "#!/usr/bin/env bash\n").expect("worker");
+        make_executable(&worker);
 
         OperatorLockfile {
             skills: vec![LockedSkill {
@@ -1304,15 +1358,7 @@ mod tests {
             "#!/usr/bin/env bash\necho v1\n",
         )
         .expect("worker v1");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                skill_source.join("scripts/worker"),
-                fs::Permissions::from_mode(0o755),
-            )
-            .expect("chmod worker v1");
-        }
+        make_executable(&skill_source.join("scripts/worker"));
 
         let config = OperatorConfig {
             skills: vec![ManagedSkillConfig {
@@ -1427,6 +1473,64 @@ mod tests {
         assert_eq!(enabled.len(), 1);
         assert_eq!(enabled[0].alias, "beta");
         assert_eq!(enabled[0].skill_id, applied.lockfile.skills[0].skill_id);
+    }
+
+    #[tokio::test]
+    async fn apply_disables_enabled_alias_conflict_missing_from_lockfile() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+
+        let kernel = Kernel::new(&home.db_path()).await.expect("kernel");
+        let stale = kernel
+            .install_skill(SkillInstallRequest {
+                source: "local:/tmp/stale-telegram".to_string(),
+                alias: "telegram".to_string(),
+                reference: Some("local".to_string()),
+                hash: Some("stale-hash".to_string()),
+                skill_md: Some(
+                    "---\nname: stale-telegram\ndescription: stale telegram\n---\n".to_string(),
+                ),
+                snapshot_path: None,
+            })
+            .await
+            .expect("install stale skill");
+        kernel
+            .enable_skill(stale.skill_id.clone())
+            .await
+            .expect("enable stale skill");
+
+        let skill_source =
+            write_channel_skill_fixture(temp_dir.path(), "channel-telegram", "telegram");
+        let config = OperatorConfig {
+            skills: vec![ManagedSkillConfig {
+                alias: "telegram".to_string(),
+                source: skill_source.to_string_lossy().to_string(),
+                reference: "local".to_string(),
+                enabled: true,
+            }],
+            ..OperatorConfig::default()
+        };
+        config.save(&home).await.expect("save config");
+        OperatorLockfile::default()
+            .save(&home)
+            .await
+            .expect("save empty lockfile");
+
+        let applied = apply(&home).await.expect("apply should converge");
+        let enabled = kernel
+            .list_skills()
+            .await
+            .expect("list skills")
+            .skills
+            .into_iter()
+            .filter(|skill| skill.enabled)
+            .collect::<Vec<_>>();
+
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].alias, "telegram");
+        assert_eq!(enabled[0].skill_id, applied.lockfile.skills[0].skill_id);
+        assert_ne!(enabled[0].skill_id, stale.skill_id);
     }
 
     #[tokio::test]
@@ -1634,15 +1738,7 @@ mod tests {
         )
         .expect("skill md");
         fs::write(skill_source.join("scripts/worker"), "#!/usr/bin/env bash\n").expect("worker");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                skill_source.join("scripts/worker"),
-                fs::Permissions::from_mode(0o755),
-            )
-            .expect("chmod worker");
-        }
+        make_executable(&skill_source.join("scripts/worker"));
 
         config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
             .into_iter()

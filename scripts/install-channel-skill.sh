@@ -95,9 +95,6 @@ if [[ "$START_WORKER" == true ]]; then
   curl -fsS "$BASE_URL/health" >/dev/null
   WORKER="$(resolve_snapshot_worker)"
   if [[ ! -x "$WORKER" ]]; then
-    chmod +x "$WORKER" 2>/dev/null || true
-  fi
-  if [[ ! -x "$WORKER" ]]; then
     echo "worker script is not executable: $WORKER" >&2
     exit 1
   fi
