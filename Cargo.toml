@@ -67,7 +67,7 @@ thiserror = "1.0"
 tempfile = "3.27"
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "signal", "net", "fs", "process"] }
 toml = "1.1"
-tower-http = { version = "0.5", features = ["trace"] }
+tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.8", features = ["serde", "v4", "v5"] }
