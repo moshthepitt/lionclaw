@@ -1,7 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path, PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::{Component, Path, PathBuf},
+};
 
 use crate::{
     config::resolve_project_workspace_root,
@@ -654,15 +657,8 @@ pub(crate) async fn render_runtime_cache(
     }
 
     for skill in lockfile.skills.iter().filter(|skill| skill.enabled) {
-        let skill_md_path =
-            resolve_locked_snapshot_dir(home, &skill.snapshot_dir)?.join("SKILL.md");
-        if tokio::fs::try_exists(&skill_md_path)
-            .await
-            .with_context(|| format!("failed to stat {}", skill_md_path.display()))?
-        {
-            let content = tokio::fs::read_to_string(&skill_md_path)
-                .await
-                .with_context(|| format!("failed to read {}", skill_md_path.display()))?;
+        let snapshot_root = resolve_locked_snapshot_dir(home, &skill.snapshot_dir)?;
+        if let Some(content) = read_locked_skill_md(&snapshot_root).await? {
             sections.push(format!(
                 "## Skill {} ({})\n\n{}",
                 skill.alias,
@@ -734,13 +730,33 @@ pub(crate) fn resolve_worker_entrypoint(
 ) -> Result<PathBuf> {
     let snapshot_root = resolve_locked_snapshot_dir(home, snapshot_dir)?;
     let candidate = snapshot_root.join("scripts/worker");
-    if !candidate.is_file() {
+    let metadata = match fs::symlink_metadata(&candidate) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!(
+                "worker entrypoint is missing under '{}'; expected 'scripts/worker'",
+                snapshot_root.display()
+            ));
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to stat worker entrypoint {}", candidate.display())
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "worker entrypoint '{}' must not be a symlink",
+            candidate.display()
+        ));
+    }
+    if !metadata.is_file() {
         return Err(anyhow!(
             "worker entrypoint is missing under '{}'; expected 'scripts/worker'",
             snapshot_root.display()
         ));
     }
-    if !is_executable_file(&candidate)? {
+    if !is_executable_file(&metadata) {
         return Err(anyhow!(
             "worker entrypoint '{}' is not executable",
             candidate.display()
@@ -748,6 +764,34 @@ pub(crate) fn resolve_worker_entrypoint(
     }
 
     Ok(candidate)
+}
+
+async fn read_locked_skill_md(snapshot_root: &Path) -> Result<Option<String>> {
+    let skill_md_path = snapshot_root.join("SKILL.md");
+    let metadata = match tokio::fs::symlink_metadata(&skill_md_path).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", skill_md_path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "locked skill metadata '{}' must not be a symlink",
+            skill_md_path.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "locked skill metadata '{}' is not a regular file",
+            skill_md_path.display()
+        ));
+    }
+
+    tokio::fs::read_to_string(&skill_md_path)
+        .await
+        .map(Some)
+        .with_context(|| format!("failed to read {}", skill_md_path.display()))
 }
 
 pub(crate) async fn resolve_installed_skill_worker_entrypoint(
@@ -778,22 +822,53 @@ fn resolve_locked_snapshot_dir(home: &LionClawHome, snapshot_dir: &str) -> Resul
         ));
     }
 
-    Ok(home.root().join(snapshot_path))
+    let snapshot_root = home.root().join(snapshot_path);
+    let metadata = fs::symlink_metadata(&snapshot_root).with_context(|| {
+        format!(
+            "failed to stat locked skill snapshot {}",
+            snapshot_root.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "locked skill snapshot '{}' must not be a symlink",
+            snapshot_root.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(anyhow!(
+            "locked skill snapshot '{}' is not a directory",
+            snapshot_root.display()
+        ));
+    }
+
+    let skills_root = fs::canonicalize(home.skills_dir())
+        .with_context(|| format!("failed to resolve {}", home.skills_dir().display()))?;
+    let snapshot_root = fs::canonicalize(&snapshot_root)
+        .with_context(|| format!("failed to resolve {}", snapshot_root.display()))?;
+    if snapshot_root.parent() != Some(skills_root.as_path()) {
+        return Err(anyhow!(
+            "locked skill snapshot '{}' must stay directly under '{}'",
+            snapshot_root.display(),
+            skills_root.display()
+        ));
+    }
+
+    Ok(snapshot_root)
 }
 
-fn is_executable_file(path: &Path) -> Result<bool> {
+fn is_executable_file(metadata: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let metadata = std::fs::metadata(path)
-            .with_context(|| format!("failed to stat worker entrypoint {}", path.display()))?;
-        Ok(metadata.permissions().mode() & 0o111 != 0)
+        metadata.permissions().mode() & 0o111 != 0
     }
 
     #[cfg(not(unix))]
     {
-        Ok(path.is_file())
+        let _ = metadata;
+        true
     }
 }
 
@@ -1152,6 +1227,30 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn worker_entrypoint_rejects_symlinked_snapshot_dir() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let outside = temp_dir.path().join("outside-snapshot");
+        let worker = outside.join("scripts/worker");
+        fs::create_dir_all(worker.parent().expect("worker parent")).expect("outside scripts");
+        fs::write(&worker, "#!/usr/bin/env bash\n").expect("worker");
+        make_executable(&worker);
+        fs::create_dir_all(home.skills_dir()).expect("skills dir");
+        symlink(&outside, home.skills_dir().join("example")).expect("snapshot symlink");
+
+        let err = resolve_worker_entrypoint(&home, "skills/example")
+            .expect_err("symlinked snapshot should fail");
+
+        assert!(
+            err.to_string().contains("must not be a symlink"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn worker_entrypoint_rejects_directory_worker_path() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -1190,6 +1289,32 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn worker_entrypoint_rejects_symlinked_worker() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let snapshot_dir = "skills/example";
+        let worker = home
+            .root()
+            .join(snapshot_dir)
+            .join("scripts")
+            .join("worker");
+        fs::create_dir_all(worker.parent().expect("worker parent")).expect("scripts dir");
+        let outside_worker = temp_dir.path().join("outside-worker");
+        fs::write(&outside_worker, "#!/usr/bin/env bash\n").expect("outside worker");
+        make_executable(&outside_worker);
+        symlink(&outside_worker, &worker).expect("worker symlink");
+
+        let err = resolve_worker_entrypoint(&home, snapshot_dir).expect_err("should fail");
+        assert!(
+            err.to_string().contains("must not be a symlink"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn installed_skill_worker_entrypoint_uses_locked_alias() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -1224,7 +1349,47 @@ mod tests {
             .await
             .expect("resolve worker");
 
-        assert_eq!(resolved, worker);
+        assert_eq!(resolved, worker.canonicalize().expect("canonical worker"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn render_runtime_cache_rejects_symlinked_skill_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let config = onboard(&home, None).await.expect("onboard");
+        let snapshot_root = home.skills_dir().join("example");
+        fs::create_dir_all(&snapshot_root).expect("snapshot root");
+        let outside_skill_md = temp_dir.path().join("outside-SKILL.md");
+        fs::write(
+            &outside_skill_md,
+            "---\nname: outside\ndescription: outside\n---\n",
+        )
+        .expect("outside skill md");
+        symlink(&outside_skill_md, snapshot_root.join("SKILL.md")).expect("skill md symlink");
+        let lockfile = OperatorLockfile {
+            skills: vec![LockedSkill {
+                alias: "telegram".to_string(),
+                source: "local:skills/channel-telegram".to_string(),
+                reference: "local".to_string(),
+                skill_id: "channel-telegram-hash".to_string(),
+                hash: "hash".to_string(),
+                snapshot_dir: "skills/example".to_string(),
+                enabled: true,
+            }],
+            ..OperatorLockfile::default()
+        };
+
+        let err = render_runtime_cache(&home, &config, &lockfile, "codex")
+            .await
+            .expect_err("symlinked skill metadata should fail");
+
+        assert!(
+            err.to_string().contains("must not be a symlink"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1405,6 +1570,66 @@ mod tests {
             skills.len(),
             2,
             "old revisions remain installed for auditability"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_converges_when_worker_executable_bit_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+
+        let skill_source = temp_dir.path().join("channel-terminal");
+        fs::create_dir_all(skill_source.join("scripts")).expect("skill dir");
+        fs::write(
+            skill_source.join("SKILL.md"),
+            "---\nname: channel-terminal\ndescription: test\n---\n",
+        )
+        .expect("skill md");
+        let worker = skill_source.join("scripts/worker");
+        fs::write(&worker, "#!/usr/bin/env bash\n").expect("worker");
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+
+        let config = OperatorConfig {
+            skills: vec![ManagedSkillConfig {
+                alias: "mode-test".to_string(),
+                source: skill_source.to_string_lossy().to_string(),
+                reference: "local".to_string(),
+                enabled: true,
+            }],
+            ..OperatorConfig::default()
+        };
+        config.save(&home).await.expect("save config");
+        let first = apply(&home).await.expect("apply non-executable worker");
+        let err = resolve_installed_skill_worker_entrypoint(&home, "mode-test")
+            .await
+            .expect_err("worker should not be executable yet");
+        assert!(
+            err.to_string().contains("is not executable"),
+            "unexpected error: {err}"
+        );
+
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("chmod 755");
+        let second = apply(&home).await.expect("apply executable worker");
+        let installed_worker = resolve_installed_skill_worker_entrypoint(&home, "mode-test")
+            .await
+            .expect("resolve executable worker");
+
+        assert_ne!(
+            first.lockfile.skills[0].hash, second.lockfile.skills[0].hash,
+            "mode-only changes should create a new snapshot revision"
+        );
+        assert_ne!(
+            installed_worker
+                .metadata()
+                .expect("installed worker metadata")
+                .permissions()
+                .mode()
+                & 0o111,
+            0
         );
     }
 
