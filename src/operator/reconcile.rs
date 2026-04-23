@@ -171,22 +171,21 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
     }
 
     let existing_skills = kernel.list_skills().await.map_err(to_anyhow)?.skills;
-    for (skill, snapshot) in desired_skills {
-        if let Some(old_skill) = previous_lock.find_skill(&skill.alias).filter(|old_skill| {
-            old_skill.source != snapshot.source_uri
-                || old_skill.reference != snapshot.reference
-                || old_skill.hash != snapshot.hash
-        }) {
-            disable_stale_skill_if_present(&kernel, &old_skill.skill_id).await?;
-        }
-        for existing in existing_skills.iter().filter(|existing| {
-            existing.enabled
-                && existing.alias == skill.alias
-                && existing.skill_id != snapshot.skill_id
-        }) {
+    let desired_skill_id_by_alias = desired_skills
+        .iter()
+        .map(|(skill, snapshot)| (skill.alias.clone(), snapshot.skill_id.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    for existing in existing_skills.iter().filter(|existing| existing.enabled) {
+        if desired_skill_id_by_alias
+            .get(&existing.alias)
+            .is_some_and(|skill_id| skill_id != &existing.skill_id)
+        {
             disable_stale_skill_if_present(&kernel, &existing.skill_id).await?;
         }
+    }
 
+    for (skill, snapshot) in desired_skills {
         let installed = kernel
             .install_skill(crate::contracts::SkillInstallRequest {
                 source: snapshot.source_uri.clone(),
@@ -198,13 +197,6 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
             })
             .await
             .map_err(to_anyhow)?;
-
-        if let Some(old_skill) = previous_lock
-            .find_skill(&skill.alias)
-            .filter(|old_skill| old_skill.skill_id != installed.skill_id)
-        {
-            disable_stale_skill_if_present(&kernel, &old_skill.skill_id).await?;
-        }
 
         if skill.enabled {
             kernel
@@ -1698,6 +1690,93 @@ mod tests {
         assert_eq!(enabled.len(), 1);
         assert_eq!(enabled[0].alias, "beta");
         assert_eq!(enabled[0].skill_id, applied.lockfile.skills[0].skill_id);
+    }
+
+    #[tokio::test]
+    async fn apply_swaps_skill_aliases_without_disabling_reassigned_skills() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+
+        let terminal_source =
+            write_channel_skill_fixture(temp_dir.path(), "channel-terminal", "terminal");
+        let telegram_source =
+            write_channel_skill_fixture(temp_dir.path(), "channel-telegram", "telegram");
+
+        OperatorConfig {
+            skills: vec![
+                ManagedSkillConfig {
+                    alias: "alpha".to_string(),
+                    source: terminal_source.to_string_lossy().to_string(),
+                    reference: "local".to_string(),
+                    enabled: true,
+                },
+                ManagedSkillConfig {
+                    alias: "beta".to_string(),
+                    source: telegram_source.to_string_lossy().to_string(),
+                    reference: "local".to_string(),
+                    enabled: true,
+                },
+            ],
+            ..OperatorConfig::default()
+        }
+        .save(&home)
+        .await
+        .expect("save original config");
+        apply(&home).await.expect("apply original aliases");
+
+        OperatorConfig {
+            skills: vec![
+                ManagedSkillConfig {
+                    alias: "alpha".to_string(),
+                    source: telegram_source.to_string_lossy().to_string(),
+                    reference: "local".to_string(),
+                    enabled: true,
+                },
+                ManagedSkillConfig {
+                    alias: "beta".to_string(),
+                    source: terminal_source.to_string_lossy().to_string(),
+                    reference: "local".to_string(),
+                    enabled: true,
+                },
+            ],
+            ..OperatorConfig::default()
+        }
+        .save(&home)
+        .await
+        .expect("save swapped config");
+        let applied = apply(&home).await.expect("apply swapped aliases");
+
+        let expected = applied
+            .lockfile
+            .skills
+            .iter()
+            .map(|skill| (skill.alias.clone(), skill.skill_id.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(expected.len(), 2);
+
+        let kernel = Kernel::new_with_options(
+            &home.db_path(),
+            KernelOptions {
+                default_runtime_id: None,
+                workspace_root: Some(home.workspace_dir("main")),
+                project_workspace_root: Some(home.workspace_dir("main")),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel");
+        let enabled = kernel
+            .list_skills()
+            .await
+            .expect("list skills")
+            .skills
+            .into_iter()
+            .filter(|skill| skill.enabled)
+            .map(|skill| (skill.alias, skill.skill_id))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(enabled, expected);
     }
 
     #[tokio::test]
