@@ -27,6 +27,7 @@ async fn runtime_capability_requests_are_kernel_gated() {
     let skill = kernel
         .install_skill(SkillInstallRequest {
             source: "local/capability-protocol".to_string(),
+            alias: "capability-protocol".to_string(),
             reference: Some("main".to_string()),
             hash: Some("capability-protocol-hash".to_string()),
             skill_md: Some(

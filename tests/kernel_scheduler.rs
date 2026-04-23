@@ -119,6 +119,64 @@ async fn scheduled_job_tick_runs_in_fresh_scheduler_session() {
 }
 
 #[tokio::test]
+async fn scheduled_job_does_not_use_skill_disabled_after_creation() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let skill_id = install_enabled_skill(&kernel, "scheduler-disabled").await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "disabled skill guard".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "try the disabled scheduler skill".to_string(),
+            skill_ids: vec![skill_id.clone()],
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create job");
+    kernel
+        .disable_skill(skill_id.clone())
+        .await
+        .expect("disable skill after job creation");
+
+    let tick = kernel.scheduler_tick().await.expect("run scheduler tick");
+    assert_eq!(tick.claimed_runs, 1);
+
+    let latest = kernel
+        .latest_session_snapshot(SessionLatestQuery {
+            channel_id: "scheduler".to_string(),
+            peer_id: format!("job:{}", created.job.job_id),
+            history_policy: Some(SessionHistoryPolicy::Conservative),
+        })
+        .await
+        .expect("load latest scheduler session");
+    let session = latest.session.expect("scheduler session should exist");
+    let history = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: session.session_id,
+            limit: Some(5),
+        })
+        .await
+        .expect("load session history");
+
+    assert!(
+        history.turns[0]
+            .assistant_text
+            .contains("no skill context selected"),
+        "disabled skills must not be passed to runtime turns"
+    );
+    assert!(
+        !history.turns[0].assistant_text.contains(&skill_id),
+        "disabled skill id should not be visible as a selected skill"
+    );
+}
+
+#[tokio::test]
 async fn create_job_rejects_missing_runtime_auth_before_persisting() {
     let env = TestEnv::new();
     let home = LionClawHome::new(env.temp_dir.path().join(".lionclaw"));
@@ -1073,6 +1131,7 @@ async fn install_enabled_skill(kernel: &Kernel, skill_name: &str) -> String {
     let installed = kernel
         .install_skill(SkillInstallRequest {
             source: format!("local/{skill_name}"),
+            alias: skill_name.to_string(),
             reference: Some("main".to_string()),
             hash: Some(format!("{skill_name}-hash")),
             skill_md: Some(format!(

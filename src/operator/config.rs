@@ -66,7 +66,10 @@ impl OperatorConfig {
     }
 
     pub fn upsert_skill(&mut self, skill: ManagedSkillConfig) {
-        self.skills.retain(|existing| existing.alias != skill.alias);
+        self.skills.retain(|existing| {
+            existing.alias != skill.alias
+                && !(existing.source == skill.source && existing.reference == skill.reference)
+        });
         self.skills.push(skill);
         self.normalize();
     }

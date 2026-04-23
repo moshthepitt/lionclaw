@@ -2,6 +2,12 @@ use std::{collections::BTreeSet, fmt, path::PathBuf, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
+pub const SKILLS_MOUNT_TARGET_ROOT: &str = "/lionclaw/skills";
+
+pub fn skill_mount_target(alias: &str) -> String {
+    format!("{SKILLS_MOUNT_TARGET_ROOT}/{alias}")
+}
+
 /// Adapter-produced program invocation details, independent from how LionClaw
 /// chooses to confine the process.
 #[derive(Clone, PartialEq, Eq, Default)]

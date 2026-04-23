@@ -17,9 +17,9 @@ pub use oci::{
     OciExecutionBackend,
 };
 pub use plan::{
-    ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan, EscapeClass, ExecutionLimits,
-    ExecutionPreset, MountAccess, MountSpec, NetworkMode, OciConfinementConfig, RuntimeAuthKind,
-    RuntimeProgramSpec, WorkspaceAccess,
+    skill_mount_target, ConfinementBackend, ConfinementConfig, EffectiveExecutionPlan, EscapeClass,
+    ExecutionLimits, ExecutionPreset, MountAccess, MountSpec, NetworkMode, OciConfinementConfig,
+    RuntimeAuthKind, RuntimeProgramSpec, WorkspaceAccess, SKILLS_MOUNT_TARGET_ROOT,
 };
 pub use planner::{
     ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,

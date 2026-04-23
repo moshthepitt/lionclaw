@@ -26,7 +26,8 @@ use crate::{
         reconcile::{
             add_channel, add_skill, apply, down, logs, onboard, open_kernel, open_runtime_kernel,
             pairing_approve, pairing_block, pairing_list, remove_channel, remove_skill,
-            resolve_stack_binaries, status, up, OnboardBindSelection,
+            resolve_installed_skill_worker_entrypoint, resolve_stack_binaries, status, up,
+            OnboardBindSelection,
         },
         run::run_local,
         runtime::{
@@ -171,6 +172,8 @@ struct RuntimeSetDefaultArgs {
 enum SkillCommand {
     Add(SkillAddArgs),
     Rm(SkillRmArgs),
+    #[command(hide = true)]
+    WorkerPath(SkillWorkerPathArgs),
 }
 
 #[derive(Debug, Args)]
@@ -184,6 +187,11 @@ struct SkillAddArgs {
 
 #[derive(Debug, Args)]
 struct SkillRmArgs {
+    alias: String,
+}
+
+#[derive(Debug, Args)]
+struct SkillWorkerPathArgs {
     alias: String,
 }
 
@@ -511,6 +519,10 @@ pub async fn run() -> Result<()> {
                     if removed { "removed" } else { "left unchanged" },
                     args.alias
                 );
+            }
+            SkillCommand::WorkerPath(args) => {
+                let worker = resolve_installed_skill_worker_entrypoint(&home, &args.alias).await?;
+                println!("{}", worker.display());
             }
         },
         Command::Channel { command } => match command {

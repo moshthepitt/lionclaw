@@ -48,7 +48,7 @@ lionclaw service up --runtime codex
 ```bash
 TELEGRAM_BOT_TOKEN=... \
 LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
-./skills/channel-telegram/scripts/worker.sh
+./skills/channel-telegram/scripts/worker
 ```
 
 ## Notes

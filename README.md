@@ -94,6 +94,7 @@ runtime mechanism:
 `lionclaw run ...` uses your current directory as the project root by default.
 The confined runtime sees that project at `/workspace`. LionClaw keeps its own
 state, continuity, runtime cache, services, and config under `LIONCLAW_HOME`.
+Selected skill snapshots are mounted read-only under `/lionclaw/skills/<alias>`.
 
 Runtime-specific provider settings stay with the runtime. For example, if a
 Codex profile leaves `model` unset, LionClaw reuses the current host Codex
@@ -330,6 +331,7 @@ The everyday confined runtime layout is:
 - `/workspace`: the project root, mounted read-only or read-write by preset
 - `/runtime`: runtime-private writable state
 - `/drafts`: runtime-private draft/output area
+- `/lionclaw/skills/<alias>`: selected skill snapshot assets, mounted read-only
 
 Current runtime network policy is intentionally coarse:
 `network-mode = "on"` or `network-mode = "none"`. `on` maps to Podman's

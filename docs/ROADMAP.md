@@ -20,7 +20,7 @@ Status key:
 - [x] Runtime selection happens at invocation or service startup.
 - [x] Channels remain external skill workers.
 - [x] Installed state lives under `~/.lionclaw`, not repository-relative paths.
-- [x] The runtime boundary is mount-first: `/workspace`, `/runtime`, `/drafts`.
+- [x] The runtime boundary is mount-first: `/workspace`, `/runtime`, `/drafts`, and selected read-only skill assets.
 - [x] LionClaw owns the boundary, session, channel, scheduler, continuity, and audit surfaces.
 
 ## Non-Negotiable Invariants
@@ -174,6 +174,7 @@ Goal: keep skills useful without making them implicitly trusted code.
 - [x] path traversal and unsafe name protections.
 - [x] deterministic skill folder hashes.
 - [x] deterministic lockfile ordering.
+- [x] selected skill snapshots mounted read-only into runtimes by alias.
 - [x] marker-based injection cache as derived, non-authoritative output.
 - [x] selector decisions and policy checks remain independent of injected text.
 - [ ] generic git URL install support.

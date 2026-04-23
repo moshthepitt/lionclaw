@@ -63,6 +63,7 @@ Instead, LionClaw constrains the runtime launch:
 - project root mounted at `/workspace`
 - runtime-private state mounted at `/runtime`
 - draft/output area mounted at `/drafts`
+- selected skill snapshots mounted read-only at `/lionclaw/skills/<alias>`
 - network mode chosen by preset
 - runtime secrets mounted only when preset allows it
 - runtime auth staged into the runtime-private home
@@ -168,14 +169,16 @@ The everyday runtime layout is mount-first:
 - `/workspace`: project/task root with preset-controlled read-only or read-write access
 - `/runtime`: runtime-private writable state root
 - `/drafts`: runtime-private draft/output area
+- `/lionclaw/skills/<alias>`: selected skill snapshot assets mounted read-only
 
 For local `lionclaw run`, the project root defaults to the current working
 directory and is mounted at `/workspace`. `LIONCLAW_HOME` remains LionClaw's
 state root and is not the project tree.
 
 The planner injects runtime-private environment defaults such as
-`HOME=/runtime/home` and `LIONCLAW_DRAFTS_DIR=/drafts`, so engine-specific
-caches and config stay out of assistant continuity.
+`HOME=/runtime/home`, `LIONCLAW_DRAFTS_DIR=/drafts`, and
+`LIONCLAW_SKILLS_DIR=/lionclaw/skills` when selected skills have mounted
+assets, so engine-specific caches and config stay out of assistant continuity.
 
 Interactive program-backed turns launch a fresh confined process for each
 request, but the mounted `/runtime` state root is scoped to the LionClaw
