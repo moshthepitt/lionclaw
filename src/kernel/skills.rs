@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -29,6 +31,13 @@ pub struct SkillInstallInput {
     pub hash: Option<String>,
     pub skill_md: Option<String>,
     pub snapshot_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillAliasState {
+    pub skill_id: String,
+    pub alias: String,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Error)]
@@ -63,6 +72,19 @@ impl SkillStore {
     }
 
     pub async fn install(&self, input: SkillInstallInput) -> Result<SkillRecord> {
+        self.install_with_mode(input, SkillInstallMode::Strict)
+            .await
+    }
+
+    pub async fn stage(&self, input: SkillInstallInput) -> Result<SkillRecord> {
+        self.install_with_mode(input, SkillInstallMode::Stage).await
+    }
+
+    async fn install_with_mode(
+        &self,
+        input: SkillInstallInput,
+        mode: SkillInstallMode,
+    ) -> Result<SkillRecord> {
         validate_skill_alias(&input.alias)?;
 
         let (name, description) = input
@@ -87,30 +109,22 @@ impl SkillStore {
         });
 
         let reference_key = input.reference.unwrap_or_default();
+        let alias = input.alias;
 
         if let Some(existing) = self
             .find_by_provenance(&input.source, &reference_key, &hash)
             .await?
         {
-            if existing.alias == input.alias {
-                return Ok(existing);
-            }
-            return self.set_alias(&existing.skill_id, &input.alias).await;
+            return self.record_with_alias_mode(existing, &alias, mode).await;
         }
 
         let skill_id = derive_skill_id(&name, &hash);
-        if let Some(existing) = self.find_enabled_by_alias(&input.alias).await? {
-            if existing.skill_id != skill_id {
-                return Err(SkillAliasConflict {
-                    alias: input.alias,
-                    existing_skill_id: existing.skill_id,
-                }
-                .into());
-            }
+        if mode == SkillInstallMode::Strict {
+            self.ensure_enabled_alias_available(&alias, &skill_id)
+                .await?;
         }
 
         let installed_at_ms = now_ms();
-        let alias = input.alias;
         let snapshot_path = input.snapshot_path.unwrap_or_default();
         let skill_md = input.skill_md.unwrap_or_default();
 
@@ -137,16 +151,10 @@ impl SkillStore {
                 .find_by_provenance(&input.source, &reference_key, &hash)
                 .await?
             {
-                if existing.alias == alias {
-                    return Ok(existing);
-                }
-                return self.set_alias(&existing.skill_id, &alias).await;
+                return self.record_with_alias_mode(existing, &alias, mode).await;
             }
             if let Some(existing) = self.get(&skill_id).await? {
-                if existing.alias == alias {
-                    return Ok(existing);
-                }
-                return self.set_alias(&existing.skill_id, &alias).await;
+                return self.record_with_alias_mode(existing, &alias, mode).await;
             }
             return Err(err).context("failed to insert skill");
         }
@@ -154,6 +162,22 @@ impl SkillStore {
         self.get(&skill_id)
             .await?
             .ok_or_else(|| anyhow!("skill disappeared immediately after insert"))
+    }
+
+    async fn record_with_alias_mode(
+        &self,
+        existing: SkillRecord,
+        alias: &str,
+        mode: SkillInstallMode,
+    ) -> Result<SkillRecord> {
+        if existing.alias == alias {
+            return Ok(existing);
+        }
+
+        match mode {
+            SkillInstallMode::Strict => self.set_alias(&existing.skill_id, alias).await,
+            SkillInstallMode::Stage => self.stage_alias(existing, alias).await,
+        }
     }
 
     pub async fn list(&self) -> Result<Vec<SkillRecord>> {
@@ -170,32 +194,166 @@ impl SkillStore {
     }
 
     pub async fn set_enabled(&self, skill_id: &str, enabled: bool) -> Result<Option<SkillRecord>> {
-        if enabled {
-            if let Some(skill) = self.get(skill_id).await? {
-                if let Some(existing) = self.find_enabled_by_alias(&skill.alias).await? {
-                    if existing.skill_id != skill.skill_id {
-                        return Err(SkillAliasConflict {
-                            alias: skill.alias,
-                            existing_skill_id: existing.skill_id,
-                        }
-                        .into());
-                    }
-                }
-            }
-        }
-
-        let changed = sqlx::query("UPDATE skills SET enabled = ?2 WHERE skill_id = ?1")
+        let changed = if enabled {
+            sqlx::query(
+                "UPDATE skills \
+                 SET enabled = 1 \
+                 WHERE skill_id = ?1 \
+                   AND NOT EXISTS (\
+                     SELECT 1 FROM skills AS existing \
+                     WHERE existing.alias = (\
+                       SELECT target.alias FROM skills AS target WHERE target.skill_id = ?1\
+                     ) \
+                       AND existing.enabled = 1 \
+                       AND existing.skill_id <> ?1\
+                   )",
+            )
             .bind(skill_id)
-            .bind(if enabled { 1 } else { 0 })
             .execute(&self.pool)
             .await
-            .context("failed to update skill enabled state")?;
+            .context("failed to update skill enabled state")?
+        } else {
+            sqlx::query("UPDATE skills SET enabled = 0 WHERE skill_id = ?1")
+                .bind(skill_id)
+                .execute(&self.pool)
+                .await
+                .context("failed to update skill enabled state")?
+        };
 
         if changed.rows_affected() == 0 {
+            if enabled {
+                if let Some(skill) = self.get(skill_id).await? {
+                    if let Some(existing) = self.find_enabled_by_alias(&skill.alias).await? {
+                        if existing.skill_id != skill.skill_id {
+                            return Err(SkillAliasConflict {
+                                alias: skill.alias,
+                                existing_skill_id: existing.skill_id,
+                            }
+                            .into());
+                        }
+                    }
+                    return Ok(Some(skill));
+                }
+            }
             return Ok(None);
         }
 
         self.get(skill_id).await
+    }
+
+    pub async fn apply_alias_states(&self, states: &[SkillAliasState]) -> Result<Vec<SkillRecord>> {
+        validate_alias_states(states)?;
+        let mut affected_skill_ids = BTreeSet::new();
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin skill alias state transaction")?;
+
+        for state in states {
+            let exists = sqlx::query("SELECT 1 FROM skills WHERE skill_id = ?1")
+                .bind(&state.skill_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .context("failed to query desired skill")?;
+            if exists.is_none() {
+                return Err(anyhow!("skill '{}' is not installed", state.skill_id));
+            }
+        }
+
+        for state in states {
+            let replaced = sqlx::query(
+                "SELECT skill_id FROM skills \
+                 WHERE alias = ?1 AND enabled = 1 AND skill_id <> ?2",
+            )
+            .bind(&state.alias)
+            .bind(&state.skill_id)
+            .fetch_all(&mut *tx)
+            .await
+            .context("failed to query replaced skill alias")?;
+            for row in replaced {
+                affected_skill_ids.insert(row.get::<String, _>("skill_id"));
+            }
+
+            sqlx::query(
+                "UPDATE skills \
+                 SET enabled = 0 \
+                 WHERE alias = ?1 AND enabled = 1 AND skill_id <> ?2",
+            )
+            .bind(&state.alias)
+            .bind(&state.skill_id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to disable replaced skill alias")?;
+        }
+
+        for state in states {
+            affected_skill_ids.insert(state.skill_id.clone());
+            let changed = sqlx::query("UPDATE skills SET alias = ?2 WHERE skill_id = ?1")
+                .bind(&state.skill_id)
+                .bind(&state.alias)
+                .execute(&mut *tx)
+                .await
+                .context("failed to update desired skill alias")?;
+            if changed.rows_affected() == 0 {
+                return Err(anyhow!("skill '{}' is not installed", state.skill_id));
+            }
+        }
+
+        for state in states {
+            if state.enabled {
+                let changed = sqlx::query(
+                    "UPDATE skills \
+                     SET enabled = 1 \
+                     WHERE skill_id = ?1 \
+                       AND alias = ?2 \
+                       AND NOT EXISTS (\
+                         SELECT 1 FROM skills AS existing \
+                         WHERE existing.alias = ?2 \
+                           AND existing.enabled = 1 \
+                           AND existing.skill_id <> ?1\
+                       )",
+                )
+                .bind(&state.skill_id)
+                .bind(&state.alias)
+                .execute(&mut *tx)
+                .await
+                .context("failed to enable desired skill")?;
+                if changed.rows_affected() == 0 {
+                    if let Some(existing_skill_id) =
+                        enabled_skill_id_by_alias(&mut tx, &state.alias).await?
+                    {
+                        return Err(SkillAliasConflict {
+                            alias: state.alias.clone(),
+                            existing_skill_id,
+                        }
+                        .into());
+                    }
+                    return Err(anyhow!("skill '{}' is not installed", state.skill_id));
+                }
+            } else {
+                sqlx::query("UPDATE skills SET enabled = 0 WHERE skill_id = ?1")
+                    .bind(&state.skill_id)
+                    .execute(&mut *tx)
+                    .await
+                    .context("failed to disable desired skill")?;
+            }
+        }
+
+        tx.commit()
+            .await
+            .context("failed to commit skill alias state transaction")?;
+
+        let mut records = Vec::with_capacity(affected_skill_ids.len());
+        for skill_id in affected_skill_ids {
+            records.push(
+                self.get(&skill_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("skill '{skill_id}' disappeared after state update"))?,
+            );
+        }
+        Ok(records)
     }
 
     pub async fn get(&self, skill_id: &str) -> Result<Option<SkillRecord>> {
@@ -262,16 +420,11 @@ impl SkillStore {
     }
 
     async fn set_alias(&self, skill_id: &str, alias: &str) -> Result<SkillRecord> {
-        if let Some(existing) = self.find_enabled_by_alias(alias).await? {
-            if existing.skill_id != skill_id {
-                return Err(SkillAliasConflict {
-                    alias: alias.to_string(),
-                    existing_skill_id: existing.skill_id,
-                }
-                .into());
-            }
-        }
+        self.ensure_enabled_alias_available(alias, skill_id).await?;
+        self.update_alias(skill_id, alias).await
+    }
 
+    async fn update_alias(&self, skill_id: &str, alias: &str) -> Result<SkillRecord> {
         sqlx::query("UPDATE skills SET alias = ?2 WHERE skill_id = ?1")
             .bind(skill_id)
             .bind(alias)
@@ -283,6 +436,59 @@ impl SkillStore {
             .await?
             .ok_or_else(|| anyhow!("skill disappeared immediately after alias update"))
     }
+
+    async fn stage_alias(&self, existing: SkillRecord, alias: &str) -> Result<SkillRecord> {
+        if existing.enabled {
+            return Ok(existing);
+        }
+
+        self.update_alias(&existing.skill_id, alias).await
+    }
+
+    async fn ensure_enabled_alias_available(&self, alias: &str, skill_id: &str) -> Result<()> {
+        if let Some(existing) = self.find_enabled_by_alias(alias).await? {
+            if existing.skill_id != skill_id {
+                return Err(SkillAliasConflict {
+                    alias: alias.to_string(),
+                    existing_skill_id: existing.skill_id,
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillInstallMode {
+    Strict,
+    Stage,
+}
+
+async fn enabled_skill_id_by_alias(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    alias: &str,
+) -> Result<Option<String>> {
+    let row = sqlx::query("SELECT skill_id FROM skills WHERE alias = ?1 AND enabled = 1")
+        .bind(alias)
+        .fetch_optional(&mut **tx)
+        .await
+        .context("failed to query enabled skill by alias")?;
+    Ok(row.map(|row| row.get("skill_id")))
+}
+
+fn validate_alias_states(states: &[SkillAliasState]) -> Result<()> {
+    let mut aliases = BTreeSet::new();
+    for state in states {
+        validate_skill_alias(&state.alias)?;
+        if !aliases.insert(state.alias.clone()) {
+            return Err(anyhow!(
+                "skill alias '{}' appears more than once in desired skill state",
+                state.alias
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn map_skill_row(row: SqliteRow) -> Result<SkillRecord> {

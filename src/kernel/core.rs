@@ -93,8 +93,8 @@ use super::{
     session_turns::{NewSessionTurn, SessionTurnCompletion, SessionTurnRecord, SessionTurnStore},
     sessions::SessionStore,
     skills::{
-        validate_skill_alias, SkillAliasConflict, SkillAliasValidationError, SkillInstallInput,
-        SkillStore,
+        validate_skill_alias, SkillAliasConflict, SkillAliasState, SkillAliasValidationError,
+        SkillInstallInput, SkillRecord, SkillStore,
     },
 };
 
@@ -204,6 +204,12 @@ pub struct Kernel {
     workspace_name: Option<String>,
     continuity: Option<ContinuityLayout>,
     hidden_compaction_turn_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillInstallScope {
+    Strict,
+    Stage,
 }
 
 #[derive(Debug, Clone)]
@@ -824,28 +830,47 @@ impl Kernel {
         &self,
         req: SkillInstallRequest,
     ) -> Result<SkillInstallResponse, KernelError> {
+        self.install_skill_with_scope(req, SkillInstallScope::Strict, "api")
+            .await
+    }
+
+    pub(crate) async fn stage_skill(
+        &self,
+        req: SkillInstallRequest,
+    ) -> Result<SkillInstallResponse, KernelError> {
+        self.install_skill_with_scope(req, SkillInstallScope::Stage, "operator")
+            .await
+    }
+
+    async fn install_skill_with_scope(
+        &self,
+        req: SkillInstallRequest,
+        scope: SkillInstallScope,
+        actor: &str,
+    ) -> Result<SkillInstallResponse, KernelError> {
         if req.source.trim().is_empty() {
             return Err(KernelError::BadRequest("source is required".to_string()));
         }
 
-        let installed = self
-            .skills
-            .install(SkillInstallInput {
-                source: req.source,
-                alias: req.alias,
-                reference: req.reference,
-                hash: req.hash,
-                skill_md: req.skill_md,
-                snapshot_path: req.snapshot_path,
-            })
-            .await
-            .map_err(skill_install_error)?;
+        let input = SkillInstallInput {
+            source: req.source,
+            alias: req.alias,
+            reference: req.reference,
+            hash: req.hash,
+            skill_md: req.skill_md,
+            snapshot_path: req.snapshot_path,
+        };
+        let installed = match scope {
+            SkillInstallScope::Strict => self.skills.install(input).await,
+            SkillInstallScope::Stage => self.skills.stage(input).await,
+        }
+        .map_err(skill_install_error)?;
 
         self.audit
             .append(
                 "skill.install",
                 None,
-                Some("api".to_string()),
+                Some(actor.to_string()),
                 json!({"skill_id": installed.skill_id, "alias": installed.alias, "name": installed.name, "hash": installed.hash}),
             )
             .await
@@ -858,6 +883,23 @@ impl Kernel {
             hash: installed.hash,
             enabled: installed.enabled,
         })
+    }
+
+    pub(crate) async fn apply_skill_alias_states(
+        &self,
+        states: Vec<SkillAliasState>,
+    ) -> Result<(), KernelError> {
+        let updated = self
+            .skills
+            .apply_alias_states(&states)
+            .await
+            .map_err(skill_toggle_error)?;
+
+        for skill in updated {
+            self.audit_skill_state(&skill, "operator").await?;
+        }
+
+        Ok(())
     }
 
     pub async fn list_skills(&self) -> Result<SkillListResponse, KernelError> {
@@ -900,6 +942,23 @@ impl Kernel {
             skill_id: updated.skill_id,
             enabled: updated.enabled,
         })
+    }
+
+    async fn audit_skill_state(&self, skill: &SkillRecord, actor: &str) -> Result<(), KernelError> {
+        let event_type = if skill.enabled {
+            "skill.enable"
+        } else {
+            "skill.disable"
+        };
+        self.audit
+            .append(
+                event_type,
+                None,
+                Some(actor.to_string()),
+                json!({"skill_id": skill.skill_id, "alias": skill.alias}),
+            )
+            .await
+            .map_err(internal)
     }
 
     pub async fn disable_skill(
@@ -3221,6 +3280,66 @@ mod tests {
             asset_paths.get(&installed.skill_id).map(String::as_str),
             Some("/lionclaw/skills/terminal")
         );
+    }
+
+    #[tokio::test]
+    async fn staging_existing_enabled_skill_does_not_rename_active_alias() {
+        let temp_dir = tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("lionclaw.db");
+        let kernel = Kernel::new(&db_path).await.expect("kernel init");
+        let install = crate::contracts::SkillInstallRequest {
+            source: "local:/skills/channel-terminal".to_string(),
+            alias: "alpha".to_string(),
+            reference: Some("local".to_string()),
+            hash: Some("hash".to_string()),
+            skill_md: Some("---\nname: terminal\ndescription: terminal skill\n---\n".to_string()),
+            snapshot_path: Some("/tmp/lionclaw-test-skills/terminal".to_string()),
+        };
+        let installed = kernel
+            .install_skill(install.clone())
+            .await
+            .expect("install skill");
+        kernel
+            .enable_skill(installed.skill_id.clone())
+            .await
+            .expect("enable skill");
+
+        let mut staged = install;
+        staged.alias = "beta".to_string();
+        kernel
+            .stage_skill(staged)
+            .await
+            .expect("stage alias change");
+
+        let active = kernel
+            .list_skills()
+            .await
+            .expect("list skills")
+            .skills
+            .into_iter()
+            .find(|skill| skill.skill_id == installed.skill_id)
+            .expect("installed skill");
+        assert_eq!(active.alias, "alpha");
+        assert!(active.enabled);
+
+        kernel
+            .apply_skill_alias_states(vec![SkillAliasState {
+                skill_id: installed.skill_id.clone(),
+                alias: "beta".to_string(),
+                enabled: true,
+            }])
+            .await
+            .expect("apply staged alias state");
+        let active = kernel
+            .list_skills()
+            .await
+            .expect("list skills after apply")
+            .skills
+            .into_iter()
+            .find(|skill| skill.skill_id == installed.skill_id)
+            .expect("installed skill after apply");
+        assert_eq!(active.alias, "beta");
+        assert!(active.enabled);
     }
 
     #[tokio::test]

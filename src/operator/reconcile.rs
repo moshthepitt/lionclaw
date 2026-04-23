@@ -11,7 +11,8 @@ use crate::{
     contracts::{ChannelBindRequest, ChannelPeerApproveRequest, ChannelPeerResponse, TrustTier},
     home::{runtime_project_partition_key, LionClawHome},
     kernel::{
-        skills::validate_skill_alias, Kernel, KernelError, KernelOptions, RuntimeExecutionPolicy,
+        skills::{validate_skill_alias, SkillAliasState},
+        Kernel, KernelError, KernelOptions, RuntimeExecutionPolicy,
     },
     operator::{
         config::{
@@ -170,24 +171,37 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
         desired_skills.push((skill, snapshot));
     }
 
-    let existing_skills = kernel.list_skills().await.map_err(to_anyhow)?.skills;
-    let desired_skill_id_by_alias = desired_skills
-        .iter()
-        .map(|(skill, snapshot)| (skill.alias.clone(), snapshot.skill_id.clone()))
-        .collect::<BTreeMap<_, _>>();
+    for channel in &config.channels {
+        if !desired_aliases.contains(channel.skill.as_str()) {
+            return Err(anyhow!(
+                "channel '{}' references missing skill alias '{}'",
+                channel.id,
+                channel.skill
+            ));
+        }
 
-    for existing in existing_skills.iter().filter(|existing| existing.enabled) {
-        if desired_skill_id_by_alias
-            .get(&existing.alias)
-            .is_some_and(|skill_id| skill_id != &existing.skill_id)
-        {
-            disable_stale_skill_if_present(&kernel, &existing.skill_id).await?;
+        if channel.enabled {
+            let skill_config = config
+                .skills
+                .iter()
+                .find(|skill| skill.alias == channel.skill)
+                .ok_or_else(|| {
+                    anyhow!("skill alias '{}' disappeared during apply", channel.skill)
+                })?;
+            if !skill_config.enabled {
+                return Err(anyhow!(
+                    "channel '{}' cannot be enabled while skill '{}' is disabled",
+                    channel.id,
+                    channel.skill
+                ));
+            }
         }
     }
 
+    let mut desired_skill_states = Vec::new();
     for (skill, snapshot) in desired_skills {
         let installed = kernel
-            .install_skill(crate::contracts::SkillInstallRequest {
+            .stage_skill(crate::contracts::SkillInstallRequest {
                 source: snapshot.source_uri.clone(),
                 alias: skill.alias.clone(),
                 reference: Some(snapshot.reference.clone()),
@@ -198,18 +212,11 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
             .await
             .map_err(to_anyhow)?;
 
-        if skill.enabled {
-            kernel
-                .enable_skill(installed.skill_id.clone())
-                .await
-                .map_err(to_anyhow)?;
-        } else {
-            kernel
-                .disable_skill(installed.skill_id.clone())
-                .await
-                .map_err(to_anyhow)?;
-        }
-
+        desired_skill_states.push(SkillAliasState {
+            skill_id: installed.skill_id.clone(),
+            alias: skill.alias.clone(),
+            enabled: skill.enabled,
+        });
         installed_skills.insert(
             skill.alias.clone(),
             (snapshot.clone(), installed.skill_id.clone()),
@@ -218,6 +225,11 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
             .skills
             .push(to_locked_skill(skill, snapshot, installed.skill_id));
     }
+
+    kernel
+        .apply_skill_alias_states(desired_skill_states)
+        .await
+        .map_err(to_anyhow)?;
 
     let next_skill_ids = next_lock
         .skills
@@ -241,30 +253,9 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
     }
 
     for channel in &config.channels {
-        let (_snapshot, skill_id) = installed_skills.get(&channel.skill).ok_or_else(|| {
-            anyhow!(
-                "channel '{}' references missing skill alias '{}'",
-                channel.id,
-                channel.skill
-            )
-        })?;
-
-        if channel.enabled {
-            let skill_config = config
-                .skills
-                .iter()
-                .find(|skill| skill.alias == channel.skill)
-                .ok_or_else(|| {
-                    anyhow!("skill alias '{}' disappeared during apply", channel.skill)
-                })?;
-            if !skill_config.enabled {
-                return Err(anyhow!(
-                    "channel '{}' cannot be enabled while skill '{}' is disabled",
-                    channel.id,
-                    channel.skill
-                ));
-            }
-        }
+        let (_snapshot, skill_id) = installed_skills
+            .get(&channel.skill)
+            .ok_or_else(|| anyhow!("skill alias '{}' disappeared during apply", channel.skill))?;
 
         kernel
             .bind_channel(ChannelBindRequest {
@@ -1780,6 +1771,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_preserves_enabled_alias_when_channel_validation_fails() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+
+        let terminal_source =
+            write_channel_skill_fixture(temp_dir.path(), "channel-terminal", "terminal");
+        let telegram_source =
+            write_channel_skill_fixture(temp_dir.path(), "channel-telegram", "telegram");
+
+        OperatorConfig {
+            skills: vec![ManagedSkillConfig {
+                alias: "alpha".to_string(),
+                source: terminal_source.to_string_lossy().to_string(),
+                reference: "local".to_string(),
+                enabled: true,
+            }],
+            ..OperatorConfig::default()
+        }
+        .save(&home)
+        .await
+        .expect("save original config");
+        let original = apply(&home).await.expect("apply original alias");
+        let original_skill_id = original.lockfile.skills[0].skill_id.clone();
+
+        OperatorConfig {
+            skills: vec![ManagedSkillConfig {
+                alias: "alpha".to_string(),
+                source: telegram_source.to_string_lossy().to_string(),
+                reference: "local".to_string(),
+                enabled: true,
+            }],
+            channels: vec![ManagedChannelConfig {
+                id: "broken".to_string(),
+                skill: "missing".to_string(),
+                enabled: true,
+                launch_mode: ChannelLaunchMode::Service,
+                required_env: Vec::new(),
+            }],
+            ..OperatorConfig::default()
+        }
+        .save(&home)
+        .await
+        .expect("save invalid replacement config");
+
+        let err = apply(&home)
+            .await
+            .expect_err("channel validation should fail before alias switch");
+        assert!(
+            err.to_string()
+                .contains("references missing skill alias 'missing'"),
+            "unexpected error: {err}"
+        );
+
+        let kernel = Kernel::new_with_options(
+            &home.db_path(),
+            KernelOptions {
+                default_runtime_id: None,
+                workspace_root: Some(home.workspace_dir("main")),
+                project_workspace_root: Some(home.workspace_dir("main")),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel");
+        let enabled = kernel
+            .list_skills()
+            .await
+            .expect("list skills")
+            .skills
+            .into_iter()
+            .filter(|skill| skill.enabled)
+            .collect::<Vec<_>>();
+
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].alias, "alpha");
+        assert_eq!(enabled[0].skill_id, original_skill_id);
+
+        let listed = kernel
+            .list_skills()
+            .await
+            .expect("list skills after failure");
+        assert_eq!(
+            listed.skills.len(),
+            1,
+            "channel preflight should fail before staging the replacement skill"
+        );
+    }
+
+    #[tokio::test]
     async fn apply_disables_enabled_alias_conflict_missing_from_lockfile() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
@@ -1835,6 +1916,19 @@ mod tests {
         assert_eq!(enabled[0].alias, "telegram");
         assert_eq!(enabled[0].skill_id, applied.lockfile.skills[0].skill_id);
         assert_ne!(enabled[0].skill_id, stale.skill_id);
+
+        let disable_audit = kernel
+            .query_audit(None, Some("skill.disable".to_string()), None, Some(10))
+            .await
+            .expect("query skill disable audit");
+        assert!(
+            disable_audit.events.iter().any(|event| {
+                event.actor.as_deref() == Some("operator")
+                    && event.details["skill_id"].as_str() == Some(stale.skill_id.as_str())
+                    && event.details["alias"].as_str() == Some("telegram")
+            }),
+            "replaced active skill disable should be audited"
+        );
     }
 
     #[tokio::test]

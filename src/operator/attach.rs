@@ -346,13 +346,46 @@ mod tests {
     async fn seed_interactive_channel(
         launch_mode: ChannelLaunchMode,
     ) -> (tempfile::TempDir, LionClawHome, FakeServiceManager) {
+        let (temp_dir, home, manager, _listener) =
+            seed_interactive_channel_with_bind(launch_mode, false).await;
+        (temp_dir, home, manager)
+    }
+
+    #[cfg(unix)]
+    async fn seed_interactive_channel_with_reserved_bind(
+        launch_mode: ChannelLaunchMode,
+    ) -> (
+        tempfile::TempDir,
+        LionClawHome,
+        FakeServiceManager,
+        std::net::TcpListener,
+    ) {
+        let (temp_dir, home, manager, listener) =
+            seed_interactive_channel_with_bind(launch_mode, true).await;
+        (
+            temp_dir,
+            home,
+            manager,
+            listener.expect("reserved daemon bind listener"),
+        )
+    }
+
+    #[cfg(unix)]
+    async fn seed_interactive_channel_with_bind(
+        launch_mode: ChannelLaunchMode,
+        reserve_bind: bool,
+    ) -> (
+        tempfile::TempDir,
+        LionClawHome,
+        FakeServiceManager,
+        Option<std::net::TcpListener>,
+    ) {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let bind = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-            let addr = listener.local_addr().expect("listener addr");
-            format!("127.0.0.1:{}", addr.port())
-        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("listener addr");
+        let bind = format!("127.0.0.1:{}", addr.port());
+        let listener = reserve_bind.then_some(listener);
         crate::operator::reconcile::onboard(&home, None)
             .await
             .expect("onboard");
@@ -425,13 +458,17 @@ mod tests {
         };
         config.save(&home).await.expect("save config");
 
-        (temp_dir, home, FakeServiceManager::default())
+        (temp_dir, home, FakeServiceManager::default(), listener)
     }
 
-    async fn spawn_probe_server(app: Router, bind_addr: &str) -> tokio::task::JoinHandle<()> {
-        let listener = tokio::net::TcpListener::bind(bind_addr)
-            .await
-            .expect("bind probe server");
+    async fn spawn_probe_server(
+        app: Router,
+        listener: std::net::TcpListener,
+    ) -> tokio::task::JoinHandle<()> {
+        listener
+            .set_nonblocking(true)
+            .expect("set probe listener nonblocking");
+        let listener = tokio::net::TcpListener::from_std(listener).expect("convert probe listener");
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve probe app");
         })
@@ -542,8 +579,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn prepare_channel_attach_reuses_same_home_daemon() {
-        let (_temp_dir, home, manager) =
-            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        let (_temp_dir, home, manager, listener) =
+            seed_interactive_channel_with_reserved_bind(ChannelLaunchMode::Interactive).await;
         let config = OperatorConfig::load(&home).await.expect("load config");
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
@@ -570,7 +607,7 @@ mod tests {
                     }
                 }),
             ),
-            &bind_addr,
+            listener,
         )
         .await;
 
@@ -592,8 +629,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn prepare_channel_attach_exports_requested_runtime_when_reusing_same_home_daemon() {
-        let (_temp_dir, home, manager) =
-            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        let (_temp_dir, home, manager, listener) =
+            seed_interactive_channel_with_reserved_bind(ChannelLaunchMode::Interactive).await;
         let config = OperatorConfig::load(&home).await.expect("load config");
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
@@ -620,7 +657,7 @@ mod tests {
                     }
                 }),
             ),
-            &bind_addr,
+            listener,
         )
         .await;
 
@@ -647,8 +684,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn prepare_channel_attach_restarts_same_home_daemon_when_config_is_stale() {
-        let (_temp_dir, home, manager) =
-            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        let (_temp_dir, home, manager, listener) =
+            seed_interactive_channel_with_reserved_bind(ChannelLaunchMode::Interactive).await;
         let config = OperatorConfig::load(&home).await.expect("load config");
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
@@ -674,7 +711,7 @@ mod tests {
                     }
                 }),
             ),
-            &bind_addr,
+            listener,
         )
         .await;
         manager
@@ -709,8 +746,8 @@ mod tests {
     #[tokio::test]
     async fn prepare_channel_attach_rejects_unknown_requested_runtime_when_reusing_same_home_daemon(
     ) {
-        let (_temp_dir, home, manager) =
-            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        let (_temp_dir, home, manager, listener) =
+            seed_interactive_channel_with_reserved_bind(ChannelLaunchMode::Interactive).await;
         let config = OperatorConfig::load(&home).await.expect("load config");
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
@@ -737,7 +774,7 @@ mod tests {
                     }
                 }),
             ),
-            &bind_addr,
+            listener,
         )
         .await;
 
@@ -761,8 +798,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn prepare_channel_attach_rejects_foreign_home_daemon() {
-        let (_temp_dir, home, manager) =
-            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        let (_temp_dir, home, manager, listener) =
+            seed_interactive_channel_with_reserved_bind(ChannelLaunchMode::Interactive).await;
         let config = OperatorConfig::load(&home).await.expect("load config");
         let bind_addr = config.daemon.bind.clone();
         let config_fingerprint = current_config_fingerprint(&home, &config, Some("codex")).await;
@@ -784,7 +821,7 @@ mod tests {
                     }
                 }),
             ),
-            &bind_addr,
+            listener,
         )
         .await;
 
@@ -806,16 +843,14 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn prepare_channel_attach_rejects_incompatible_lionclaw_daemon() {
-        let (_temp_dir, home, manager) =
-            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
-        let config = OperatorConfig::load(&home).await.expect("load config");
-        let bind_addr = config.daemon.bind.clone();
+        let (_temp_dir, home, manager, listener) =
+            seed_interactive_channel_with_reserved_bind(ChannelLaunchMode::Interactive).await;
         let _server = spawn_probe_server(
             Router::new().route(
                 "/health",
                 get(|| async { Json(json!({"service": "lionclawd", "status": "ok"})) }),
             ),
-            &bind_addr,
+            listener,
         )
         .await;
 
@@ -837,8 +872,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn prepare_channel_attach_rejects_same_home_different_project_daemon() {
-        let (_temp_dir, home, manager) =
-            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        let (_temp_dir, home, manager, listener) =
+            seed_interactive_channel_with_reserved_bind(ChannelLaunchMode::Interactive).await;
         let config = OperatorConfig::load(&home).await.expect("load config");
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
@@ -864,7 +899,7 @@ mod tests {
                     }
                 }),
             ),
-            &bind_addr,
+            listener,
         )
         .await;
 

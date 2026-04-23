@@ -392,6 +392,54 @@ async fn enable_rejects_reusing_alias_for_different_skill() {
 }
 
 #[tokio::test]
+async fn concurrent_enable_alias_conflict_is_typed() {
+    let sandbox = temp_env();
+    let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
+
+    let first = kernel
+        .install_skill(skill_install_request(
+            "local/concurrent-first",
+            "shared-alias",
+            "concurrent-first-hash",
+        ))
+        .await
+        .expect("install first skill");
+    let second = kernel
+        .install_skill(skill_install_request(
+            "local/concurrent-second",
+            "shared-alias",
+            "concurrent-second-hash",
+        ))
+        .await
+        .expect("install second skill");
+
+    let first_kernel = kernel.clone();
+    let second_kernel = kernel.clone();
+    let first_id = first.skill_id.clone();
+    let second_id = second.skill_id.clone();
+    let (first_result, second_result) = tokio::join!(
+        first_kernel.enable_skill(first_id),
+        second_kernel.enable_skill(second_id)
+    );
+
+    let results = [first_result, second_result];
+    let successes = results.iter().filter(|result| result.is_ok()).count();
+    let conflicts = results
+        .iter()
+        .filter(|result| {
+            matches!(
+                result,
+                Err(KernelError::Conflict(message))
+                    if message.contains("skill alias 'shared-alias' is already enabled")
+            )
+        })
+        .count();
+
+    assert_eq!(successes, 1, "exactly one enable should win");
+    assert_eq!(conflicts, 1, "the losing enable should be a typed conflict");
+}
+
+#[tokio::test]
 async fn install_rejects_enabled_alias_reuse_as_conflict() {
     let sandbox = temp_env();
     let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
