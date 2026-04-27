@@ -84,11 +84,11 @@ use super::{
     selector::SkillSelector,
     session_compactions::SessionCompactionStore,
     session_transcript::{
-        build_compaction_prompt, load_repaired_turns, merge_compaction_summary_state,
-        merge_compaction_summary_updates, parse_compaction_summary_state,
-        remove_memory_proposal_from_summary_state, remove_open_loop_from_summary_state,
-        render_compaction_summary, render_turns_for_prompt, turns_to_history_views,
-        CompactionSummaryState, TranscriptMode, COMPACTION_RAW_KEEP,
+        build_compaction_prompt, load_repaired_turns, load_repaired_turns_before_sequence,
+        merge_compaction_summary_state, merge_compaction_summary_updates,
+        parse_compaction_summary_state, remove_memory_proposal_from_summary_state,
+        remove_open_loop_from_summary_state, render_compaction_summary, render_turns_for_prompt,
+        turns_to_history_views, CompactionSummaryState, TranscriptMode, COMPACTION_RAW_KEEP,
     },
     session_turns::{NewSessionTurn, SessionTurnCompletion, SessionTurnRecord, SessionTurnStore},
     sessions::SessionStore,
@@ -1467,8 +1467,8 @@ impl Kernel {
                         None,
                         None,
                         &format!(
-                            "Pairing required. Approve this peer with code {} via /v0/channels/peers/approve.",
-                            pending.pairing_code
+                            "Pairing required. Approve with: lionclaw channel pairing approve {} {} {} --trust-tier main",
+                            channel_id, peer_id, pending.pairing_code
                         ),
                     )
                     .await
@@ -1508,8 +1508,8 @@ impl Kernel {
                         None,
                         None,
                         &format!(
-                            "Peer is pending approval. Use pairing code {} via /v0/channels/peers/approve.",
-                            peer.pairing_code
+                            "Peer is pending approval. Approve with: lionclaw channel pairing approve {} {} {} --trust-tier main",
+                            channel_id, peer_id, peer.pairing_code
                         ),
                     )
                     .await
@@ -4320,6 +4320,7 @@ fn to_stream_event_kind_dto(kind: ChannelStreamEventKind) -> StreamEventKindDto 
         ChannelStreamEventKind::MessageDelta => StreamEventKindDto::MessageDelta,
         ChannelStreamEventKind::Status => StreamEventKindDto::Status,
         ChannelStreamEventKind::Error => StreamEventKindDto::Error,
+        ChannelStreamEventKind::TurnCompleted => StreamEventKindDto::TurnCompleted,
         ChannelStreamEventKind::Done => StreamEventKindDto::Done,
     }
 }
@@ -4934,6 +4935,7 @@ impl Kernel {
                 &allowed_skills,
                 &selected_skill_asset_paths,
                 handle.resumes_existing_session,
+                Some(persisted_turn.sequence_no),
             )
             .await?;
 
@@ -5107,6 +5109,10 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
+        if let Some(stream_context) = &channel_stream_context {
+            self.emit_turn_completed_snapshot(stream_context, &artifacts.assistant_text)
+                .await?;
+        }
         self.sessions
             .record_turn(session.session_id)
             .await
@@ -5658,13 +5664,55 @@ impl Kernel {
             RuntimeEvent::Done => (ChannelStreamEventKind::Done, None, None, None),
         };
 
+        self.append_channel_stream_event(
+            &context.channel_id,
+            &context.peer_id,
+            Some(context.session_id),
+            Some(context.turn_id),
+            kind,
+            lane,
+            code,
+            text,
+        )
+        .await
+    }
+
+    async fn emit_turn_completed_snapshot(
+        &self,
+        context: &ChannelStreamContext,
+        assistant_text: &str,
+    ) -> Result<i64, KernelError> {
+        self.append_channel_stream_event(
+            &context.channel_id,
+            &context.peer_id,
+            Some(context.session_id),
+            Some(context.turn_id),
+            ChannelStreamEventKind::TurnCompleted,
+            Some(ChannelStreamLane::Answer),
+            None,
+            Some(assistant_text),
+        )
+        .await
+    }
+
+    async fn append_channel_stream_event(
+        &self,
+        channel_id: &str,
+        peer_id: &str,
+        session_id: Option<Uuid>,
+        turn_id: Option<Uuid>,
+        kind: ChannelStreamEventKind,
+        lane: Option<ChannelStreamLane>,
+        code: Option<&str>,
+        text: Option<&str>,
+    ) -> Result<i64, KernelError> {
         let appended = self
             .channel_state
             .append_stream_event(ChannelStreamEventInsert {
-                channel_id: &context.channel_id,
-                peer_id: &context.peer_id,
-                session_id: context.session_id,
-                turn_id: context.turn_id,
+                channel_id,
+                peer_id,
+                session_id,
+                turn_id,
                 kind,
                 lane,
                 code,
@@ -5672,7 +5720,7 @@ impl Kernel {
             })
             .await
             .map_err(internal)?;
-        self.notify_channel_stream(&context.channel_id).await;
+        self.notify_channel_stream(channel_id).await;
         Ok(appended.sequence)
     }
 
@@ -5772,14 +5820,6 @@ impl Kernel {
         content: &str,
     ) -> Result<Vec<Uuid>, KernelError> {
         self.require_active_channel_binding(channel_id).await?;
-        let session_id = session_id.unwrap_or_else(Uuid::new_v4);
-        let turn_id = turn_id.unwrap_or_else(Uuid::new_v4);
-        let stream_context = ChannelStreamContext {
-            channel_id: channel_id.to_string(),
-            peer_id: peer_id.to_string(),
-            session_id,
-            turn_id,
-        };
         let mut message_ids = Vec::new();
 
         for chunk in split_text_chunks(content, 3500) {
@@ -5789,12 +5829,15 @@ impl Kernel {
                 .await
                 .map_err(internal)?;
             message_ids.push(message_id);
-            self.append_stream_event(
-                &stream_context,
-                &RuntimeEvent::MessageDelta {
-                    lane: RuntimeMessageLane::Answer,
-                    text: chunk.clone(),
-                },
+            self.append_channel_stream_event(
+                channel_id,
+                peer_id,
+                session_id,
+                turn_id,
+                ChannelStreamEventKind::MessageDelta,
+                Some(ChannelStreamLane::Answer),
+                None,
+                Some(&chunk),
             )
             .await?;
             self.audit
@@ -5814,8 +5857,17 @@ impl Kernel {
                 .map_err(internal)?;
         }
 
-        self.append_stream_event(&stream_context, &RuntimeEvent::Done)
-            .await?;
+        self.append_channel_stream_event(
+            channel_id,
+            peer_id,
+            session_id,
+            turn_id,
+            ChannelStreamEventKind::Done,
+            None,
+            None,
+            None,
+        )
+        .await?;
         Ok(message_ids)
     }
 
@@ -6148,6 +6200,7 @@ impl Kernel {
         selected_skill_ids: &[String],
         selected_skill_asset_paths: &BTreeMap<String, String>,
         resumes_existing_runtime_session: bool,
+        history_before_sequence_no: Option<u64>,
     ) -> Result<String, KernelError> {
         let mut sections = self
             .build_prompt_sections(selected_skill_ids, selected_skill_asset_paths)
@@ -6159,7 +6212,7 @@ impl Kernel {
             ));
         } else {
             sections.extend(
-                self.render_session_history_for_prompt(session, 12)
+                self.render_session_history_for_prompt(session, 12, history_before_sequence_no)
                     .await
                     .map_err(internal)?,
             );
@@ -6215,6 +6268,7 @@ impl Kernel {
         &self,
         session: &super::sessions::Session,
         limit: usize,
+        before_sequence_no: Option<u64>,
     ) -> anyhow::Result<Vec<String>> {
         let mut sections = Vec::new();
         if let Some(record) = self.session_compactions.latest(session.session_id).await? {
@@ -6227,9 +6281,10 @@ impl Kernel {
                 sections.push(summary_text);
             }
         }
-        let turns = load_repaired_turns(
+        let turns = load_repaired_turns_before_sequence(
             &self.session_turns,
             session.session_id,
+            before_sequence_no,
             limit,
             TranscriptMode::Prompt(session.history_policy),
         )

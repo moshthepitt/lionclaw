@@ -12,13 +12,14 @@ from lionclaw_channel_terminal.api import (
     SessionTurnSnapshot,
 )
 from lionclaw_channel_terminal.app import AppConfig, TerminalChannelApp
-from lionclaw_channel_terminal.state import ChannelViewState, StreamEvent, TranscriptEntry
+from lionclaw_channel_terminal.state import ChannelViewState, StreamEvent
 
 
 class ChannelViewStateTests(unittest.TestCase):
     def test_answer_and_reasoning_stay_separate(self):
         state = ChannelViewState(peer_id="mosh")
-        state.append_user_message("hello")
+        state.begin_submit("hello")
+        state.mark_queued("turn-1")
         state.apply_stream_event(
             StreamEvent(
                 sequence=1,
@@ -60,6 +61,23 @@ class ChannelViewStateTests(unittest.TestCase):
         self.assertIn("123456", banner)
         self.assertIn("lionclaw channel pairing approve terminal mosh 123456", banner)
 
+    def test_channel_scoped_stream_event_does_not_select_active_session(self):
+        state = ChannelViewState(peer_id="mosh")
+
+        state.apply_stream_event(
+            StreamEvent(
+                sequence=1,
+                peer_id="mosh",
+                kind="message_delta",
+                lane="answer",
+                text="Pairing required.",
+            )
+        )
+
+        self.assertIsNone(state.active_session_id)
+        self.assertEqual(state.transcript_text(), "")
+        self.assertIn("[message] Pairing required.", state.activity_text())
+
     def test_blocked_peer_disables_input(self):
         state = ChannelViewState(peer_id="mosh")
         state.set_pairing_state(status="blocked")
@@ -100,9 +118,9 @@ class ChannelViewStateTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(state.reasoning_text(), "No pre-answer reasoning for this turn.")
+        self.assertEqual(state.reasoning_text(), "No reasoning for this turn yet.")
 
-    def test_reasoning_after_answer_is_suppressed_for_active_turn(self):
+    def test_reasoning_after_answer_stays_in_thinking_pane(self):
         state = ChannelViewState(peer_id="mosh")
         state.begin_submit("hello")
         state.mark_queued("turn-1")
@@ -128,7 +146,60 @@ class ChannelViewStateTests(unittest.TestCase):
             )
         )
 
-        self.assertNotIn("late reasoning", state.reasoning_text())
+        self.assertIn("late reasoning", state.reasoning_text())
+        self.assertNotIn("late reasoning", state.transcript_text())
+
+    def test_turn_completed_reconciles_answer_from_canonical_snapshot(self):
+        state = ChannelViewState(peer_id="mosh")
+        state.begin_submit("hello")
+        state.mark_queued("turn-1")
+
+        state.apply_stream_event(
+            StreamEvent(
+                sequence=1,
+                peer_id="mosh",
+                turn_id="turn-1",
+                kind="message_delta",
+                lane="answer",
+                text="partial",
+            )
+        )
+        state.apply_stream_event(
+            StreamEvent(
+                sequence=2,
+                peer_id="mosh",
+                turn_id="turn-1",
+                kind="turn_completed",
+                lane="answer",
+                text="complete final answer",
+            )
+        )
+
+        transcript = state.transcript_text()
+        self.assertIn("lionclaw> complete final answer", transcript)
+        self.assertNotIn("partial", transcript)
+        self.assertFalse(state.input_disabled())
+
+    def test_mark_queued_preserves_stream_events_that_arrived_first(self):
+        state = ChannelViewState(peer_id="mosh")
+        state.begin_submit("hello")
+
+        state.apply_stream_event(
+            StreamEvent(
+                sequence=1,
+                peer_id="mosh",
+                turn_id="turn-1",
+                kind="message_delta",
+                lane="answer",
+                text="early answer",
+            )
+        )
+        state.mark_queued("turn-1", "session-1")
+
+        self.assertEqual([turn.turn_id for turn in state.ordered_turns()], ["turn-1"])
+        transcript = state.transcript_text()
+        self.assertIn("you> hello", transcript)
+        self.assertIn("lionclaw> early answer", transcript)
 
     def test_restore_running_history_keeps_transcript_and_thinking_blank(self):
         state = ChannelViewState(peer_id="mosh")
@@ -345,7 +416,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(accepted)
         self.assertIn("you> hello", app.state.transcript_text())
-        self.assertIn("send failed: boom", app.state.status_text())
+        self.assertIn("send failed: boom", app.state.activity_text())
         self.assertFalse(app.state.input_disabled())
 
     async def test_submit_text_binds_active_turn_after_success(self):
@@ -396,7 +467,8 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
         app.api = api
         app._render_views = lambda: None  # type: ignore[method-assign]
         app.state.active_session_id = "session-1"
-        app.state.append_user_message("hello")
+        app.state.begin_submit("hello")
+        app.state.clear_pending_turn()
 
         reset = await app.reset_session()
 
@@ -430,20 +502,14 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
         app.state.set_pairing_state(status="pending", pairing_code="123456")
         app.state.begin_submit("hello")
         app.state.clear_pending_turn()
-        app.state.transcript.append(
-            TranscriptEntry(
-                role="assistant",
-                text="Pairing required. Approve this peer with code 123456.",
-            )
-        )
-        app.state.status_lines.append("[status] pairing pending")
+        app.state.activity_lines.append("[status] pairing pending")
 
         await app.refresh_pairing_state()
 
         self.assertEqual(api.fetch_latest_calls, 1)
         self.assertEqual(app.state.pairing.status, "approved")
         self.assertEqual(app.state.transcript_text(), "")
-        self.assertEqual(app.state.status_text(), "[status] peer approved")
+        self.assertEqual(app.state.activity_text(), "[status] peer approved")
         self.assertIsNone(app.state.active_session_id)
         self.assertFalse(app.state.input_disabled())
 
@@ -478,7 +544,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
         app.state.set_pairing_state(status="pending", pairing_code="123456")
         app.state.begin_submit("hello")
         app.state.clear_pending_turn()
-        app.state.status_lines.append("[status] pairing pending")
+        app.state.activity_lines.append("[status] pairing pending")
 
         await app.refresh_pairing_state()
 
@@ -486,7 +552,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
         transcript = app.state.transcript_text()
         self.assertIn("you> restored question", transcript)
         self.assertIn("lionclaw> restored answer", transcript)
-        self.assertEqual(app.state.status_text(), "[status] peer approved")
+        self.assertEqual(app.state.activity_text(), "[status] peer approved")
 
 
 if __name__ == "__main__":

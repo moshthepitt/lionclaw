@@ -5,11 +5,11 @@ import os
 from dataclasses import dataclass
 
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
-from textual.widgets import Footer, Input, RichLog, Static
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.widgets import Footer, Input, Markdown, RichLog, Static
 
 from lionclaw_channel_terminal.api import LionClawApi
-from lionclaw_channel_terminal.state import ChannelViewState
+from lionclaw_channel_terminal.state import ChannelViewState, TurnState
 
 
 @dataclass(slots=True)
@@ -57,7 +57,7 @@ class TerminalChannelApp(App[None]):
         height: 1fr;
     }
 
-    #transcript-pane {
+    #answer-pane {
         width: 2fr;
         border: solid $accent;
     }
@@ -67,13 +67,19 @@ class TerminalChannelApp(App[None]):
         border: solid $secondary;
     }
 
-    #transcript-view,
-    #thinking-view,
-    #status-log {
+    #answer-scroll,
+    #thinking-scroll,
+    #activity-log {
         height: 1fr;
     }
 
-    #status-log {
+    #answer-view,
+    #thinking-view {
+        width: 100%;
+        padding: 0 1;
+    }
+
+    #activity-log {
         height: 6;
         border: solid $boost;
     }
@@ -107,20 +113,22 @@ class TerminalChannelApp(App[None]):
     def compose(self) -> ComposeResult:
         yield Static(id="pairing-banner")
         with Horizontal(id="panes"):
-            with Vertical(id="transcript-pane"):
-                yield Static("", id="transcript-view")
+            with Vertical(id="answer-pane"):
+                with VerticalScroll(id="answer-scroll"):
+                    yield Markdown("", id="answer-view")
             with Vertical(id="thinking-pane"):
-                yield Static("No reasoning for the current turn yet.", id="thinking-view")
-        yield RichLog(id="status-log", wrap=True, markup=False, highlight=False)
+                with VerticalScroll(id="thinking-scroll"):
+                    yield Markdown("No reasoning for the current turn yet.", id="thinking-view")
+        yield RichLog(id="activity-log", wrap=True, markup=False, highlight=False)
         yield Input(placeholder="Send a message or /quit", id="input")
         yield Footer()
 
     async def on_mount(self) -> None:
         self.title = f"LionClaw {self.config.channel_id}"
         self.sub_title = f"peer={self.config.peer_id}"
-        self.query_one("#transcript-pane", Vertical).border_title = "Transcript"
+        self.query_one("#answer-pane", Vertical).border_title = "Answer"
         self.query_one("#thinking-pane", Vertical).border_title = "Thinking"
-        self.query_one("#status-log", RichLog).border_title = "Status"
+        self.query_one("#activity-log", RichLog).border_title = "Activity"
         await self.refresh_pairing_state()
         await self.restore_latest_session()
         self._render_views()
@@ -233,7 +241,7 @@ class TerminalChannelApp(App[None]):
             await self._push_status(f"reset failed: {err}")
             return False
 
-        self.state.status_lines.append("[status] opened a fresh session")
+        self.state.activity_lines.append("[status] opened a fresh session")
         self._render_views()
         return True
 
@@ -242,7 +250,7 @@ class TerminalChannelApp(App[None]):
         try:
             peer_state = await self.api.fetch_peer_state()
         except Exception as err:  # noqa: BLE001
-            self.state.status_lines.append(f"[error] peer refresh failed: {err}")
+            self.state.activity_lines.append(f"[error] peer refresh failed: {err}")
             self._render_views()
             return
 
@@ -265,7 +273,7 @@ class TerminalChannelApp(App[None]):
         try:
             snapshot = await self.api.fetch_latest_session(history_policy="interactive")
         except Exception as err:  # noqa: BLE001
-            self.state.status_lines.append(f"[error] session restore failed: {err}")
+            self.state.activity_lines.append(f"[error] session restore failed: {err}")
             return False
 
         if snapshot.session is None:
@@ -314,7 +322,7 @@ class TerminalChannelApp(App[None]):
             except asyncio.CancelledError:
                 raise
             except Exception as err:  # noqa: BLE001
-                self.state.status_lines.append(f"[error] stream failed: {err}")
+                self.state.activity_lines.append(f"[error] stream failed: {err}")
                 self._render_views()
                 await asyncio.sleep(1)
                 continue
@@ -322,7 +330,7 @@ class TerminalChannelApp(App[None]):
             self._render_views()
 
     async def _push_status(self, message: str) -> None:
-        self.state.status_lines.append(f"[status] {message}")
+        self.state.activity_lines.append(f"[status] {message}")
         self._render_views()
 
     async def _handle_pairing_transition(
@@ -335,32 +343,43 @@ class TerminalChannelApp(App[None]):
             if restored:
                 if self.state.active_session_id is None:
                     self.state.clear_transient_view()
-                self.state.status_lines.clear()
-                self.state.status_lines.append("[status] peer approved")
+                self.state.activity_lines.clear()
+                self.state.activity_lines.append("[status] peer approved")
                 self._focus_input_requested = True
             return
 
         if previous_status == "approved" and current_status == "blocked":
             self.state.clear_pending_turn()
-            self.state.status_lines.clear()
-            self.state.status_lines.append("[error] peer blocked")
+            self.state.activity_lines.clear()
+            self.state.activity_lines.append("[error] peer blocked")
 
     def _render_views(self) -> None:
         self.query_one("#pairing-banner", Static).update(
             self.state.pairing_banner(self.config.channel_id, self.config.peer_id)
         )
-        self.query_one("#transcript-view", Static).update(self.state.transcript_text())
-        self.query_one("#thinking-view", Static).update(self.state.reasoning_text())
+        answer_scroll = self.query_one("#answer-scroll", VerticalScroll)
+        thinking_scroll = self.query_one("#thinking-scroll", VerticalScroll)
+        answer_should_follow = _should_follow(answer_scroll)
+        thinking_should_follow = _should_follow(thinking_scroll)
+
+        self.query_one("#answer-view", Markdown).update(_answer_markdown(self.state))
+        self.query_one("#thinking-view", Markdown).update(_thinking_markdown(self.state))
+
+        if answer_should_follow:
+            answer_scroll.scroll_end(animate=False, immediate=True)
+        if thinking_should_follow:
+            thinking_scroll.scroll_end(animate=False, immediate=True)
+
         input_widget = self.query_one("#input", Input)
         input_is_disabled = self.state.input_disabled()
         input_widget.disabled = input_is_disabled
         self._focus_input_if_enabled(input_widget, self._input_was_disabled)
         self._input_was_disabled = input_is_disabled
 
-        status_log = self.query_one("#status-log", RichLog)
-        status_log.clear()
-        for line in self.state.status_text().splitlines():
-            status_log.write(line)
+        activity_log = self.query_one("#activity-log", RichLog)
+        activity_log.clear()
+        for line in self.state.activity_text().splitlines():
+            activity_log.write(line, scroll_end=True)
 
     def _focus_input_if_enabled(
         self,
@@ -386,20 +405,71 @@ class TerminalChannelApp(App[None]):
             self.state.mark_queued(turn_id, session_id)
             return True
         if outcome == "pairing_pending":
-            self.state.clear_pending_turn()
-            self.state.status_lines.append("[status] pairing pending")
+            self.state.discard_pending_turn()
+            self.state.activity_lines.append("[status] pairing pending")
             return True
         if outcome == "peer_blocked":
-            self.state.clear_pending_turn()
-            self.state.status_lines.append("[error] peer_blocked: peer is blocked")
+            self.state.discard_pending_turn()
+            self.state.activity_lines.append("[error] peer_blocked: peer is blocked")
             return False
         if outcome == "duplicate":
-            self.state.clear_pending_turn()
-            self.state.status_lines.append("[status] duplicate: inbound ignored")
+            self.state.discard_pending_turn()
+            self.state.activity_lines.append("[status] duplicate: inbound ignored")
             return False
 
         self.state.mark_send_failed(f"unexpected inbound outcome: {outcome}")
         return False
+
+
+def _answer_markdown(state: ChannelViewState) -> str:
+    parts: list[str] = []
+
+    for turn in state.ordered_turns():
+        parts.extend(_turn_answer_markdown(turn))
+
+    if not parts:
+        return "_No answer yet._"
+    return "\n\n".join(parts)
+
+
+def _turn_answer_markdown(turn: TurnState) -> list[str]:
+    parts: list[str] = []
+    if turn.user_text:
+        parts.append(f"### You\n\n{_blockquote(turn.user_text)}")
+
+    answer = turn.assistant_display_text()
+    if answer:
+        parts.append(f"### LionClaw\n\n{answer.strip()}")
+    elif turn.is_running:
+        parts.append("### LionClaw\n\n_Working..._")
+
+    if turn.error_text:
+        parts.append(f"### Error\n\n{_blockquote(turn.error_text)}")
+    return parts
+
+
+def _thinking_markdown(state: ChannelViewState) -> str:
+    turn = state.current_reasoning_turn()
+    if state.pending_submission:
+        return "_Waiting to queue this turn..._"
+    if turn is None:
+        return "_No reasoning for the current turn yet._"
+    if turn.reasoning_text:
+        return turn.reasoning_text.strip()
+    if turn.restored_running:
+        return ""
+    if turn.is_running:
+        return "_Waiting for reasoning for this turn..._"
+    return "_No reasoning for the current turn yet._"
+
+
+def _blockquote(text: str) -> str:
+    lines = text.splitlines() or [text]
+    return "\n".join(f"> {line}" if line else ">" for line in lines)
+
+
+def _should_follow(scroll: VerticalScroll) -> bool:
+    return scroll.max_scroll_y <= 0 or scroll.is_vertical_scroll_end
 
 
 def run() -> None:

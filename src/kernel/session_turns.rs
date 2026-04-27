@@ -272,6 +272,37 @@ impl SessionTurnStore {
         Ok(turns)
     }
 
+    pub async fn list_recent_before_sequence(
+        &self,
+        session_id: Uuid,
+        before_sequence_no: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionTurnRecord>> {
+        let limit = i64::try_from(limit).context("session history limit is too large")?;
+        let before_sequence_no =
+            i64::try_from(before_sequence_no).context("before_sequence_no is too large")?;
+        let rows = sqlx::query(
+            "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, runtime_id, started_at_ms, finished_at_ms \
+             FROM session_turns \
+             WHERE session_id = ?1 AND sequence_no < ?2 \
+             ORDER BY sequence_no DESC \
+             LIMIT ?3",
+        )
+        .bind(session_id.to_string())
+        .bind(before_sequence_no)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to query bounded session turn history")?;
+
+        let mut turns = rows
+            .into_iter()
+            .map(map_session_turn_row)
+            .collect::<Result<Vec<_>>>()?;
+        turns.reverse();
+        Ok(turns)
+    }
+
     pub async fn list_sequence_range(
         &self,
         session_id: Uuid,

@@ -83,12 +83,28 @@ pub async fn load_repaired_turns(
     limit: usize,
     mode: TranscriptMode,
 ) -> Result<Vec<SessionTurnRecord>> {
+    load_repaired_turns_before_sequence(store, session_id, None, limit, mode).await
+}
+
+pub async fn load_repaired_turns_before_sequence(
+    store: &SessionTurnStore,
+    session_id: Uuid,
+    before_sequence_no: Option<u64>,
+    limit: usize,
+    mode: TranscriptMode,
+) -> Result<Vec<SessionTurnRecord>> {
     let limit = limit.max(1);
     let fetch_limit = limit
         .saturating_mul(HISTORY_OVERFETCH_MULTIPLIER)
         .min(HISTORY_OVERFETCH_CAP)
         .max(limit);
-    let turns = store.list_recent(session_id, fetch_limit).await?;
+    let turns = if let Some(before_sequence_no) = before_sequence_no {
+        store
+            .list_recent_before_sequence(session_id, before_sequence_no, fetch_limit)
+            .await?
+    } else {
+        store.list_recent(session_id, fetch_limit).await?
+    };
     let mut repaired = repair_turns(turns, mode);
     if repaired.len() > limit {
         let keep_from = repaired.len() - limit;

@@ -217,6 +217,16 @@ description: inbound skill for channel flow
     assert!(codes.contains(&"queue.started"));
     assert!(codes.contains(&"queue.completed"));
     assert!(
+        stream.events.iter().any(|event| {
+            event.kind == StreamEventKindDto::TurnCompleted
+                && event
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("[mock]"))
+        }),
+        "queued channel turn should publish a canonical completed answer snapshot"
+    );
+    assert!(
         stream
             .events
             .iter()
@@ -312,16 +322,25 @@ description: channel outbox skill
         })
         .await
         .expect("pull stream");
-    assert!(
-        stream.events.iter().any(|event| {
+    let pairing_event = stream
+        .events
+        .iter()
+        .find(|event| {
             event.kind == StreamEventKindDto::MessageDelta
                 && event.lane == Some(StreamLaneDto::Answer)
                 && event
                     .text
                     .as_deref()
                     .is_some_and(|text| text.contains("Pairing required"))
-        }),
-        "pairing prompt should stream as answer delta"
+        })
+        .expect("pairing prompt should stream as answer delta");
+    assert_eq!(
+        pairing_event.session_id, None,
+        "channel-scoped pairing prompts must not advertise a fake session"
+    );
+    assert_eq!(
+        pairing_event.turn_id, None,
+        "channel-scoped pairing prompts must not advertise a fake turn"
     );
     let through_sequence = stream
         .events
