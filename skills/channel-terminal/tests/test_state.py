@@ -11,7 +11,7 @@ from lionclaw_channel_terminal.api import (
     SessionOpenResult,
     SessionTurnSnapshot,
 )
-from lionclaw_channel_terminal.app import AppConfig, TerminalChannelApp
+from lionclaw_channel_terminal.app import AppConfig, TerminalChannelApp, _thinking_markdown
 from lionclaw_channel_terminal.state import ChannelViewState, StreamEvent
 
 
@@ -119,6 +119,7 @@ class ChannelViewStateTests(unittest.TestCase):
         )
 
         self.assertEqual(state.reasoning_text(), "No reasoning for this turn yet.")
+        self.assertEqual(_thinking_markdown(state), "_No reasoning for this turn yet._")
 
     def test_reasoning_after_answer_stays_in_thinking_pane(self):
         state = ChannelViewState(peer_id="mosh")
@@ -371,11 +372,13 @@ def _make_app() -> TerminalChannelApp:
 class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_mount_focuses_enabled_input(self):
         app = _make_app()
-        app.api = _MountedApi()
+        api = _MountedApi()
+        app.api = api
 
         async with app.run_test() as pilot:
             await pilot.pause()
             self.assertTrue(app.query_one(Input).has_focus)
+            self.assertEqual(api.fetch_latest_calls, 1)
 
     async def test_pairing_approval_refocuses_input_without_stealing_on_every_render(self):
         app = _make_app()

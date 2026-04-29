@@ -29,6 +29,12 @@ class ActivityEntry:
     turn_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class DisplayText:
+    text: str
+    placeholder: bool = False
+
+
 @dataclass(slots=True)
 class TurnState:
     turn_id: str
@@ -285,21 +291,29 @@ class ChannelViewState:
         return "\n".join(rendered)
 
     def reasoning_text(self) -> str:
+        display = self.reasoning_display()
+        if not display.text:
+            return ""
+        if display.placeholder:
+            return display.text
+        return "\n".join(_prefix_lines("thinking> ", display.text))
+
+    def reasoning_display(self) -> DisplayText:
         if self.pending_submission:
-            return "Waiting to queue this turn..."
+            return DisplayText("Waiting to queue this turn...", placeholder=True)
 
         turn = self.current_reasoning_turn()
         if turn is None:
-            return "No reasoning for the current turn yet."
+            return DisplayText("No reasoning for the current turn yet.", placeholder=True)
         if turn.reasoning_text:
-            return "\n".join(_prefix_lines("thinking> ", turn.reasoning_text))
+            return DisplayText(turn.reasoning_text)
         if turn.restored_running:
-            return ""
+            return DisplayText("")
         if turn.is_running:
             if turn.answer_started:
-                return "No reasoning for this turn yet."
-            return "Waiting for reasoning for this turn..."
-        return "No reasoning for the current turn yet."
+                return DisplayText("No reasoning for this turn yet.", placeholder=True)
+            return DisplayText("Waiting for reasoning for this turn...", placeholder=True)
+        return DisplayText("No reasoning for the current turn yet.", placeholder=True)
 
     def current_reasoning_turn(self) -> TurnState | None:
         if self.active_turn_id is not None:

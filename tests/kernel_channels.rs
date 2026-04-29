@@ -172,7 +172,9 @@ description: inbound skill for channel flow
         .await
         .expect("approved inbound turn should succeed");
     assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
-    assert!(queued.turn_id.is_some());
+    let queued_turn_id = queued
+        .turn_id
+        .expect("queued inbound response should include turn id");
     assert!(queued.session_id.is_some());
 
     // Duplicate update id should be ignored by dedupe index.
@@ -216,22 +218,28 @@ description: inbound skill for channel flow
     assert!(codes.contains(&"queue.queued"));
     assert!(codes.contains(&"queue.started"));
     assert!(codes.contains(&"queue.completed"));
-    assert!(
-        stream.events.iter().any(|event| {
-            event.kind == StreamEventKindDto::TurnCompleted
+    let completed_position = stream
+        .events
+        .iter()
+        .position(|event| {
+            event.turn_id == Some(queued_turn_id)
+                && event.kind == StreamEventKindDto::TurnCompleted
                 && event
                     .text
                     .as_deref()
                     .is_some_and(|text| text.contains("[mock]"))
-        }),
-        "queued channel turn should publish a canonical completed answer snapshot"
-    );
+        })
+        .expect("queued channel turn should publish a canonical completed answer snapshot");
+    let done_position = stream
+        .events
+        .iter()
+        .position(|event| {
+            event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::Done
+        })
+        .expect("queued channel turn should terminate with a turn-scoped done");
     assert!(
-        stream
-            .events
-            .iter()
-            .any(|event| event.kind == StreamEventKindDto::Done),
-        "queued channel turn should terminate with done"
+        completed_position < done_position,
+        "queued channel turn should publish turn_completed before done"
     );
 
     let queued_events = kernel

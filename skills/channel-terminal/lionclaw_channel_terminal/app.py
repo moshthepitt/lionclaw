@@ -130,7 +130,6 @@ class TerminalChannelApp(App[None]):
         self.query_one("#thinking-pane", Vertical).border_title = "Thinking"
         self.query_one("#activity-log", RichLog).border_title = "Activity"
         await self.refresh_pairing_state()
-        await self.restore_latest_session()
         self._render_views()
         self.run_worker(self.stream_loop(), exclusive=False, group="stream")
         self.set_interval(2.0, self.refresh_pairing_state, pause=False)
@@ -449,18 +448,12 @@ def _turn_answer_markdown(turn: TurnState) -> list[str]:
 
 
 def _thinking_markdown(state: ChannelViewState) -> str:
-    turn = state.current_reasoning_turn()
-    if state.pending_submission:
-        return "_Waiting to queue this turn..._"
-    if turn is None:
-        return "_No reasoning for the current turn yet._"
-    if turn.reasoning_text:
-        return turn.reasoning_text.strip()
-    if turn.restored_running:
+    display = state.reasoning_display()
+    if not display.text:
         return ""
-    if turn.is_running:
-        return "_Waiting for reasoning for this turn..._"
-    return "_No reasoning for the current turn yet._"
+    if display.placeholder:
+        return f"_{display.text}_"
+    return display.text.strip()
 
 
 def _blockquote(text: str) -> str:
