@@ -5664,16 +5664,16 @@ impl Kernel {
             RuntimeEvent::Done => (ChannelStreamEventKind::Done, None, None, None),
         };
 
-        self.append_channel_stream_event(
-            &context.channel_id,
-            &context.peer_id,
-            Some(context.session_id),
-            Some(context.turn_id),
+        self.append_channel_stream_event(ChannelStreamEventInsert {
+            channel_id: &context.channel_id,
+            peer_id: &context.peer_id,
+            session_id: Some(context.session_id),
+            turn_id: Some(context.turn_id),
             kind,
             lane,
             code,
             text,
-        )
+        })
         .await
     }
 
@@ -5682,45 +5682,29 @@ impl Kernel {
         context: &ChannelStreamContext,
         assistant_text: &str,
     ) -> Result<i64, KernelError> {
-        self.append_channel_stream_event(
-            &context.channel_id,
-            &context.peer_id,
-            Some(context.session_id),
-            Some(context.turn_id),
-            ChannelStreamEventKind::TurnCompleted,
-            Some(ChannelStreamLane::Answer),
-            None,
-            Some(assistant_text),
-        )
+        self.append_channel_stream_event(ChannelStreamEventInsert {
+            channel_id: &context.channel_id,
+            peer_id: &context.peer_id,
+            session_id: Some(context.session_id),
+            turn_id: Some(context.turn_id),
+            kind: ChannelStreamEventKind::TurnCompleted,
+            lane: Some(ChannelStreamLane::Answer),
+            code: None,
+            text: Some(assistant_text),
+        })
         .await
     }
 
     async fn append_channel_stream_event(
         &self,
-        channel_id: &str,
-        peer_id: &str,
-        session_id: Option<Uuid>,
-        turn_id: Option<Uuid>,
-        kind: ChannelStreamEventKind,
-        lane: Option<ChannelStreamLane>,
-        code: Option<&str>,
-        text: Option<&str>,
+        event: ChannelStreamEventInsert<'_>,
     ) -> Result<i64, KernelError> {
         let appended = self
             .channel_state
-            .append_stream_event(ChannelStreamEventInsert {
-                channel_id,
-                peer_id,
-                session_id,
-                turn_id,
-                kind,
-                lane,
-                code,
-                text,
-            })
+            .append_stream_event(event)
             .await
             .map_err(internal)?;
-        self.notify_channel_stream(channel_id).await;
+        self.notify_channel_stream(event.channel_id).await;
         Ok(appended.sequence)
     }
 
@@ -5829,16 +5813,16 @@ impl Kernel {
                 .await
                 .map_err(internal)?;
             message_ids.push(message_id);
-            self.append_channel_stream_event(
+            self.append_channel_stream_event(ChannelStreamEventInsert {
                 channel_id,
                 peer_id,
                 session_id,
                 turn_id,
-                ChannelStreamEventKind::MessageDelta,
-                Some(ChannelStreamLane::Answer),
-                None,
-                Some(&chunk),
-            )
+                kind: ChannelStreamEventKind::MessageDelta,
+                lane: Some(ChannelStreamLane::Answer),
+                code: None,
+                text: Some(&chunk),
+            })
             .await?;
             self.audit
                 .append(
@@ -5857,16 +5841,16 @@ impl Kernel {
                 .map_err(internal)?;
         }
 
-        self.append_channel_stream_event(
+        self.append_channel_stream_event(ChannelStreamEventInsert {
             channel_id,
             peer_id,
             session_id,
             turn_id,
-            ChannelStreamEventKind::Done,
-            None,
-            None,
-            None,
-        )
+            kind: ChannelStreamEventKind::Done,
+            lane: None,
+            code: None,
+            text: None,
+        })
         .await?;
         Ok(message_ids)
     }
