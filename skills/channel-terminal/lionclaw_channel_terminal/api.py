@@ -180,10 +180,10 @@ class LionClawApi:
             payload["session_id"] = session_id
         if self.runtime_id:
             payload["runtime_id"] = self.runtime_id
-        self._inbound_sequence += 1
         response = await self._client.post("/v0/channels/inbound", json=payload)
         _raise_for_status(response)
         data = response.json()
+        self._inbound_sequence += 1
         return InboundResponse(
             outcome=data["outcome"],
             turn_id=data.get("turn_id"),
