@@ -617,7 +617,7 @@ pub(crate) fn build_managed_units(
 pub(crate) async fn render_runtime_cache(
     home: &LionClawHome,
     config: &OperatorConfig,
-    lockfile: &OperatorLockfile,
+    _lockfile: &OperatorLockfile,
     runtime_id: &str,
 ) -> Result<()> {
     let workspace = &config.daemon.workspace;
@@ -637,18 +637,6 @@ pub(crate) async fn render_runtime_cache(
     let mut sections = Vec::new();
     for (name, content) in read_workspace_sections(&config.workspace_root(home)).await? {
         sections.push(format!("## {}\n\n{}", name, content.trim()));
-    }
-
-    for skill in lockfile.skills.iter().filter(|skill| skill.enabled) {
-        let snapshot_root = resolve_locked_snapshot_dir(home, &skill.snapshot_dir)?;
-        if let Some(content) = read_locked_skill_md(&snapshot_root).await? {
-            sections.push(format!(
-                "## Skill {} ({})\n\n{}",
-                skill.alias,
-                skill.hash,
-                content.trim()
-            ));
-        }
     }
 
     sections.push(
@@ -747,34 +735,6 @@ pub(crate) fn resolve_worker_entrypoint(
     }
 
     Ok(candidate)
-}
-
-async fn read_locked_skill_md(snapshot_root: &Path) -> Result<Option<String>> {
-    let skill_md_path = snapshot_root.join("SKILL.md");
-    let metadata = match tokio::fs::symlink_metadata(&skill_md_path).await {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to stat {}", skill_md_path.display()));
-        }
-    };
-    if metadata.file_type().is_symlink() {
-        return Err(anyhow!(
-            "locked skill metadata '{}' must not be a symlink",
-            skill_md_path.display()
-        ));
-    }
-    if !metadata.is_file() {
-        return Err(anyhow!(
-            "locked skill metadata '{}' is not a regular file",
-            skill_md_path.display()
-        ));
-    }
-
-    tokio::fs::read_to_string(&skill_md_path)
-        .await
-        .map(Some)
-        .with_context(|| format!("failed to read {}", skill_md_path.display()))
 }
 
 pub(crate) async fn resolve_installed_skill_worker_entrypoint(
@@ -1337,7 +1297,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn render_runtime_cache_rejects_symlinked_skill_metadata() {
+    async fn render_runtime_cache_ignores_symlinked_skill_metadata() {
         use std::os::unix::fs::symlink;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -1365,14 +1325,9 @@ mod tests {
             ..OperatorLockfile::default()
         };
 
-        let err = render_runtime_cache(&home, &config, &lockfile, "codex")
+        render_runtime_cache(&home, &config, &lockfile, "codex")
             .await
-            .expect_err("symlinked skill metadata should fail");
-
-        assert!(
-            err.to_string().contains("must not be a symlink"),
-            "unexpected error: {err}"
-        );
+            .expect("symlinked skill metadata should be ignored");
     }
 
     #[tokio::test]

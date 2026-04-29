@@ -294,7 +294,7 @@ pub struct SessionTurnResponse {
     pub session_id: Uuid,
     pub turn_id: Uuid,
     pub assistant_text: String,
-    pub selected_skills: Vec<String>,
+    pub runtime_skills: Vec<String>,
     pub runtime_id: String,
     pub stream_events: Vec<StreamEventDto>,
 }
@@ -437,8 +437,6 @@ pub struct JobCreateRequest {
     pub schedule: JobScheduleDto,
     pub prompt_text: String,
     #[serde(default)]
-    pub skill_ids: Vec<String>,
-    #[serde(default)]
     pub allow_capabilities: Vec<String>,
     #[serde(default)]
     pub delivery: Option<JobDeliveryTargetDto>,
@@ -466,7 +464,6 @@ pub struct JobView {
     pub runtime_id: String,
     pub schedule: JobScheduleDto,
     pub prompt_text: String,
-    pub skill_ids: Vec<String>,
     #[serde(default)]
     pub delivery: Option<JobDeliveryTargetDto>,
     pub retry_attempts: u32,

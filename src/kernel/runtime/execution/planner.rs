@@ -130,7 +130,7 @@ pub struct ExecutionPlanRequest {
     pub preset_name: Option<String>,
     pub working_dir: Option<String>,
     pub env_passthrough_keys: Vec<String>,
-    pub selected_skill_mounts: Vec<MountSpec>,
+    pub skill_mounts: Vec<MountSpec>,
     pub timeout_ms: Option<u64>,
 }
 
@@ -219,7 +219,7 @@ impl ExecutionPlanner {
             &request.runtime_id,
             &preset,
             &runtime_profile,
-            &request.selected_skill_mounts,
+            &request.skill_mounts,
             request.purpose,
         )?;
         let limits = match &runtime_profile.confinement {
@@ -321,7 +321,7 @@ impl ExecutionPlanner {
         runtime_id: &str,
         preset: &ExecutionPreset,
         runtime_profile: &RuntimeExecutionProfile,
-        selected_skill_mounts: &[MountSpec],
+        skill_mounts: &[MountSpec],
         purpose: ExecutionPlanPurpose,
     ) -> Result<Vec<MountSpec>, String> {
         if purpose == ExecutionPlanPurpose::HiddenCompaction {
@@ -372,15 +372,15 @@ impl ExecutionPlanner {
             });
         }
 
-        validate_selected_skill_mounts(selected_skill_mounts)?;
-        mounts.extend(selected_skill_mounts.iter().cloned());
+        validate_runtime_skill_mounts(skill_mounts)?;
+        mounts.extend(skill_mounts.iter().cloned());
 
         match &runtime_profile.confinement {
             ConfinementConfig::Oci(config) => {
                 for mount in &config.additional_mounts {
                     if is_skills_mount_target(&mount.target) {
                         return Err(format!(
-                            "runtime additional mount target '{}' is reserved for selected skill assets",
+                            "runtime additional mount target '{}' is reserved for runtime skill assets",
                             mount.target
                         ));
                     }
@@ -407,24 +407,24 @@ fn is_skills_mount_target(target: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-fn is_selected_skill_mount_target(target: &str) -> bool {
+fn is_runtime_skill_mount_target(target: &str) -> bool {
     target
         .strip_prefix(SKILLS_MOUNT_TARGET_ROOT)
         .and_then(|suffix| suffix.strip_prefix('/'))
         .is_some_and(|alias| !alias.contains('/') && validate_skill_alias(alias).is_ok())
 }
 
-fn validate_selected_skill_mounts(mounts: &[MountSpec]) -> Result<(), String> {
+fn validate_runtime_skill_mounts(mounts: &[MountSpec]) -> Result<(), String> {
     for mount in mounts {
-        if !is_selected_skill_mount_target(&mount.target) {
+        if !is_runtime_skill_mount_target(&mount.target) {
             return Err(format!(
-                "selected skill mount target '{}' must be under {SKILLS_MOUNT_TARGET_ROOT}/<alias>",
+                "runtime skill mount target '{}' must be under {SKILLS_MOUNT_TARGET_ROOT}/<alias>",
                 mount.target
             ));
         }
         if mount.access != MountAccess::ReadOnly {
             return Err(format!(
-                "selected skill mount target '{}' must be read-only",
+                "runtime skill mount target '{}' must be read-only",
                 mount.target
             ));
         }
@@ -563,7 +563,7 @@ mod tests {
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
-                selected_skill_mounts: Vec::new(),
+                skill_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("plan");
@@ -622,7 +622,7 @@ mod tests {
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
-                selected_skill_mounts: Vec::new(),
+                skill_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("plan");
@@ -686,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_mounts_selected_skill_snapshots_read_only() {
+    fn planner_mounts_runtime_skill_snapshots_read_only() {
         let sandbox = tempdir().expect("temp dir");
         let skill_mount = MountSpec {
             source: sandbox.path().join(".lionclaw/skills/terminal"),
@@ -714,7 +714,7 @@ mod tests {
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
-                selected_skill_mounts: vec![skill_mount.clone()],
+                skill_mounts: vec![skill_mount.clone()],
                 timeout_ms: None,
             })
             .expect("plan");
@@ -727,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_rejects_selected_skill_mounts_that_are_not_read_only() {
+    fn planner_rejects_runtime_skill_mounts_that_are_not_read_only() {
         let sandbox = tempdir().expect("temp dir");
         let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
             policy: RuntimeExecutionPolicy::default(),
@@ -750,14 +750,14 @@ mod tests {
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
-                selected_skill_mounts: vec![MountSpec {
+                skill_mounts: vec![MountSpec {
                     source: sandbox.path().join(".lionclaw/skills/terminal"),
                     target: "/lionclaw/skills/terminal".to_string(),
                     access: MountAccess::ReadWrite,
                 }],
                 timeout_ms: None,
             })
-            .expect_err("selected skill mounts must be read-only");
+            .expect_err("runtime skill mounts must be read-only");
 
         assert!(
             err.contains("must be read-only"),
@@ -766,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_rejects_selected_skill_mounts_with_invalid_alias_targets() {
+    fn planner_rejects_runtime_skill_mounts_with_invalid_alias_targets() {
         let sandbox = tempdir().expect("temp dir");
         let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
             policy: RuntimeExecutionPolicy::default(),
@@ -790,14 +790,14 @@ mod tests {
                     preset_name: None,
                     working_dir: None,
                     env_passthrough_keys: Vec::new(),
-                    selected_skill_mounts: vec![MountSpec {
+                    skill_mounts: vec![MountSpec {
                         source: sandbox.path().join(".lionclaw/skills/terminal"),
                         target: target.to_string(),
                         access: MountAccess::ReadOnly,
                     }],
                     timeout_ms: None,
                 })
-                .expect_err("selected skill mount targets must use valid skill aliases");
+                .expect_err("runtime skill mount targets must use valid skill aliases");
 
             assert!(
                 err.contains("must be under /lionclaw/skills/<alias>"),
@@ -848,13 +848,13 @@ mod tests {
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
-                selected_skill_mounts: Vec::new(),
+                skill_mounts: Vec::new(),
                 timeout_ms: None,
             })
-            .expect_err("skill namespace is reserved for kernel-selected skill mounts");
+            .expect_err("skill namespace is reserved for kernel runtime skill mounts");
 
         assert!(
-            err.contains("reserved for selected skill assets"),
+            err.contains("reserved for runtime skill assets"),
             "unexpected planner error: {err}"
         );
     }
@@ -882,7 +882,7 @@ mod tests {
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
-                selected_skill_mounts: Vec::new(),
+                skill_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect_err("plan should fail");
@@ -933,7 +933,7 @@ mod tests {
                 preset_name: None,
                 working_dir: Some(child.to_string_lossy().to_string()),
                 env_passthrough_keys: Vec::new(),
-                selected_skill_mounts: Vec::new(),
+                skill_mounts: Vec::new(),
                 timeout_ms: Some(45_000),
             })
             .expect("plan");
@@ -980,7 +980,7 @@ mod tests {
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
-                selected_skill_mounts: Vec::new(),
+                skill_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("plan");
@@ -1015,7 +1015,7 @@ mod tests {
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
-                selected_skill_mounts: Vec::new(),
+                skill_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("plan");
@@ -1070,7 +1070,7 @@ mod tests {
                 preset_name: Some("plain".to_string()),
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
-                selected_skill_mounts: Vec::new(),
+                skill_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("plain plan");
@@ -1082,7 +1082,7 @@ mod tests {
                 preset_name: Some("secreted".to_string()),
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
-                selected_skill_mounts: Vec::new(),
+                skill_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("secreted plan");
@@ -1137,7 +1137,7 @@ mod tests {
                 preset_name: None,
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
-                selected_skill_mounts: vec![MountSpec {
+                skill_mounts: vec![MountSpec {
                     source: sandbox.path().join(".lionclaw/skills/terminal"),
                     target: "/lionclaw/skills/terminal".to_string(),
                     access: MountAccess::ReadOnly,

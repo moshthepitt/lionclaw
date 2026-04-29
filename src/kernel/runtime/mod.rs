@@ -16,6 +16,7 @@ pub mod adapters;
 pub mod builtins;
 mod codex_host_auth;
 pub mod execution;
+mod skill_projection;
 
 pub use adapters::{
     CodexRuntimeAdapter, CodexRuntimeConfig, MockRuntimeAdapter, OpenCodeRuntimeAdapter,
@@ -33,6 +34,7 @@ pub use execution::{
     RuntimeSecretsMount, WorkspaceAccess, BUILTIN_PRESET_EVERYDAY,
     BUILTIN_PRESET_HIDDEN_COMPACTION, SKILLS_MOUNT_TARGET_ROOT,
 };
+pub use skill_projection::project_runtime_skills;
 
 async fn validate_runtime_auth_prerequisites(
     runtime_id: &str,
@@ -77,7 +79,7 @@ pub struct RuntimeSessionStartInput {
     pub session_id: Uuid,
     pub working_dir: Option<String>,
     pub environment: Vec<(String, String)>,
-    pub selected_skills: Vec<String>,
+    pub runtime_skills: Vec<String>,
     pub runtime_state_root: Option<PathBuf>,
 }
 
@@ -91,7 +93,7 @@ pub struct RuntimeSessionHandle {
 pub struct RuntimeTurnInput {
     pub runtime_session_id: String,
     pub prompt: String,
-    pub selected_skills: Vec<String>,
+    pub runtime_skills: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

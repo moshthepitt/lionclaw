@@ -51,7 +51,7 @@ impl CapabilityBroker {
             Capability::SecretRequest => self.secrets.request(payload).await,
             Capability::ChannelSend => build_channel_send_intent(context, payload).await,
             Capability::SchedulerRun => self.scheduler.run(payload).await,
-            Capability::Any | Capability::SkillUse => Err(anyhow!(
+            Capability::Any => Err(anyhow!(
                 "capability '{}' is not broker-executable",
                 capability.as_str()
             )),

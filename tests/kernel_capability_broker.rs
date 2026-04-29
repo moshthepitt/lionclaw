@@ -163,7 +163,7 @@ async fn invalid_capability_payload_is_denied_by_broker() {
 async fn runtime_cannot_override_kernel_selected_scope() {
     let env = TestEnv::new();
     let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
-    let (session_id, skill_id) = prepare_session_with_skill(
+    let (session_id, _skill_id) = prepare_session_with_skill(
         &kernel,
         "peer-cap-broker-scope",
         "broker-scope-guard",
@@ -178,7 +178,6 @@ async fn runtime_cannot_override_kernel_selected_scope() {
                 run_at: Utc::now() + ChronoDuration::minutes(10),
             },
             prompt_text: "scheduled scope guard".to_string(),
-            skill_ids: vec![skill_id.clone()],
             allow_capabilities: vec!["fs.read".to_string()],
             delivery: None,
             retry_attempts: Some(0),
@@ -243,17 +242,34 @@ async fn channel_send_capability_uses_session_channel_defaults() {
         .await;
 
     let peer_id = "peer-cap-broker-channel";
-    let (session_id, skill_id) = prepare_session_with_skill(
+    let (session_id, runtime_skill_id) = prepare_session_with_skill(
         &kernel,
         peer_id,
         "broker-channel-send",
         "Capability broker channel send skill",
     )
     .await;
+    let channel_skill = kernel
+        .install_skill(SkillInstallRequest {
+            source: "local/channel-local-cli".to_string(),
+            alias: "channel-local-cli".to_string(),
+            reference: Some("main".to_string()),
+            hash: Some("channel-local-cli-hash".to_string()),
+            skill_md: Some(
+                "---\nname: channel-local-cli\ndescription: local channel worker\n---".to_string(),
+            ),
+            snapshot_path: None,
+        })
+        .await
+        .expect("install local channel skill");
+    kernel
+        .enable_skill(channel_skill.skill_id.clone())
+        .await
+        .expect("enable local channel skill");
     kernel
         .bind_channel(ChannelBindRequest {
             channel_id: "local-cli".to_string(),
-            skill_id: skill_id.clone(),
+            skill_id: channel_skill.skill_id,
             enabled: Some(true),
             config: None,
         })
@@ -290,7 +306,7 @@ async fn channel_send_capability_uses_session_channel_defaults() {
         })
         .await
         .expect("approve peer");
-    grant_capability(&kernel, &skill_id, "channel.send").await;
+    grant_capability(&kernel, &runtime_skill_id, "channel.send").await;
 
     let response = kernel
         .turn_session(SessionTurnRequest {
@@ -395,7 +411,7 @@ impl RuntimeAdapter for SingleCapabilityRuntimeAdapter {
         });
         let mut capability_requests = Vec::new();
 
-        if let Some(skill_id) = input.selected_skills.first() {
+        if let Some(skill_id) = input.runtime_skills.first() {
             capability_requests.push(RuntimeCapabilityRequest {
                 request_id: "req-1".to_string(),
                 skill_id: skill_id.clone(),
@@ -406,7 +422,7 @@ impl RuntimeAdapter for SingleCapabilityRuntimeAdapter {
         } else {
             let _ = events.send(RuntimeEvent::Status {
                 code: None,
-                text: "single capability runtime had no selected skill".to_string(),
+                text: "single capability runtime had no runtime skill".to_string(),
             });
             let _ = events.send(RuntimeEvent::Done);
         }
@@ -486,7 +502,6 @@ async fn prepare_session_with_skill(
         .enable_skill(skill.skill_id.clone())
         .await
         .expect("enable skill");
-    grant_capability(kernel, &skill.skill_id, "skill.use").await;
 
     (session.session_id, skill.skill_id)
 }

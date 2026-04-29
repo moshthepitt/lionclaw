@@ -36,7 +36,7 @@ description: Handles restart durability requests
         let grant = kernel
             .grant_policy(PolicyGrantRequest {
                 skill_id: installed.skill_id.clone(),
-                capability: "skill.use".to_string(),
+                capability: "fs.read".to_string(),
                 scope: "*".to_string(),
                 ttl_seconds: None,
             })
@@ -46,7 +46,7 @@ description: Handles restart durability requests
         let turn = kernel
             .turn_session(SessionTurnRequest {
                 session_id: opened.session_id,
-                user_text: "please use restart skill for this task".to_string(),
+                user_text: "please use restart skill for this task [cap:fs.read]".to_string(),
                 runtime_id: Some("mock".to_string()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
@@ -55,9 +55,15 @@ description: Handles restart durability requests
             .await
             .expect("turn should succeed");
         assert!(
-            turn.selected_skills.contains(&installed.skill_id),
-            "policy-gated skill should be selected before restart"
+            turn.runtime_skills.contains(&installed.skill_id),
+            "enabled skill should be runtime-visible before restart"
         );
+        assert!(turn.stream_events.iter().any(|event| {
+            event
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("capability:req-1:granted"))
+        }));
 
         let audit = kernel
             .query_audit(Some(opened.session_id), None, None, Some(50))
@@ -94,7 +100,7 @@ description: Handles restart durability requests
     let turn_after_restart = kernel
         .turn_session(SessionTurnRequest {
             session_id,
-            user_text: "restart skill should still be available".to_string(),
+            user_text: "restart skill should still be available [cap:fs.read]".to_string(),
             runtime_id: Some("mock".to_string()),
             runtime_working_dir: None,
             runtime_timeout_ms: None,
@@ -103,9 +109,15 @@ description: Handles restart durability requests
         .await
         .expect("turn after restart");
     assert!(
-        turn_after_restart.selected_skills.contains(&skill_id),
+        turn_after_restart.runtime_skills.contains(&skill_id),
         "session + policy should persist across restart"
     );
+    assert!(turn_after_restart.stream_events.iter().any(|event| {
+        event
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("capability:req-1:granted"))
+    }));
 
     let revoked = kernel
         .revoke_policy(grant_id)
@@ -141,7 +153,7 @@ description: Handles expiring policy windows
     kernel
         .grant_policy(PolicyGrantRequest {
             skill_id: installed.skill_id.clone(),
-            capability: "skill.use".to_string(),
+            capability: "fs.read".to_string(),
             scope: "*".to_string(),
             ttl_seconds: Some(1),
         })
@@ -151,7 +163,7 @@ description: Handles expiring policy windows
     let allowed_turn = kernel
         .turn_session(SessionTurnRequest {
             session_id: opened.session_id,
-            user_text: "ttl skill now".to_string(),
+            user_text: "ttl skill now [cap:fs.read]".to_string(),
             runtime_id: Some("mock".to_string()),
             runtime_working_dir: None,
             runtime_timeout_ms: None,
@@ -160,16 +172,22 @@ description: Handles expiring policy windows
         .await
         .expect("turn during ttl");
     assert!(
-        allowed_turn.selected_skills.contains(&installed.skill_id),
-        "skill should be usable before ttl expiry"
+        allowed_turn.runtime_skills.contains(&installed.skill_id),
+        "enabled skill should stay runtime-visible before ttl expiry"
     );
+    assert!(allowed_turn.stream_events.iter().any(|event| {
+        event
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("capability:req-1:granted"))
+    }));
 
     sleep(Duration::from_millis(1500)).await;
 
     let denied_turn = kernel
         .turn_session(SessionTurnRequest {
             session_id: opened.session_id,
-            user_text: "ttl skill now".to_string(),
+            user_text: "ttl skill now [cap:fs.read]".to_string(),
             runtime_id: Some("mock".to_string()),
             runtime_working_dir: None,
             runtime_timeout_ms: None,
@@ -178,9 +196,15 @@ description: Handles expiring policy windows
         .await
         .expect("turn after ttl");
     assert!(
-        denied_turn.selected_skills.is_empty(),
-        "skill should be denied after ttl expiry"
+        denied_turn.runtime_skills.contains(&installed.skill_id),
+        "enabled skill should remain runtime-visible after ttl expiry"
     );
+    assert!(denied_turn.stream_events.iter().any(|event| {
+        event
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("capability:req-1:denied"))
+    }));
 }
 
 #[tokio::test]
@@ -328,7 +352,7 @@ description: Handles idempotent operations
     let grant = kernel
         .grant_policy(PolicyGrantRequest {
             skill_id: install_a.skill_id.clone(),
-            capability: "skill.use".to_string(),
+            capability: "fs.read".to_string(),
             scope: "*".to_string(),
             ttl_seconds: None,
         })

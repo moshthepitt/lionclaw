@@ -10,7 +10,6 @@ use crate::kernel::db::{ms_to_datetime, now_ms};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capability {
     Any,
-    SkillUse,
     FsRead,
     FsWrite,
     NetEgress,
@@ -23,7 +22,6 @@ impl Capability {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Any => "*",
-            Self::SkillUse => "skill.use",
             Self::FsRead => "fs.read",
             Self::FsWrite => "fs.write",
             Self::NetEgress => "net.egress",
@@ -40,7 +38,6 @@ impl FromStr for Capability {
     fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
         match raw.trim() {
             "*" => Ok(Self::Any),
-            "skill.use" => Ok(Self::SkillUse),
             "fs.read" => Ok(Self::FsRead),
             "fs.write" => Ok(Self::FsWrite),
             "net.egress" => Ok(Self::NetEgress),
@@ -336,7 +333,7 @@ mod tests {
         let store = PolicyStore::new(db.pool());
         let scope = Scope::from_str("*").expect("scope");
         assert!(!store
-            .is_allowed("skill-a", Capability::SkillUse, &scope)
+            .is_allowed("skill-a", Capability::FsRead, &scope)
             .await
             .expect("policy"));
     }
@@ -351,7 +348,7 @@ mod tests {
         store
             .grant(
                 "skill-a".to_string(),
-                Capability::SkillUse,
+                Capability::FsRead,
                 scope.clone(),
                 None,
             )
@@ -359,7 +356,7 @@ mod tests {
             .expect("grant");
 
         assert!(store
-            .is_allowed("skill-a", Capability::SkillUse, &scope)
+            .is_allowed("skill-a", Capability::FsRead, &scope)
             .await
             .expect("policy"));
     }

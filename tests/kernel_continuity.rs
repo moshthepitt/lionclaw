@@ -323,7 +323,7 @@ async fn scheduler_success_records_artifact_and_updates_active_in_home_workspace
     .await
     .expect("kernel init");
 
-    let skill_id = install_enabled_skill(&kernel, "scheduler-brief").await;
+    install_enabled_skill(&kernel, "scheduler-brief").await;
     let created = kernel
         .create_job(JobCreateRequest {
             name: "daily brief".to_string(),
@@ -332,7 +332,6 @@ async fn scheduler_success_records_artifact_and_updates_active_in_home_workspace
                 run_at: Utc::now() - ChronoDuration::minutes(1),
             },
             prompt_text: "review the current workspace".to_string(),
-            skill_ids: vec![skill_id],
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -470,7 +469,6 @@ async fn active_continuity_global_slices_are_bounded_to_recent_items() {
                     run_at: Utc::now() + ChronoDuration::minutes(5 + i64::from(index)),
                 },
                 prompt_text: "attention job".to_string(),
-                skill_ids: Vec::new(),
                 allow_capabilities: Vec::new(),
                 delivery: None,
                 retry_attempts: Some(0),
@@ -513,7 +511,6 @@ async fn active_continuity_global_slices_are_bounded_to_recent_items() {
                 run_at: Utc::now() + ChronoDuration::minutes(30),
             },
             prompt_text: "refresh active continuity".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -574,7 +571,6 @@ async fn create_job_rolls_back_when_audit_append_fails() {
                 run_at: Utc::now() + ChronoDuration::minutes(5),
             },
             prompt_text: "job should not persist".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -663,7 +659,6 @@ async fn pause_job_rolls_back_when_audit_append_fails() {
                 run_at: Utc::now() + ChronoDuration::minutes(5),
             },
             prompt_text: "job should stay enabled".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -720,7 +715,6 @@ async fn create_job_succeeds_when_active_continuity_refresh_fails() {
                 run_at: Utc::now() + ChronoDuration::minutes(5),
             },
             prompt_text: "refresh failure should not fail create".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -2027,15 +2021,6 @@ async fn install_enabled_skill(kernel: &Kernel, name: &str) -> String {
         .enable_skill(skill.skill_id.clone())
         .await
         .expect("enable skill");
-    kernel
-        .grant_policy(PolicyGrantRequest {
-            skill_id: skill.skill_id.clone(),
-            capability: "skill.use".to_string(),
-            scope: "*".to_string(),
-            ttl_seconds: None,
-        })
-        .await
-        .expect("grant skill.use");
     skill.skill_id
 }
 
@@ -2228,7 +2213,7 @@ impl RuntimeAdapter for CapturePromptAdapter {
             .push(current_prompt.clone());
 
         if self.allow_hidden_compaction
-            && input.selected_skills.is_empty()
+            && input.runtime_skills.is_empty()
             && current_prompt.contains("lionclaw_compaction_handoff_v1")
         {
             let first_user = extract_compaction_user(&current_prompt, false);
@@ -2276,10 +2261,10 @@ impl RuntimeAdapter for CapturePromptAdapter {
 
         if self.request_fs_read {
             let skill_id = input
-                .selected_skills
+                .runtime_skills
                 .first()
                 .cloned()
-                .ok_or_else(|| anyhow!("selected skill required"))?;
+                .ok_or_else(|| anyhow!("runtime skill required"))?;
             return Ok(RuntimeTurnResult {
                 capability_requests: vec![RuntimeCapabilityRequest {
                     request_id: "req-1".to_string(),
@@ -2359,7 +2344,7 @@ impl RuntimeAdapter for HangingHiddenCompactionAdapter {
         input: RuntimeTurnInput,
         events: RuntimeEventSender,
     ) -> Result<RuntimeTurnResult> {
-        if input.selected_skills.is_empty()
+        if input.runtime_skills.is_empty()
             && input.prompt.contains("lionclaw_compaction_handoff_v1")
         {
             std::future::pending::<()>().await;

@@ -254,15 +254,6 @@ impl JobStore {
         let created = self.insert_job_in_tx(tx, input).await?;
         let scope = Scope::Job(created.job_id);
         for skill_id in &created.skill_ids {
-            policy
-                .grant_in_tx(
-                    tx,
-                    skill_id.clone(),
-                    Capability::SkillUse,
-                    scope.clone(),
-                    None,
-                )
-                .await?;
             for capability in allowed_capabilities {
                 policy
                     .grant_in_tx(tx, skill_id.clone(), *capability, scope.clone(), None)

@@ -6,9 +6,9 @@ use lionclaw::{
         ChannelBindRequest, ChannelInboundOutcome, ChannelInboundRequest,
         ChannelPeerApproveRequest, ChannelPeerBlockRequest, ChannelStreamAckRequest,
         ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamStartMode,
-        PolicyGrantRequest, SessionActionKind, SessionActionRequest, SessionHistoryPolicy,
-        SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest, SessionTurnRequest,
-        SessionTurnStatus, SkillInstallRequest, StreamEventKindDto, StreamLaneDto, TrustTier,
+        SessionActionKind, SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest,
+        SessionLatestQuery, SessionOpenRequest, SessionTurnRequest, SessionTurnStatus,
+        SkillInstallRequest, StreamEventKindDto, StreamLaneDto, TrustTier,
     },
     kernel::{
         runtime::{
@@ -148,16 +148,6 @@ description: inbound skill for channel flow
         })
         .await
         .expect("approve peer");
-
-    kernel
-        .grant_policy(PolicyGrantRequest {
-            skill_id: skill.skill_id.clone(),
-            capability: "skill.use".to_string(),
-            scope: "*".to_string(),
-            ttl_seconds: None,
-        })
-        .await
-        .expect("grant skill use");
 
     let queued = kernel
         .process_inbound_channel_text(InboundChannelText {
@@ -1103,16 +1093,6 @@ async fn install_and_bind_channel(
         })
         .await
         .expect("bind channel");
-
-    kernel
-        .grant_policy(PolicyGrantRequest {
-            skill_id: skill.skill_id,
-            capability: "skill.use".to_string(),
-            scope: "*".to_string(),
-            ttl_seconds: None,
-        })
-        .await
-        .expect("grant skill use");
 }
 
 fn assert_turn_completed_before_done(

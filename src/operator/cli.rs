@@ -22,7 +22,6 @@ use crate::{
             derive_skill_alias, normalize_podman_executable, normalize_runtime_command,
             ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig,
         },
-        lockfile::OperatorLockfile,
         reconcile::{
             add_channel, add_skill, apply, down, logs, onboard, open_kernel, open_runtime_kernel,
             pairing_approve, pairing_block, pairing_list, remove_channel, remove_skill,
@@ -337,8 +336,6 @@ struct JobAddArgs {
     prompt_file: Option<String>,
     #[arg(long)]
     runtime: Option<String>,
-    #[arg(long = "skill")]
-    skills: Vec<String>,
     #[arg(long = "allow")]
     allow_capabilities: Vec<String>,
     #[arg(long = "deliver-channel")]
@@ -793,14 +790,12 @@ pub async fn run() -> Result<()> {
                                     ));
                             }
                         };
-                        let skill_ids = resolve_job_skill_ids(&applied.lockfile, &args.skills)?;
                         let response = kernel
                             .create_job(JobCreateRequest {
                                 name: args.name,
                                 runtime_id,
                                 schedule,
                                 prompt_text,
-                                skill_ids,
                                 allow_capabilities: args.allow_capabilities,
                                 delivery,
                                 retry_attempts: args.retry_attempts,
@@ -960,24 +955,6 @@ async fn load_job_prompt(prompt: Option<String>, prompt_file: Option<String>) ->
         (Some(_), Some(_)) => Err(anyhow!("use either --prompt or --prompt-file, not both")),
         (None, None) => Err(anyhow!("either --prompt or --prompt-file is required")),
     }
-}
-
-fn resolve_job_skill_ids(lockfile: &OperatorLockfile, requested: &[String]) -> Result<Vec<String>> {
-    let mut resolved = Vec::new();
-    for raw in requested {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Err(anyhow!("--skill cannot be empty"));
-        }
-        let skill_id = lockfile
-            .find_skill(trimmed)
-            .map(|skill| skill.skill_id.clone())
-            .unwrap_or_else(|| trimmed.to_string());
-        if !resolved.iter().any(|value| value == &skill_id) {
-            resolved.push(skill_id);
-        }
-    }
-    Ok(resolved)
 }
 
 fn parse_job_id(raw: &str) -> Result<uuid::Uuid> {

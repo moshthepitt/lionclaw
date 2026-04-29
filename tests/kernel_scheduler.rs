@@ -14,9 +14,9 @@ use chrono::{Duration as ChronoDuration, Utc};
 use lionclaw::{
     contracts::{
         ChannelBindRequest, ChannelStreamPullRequest, ChannelStreamStartMode, JobCreateRequest,
-        JobRefRequest, JobRunsRequest, PolicyGrantRequest, SessionHistoryPolicy,
-        SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest, SessionTurnRequest,
-        SkillInstallRequest, StreamEventKindDto, TrustTier,
+        JobRefRequest, JobRunsRequest, SessionHistoryPolicy, SessionHistoryRequest,
+        SessionLatestQuery, SessionOpenRequest, SessionTurnRequest, SkillInstallRequest,
+        StreamEventKindDto, TrustTier,
     },
     home::LionClawHome,
     kernel::{
@@ -49,7 +49,6 @@ async fn scheduled_job_tick_runs_in_fresh_scheduler_session() {
                 run_at: Utc::now() - ChronoDuration::minutes(1),
             },
             prompt_text: "review the current workspace".to_string(),
-            skill_ids: vec![skill_id.clone()],
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -132,7 +131,6 @@ async fn scheduled_job_does_not_use_skill_disabled_after_creation() {
                 run_at: Utc::now() - ChronoDuration::minutes(1),
             },
             prompt_text: "try the disabled scheduler skill".to_string(),
-            skill_ids: vec![skill_id.clone()],
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -167,12 +165,12 @@ async fn scheduled_job_does_not_use_skill_disabled_after_creation() {
     assert!(
         history.turns[0]
             .assistant_text
-            .contains("no skill context selected"),
+            .contains("no runtime skills available"),
         "disabled skills must not be passed to runtime turns"
     );
     assert!(
         !history.turns[0].assistant_text.contains(&skill_id),
-        "disabled skill id should not be visible as a selected skill"
+        "disabled skill id should not be visible as a runtime skill"
     );
 }
 
@@ -189,7 +187,6 @@ async fn create_job_rejects_missing_runtime_auth_before_persisting() {
             runtime_id: "codex".to_string(),
             schedule: lionclaw::contracts::JobScheduleDto::Once { run_at: Utc::now() },
             prompt_text: "summarize repo".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -226,7 +223,6 @@ async fn manual_job_run_rejects_missing_runtime_auth_before_launch() {
                 run_at: Utc::now() + ChronoDuration::hours(1),
             },
             prompt_text: "manual run".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -280,7 +276,6 @@ async fn scheduler_tick_dead_letters_missing_runtime_auth_without_launching_runt
                 run_at: Utc::now() - ChronoDuration::minutes(1),
             },
             prompt_text: "scheduled run".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -345,7 +340,6 @@ async fn scheduler_tick_retries_missing_runtime_auth_before_dead_lettering() {
                 run_at: Utc::now() - ChronoDuration::minutes(1),
             },
             prompt_text: "scheduled run".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(1),
@@ -408,7 +402,6 @@ async fn scheduler_tick_continues_past_auth_invalid_jobs() {
                 run_at: Utc::now() - ChronoDuration::minutes(2),
             },
             prompt_text: "scheduled run".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -423,7 +416,6 @@ async fn scheduler_tick_continues_past_auth_invalid_jobs() {
                 run_at: Utc::now() - ChronoDuration::minutes(1),
             },
             prompt_text: "scheduled run".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -476,7 +468,7 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
     )
     .await
     .expect("kernel init");
-    let skill_id = install_enabled_skill(&kernel, "job-scope-reader").await;
+    install_enabled_skill(&kernel, "job-scope-reader").await;
     install_and_bind_channel(&kernel, "terminal", "terminal-delivery").await;
     approve_channel_peer(&kernel, "terminal", "alice").await;
 
@@ -498,7 +490,6 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
                 run_at: Utc::now() - ChronoDuration::minutes(1),
             },
             prompt_text: "please use job-scope-reader [cap:fs.read]".to_string(),
-            skill_ids: vec![skill_id.clone()],
             allow_capabilities: vec!["fs.read".to_string()],
             delivery: Some(lionclaw::contracts::JobDeliveryTargetDto {
                 channel_id: "terminal".to_string(),
@@ -571,16 +562,6 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
                 .is_some_and(|text| text.contains("[mock]"))
     }));
 
-    kernel
-        .grant_policy(PolicyGrantRequest {
-            skill_id: skill_id.clone(),
-            capability: "skill.use".to_string(),
-            scope: "*".to_string(),
-            ttl_seconds: None,
-        })
-        .await
-        .expect("grant global skill.use");
-
     let interactive = kernel
         .open_session(SessionOpenRequest {
             channel_id: "local-cli".to_string(),
@@ -635,7 +616,6 @@ async fn scheduled_job_failure_delivers_summary_and_dead_letters() {
                 run_at: Utc::now() - ChronoDuration::minutes(1),
             },
             prompt_text: "this will fail".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: Some(lionclaw::contracts::JobDeliveryTargetDto {
                 channel_id: "terminal".to_string(),
@@ -709,7 +689,6 @@ async fn paused_jobs_are_skipped_by_ticks_but_can_run_manually() {
                 run_at: Utc::now() - ChronoDuration::minutes(1),
             },
             prompt_text: "manual-only run".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -773,7 +752,7 @@ async fn paused_jobs_are_skipped_by_ticks_but_can_run_manually() {
 async fn removing_job_revokes_job_scoped_policy_grants() {
     let env = TestEnv::new();
     let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
-    let skill_id = install_enabled_skill(&kernel, "scheduler-remove-guard").await;
+    install_enabled_skill(&kernel, "scheduler-remove-guard").await;
 
     let created = kernel
         .create_job(JobCreateRequest {
@@ -783,7 +762,6 @@ async fn removing_job_revokes_job_scoped_policy_grants() {
                 run_at: Utc::now() + ChronoDuration::minutes(5),
             },
             prompt_text: "grant cleanup".to_string(),
-            skill_ids: vec![skill_id],
             allow_capabilities: vec!["fs.read".to_string()],
             delivery: None,
             retry_attempts: Some(0),
@@ -801,8 +779,8 @@ async fn removing_job_revokes_job_scoped_policy_grants() {
         .await
         .expect("count job-scoped grants before delete");
     assert_eq!(
-        before, 2,
-        "create_job should add skill.use and the allowed capability for the job scope"
+        before, 1,
+        "create_job should add the allowed capability for the job scope"
     );
 
     let removed = kernel
@@ -836,7 +814,6 @@ async fn scheduler_tick_surfaces_unexpected_job_completion_failures() {
                 run_at: Utc::now() - ChronoDuration::minutes(1),
             },
             prompt_text: "complete after corruption".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -889,7 +866,6 @@ async fn scheduler_ticks_are_single_flight_and_run_due_jobs_serially() {
                 run_at: Utc::now() - ChronoDuration::minutes(2),
             },
             prompt_text: "first prompt".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -904,7 +880,6 @@ async fn scheduler_ticks_are_single_flight_and_run_due_jobs_serially() {
                 run_at: Utc::now() - ChronoDuration::minutes(1),
             },
             prompt_text: "second prompt".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),

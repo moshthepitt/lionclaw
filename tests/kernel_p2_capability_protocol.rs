@@ -47,16 +47,6 @@ description: Handles capability-gated runtime operations
         .await
         .expect("enable skill");
 
-    kernel
-        .grant_policy(PolicyGrantRequest {
-            skill_id: skill.skill_id.clone(),
-            capability: "skill.use".to_string(),
-            scope: "*".to_string(),
-            ttl_seconds: None,
-        })
-        .await
-        .expect("grant skill.use");
-
     let denied_turn = kernel
         .turn_session(SessionTurnRequest {
             session_id: session.session_id,
