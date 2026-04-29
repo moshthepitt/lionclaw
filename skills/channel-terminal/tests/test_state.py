@@ -271,6 +271,7 @@ class _InteractiveApi(_SuccessfulApi):
         super().__init__()
         self.open_calls = 0
         self.action_calls: list[tuple[str, str]] = []
+        self.fetch_latest_calls = 0
 
     async def open_session(
         self,
@@ -291,6 +292,17 @@ class _InteractiveApi(_SuccessfulApi):
         return SessionActionResult(
             session_id="session-reset" if action == "reset_session" else session_id,
             turn_id="turn-action" if action != "reset_session" else None,
+        )
+
+    async def fetch_latest_session(
+        self,
+        history_policy: str = "interactive",
+    ) -> SessionLatestSnapshot:
+        self.fetch_latest_calls += 1
+        return SessionLatestSnapshot(
+            session=None,
+            turns=[],
+            resume_after_sequence=None,
         )
 
 
@@ -336,6 +348,26 @@ class _PairingRefreshApi(_InteractiveApi):
     ) -> SessionLatestSnapshot:
         self.fetch_latest_calls += 1
         return self.latest_snapshot
+
+
+class _RecoveringRestoreApi(_PairingRefreshApi):
+    async def fetch_latest_session(
+        self,
+        history_policy: str = "interactive",
+    ) -> SessionLatestSnapshot:
+        self.fetch_latest_calls += 1
+        if self.fetch_latest_calls == 1:
+            raise RuntimeError("restore boom")
+        return self.latest_snapshot
+
+
+class _FailingRestoreApi(_InteractiveApi):
+    async def fetch_latest_session(
+        self,
+        history_policy: str = "interactive",
+    ) -> SessionLatestSnapshot:
+        self.fetch_latest_calls += 1
+        raise RuntimeError("restore boom")
 
 
 class _MountedApi(_PairingRefreshApi):
@@ -556,6 +588,65 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("you> restored question", transcript)
         self.assertIn("lionclaw> restored answer", transcript)
         self.assertEqual(app.state.activity_text(), "[status] peer approved")
+
+    async def test_refresh_pairing_state_retries_failed_approved_restore(self):
+        app = _make_app()
+        api = _RecoveringRestoreApi(
+            peer_state=PeerState(status="approved", trust_tier="main"),
+            latest_snapshot=SessionLatestSnapshot(
+                session=SessionOpenResult(
+                    session_id="session-1",
+                    channel_id="terminal",
+                    peer_id="mosh",
+                    trust_tier="main",
+                    history_policy="interactive",
+                ),
+                turns=[
+                    SessionTurnSnapshot(
+                        turn_id="turn-1",
+                        kind="normal",
+                        status="completed",
+                        display_user_text="restored question",
+                        assistant_text="restored answer",
+                        error_code=None,
+                        error_text=None,
+                    )
+                ],
+                resume_after_sequence=None,
+            ),
+        )
+        app.api = api
+        app._render_views = lambda: None  # type: ignore[method-assign]
+
+        await app.refresh_pairing_state()
+
+        self.assertEqual(api.fetch_latest_calls, 1)
+        self.assertIsNone(app.state.active_session_id)
+        self.assertIn("session restore failed: restore boom", app.state.activity_text())
+
+        await app.refresh_pairing_state()
+
+        self.assertEqual(api.fetch_latest_calls, 2)
+        self.assertEqual(app.state.active_session_id, "session-1")
+        self.assertIn("lionclaw> restored answer", app.state.transcript_text())
+        self.assertEqual(app.state.activity_text(), "[status] peer approved")
+
+    async def test_submit_text_blocks_fresh_session_when_restore_is_pending_and_fails(self):
+        app = _make_app()
+        api = _FailingRestoreApi()
+        app.api = api
+        app._render_views = lambda: None  # type: ignore[method-assign]
+        app.state.set_pairing_state(status="approved", trust_tier="main")
+
+        accepted = await app.submit_text("hello")
+
+        self.assertFalse(accepted)
+        self.assertEqual(api.fetch_latest_calls, 1)
+        self.assertEqual(api.open_calls, 0)
+        self.assertIsNone(api.sent_text)
+        self.assertIsNone(app.state.active_session_id)
+        self.assertEqual(app.state.transcript_text(), "")
+        self.assertIn("send blocked: latest session restore failed", app.state.activity_text())
 
 
 if __name__ == "__main__":

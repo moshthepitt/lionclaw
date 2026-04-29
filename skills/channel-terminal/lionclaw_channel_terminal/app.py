@@ -107,6 +107,7 @@ class TerminalChannelApp(App[None]):
         )
         self._initial_stream_start_after_sequence: int | None = None
         self._first_stream_pull = True
+        self._approved_peer_session_restore_complete = False
         self._focus_input_requested = True
         self._input_was_disabled = True
 
@@ -169,11 +170,16 @@ class TerminalChannelApp(App[None]):
             )
             return False
 
+        try:
+            session_id = await self.ensure_interactive_session_for_send()
+        except Exception as err:  # noqa: BLE001
+            await self._push_status(f"send blocked: {err}")
+            return False
+
         self.state.begin_submit(text)
         self._render_views()
 
         try:
-            session_id = await self.ensure_interactive_session_for_send()
             response = await self.api.send_inbound(text, session_id=session_id)
         except Exception as err:  # noqa: BLE001
             self.state.mark_send_failed(str(err))
@@ -259,8 +265,16 @@ class TerminalChannelApp(App[None]):
             trust_tier=peer_state.trust_tier,
         )
 
+        if peer_state.status != "approved":
+            self._approved_peer_session_restore_complete = False
+
         if previous_status != peer_state.status:
             await self._handle_pairing_transition(previous_status, peer_state.status)
+        elif (
+            peer_state.status == "approved"
+            and not self._approved_peer_session_restore_complete
+        ):
+            await self._restore_approved_peer_session()
 
         self._render_views()
 
@@ -288,6 +302,11 @@ class TerminalChannelApp(App[None]):
             return self.state.active_session_id
         if self.state.pairing.status != "approved":
             return None
+        if not self._approved_peer_session_restore_complete:
+            if not await self._restore_approved_peer_session():
+                raise RuntimeError("latest session restore failed; retrying")
+            if self.state.active_session_id is not None:
+                return self.state.active_session_id
         return await self.open_interactive_session()
 
     async def open_interactive_session(self) -> str | None:
@@ -300,6 +319,7 @@ class TerminalChannelApp(App[None]):
             history_policy="interactive",
         )
         self.state.active_session_id = session.session_id
+        self._approved_peer_session_restore_complete = True
         return session.session_id
 
     async def stream_loop(self) -> None:
@@ -338,19 +358,26 @@ class TerminalChannelApp(App[None]):
         current_status: str,
     ) -> None:
         if current_status == "approved":
-            restored = await self.restore_latest_session()
-            if restored:
-                if self.state.active_session_id is None:
-                    self.state.clear_transient_view()
-                self.state.activity_lines.clear()
-                self.state.activity_lines.append("[status] peer approved")
-                self._focus_input_requested = True
+            await self._restore_approved_peer_session()
             return
 
         if previous_status == "approved" and current_status == "blocked":
             self.state.clear_pending_turn()
             self.state.activity_lines.clear()
             self.state.activity_lines.append("[error] peer blocked")
+
+    async def _restore_approved_peer_session(self) -> bool:
+        restored = await self.restore_latest_session()
+        if not restored:
+            return False
+
+        self._approved_peer_session_restore_complete = True
+        if self.state.active_session_id is None:
+            self.state.clear_transient_view()
+        self.state.activity_lines.clear()
+        self.state.activity_lines.append("[status] peer approved")
+        self._focus_input_requested = True
+        return True
 
     def _render_views(self) -> None:
         self.query_one("#pairing-banner", Static).update(
