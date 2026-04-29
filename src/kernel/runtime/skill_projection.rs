@@ -8,17 +8,23 @@ use super::{MountSpec, SKILLS_MOUNT_TARGET_ROOT};
 use crate::kernel::skills::validate_skill_alias;
 
 pub async fn project_runtime_skills(
-    runtime_id: &str,
+    runtime_kind: &str,
     runtime_state_root: &Path,
     mounts: &[MountSpec],
 ) -> Result<()> {
-    let Some(native_root) = native_runtime_skills_root(runtime_id, runtime_state_root) else {
+    let Some(native_root) = native_runtime_skills_root(runtime_kind, runtime_state_root) else {
         return Ok(());
     };
 
     let desired = desired_skill_symlinks(mounts)?;
     if desired.is_empty() {
-        return Ok(());
+        if !fs::try_exists(&native_root)
+            .await
+            .with_context(|| format!("failed to stat {}", native_root.display()))?
+        {
+            return Ok(());
+        }
+        return reconcile_skill_symlinks(&native_root, &desired).await;
     }
 
     if let Some(parent) = native_root.parent() {
@@ -33,8 +39,8 @@ pub async fn project_runtime_skills(
     reconcile_skill_symlinks(&native_root, &desired).await
 }
 
-fn native_runtime_skills_root(runtime_id: &str, runtime_state_root: &Path) -> Option<PathBuf> {
-    match runtime_id {
+fn native_runtime_skills_root(runtime_kind: &str, runtime_state_root: &Path) -> Option<PathBuf> {
+    match runtime_kind {
         "codex" => Some(
             runtime_state_root
                 .join("home")
@@ -234,5 +240,30 @@ mod tests {
                 .expect("read new link"),
             PathBuf::from("/lionclaw/skills/new")
         );
+    }
+
+    #[tokio::test]
+    async fn removes_stale_runtime_skill_symlinks_when_no_skills_remain() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime");
+        let stale_root = runtime_root.join("home/.codex/skills");
+        tokio::fs::create_dir_all(&stale_root)
+            .await
+            .expect("create stale root");
+        tokio::task::spawn_blocking({
+            let stale = stale_root.join("old");
+            move || std::os::unix::fs::symlink("/lionclaw/skills/old", stale)
+        })
+        .await
+        .expect("join stale link")
+        .expect("create stale link");
+
+        project_runtime_skills("codex", &runtime_root, &[])
+            .await
+            .expect("project empty skill set");
+
+        assert!(!tokio::fs::try_exists(stale_root.join("old"))
+            .await
+            .expect("check stale link"));
     }
 }

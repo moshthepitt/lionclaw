@@ -3568,6 +3568,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn materialize_runtime_plan_projects_skills_using_runtime_kind() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let plan = EffectiveExecutionPlan {
+            runtime_id: "work-codex".to_string(),
+            preset_name: "everyday".to_string(),
+            confinement: crate::kernel::runtime::ConfinementConfig::Oci(
+                crate::kernel::runtime::OciConfinementConfig::default(),
+            ),
+            workspace_access: crate::kernel::runtime::WorkspaceAccess::ReadWrite,
+            network_mode: crate::kernel::runtime::NetworkMode::On,
+            working_dir: None,
+            environment: Vec::new(),
+            idle_timeout: Duration::from_secs(30),
+            hard_timeout: Duration::from_secs(60),
+            mounts: vec![
+                MountSpec {
+                    source: temp_dir.path().join("workspace"),
+                    target: "/workspace".to_string(),
+                    access: MountAccess::ReadWrite,
+                },
+                MountSpec {
+                    source: runtime_state_root.clone(),
+                    target: "/runtime".to_string(),
+                    access: MountAccess::ReadWrite,
+                },
+                MountSpec {
+                    source: temp_dir.path().join("skills/terminal"),
+                    target: "/lionclaw/skills/terminal".to_string(),
+                    access: MountAccess::ReadOnly,
+                },
+            ],
+            mount_runtime_secrets: false,
+            escape_classes: std::collections::BTreeSet::new(),
+            limits: crate::kernel::runtime::ExecutionLimits::default(),
+        };
+
+        kernel
+            .materialize_runtime_plan("work-codex", "codex", &plan)
+            .await
+            .expect("materialize runtime plan");
+
+        let link = runtime_state_root.join("home/.codex/skills/terminal");
+        assert_eq!(
+            tokio::fs::read_link(&link)
+                .await
+                .expect("read runtime skill link"),
+            PathBuf::from("/lionclaw/skills/terminal")
+        );
+    }
+
+    #[tokio::test]
     async fn runtime_secrets_mount_resolves_runtime_secrets_file_on_demand() {
         let temp_dir = tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
@@ -4892,6 +4947,7 @@ impl Kernel {
         let adapter = self.runtime.get(&runtime_id).await.ok_or_else(|| {
             KernelError::NotFound(format!("runtime adapter '{runtime_id}' not found"))
         })?;
+        let runtime_kind = adapter.info().await.id;
         let execution_plan = self
             .resolve_runtime_execution_plan(
                 session.session_id,
@@ -4913,7 +4969,7 @@ impl Kernel {
         if kind == SessionTurnKind::Retry {
             self.reset_runtime_plan_state(&execution_plan).await?;
         }
-        self.materialize_runtime_plan(&runtime_id, &execution_plan)
+        self.materialize_runtime_plan(&runtime_id, &runtime_kind, &execution_plan)
             .await?;
         let persisted_turn = self
             .session_turns
@@ -5451,6 +5507,7 @@ impl Kernel {
     async fn materialize_runtime_plan(
         &self,
         runtime_id: &str,
+        runtime_kind: &str,
         plan: &EffectiveExecutionPlan,
     ) -> Result<(), KernelError> {
         for mount in &plan.mounts {
@@ -5464,7 +5521,7 @@ impl Kernel {
         let Some(runtime_state_root) = Self::runtime_state_root(plan) else {
             return Ok(());
         };
-        project_runtime_skills(runtime_id, runtime_state_root, &plan.mounts)
+        project_runtime_skills(runtime_kind, runtime_state_root, &plan.mounts)
             .await
             .map_err(internal)?;
         let Some(runtime_root) = self.runtime_root.as_deref() else {
