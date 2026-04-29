@@ -107,9 +107,11 @@ class ChannelViewState:
         else:
             turn = self._ensure_turn(turn_id)
 
+        if _is_finished_status(turn.status):
+            return
+
         turn.status = "running"
         turn.restored_running = False
-
         self.active_turn_id = turn_id
         self.latest_reasoning_turn_id = turn_id
 
@@ -421,6 +423,10 @@ def _format_error_line(code: str | None, text: str) -> str:
     if code:
         return f"[error] {code}: {text}"
     return f"[error] {text}"
+
+
+def _is_finished_status(status: str) -> bool:
+    return status in {"completed", "failed", "timed_out", "cancelled", "interrupted"}
 
 
 def _partial_history_marker(status: str) -> str:

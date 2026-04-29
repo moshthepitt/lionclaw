@@ -181,7 +181,7 @@ class ChannelViewStateTests(unittest.TestCase):
         self.assertNotIn("partial", transcript)
         self.assertFalse(state.input_disabled())
 
-    def test_mark_queued_preserves_stream_events_that_arrived_first(self):
+    def test_mark_queued_preserves_completed_stream_events_that_arrived_first(self):
         state = ChannelViewState(peer_id="mosh")
         state.begin_submit("hello")
 
@@ -195,12 +195,31 @@ class ChannelViewStateTests(unittest.TestCase):
                 text="early answer",
             )
         )
+        state.apply_stream_event(
+            StreamEvent(
+                sequence=2,
+                peer_id="mosh",
+                turn_id="turn-1",
+                kind="turn_completed",
+                lane="answer",
+                text="complete early answer",
+            )
+        )
+        state.apply_stream_event(
+            StreamEvent(
+                sequence=3,
+                peer_id="mosh",
+                turn_id="turn-1",
+                kind="done",
+            )
+        )
         state.mark_queued("turn-1", "session-1")
 
         self.assertEqual([turn.turn_id for turn in state.ordered_turns()], ["turn-1"])
         transcript = state.transcript_text()
         self.assertIn("you> hello", transcript)
-        self.assertIn("lionclaw> early answer", transcript)
+        self.assertIn("lionclaw> complete early answer", transcript)
+        self.assertFalse(state.input_disabled())
 
     def test_restore_running_history_keeps_transcript_and_thinking_blank(self):
         state = ChannelViewState(peer_id="mosh")
