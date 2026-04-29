@@ -144,9 +144,8 @@ Per turn, LionClaw composes a runtime-neutral prompt envelope from:
 
 1. kernel safety and product identity sections,
 2. assistant-home identity and hot continuity files,
-3. selected skill context from installed `SKILL.md` snapshots,
-4. current user, channel, or scheduler input,
-5. transcript history or a continuation note depending on runtime state.
+3. current user, channel, or scheduler input,
+4. transcript history or a continuation note depending on runtime state.
 
 The runtime receives the assembled envelope. It does not own LionClaw persona,
 assistant home, policy, or continuity.
@@ -226,11 +225,11 @@ The everyday confined layout is mount-first:
 - `/workspace`: the current project or task root
 - `/runtime`: runtime-private writable state
 - `/drafts`: runtime-private draft/output area
-- `/lionclaw/skills/<alias>`: selected skill snapshot assets mounted read-only
+- `/lionclaw/skills/<alias>`: installed non-channel skill snapshot assets mounted read-only
 
 The planner injects stable runtime-private environment defaults such as
 `HOME=/runtime/home`, `LIONCLAW_DRAFTS_DIR=/drafts`, and
-`LIONCLAW_SKILLS_DIR=/lionclaw/skills` when selected skills have mounted
+`LIONCLAW_SKILLS_DIR=/lionclaw/skills` when runtime-visible skills have mounted
 assets, so engine-specific caches and config stay out of assistant continuity.
 
 ## Runtime State And Continuation

@@ -13,7 +13,7 @@ It:
 1. runs selected agent CLIs through `lionclaw run [runtime]`,
 2. compiles and enforces runtime execution plans,
 3. keeps durable LionClaw sessions and turn history,
-4. projects assistant identity, continuity, and selected skill context into the runtime,
+4. projects assistant identity and continuity into the runtime while mounting installed non-channel skills for runtime use,
 5. supports Codex and OpenCode as program-backed runtimes,
 6. treats channels as external skill workers,
 7. runs time-based jobs in isolated scheduler sessions,

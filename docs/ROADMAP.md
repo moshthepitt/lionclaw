@@ -174,7 +174,7 @@ Goal: keep skills useful without making them implicitly trusted code.
 - [x] path traversal and unsafe name protections.
 - [x] deterministic skill folder hashes.
 - [x] deterministic lockfile ordering.
-- [x] selected skill snapshots mounted read-only into runtimes by alias.
+- [x] installed non-channel skill snapshots mounted read-only into runtimes by alias.
 - [x] marker-based injection cache as derived, non-authoritative output.
 - [x] selector decisions and policy checks remain independent of injected text.
 - [ ] generic git URL install support.
