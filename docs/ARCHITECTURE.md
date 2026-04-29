@@ -391,8 +391,8 @@ Scheduled runs open fresh synthetic sessions:
 - `peer_id = "job:<job-id>"`
 - `history_policy = conservative`
 
-Scheduled jobs invoke the selected runtime with explicit job context and
-optional attached skill context. Optional delivery sends the final result
+Scheduled jobs invoke the selected runtime with explicit job context and the
+runtime-visible skill set captured when the job was created. Optional delivery sends the final result
 through the existing channel stream/outbox path without changing the latest
 interactive session for that peer.
 
