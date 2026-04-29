@@ -175,6 +175,59 @@ async fn scheduled_job_does_not_use_skill_disabled_after_creation() {
 }
 
 #[tokio::test]
+async fn scheduled_job_keeps_creation_time_runtime_skill_set() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let first_skill_id = install_enabled_skill(&kernel, "scheduler-first").await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "stable runtime skills".to_string(),
+            runtime_id: "mock".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "use the skills visible when this job was created".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create job");
+
+    let later_skill_id = install_enabled_skill(&kernel, "scheduler-later").await;
+
+    let tick = kernel.scheduler_tick().await.expect("run scheduler tick");
+    assert_eq!(tick.claimed_runs, 1);
+
+    let latest = kernel
+        .latest_session_snapshot(SessionLatestQuery {
+            channel_id: "scheduler".to_string(),
+            peer_id: format!("job:{}", created.job.job_id),
+            history_policy: Some(SessionHistoryPolicy::Conservative),
+        })
+        .await
+        .expect("load latest scheduler session");
+    let session = latest.session.expect("scheduler session should exist");
+    let history = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: session.session_id,
+            limit: Some(5),
+        })
+        .await
+        .expect("load session history");
+
+    assert!(
+        history.turns[0].assistant_text.contains(&first_skill_id),
+        "job should keep the runtime skills visible at creation"
+    );
+    assert!(
+        !history.turns[0].assistant_text.contains(&later_skill_id),
+        "later skill installs must not change already-created jobs"
+    );
+}
+
+#[tokio::test]
 async fn create_job_rejects_missing_runtime_auth_before_persisting() {
     let env = TestEnv::new();
     let home = LionClawHome::new(env.temp_dir.path().join(".lionclaw"));

@@ -44,6 +44,10 @@ description: channel skill
         })
         .await
         .expect("install skill");
+    kernel
+        .disable_skill(skill.skill_id.clone())
+        .await
+        .expect("disable skill");
 
     let err = kernel
         .bind_channel(ChannelBindRequest {

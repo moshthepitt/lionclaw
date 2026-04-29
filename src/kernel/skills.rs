@@ -127,11 +127,12 @@ impl SkillStore {
         let installed_at_ms = now_ms();
         let snapshot_path = input.snapshot_path.unwrap_or_default();
         let skill_md = input.skill_md.unwrap_or_default();
+        let enabled = matches!(mode, SkillInstallMode::Strict);
 
         let insert_result = sqlx::query(
             "INSERT INTO skills \
              (skill_id, alias, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )
         .bind(&skill_id)
         .bind(&alias)
@@ -142,6 +143,7 @@ impl SkillStore {
         .bind(&hash)
         .bind(&snapshot_path)
         .bind(&skill_md)
+        .bind(if enabled { 1 } else { 0 })
         .bind(installed_at_ms)
         .execute(&self.pool)
         .await;
@@ -170,12 +172,8 @@ impl SkillStore {
         alias: &str,
         mode: SkillInstallMode,
     ) -> Result<SkillRecord> {
-        if existing.alias == alias {
-            return Ok(existing);
-        }
-
         match mode {
-            SkillInstallMode::Strict => self.set_alias(&existing.skill_id, alias).await,
+            SkillInstallMode::Strict => self.activate(existing, alias).await,
             SkillInstallMode::Stage => self.stage_alias(existing, alias).await,
         }
     }
@@ -422,6 +420,23 @@ impl SkillStore {
     async fn set_alias(&self, skill_id: &str, alias: &str) -> Result<SkillRecord> {
         self.ensure_enabled_alias_available(alias, skill_id).await?;
         self.update_alias(skill_id, alias).await
+    }
+
+    async fn activate(&self, existing: SkillRecord, alias: &str) -> Result<SkillRecord> {
+        let mut active = if existing.alias == alias {
+            existing
+        } else {
+            self.set_alias(&existing.skill_id, alias).await?
+        };
+        if active.enabled {
+            return Ok(active);
+        }
+
+        active = self
+            .set_enabled(&active.skill_id, true)
+            .await?
+            .ok_or_else(|| anyhow!("skill '{}' disappeared during activation", active.skill_id))?;
+        Ok(active)
     }
 
     async fn update_alias(&self, skill_id: &str, alias: &str) -> Result<SkillRecord> {

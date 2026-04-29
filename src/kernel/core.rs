@@ -774,6 +774,7 @@ impl Kernel {
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
                     runtime_env_passthrough: None,
+                    allowed_runtime_skill_ids: None,
                     default_policy_scope: Scope::Session(session_id),
                     sink,
                     emit_channel_stream_done: true,
@@ -793,6 +794,7 @@ impl Kernel {
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
                 runtime_env_passthrough: None,
+                allowed_runtime_skill_ids: None,
                 default_policy_scope: Scope::Session(session_id),
                 sink,
                 emit_channel_stream_done: true,
@@ -1768,11 +1770,13 @@ impl Kernel {
             }
         }
 
-        if self.runtime.get(&runtime_id).await.is_none() {
+        let adapter = self.runtime.get(&runtime_id).await;
+        if adapter.is_none() {
             return Err(KernelError::NotFound(format!(
                 "runtime adapter '{runtime_id}' not found"
             )));
         }
+        let adapter = adapter.expect("adapter presence checked");
         if let Err(err) = self
             .validate_runtime_launch_prerequisites(&runtime_id)
             .await
@@ -1787,11 +1791,9 @@ impl Kernel {
             .map_err(|err| KernelError::BadRequest(err.to_string()))?;
         let retry_attempts = req.retry_attempts.unwrap_or(1);
         let skill_ids = self
-            .runtime_visible_skills()
+            .resolve_runtime_execution_skills(None, adapter.turn_mode())
             .await?
-            .into_iter()
-            .map(|skill| skill.skill_id)
-            .collect::<Vec<_>>();
+            .skill_ids;
         let delivery = req
             .delivery
             .map(job_delivery_from_dto)
@@ -2727,6 +2729,7 @@ impl Kernel {
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
                 runtime_env_passthrough: None,
+                allowed_runtime_skill_ids: Some(job.skill_ids.clone()),
                 default_policy_scope: Scope::Job(job.job_id),
                 sink: None,
                 emit_channel_stream_done: true,
@@ -3546,10 +3549,6 @@ mod tests {
             .await
             .expect("install skill");
         kernel
-            .enable_skill(installed.skill_id.clone())
-            .await
-            .expect("enable skill");
-        kernel
             .bind_channel(crate::contracts::ChannelBindRequest {
                 channel_id: "terminal".to_string(),
                 skill_id: installed.skill_id.clone(),
@@ -3565,6 +3564,119 @@ mod tests {
             .expect("list runtime-visible skills");
 
         assert!(runtime_skills.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_channel_binding_restores_runtime_skill_visibility() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let installed = kernel
+            .install_skill(crate::contracts::SkillInstallRequest {
+                source: "local:/skills/channel-terminal".to_string(),
+                alias: "terminal".to_string(),
+                reference: Some("local".to_string()),
+                hash: Some("hash".to_string()),
+                skill_md: Some(
+                    "---\nname: terminal\ndescription: terminal skill\n---\n".to_string(),
+                ),
+                snapshot_path: None,
+            })
+            .await
+            .expect("install skill");
+        kernel
+            .bind_channel(crate::contracts::ChannelBindRequest {
+                channel_id: "terminal".to_string(),
+                skill_id: installed.skill_id.clone(),
+                enabled: Some(true),
+                config: None,
+            })
+            .await
+            .expect("bind channel");
+        kernel
+            .disable_channel_binding("terminal", "test")
+            .await
+            .expect("disable channel binding");
+
+        let runtime_skills = kernel
+            .runtime_visible_skills()
+            .await
+            .expect("list runtime-visible skills");
+
+        assert_eq!(runtime_skills.len(), 1);
+        assert_eq!(runtime_skills[0].skill_id, installed.skill_id);
+    }
+
+    #[tokio::test]
+    async fn installed_skills_are_runtime_visible_by_default() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let installed = kernel
+            .install_skill(crate::contracts::SkillInstallRequest {
+                source: "local:/skills/runtime-visible".to_string(),
+                alias: "runtime-visible".to_string(),
+                reference: Some("local".to_string()),
+                hash: Some("hash".to_string()),
+                skill_md: Some(
+                    "---\nname: runtime-visible\ndescription: runtime visible skill\n---\n"
+                        .to_string(),
+                ),
+                snapshot_path: None,
+            })
+            .await
+            .expect("install skill");
+
+        let listed = kernel.list_skills().await.expect("list skills");
+        let persisted = listed
+            .skills
+            .into_iter()
+            .find(|skill| skill.skill_id == installed.skill_id)
+            .expect("installed skill record");
+        assert!(persisted.enabled, "plain installs should be enabled");
+
+        let runtime_skills = kernel
+            .runtime_visible_skills()
+            .await
+            .expect("list runtime-visible skills");
+        assert_eq!(runtime_skills.len(), 1);
+        assert_eq!(runtime_skills[0].skill_id, installed.skill_id);
+    }
+
+    #[tokio::test]
+    async fn reinstalling_existing_skill_reactivates_it() {
+        let temp_dir = tempdir().expect("temp dir");
+        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
+            .await
+            .expect("kernel init");
+        let request = crate::contracts::SkillInstallRequest {
+            source: "local:/skills/runtime-visible".to_string(),
+            alias: "runtime-visible".to_string(),
+            reference: Some("local".to_string()),
+            hash: Some("hash".to_string()),
+            skill_md: Some(
+                "---\nname: runtime-visible\ndescription: runtime visible skill\n---\n".to_string(),
+            ),
+            snapshot_path: None,
+        };
+        let installed = kernel
+            .install_skill(request.clone())
+            .await
+            .expect("install skill");
+        kernel
+            .disable_skill(installed.skill_id.clone())
+            .await
+            .expect("disable skill");
+
+        let reinstalled = kernel
+            .install_skill(request)
+            .await
+            .expect("reinstall skill");
+
+        assert_eq!(reinstalled.skill_id, installed.skill_id);
+        assert!(reinstalled.enabled, "reinstall should reactivate the skill");
     }
 
     #[tokio::test]
@@ -4742,10 +4854,16 @@ struct SessionTurnExecution {
     runtime_working_dir: Option<String>,
     runtime_timeout_ms: Option<u64>,
     runtime_env_passthrough: Option<Vec<String>>,
+    allowed_runtime_skill_ids: Option<Vec<String>>,
     default_policy_scope: Scope,
     sink: Option<RuntimeEventSink>,
     emit_channel_stream_done: bool,
     audit_actor: String,
+}
+
+struct RuntimeExecutionSkills {
+    skill_ids: Vec<String>,
+    mounts: Vec<MountSpec>,
 }
 
 #[derive(Debug)]
@@ -4885,6 +5003,7 @@ impl Kernel {
                 runtime_working_dir: req.runtime_working_dir,
                 runtime_timeout_ms: req.runtime_timeout_ms,
                 runtime_env_passthrough: req.runtime_env_passthrough,
+                allowed_runtime_skill_ids: None,
                 default_policy_scope: Scope::Session(req.session_id),
                 sink,
                 emit_channel_stream_done: true,
@@ -4918,17 +5037,12 @@ impl Kernel {
             runtime_working_dir,
             runtime_timeout_ms,
             runtime_env_passthrough,
+            allowed_runtime_skill_ids,
             default_policy_scope,
             sink,
             emit_channel_stream_done,
             audit_actor,
         } = execution;
-        let runtime_skills = self.runtime_visible_skills().await?;
-        let runtime_skill_ids = runtime_skills
-            .iter()
-            .map(|skill| skill.skill_id.clone())
-            .collect::<Vec<_>>();
-        let skill_mounts = self.resolve_runtime_skill_mounts(&runtime_skills).await?;
 
         let channel_stream_context = self
             .channel_stream_context_for_session(
@@ -4948,6 +5062,15 @@ impl Kernel {
             KernelError::NotFound(format!("runtime adapter '{runtime_id}' not found"))
         })?;
         let runtime_kind = adapter.info().await.id;
+        let RuntimeExecutionSkills {
+            skill_ids: runtime_skill_ids,
+            mounts: skill_mounts,
+        } = self
+            .resolve_runtime_execution_skills(
+                allowed_runtime_skill_ids.as_deref(),
+                adapter.turn_mode(),
+            )
+            .await?;
         let execution_plan = self
             .resolve_runtime_execution_plan(
                 session.session_id,
@@ -5384,6 +5507,35 @@ impl Kernel {
             .map(|mount| mount.source.as_path())
     }
 
+    async fn resolve_runtime_execution_skills(
+        &self,
+        allowed_skill_ids: Option<&[String]>,
+        turn_mode: RuntimeTurnMode,
+    ) -> Result<RuntimeExecutionSkills, KernelError> {
+        let mut runtime_skills = self.runtime_visible_skills().await?;
+        if let Some(allowed_skill_ids) = allowed_skill_ids {
+            let allowed = allowed_skill_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            runtime_skills.retain(|skill| allowed.contains(skill.skill_id.as_str()));
+        }
+
+        let (runtime_skills, mounts) = match turn_mode {
+            RuntimeTurnMode::Direct => (runtime_skills, Vec::new()),
+            RuntimeTurnMode::ProgramBacked => {
+                self.resolve_runtime_skill_mounts_and_skills(&runtime_skills)
+                    .await?
+            }
+        };
+        let skill_ids = runtime_skills
+            .iter()
+            .map(|skill| skill.skill_id.clone())
+            .collect();
+
+        Ok(RuntimeExecutionSkills { skill_ids, mounts })
+    }
+
     async fn runtime_visible_skills(&self) -> Result<Vec<SkillRecord>, KernelError> {
         let mut runtime_skills = self.skills.list_enabled().await.map_err(internal)?;
         if runtime_skills.is_empty() {
@@ -5396,6 +5548,7 @@ impl Kernel {
             .await
             .map_err(internal)?
             .into_iter()
+            .filter(|binding| binding.enabled)
             .map(|binding| binding.skill_id)
             .collect::<HashSet<_>>();
         runtime_skills.retain(|skill| !host_only_skill_ids.contains(&skill.skill_id));
@@ -5403,12 +5556,23 @@ impl Kernel {
         Ok(runtime_skills)
     }
 
+    #[cfg(test)]
     async fn resolve_runtime_skill_mounts(
         &self,
         runtime_skills: &[SkillRecord],
     ) -> Result<Vec<MountSpec>, KernelError> {
+        let (_skills, mounts) = self
+            .resolve_runtime_skill_mounts_and_skills(runtime_skills)
+            .await?;
+        Ok(mounts)
+    }
+
+    async fn resolve_runtime_skill_mounts_and_skills(
+        &self,
+        runtime_skills: &[SkillRecord],
+    ) -> Result<(Vec<SkillRecord>, Vec<MountSpec>), KernelError> {
         let Some(snapshot_root) = self.canonical_skill_snapshot_root().await? else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         };
 
         let mut selected = Vec::new();
@@ -5427,7 +5591,7 @@ impl Kernel {
             };
 
             selected.push((
-                skill.alias.clone(),
+                skill.clone(),
                 MountSpec {
                     source,
                     target: skill_mount_target(&skill.alias),
@@ -5436,20 +5600,23 @@ impl Kernel {
             ));
         }
 
-        selected.sort_by(|left, right| left.0.cmp(&right.0));
+        selected.sort_by(|left, right| left.0.alias.cmp(&right.0.alias));
 
         let mut aliases = BTreeMap::new();
+        let mut mounted_skills = Vec::with_capacity(selected.len());
         let mut mounts = Vec::with_capacity(selected.len());
-        for (alias, mount) in selected {
-            if aliases.insert(alias.clone(), ()).is_some() {
+        for (skill, mount) in selected {
+            if aliases.insert(skill.alias.clone(), ()).is_some() {
                 return Err(KernelError::Conflict(format!(
-                    "runtime-visible skills share alias '{alias}'"
+                    "runtime-visible skills share alias '{}'",
+                    skill.alias
                 )));
             }
+            mounted_skills.push(skill);
             mounts.push(mount);
         }
 
-        Ok(mounts)
+        Ok((mounted_skills, mounts))
     }
 
     async fn canonical_skill_snapshot_root(&self) -> Result<Option<PathBuf>, KernelError> {
@@ -6181,6 +6348,7 @@ impl Kernel {
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
                     runtime_env_passthrough: None,
+                    allowed_runtime_skill_ids: None,
                     default_policy_scope: Scope::Session(turn.session_id),
                     sink: None,
                     emit_channel_stream_done: false,

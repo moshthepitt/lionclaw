@@ -12,50 +12,112 @@ pub async fn project_runtime_skills(
     runtime_state_root: &Path,
     mounts: &[MountSpec],
 ) -> Result<()> {
-    let Some(native_root) = native_runtime_skills_root(runtime_kind, runtime_state_root) else {
+    let Some(native_relative_root) = native_runtime_skills_relative_root(runtime_kind) else {
         return Ok(());
     };
 
     let desired = desired_skill_symlinks(mounts)?;
     if desired.is_empty() {
-        if !fs::try_exists(&native_root)
-            .await
-            .with_context(|| format!("failed to stat {}", native_root.display()))?
-        {
+        let Some(native_root) =
+            existing_safe_runtime_dir(runtime_state_root, native_relative_root).await?
+        else {
             return Ok(());
-        }
+        };
         return reconcile_skill_symlinks(&native_root, &desired).await;
     }
 
-    if let Some(parent) = native_root.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::create_dir_all(&native_root)
-        .await
-        .with_context(|| format!("failed to create {}", native_root.display()))?;
+    let native_root = ensure_safe_runtime_dir(runtime_state_root, native_relative_root).await?;
 
     reconcile_skill_symlinks(&native_root, &desired).await
 }
 
-fn native_runtime_skills_root(runtime_kind: &str, runtime_state_root: &Path) -> Option<PathBuf> {
+fn native_runtime_skills_relative_root(runtime_kind: &str) -> Option<&'static [&'static str]> {
     match runtime_kind {
-        "codex" => Some(
-            runtime_state_root
-                .join("home")
-                .join(".codex")
-                .join("skills"),
-        ),
-        "opencode" => Some(
-            runtime_state_root
-                .join("home")
-                .join(".config")
-                .join("opencode")
-                .join("skills"),
-        ),
+        "codex" => Some(&["home", ".codex", "skills"]),
+        "opencode" => Some(&["home", ".config", "opencode", "skills"]),
         _ => None,
     }
+}
+
+async fn existing_safe_runtime_dir(
+    runtime_state_root: &Path,
+    relative_components: &[&str],
+) -> Result<Option<PathBuf>> {
+    ensure_safe_directory_state(runtime_state_root, relative_components, false).await
+}
+
+async fn ensure_safe_runtime_dir(
+    runtime_state_root: &Path,
+    relative_components: &[&str],
+) -> Result<PathBuf> {
+    ensure_safe_directory_state(runtime_state_root, relative_components, true)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("runtime skill root disappeared during preparation"))
+}
+
+async fn ensure_safe_directory_state(
+    runtime_state_root: &Path,
+    relative_components: &[&str],
+    create_missing: bool,
+) -> Result<Option<PathBuf>> {
+    let mut current = runtime_state_root.to_path_buf();
+    if !ensure_safe_directory(&current, create_missing).await? {
+        return Ok(None);
+    }
+
+    for component in relative_components {
+        current.push(component);
+        match ensure_safe_directory(&current, create_missing).await? {
+            true => {}
+            false => return Ok(None),
+        }
+    }
+
+    Ok(Some(current))
+}
+
+async fn ensure_safe_directory(path: &Path, create_missing: bool) -> Result<bool> {
+    match fs::symlink_metadata(path).await {
+        Ok(metadata) => {
+            validate_directory_metadata(path, &metadata)?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if !create_missing {
+                return Ok(false);
+            }
+            match fs::create_dir(path).await {
+                Ok(()) => Ok(true),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let metadata = fs::symlink_metadata(path)
+                        .await
+                        .with_context(|| format!("failed to stat {}", path.display()))?;
+                    validate_directory_metadata(path, &metadata)?;
+                    Ok(true)
+                }
+                Err(err) => {
+                    Err(err).with_context(|| format!("failed to create {}", path.display()))
+                }
+            }
+        }
+        Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
+    }
+}
+
+fn validate_directory_metadata(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "runtime skill projection refuses symlinked path component '{}'",
+            path.display()
+        );
+    }
+    if !metadata.is_dir() {
+        anyhow::bail!(
+            "runtime skill projection expected directory '{}'",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn desired_skill_symlinks(mounts: &[MountSpec]) -> Result<BTreeMap<String, String>> {
@@ -265,5 +327,46 @@ mod tests {
         assert!(!tokio::fs::try_exists(stale_root.join("old"))
             .await
             .expect("check stale link"));
+    }
+
+    #[tokio::test]
+    async fn rejects_symlinked_runtime_path_components() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime");
+        let outside_root = temp_dir.path().join("outside-home");
+        tokio::fs::create_dir_all(&runtime_root)
+            .await
+            .expect("create runtime root");
+        tokio::fs::create_dir_all(&outside_root)
+            .await
+            .expect("create outside root");
+        tokio::task::spawn_blocking({
+            let home_link = runtime_root.join("home");
+            let outside_root = outside_root.clone();
+            move || std::os::unix::fs::symlink(outside_root, home_link)
+        })
+        .await
+        .expect("join home symlink")
+        .expect("create home symlink");
+
+        let mounts = vec![MountSpec {
+            source: temp_dir.path().join("skills/terminal"),
+            target: "/lionclaw/skills/terminal".to_string(),
+            access: MountAccess::ReadOnly,
+        }];
+
+        let err = project_runtime_skills("codex", &runtime_root, &mounts)
+            .await
+            .expect_err("reject symlinked home");
+        assert!(
+            err.to_string().contains("refuses symlinked path component"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !tokio::fs::try_exists(outside_root.join(".codex"))
+                .await
+                .expect("check outside codex dir"),
+            "projection must not follow runtime-owned symlinks"
+        );
     }
 }

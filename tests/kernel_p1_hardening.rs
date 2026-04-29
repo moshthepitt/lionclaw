@@ -388,21 +388,21 @@ async fn enable_rejects_reusing_alias_for_different_skill() {
         ))
         .await
         .expect("install first skill");
-    let second = kernel
+    kernel
+        .disable_skill(first.skill_id.clone())
+        .await
+        .expect("disable first skill");
+    let _second = kernel
         .install_skill(skill_install_request(
             "local/second-skill",
             "shared-alias",
             "second-hash",
         ))
         .await
-        .expect("install second disabled skill revision");
-    kernel
-        .enable_skill(first.skill_id)
-        .await
-        .expect("enable first skill");
+        .expect("install second enabled skill revision");
 
     let err = kernel
-        .enable_skill(second.skill_id)
+        .enable_skill(first.skill_id)
         .await
         .expect_err("same alias must not identify two enabled skills");
 
@@ -428,6 +428,10 @@ async fn concurrent_enable_alias_conflict_is_typed() {
         ))
         .await
         .expect("install first skill");
+    kernel
+        .disable_skill(first.skill_id.clone())
+        .await
+        .expect("disable first skill");
     let second = kernel
         .install_skill(skill_install_request(
             "local/concurrent-second",
@@ -436,6 +440,10 @@ async fn concurrent_enable_alias_conflict_is_typed() {
         ))
         .await
         .expect("install second skill");
+    kernel
+        .disable_skill(second.skill_id.clone())
+        .await
+        .expect("disable second skill");
 
     let first_kernel = kernel.clone();
     let second_kernel = kernel.clone();
