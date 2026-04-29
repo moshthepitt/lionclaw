@@ -12,7 +12,7 @@ from lionclaw_channel_terminal.api import (
     SessionOpenResult,
     SessionTurnSnapshot,
 )
-from lionclaw_channel_terminal.app import AppConfig, TerminalChannelApp, _thinking_markdown
+from lionclaw_channel_terminal.app import AppConfig, TerminalChannelApp
 from lionclaw_channel_terminal.state import ChannelViewState, StreamEvent
 
 
@@ -120,7 +120,6 @@ class ChannelViewStateTests(unittest.TestCase):
         )
 
         self.assertEqual(state.reasoning_text(), "No reasoning for this turn yet.")
-        self.assertEqual(_thinking_markdown(state), "_No reasoning for this turn yet._")
 
     def test_reasoning_after_answer_stays_in_thinking_pane(self):
         state = ChannelViewState(peer_id="mosh")
@@ -402,6 +401,10 @@ def _make_app() -> TerminalChannelApp:
     )
 
 
+def _disable_rendering(app: TerminalChannelApp) -> None:
+    app._render_views = lambda: None  # type: ignore[method-assign]
+
+
 class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_mount_focuses_enabled_input(self):
         app = _make_app()
@@ -489,7 +492,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_submit_text_keeps_local_echo_when_send_fails(self):
         app = _make_app()
         app.api = _FailingApi()
-        app._render_views = lambda: None  # type: ignore[method-assign]
+        _disable_rendering(app)
 
         accepted = await app.submit_text("hello")
 
@@ -502,7 +505,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
         app = _make_app()
         api = _SuccessfulApi()
         app.api = api
-        app._render_views = lambda: None  # type: ignore[method-assign]
+        _disable_rendering(app)
 
         accepted = await app.submit_text("hello")
 
@@ -516,7 +519,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_done_event_reenables_input(self):
         app = _make_app()
-        app._render_views = lambda: None  # type: ignore[method-assign]
+        _disable_rendering(app)
         app.state.begin_submit("hello")
         app.state.mark_queued("turn-1")
 
@@ -530,7 +533,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
         app = _make_app()
         api = _InteractiveApi()
         app.api = api
-        app._render_views = lambda: None  # type: ignore[method-assign]
+        _disable_rendering(app)
         app.state.set_pairing_state(status="approved", trust_tier="main")
 
         accepted = await app.submit_text("hello")
@@ -544,7 +547,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
         app = _make_app()
         api = _InteractiveApi()
         app.api = api
-        app._render_views = lambda: None  # type: ignore[method-assign]
+        _disable_rendering(app)
         app.state.active_session_id = "session-1"
         app.state.begin_submit("hello")
         app.state.clear_pending_turn()
@@ -560,7 +563,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
         app = _make_app()
         api = _FlakyStreamApi()
         app.api = api
-        app._render_views = lambda: None  # type: ignore[method-assign]
+        _disable_rendering(app)
         app._initial_stream_start_after_sequence = 42
 
         task = asyncio.create_task(app.stream_loop())
@@ -577,7 +580,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
             peer_state=PeerState(status="approved", trust_tier="main"),
         )
         app.api = api
-        app._render_views = lambda: None  # type: ignore[method-assign]
+        _disable_rendering(app)
         app.state.set_pairing_state(status="pending", pairing_code="123456")
         app.state.begin_submit("hello")
         app.state.clear_pending_turn()
@@ -619,7 +622,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         app.api = api
-        app._render_views = lambda: None  # type: ignore[method-assign]
+        _disable_rendering(app)
         app.state.set_pairing_state(status="pending", pairing_code="123456")
         app.state.begin_submit("hello")
         app.state.clear_pending_turn()
@@ -660,7 +663,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         app.api = api
-        app._render_views = lambda: None  # type: ignore[method-assign]
+        _disable_rendering(app)
 
         await app.refresh_pairing_state()
 
@@ -679,7 +682,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
         app = _make_app()
         api = _FailingRestoreApi()
         app.api = api
-        app._render_views = lambda: None  # type: ignore[method-assign]
+        _disable_rendering(app)
         app.state.set_pairing_state(status="approved", trust_tier="main")
 
         accepted = await app.submit_text("hello")

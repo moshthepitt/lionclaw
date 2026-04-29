@@ -141,7 +141,7 @@ class TerminalChannelApp(App[None]):
                     yield Markdown("", id="answer-view")
             with Vertical(id="thinking-pane"):
                 with _FollowScroll(id="thinking-scroll"):
-                    yield Markdown("No reasoning for the current turn yet.", id="thinking-view")
+                    yield Markdown("", id="thinking-view")
         yield RichLog(id="activity-log", wrap=True, markup=False, highlight=False)
         yield Input(placeholder="Send a message or /quit", id="input")
         yield Footer()
