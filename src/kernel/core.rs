@@ -1770,13 +1770,11 @@ impl Kernel {
             }
         }
 
-        let adapter = self.runtime.get(&runtime_id).await;
-        if adapter.is_none() {
+        let Some(adapter) = self.runtime.get(&runtime_id).await else {
             return Err(KernelError::NotFound(format!(
                 "runtime adapter '{runtime_id}' not found"
             )));
-        }
-        let adapter = adapter.expect("adapter presence checked");
+        };
         if let Err(err) = self
             .validate_runtime_launch_prerequisites(&runtime_id)
             .await
@@ -5584,7 +5582,7 @@ impl Kernel {
                 ))
             })?;
             let Some(source) = self
-                .resolve_skill_snapshot_dir(&snapshot_root, &skill)
+                .resolve_skill_snapshot_dir(&snapshot_root, skill)
                 .await?
             else {
                 continue;

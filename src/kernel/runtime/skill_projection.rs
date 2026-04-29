@@ -194,7 +194,7 @@ async fn symlink_points_to(path: &Path, expected_target: &str) -> Result<bool> {
     let target = fs::read_link(path)
         .await
         .with_context(|| format!("failed to read link {}", path.display()))?;
-    Ok(target == PathBuf::from(expected_target))
+    Ok(target == Path::new(expected_target))
 }
 
 async fn remove_managed_path(path: &Path) -> Result<()> {
