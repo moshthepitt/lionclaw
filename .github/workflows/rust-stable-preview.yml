@@ -30,7 +30,7 @@ jobs:
           rustc --version
           cargo clippy --version
 
-      - uses: astral-sh/setup-uv@v8
+      - uses: astral-sh/setup-uv@v8.1.0
         with:
           enable-cache: true
           python-version: "3.12"
