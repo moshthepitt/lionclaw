@@ -64,7 +64,7 @@ For repeated manual testing, you can use the repo helper:
 - LionClaw enforces pairing. The TUI shows pending pairing state and the exact approval command to run through `lionclaw channel pairing approve ...`.
 - The worker defaults to `channel_id=terminal` and `peer_id=$USER` (falling back to `$USERNAME` or `local-user`).
 - `channel attach` restores the latest `history_policy=interactive` session for that peer, renders the last 12 durable turns into the answer pane, and resumes a still-running answer stream from the last durable checkpoint when one exists.
-- The TUI echoes your message immediately, shows a local pending state right away, follows live `queue.*` / `runtime.*` stream events for the active turn, and reconciles completed turns from the kernel `turn_completed` snapshot.
+- The TUI restores or opens the interactive session before sending, then echoes your message with a local pending state, follows live `queue.*` / `runtime.*` stream events for the active turn, and reconciles completed turns from the kernel `turn_completed` snapshot.
 - Channel-scoped stream messages without `session_id` / `turn_id` are rendered as activity only; they must not select or pin the active interactive session.
 - Slash commands are built into the TUI:
   - `/continue`
