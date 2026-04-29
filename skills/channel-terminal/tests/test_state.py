@@ -1,6 +1,7 @@
 import unittest
 import asyncio
 
+from textual.containers import VerticalScroll
 from textual.widgets import Input
 
 from lionclaw_channel_terminal.api import (
@@ -411,6 +412,49 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertTrue(app.query_one(Input).has_focus)
             self.assertEqual(api.fetch_latest_calls, 1)
+
+    async def test_restore_scrolls_answer_pane_to_latest_turn_after_markdown_layout(self):
+        app = _make_app()
+        api = _MountedApi()
+        api.latest_snapshot = SessionLatestSnapshot(
+            session=SessionOpenResult(
+                session_id="session-1",
+                channel_id="terminal",
+                peer_id="mosh",
+                trust_tier="main",
+                history_policy="interactive",
+            ),
+            turns=[
+                SessionTurnSnapshot(
+                    turn_id="turn-1",
+                    kind="normal",
+                    status="completed",
+                    display_user_text="Say exactly: terminal e2e restore ok",
+                    assistant_text="terminal e2e restore ok",
+                    error_code=None,
+                    error_text=None,
+                ),
+                SessionTurnSnapshot(
+                    turn_id="turn-2",
+                    kind="normal",
+                    status="completed",
+                    display_user_text="Say exactly: terminal e2e second ok",
+                    assistant_text="terminal e2e second ok",
+                    error_code=None,
+                    error_text=None,
+                ),
+            ],
+            resume_after_sequence=24,
+        )
+        app.api = api
+
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+
+            answer_scroll = app.query_one("#answer-scroll", VerticalScroll)
+            self.assertGreater(answer_scroll.max_scroll_y, 0)
+            self.assertTrue(answer_scroll.is_vertical_scroll_end)
 
     async def test_pairing_approval_refocuses_input_without_stealing_on_every_render(self):
         app = _make_app()

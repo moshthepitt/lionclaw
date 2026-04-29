@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.geometry import Size
 from textual.widgets import Footer, Input, Markdown, RichLog, Static
 
 from lionclaw_channel_terminal.api import LionClawApi
@@ -37,6 +38,27 @@ class AppConfig:
             stream_wait_ms=int(os.environ.get("LIONCLAW_STREAM_WAIT_MS", "30000")),
             runtime_id=os.environ.get("LIONCLAW_RUNTIME_ID") or None,
         )
+
+
+class _FollowScroll(VerticalScroll):
+    """Vertical scroll container that can stick to the end after layout changes."""
+
+    _follow_end: bool = False
+
+    def follow_end(self) -> None:
+        self._follow_end = True
+        if self.max_scroll_y > 0:
+            self._scroll_to_current_end()
+
+    def cancel_follow_end(self) -> None:
+        self._follow_end = False
+
+    def watch_virtual_size(self, _old: Size, _new: Size) -> None:
+        if self._follow_end:
+            self._scroll_to_current_end()
+
+    def _scroll_to_current_end(self) -> None:
+        self.scroll_end(animate=False, immediate=True, force=True)
 
 
 class TerminalChannelApp(App[None]):
@@ -115,10 +137,10 @@ class TerminalChannelApp(App[None]):
         yield Static(id="pairing-banner")
         with Horizontal(id="panes"):
             with Vertical(id="answer-pane"):
-                with VerticalScroll(id="answer-scroll"):
+                with _FollowScroll(id="answer-scroll"):
                     yield Markdown("", id="answer-view")
             with Vertical(id="thinking-pane"):
-                with VerticalScroll(id="thinking-scroll"):
+                with _FollowScroll(id="thinking-scroll"):
                     yield Markdown("No reasoning for the current turn yet.", id="thinking-view")
         yield RichLog(id="activity-log", wrap=True, markup=False, highlight=False)
         yield Input(placeholder="Send a message or /quit", id="input")
@@ -383,18 +405,22 @@ class TerminalChannelApp(App[None]):
         self.query_one("#pairing-banner", Static).update(
             self.state.pairing_banner(self.config.channel_id, self.config.peer_id)
         )
-        answer_scroll = self.query_one("#answer-scroll", VerticalScroll)
-        thinking_scroll = self.query_one("#thinking-scroll", VerticalScroll)
+        answer_scroll = self.query_one("#answer-scroll", _FollowScroll)
+        thinking_scroll = self.query_one("#thinking-scroll", _FollowScroll)
         answer_should_follow = _should_follow(answer_scroll)
         thinking_should_follow = _should_follow(thinking_scroll)
+        if not answer_should_follow:
+            answer_scroll.cancel_follow_end()
+        if not thinking_should_follow:
+            thinking_scroll.cancel_follow_end()
 
         self.query_one("#answer-view", Markdown).update(_answer_markdown(self.state))
         self.query_one("#thinking-view", Markdown).update(_thinking_markdown(self.state))
 
         if answer_should_follow:
-            answer_scroll.scroll_end(animate=False, immediate=True)
+            answer_scroll.follow_end()
         if thinking_should_follow:
-            thinking_scroll.scroll_end(animate=False, immediate=True)
+            thinking_scroll.follow_end()
 
         input_widget = self.query_one("#input", Input)
         input_is_disabled = self.state.input_disabled()
