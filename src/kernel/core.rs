@@ -4365,7 +4365,7 @@ fn to_stream_event_view(event: RuntimeEvent) -> StreamEventDto {
 }
 
 fn internal(err: anyhow::Error) -> KernelError {
-    KernelError::Internal(err.to_string())
+    KernelError::Internal(format!("{err:#}"))
 }
 
 fn skill_install_error(err: anyhow::Error) -> KernelError {

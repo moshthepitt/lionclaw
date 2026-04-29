@@ -150,6 +150,13 @@ pub enum RuntimeEvent {
 
 pub type RuntimeEventSender = mpsc::UnboundedSender<RuntimeEvent>;
 
+pub trait RuntimeProgramOutputParser: Send {
+    fn parse_line(&mut self, line: &str) -> Vec<RuntimeEvent>;
+    fn finish(&mut self) -> Vec<RuntimeEvent> {
+        Vec::new()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HiddenTurnSupport {
     Unsupported,
@@ -181,6 +188,9 @@ pub trait RuntimeAdapter: Send + Sync {
     }
     fn build_turn_program(&self, _input: &RuntimeTurnInput) -> Result<RuntimeProgramSpec> {
         Err(anyhow!("runtime does not support program-backed turns"))
+    }
+    fn program_output_parser(&self) -> Option<Box<dyn RuntimeProgramOutputParser>> {
+        None
     }
     fn parse_program_output_line(&self, _line: &str) -> Vec<RuntimeEvent> {
         Vec::new()
@@ -258,6 +268,7 @@ pub async fn execute_program_backed_turn(
 
     let mut saw_done = false;
     let mut last_error_text: Option<String> = None;
+    let mut output_parser = adapter.program_output_parser();
 
     loop {
         tokio::select! {
@@ -265,12 +276,19 @@ pub async fn execute_program_backed_turn(
                 match maybe_line {
                     Some(line) => observe_program_output_line(
                         adapter,
+                        &mut output_parser,
                         &events,
                         &line,
                         &mut saw_done,
                         &mut last_error_text,
                     ),
                     None => {
+                        finish_program_output_parser(
+                            &mut output_parser,
+                            &events,
+                            &mut saw_done,
+                            &mut last_error_text,
+                        );
                         let output = execution.await?;
                         return finish_program_backed_turn(
                             adapter,
@@ -287,12 +305,19 @@ pub async fn execute_program_backed_turn(
                 while let Some(line) = stdout_rx.recv().await {
                     observe_program_output_line(
                         adapter,
+                        &mut output_parser,
                         &events,
                         &line,
                         &mut saw_done,
                         &mut last_error_text,
                     );
                 }
+                finish_program_output_parser(
+                    &mut output_parser,
+                    &events,
+                    &mut saw_done,
+                    &mut last_error_text,
+                );
                 return finish_program_backed_turn(
                     adapter,
                     output,
@@ -307,12 +332,39 @@ pub async fn execute_program_backed_turn(
 
 fn observe_program_output_line(
     adapter: &(dyn RuntimeAdapter + Send + Sync),
+    output_parser: &mut Option<Box<dyn RuntimeProgramOutputParser>>,
     events: &RuntimeEventSender,
     line: &str,
     saw_done: &mut bool,
     last_error_text: &mut Option<String>,
 ) {
-    for event in adapter.parse_program_output_line(line) {
+    let parsed_events = if let Some(parser) = output_parser.as_mut() {
+        parser.parse_line(line)
+    } else {
+        adapter.parse_program_output_line(line)
+    };
+
+    observe_program_output_events(events, parsed_events, saw_done, last_error_text);
+}
+
+fn finish_program_output_parser(
+    output_parser: &mut Option<Box<dyn RuntimeProgramOutputParser>>,
+    events: &RuntimeEventSender,
+    saw_done: &mut bool,
+    last_error_text: &mut Option<String>,
+) {
+    if let Some(parser) = output_parser.as_mut() {
+        observe_program_output_events(events, parser.finish(), saw_done, last_error_text);
+    }
+}
+
+fn observe_program_output_events(
+    events: &RuntimeEventSender,
+    parsed_events: Vec<RuntimeEvent>,
+    saw_done: &mut bool,
+    last_error_text: &mut Option<String>,
+) {
+    for event in parsed_events {
         if matches!(event, RuntimeEvent::Done) {
             *saw_done = true;
         }
