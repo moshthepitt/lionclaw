@@ -5,10 +5,10 @@ use lionclaw::{
     contracts::{
         ChannelBindRequest, ChannelInboundOutcome, ChannelInboundRequest,
         ChannelPeerApproveRequest, ChannelPeerBlockRequest, ChannelStreamAckRequest,
-        ChannelStreamPullRequest, ChannelStreamStartMode, PolicyGrantRequest, SessionActionKind,
-        SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery,
-        SessionOpenRequest, SessionTurnRequest, SessionTurnStatus, SkillInstallRequest,
-        StreamEventKindDto, StreamLaneDto, TrustTier,
+        ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamStartMode,
+        PolicyGrantRequest, SessionActionKind, SessionActionRequest, SessionHistoryPolicy,
+        SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest, SessionTurnRequest,
+        SessionTurnStatus, SkillInstallRequest, StreamEventKindDto, StreamLaneDto, TrustTier,
     },
     kernel::{
         runtime::{
@@ -218,28 +218,14 @@ description: inbound skill for channel flow
     assert!(codes.contains(&"queue.queued"));
     assert!(codes.contains(&"queue.started"));
     assert!(codes.contains(&"queue.completed"));
-    let completed_position = stream
-        .events
-        .iter()
-        .position(|event| {
-            event.turn_id == Some(queued_turn_id)
-                && event.kind == StreamEventKindDto::TurnCompleted
-                && event
-                    .text
-                    .as_deref()
-                    .is_some_and(|text| text.contains("[mock]"))
-        })
-        .expect("queued channel turn should publish a canonical completed answer snapshot");
-    let done_position = stream
-        .events
-        .iter()
-        .position(|event| {
-            event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::Done
-        })
-        .expect("queued channel turn should terminate with a turn-scoped done");
+    let (completed_position, _) =
+        assert_turn_completed_before_done(&stream.events, queued_turn_id, "queued channel turn");
     assert!(
-        completed_position < done_position,
-        "queued channel turn should publish turn_completed before done"
+        stream.events[completed_position]
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("[mock]")),
+        "queued channel turn should publish a canonical completed answer snapshot"
     );
 
     let queued_events = kernel
@@ -601,6 +587,57 @@ async fn channel_backed_session_open_requires_approved_peer() {
         .expect("approved peer session open");
     assert_eq!(opened.trust_tier.as_str(), TrustTier::Main.as_str());
     assert_eq!(opened.history_policy, SessionHistoryPolicy::Interactive);
+}
+
+#[tokio::test]
+async fn direct_channel_session_turn_streams_turn_completed_then_done() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    install_and_bind_channel(&kernel, "terminal", "direct-turn-skill", "mock").await;
+    create_pending_peer(
+        &kernel,
+        "terminal",
+        "peer-direct",
+        "mock",
+        7051,
+        "direct-7051",
+    )
+    .await;
+    approve_peer(&kernel, "terminal", "peer-direct").await;
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-direct".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open direct channel session");
+
+    let response = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "direct channel turn".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("run direct channel turn");
+
+    let stream = kernel
+        .pull_channel_stream(ChannelStreamPullRequest {
+            channel_id: "terminal".to_string(),
+            consumer_id: "terminal-direct-turn".to_string(),
+            start_mode: Some(ChannelStreamStartMode::Resume),
+            start_after_sequence: None,
+            limit: Some(50),
+            wait_ms: Some(0),
+        })
+        .await
+        .expect("pull direct channel stream");
+    assert_turn_completed_before_done(&stream.events, response.turn_id, "direct channel turn");
 }
 
 #[tokio::test]
@@ -1076,6 +1113,28 @@ async fn install_and_bind_channel(
         })
         .await
         .expect("grant skill use");
+}
+
+fn assert_turn_completed_before_done(
+    events: &[ChannelStreamEventView],
+    turn_id: uuid::Uuid,
+    context: &str,
+) -> (usize, usize) {
+    let completed_position = events
+        .iter()
+        .position(|event| {
+            event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::TurnCompleted
+        })
+        .unwrap_or_else(|| panic!("{context} should publish turn_completed"));
+    let done_position = events
+        .iter()
+        .position(|event| event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::Done)
+        .unwrap_or_else(|| panic!("{context} should publish done"));
+    assert!(
+        completed_position < done_position,
+        "{context} should publish turn_completed before done"
+    );
+    (completed_position, done_position)
 }
 
 async fn create_pending_peer(

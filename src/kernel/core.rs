@@ -780,6 +780,7 @@ impl Kernel {
                     selected_skills: SelectedSkillMode::Auto,
                     default_policy_scope: Scope::Session(session_id),
                     sink,
+                    emit_channel_stream_done: true,
                     audit_actor: "api".to_string(),
                 }
             }
@@ -799,6 +800,7 @@ impl Kernel {
                 selected_skills: SelectedSkillMode::Auto,
                 default_policy_scope: Scope::Session(session_id),
                 sink,
+                emit_channel_stream_done: true,
                 audit_actor: "api".to_string(),
             },
             SessionActionKind::ResetSession => {
@@ -2738,6 +2740,7 @@ impl Kernel {
                 selected_skills: SelectedSkillMode::Explicit(job.skill_ids.clone()),
                 default_policy_scope: Scope::Job(job.job_id),
                 sink: None,
+                emit_channel_stream_done: true,
                 audit_actor: "scheduler".to_string(),
             },
         )
@@ -4639,6 +4642,7 @@ struct SessionTurnExecution {
     selected_skills: SelectedSkillMode,
     default_policy_scope: Scope,
     sink: Option<RuntimeEventSink>,
+    emit_channel_stream_done: bool,
     audit_actor: String,
 }
 
@@ -4652,6 +4656,12 @@ struct SessionTurnArtifacts {
     assistant_text: String,
     event_views: Vec<StreamEventDto>,
     saw_error: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ChannelStreamFinalizer<'a> {
+    stream_context: &'a Option<ChannelStreamContext>,
+    emit_done: bool,
 }
 
 const ASSISTANT_CHECKPOINT_BYTES: usize = 256;
@@ -4781,6 +4791,7 @@ impl Kernel {
                 selected_skills: SelectedSkillMode::Auto,
                 default_policy_scope: Scope::Session(req.session_id),
                 sink,
+                emit_channel_stream_done: true,
                 audit_actor: "api".to_string(),
             },
         )
@@ -4814,6 +4825,7 @@ impl Kernel {
             selected_skills,
             default_policy_scope,
             sink,
+            emit_channel_stream_done,
             audit_actor,
         } = execution;
         let enabled_skills = self.skills.list_enabled().await.map_err(internal)?;
@@ -4860,6 +4872,10 @@ impl Kernel {
                 turn_id,
             )
             .await?;
+        let channel_stream_finalizer = ChannelStreamFinalizer {
+            stream_context: &channel_stream_context,
+            emit_done: emit_channel_stream_done,
+        };
 
         let runtime_id = self.resolve_runtime_id(requested_runtime_id.as_deref())?;
         let adapter = self.runtime.get(&runtime_id).await.ok_or_else(|| {
@@ -4922,6 +4938,7 @@ impl Kernel {
                     String::new(),
                     "runtime.error".to_string(),
                     err.to_string(),
+                    channel_stream_finalizer,
                 )
                 .await?;
                 return Err(err);
@@ -4981,6 +4998,7 @@ impl Kernel {
                     assistant_text,
                     turn_err.error_code.clone(),
                     turn_err.error_text.clone(),
+                    channel_stream_finalizer,
                 )
                 .await?;
                 return Err(kernel_error_for_turn_status(
@@ -5052,6 +5070,7 @@ impl Kernel {
                     pre_followup_assistant.clone(),
                     "runtime.error".to_string(),
                     err.to_string(),
+                    channel_stream_finalizer,
                 )
                 .await?;
                 return Err(err);
@@ -5065,6 +5084,7 @@ impl Kernel {
                     assistant_text,
                     "runtime.error".to_string(),
                     close_err.to_string(),
+                    channel_stream_finalizer,
                 )
                 .await?;
                 return Err(close_err);
@@ -5077,6 +5097,7 @@ impl Kernel {
                     pre_followup_assistant,
                     "runtime.error".to_string(),
                     err.to_string(),
+                    channel_stream_finalizer,
                 )
                 .await?;
                 return Err(err);
@@ -5093,6 +5114,7 @@ impl Kernel {
                 artifacts.assistant_text.clone(),
                 error_code,
                 error_text.clone(),
+                channel_stream_finalizer,
             )
             .await?;
             return Err(kernel_error_for_turn_status(status, error_text));
@@ -5113,6 +5135,8 @@ impl Kernel {
             self.emit_turn_completed_snapshot(stream_context, &artifacts.assistant_text)
                 .await?;
         }
+        self.emit_channel_stream_done_if_requested(channel_stream_finalizer)
+            .await?;
         self.sessions
             .record_turn(session.session_id)
             .await
@@ -5203,6 +5227,7 @@ impl Kernel {
         assistant_text: String,
         error_code: String,
         error_text: String,
+        channel_stream_finalizer: ChannelStreamFinalizer<'_>,
     ) -> Result<(), KernelError> {
         let status = session_turn_status_for_error_code(&error_code);
 
@@ -5240,6 +5265,8 @@ impl Kernel {
             )
             .await;
         }
+        self.emit_channel_stream_done_if_requested(channel_stream_finalizer)
+            .await?;
         Ok(())
     }
 
@@ -5695,6 +5722,17 @@ impl Kernel {
         .await
     }
 
+    async fn emit_channel_stream_done_if_requested(
+        &self,
+        finalizer: ChannelStreamFinalizer<'_>,
+    ) -> Result<(), KernelError> {
+        if finalizer.emit_done {
+            self.emit_runtime_event(finalizer.stream_context, &None, RuntimeEvent::Done)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn append_channel_stream_event(
         &self,
         event: ChannelStreamEventInsert<'_>,
@@ -5766,6 +5804,7 @@ impl Kernel {
     ) -> Result<(), FailedRuntimeTurn> {
         checkpoints.observe(&event);
         let appended_sequence = if matches!(event, RuntimeEvent::Done) && stream_context.is_some() {
+            // Durable channel streams get their terminal done after the turn is persisted.
             self.emit_local_stream_event(event_sink, &event);
             None
         } else {
@@ -6063,6 +6102,7 @@ impl Kernel {
                     selected_skills: SelectedSkillMode::Auto,
                     default_policy_scope: Scope::Session(turn.session_id),
                     sink: None,
+                    emit_channel_stream_done: false,
                     audit_actor: "kernel".to_string(),
                 },
             )
