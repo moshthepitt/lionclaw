@@ -114,7 +114,7 @@ impl AppliedState {
             channels.push(AppliedChannel::from_config(channel));
         }
 
-        let skills = materialize_applied_skills(&skills_root, skills, &channels)?;
+        let skills = materialize_applied_skills(&skills_root, skills)?;
         Ok(Self::from_parts(skills, channels))
     }
 
@@ -182,9 +182,9 @@ impl AppliedState {
     }
 }
 
-fn applied_state_fingerprint(skills: &[AppliedSkill], channels: &[AppliedChannel]) -> String {
+fn applied_skills_fingerprint(skills: &[AppliedSkill]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"lionclaw-applied-state-v1\0");
+    hasher.update(b"lionclaw-applied-skills-v1\0");
 
     for skill in skills {
         hasher.update(b"skill\0");
@@ -195,6 +195,15 @@ fn applied_state_fingerprint(skills: &[AppliedSkill], channels: &[AppliedChannel
         hasher.update(skill.hash.as_bytes());
         hasher.update(b"\0");
     }
+
+    hex::encode(hasher.finalize())
+}
+
+fn applied_state_fingerprint(skills: &[AppliedSkill], channels: &[AppliedChannel]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lionclaw-applied-state-v1\0");
+    hasher.update(applied_skills_fingerprint(skills).as_bytes());
+    hasher.update(b"\0");
 
     for channel in channels {
         hasher.update(b"channel\0");
@@ -212,7 +221,6 @@ fn applied_state_fingerprint(skills: &[AppliedSkill], channels: &[AppliedChannel
 fn materialize_applied_skills(
     skills_root: &Path,
     skills: Vec<AppliedSkill>,
-    channels: &[AppliedChannel],
 ) -> Result<Vec<AppliedSkill>> {
     if skills.is_empty() {
         return Ok(skills);
@@ -220,7 +228,7 @@ fn materialize_applied_skills(
 
     let applied_root = materialize_applied_snapshot_root(
         skills_root,
-        &applied_state_fingerprint(&skills, channels),
+        &applied_skills_fingerprint(&skills),
         &skills,
     )?;
 
@@ -604,5 +612,49 @@ mod tests {
             err.to_string().contains("must not be a symlink"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn channel_only_changes_reuse_materialized_skill_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+
+        let visible = home.skills_dir().join("visible");
+        fs::create_dir_all(&visible).expect("visible dir");
+        fs::write(
+            visible.join("SKILL.md"),
+            "---\nname: visible\ndescription: visible\n---\n",
+        )
+        .expect("visible skill");
+
+        let initial = AppliedState::load(&home).await.expect("load initial state");
+        let initial_snapshot = initial
+            .skill_by_alias("visible")
+            .expect("visible skill")
+            .snapshot_path
+            .clone();
+
+        let mut config = crate::operator::config::OperatorConfig::load(&home)
+            .await
+            .expect("load config");
+        config.upsert_channel(crate::operator::config::ManagedChannelConfig {
+            id: "terminal".to_string(),
+            skill: "visible".to_string(),
+            launch_mode: crate::operator::config::ChannelLaunchMode::Service,
+            required_env: Vec::new(),
+        });
+        config.save(&home).await.expect("save config");
+
+        let with_channel = AppliedState::load(&home)
+            .await
+            .expect("load state with channel");
+        let reloaded_snapshot = with_channel
+            .skill_by_alias("visible")
+            .expect("visible skill")
+            .snapshot_path
+            .clone();
+
+        assert_eq!(initial_snapshot, reloaded_snapshot);
     }
 }
