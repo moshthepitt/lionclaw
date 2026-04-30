@@ -70,14 +70,12 @@ pub struct LockedSkill {
     pub skill_id: String,
     pub hash: String,
     pub snapshot_dir: String,
-    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockedChannel {
     pub id: String,
     pub skill: String,
-    pub skill_id: String,
     pub enabled: bool,
     #[serde(default)]
     pub launch_mode: ChannelLaunchMode,

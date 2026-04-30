@@ -44,7 +44,7 @@ impl FromStr for ChannelPeerStatus {
 #[derive(Debug, Clone)]
 pub struct ChannelBindingRecord {
     pub channel_id: String,
-    pub skill_id: String,
+    pub skill_alias: String,
     pub enabled: bool,
     pub config: Value,
     pub updated_at: DateTime<Utc>,
@@ -265,7 +265,7 @@ impl ChannelStateStore {
     pub async fn upsert_binding(
         &self,
         channel_id: &str,
-        skill_id: &str,
+        skill_alias: &str,
         enabled: bool,
         config: Value,
     ) -> Result<ChannelBindingRecord> {
@@ -274,16 +274,16 @@ impl ChannelStateStore {
         let now = now_ms();
 
         sqlx::query(
-            "INSERT INTO channel_bindings (channel_id, skill_id, enabled, config_json, updated_at_ms) \
+            "INSERT INTO channel_bindings (channel_id, skill_alias, enabled, config_json, updated_at_ms) \
              VALUES (?1, ?2, ?3, ?4, ?5) \
              ON CONFLICT(channel_id) DO UPDATE SET \
-                 skill_id = excluded.skill_id, \
+                 skill_alias = excluded.skill_alias, \
                  enabled = excluded.enabled, \
                  config_json = excluded.config_json, \
                  updated_at_ms = excluded.updated_at_ms",
         )
         .bind(channel_id)
-        .bind(skill_id)
+        .bind(skill_alias)
         .bind(if enabled { 1 } else { 0 })
         .bind(config_json)
         .bind(now)
@@ -298,7 +298,7 @@ impl ChannelStateStore {
 
     pub async fn get_binding(&self, channel_id: &str) -> Result<Option<ChannelBindingRecord>> {
         let row = sqlx::query(
-            "SELECT channel_id, skill_id, enabled, config_json, updated_at_ms \
+            "SELECT channel_id, skill_alias, enabled, config_json, updated_at_ms \
              FROM channel_bindings WHERE channel_id = ?1",
         )
         .bind(channel_id)
@@ -333,7 +333,7 @@ impl ChannelStateStore {
 
     pub async fn list_bindings(&self) -> Result<Vec<ChannelBindingRecord>> {
         let rows = sqlx::query(
-            "SELECT channel_id, skill_id, enabled, config_json, updated_at_ms \
+            "SELECT channel_id, skill_alias, enabled, config_json, updated_at_ms \
              FROM channel_bindings ORDER BY updated_at_ms DESC",
         )
         .fetch_all(&self.pool)
@@ -1054,7 +1054,7 @@ fn map_binding_row(row: SqliteRow) -> Result<ChannelBindingRecord> {
 
     Ok(ChannelBindingRecord {
         channel_id: row.get("channel_id"),
-        skill_id: row.get("skill_id"),
+        skill_alias: row.get("skill_alias"),
         enabled: row.get::<i64, _>("enabled") != 0,
         config,
         updated_at,

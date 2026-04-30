@@ -303,8 +303,6 @@ pub struct ManagedSkillConfig {
     pub source: String,
     #[serde(default = "default_reference")]
     pub reference: String,
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

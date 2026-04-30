@@ -445,7 +445,6 @@ mod tests {
                 alias: "terminal".to_string(),
                 source: skill_source.to_string_lossy().to_string(),
                 reference: "local".to_string(),
-                enabled: true,
             }],
             channels: vec![ManagedChannelConfig {
                 id: "terminal".to_string(),

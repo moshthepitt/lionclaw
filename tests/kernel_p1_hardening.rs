@@ -28,11 +28,6 @@ description: Handles restart durability requests
         )
         .await;
 
-        kernel
-            .enable_skill(installed.skill_id.clone())
-            .await
-            .expect("enable skill");
-
         let grant = kernel
             .grant_policy(PolicyGrantRequest {
                 skill_id: installed.skill_id.clone(),
@@ -95,7 +90,7 @@ description: Handles restart durability requests
         .iter()
         .find(|skill| skill.skill_id == skill_id)
         .expect("installed skill must persist");
-    assert!(persisted_skill.enabled, "enabled state should persist");
+    assert_eq!(persisted_skill.alias, "restart-skill");
 
     let turn_after_restart = kernel
         .turn_session(SessionTurnRequest {
@@ -146,11 +141,6 @@ description: Handles expiring policy windows
     .await;
 
     kernel
-        .enable_skill(installed.skill_id.clone())
-        .await
-        .expect("enable skill");
-
-    kernel
         .grant_policy(PolicyGrantRequest {
             skill_id: installed.skill_id.clone(),
             capability: "fs.read".to_string(),
@@ -173,7 +163,7 @@ description: Handles expiring policy windows
         .expect("turn during ttl");
     assert!(
         allowed_turn.runtime_skills.contains(&installed.skill_id),
-        "enabled skill should stay runtime-visible before ttl expiry"
+        "installed skill should stay runtime-visible before ttl expiry"
     );
     assert!(allowed_turn.stream_events.iter().any(|event| {
         event
@@ -197,7 +187,7 @@ description: Handles expiring policy windows
         .expect("turn after ttl");
     assert!(
         denied_turn.runtime_skills.contains(&installed.skill_id),
-        "enabled skill should remain runtime-visible after ttl expiry"
+        "installed skill should remain runtime-visible after ttl expiry"
     );
     assert!(denied_turn.stream_events.iter().any(|event| {
         event
@@ -344,11 +334,6 @@ description: Handles idempotent operations
         "idempotent install must avoid duplicates"
     );
 
-    kernel
-        .enable_skill(install_a.skill_id.clone())
-        .await
-        .expect("enable skill");
-
     let grant = kernel
         .grant_policy(PolicyGrantRequest {
             skill_id: install_a.skill_id.clone(),
@@ -376,7 +361,7 @@ description: Handles idempotent operations
 }
 
 #[tokio::test]
-async fn enable_rejects_reusing_alias_for_different_skill() {
+async fn install_reassigns_current_alias_to_latest_revision() {
     let sandbox = temp_env();
     let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
 
@@ -388,168 +373,99 @@ async fn enable_rejects_reusing_alias_for_different_skill() {
         ))
         .await
         .expect("install first skill");
-    kernel
-        .disable_skill(first.skill_id.clone())
-        .await
-        .expect("disable first skill");
-    let _second = kernel
+    let second = kernel
         .install_skill(skill_install_request(
             "local/second-skill",
             "shared-alias",
             "second-hash",
         ))
         .await
-        .expect("install second enabled skill revision");
+        .expect("install replacement skill revision");
 
-    let err = kernel
-        .enable_skill(first.skill_id)
-        .await
-        .expect_err("same alias must not identify two enabled skills");
-
-    match err {
-        KernelError::Conflict(message) => assert!(
-            message.contains("skill alias 'shared-alias' is already enabled"),
-            "unexpected conflict: {message}"
-        ),
-        other => panic!("expected alias conflict, got {other:?}"),
-    }
+    let listed = kernel.list_skills().await.expect("list skills");
+    assert_eq!(listed.skills.len(), 1);
+    assert_eq!(listed.skills[0].alias, "shared-alias");
+    assert_eq!(listed.skills[0].skill_id, second.skill_id);
+    assert_ne!(listed.skills[0].skill_id, first.skill_id);
 }
 
 #[tokio::test]
-async fn concurrent_enable_alias_conflict_is_typed() {
+async fn concurrent_installs_converge_to_single_current_alias() {
     let sandbox = temp_env();
     let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
 
-    let first = kernel
-        .install_skill(skill_install_request(
+    let first_kernel = kernel.clone();
+    let second_kernel = kernel.clone();
+    let (first_result, second_result) = tokio::join!(
+        first_kernel.install_skill(skill_install_request(
             "local/concurrent-first",
             "shared-alias",
             "concurrent-first-hash",
-        ))
-        .await
-        .expect("install first skill");
-    kernel
-        .disable_skill(first.skill_id.clone())
-        .await
-        .expect("disable first skill");
-    let second = kernel
-        .install_skill(skill_install_request(
+        )),
+        second_kernel.install_skill(skill_install_request(
             "local/concurrent-second",
             "shared-alias",
             "concurrent-second-hash",
         ))
-        .await
-        .expect("install second skill");
-    kernel
-        .disable_skill(second.skill_id.clone())
-        .await
-        .expect("disable second skill");
-
-    let first_kernel = kernel.clone();
-    let second_kernel = kernel.clone();
-    let first_id = first.skill_id.clone();
-    let second_id = second.skill_id.clone();
-    let (first_result, second_result) = tokio::join!(
-        first_kernel.enable_skill(first_id),
-        second_kernel.enable_skill(second_id)
     );
 
-    let results = [first_result, second_result];
-    let successes = results.iter().filter(|result| result.is_ok()).count();
-    let conflicts = results
-        .iter()
-        .filter(|result| {
-            matches!(
-                result,
-                Err(KernelError::Conflict(message))
-                    if message.contains("skill alias 'shared-alias' is already enabled")
-            )
-        })
-        .count();
-
-    assert_eq!(successes, 1, "exactly one enable should win");
-    assert_eq!(conflicts, 1, "the losing enable should be a typed conflict");
+    let first = first_result.expect("install first");
+    let second = second_result.expect("install second");
+    let listed = kernel.list_skills().await.expect("list skills");
+    assert_eq!(listed.skills.len(), 1);
+    assert_eq!(listed.skills[0].alias, "shared-alias");
+    assert!(
+        listed.skills[0].skill_id == first.skill_id || listed.skills[0].skill_id == second.skill_id,
+        "shared alias should converge to one current revision"
+    );
 }
 
 #[tokio::test]
-async fn install_rejects_enabled_alias_reuse_as_conflict() {
+async fn remove_skill_alias_hides_current_alias_until_reinstall() {
     let sandbox = temp_env();
     let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
 
     let first = kernel
         .install_skill(skill_install_request(
-            "local/first-enabled-alias",
+            "local/active-alias",
             "active-alias",
-            "first-enabled-alias-hash",
+            "active-alias-hash",
         ))
         .await
         .expect("install first skill");
-    kernel
-        .enable_skill(first.skill_id)
-        .await
-        .expect("enable first skill");
 
-    let err = kernel
+    let removed = kernel
+        .remove_skill("active-alias")
+        .await
+        .expect("remove active alias");
+    assert!(removed);
+    assert!(
+        kernel
+            .list_skills()
+            .await
+            .expect("list after removal")
+            .skills
+            .is_empty(),
+        "removed aliases should disappear from the current installed skill list"
+    );
+
+    let reinstalled = kernel
         .install_skill(skill_install_request(
-            "local/second-enabled-alias",
+            "local/active-alias",
             "active-alias",
-            "second-enabled-alias-hash",
+            "active-alias-hash",
         ))
         .await
-        .expect_err("enabled alias reuse should fail during install");
+        .expect("reinstall removed alias");
+    assert_eq!(reinstalled.skill_id, first.skill_id);
 
-    match err {
-        KernelError::Conflict(message) => assert!(
-            message.contains("skill alias 'active-alias' is already enabled"),
-            "unexpected conflict: {message}"
-        ),
-        other => panic!("expected conflict, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn install_rejects_retitling_disabled_skill_to_enabled_alias() {
-    let sandbox = temp_env();
-    let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
-
-    let active = kernel
-        .install_skill(skill_install_request(
-            "local/active-skill",
-            "active-alias",
-            "active-skill-hash",
-        ))
+    let listed = kernel
+        .list_skills()
         .await
-        .expect("install active skill");
-    kernel
-        .enable_skill(active.skill_id)
-        .await
-        .expect("enable active skill");
-
-    kernel
-        .install_skill(skill_install_request(
-            "local/disabled-skill",
-            "disabled-alias",
-            "disabled-skill-hash",
-        ))
-        .await
-        .expect("install disabled skill");
-
-    let err = kernel
-        .install_skill(skill_install_request(
-            "local/disabled-skill",
-            "active-alias",
-            "disabled-skill-hash",
-        ))
-        .await
-        .expect_err("disabled skill alias update should respect enabled aliases");
-
-    match err {
-        KernelError::Conflict(message) => assert!(
-            message.contains("skill alias 'active-alias' is already enabled"),
-            "unexpected conflict: {message}"
-        ),
-        other => panic!("expected conflict, got {other:?}"),
-    }
+        .expect("list skills after reinstall");
+    assert_eq!(listed.skills.len(), 1);
+    assert_eq!(listed.skills[0].alias, "active-alias");
+    assert_eq!(listed.skills[0].skill_id, first.skill_id);
 }
 
 #[tokio::test]

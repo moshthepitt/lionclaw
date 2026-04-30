@@ -316,7 +316,6 @@ pub struct SkillInstallResponse {
     pub alias: String,
     pub name: String,
     pub hash: String,
-    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,24 +327,12 @@ pub struct SkillView {
     pub source: String,
     pub reference: Option<String>,
     pub hash: String,
-    pub enabled: bool,
     pub installed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillListResponse {
     pub skills: Vec<SkillView>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillToggleRequest {
-    pub skill_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillToggleResponse {
-    pub skill_id: String,
-    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -700,7 +687,7 @@ pub struct ContinuityOpenLoopActionResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelBindRequest {
     pub channel_id: String,
-    pub skill_id: String,
+    pub skill_alias: String,
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
@@ -710,7 +697,7 @@ pub struct ChannelBindRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelBindingView {
     pub channel_id: String,
-    pub skill_id: String,
+    pub skill_alias: String,
     pub enabled: bool,
     pub config: Value,
     pub updated_at: DateTime<Utc>,

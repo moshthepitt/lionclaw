@@ -118,7 +118,7 @@ async fn scheduled_job_tick_runs_in_fresh_scheduler_session() {
 }
 
 #[tokio::test]
-async fn scheduled_job_does_not_use_skill_disabled_after_creation() {
+async fn scheduled_job_keeps_creation_time_skills_after_alias_removal() {
     let env = TestEnv::new();
     let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
     let skill_id = install_enabled_skill(&kernel, "scheduler-disabled").await;
@@ -138,9 +138,9 @@ async fn scheduled_job_does_not_use_skill_disabled_after_creation() {
         .await
         .expect("create job");
     kernel
-        .disable_skill(skill_id.clone())
+        .remove_skill("scheduler-disabled")
         .await
-        .expect("disable skill after job creation");
+        .expect("remove skill after job creation");
 
     let tick = kernel.scheduler_tick().await.expect("run scheduler tick");
     assert_eq!(tick.claimed_runs, 1);
@@ -163,14 +163,8 @@ async fn scheduled_job_does_not_use_skill_disabled_after_creation() {
         .expect("load session history");
 
     assert!(
-        history.turns[0]
-            .assistant_text
-            .contains("no runtime skills available"),
-        "disabled skills must not be passed to runtime turns"
-    );
-    assert!(
-        !history.turns[0].assistant_text.contains(&skill_id),
-        "disabled skill id should not be visible as a runtime skill"
+        history.turns[0].assistant_text.contains(&skill_id),
+        "scheduled jobs should keep the runtime skill set captured at creation time"
     );
 }
 
@@ -1169,19 +1163,15 @@ async fn install_enabled_skill(kernel: &Kernel, skill_name: &str) -> String {
         })
         .await
         .expect("install skill");
-    kernel
-        .enable_skill(installed.skill_id.clone())
-        .await
-        .expect("enable skill");
     installed.skill_id
 }
 
 async fn install_and_bind_channel(kernel: &Kernel, channel_id: &str, skill_name: &str) {
-    let skill_id = install_enabled_skill(kernel, skill_name).await;
+    install_enabled_skill(kernel, skill_name).await;
     kernel
         .bind_channel(ChannelBindRequest {
             channel_id: channel_id.to_string(),
-            skill_id,
+            skill_alias: skill_name.to_string(),
             enabled: Some(true),
             config: None,
         })

@@ -263,13 +263,9 @@ async fn channel_send_capability_uses_session_channel_defaults() {
         .await
         .expect("install local channel skill");
     kernel
-        .enable_skill(channel_skill.skill_id.clone())
-        .await
-        .expect("enable local channel skill");
-    kernel
         .bind_channel(ChannelBindRequest {
             channel_id: "local-cli".to_string(),
-            skill_id: channel_skill.skill_id,
+            skill_alias: channel_skill.alias,
             enabled: Some(true),
             config: None,
         })
@@ -497,11 +493,6 @@ async fn prepare_session_with_skill(
         })
         .await
         .expect("install skill");
-
-    kernel
-        .enable_skill(skill.skill_id.clone())
-        .await
-        .expect("enable skill");
 
     (session.session_id, skill.skill_id)
 }

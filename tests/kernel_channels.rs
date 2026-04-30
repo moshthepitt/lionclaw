@@ -23,11 +23,11 @@ use tempfile::TempDir;
 use tokio::time::{sleep, Duration, Instant};
 
 #[tokio::test]
-async fn channel_bind_requires_enabled_skill() {
+async fn channel_bind_requires_installed_alias() {
     let env = TestEnv::new();
     let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
 
-    let skill = kernel
+    kernel
         .install_skill(SkillInstallRequest {
             source: "local/channel-skill".to_string(),
             alias: "channel-skill".to_string(),
@@ -45,23 +45,23 @@ description: channel skill
         .await
         .expect("install skill");
     kernel
-        .disable_skill(skill.skill_id.clone())
+        .remove_skill("channel-skill")
         .await
-        .expect("disable skill");
+        .expect("remove skill alias");
 
     let err = kernel
         .bind_channel(ChannelBindRequest {
             channel_id: "local-cli".to_string(),
-            skill_id: skill.skill_id,
+            skill_alias: "channel-skill".to_string(),
             enabled: Some(true),
             config: None,
         })
         .await
-        .expect_err("bind should fail for disabled skill");
+        .expect_err("bind should fail for missing alias");
 
     assert!(
-        matches!(err, KernelError::BadRequest(message) if message.contains("enabled skill")),
-        "disabled skill should be rejected for channel binding"
+        matches!(err, KernelError::NotFound(message) if message.contains("skill not found")),
+        "missing skill alias should be rejected for channel binding"
     );
 }
 
@@ -99,14 +99,9 @@ description: inbound skill for channel flow
         .expect("install skill");
 
     kernel
-        .enable_skill(skill.skill_id.clone())
-        .await
-        .expect("enable skill");
-
-    kernel
         .bind_channel(ChannelBindRequest {
             channel_id: "local-cli".to_string(),
-            skill_id: skill.skill_id.clone(),
+            skill_alias: skill.alias.clone(),
             enabled: Some(true),
             config: Some(serde_json::json!({"runtime_id": "mock"})),
         })
@@ -270,14 +265,9 @@ description: channel outbox skill
         .expect("install skill");
 
     kernel
-        .enable_skill(skill.skill_id.clone())
-        .await
-        .expect("enable skill");
-
-    kernel
         .bind_channel(ChannelBindRequest {
             channel_id: "telegram".to_string(),
-            skill_id: skill.skill_id,
+            skill_alias: skill.alias,
             enabled: Some(true),
             config: None,
         })
@@ -387,14 +377,9 @@ description: channel tail skill
         .expect("install skill");
 
     kernel
-        .enable_skill(skill.skill_id.clone())
-        .await
-        .expect("enable skill");
-
-    kernel
         .bind_channel(ChannelBindRequest {
             channel_id: "terminal".to_string(),
-            skill_id: skill.skill_id,
+            skill_alias: skill.alias,
             enabled: Some(true),
             config: None,
         })
@@ -479,14 +464,9 @@ description: channel wait skill
         .expect("install skill");
 
     kernel
-        .enable_skill(skill.skill_id.clone())
-        .await
-        .expect("enable skill");
-
-    kernel
         .bind_channel(ChannelBindRequest {
             channel_id: "telegram".to_string(),
-            skill_id: skill.skill_id,
+            skill_alias: skill.alias,
             enabled: Some(true),
             config: None,
         })
@@ -1084,14 +1064,9 @@ async fn install_and_bind_channel(
         .expect("install skill");
 
     kernel
-        .enable_skill(skill.skill_id.clone())
-        .await
-        .expect("enable skill");
-
-    kernel
         .bind_channel(ChannelBindRequest {
             channel_id: channel_id.to_string(),
-            skill_id: skill.skill_id.clone(),
+            skill_alias: skill.alias.clone(),
             enabled: Some(true),
             config: Some(serde_json::json!({"runtime_id": runtime_id})),
         })

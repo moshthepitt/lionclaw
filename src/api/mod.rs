@@ -28,7 +28,7 @@ use crate::{
         SessionActionRequest, SessionActionResponse, SessionHistoryRequest, SessionHistoryResponse,
         SessionLatestQuery, SessionLatestResponse, SessionOpenRequest, SessionOpenResponse,
         SessionTurnRequest, SessionTurnResponse, SkillInstallRequest, SkillInstallResponse,
-        SkillListResponse, SkillToggleRequest, SkillToggleResponse,
+        SkillListResponse,
     },
     kernel::{Kernel, KernelError},
 };
@@ -55,8 +55,6 @@ pub fn build_router(kernel: Arc<Kernel>, daemon_info: DaemonInfoResponse) -> Rou
         .route("/v0/sessions/turn", post(turn_session))
         .route("/v0/skills/install", post(install_skill))
         .route("/v0/skills/list", get(list_skills))
-        .route("/v0/skills/enable", post(enable_skill))
-        .route("/v0/skills/disable", post(disable_skill))
         .route("/v0/channels/bind", post(bind_channel))
         .route("/v0/channels/list", get(list_channels))
         .route("/v0/channels/peers", get(list_channel_peers))
@@ -164,22 +162,6 @@ async fn install_skill(
 
 async fn list_skills(State(state): State<ApiState>) -> Result<Json<SkillListResponse>, ApiError> {
     let result = state.kernel.list_skills().await?;
-    Ok(Json(result))
-}
-
-async fn enable_skill(
-    State(state): State<ApiState>,
-    Json(req): Json<SkillToggleRequest>,
-) -> Result<Json<SkillToggleResponse>, ApiError> {
-    let result = state.kernel.enable_skill(req.skill_id).await?;
-    Ok(Json(result))
-}
-
-async fn disable_skill(
-    State(state): State<ApiState>,
-    Json(req): Json<SkillToggleRequest>,
-) -> Result<Json<SkillToggleResponse>, ApiError> {
-    let result = state.kernel.disable_skill(req.skill_id).await?;
     Ok(Json(result))
 }
 

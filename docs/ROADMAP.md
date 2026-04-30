@@ -60,7 +60,7 @@ Goal: make LionClaw state survive restart and remain auditable.
 
 - [x] SQLite persistence for sessions, turns, skills, policy, audit, jobs, and channels.
 - [x] migrations and startup schema checks.
-- [x] idempotent install/enable/disable/grant/revoke handling.
+- [x] idempotent install/remove/grant/revoke handling.
 - [x] durable per-turn history with running/completed/failed/timed-out/cancelled/interrupted states.
 - [x] partial answer checkpoints for restart recovery.
 - [x] stale running turns reconciled on bootstrap.

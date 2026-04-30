@@ -1,13 +1,12 @@
 CREATE TABLE IF NOT EXISTS channel_bindings (
     channel_id TEXT PRIMARY KEY NOT NULL,
-    skill_id TEXT NOT NULL,
+    skill_alias TEXT NOT NULL,
     enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
     config_json TEXT NOT NULL DEFAULT '{}',
-    updated_at_ms INTEGER NOT NULL,
-    FOREIGN KEY (skill_id) REFERENCES skills (skill_id) ON DELETE CASCADE
+    updated_at_ms INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_channel_bindings_skill ON channel_bindings (skill_id);
+CREATE INDEX IF NOT EXISTS idx_channel_bindings_skill_alias ON channel_bindings (skill_alias);
 CREATE INDEX IF NOT EXISTS idx_channel_bindings_enabled ON channel_bindings (enabled);
 
 CREATE TABLE IF NOT EXISTS channel_peers (

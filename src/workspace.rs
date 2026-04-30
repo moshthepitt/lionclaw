@@ -13,7 +13,7 @@ pub const GENERATED_AGENTS_FILE: &str = "AGENTS.generated.md";
 const IDENTITY_TEMPLATE: &str = "# Identity\n\nLionClaw is your local secure-first agent kernel.\n";
 const SOUL_TEMPLATE: &str =
     "# Soul\n\nLionClaw is calm, precise, security-first, and execution-oriented.\n";
-const AGENTS_TEMPLATE: &str = "# Agents\n\nFollow kernel policy, use installed skills, and preserve auditability.\nWrite generated files intended for review or keeping to LIONCLAW_DRAFTS_DIR.\nIf this preset mounts runtime secrets, look under /run/secrets for the LionClaw-provided dotenv file whose name starts with lionclaw-runtime-secrets-, read it, and do not print its contents.\n";
+const AGENTS_TEMPLATE: &str = "# Agents\n\nFollow kernel policy, use installed skills, and preserve auditability.\nInstalled LionClaw skills are mounted under /lionclaw/skills and may also appear in the runtime's native skill directory.\nWrite generated files intended for review or keeping to LIONCLAW_DRAFTS_DIR.\nIf this preset mounts runtime secrets, look under /run/secrets for the LionClaw-provided dotenv file whose name starts with lionclaw-runtime-secrets-, read it, and do not print its contents.\n";
 const USER_TEMPLATE: &str =
     "# User\n\nCapture operator-specific goals, preferences, and environment notes here.\n";
 

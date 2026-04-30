@@ -42,11 +42,6 @@ description: Handles capability-gated runtime operations
         .await
         .expect("install skill");
 
-    kernel
-        .enable_skill(skill.skill_id.clone())
-        .await
-        .expect("enable skill");
-
     let denied_turn = kernel
         .turn_session(SessionTurnRequest {
             session_id: session.session_id,

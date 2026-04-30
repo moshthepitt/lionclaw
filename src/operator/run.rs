@@ -1001,7 +1001,6 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             alias: "test-skill".to_string(),
             source: skill_source.display().to_string(),
             reference: "local".to_string(),
-            enabled: true,
         });
         config.save(&home).await.expect("save config");
 

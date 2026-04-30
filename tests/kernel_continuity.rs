@@ -2017,19 +2017,16 @@ async fn install_enabled_skill(kernel: &Kernel, name: &str) -> String {
         })
         .await
         .expect("install skill");
-    kernel
-        .enable_skill(skill.skill_id.clone())
-        .await
-        .expect("enable skill");
     skill.skill_id
 }
 
 async fn install_and_bind_channel(kernel: &Kernel, channel_id: &str) {
-    let skill_id = install_enabled_skill(kernel, &format!("channel-{channel_id}")).await;
+    let skill_alias = format!("channel-{channel_id}");
+    install_enabled_skill(kernel, &skill_alias).await;
     kernel
         .bind_channel(ChannelBindRequest {
             channel_id: channel_id.to_string(),
-            skill_id,
+            skill_alias,
             enabled: None,
             config: None,
         })

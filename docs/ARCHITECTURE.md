@@ -83,7 +83,7 @@ Skill text can influence prompt context. It cannot grant permissions.
 
 - `kernel.sessions`: session lifecycle, history policy, and aggregate turn metadata.
 - `kernel.session_turns`: durable per-turn history, recovery state, and partial assistant output.
-- `kernel.skills`: installed skill registry and enable/disable state.
+- `kernel.skills`: installed skill registry and current alias ownership.
 - `kernel.policy`: capability grant/revoke and allow checks.
 - `kernel.jobs`: scheduled job definitions, run records, and SQLite persistence.
 - `kernel.capability_broker`: explicit brokered capability execution for direct runtimes and narrow kernel surfaces.
@@ -244,8 +244,6 @@ with the CLI.
 
 - `POST /v0/skills/install`
 - `GET /v0/skills/list`
-- `POST /v0/skills/enable`
-- `POST /v0/skills/disable`
 
 ### Channel
 

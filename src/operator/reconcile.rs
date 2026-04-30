@@ -10,10 +10,7 @@ use crate::{
     config::resolve_project_workspace_root,
     contracts::{ChannelBindRequest, ChannelPeerApproveRequest, ChannelPeerResponse, TrustTier},
     home::{runtime_project_partition_key, LionClawHome},
-    kernel::{
-        skills::{validate_skill_alias, SkillAliasState},
-        Kernel, KernelError, KernelOptions, RuntimeExecutionPolicy,
-    },
+    kernel::{skills::validate_skill_alias, Kernel, KernelOptions, RuntimeExecutionPolicy},
     operator::{
         config::{
             normalize_local_source, ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig,
@@ -100,7 +97,6 @@ pub async fn add_skill(
         alias,
         source,
         reference,
-        enabled: true,
     });
     config.save(home).await
 }
@@ -179,44 +175,24 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
                 channel.skill
             ));
         }
-
-        if channel.enabled {
-            let skill_config = config
-                .skills
-                .iter()
-                .find(|skill| skill.alias == channel.skill)
-                .ok_or_else(|| {
-                    anyhow!("skill alias '{}' disappeared during apply", channel.skill)
-                })?;
-            if !skill_config.enabled {
-                return Err(anyhow!(
-                    "channel '{}' cannot be enabled while skill '{}' is disabled",
-                    channel.id,
-                    channel.skill
-                ));
-            }
-        }
     }
 
-    let mut desired_skill_states = Vec::new();
     for (skill, snapshot) in desired_skills {
         let installed = kernel
-            .stage_skill(crate::contracts::SkillInstallRequest {
-                source: snapshot.source_uri.clone(),
-                alias: skill.alias.clone(),
-                reference: Some(snapshot.reference.clone()),
-                hash: Some(snapshot.hash.clone()),
-                skill_md: Some(snapshot.skill_md.clone()),
-                snapshot_path: Some(snapshot.snapshot_abs_dir.to_string_lossy().to_string()),
-            })
+            .install_skill_with_actor(
+                crate::contracts::SkillInstallRequest {
+                    source: snapshot.source_uri.clone(),
+                    alias: skill.alias.clone(),
+                    reference: Some(snapshot.reference.clone()),
+                    hash: Some(snapshot.hash.clone()),
+                    skill_md: Some(snapshot.skill_md.clone()),
+                    snapshot_path: Some(snapshot.snapshot_abs_dir.to_string_lossy().to_string()),
+                },
+                "operator",
+            )
             .await
             .map_err(to_anyhow)?;
 
-        desired_skill_states.push(SkillAliasState {
-            skill_id: installed.skill_id.clone(),
-            alias: skill.alias.clone(),
-            enabled: skill.enabled,
-        });
         installed_skills.insert(
             skill.alias.clone(),
             (snapshot.clone(), installed.skill_id.clone()),
@@ -225,16 +201,10 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
             .skills
             .push(to_locked_skill(skill, snapshot, installed.skill_id));
     }
-
-    kernel
-        .apply_skill_alias_states(desired_skill_states)
-        .await
-        .map_err(to_anyhow)?;
-
-    let next_skill_ids = next_lock
+    let next_skill_aliases = next_lock
         .skills
         .iter()
-        .map(|skill| skill.skill_id.as_str())
+        .map(|skill| skill.alias.as_str())
         .collect::<BTreeSet<_>>();
 
     let desired_channel_ids = config
@@ -253,14 +223,14 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
     }
 
     for channel in &config.channels {
-        let (_snapshot, skill_id) = installed_skills
+        installed_skills
             .get(&channel.skill)
             .ok_or_else(|| anyhow!("skill alias '{}' disappeared during apply", channel.skill))?;
 
         kernel
             .bind_channel(ChannelBindRequest {
                 channel_id: channel.id.clone(),
-                skill_id: skill_id.clone(),
+                skill_alias: channel.skill.clone(),
                 enabled: Some(channel.enabled),
                 config: Some(json!({})),
             })
@@ -270,15 +240,14 @@ pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
         next_lock.channels.push(LockedChannel {
             id: channel.id.clone(),
             skill: channel.skill.clone(),
-            skill_id: skill_id.clone(),
             enabled: channel.enabled,
             launch_mode: channel.launch_mode,
         });
     }
 
     for old_skill in &previous_lock.skills {
-        if !next_skill_ids.contains(old_skill.skill_id.as_str()) {
-            disable_stale_skill_if_present(&kernel, &old_skill.skill_id).await?;
+        if !next_skill_aliases.contains(old_skill.alias.as_str()) {
+            remove_stale_skill_alias_if_present(&kernel, &old_skill.alias).await?;
         }
     }
 
@@ -449,7 +418,16 @@ pub async fn status<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Resu
         channels.push(ChannelStatus {
             id: channel.id.clone(),
             skill: channel.skill.clone(),
-            skill_id: channel.skill_id.clone(),
+            skill_id: lockfile
+                .find_skill(&channel.skill)
+                .map(|skill| skill.skill_id.clone())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "channel '{}' skill '{}' is missing",
+                        channel.id,
+                        channel.skill
+                    )
+                })?,
             launch_mode: channel.launch_mode.as_str().to_string(),
             binding_enabled: binding.enabled,
             unit_status,
@@ -678,7 +656,6 @@ fn to_locked_skill(
         skill_id,
         hash: snapshot.hash,
         snapshot_dir: snapshot.snapshot_rel_dir,
-        enabled: config.enabled,
     }
 }
 
@@ -746,9 +723,6 @@ pub(crate) async fn resolve_installed_skill_worker_entrypoint(
     let locked_skill = lockfile
         .find_skill(alias)
         .ok_or_else(|| anyhow!("skill alias '{alias}' is not installed; run 'lionclaw apply'"))?;
-    if !locked_skill.enabled {
-        return Err(anyhow!("skill alias '{alias}' is disabled"));
-    }
 
     resolve_worker_entrypoint(home, &locked_skill.snapshot_dir)
 }
@@ -922,15 +896,15 @@ fn to_anyhow(err: crate::kernel::KernelError) -> anyhow::Error {
     anyhow!(err.to_string())
 }
 
-async fn disable_stale_skill_if_present(kernel: &Kernel, skill_id: &str) -> Result<()> {
-    let Err(err) = kernel.disable_skill(skill_id.to_string()).await else {
+async fn remove_stale_skill_alias_if_present(kernel: &Kernel, alias: &str) -> Result<()> {
+    let removed = kernel
+        .remove_skill_with_actor(alias, "operator")
+        .await
+        .map_err(to_anyhow)?;
+    if removed {
         return Ok(());
-    };
-
-    match err {
-        KernelError::NotFound(_) => Ok(()),
-        other => Err(to_anyhow(other)),
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1280,7 +1254,6 @@ mod tests {
                 skill_id: "channel-telegram-hash".to_string(),
                 hash: "hash".to_string(),
                 snapshot_dir: snapshot_dir.to_string(),
-                enabled: true,
             }],
             ..OperatorLockfile::default()
         }
@@ -1320,7 +1293,6 @@ mod tests {
                 skill_id: "channel-telegram-hash".to_string(),
                 hash: "hash".to_string(),
                 snapshot_dir: "skills/example".to_string(),
-                enabled: true,
             }],
             ..OperatorLockfile::default()
         };
@@ -1356,7 +1328,6 @@ mod tests {
             alias: "telegram".to_string(),
             source: skill_source.to_string_lossy().to_string(),
             reference: "local".to_string(),
-            enabled: true,
         }];
         config.channels = vec![ManagedChannelConfig {
             id: "telegram".to_string(),
@@ -1419,7 +1390,6 @@ mod tests {
             alias: "test-skill".to_string(),
             source: skill_source.display().to_string(),
             reference: "local".to_string(),
-            enabled: true,
         });
         config.save(&home).await.expect("save config");
 
@@ -1468,7 +1438,6 @@ mod tests {
                 alias: "telegram".to_string(),
                 source: skill_source.to_string_lossy().to_string(),
                 reference: "local".to_string(),
-                enabled: true,
             }],
             ..OperatorConfig::default()
         };
@@ -1495,19 +1464,20 @@ mod tests {
         .expect("kernel");
 
         let skills = kernel.list_skills().await.expect("list skills").skills;
-        let enabled = skills
-            .iter()
-            .filter(|skill| skill.enabled)
-            .collect::<Vec<_>>();
-        assert_eq!(enabled.len(), 1, "only one revision should remain enabled");
+        let enabled = skills.iter().collect::<Vec<_>>();
+        assert_eq!(
+            enabled.len(),
+            1,
+            "only one current revision should remain listed"
+        );
         assert_eq!(
             enabled[0].skill_id, applied.lockfile.skills[0].skill_id,
-            "the latest lockfile revision should be the enabled one"
+            "the latest lockfile revision should be the current one"
         );
         assert_eq!(
             skills.len(),
-            2,
-            "old revisions remain installed for auditability"
+            1,
+            "list_skills should only show current aliases"
         );
     }
 
@@ -1536,7 +1506,6 @@ mod tests {
                 alias: "mode-test".to_string(),
                 source: skill_source.to_string_lossy().to_string(),
                 reference: "local".to_string(),
-                enabled: true,
             }],
             ..OperatorConfig::default()
         };
@@ -1625,14 +1594,7 @@ mod tests {
         )
         .await
         .expect("kernel");
-        let enabled = kernel
-            .list_skills()
-            .await
-            .expect("list skills")
-            .skills
-            .into_iter()
-            .filter(|skill| skill.enabled)
-            .collect::<Vec<_>>();
+        let enabled = kernel.list_skills().await.expect("list skills").skills;
         assert_eq!(enabled.len(), 1);
         assert_eq!(enabled[0].alias, "beta");
         assert_eq!(enabled[0].skill_id, applied.lockfile.skills[0].skill_id);
@@ -1655,13 +1617,11 @@ mod tests {
                     alias: "alpha".to_string(),
                     source: terminal_source.to_string_lossy().to_string(),
                     reference: "local".to_string(),
-                    enabled: true,
                 },
                 ManagedSkillConfig {
                     alias: "beta".to_string(),
                     source: telegram_source.to_string_lossy().to_string(),
                     reference: "local".to_string(),
-                    enabled: true,
                 },
             ],
             ..OperatorConfig::default()
@@ -1677,13 +1637,11 @@ mod tests {
                     alias: "alpha".to_string(),
                     source: telegram_source.to_string_lossy().to_string(),
                     reference: "local".to_string(),
-                    enabled: true,
                 },
                 ManagedSkillConfig {
                     alias: "beta".to_string(),
                     source: terminal_source.to_string_lossy().to_string(),
                     reference: "local".to_string(),
-                    enabled: true,
                 },
             ],
             ..OperatorConfig::default()
@@ -1718,7 +1676,6 @@ mod tests {
             .expect("list skills")
             .skills
             .into_iter()
-            .filter(|skill| skill.enabled)
             .map(|skill| (skill.alias, skill.skill_id))
             .collect::<std::collections::BTreeMap<_, _>>();
 
@@ -1741,7 +1698,6 @@ mod tests {
                 alias: "alpha".to_string(),
                 source: terminal_source.to_string_lossy().to_string(),
                 reference: "local".to_string(),
-                enabled: true,
             }],
             ..OperatorConfig::default()
         }
@@ -1756,7 +1712,6 @@ mod tests {
                 alias: "alpha".to_string(),
                 source: telegram_source.to_string_lossy().to_string(),
                 reference: "local".to_string(),
-                enabled: true,
             }],
             channels: vec![ManagedChannelConfig {
                 id: "broken".to_string(),
@@ -1791,14 +1746,7 @@ mod tests {
         )
         .await
         .expect("kernel");
-        let enabled = kernel
-            .list_skills()
-            .await
-            .expect("list skills")
-            .skills
-            .into_iter()
-            .filter(|skill| skill.enabled)
-            .collect::<Vec<_>>();
+        let enabled = kernel.list_skills().await.expect("list skills").skills;
 
         assert_eq!(enabled.len(), 1);
         assert_eq!(enabled[0].alias, "alpha");
@@ -1835,11 +1783,6 @@ mod tests {
             })
             .await
             .expect("install stale skill");
-        kernel
-            .enable_skill(stale.skill_id.clone())
-            .await
-            .expect("enable stale skill");
-
         let skill_source =
             write_channel_skill_fixture(temp_dir.path(), "channel-telegram", "telegram");
         let config = OperatorConfig {
@@ -1847,7 +1790,6 @@ mod tests {
                 alias: "telegram".to_string(),
                 source: skill_source.to_string_lossy().to_string(),
                 reference: "local".to_string(),
-                enabled: true,
             }],
             ..OperatorConfig::default()
         };
@@ -1858,32 +1800,12 @@ mod tests {
             .expect("save empty lockfile");
 
         let applied = apply(&home).await.expect("apply should converge");
-        let enabled = kernel
-            .list_skills()
-            .await
-            .expect("list skills")
-            .skills
-            .into_iter()
-            .filter(|skill| skill.enabled)
-            .collect::<Vec<_>>();
+        let enabled = kernel.list_skills().await.expect("list skills").skills;
 
         assert_eq!(enabled.len(), 1);
         assert_eq!(enabled[0].alias, "telegram");
         assert_eq!(enabled[0].skill_id, applied.lockfile.skills[0].skill_id);
         assert_ne!(enabled[0].skill_id, stale.skill_id);
-
-        let disable_audit = kernel
-            .query_audit(None, Some("skill.disable".to_string()), None, Some(10))
-            .await
-            .expect("query skill disable audit");
-        assert!(
-            disable_audit.events.iter().any(|event| {
-                event.actor.as_deref() == Some("operator")
-                    && event.details["skill_id"].as_str() == Some(stale.skill_id.as_str())
-                    && event.details["alias"].as_str() == Some("telegram")
-            }),
-            "replaced active skill disable should be audited"
-        );
     }
 
     #[tokio::test]
@@ -1900,13 +1822,11 @@ mod tests {
                     alias: "alpha".to_string(),
                     source: source.clone(),
                     reference: "local".to_string(),
-                    enabled: true,
                 },
                 ManagedSkillConfig {
                     alias: "beta".to_string(),
                     source,
                     reference: "other-ref".to_string(),
-                    enabled: true,
                 },
             ],
             ..OperatorConfig::default()
@@ -1939,13 +1859,11 @@ mod tests {
                     alias: "shared".to_string(),
                     source: terminal_source.to_string_lossy().to_string(),
                     reference: "local".to_string(),
-                    enabled: true,
                 },
                 ManagedSkillConfig {
                     alias: "shared".to_string(),
                     source: telegram_source.to_string_lossy().to_string(),
                     reference: "local".to_string(),
-                    enabled: true,
                 },
             ],
             ..OperatorConfig::default()
@@ -1975,7 +1893,6 @@ mod tests {
                 alias: "telegram".to_string(),
                 source: skill_source.to_string_lossy().to_string(),
                 reference: "local".to_string(),
-                enabled: true,
             }],
             channels: vec![ManagedChannelConfig {
                 id: "telegram".to_string(),
@@ -1987,7 +1904,7 @@ mod tests {
             ..OperatorConfig::default()
         };
         config.save(&home).await.expect("save config");
-        let applied = apply(&home).await.expect("apply channel");
+        let _applied = apply(&home).await.expect("apply channel");
 
         let kernel = Kernel::new_with_options(
             &home.db_path(),
@@ -2000,11 +1917,6 @@ mod tests {
         )
         .await
         .expect("kernel");
-        kernel
-            .disable_skill(applied.lockfile.skills[0].skill_id.clone())
-            .await
-            .expect("disable old skill");
-
         config.skills.clear();
         config.channels.clear();
         config.save(&home).await.expect("save empty config");
@@ -2031,7 +1943,6 @@ mod tests {
                 alias: "telegram".to_string(),
                 source: skill_source.to_string_lossy().to_string(),
                 reference: "local".to_string(),
-                enabled: true,
             }],
             channels: vec![ManagedChannelConfig {
                 id: "telegram".to_string(),
@@ -2100,7 +2011,6 @@ mod tests {
             alias: "terminal".to_string(),
             source: skill_source.to_string_lossy().to_string(),
             reference: "local".to_string(),
-            enabled: true,
         }];
         config.channels = vec![ManagedChannelConfig {
             id: "terminal".to_string(),

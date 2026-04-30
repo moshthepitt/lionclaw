@@ -37,8 +37,8 @@ use crate::contracts::{
     SessionHistoryRequest, SessionHistoryResponse, SessionLatestQuery, SessionLatestResponse,
     SessionOpenRequest, SessionOpenResponse, SessionTurnKind, SessionTurnRequest,
     SessionTurnResponse, SessionTurnStatus, SessionTurnView, SkillInstallRequest,
-    SkillInstallResponse, SkillListResponse, SkillToggleResponse, SkillView, StreamEventDto,
-    StreamEventKindDto, StreamLaneDto, TrustTier,
+    SkillInstallResponse, SkillListResponse, SkillView, StreamEventDto, StreamEventKindDto,
+    StreamLaneDto, TrustTier,
 };
 use crate::{
     home::{
@@ -92,8 +92,7 @@ use super::{
     session_turns::{NewSessionTurn, SessionTurnCompletion, SessionTurnRecord, SessionTurnStore},
     sessions::SessionStore,
     skills::{
-        validate_skill_alias, SkillAliasConflict, SkillAliasState, SkillAliasValidationError,
-        SkillInstallInput, SkillRecord, SkillStore,
+        validate_skill_alias, SkillAliasValidationError, SkillInstallInput, SkillRecord, SkillStore,
     },
 };
 
@@ -202,12 +201,6 @@ pub struct Kernel {
     workspace_name: Option<String>,
     continuity: Option<ContinuityLayout>,
     hidden_compaction_turn_timeout: Duration,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SkillInstallScope {
-    Strict,
-    Stage,
 }
 
 #[derive(Debug, Clone)]
@@ -829,22 +822,12 @@ impl Kernel {
         &self,
         req: SkillInstallRequest,
     ) -> Result<SkillInstallResponse, KernelError> {
-        self.install_skill_with_scope(req, SkillInstallScope::Strict, "api")
-            .await
+        self.install_skill_with_actor(req, "api").await
     }
 
-    pub(crate) async fn stage_skill(
+    pub(crate) async fn install_skill_with_actor(
         &self,
         req: SkillInstallRequest,
-    ) -> Result<SkillInstallResponse, KernelError> {
-        self.install_skill_with_scope(req, SkillInstallScope::Stage, "operator")
-            .await
-    }
-
-    async fn install_skill_with_scope(
-        &self,
-        req: SkillInstallRequest,
-        scope: SkillInstallScope,
         actor: &str,
     ) -> Result<SkillInstallResponse, KernelError> {
         if req.source.trim().is_empty() {
@@ -859,11 +842,11 @@ impl Kernel {
             skill_md: req.skill_md,
             snapshot_path: req.snapshot_path,
         };
-        let installed = match scope {
-            SkillInstallScope::Strict => self.skills.install(input).await,
-            SkillInstallScope::Stage => self.skills.stage(input).await,
-        }
-        .map_err(skill_install_error)?;
+        let installed = self
+            .skills
+            .install(input)
+            .await
+            .map_err(skill_install_error)?;
 
         self.audit
             .append(
@@ -880,25 +863,7 @@ impl Kernel {
             alias: installed.alias,
             name: installed.name,
             hash: installed.hash,
-            enabled: installed.enabled,
         })
-    }
-
-    pub(crate) async fn apply_skill_alias_states(
-        &self,
-        states: Vec<SkillAliasState>,
-    ) -> Result<(), KernelError> {
-        let updated = self
-            .skills
-            .apply_alias_states(&states)
-            .await
-            .map_err(skill_toggle_error)?;
-
-        for skill in updated {
-            self.audit_skill_state(&skill, "operator").await?;
-        }
-
-        Ok(())
     }
 
     pub async fn list_skills(&self) -> Result<SkillListResponse, KernelError> {
@@ -914,91 +879,48 @@ impl Kernel {
         Ok(SkillListResponse { skills })
     }
 
-    pub async fn is_skill_enabled(&self, skill_id: &str) -> Result<bool, KernelError> {
-        let skill = self.skills.get(skill_id).await.map_err(internal)?;
-        Ok(skill.map(|value| value.enabled).unwrap_or(false))
+    pub async fn remove_skill(&self, alias: &str) -> Result<bool, KernelError> {
+        self.remove_skill_with_actor(alias, "api").await
     }
 
-    pub async fn enable_skill(&self, skill_id: String) -> Result<SkillToggleResponse, KernelError> {
-        let updated = self
+    pub(crate) async fn remove_skill_with_actor(
+        &self,
+        alias: &str,
+        actor: &str,
+    ) -> Result<bool, KernelError> {
+        let removed = self
             .skills
-            .set_enabled(&skill_id, true)
+            .disable_alias(alias)
             .await
-            .map_err(skill_toggle_error)?
-            .ok_or_else(|| KernelError::NotFound("skill not found".to_string()))?;
+            .map_err(skill_install_error)?;
+        if !removed {
+            return Ok(false);
+        }
 
         self.audit
             .append(
-                "skill.enable",
-                None,
-                Some("api".to_string()),
-                json!({"skill_id": updated.skill_id}),
-            )
-            .await
-            .map_err(internal)?;
-
-        Ok(SkillToggleResponse {
-            skill_id: updated.skill_id,
-            enabled: updated.enabled,
-        })
-    }
-
-    async fn audit_skill_state(&self, skill: &SkillRecord, actor: &str) -> Result<(), KernelError> {
-        let event_type = if skill.enabled {
-            "skill.enable"
-        } else {
-            "skill.disable"
-        };
-        self.audit
-            .append(
-                event_type,
+                "skill.remove",
                 None,
                 Some(actor.to_string()),
-                json!({"skill_id": skill.skill_id, "alias": skill.alias}),
-            )
-            .await
-            .map_err(internal)
-    }
-
-    pub async fn disable_skill(
-        &self,
-        skill_id: String,
-    ) -> Result<SkillToggleResponse, KernelError> {
-        let updated = self
-            .skills
-            .set_enabled(&skill_id, false)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| KernelError::NotFound("skill not found".to_string()))?;
-
-        self.audit
-            .append(
-                "skill.disable",
-                None,
-                Some("api".to_string()),
-                json!({"skill_id": updated.skill_id}),
+                json!({ "alias": alias }),
             )
             .await
             .map_err(internal)?;
-
-        Ok(SkillToggleResponse {
-            skill_id: updated.skill_id,
-            enabled: updated.enabled,
-        })
+        Ok(true)
     }
 
     pub async fn bind_channel(
         &self,
         req: ChannelBindRequest,
     ) -> Result<ChannelBindResponse, KernelError> {
-        if req.channel_id.trim().is_empty() || req.skill_id.trim().is_empty() {
+        if req.channel_id.trim().is_empty() || req.skill_alias.trim().is_empty() {
             return Err(KernelError::BadRequest(
-                "channel_id and skill_id are required".to_string(),
+                "channel_id and skill_alias are required".to_string(),
             ));
         }
 
         let channel_id = req.channel_id.trim().to_string();
-        let skill_id = req.skill_id.trim().to_string();
+        let skill_alias = req.skill_alias.trim().to_string();
         let enabled = req.enabled.unwrap_or(true);
         let config = req
             .config
@@ -1006,20 +928,14 @@ impl Kernel {
 
         let skill = self
             .skills
-            .get(&skill_id)
+            .get_enabled_by_alias(&skill_alias)
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("skill not found".to_string()))?;
 
-        if !skill.enabled {
-            return Err(KernelError::BadRequest(
-                "channel binding requires an enabled skill".to_string(),
-            ));
-        }
-
         let binding = self
             .channel_state
-            .upsert_binding(&channel_id, &skill_id, enabled, config.clone())
+            .upsert_binding(&channel_id, &skill_alias, enabled, config.clone())
             .await
             .map_err(internal)?;
 
@@ -1030,7 +946,8 @@ impl Kernel {
                 Some("api".to_string()),
                 json!({
                     "channel_id": binding.channel_id,
-                    "skill_id": binding.skill_id,
+                    "skill_alias": binding.skill_alias,
+                    "skill_id": skill.skill_id,
                     "enabled": binding.enabled,
                     "config": binding.config,
                 }),
@@ -1078,7 +995,7 @@ impl Kernel {
                 Some(actor.to_string()),
                 json!({
                     "channel_id": binding.channel_id,
-                    "skill_id": binding.skill_id,
+                    "skill_alias": binding.skill_alias,
                 }),
             )
             .await
@@ -3243,7 +3160,7 @@ mod tests {
         )
         .await
         .expect("kernel init");
-        let installed = kernel
+        let _installed = kernel
             .install_skill(crate::contracts::SkillInstallRequest {
                 source: "local:/skills/channel-terminal".to_string(),
                 alias: "terminal".to_string(),
@@ -3256,10 +3173,6 @@ mod tests {
             })
             .await
             .expect("install skill");
-        kernel
-            .enable_skill(installed.skill_id.clone())
-            .await
-            .expect("enable skill");
 
         let runtime_skills = kernel
             .runtime_visible_skills()
@@ -3281,11 +3194,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn staging_existing_enabled_skill_does_not_rename_active_alias() {
+    async fn reinstalling_existing_skill_can_move_current_alias() {
         let temp_dir = tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("lionclaw.db");
         let kernel = Kernel::new(&db_path).await.expect("kernel init");
-        let install = crate::contracts::SkillInstallRequest {
+        let alpha = crate::contracts::SkillInstallRequest {
             source: "local:/skills/channel-terminal".to_string(),
             alias: "alpha".to_string(),
             reference: Some("local".to_string()),
@@ -3293,51 +3206,28 @@ mod tests {
             skill_md: Some("---\nname: terminal\ndescription: terminal skill\n---\n".to_string()),
             snapshot_path: Some("/tmp/lionclaw-test-skills/terminal".to_string()),
         };
-        let installed = kernel
-            .install_skill(install.clone())
-            .await
-            .expect("install skill");
-        kernel
-            .enable_skill(installed.skill_id.clone())
-            .await
-            .expect("enable skill");
+        let _installed = kernel.install_skill(alpha).await.expect("install skill");
 
-        let mut staged = install;
-        staged.alias = "beta".to_string();
-        kernel
-            .stage_skill(staged)
-            .await
-            .expect("stage alias change");
-
-        let active = kernel
-            .list_skills()
-            .await
-            .expect("list skills")
-            .skills
-            .into_iter()
-            .find(|skill| skill.skill_id == installed.skill_id)
-            .expect("installed skill");
-        assert_eq!(active.alias, "alpha");
-        assert!(active.enabled);
-
-        kernel
-            .apply_skill_alias_states(vec![SkillAliasState {
-                skill_id: installed.skill_id.clone(),
+        let reinstalled = kernel
+            .install_skill(crate::contracts::SkillInstallRequest {
+                source: "local:/skills/channel-terminal".to_string(),
                 alias: "beta".to_string(),
-                enabled: true,
-            }])
+                reference: Some("local".to_string()),
+                hash: Some("hash".to_string()),
+                skill_md: Some(
+                    "---\nname: terminal\ndescription: terminal skill\n---\n".to_string(),
+                ),
+                snapshot_path: Some("/tmp/lionclaw-test-skills/terminal".to_string()),
+            })
             .await
-            .expect("apply staged alias state");
-        let active = kernel
-            .list_skills()
-            .await
-            .expect("list skills after apply")
-            .skills
-            .into_iter()
-            .find(|skill| skill.skill_id == installed.skill_id)
-            .expect("installed skill after apply");
-        assert_eq!(active.alias, "beta");
-        assert!(active.enabled);
+            .expect("reinstall skill under new alias");
+
+        assert_eq!(reinstalled.skill_id, installed.skill_id);
+
+        let active = kernel.list_skills().await.expect("list skills").skills;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].skill_id, installed.skill_id);
+        assert_eq!(active[0].alias, "beta");
     }
 
     #[tokio::test]
@@ -3376,10 +3266,6 @@ mod tests {
             })
             .await
             .expect("install skill");
-        kernel
-            .enable_skill(installed.skill_id)
-            .await
-            .expect("enable skill");
 
         let runtime_skills = kernel
             .runtime_visible_skills()
@@ -3431,10 +3317,6 @@ mod tests {
             })
             .await
             .expect("install skill");
-        kernel
-            .enable_skill(installed.skill_id)
-            .await
-            .expect("enable skill");
 
         let sections = kernel
             .build_prompt_sections()
@@ -3469,7 +3351,7 @@ mod tests {
         )
         .await
         .expect("kernel init");
-        let root_skill = kernel
+        let _root_skill = kernel
             .install_skill(crate::contracts::SkillInstallRequest {
                 source: "local:/tmp/root-skill".to_string(),
                 alias: "root-skill".to_string(),
@@ -3480,11 +3362,7 @@ mod tests {
             })
             .await
             .expect("install root skill");
-        kernel
-            .enable_skill(root_skill.skill_id)
-            .await
-            .expect("enable root skill");
-        let file_skill = kernel
+        let _file_skill = kernel
             .install_skill(crate::contracts::SkillInstallRequest {
                 source: "local:/tmp/file-skill".to_string(),
                 alias: "file-skill".to_string(),
@@ -3495,11 +3373,7 @@ mod tests {
             })
             .await
             .expect("install file skill");
-        kernel
-            .enable_skill(file_skill.skill_id)
-            .await
-            .expect("enable file skill");
-        let nested_skill = kernel
+        let _nested_skill = kernel
             .install_skill(crate::contracts::SkillInstallRequest {
                 source: "local:/tmp/nested-skill".to_string(),
                 alias: "nested-skill".to_string(),
@@ -3510,10 +3384,6 @@ mod tests {
             })
             .await
             .expect("install nested skill");
-        kernel
-            .enable_skill(nested_skill.skill_id)
-            .await
-            .expect("enable nested skill");
 
         let runtime_skills = kernel
             .runtime_visible_skills()
@@ -3549,7 +3419,7 @@ mod tests {
         kernel
             .bind_channel(crate::contracts::ChannelBindRequest {
                 channel_id: "terminal".to_string(),
-                skill_id: installed.skill_id.clone(),
+                skill_alias: installed.alias.clone(),
                 enabled: Some(true),
                 config: None,
             })
@@ -3586,7 +3456,7 @@ mod tests {
         kernel
             .bind_channel(crate::contracts::ChannelBindRequest {
                 channel_id: "terminal".to_string(),
-                skill_id: installed.skill_id.clone(),
+                skill_alias: installed.alias.clone(),
                 enabled: Some(true),
                 config: None,
             })
@@ -3633,7 +3503,7 @@ mod tests {
             .into_iter()
             .find(|skill| skill.skill_id == installed.skill_id)
             .expect("installed skill record");
-        assert!(persisted.enabled, "plain installs should be enabled");
+        assert_eq!(persisted.alias, "runtime-visible");
 
         let runtime_skills = kernel
             .runtime_visible_skills()
@@ -3664,9 +3534,9 @@ mod tests {
             .await
             .expect("install skill");
         kernel
-            .disable_skill(installed.skill_id.clone())
+            .remove_skill("runtime-visible")
             .await
-            .expect("disable skill");
+            .expect("remove skill alias");
 
         let reinstalled = kernel
             .install_skill(request)
@@ -3674,7 +3544,12 @@ mod tests {
             .expect("reinstall skill");
 
         assert_eq!(reinstalled.skill_id, installed.skill_id);
-        assert!(reinstalled.enabled, "reinstall should reactivate the skill");
+        let runtime_skills = kernel
+            .runtime_visible_skills()
+            .await
+            .expect("list runtime-visible skills");
+        assert_eq!(runtime_skills.len(), 1);
+        assert_eq!(runtime_skills[0].skill_id, installed.skill_id);
     }
 
     #[tokio::test]
@@ -4307,7 +4182,6 @@ fn to_skill_view(skill: super::skills::SkillRecord) -> SkillView {
         source: skill.source,
         reference: skill.reference,
         hash: skill.hash,
-        enabled: skill.enabled,
         installed_at: skill.installed_at,
     }
 }
@@ -4317,7 +4191,7 @@ fn to_channel_binding_view(
 ) -> ChannelBindingView {
     ChannelBindingView {
         channel_id: binding.channel_id,
-        skill_id: binding.skill_id,
+        skill_alias: binding.skill_alias,
         enabled: binding.enabled,
         config: binding.config,
         updated_at: binding.updated_at,
@@ -4587,16 +4461,6 @@ fn internal(err: anyhow::Error) -> KernelError {
 fn skill_install_error(err: anyhow::Error) -> KernelError {
     if let Some(err) = err.downcast_ref::<SkillAliasValidationError>() {
         KernelError::BadRequest(err.to_string())
-    } else if let Some(err) = err.downcast_ref::<SkillAliasConflict>() {
-        KernelError::Conflict(err.to_string())
-    } else {
-        internal(err)
-    }
-}
-
-fn skill_toggle_error(err: anyhow::Error) -> KernelError {
-    if let Some(err) = err.downcast_ref::<SkillAliasConflict>() {
-        KernelError::Conflict(err.to_string())
     } else {
         internal(err)
     }
@@ -5510,14 +5374,10 @@ impl Kernel {
         allowed_skill_ids: Option<&[String]>,
         turn_mode: RuntimeTurnMode,
     ) -> Result<RuntimeExecutionSkills, KernelError> {
-        let mut runtime_skills = self.runtime_visible_skills().await?;
-        if let Some(allowed_skill_ids) = allowed_skill_ids {
-            let allowed = allowed_skill_ids
-                .iter()
-                .map(String::as_str)
-                .collect::<HashSet<_>>();
-            runtime_skills.retain(|skill| allowed.contains(skill.skill_id.as_str()));
-        }
+        let runtime_skills = match allowed_skill_ids {
+            Some(skill_ids) => self.runtime_skills_for_ids(skill_ids).await?,
+            None => self.runtime_visible_skills().await?,
+        };
 
         let (runtime_skills, mounts) = match turn_mode {
             RuntimeTurnMode::Direct => (runtime_skills, Vec::new()),
@@ -5534,22 +5394,35 @@ impl Kernel {
         Ok(RuntimeExecutionSkills { skill_ids, mounts })
     }
 
+    async fn runtime_skills_for_ids(
+        &self,
+        skill_ids: &[String],
+    ) -> Result<Vec<SkillRecord>, KernelError> {
+        let mut runtime_skills = Vec::new();
+        for skill_id in skill_ids {
+            if let Some(skill) = self.skills.get(skill_id).await.map_err(internal)? {
+                runtime_skills.push(skill);
+            }
+        }
+        Ok(runtime_skills)
+    }
+
     async fn runtime_visible_skills(&self) -> Result<Vec<SkillRecord>, KernelError> {
-        let mut runtime_skills = self.skills.list_enabled().await.map_err(internal)?;
+        let mut runtime_skills = self.skills.list().await.map_err(internal)?;
         if runtime_skills.is_empty() {
             return Ok(runtime_skills);
         }
 
-        let host_only_skill_ids = self
+        let host_only_skill_aliases = self
             .channel_state
             .list_bindings()
             .await
             .map_err(internal)?
             .into_iter()
             .filter(|binding| binding.enabled)
-            .map(|binding| binding.skill_id)
+            .map(|binding| binding.skill_alias)
             .collect::<HashSet<_>>();
-        runtime_skills.retain(|skill| !host_only_skill_ids.contains(&skill.skill_id));
+        runtime_skills.retain(|skill| !host_only_skill_aliases.contains(&skill.alias));
         runtime_skills.sort_by(|left, right| left.alias.cmp(&right.alias));
         Ok(runtime_skills)
     }
@@ -5809,11 +5682,10 @@ impl Kernel {
 
         let skill_enabled = self
             .skills
-            .get(&binding.skill_id)
+            .get_enabled_by_alias(&binding.skill_alias)
             .await
             .map_err(internal)?
-            .map(|skill| skill.enabled)
-            .unwrap_or(false);
+            .is_some();
         if !skill_enabled {
             return Ok(None);
         }
@@ -7163,15 +7035,14 @@ impl Kernel {
 
         let skill_enabled = self
             .skills
-            .get(&binding.skill_id)
+            .get_enabled_by_alias(&binding.skill_alias)
             .await
             .map_err(internal)?
-            .map(|skill| skill.enabled)
-            .unwrap_or(false);
+            .is_some();
         if !skill_enabled {
             return Err(KernelError::Conflict(format!(
-                "channel '{}' binding skill '{}' is disabled",
-                channel_id, binding.skill_id
+                "channel '{}' binding skill '{}' is unavailable",
+                channel_id, binding.skill_alias
             )));
         }
 
