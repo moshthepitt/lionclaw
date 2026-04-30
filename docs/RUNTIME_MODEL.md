@@ -307,10 +307,20 @@ Operator-facing paths:
 - `lionclaw service status`
 - `lionclaw service logs`
 
+`lionclaw skill add` copies a skill into `~/.lionclaw/skills/<alias>`.
+`lionclaw skill rm` deletes that installed alias from disk. `lionclaw channel
+add --skill <alias>` makes that alias host-only; every other installed alias
+is runtime-visible by default.
+
 Background operation is explicit. If you want long-running channels,
 auto-restart, or channel attach to start the daemon for you, LionClaw uses the
 platform service manager for that job. The current managed-service
 implementation uses systemd user services.
+
+Direct `lionclaw run` reads the current installed skill and channel state each
+time it launches a runtime. Managed daemons read that state at startup, so
+skill or channel changes take effect after the daemon is restarted or
+reconciled through `lionclaw service up` or `lionclaw channel attach`.
 
 Raw HTTP is for workers, tests, and debugging. It is not the normal operator
 experience.

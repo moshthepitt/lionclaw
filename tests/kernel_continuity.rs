@@ -2238,7 +2238,7 @@ impl RuntimeAdapter for CapturePromptAdapter {
             .push(current_prompt.clone());
 
         if self.allow_hidden_compaction
-            && input.runtime_skills.is_empty()
+            && input.runtime_skill_ids.is_empty()
             && current_prompt.contains("lionclaw_compaction_handoff_v1")
         {
             let first_user = extract_compaction_user(&current_prompt, false);
@@ -2286,7 +2286,7 @@ impl RuntimeAdapter for CapturePromptAdapter {
 
         if self.request_fs_read {
             let skill_id = input
-                .runtime_skills
+                .runtime_skill_ids
                 .first()
                 .cloned()
                 .ok_or_else(|| anyhow!("runtime skill required"))?;
@@ -2369,7 +2369,7 @@ impl RuntimeAdapter for HangingHiddenCompactionAdapter {
         input: RuntimeTurnInput,
         events: RuntimeEventSender,
     ) -> Result<RuntimeTurnResult> {
-        if input.runtime_skills.is_empty()
+        if input.runtime_skill_ids.is_empty()
             && input.prompt.contains("lionclaw_compaction_handoff_v1")
         {
             std::future::pending::<()>().await;

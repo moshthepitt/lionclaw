@@ -48,10 +48,10 @@ impl RuntimeAdapter for MockRuntimeAdapter {
             text: "mock runtime started turn".to_string(),
         }));
 
-        let skill_context = if input.runtime_skills.is_empty() {
+        let skill_context = if input.runtime_skill_ids.is_empty() {
             "no runtime skills available".to_string()
         } else {
-            format!("runtime skills: {}", input.runtime_skills.join(", "))
+            format!("runtime skill ids: {}", input.runtime_skill_ids.join(", "))
         };
 
         drop(events.send(RuntimeEvent::MessageDelta {
@@ -60,7 +60,7 @@ impl RuntimeAdapter for MockRuntimeAdapter {
         }));
 
         let mut capability_requests = Vec::new();
-        if let Some(skill_id) = input.runtime_skills.first() {
+        if let Some(skill_id) = input.runtime_skill_ids.first() {
             for (index, (capability, payload)) in parse_capability_markers(&input.prompt)
                 .into_iter()
                 .enumerate()

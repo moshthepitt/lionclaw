@@ -294,7 +294,7 @@ pub struct SessionTurnResponse {
     pub session_id: Uuid,
     pub turn_id: Uuid,
     pub assistant_text: String,
-    pub runtime_skills: Vec<String>,
+    pub runtime_skill_ids: Vec<String>,
     pub runtime_id: String,
     pub stream_events: Vec<StreamEventDto>,
 }

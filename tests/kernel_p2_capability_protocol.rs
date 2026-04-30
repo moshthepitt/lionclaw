@@ -47,7 +47,7 @@ async fn runtime_capability_requests_are_kernel_gated() {
         .await
         .expect("turn before fs.read grant");
 
-    assert!(denied_turn.runtime_skills.contains(&skill_id));
+    assert!(denied_turn.runtime_skill_ids.contains(&skill_id));
     assert!(denied_turn.stream_events.iter().any(|event| {
         event.kind == StreamEventKindDto::Status
             && event
@@ -78,7 +78,7 @@ async fn runtime_capability_requests_are_kernel_gated() {
         .await
         .expect("turn after fs.read grant");
 
-    assert!(granted_turn.runtime_skills.contains(&skill_id));
+    assert!(granted_turn.runtime_skill_ids.contains(&skill_id));
     assert!(granted_turn.stream_events.iter().any(|event| {
         event.kind == StreamEventKindDto::Status
             && event

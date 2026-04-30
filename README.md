@@ -96,6 +96,10 @@ The confined runtime sees that project at `/workspace`. LionClaw keeps its own
 state, continuity, runtime cache, services, and config under `LIONCLAW_HOME`.
 Installed non-channel skills are mounted read-only under `/lionclaw/skills/<alias>`
 and projected into each runtime's native skill directory inside `/runtime/home`.
+`lionclaw skill add` copies a skill into that canonical skills directory, and
+`lionclaw skill rm` removes it physically. `lionclaw channel add --skill <alias>`
+makes that alias host-only; every other installed alias is runtime-visible by
+default.
 
 Runtime-specific provider settings stay with the runtime. For example, if a
 Codex profile leaves `model` unset, LionClaw reuses the current host Codex
@@ -154,6 +158,11 @@ or any future transport should not become part of the trusted Rust core.
 Skills can provide context to the selected runtime, run external workers, and
 connect LionClaw to the outside world. They cannot grant permissions by
 putting words in a prompt.
+
+Direct `lionclaw run` picks up the current installed skills and channels every
+time you start a new run. Managed daemons cache that applied state at startup,
+so after changing skills or channels you should rerun `lionclaw service up` or
+reattach the channel to reconcile and restart the daemon when needed.
 
 ## One Real Recurring Workflow
 
@@ -275,7 +284,8 @@ peer, resumes any still-running answer stream from the last durable checkpoint,
 and prints the pairing code and approval command on first contact. It only
 reuses a daemon when that daemon belongs to the same `LIONCLAW_HOME`, current
 project, and compatible daemon config, including runtime, preset, and workspace
-settings.
+settings. If installed skills or channel config changed since that daemon
+started, `channel attach` reconciles and restarts it before attaching.
 
 To run multiple local terminal channels at once, register multiple interactive
 channels and attach each one in its own terminal:

@@ -2283,7 +2283,7 @@ impl Kernel {
                 session_id: Uuid::new_v4(),
                 working_dir: execution_plan.working_dir.clone(),
                 environment: execution_plan.environment.clone(),
-                runtime_skills: Vec::new(),
+                runtime_skill_ids: Vec::new(),
                 runtime_state_root: None,
             })
             .await
@@ -2292,7 +2292,7 @@ impl Kernel {
         let turn_input = RuntimeTurnInput {
             runtime_session_id: handle.runtime_session_id.clone(),
             prompt,
-            runtime_skills: Vec::new(),
+            runtime_skill_ids: Vec::new(),
         };
         let runtime_secrets_mount = self.resolve_runtime_secrets_mount(&execution_plan).await?;
         let turn_outcome = timeout(hidden_compaction_turn_timeout, async {
@@ -4440,7 +4440,7 @@ impl Kernel {
                 session_id: session.session_id,
                 working_dir: execution_plan.working_dir.clone(),
                 environment: execution_plan.environment.clone(),
-                runtime_skills: runtime_skill_ids.clone(),
+                runtime_skill_ids: runtime_skill_ids.clone(),
                 runtime_state_root: Self::runtime_state_root(&execution_plan)
                     .map(Path::to_path_buf),
             })
@@ -4485,7 +4485,7 @@ impl Kernel {
                 input: RuntimeTurnInput {
                     runtime_session_id: handle.runtime_session_id.clone(),
                     prompt: prompt_envelope,
-                    runtime_skills: runtime_skill_ids.clone(),
+                    runtime_skill_ids: runtime_skill_ids.clone(),
                 },
                 stream_context: channel_stream_context.clone(),
                 event_sink: sink.clone(),
@@ -4714,7 +4714,7 @@ impl Kernel {
                 json!({
                     "turn_id": turn_id,
                     "runtime_id": runtime_id,
-                    "runtime_skills": runtime_skill_ids,
+                    "runtime_skill_ids": runtime_skill_ids,
                     "prompt_len": prompt_user_text.len(),
                     "runtime_preset_name": execution_plan.preset_name,
                     "runtime_working_dir": execution_plan.working_dir,
@@ -4730,7 +4730,7 @@ impl Kernel {
             session_id: session.session_id,
             turn_id,
             assistant_text: artifacts.assistant_text,
-            runtime_skills: runtime_skill_ids,
+            runtime_skill_ids,
             runtime_id,
             stream_events: artifacts.event_views,
         })

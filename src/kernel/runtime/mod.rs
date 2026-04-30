@@ -79,7 +79,7 @@ pub struct RuntimeSessionStartInput {
     pub session_id: Uuid,
     pub working_dir: Option<String>,
     pub environment: Vec<(String, String)>,
-    pub runtime_skills: Vec<String>,
+    pub runtime_skill_ids: Vec<String>,
     pub runtime_state_root: Option<PathBuf>,
 }
 
@@ -93,7 +93,7 @@ pub struct RuntimeSessionHandle {
 pub struct RuntimeTurnInput {
     pub runtime_session_id: String,
     pub prompt: String,
-    pub runtime_skills: Vec<String>,
+    pub runtime_skill_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

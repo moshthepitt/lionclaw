@@ -65,7 +65,7 @@ async fn fs_read_capability_executes_through_kernel_broker() {
         .await
         .expect("turn should succeed");
 
-    assert!(response.runtime_skills.contains(&skill_id));
+    assert!(response.runtime_skill_ids.contains(&skill_id));
     assert!(response.stream_events.iter().any(|event| {
         event.kind == StreamEventKindDto::Status
             && event
@@ -132,7 +132,7 @@ async fn invalid_capability_payload_is_denied_by_broker() {
         .await
         .expect("turn should complete with denied capability result");
 
-    assert!(response.runtime_skills.contains(&skill_id));
+    assert!(response.runtime_skill_ids.contains(&skill_id));
     assert!(response.stream_events.iter().any(|event| {
         event.kind == StreamEventKindDto::Status
             && event
@@ -388,7 +388,7 @@ impl RuntimeAdapter for SingleCapabilityRuntimeAdapter {
             text: "single capability runtime started turn".to_string(),
         });
         let capability_requests = input
-            .runtime_skills
+            .runtime_skill_ids
             .first()
             .map(|skill_id| RuntimeCapabilityRequest {
                 request_id: "req-1".to_string(),

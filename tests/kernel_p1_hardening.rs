@@ -51,7 +51,7 @@ async fn restart_persists_session_skill_policy_and_audit() {
             })
             .await
             .expect("turn should succeed");
-        assert!(turn.runtime_skills.contains(&skill_id));
+        assert!(turn.runtime_skill_ids.contains(&skill_id));
         assert!(turn.stream_events.iter().any(|event| {
             event
                 .text
@@ -91,7 +91,7 @@ async fn restart_persists_session_skill_policy_and_audit() {
         })
         .await
         .expect("turn after restart");
-    assert!(turn_after_restart.runtime_skills.contains(&skill_id));
+    assert!(turn_after_restart.runtime_skill_ids.contains(&skill_id));
     assert!(turn_after_restart.stream_events.iter().any(|event| {
         event
             .text
@@ -147,7 +147,7 @@ async fn expiring_policy_grant_is_enforced() {
         })
         .await
         .expect("turn during ttl");
-    assert!(allowed_turn.runtime_skills.contains(&skill_id));
+    assert!(allowed_turn.runtime_skill_ids.contains(&skill_id));
     assert!(allowed_turn.stream_events.iter().any(|event| {
         event
             .text
@@ -168,7 +168,7 @@ async fn expiring_policy_grant_is_enforced() {
         })
         .await
         .expect("turn after ttl");
-    assert!(denied_turn.runtime_skills.contains(&skill_id));
+    assert!(denied_turn.runtime_skill_ids.contains(&skill_id));
     assert!(denied_turn.stream_events.iter().any(|event| {
         event
             .text
