@@ -49,8 +49,9 @@ async fn fs_read_capability_executes_through_kernel_broker() {
         .await;
 
     let (session_id, skill_id) =
-        prepare_session_with_skill(&kernel, "peer-cap-broker-fs", "broker-fs-read").await;
-    grant_capability(&kernel, &skill_id, "fs.read").await;
+        prepare_session_with_skill(env.home(), &kernel, "peer-cap-broker-fs", "broker-fs-read")
+            .await;
+    grant_capability(&kernel, "broker-fs-read", "fs.read").await;
 
     let response = kernel
         .turn_session(SessionTurnRequest {
@@ -64,6 +65,7 @@ async fn fs_read_capability_executes_through_kernel_broker() {
         .await
         .expect("turn should succeed");
 
+    assert!(response.runtime_skills.contains(&skill_id));
     assert!(response.stream_events.iter().any(|event| {
         event.kind == StreamEventKindDto::Status
             && event
@@ -109,10 +111,14 @@ async fn invalid_capability_payload_is_denied_by_broker() {
         )
         .await;
 
-    let (session_id, skill_id) =
-        prepare_session_with_skill(&kernel, "peer-cap-broker-invalid", "broker-invalid-payload")
-            .await;
-    grant_capability(&kernel, &skill_id, "fs.read").await;
+    let (session_id, skill_id) = prepare_session_with_skill(
+        env.home(),
+        &kernel,
+        "peer-cap-broker-invalid",
+        "broker-invalid-payload",
+    )
+    .await;
+    grant_capability(&kernel, "broker-invalid-payload", "fs.read").await;
 
     let response = kernel
         .turn_session(SessionTurnRequest {
@@ -126,6 +132,7 @@ async fn invalid_capability_payload_is_denied_by_broker() {
         .await
         .expect("turn should complete with denied capability result");
 
+    assert!(response.runtime_skills.contains(&skill_id));
     assert!(response.stream_events.iter().any(|event| {
         event.kind == StreamEventKindDto::Status
             && event
@@ -160,8 +167,13 @@ async fn runtime_cannot_override_kernel_selected_scope() {
     );
     env.install_skill("broker-scope-guard", &skill_source).await;
     let kernel = env.kernel().await;
-    let (session_id, _skill_id) =
-        prepare_session_with_skill(&kernel, "peer-cap-broker-scope", "broker-scope-guard").await;
+    let (session_id, _skill_id) = prepare_session_with_skill(
+        env.home(),
+        &kernel,
+        "peer-cap-broker-scope",
+        "broker-scope-guard",
+    )
+    .await;
     let created = kernel
         .create_job(JobCreateRequest {
             name: "scope guard".to_string(),
@@ -283,9 +295,9 @@ async fn channel_send_capability_uses_session_channel_defaults() {
         })
         .await
         .expect("approve peer");
-    let (session_id, runtime_skill_id) =
-        prepare_session_with_skill(&kernel, peer_id, "broker-channel-send").await;
-    grant_capability(&kernel, &runtime_skill_id, "channel.send").await;
+    let (session_id, _runtime_skill_id) =
+        prepare_session_with_skill(env.home(), &kernel, peer_id, "broker-channel-send").await;
+    grant_capability(&kernel, "broker-channel-send", "channel.send").await;
 
     let response = kernel
         .turn_session(SessionTurnRequest {
@@ -430,6 +442,7 @@ impl RuntimeAdapter for SingleCapabilityRuntimeAdapter {
 }
 
 async fn prepare_session_with_skill(
+    home: &lionclaw::home::LionClawHome,
     kernel: &Kernel,
     peer_id: &str,
     skill_alias: &str,
@@ -443,22 +456,20 @@ async fn prepare_session_with_skill(
         })
         .await
         .expect("open session");
-    let skill_id = kernel
-        .list_skills()
+    let skill_id = lionclaw::applied::AppliedState::load(home)
         .await
-        .expect("list skills")
-        .skills
-        .into_iter()
-        .find(|skill| skill.alias == skill_alias)
+        .expect("load applied state")
+        .skill_by_alias(skill_alias)
         .expect("installed skill")
-        .skill_id;
+        .skill_id
+        .clone();
     (session.session_id, skill_id)
 }
 
-async fn grant_capability(kernel: &Kernel, skill_id: &str, capability: &str) {
+async fn grant_capability(kernel: &Kernel, skill_alias: &str, capability: &str) {
     kernel
         .grant_policy(PolicyGrantRequest {
-            skill_id: skill_id.to_string(),
+            skill_alias: skill_alias.to_string(),
             capability: capability.to_string(),
             scope: "*".to_string(),
             ttl_seconds: None,

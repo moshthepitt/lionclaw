@@ -41,13 +41,12 @@ LionClaw splits responsibility into three classes.
 The Rust kernel owns:
 
 - sessions and turn history
-- runtime profiles and execution presets
 - runtime launch plans
-- channel bindings, peer approval, inbound queues, outbound streams
+- channel peer approval, inbound queues, outbound streams
 - scheduler definitions and run records
-- installed skill snapshots
-- assistant-home continuity files and derived search index
 - policy grants and audit events
+- assistant-home continuity files and derived search index
+- the applied runtime view loaded from operator config and filesystem-installed skills
 
 Kernel-owned mutations are policy checked where privileged and audited where
 security or operator visibility matters.
@@ -83,14 +82,14 @@ Skill text can influence prompt context. It cannot grant permissions.
 
 - `kernel.sessions`: session lifecycle, history policy, and aggregate turn metadata.
 - `kernel.session_turns`: durable per-turn history, recovery state, and partial assistant output.
-- `kernel.skills`: installed skill registry and current alias ownership.
+- `kernel.skills`: skill alias validation and installed-skill metadata helpers.
 - `kernel.policy`: capability grant/revoke and allow checks.
 - `kernel.jobs`: scheduled job definitions, run records, and SQLite persistence.
 - `kernel.capability_broker`: explicit brokered capability execution for direct runtimes and narrow kernel surfaces.
 - `kernel.runtime`: runtime adapter contract and registry.
 - `kernel.runtime.execution`: execution presets, plan compilation, OCI backend, and process execution.
 - `kernel.scheduler`: due-job claiming, lease coordination, retry, and dispatch.
-- `kernel.channel_state`: channel bindings, peer trust state, inbound logs, queued turns, outbound stream state, and transcript history.
+- `kernel.channel_state`: channel peer trust state, inbound logs, queued turns, outbound stream state, and transcript history.
 - `kernel.continuity`: assistant-home continuity files, `ACTIVE.md` projection, daily notes, artifacts, open loops, proposals, and retrieval helpers.
 - `kernel.continuity_fs`: descriptor-rooted Unix filesystem helper for assistant-home continuity.
 - `kernel.session_compactions`: persisted transcript compaction summaries and ranges.
@@ -239,10 +238,6 @@ with the CLI.
 - `POST /v0/sessions/history`
 - `POST /v0/sessions/action`
 - `POST /v0/sessions/turn`
-
-### Skill
-
-- `GET /v0/skills/list`
 
 ### Channel
 

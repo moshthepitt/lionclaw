@@ -4,7 +4,7 @@ use std::{
 };
 
 use lionclaw::{
-    applied::AppliedState,
+    applied::{AppliedSkill, AppliedState},
     home::LionClawHome,
     kernel::{Kernel, KernelOptions},
     operator::{
@@ -85,6 +85,27 @@ impl TestHome {
         Kernel::new_with_options(&self.home.db_path(), options)
             .await
             .expect("kernel init")
+    }
+
+    pub async fn installed_skill(&self, alias: &str) -> AppliedSkill {
+        AppliedState::load(&self.home)
+            .await
+            .expect("load applied state")
+            .skill_by_alias(alias)
+            .cloned()
+            .expect("installed skill")
+    }
+
+    pub async fn installed_skill_id(&self, alias: &str) -> String {
+        self.installed_skill(alias).await.skill_id
+    }
+
+    pub async fn installed_skills(&self) -> Vec<AppliedSkill> {
+        AppliedState::load(&self.home)
+            .await
+            .expect("load applied state")
+            .skills()
+            .to_vec()
     }
 }
 

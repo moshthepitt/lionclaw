@@ -36,7 +36,6 @@ pub struct SchedulerJobRecord {
     pub runtime_id: String,
     pub schedule: JobSchedule,
     pub prompt_text: String,
-    pub skill_ids: Vec<String>,
     pub delivery: Option<JobDeliveryTarget>,
     pub retry_attempts: u32,
     pub next_run_at: Option<DateTime<Utc>>,
@@ -176,7 +175,6 @@ pub struct NewSchedulerJob {
     pub runtime_id: String,
     pub schedule: JobSchedule,
     pub prompt_text: String,
-    pub skill_ids: Vec<String>,
     pub delivery: Option<JobDeliveryTarget>,
     pub retry_attempts: u32,
 }
@@ -228,6 +226,7 @@ impl JobStore {
         &self,
         policy: &PolicyStore,
         input: NewSchedulerJob,
+        grant_skill_ids: &[String],
         allowed_capabilities: &[Capability],
     ) -> Result<SchedulerJobRecord> {
         let mut tx = self
@@ -236,7 +235,13 @@ impl JobStore {
             .await
             .context("failed to start create scheduler job transaction")?;
         let created = self
-            .create_job_with_scope_grants_in_tx(&mut tx, policy, input, allowed_capabilities)
+            .create_job_with_scope_grants_in_tx(
+                &mut tx,
+                policy,
+                input,
+                grant_skill_ids,
+                allowed_capabilities,
+            )
             .await?;
         tx.commit()
             .await
@@ -249,11 +254,12 @@ impl JobStore {
         tx: &mut Transaction<'_, Sqlite>,
         policy: &PolicyStore,
         input: NewSchedulerJob,
+        grant_skill_ids: &[String],
         allowed_capabilities: &[Capability],
     ) -> Result<SchedulerJobRecord> {
         let created = self.insert_job_in_tx(tx, input).await?;
         let scope = Scope::Job(created.job_id);
-        for skill_id in &created.skill_ids {
+        for skill_id in grant_skill_ids {
             for capability in allowed_capabilities {
                 policy
                     .grant_in_tx(tx, skill_id.clone(), *capability, scope.clone(), None)
@@ -274,8 +280,6 @@ impl JobStore {
         let schedule_kind = schedule_kind(&input.schedule);
         let schedule_json =
             serde_json::to_string(&input.schedule).context("failed to encode job schedule")?;
-        let skill_ids_json =
-            serde_json::to_string(&input.skill_ids).context("failed to encode job skills")?;
         let delivery_json = input
             .delivery
             .as_ref()
@@ -286,9 +290,9 @@ impl JobStore {
         sqlx::query(
             "INSERT INTO scheduler_jobs \
              (job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
-              skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, \
+              delivery_json, retry_attempts, next_run_at_ms, running_run_id, \
               last_run_at_ms, last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms) \
-             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, NULL, NULL, 0, ?11, ?11)",
+             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, NULL, NULL, 0, ?10, ?10)",
         )
         .bind(job_id.to_string())
         .bind(&input.name)
@@ -296,7 +300,6 @@ impl JobStore {
         .bind(schedule_kind)
         .bind(schedule_json)
         .bind(&input.prompt_text)
-        .bind(skill_ids_json)
         .bind(delivery_json)
         .bind(i64::from(input.retry_attempts))
         .bind(next_run_at.map(|value| value.timestamp_millis()))
@@ -313,7 +316,7 @@ impl JobStore {
     pub async fn list_jobs(&self) -> Result<Vec<SchedulerJobRecord>> {
         let rows = sqlx::query(
             "SELECT job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
-             skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
+             delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
              last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms \
              FROM scheduler_jobs \
              ORDER BY created_at_ms DESC, job_id DESC",
@@ -328,7 +331,7 @@ impl JobStore {
     pub async fn list_attention_jobs(&self, limit: usize) -> Result<Vec<SchedulerJobRecord>> {
         let rows = sqlx::query(
             "SELECT job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
-             skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
+             delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
              last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms \
              FROM scheduler_jobs \
              WHERE last_status IN ('failed', 'dead_letter', 'interrupted') \
@@ -538,7 +541,7 @@ impl JobStore {
     ) -> Result<Option<SchedulerJobRecord>> {
         let row = sqlx::query(
             "SELECT job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
-             skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
+             delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
              last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms \
              FROM scheduler_jobs \
              WHERE job_id = ?1",
@@ -559,7 +562,7 @@ impl JobStore {
     ) -> Result<Option<SchedulerJobRecord>> {
         let row = sqlx::query(
             "SELECT job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
-             skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
+             delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
              last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms \
              FROM scheduler_jobs \
              WHERE job_id = ?1",
@@ -821,7 +824,7 @@ impl JobStore {
         let limit = i64::try_from(limit).context("claim limit is too large")?;
         let rows = sqlx::query(
             "SELECT job_id, name, enabled, runtime_id, schedule_kind, schedule_json, prompt_text, \
-             skill_ids_json, delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
+             delivery_json, retry_attempts, next_run_at_ms, running_run_id, last_run_at_ms, \
              last_status, last_error, consecutive_failures, created_at_ms, updated_at_ms \
              FROM scheduler_jobs \
              WHERE enabled = 1 AND running_run_id IS NULL AND next_run_at_ms IS NOT NULL AND next_run_at_ms <= ?1 \
@@ -1371,7 +1374,6 @@ pub fn normalize_cron_expression(expr: &str) -> Result<String> {
 fn map_job_row(row: SqliteRow) -> Result<SchedulerJobRecord> {
     let job_id_raw: String = row.get("job_id");
     let schedule_json: String = row.get("schedule_json");
-    let skill_ids_json: String = row.get("skill_ids_json");
     let delivery_json: Option<String> = row.get("delivery_json");
     let retry_attempts_raw: i64 = row.get("retry_attempts");
     let next_run_at_ms: Option<i64> = row.get("next_run_at_ms");
@@ -1386,8 +1388,6 @@ fn map_job_row(row: SqliteRow) -> Result<SchedulerJobRecord> {
         .with_context(|| format!("invalid scheduler job id '{job_id_raw}'"))?;
     let schedule: JobSchedule =
         serde_json::from_str(&schedule_json).context("failed to decode scheduler job schedule")?;
-    let skill_ids: Vec<String> =
-        serde_json::from_str(&skill_ids_json).context("failed to decode scheduler job skills")?;
     let delivery = delivery_json
         .as_deref()
         .map(|value| serde_json::from_str(value).context("failed to decode scheduler job delivery"))
@@ -1407,7 +1407,6 @@ fn map_job_row(row: SqliteRow) -> Result<SchedulerJobRecord> {
         runtime_id: row.get("runtime_id"),
         schedule,
         prompt_text: row.get("prompt_text"),
-        skill_ids,
         delivery,
         retry_attempts: u32::try_from(retry_attempts_raw)
             .with_context(|| format!("invalid retry_attempts '{retry_attempts_raw}'"))?,
@@ -1561,16 +1560,15 @@ mod tests {
                         run_at: Utc::now() + ChronoDuration::minutes(1),
                     },
                     prompt_text: "prompt".to_string(),
-                    skill_ids: vec!["scheduler-skill".to_string()],
                     delivery: None,
                     retry_attempts: 1,
                 },
+                &["scheduler-skill".to_string()],
                 &[Capability::FsRead],
             )
             .await
             .expect("job creation should succeed");
 
-        assert_eq!(created.skill_ids, vec!["scheduler-skill".to_string()]);
         assert!(
             policy
                 .is_allowed(
@@ -1604,7 +1602,6 @@ mod tests {
                     run_at: initial_run_at,
                 },
                 prompt_text: "prompt".to_string(),
-                skill_ids: Vec::new(),
                 delivery: None,
                 retry_attempts: 0,
             })
@@ -1645,7 +1642,6 @@ mod tests {
                     anchor_ms: anchor.timestamp_millis(),
                 },
                 prompt_text: "prompt".to_string(),
-                skill_ids: Vec::new(),
                 delivery: None,
                 retry_attempts: 1,
             })
@@ -1693,7 +1689,6 @@ mod tests {
                     run_at: Utc::now() - ChronoDuration::minutes(1),
                 },
                 prompt_text: "prompt".to_string(),
-                skill_ids: Vec::new(),
                 delivery: None,
                 retry_attempts: 1,
             })
@@ -1735,7 +1730,6 @@ mod tests {
                     run_at: Utc::now() - ChronoDuration::minutes(1),
                 },
                 prompt_text: "prompt".to_string(),
-                skill_ids: Vec::new(),
                 delivery: None,
                 retry_attempts: 1,
             })
@@ -1824,7 +1818,6 @@ mod tests {
                     run_at: Utc::now() - ChronoDuration::minutes(1),
                 },
                 prompt_text: "prompt".to_string(),
-                skill_ids: Vec::new(),
                 delivery: None,
                 retry_attempts: 0,
             })
@@ -1876,7 +1869,6 @@ mod tests {
                     run_at: Utc::now() + ChronoDuration::minutes(1),
                 },
                 prompt_text: "prompt".to_string(),
-                skill_ids: Vec::new(),
                 delivery: None,
                 retry_attempts: 0,
             })
@@ -1890,7 +1882,6 @@ mod tests {
                     run_at: Utc::now() + ChronoDuration::minutes(2),
                 },
                 prompt_text: "prompt".to_string(),
-                skill_ids: Vec::new(),
                 delivery: None,
                 retry_attempts: 0,
             })
@@ -1904,7 +1895,6 @@ mod tests {
                     run_at: Utc::now() + ChronoDuration::minutes(3),
                 },
                 prompt_text: "prompt".to_string(),
-                skill_ids: Vec::new(),
                 delivery: None,
                 retry_attempts: 0,
             })

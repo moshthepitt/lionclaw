@@ -300,25 +300,8 @@ pub struct SessionTurnResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillView {
-    pub skill_id: String,
-    pub alias: String,
-    pub name: String,
-    pub description: String,
-    pub source: String,
-    pub reference: Option<String>,
-    pub hash: String,
-    pub installed_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillListResponse {
-    pub skills: Vec<SkillView>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyGrantRequest {
-    pub skill_id: String,
+    pub skill_alias: String,
     pub capability: String,
     pub scope: String,
     pub ttl_seconds: Option<i64>,
@@ -327,7 +310,7 @@ pub struct PolicyGrantRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyGrantResponse {
     pub grant_id: Uuid,
-    pub skill_id: String,
+    pub skill_alias: String,
     pub capability: String,
     pub scope: String,
     pub expires_at: Option<DateTime<Utc>>,

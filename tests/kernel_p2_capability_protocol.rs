@@ -33,14 +33,7 @@ async fn runtime_capability_requests_are_kernel_gated() {
         })
         .await
         .expect("open session");
-    let skill = kernel
-        .list_skills()
-        .await
-        .expect("list skills")
-        .skills
-        .into_iter()
-        .find(|skill| skill.alias == "capability-protocol")
-        .expect("installed skill");
+    let skill_id = env.installed_skill_id("capability-protocol").await;
 
     let denied_turn = kernel
         .turn_session(SessionTurnRequest {
@@ -54,6 +47,7 @@ async fn runtime_capability_requests_are_kernel_gated() {
         .await
         .expect("turn before fs.read grant");
 
+    assert!(denied_turn.runtime_skills.contains(&skill_id));
     assert!(denied_turn.stream_events.iter().any(|event| {
         event.kind == StreamEventKindDto::Status
             && event
@@ -64,7 +58,7 @@ async fn runtime_capability_requests_are_kernel_gated() {
 
     kernel
         .grant_policy(PolicyGrantRequest {
-            skill_id: skill.skill_id.clone(),
+            skill_alias: "capability-protocol".to_string(),
             capability: "fs.read".to_string(),
             scope: "*".to_string(),
             ttl_seconds: None,
@@ -84,6 +78,7 @@ async fn runtime_capability_requests_are_kernel_gated() {
         .await
         .expect("turn after fs.read grant");
 
+    assert!(granted_turn.runtime_skills.contains(&skill_id));
     assert!(granted_turn.stream_events.iter().any(|event| {
         event.kind == StreamEventKindDto::Status
             && event

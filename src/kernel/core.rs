@@ -35,8 +35,8 @@ use crate::contracts::{
     SchedulerJobTriggerKindDto, SessionActionKind, SessionActionRequest, SessionActionResponse,
     SessionHistoryPolicy, SessionHistoryRequest, SessionHistoryResponse, SessionLatestQuery,
     SessionLatestResponse, SessionOpenRequest, SessionOpenResponse, SessionTurnKind,
-    SessionTurnRequest, SessionTurnResponse, SessionTurnStatus, SessionTurnView, SkillListResponse,
-    SkillView, StreamEventDto, StreamEventKindDto, StreamLaneDto, TrustTier,
+    SessionTurnRequest, SessionTurnResponse, SessionTurnStatus, SessionTurnView, StreamEventDto,
+    StreamEventKindDto, StreamLaneDto, TrustTier,
 };
 use crate::{
     applied::{AppliedChannel, AppliedSkill, AppliedState},
@@ -753,7 +753,6 @@ impl Kernel {
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
                     runtime_env_passthrough: None,
-                    allowed_runtime_skill_ids: None,
                     default_policy_scope: Scope::Session(session_id),
                     sink,
                     emit_channel_stream_done: true,
@@ -773,7 +772,6 @@ impl Kernel {
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
                 runtime_env_passthrough: None,
-                allowed_runtime_skill_ids: None,
                 default_policy_scope: Scope::Session(session_id),
                 sink,
                 emit_channel_stream_done: true,
@@ -802,18 +800,6 @@ impl Kernel {
         sink: RuntimeEventSink,
     ) -> Result<SessionTurnResponse, KernelError> {
         self.turn_session_with_sink(req, Some(sink)).await
-    }
-
-    pub async fn list_skills(&self) -> Result<SkillListResponse, KernelError> {
-        let skills = self
-            .applied_state
-            .skills()
-            .iter()
-            .cloned()
-            .map(to_skill_view)
-            .collect::<Vec<_>>();
-
-        Ok(SkillListResponse { skills })
     }
 
     pub async fn list_channels(&self) -> Result<ChannelListResponse, KernelError> {
@@ -1412,7 +1398,12 @@ impl Kernel {
         &self,
         req: PolicyGrantRequest,
     ) -> Result<PolicyGrantResponse, KernelError> {
-        if self.applied_state.skill_by_id(&req.skill_id).is_none() {
+        let skill = self
+            .applied_state
+            .skill_by_alias(&req.skill_alias)
+            .cloned()
+            .ok_or_else(|| KernelError::NotFound("skill not found".to_string()))?;
+        if self.applied_state.skill_by_id(&skill.skill_id).is_none() {
             return Err(KernelError::NotFound("skill not found".to_string()));
         }
 
@@ -1431,7 +1422,7 @@ impl Kernel {
 
         let grant = self
             .policy
-            .grant(req.skill_id, capability, scope, req.ttl_seconds)
+            .grant(skill.skill_id.clone(), capability, scope, req.ttl_seconds)
             .await
             .map_err(internal)?;
 
@@ -1442,6 +1433,7 @@ impl Kernel {
                 Some("api".to_string()),
                 json!({
                     "grant_id": grant.grant_id,
+                    "skill_alias": skill.alias,
                     "skill_id": grant.skill_id,
                     "capability": grant.capability.as_str(),
                     "scope": grant.scope.as_str(),
@@ -1453,7 +1445,7 @@ impl Kernel {
 
         Ok(PolicyGrantResponse {
             grant_id: grant.grant_id,
-            skill_id: grant.skill_id,
+            skill_alias: skill.alias,
             capability: grant.capability.as_str().to_string(),
             scope: grant.scope.as_str(),
             expires_at: grant.expires_at,
@@ -1525,8 +1517,8 @@ impl Kernel {
         let schedule = job_schedule_from_dto(req.schedule)
             .map_err(|err| KernelError::BadRequest(err.to_string()))?;
         let retry_attempts = req.retry_attempts.unwrap_or(1);
-        let skill_ids = self
-            .resolve_runtime_execution_skills(None, adapter.turn_mode())
+        let grant_skill_ids = self
+            .resolve_runtime_execution_skills(adapter.turn_mode())
             .await?
             .skill_ids;
         let delivery = req
@@ -1564,10 +1556,10 @@ impl Kernel {
                     runtime_id,
                     schedule,
                     prompt_text,
-                    skill_ids,
                     delivery,
                     retry_attempts,
                 },
+                &grant_skill_ids,
                 &allowed_capabilities,
             )
             .await
@@ -1583,7 +1575,11 @@ impl Kernel {
                     "job_id": created.job_id,
                     "name": created.name,
                     "runtime_id": created.runtime_id,
-                    "runtime_skill_ids": created.skill_ids,
+                    "granted_skill_ids": grant_skill_ids,
+                    "allowed_capabilities": allowed_capabilities
+                        .iter()
+                        .map(|capability| capability.as_str())
+                        .collect::<Vec<_>>(),
                     "retry_attempts": created.retry_attempts,
                     "delivery": created.delivery,
                 }),
@@ -2464,7 +2460,6 @@ impl Kernel {
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
                 runtime_env_passthrough: None,
-                allowed_runtime_skill_ids: None,
                 default_policy_scope: Scope::Job(job.job_id),
                 sink: None,
                 emit_channel_stream_done: true,
@@ -3674,19 +3669,6 @@ mod tests {
     }
 }
 
-fn to_skill_view(skill: AppliedSkill) -> SkillView {
-    SkillView {
-        skill_id: skill.skill_id,
-        alias: skill.alias,
-        name: skill.name,
-        description: skill.description,
-        source: skill.source,
-        reference: skill.reference,
-        hash: skill.hash,
-        installed_at: skill.installed_at,
-    }
-}
-
 fn to_channel_binding_view(binding: AppliedChannel) -> ChannelBindingView {
     ChannelBindingView {
         channel_id: binding.id,
@@ -4206,7 +4188,6 @@ struct SessionTurnExecution {
     runtime_working_dir: Option<String>,
     runtime_timeout_ms: Option<u64>,
     runtime_env_passthrough: Option<Vec<String>>,
-    allowed_runtime_skill_ids: Option<Vec<String>>,
     default_policy_scope: Scope,
     sink: Option<RuntimeEventSink>,
     emit_channel_stream_done: bool,
@@ -4355,7 +4336,6 @@ impl Kernel {
                 runtime_working_dir: req.runtime_working_dir,
                 runtime_timeout_ms: req.runtime_timeout_ms,
                 runtime_env_passthrough: req.runtime_env_passthrough,
-                allowed_runtime_skill_ids: None,
                 default_policy_scope: Scope::Session(req.session_id),
                 sink,
                 emit_channel_stream_done: true,
@@ -4389,7 +4369,6 @@ impl Kernel {
             runtime_working_dir,
             runtime_timeout_ms,
             runtime_env_passthrough,
-            allowed_runtime_skill_ids,
             default_policy_scope,
             sink,
             emit_channel_stream_done,
@@ -4418,10 +4397,7 @@ impl Kernel {
             skill_ids: runtime_skill_ids,
             mounts: skill_mounts,
         } = self
-            .resolve_runtime_execution_skills(
-                allowed_runtime_skill_ids.as_deref(),
-                adapter.turn_mode(),
-            )
+            .resolve_runtime_execution_skills(adapter.turn_mode())
             .await?;
         let execution_plan = self
             .resolve_runtime_execution_plan(
@@ -4861,14 +4837,9 @@ impl Kernel {
 
     async fn resolve_runtime_execution_skills(
         &self,
-        allowed_skill_ids: Option<&[String]>,
         turn_mode: RuntimeTurnMode,
     ) -> Result<RuntimeExecutionSkills, KernelError> {
-        let runtime_skills = match allowed_skill_ids {
-            Some(skill_ids) => self.runtime_skills_for_ids(skill_ids).await?,
-            None => self.runtime_visible_skills().await?,
-        };
-
+        let runtime_skills = self.runtime_visible_skills().await?;
         let (runtime_skills, mounts) = match turn_mode {
             RuntimeTurnMode::Direct => (runtime_skills, Vec::new()),
             RuntimeTurnMode::ProgramBacked => {
@@ -4882,20 +4853,6 @@ impl Kernel {
             .collect();
 
         Ok(RuntimeExecutionSkills { skill_ids, mounts })
-    }
-
-    async fn runtime_skills_for_ids(
-        &self,
-        skill_ids: &[String],
-    ) -> Result<Vec<AppliedSkill>, KernelError> {
-        let mut runtime_skills = Vec::new();
-        for skill_id in skill_ids {
-            let Some(skill) = self.applied_state.skill_by_id(skill_id).cloned() else {
-                continue;
-            };
-            runtime_skills.push(skill);
-        }
-        Ok(runtime_skills)
     }
 
     async fn runtime_visible_skills(&self) -> Result<Vec<AppliedSkill>, KernelError> {
@@ -5619,7 +5576,6 @@ impl Kernel {
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
                     runtime_env_passthrough: None,
-                    allowed_runtime_skill_ids: None,
                     default_policy_scope: Scope::Session(turn.session_id),
                     sink: None,
                     emit_channel_stream_done: false,

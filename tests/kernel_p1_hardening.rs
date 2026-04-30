@@ -28,19 +28,11 @@ async fn restart_persists_session_skill_policy_and_audit() {
     let (session_id, skill_id, grant_id) = {
         let kernel = env.kernel().await;
         let opened = open_main_session(&kernel, "peer-restart").await;
-        let skill_id = kernel
-            .list_skills()
-            .await
-            .expect("list skills")
-            .skills
-            .into_iter()
-            .find(|skill| skill.alias == "restart-skill")
-            .expect("installed skill")
-            .skill_id;
+        let skill_id = env.installed_skill_id("restart-skill").await;
 
         let grant = kernel
             .grant_policy(PolicyGrantRequest {
-                skill_id: skill_id.clone(),
+                skill_alias: "restart-skill".to_string(),
                 capability: "fs.read".to_string(),
                 scope: "*".to_string(),
                 ttl_seconds: None,
@@ -84,14 +76,8 @@ async fn restart_persists_session_skill_policy_and_audit() {
     };
 
     let kernel = env.kernel().await;
-    let persisted_skill = kernel
-        .list_skills()
-        .await
-        .expect("list skills")
-        .skills
-        .into_iter()
-        .find(|skill| skill.skill_id == skill_id)
-        .expect("installed skill must persist");
+    let persisted_skill = env.installed_skill("restart-skill").await;
+    assert_eq!(persisted_skill.skill_id, skill_id);
     assert_eq!(persisted_skill.alias, "restart-skill");
 
     let turn_after_restart = kernel
@@ -138,19 +124,11 @@ async fn expiring_policy_grant_is_enforced() {
     let kernel = env.kernel().await;
 
     let opened = open_main_session(&kernel, "peer-ttl").await;
-    let skill_id = kernel
-        .list_skills()
-        .await
-        .expect("list skills")
-        .skills
-        .into_iter()
-        .find(|skill| skill.alias == "ttl-skill")
-        .expect("installed skill")
-        .skill_id;
+    let skill_id = env.installed_skill_id("ttl-skill").await;
 
     kernel
         .grant_policy(PolicyGrantRequest {
-            skill_id: skill_id.clone(),
+            skill_alias: "ttl-skill".to_string(),
             capability: "fs.read".to_string(),
             scope: "*".to_string(),
             ttl_seconds: Some(1),
@@ -301,13 +279,13 @@ async fn skill_add_is_idempotent_and_policy_revoke_is_safe_to_repeat() {
     env.install_skill("repeat-skill", &skill_source).await;
     let kernel = env.kernel().await;
 
-    let skills = kernel.list_skills().await.expect("list skills").skills;
+    let skills = env.installed_skills().await;
     assert_eq!(skills.len(), 1);
     assert_eq!(skills[0].alias, "repeat-skill");
 
     let grant = kernel
         .grant_policy(PolicyGrantRequest {
-            skill_id: skills[0].skill_id.clone(),
+            skill_alias: "repeat-skill".to_string(),
             capability: "fs.read".to_string(),
             scope: "*".to_string(),
             ttl_seconds: None,
@@ -336,17 +314,7 @@ async fn skill_add_replaces_alias_revision() {
     let env = TestHome::new().await;
     let skill_source = write_skill_source(env.temp_dir(), "active-skill", "first revision", false);
     env.install_skill("active-alias", &skill_source).await;
-    let first_skill_id = env
-        .kernel()
-        .await
-        .list_skills()
-        .await
-        .expect("list skills")
-        .skills
-        .into_iter()
-        .find(|skill| skill.alias == "active-alias")
-        .expect("first skill")
-        .skill_id;
+    let first_skill_id = env.installed_skill_id("active-alias").await;
 
     std::fs::write(
         skill_source.join("SKILL.md"),
@@ -355,16 +323,7 @@ async fn skill_add_replaces_alias_revision() {
     .expect("rewrite skill");
     env.install_skill("active-alias", &skill_source).await;
 
-    let updated = env
-        .kernel()
-        .await
-        .list_skills()
-        .await
-        .expect("list skills")
-        .skills
-        .into_iter()
-        .find(|skill| skill.alias == "active-alias")
-        .expect("updated skill");
+    let updated = env.installed_skill("active-alias").await;
     assert_ne!(updated.skill_id, first_skill_id);
     assert_eq!(updated.description, "second revision");
 }
@@ -374,37 +333,23 @@ async fn skill_rm_hides_alias_until_reinstall() {
     let env = TestHome::new().await;
     let skill_source = write_skill_source(env.temp_dir(), "remove-skill", "remove", false);
     env.install_skill("active-alias", &skill_source).await;
-    assert!(env
-        .kernel()
-        .await
-        .list_skills()
-        .await
-        .expect("list skills")
-        .skills
-        .iter()
-        .any(|skill| skill.alias == "active-alias"));
+    assert_eq!(
+        env.installed_skill("active-alias").await.alias,
+        "active-alias"
+    );
 
     assert!(env.remove_skill("active-alias").await);
-    assert!(!env
-        .kernel()
+    assert!(lionclaw::applied::AppliedState::load(env.home())
         .await
-        .list_skills()
-        .await
-        .expect("list skills")
-        .skills
-        .iter()
-        .any(|skill| skill.alias == "active-alias"));
+        .expect("load applied state")
+        .skill_by_alias("active-alias")
+        .is_none());
 
     env.install_skill("active-alias", &skill_source).await;
-    assert!(env
-        .kernel()
-        .await
-        .list_skills()
-        .await
-        .expect("list skills")
-        .skills
-        .iter()
-        .any(|skill| skill.alias == "active-alias"));
+    assert_eq!(
+        env.installed_skill("active-alias").await.alias,
+        "active-alias"
+    );
 }
 
 #[tokio::test]

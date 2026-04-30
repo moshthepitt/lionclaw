@@ -128,7 +128,7 @@ async fn prompt_loads_assistant_continuity_and_fs_read_uses_project_root() {
     .await
     .expect("write project active");
 
-    let skill_id = install_skill(&env, "root-split-reader").await;
+    install_skill(&env, "root-split-reader").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
@@ -155,7 +155,7 @@ async fn prompt_loads_assistant_continuity_and_fs_read_uses_project_root() {
 
     kernel
         .grant_policy(PolicyGrantRequest {
-            skill_id: skill_id.clone(),
+            skill_alias: "root-split-reader".to_string(),
             capability: "fs.read".to_string(),
             scope: "*".to_string(),
             ttl_seconds: None,
