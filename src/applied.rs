@@ -226,6 +226,11 @@ fn materialize_applied_skills(
         return Ok(skills);
     }
 
+    let expected_skills = skills
+        .iter()
+        .cloned()
+        .map(|skill| (skill.alias.clone(), skill))
+        .collect::<BTreeMap<_, _>>();
     let applied_root = materialize_applied_snapshot_root(
         skills_root,
         &applied_skills_fingerprint(&skills),
@@ -234,9 +239,11 @@ fn materialize_applied_skills(
 
     skills
         .into_iter()
-        .map(|mut skill| {
-            skill.snapshot_path = applied_root.join(&skill.alias);
-            Ok(skill)
+        .map(|skill| {
+            let loaded =
+                AppliedSkill::from_installed(&applied_root, applied_root.join(&skill.alias))?;
+            validate_materialized_skill(&expected_skills, &loaded)?;
+            Ok(loaded)
         })
         .collect()
 }
@@ -262,7 +269,9 @@ fn materialize_applied_snapshot_root(
         .with_context(|| format!("failed to create {}", staging_root.display()))?;
 
     for skill in skills {
-        copy_snapshot_tree(&skill.snapshot_path, &staging_root.join(&skill.alias))?;
+        let staged_skill_root = staging_root.join(&skill.alias);
+        copy_snapshot_tree(&skill.snapshot_path, &staged_skill_root)?;
+        copy_install_metadata_file(&skill.snapshot_path, &staged_skill_root)?;
     }
 
     match fs::rename(&staging_root, &applied_root) {
@@ -366,6 +375,62 @@ fn validate_materialized_snapshot_root(applied_root: &Path, skills: &[AppliedSki
             ));
         }
     }
+
+    Ok(())
+}
+
+fn validate_materialized_skill(
+    expected_skills: &BTreeMap<String, AppliedSkill>,
+    loaded: &AppliedSkill,
+) -> Result<()> {
+    let Some(expected) = expected_skills.get(&loaded.alias) else {
+        return Err(anyhow!(
+            "applied skill '{}' is not part of the installed skill set",
+            loaded.snapshot_path.display()
+        ));
+    };
+
+    if loaded.skill_id != expected.skill_id || loaded.hash != expected.hash {
+        return Err(anyhow!(
+            "applied skill '{}' no longer matches installed skill alias '{}'",
+            loaded.snapshot_path.display(),
+            loaded.alias
+        ));
+    }
+
+    Ok(())
+}
+
+fn copy_install_metadata_file(source_root: &Path, destination_root: &Path) -> Result<()> {
+    let source_path = source_root.join(SKILL_INSTALL_METADATA_FILE);
+    let metadata = match fs::symlink_metadata(&source_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", source_path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "installed skill metadata '{}' must not be a symlink",
+            source_path.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "installed skill metadata '{}' is not a regular file",
+            source_path.display()
+        ));
+    }
+
+    let destination_path = destination_root.join(SKILL_INSTALL_METADATA_FILE);
+    fs::copy(&source_path, &destination_path).with_context(|| {
+        format!(
+            "failed to copy '{}' to '{}'",
+            source_path.display(),
+            destination_path.display()
+        )
+    })?;
 
     Ok(())
 }
@@ -656,5 +721,37 @@ mod tests {
             .clone();
 
         assert_eq!(initial_snapshot, reloaded_snapshot);
+    }
+
+    #[tokio::test]
+    async fn load_rejects_materialized_snapshot_mismatch() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+
+        let visible = home.skills_dir().join("visible");
+        fs::create_dir_all(&visible).expect("visible dir");
+        fs::write(
+            visible.join("SKILL.md"),
+            "---\nname: visible\ndescription: visible\n---\n",
+        )
+        .expect("visible skill");
+
+        let initial = AppliedState::load(&home).await.expect("load initial state");
+        let applied_skill = initial.skill_by_alias("visible").expect("visible skill");
+        fs::write(
+            applied_skill.snapshot_path.join("SKILL.md"),
+            "---\nname: visible\ndescription: tampered\n---\n",
+        )
+        .expect("tamper applied skill");
+
+        let err = AppliedState::load(&home)
+            .await
+            .expect_err("mismatched applied snapshot should fail");
+        assert!(
+            err.to_string()
+                .contains("no longer matches installed skill alias"),
+            "unexpected error: {err:#}"
+        );
     }
 }
