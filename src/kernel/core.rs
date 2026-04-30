@@ -3160,7 +3160,7 @@ mod tests {
         )
         .await
         .expect("kernel init");
-        let _installed = kernel
+        let installed = kernel
             .install_skill(crate::contracts::SkillInstallRequest {
                 source: "local:/skills/channel-terminal".to_string(),
                 alias: "terminal".to_string(),
@@ -3206,7 +3206,7 @@ mod tests {
             skill_md: Some("---\nname: terminal\ndescription: terminal skill\n---\n".to_string()),
             snapshot_path: Some("/tmp/lionclaw-test-skills/terminal".to_string()),
         };
-        let _installed = kernel.install_skill(alpha).await.expect("install skill");
+        let installed = kernel.install_skill(alpha).await.expect("install skill");
 
         let reinstalled = kernel
             .install_skill(crate::contracts::SkillInstallRequest {
@@ -3255,7 +3255,7 @@ mod tests {
         )
         .await
         .expect("kernel init");
-        let installed = kernel
+        let _installed = kernel
             .install_skill(crate::contracts::SkillInstallRequest {
                 source: "local:/tmp/outside-skill".to_string(),
                 alias: "outside".to_string(),
@@ -3304,7 +3304,7 @@ mod tests {
         )
         .await
         .expect("kernel init");
-        let installed = kernel
+        let _installed = kernel
             .install_skill(crate::contracts::SkillInstallRequest {
                 source: "local:/tmp/outside-skill".to_string(),
                 alias: "outside".to_string(),
