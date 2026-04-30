@@ -46,7 +46,7 @@ The Rust kernel owns:
 - scheduler definitions and run records
 - policy grants and audit events
 - assistant-home continuity files and derived search index
-- the applied runtime view loaded from operator config and filesystem-installed skills
+- the applied runtime view loaded from channel config and filesystem-installed skills
 
 Kernel-owned mutations are policy checked where privileged and audited where
 security or operator visibility matters.

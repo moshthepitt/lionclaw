@@ -505,7 +505,9 @@ pub async fn run() -> Result<()> {
                     if removed { "removed" } else { "left unchanged" },
                     args.alias
                 );
-                print_runtime_state_change_note();
+                if removed {
+                    print_runtime_state_change_note();
+                }
             }
             SkillCommand::WorkerPath(args) => {
                 let worker = resolve_installed_skill_worker_entrypoint(&home, &args.alias).await?;
@@ -540,7 +542,9 @@ pub async fn run() -> Result<()> {
                     if removed { "removed" } else { "left unchanged" },
                     args.id
                 );
-                print_runtime_state_change_note();
+                if removed {
+                    print_runtime_state_change_note();
+                }
             }
             ChannelCommand::Attach(args) => {
                 let manager = SystemdUserServiceManager;
