@@ -45,7 +45,6 @@ pub struct StackStatus {
 pub struct ChannelStatus {
     pub id: String,
     pub skill: String,
-    pub skill_id: String,
     pub launch_mode: String,
     pub unit_status: String,
     pub pending_peers: u64,
@@ -329,6 +328,12 @@ pub async fn down<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Result
 pub async fn status<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Result<StackStatus> {
     let state = load_operator_state(home).await?;
     let kernel = open_kernel(home, &state.config, None).await?;
+    let mut daemon_status = manager.unit_status(DAEMON_UNIT_NAME).await?;
+    if unit_status_is_active(&daemon_status)
+        && daemon_restart_required(home, &state.config, &state.applied_state).await?
+    {
+        daemon_status.push_str(" (restart required)");
+    }
 
     let mut channels = Vec::new();
     for channel in state.applied_state.channels() {
@@ -344,17 +349,6 @@ pub async fn status<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Resu
         channels.push(ChannelStatus {
             id: channel.id.clone(),
             skill: channel.skill_alias.clone(),
-            skill_id: state
-                .applied_state
-                .skill_by_alias(&channel.skill_alias)
-                .map(|skill| skill.skill_id.clone())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "channel '{}' skill '{}' is missing",
-                        channel.id,
-                        channel.skill_alias
-                    )
-                })?,
             launch_mode: channel.launch_mode.as_str().to_string(),
             unit_status,
             pending_peers: health.pending_peer_count,
@@ -366,9 +360,96 @@ pub async fn status<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Resu
     }
 
     Ok(StackStatus {
-        daemon_status: manager.unit_status(DAEMON_UNIT_NAME).await?,
+        daemon_status,
         channels,
     })
+}
+
+async fn daemon_restart_required(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+    applied_state: &AppliedState,
+) -> Result<bool> {
+    let Some(runtime_id) = managed_daemon_runtime_id(home, config)? else {
+        return Ok(false);
+    };
+    let runtime_context =
+        match resolve_runtime_execution_context(home, config, Some(&runtime_id)).await {
+            Ok(context) => context,
+            Err(_) => return Ok(false),
+        };
+    let home_id = home.ensure_home_id().await?;
+    let project_root =
+        resolve_project_workspace_root().context("failed to resolve project workspace root")?;
+    let project_scope = runtime_project_partition_key(Some(project_root.as_path()));
+    let expected_daemon_fingerprint =
+        compute_daemon_fingerprint(&runtime_context.daemon_config_fingerprint, applied_state);
+
+    Ok(matches!(
+        classify_daemon(
+            &config.daemon.bind,
+            &home_id,
+            &project_scope,
+            &expected_daemon_fingerprint,
+        )
+        .await?,
+        DaemonClassification::SameHomeDifferentConfig
+    ))
+}
+
+fn managed_daemon_runtime_id(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+) -> Result<Option<String>> {
+    let env_path = home.services_env_dir().join("lionclawd.env");
+    let content = match fs::read_to_string(&env_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(config.defaults.runtime.clone());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", env_path.display()));
+        }
+    };
+
+    for line in content.lines() {
+        let Some(value) = line.strip_prefix("LIONCLAW_DEFAULT_RUNTIME_ID=") else {
+            continue;
+        };
+        let value = unescape_managed_env_value(value.trim());
+        if !value.is_empty() {
+            return Ok(Some(value));
+        }
+    }
+
+    Ok(config.defaults.runtime.clone())
+}
+
+fn unescape_managed_env_value(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let body = trimmed
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(trimmed);
+    let mut value = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            value.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => value.push('\n'),
+            Some('"') => value.push('"'),
+            Some('\\') => value.push('\\'),
+            Some(other) => {
+                value.push('\\');
+                value.push(other);
+            }
+            None => value.push('\\'),
+        }
+    }
+    value
 }
 
 pub async fn logs<M: ServiceManager>(
@@ -473,16 +554,7 @@ pub(crate) fn build_managed_units(
         .iter()
         .filter(|channel| channel.launch_mode == ChannelLaunchMode::Service)
     {
-        let installed_skill = applied_state
-            .skill_by_alias(&channel.skill)
-            .ok_or_else(|| {
-                anyhow!(
-                    "managed channel '{}' references unknown installed skill '{}'",
-                    channel.id,
-                    channel.skill
-                )
-            })?;
-        let worker_path = resolve_worker_entrypoint(&installed_skill.snapshot_path)
+        let worker_path = resolve_applied_skill_worker_entrypoint(applied_state, &channel.skill)
             .with_context(|| format!("channel '{}' worker resolution failed", channel.id))?;
 
         let mut env = vec![
@@ -620,6 +692,17 @@ pub(crate) fn resolve_worker_entrypoint(snapshot_root: &Path) -> Result<PathBuf>
     }
 
     Ok(candidate)
+}
+
+pub(crate) fn resolve_applied_skill_worker_entrypoint(
+    applied_state: &AppliedState,
+    alias: &str,
+) -> Result<PathBuf> {
+    validate_skill_alias(alias)?;
+    let applied_skill = applied_state
+        .skill_by_alias(alias)
+        .ok_or_else(|| anyhow!("installed skill alias '{alias}' not found"))?;
+    resolve_worker_entrypoint(&applied_skill.snapshot_path)
 }
 
 pub(crate) async fn resolve_installed_skill_worker_entrypoint(
@@ -831,9 +914,10 @@ mod tests {
     };
 
     use super::{
-        add_channel, add_skill, onboard, open_kernel, open_kernel_with_project_root,
-        render_marker_file, render_runtime_cache, resolve_installed_skill_worker_entrypoint,
-        resolve_worker_entrypoint, status, up, OnboardBindSelection, StackBinaryPaths,
+        add_channel, add_skill, daemon_restart_required, managed_daemon_runtime_id, onboard,
+        open_kernel, open_kernel_with_project_root, render_marker_file, render_runtime_cache,
+        resolve_installed_skill_worker_entrypoint, resolve_worker_entrypoint, status, up,
+        OnboardBindSelection, StackBinaryPaths,
     };
     use crate::{
         applied::compute_daemon_fingerprint,
@@ -843,6 +927,7 @@ mod tests {
         kernel::runtime::{ConfinementConfig, OciConfinementConfig},
         operator::{
             config::{ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig},
+            daemon_probe::{classify_daemon, DaemonClassification},
             reconcile::load_operator_state,
             runtime::resolve_runtime_execution_context,
             services::{FakeServiceManager, ServiceManager, DAEMON_UNIT_NAME},
@@ -1454,6 +1539,9 @@ mod tests {
         config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
             .into_iter()
             .collect();
+        config
+            .set_default_runtime("codex")
+            .expect("set default runtime");
         config.save(&home).await.expect("save config");
         add_skill(
             &home,
@@ -1505,6 +1593,9 @@ mod tests {
         config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
             .into_iter()
             .collect();
+        config
+            .set_default_runtime("codex")
+            .expect("set default runtime");
         config.save(&home).await.expect("save config");
 
         let err = up(
@@ -1537,6 +1628,9 @@ mod tests {
         config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
             .into_iter()
             .collect();
+        config
+            .set_default_runtime("codex")
+            .expect("set default runtime");
         config.save(&home).await.expect("save config");
         write_test_codex_auth(&home).await;
         add_skill(
@@ -1586,6 +1680,9 @@ mod tests {
         config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
             .into_iter()
             .collect();
+        config
+            .set_default_runtime("codex")
+            .expect("set default runtime");
         config.save(&home).await.expect("save config");
         write_test_codex_auth(&home).await;
 
@@ -1775,5 +1872,98 @@ mod tests {
 
         assert_eq!(stack.daemon_status, "not-found");
         assert!(stack.channels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_marks_restart_required_when_daemon_fingerprint_is_stale() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
+        let runtime_stub = temp_dir.path().join("codex-stub.sh");
+        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
+        make_executable(&runtime_stub);
+        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
+            .into_iter()
+            .collect();
+        config
+            .set_default_runtime("codex")
+            .expect("set default runtime");
+        config.save(&home).await.expect("save config");
+
+        let manager = FakeServiceManager::default();
+        manager
+            .set_unit_status(DAEMON_UNIT_NAME, "loaded/active/running")
+            .expect("set unit status");
+
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let bind_addr = config.daemon.bind.clone();
+        let home_root = home.root().display().to_string();
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    let home_id = home_id.clone();
+                    let home_root = home_root.clone();
+                    let project_scope = current_project_scope();
+                    move || async move {
+                        Json(DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: home_id.clone(),
+                            home_root: home_root.clone(),
+                            bind_addr: bind_addr.clone(),
+                            project_scope: project_scope.clone(),
+                            daemon_fingerprint: "daemon-stale-state".to_string(),
+                        })
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let state = load_operator_state(&home)
+            .await
+            .expect("load operator state");
+        assert_eq!(
+            managed_daemon_runtime_id(&home, &config).expect("managed daemon runtime id"),
+            Some("codex".to_string())
+        );
+        let runtime_context =
+            resolve_runtime_execution_context(&home, &config, config.defaults.runtime.as_deref())
+                .await
+                .expect("resolve runtime context");
+        let expected_daemon_fingerprint = compute_daemon_fingerprint(
+            &runtime_context.daemon_config_fingerprint,
+            &state.applied_state,
+        );
+        assert!(matches!(
+            classify_daemon(
+                &bind_addr,
+                &home_id,
+                &current_project_scope(),
+                &expected_daemon_fingerprint,
+            )
+            .await
+            .expect("classify daemon"),
+            DaemonClassification::SameHomeDifferentConfig
+        ));
+        assert!(
+            daemon_restart_required(&home, &config, &state.applied_state)
+                .await
+                .expect("daemon restart required"),
+            "status should see the daemon as stale"
+        );
+
+        let stack = status(&home, &manager).await.expect("status");
+
+        assert_eq!(
+            stack.daemon_status,
+            "loaded/active/running (restart required)"
+        );
     }
 }

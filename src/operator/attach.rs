@@ -13,7 +13,7 @@ use crate::{
         config::ChannelLaunchMode,
         daemon_probe::{classify_daemon, wait_for_same_home_daemon, DaemonClassification},
         reconcile::{
-            base_url_from_bind, load_operator_state, resolve_installed_skill_worker_entrypoint, up,
+            base_url_from_bind, load_operator_state, resolve_applied_skill_worker_entrypoint, up,
             StackBinaryPaths,
         },
         runtime::{
@@ -194,7 +194,9 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
         ));
     }
 
-    let worker_path = resolve_installed_skill_worker_entrypoint(home, &channel.skill).await?;
+    let worker_path =
+        resolve_applied_skill_worker_entrypoint(&applied.applied_state, &channel.skill)
+            .with_context(|| format!("channel '{}' worker resolution failed", channel.id))?;
     let effective_runtime_id = match requested_runtime_id.as_deref() {
         Some(runtime_id) => Some(applied.config.resolve_runtime_id(Some(runtime_id))?),
         None => None,
@@ -290,6 +292,8 @@ fn current_project_scope() -> Result<String> {
 mod tests {
     use std::{collections::BTreeMap, fs};
 
+    use anyhow::{Context, Result};
+    use async_trait::async_trait;
     use axum::{routing::get, Json, Router};
     use serde_json::json;
 
@@ -474,6 +478,67 @@ mod tests {
     }
 
     #[cfg(unix)]
+    struct RemovingInstalledSkillOnStartManager {
+        inner: FakeServiceManager,
+        home: LionClawHome,
+        alias: String,
+    }
+
+    #[cfg(unix)]
+    impl RemovingInstalledSkillOnStartManager {
+        fn new(home: &LionClawHome, alias: &str) -> Self {
+            Self {
+                inner: FakeServiceManager::default(),
+                home: home.clone(),
+                alias: alias.to_string(),
+            }
+        }
+
+        fn remove_installed_skill(&self) -> Result<()> {
+            let skill_root = self.home.skills_dir().join(&self.alias);
+            if skill_root.exists() {
+                fs::remove_dir_all(&skill_root)
+                    .with_context(|| format!("remove installed skill {}", skill_root.display()))?;
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl ServiceManager for RemovingInstalledSkillOnStartManager {
+        async fn apply_units(
+            &self,
+            home: &LionClawHome,
+            units: &[crate::operator::services::ManagedServiceUnit],
+        ) -> Result<Vec<String>> {
+            self.inner.apply_units(home, units).await
+        }
+
+        async fn up_units(&self, units: &[String]) -> Result<()> {
+            self.inner.up_units(units).await?;
+            self.remove_installed_skill()
+        }
+
+        async fn restart_units(&self, units: &[String]) -> Result<()> {
+            self.inner.restart_units(units).await?;
+            self.remove_installed_skill()
+        }
+
+        async fn down_units(&self, units: &[String]) -> Result<()> {
+            self.inner.down_units(units).await
+        }
+
+        async fn unit_status(&self, unit: &str) -> Result<String> {
+            self.inner.unit_status(unit).await
+        }
+
+        async fn logs(&self, units: &[String], lines: usize) -> Result<String> {
+            self.inner.logs(units, lines).await
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn prepare_channel_attach_rejects_service_channels() {
         let (_temp_dir, home, manager) = seed_interactive_channel(ChannelLaunchMode::Service).await;
@@ -567,6 +632,40 @@ mod tests {
                 .await
                 .expect("unit status"),
             "loaded/active/running"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_channel_attach_uses_applied_worker_snapshot_after_startup() {
+        let (_temp_dir, home, _manager) =
+            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        let manager = RemovingInstalledSkillOnStartManager::new(&home, "terminal");
+
+        let spec = prepare_channel_attach(
+            &home,
+            &manager,
+            "terminal".to_string(),
+            Some("mosh".to_string()),
+            Some("codex".to_string()),
+            &current_project_scope(),
+            &binaries(),
+        )
+        .await
+        .expect("prepare attach");
+
+        assert!(
+            spec.started_services,
+            "daemon should be ensured when unreachable"
+        );
+        assert!(
+            !home.skills_dir().join("terminal").exists(),
+            "test manager should remove the live installed alias"
+        );
+        assert!(
+            spec.worker_path
+                .starts_with(home.skills_dir().join(".applied")),
+            "interactive attach should resolve workers from the frozen applied snapshot"
         );
     }
 
