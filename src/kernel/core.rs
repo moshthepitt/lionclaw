@@ -17,30 +17,29 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::contracts::{
-    AuditEventView, AuditQueryResponse, ChannelBindRequest, ChannelBindResponse,
-    ChannelBindingView, ChannelInboundOutcome, ChannelInboundRequest, ChannelInboundResponse,
-    ChannelListResponse, ChannelPeerApproveRequest, ChannelPeerBlockRequest,
-    ChannelPeerListResponse, ChannelPeerResponse, ChannelPeerView, ChannelStreamAckRequest,
-    ChannelStreamAckResponse, ChannelStreamEventView, ChannelStreamPullRequest,
-    ChannelStreamPullResponse, ContinuityDraftActionRequest, ContinuityDraftDiscardResponse,
-    ContinuityDraftListRequest, ContinuityDraftListResponse, ContinuityDraftPromoteResponse,
-    ContinuityDraftView, ContinuityGetResponse, ContinuityMemoryProposalView,
-    ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse, ContinuityOpenLoopView,
-    ContinuityPathRequest, ContinuityProposalActionResponse, ContinuityProposalListResponse,
-    ContinuitySearchMatchView, ContinuitySearchRequest, ContinuitySearchResponse,
-    ContinuityStatusResponse, JobCreateRequest, JobCreateResponse, JobDeliveryTargetDto,
-    JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest, JobRemoveResponse,
-    JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto, JobTickResponse,
-    JobToggleResponse, JobView, PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeResponse,
-    SchedulerJobDeliveryStatusDto, SchedulerJobRunStatusDto, SchedulerJobTriggerKindDto,
-    SessionActionKind, SessionActionRequest, SessionActionResponse, SessionHistoryPolicy,
-    SessionHistoryRequest, SessionHistoryResponse, SessionLatestQuery, SessionLatestResponse,
-    SessionOpenRequest, SessionOpenResponse, SessionTurnKind, SessionTurnRequest,
-    SessionTurnResponse, SessionTurnStatus, SessionTurnView, SkillInstallRequest,
-    SkillInstallResponse, SkillListResponse, SkillView, StreamEventDto, StreamEventKindDto,
-    StreamLaneDto, TrustTier,
+    AuditEventView, AuditQueryResponse, ChannelBindingView, ChannelInboundOutcome,
+    ChannelInboundRequest, ChannelInboundResponse, ChannelListResponse, ChannelPeerApproveRequest,
+    ChannelPeerBlockRequest, ChannelPeerListResponse, ChannelPeerResponse, ChannelPeerView,
+    ChannelStreamAckRequest, ChannelStreamAckResponse, ChannelStreamEventView,
+    ChannelStreamPullRequest, ChannelStreamPullResponse, ContinuityDraftActionRequest,
+    ContinuityDraftDiscardResponse, ContinuityDraftListRequest, ContinuityDraftListResponse,
+    ContinuityDraftPromoteResponse, ContinuityDraftView, ContinuityGetResponse,
+    ContinuityMemoryProposalView, ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse,
+    ContinuityOpenLoopView, ContinuityPathRequest, ContinuityProposalActionResponse,
+    ContinuityProposalListResponse, ContinuitySearchMatchView, ContinuitySearchRequest,
+    ContinuitySearchResponse, ContinuityStatusResponse, JobCreateRequest, JobCreateResponse,
+    JobDeliveryTargetDto, JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest,
+    JobRemoveResponse, JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto,
+    JobTickResponse, JobToggleResponse, JobView, PolicyGrantRequest, PolicyGrantResponse,
+    PolicyRevokeResponse, SchedulerJobDeliveryStatusDto, SchedulerJobRunStatusDto,
+    SchedulerJobTriggerKindDto, SessionActionKind, SessionActionRequest, SessionActionResponse,
+    SessionHistoryPolicy, SessionHistoryRequest, SessionHistoryResponse, SessionLatestQuery,
+    SessionLatestResponse, SessionOpenRequest, SessionOpenResponse, SessionTurnKind,
+    SessionTurnRequest, SessionTurnResponse, SessionTurnStatus, SessionTurnView, SkillListResponse,
+    SkillView, StreamEventDto, StreamEventKindDto, StreamLaneDto, TrustTier,
 };
 use crate::{
+    applied::{AppliedChannel, AppliedSkill, AppliedState},
     home::{
         runtime_project_drafts_dir_from_parts, runtime_project_generated_agents_path_from_parts,
         runtime_project_partition_key, LionClawHome, RUNTIME_SESSION_READY_MARKER,
@@ -91,10 +90,7 @@ use super::{
     },
     session_turns::{NewSessionTurn, SessionTurnCompletion, SessionTurnRecord, SessionTurnStore},
     sessions::SessionStore,
-    skills::{
-        validate_skill_alias, SkillAliasValidationError, SkillIdentityCollisionError,
-        SkillInstallInput, SkillRecord, SkillStore,
-    },
+    skills::validate_skill_alias,
 };
 
 const ACTIVE_GLOBAL_SLICE_LIMIT: usize = 5;
@@ -115,9 +111,9 @@ pub struct KernelOptions {
     pub workspace_root: Option<PathBuf>,
     pub project_workspace_root: Option<PathBuf>,
     pub runtime_root: Option<PathBuf>,
-    pub skill_snapshot_root: Option<PathBuf>,
     pub workspace_name: Option<String>,
     pub scheduler: SchedulerConfig,
+    pub applied_state: AppliedState,
 }
 
 impl fmt::Debug for KernelOptions {
@@ -142,9 +138,9 @@ impl fmt::Debug for KernelOptions {
             .field("workspace_root", &self.workspace_root)
             .field("project_workspace_root", &self.project_workspace_root)
             .field("runtime_root", &self.runtime_root)
-            .field("skill_snapshot_root", &self.skill_snapshot_root)
             .field("workspace_name", &self.workspace_name)
             .field("scheduler", &self.scheduler)
+            .field("applied_state", &"..")
             .finish()
     }
 }
@@ -166,9 +162,9 @@ impl Default for KernelOptions {
             workspace_root: None,
             project_workspace_root: None,
             runtime_root: None,
-            skill_snapshot_root: None,
             workspace_name: None,
             scheduler: SchedulerConfig::default(),
+            applied_state: AppliedState::default(),
         }
     }
 }
@@ -178,7 +174,6 @@ pub struct Kernel {
     sessions: SessionStore,
     session_turns: SessionTurnStore,
     session_compactions: SessionCompactionStore,
-    skills: SkillStore,
     policy: PolicyStore,
     jobs: JobStore,
     runtime: RuntimeRegistry,
@@ -198,8 +193,8 @@ pub struct Kernel {
     project_workspace_root: Option<PathBuf>,
     session_scope: String,
     runtime_root: Option<PathBuf>,
-    skill_snapshot_root: Option<PathBuf>,
     workspace_name: Option<String>,
+    applied_state: AppliedState,
     continuity: Option<ContinuityLayout>,
     hidden_compaction_turn_timeout: Duration,
 }
@@ -307,7 +302,6 @@ impl Kernel {
             sessions: SessionStore::new(pool.clone()),
             session_turns: SessionTurnStore::new(pool.clone()),
             session_compactions: SessionCompactionStore::new(pool.clone()),
-            skills: SkillStore::new(pool.clone()),
             policy: PolicyStore::new(pool.clone()),
             jobs: JobStore::new(pool.clone()),
             runtime,
@@ -327,8 +321,8 @@ impl Kernel {
             project_workspace_root: options.project_workspace_root,
             session_scope,
             runtime_root: options.runtime_root,
-            skill_snapshot_root: options.skill_snapshot_root,
             workspace_name: options.workspace_name,
+            applied_state: options.applied_state,
             continuity,
             hidden_compaction_turn_timeout,
         };
@@ -637,25 +631,22 @@ impl Kernel {
         )
     }
 
+    fn applied_channel(&self, channel_id: &str) -> Option<&AppliedChannel> {
+        self.applied_state.channel(channel_id)
+    }
+
+    fn applied_skill_by_alias(&self, alias: &str) -> Option<&AppliedSkill> {
+        self.applied_state.skill_by_alias(alias)
+    }
+
     async fn resolve_session_open_trust_tier(
         &self,
         channel_id: &str,
         peer_id: &str,
         fallback: TrustTier,
     ) -> Result<TrustTier, KernelError> {
-        let Some(binding) = self
-            .channel_state
-            .get_binding(channel_id)
-            .await
-            .map_err(internal)?
-        else {
+        if self.applied_channel(channel_id).is_none() {
             return Ok(fallback);
-        };
-
-        if !binding.enabled {
-            return Err(KernelError::Conflict(format!(
-                "channel '{channel_id}' binding is disabled"
-            )));
         }
         self.require_channel_peer_approved(channel_id, peer_id)
             .await
@@ -665,13 +656,7 @@ impl Kernel {
         &self,
         session: &super::sessions::Session,
     ) -> Result<(), KernelError> {
-        if self
-            .channel_state
-            .get_binding(&session.channel_id)
-            .await
-            .map_err(internal)?
-            .is_none()
-        {
+        if self.applied_channel(&session.channel_id).is_none() {
             return Ok(());
         }
 
@@ -819,193 +804,28 @@ impl Kernel {
         self.turn_session_with_sink(req, Some(sink)).await
     }
 
-    pub async fn install_skill(
-        &self,
-        req: SkillInstallRequest,
-    ) -> Result<SkillInstallResponse, KernelError> {
-        self.install_skill_with_actor(req, "api").await
-    }
-
-    pub(crate) async fn install_skill_with_actor(
-        &self,
-        req: SkillInstallRequest,
-        actor: &str,
-    ) -> Result<SkillInstallResponse, KernelError> {
-        if req.source.trim().is_empty() {
-            return Err(KernelError::BadRequest("source is required".to_string()));
-        }
-
-        let input = SkillInstallInput {
-            source: req.source,
-            alias: req.alias,
-            reference: req.reference,
-            hash: req.hash,
-            skill_md: req.skill_md,
-            snapshot_path: req.snapshot_path,
-        };
-        let installed = self
-            .skills
-            .install(input)
-            .await
-            .map_err(skill_install_error)?;
-
-        self.audit
-            .append(
-                "skill.install",
-                None,
-                Some(actor.to_string()),
-                json!({"skill_id": installed.skill_id, "alias": installed.alias, "name": installed.name, "hash": installed.hash}),
-            )
-            .await
-            .map_err(internal)?;
-
-        Ok(SkillInstallResponse {
-            skill_id: installed.skill_id,
-            alias: installed.alias,
-            name: installed.name,
-            hash: installed.hash,
-        })
-    }
-
     pub async fn list_skills(&self) -> Result<SkillListResponse, KernelError> {
         let skills = self
-            .skills
-            .list()
-            .await
-            .map_err(internal)?
-            .into_iter()
+            .applied_state
+            .skills()
+            .iter()
+            .cloned()
             .map(to_skill_view)
             .collect::<Vec<_>>();
 
         Ok(SkillListResponse { skills })
     }
 
-    pub async fn remove_skill(&self, alias: &str) -> Result<bool, KernelError> {
-        self.remove_skill_with_actor(alias, "api").await
-    }
-
-    pub(crate) async fn remove_skill_with_actor(
-        &self,
-        alias: &str,
-        actor: &str,
-    ) -> Result<bool, KernelError> {
-        let removed = self
-            .skills
-            .disable_alias(alias)
-            .await
-            .map_err(skill_install_error)?;
-        if !removed {
-            return Ok(false);
-        }
-
-        self.audit
-            .append(
-                "skill.remove",
-                None,
-                Some(actor.to_string()),
-                json!({ "alias": alias }),
-            )
-            .await
-            .map_err(internal)?;
-        Ok(true)
-    }
-
-    pub async fn bind_channel(
-        &self,
-        req: ChannelBindRequest,
-    ) -> Result<ChannelBindResponse, KernelError> {
-        if req.channel_id.trim().is_empty() || req.skill_alias.trim().is_empty() {
-            return Err(KernelError::BadRequest(
-                "channel_id and skill_alias are required".to_string(),
-            ));
-        }
-
-        let channel_id = req.channel_id.trim().to_string();
-        let skill_alias = req.skill_alias.trim().to_string();
-        validate_skill_alias(&skill_alias).map_err(skill_install_error)?;
-        let enabled = req.enabled.unwrap_or(true);
-        let config = req
-            .config
-            .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
-
-        let skill = self
-            .skills
-            .get_enabled_by_alias(&skill_alias)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| KernelError::NotFound("skill not found".to_string()))?;
-
-        let binding = self
-            .channel_state
-            .upsert_binding(&channel_id, &skill_alias, enabled, config.clone())
-            .await
-            .map_err(internal)?;
-
-        self.audit
-            .append(
-                "channel.binding.upsert",
-                None,
-                Some("api".to_string()),
-                json!({
-                    "channel_id": binding.channel_id,
-                    "skill_alias": binding.skill_alias,
-                    "skill_id": skill.skill_id,
-                    "enabled": binding.enabled,
-                    "config": binding.config,
-                }),
-            )
-            .await
-            .map_err(internal)?;
-
-        Ok(ChannelBindResponse {
-            binding: to_channel_binding_view(binding),
-        })
-    }
-
     pub async fn list_channels(&self) -> Result<ChannelListResponse, KernelError> {
         let bindings = self
-            .channel_state
-            .list_bindings()
-            .await
-            .map_err(internal)?
-            .into_iter()
+            .applied_state
+            .channels()
+            .iter()
+            .cloned()
             .map(to_channel_binding_view)
             .collect::<Vec<_>>();
 
         Ok(ChannelListResponse { bindings })
-    }
-
-    pub async fn disable_channel_binding(
-        &self,
-        channel_id: &str,
-        actor: &str,
-    ) -> Result<Option<ChannelBindResponse>, KernelError> {
-        let binding = self
-            .channel_state
-            .set_binding_enabled(channel_id, false)
-            .await
-            .map_err(internal)?;
-
-        let Some(binding) = binding else {
-            return Ok(None);
-        };
-
-        self.audit
-            .append(
-                "channel.binding.disable",
-                None,
-                Some(actor.to_string()),
-                json!({
-                    "channel_id": binding.channel_id,
-                    "skill_alias": binding.skill_alias,
-                }),
-            )
-            .await
-            .map_err(internal)?;
-
-        Ok(Some(ChannelBindResponse {
-            binding: to_channel_binding_view(binding),
-        }))
     }
 
     pub async fn list_channel_peers(
@@ -1272,10 +1092,14 @@ impl Kernel {
         &self,
         channel_id: &str,
     ) -> Result<Option<super::channel_state::ChannelBindingRecord>, KernelError> {
-        self.channel_state
-            .get_binding(channel_id)
-            .await
-            .map_err(internal)
+        Ok(self.applied_channel(channel_id).cloned().map(|binding| {
+            super::channel_state::ChannelBindingRecord {
+                channel_id: binding.id,
+                skill_alias: binding.skill_alias,
+                config: serde_json::Value::Object(Default::default()),
+                updated_at: binding.updated_at,
+            }
+        }))
     }
 
     pub async fn get_channel_health(
@@ -1588,13 +1412,7 @@ impl Kernel {
         &self,
         req: PolicyGrantRequest,
     ) -> Result<PolicyGrantResponse, KernelError> {
-        if self
-            .skills
-            .get(&req.skill_id)
-            .await
-            .map_err(internal)?
-            .is_none()
-        {
+        if self.applied_state.skill_by_id(&req.skill_id).is_none() {
             return Err(KernelError::NotFound("skill not found".to_string()));
         }
 
@@ -2646,7 +2464,7 @@ impl Kernel {
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
                 runtime_env_passthrough: None,
-                allowed_runtime_skill_ids: Some(job.skill_ids.clone()),
+                allowed_runtime_skill_ids: None,
                 default_policy_scope: Scope::Job(job.job_id),
                 sink: None,
                 emit_channel_stream_done: true,
@@ -3134,47 +2952,43 @@ mod tests {
         assert!(debug.contains("/tmp/lionclaw-home"));
     }
 
-    #[tokio::test]
-    async fn runtime_skill_mounts_use_installed_alias_and_snapshot_root() {
-        let temp_dir = tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        home.ensure_base_dirs().await.expect("base dirs");
-        let snapshot_dir = home.skills_dir().join("terminal@hash");
-        tokio::fs::create_dir_all(snapshot_dir.join("scripts"))
-            .await
-            .expect("create snapshot");
-        tokio::fs::write(
-            snapshot_dir.join("SKILL.md"),
-            "---\nname: terminal\ndescription: terminal skill\n---\n",
-        )
-        .await
-        .expect("write skill md");
-        tokio::fs::write(snapshot_dir.join("scripts/worker"), "#!/usr/bin/env bash\n")
-            .await
-            .expect("write worker");
-
-        let kernel = Kernel::new_with_options(
-            &temp_dir.path().join("lionclaw.db"),
+    async fn kernel_with_home(home: &LionClawHome) -> Kernel {
+        let applied_state = AppliedState::load(home).await.expect("load applied state");
+        Kernel::new_with_options(
+            &home.db_path(),
             KernelOptions {
-                skill_snapshot_root: Some(home.skills_dir()),
+                applied_state,
                 ..KernelOptions::default()
             },
         )
         .await
-        .expect("kernel init");
-        let installed = kernel
-            .install_skill(crate::contracts::SkillInstallRequest {
-                source: "local:/skills/channel-terminal".to_string(),
-                alias: "terminal".to_string(),
-                reference: Some("local".to_string()),
-                hash: Some("hash".to_string()),
-                skill_md: Some(
-                    "---\nname: terminal\ndescription: terminal skill\n---\n".to_string(),
-                ),
-                snapshot_path: Some(snapshot_dir.to_string_lossy().to_string()),
-            })
+        .expect("kernel init")
+    }
+
+    async fn write_installed_skill(home: &LionClawHome, alias: &str, description: &str) -> PathBuf {
+        let skill_dir = home.skills_dir().join(alias);
+        tokio::fs::create_dir_all(skill_dir.join("scripts"))
             .await
-            .expect("install skill");
+            .expect("create skill dir");
+        tokio::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {alias}\ndescription: {description}\n---\n"),
+        )
+        .await
+        .expect("write skill md");
+        tokio::fs::write(skill_dir.join("scripts/worker"), "#!/usr/bin/env bash\n")
+            .await
+            .expect("write worker");
+        skill_dir
+    }
+
+    #[tokio::test]
+    async fn runtime_skill_mounts_use_installed_alias_directory() {
+        let temp_dir = tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        let skill_dir = write_installed_skill(&home, "terminal", "terminal skill").await;
+        let kernel = kernel_with_home(&home).await;
 
         let runtime_skills = kernel
             .runtime_visible_skills()
@@ -3188,137 +3002,21 @@ mod tests {
         assert_eq!(mounts.len(), 1);
         assert_eq!(
             mounts[0].source,
-            std::fs::canonicalize(&snapshot_dir).expect("canonical")
+            std::fs::canonicalize(&skill_dir).expect("canonical")
         );
         assert_eq!(mounts[0].target, "/lionclaw/skills/terminal");
         assert_eq!(mounts[0].access, MountAccess::ReadOnly);
-        assert_eq!(runtime_skills[0].skill_id, installed.skill_id);
+        assert_eq!(runtime_skills.len(), 1);
+        assert_eq!(runtime_skills[0].alias, "terminal");
     }
 
     #[tokio::test]
-    async fn reinstalling_existing_skill_can_move_current_alias() {
-        let temp_dir = tempdir().expect("temp dir");
-        let db_path = temp_dir.path().join("lionclaw.db");
-        let kernel = Kernel::new(&db_path).await.expect("kernel init");
-        let alpha = crate::contracts::SkillInstallRequest {
-            source: "local:/skills/channel-terminal".to_string(),
-            alias: "alpha".to_string(),
-            reference: Some("local".to_string()),
-            hash: Some("hash".to_string()),
-            skill_md: Some("---\nname: terminal\ndescription: terminal skill\n---\n".to_string()),
-            snapshot_path: Some("/tmp/lionclaw-test-skills/terminal".to_string()),
-        };
-        let installed = kernel.install_skill(alpha).await.expect("install skill");
-
-        let reinstalled = kernel
-            .install_skill(crate::contracts::SkillInstallRequest {
-                source: "local:/skills/channel-terminal".to_string(),
-                alias: "beta".to_string(),
-                reference: Some("local".to_string()),
-                hash: Some("hash".to_string()),
-                skill_md: Some(
-                    "---\nname: terminal\ndescription: terminal skill\n---\n".to_string(),
-                ),
-                snapshot_path: Some("/tmp/lionclaw-test-skills/terminal".to_string()),
-            })
-            .await
-            .expect("reinstall skill under new alias");
-
-        assert_eq!(reinstalled.skill_id, installed.skill_id);
-
-        let active = kernel.list_skills().await.expect("list skills").skills;
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].skill_id, installed.skill_id);
-        assert_eq!(active[0].alias, "beta");
-    }
-
-    #[tokio::test]
-    async fn runtime_skill_mounts_skip_snapshots_outside_skill_root() {
+    async fn prompt_sections_do_not_inline_installed_skill_context() {
         let temp_dir = tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         home.ensure_base_dirs().await.expect("base dirs");
-        let outside_snapshot = temp_dir.path().join("outside-skill");
-        tokio::fs::create_dir_all(&outside_snapshot)
-            .await
-            .expect("create outside snapshot");
-        tokio::fs::write(
-            outside_snapshot.join("SKILL.md"),
-            "---\nname: outside\ndescription: outside skill\n---\n",
-        )
-        .await
-        .expect("write skill md");
-
-        let kernel = Kernel::new_with_options(
-            &temp_dir.path().join("lionclaw.db"),
-            KernelOptions {
-                skill_snapshot_root: Some(home.skills_dir()),
-                ..KernelOptions::default()
-            },
-        )
-        .await
-        .expect("kernel init");
-        let _installed = kernel
-            .install_skill(crate::contracts::SkillInstallRequest {
-                source: "local:/tmp/outside-skill".to_string(),
-                alias: "outside".to_string(),
-                reference: Some("local".to_string()),
-                hash: Some("hash".to_string()),
-                skill_md: Some("---\nname: outside\ndescription: outside skill\n---\n".to_string()),
-                snapshot_path: Some(outside_snapshot.to_string_lossy().to_string()),
-            })
-            .await
-            .expect("install skill");
-
-        let runtime_skills = kernel
-            .runtime_visible_skills()
-            .await
-            .expect("list runtime-visible skills");
-        let mounts = kernel
-            .resolve_runtime_skill_mounts(&runtime_skills)
-            .await
-            .expect("resolve skill mounts");
-
-        assert!(mounts.is_empty());
-    }
-
-    #[tokio::test]
-    async fn prompt_sections_do_not_inline_skill_context() {
-        let temp_dir = tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        home.ensure_base_dirs().await.expect("base dirs");
-        let outside_snapshot = temp_dir.path().join("outside-skill");
-        tokio::fs::create_dir_all(&outside_snapshot)
-            .await
-            .expect("create outside snapshot");
-        tokio::fs::write(
-            outside_snapshot.join("SKILL.md"),
-            "---\nname: outside\ndescription: outside snapshot text\n---\n",
-        )
-        .await
-        .expect("write outside skill md");
-
-        let kernel = Kernel::new_with_options(
-            &temp_dir.path().join("lionclaw.db"),
-            KernelOptions {
-                skill_snapshot_root: Some(home.skills_dir()),
-                ..KernelOptions::default()
-            },
-        )
-        .await
-        .expect("kernel init");
-        let _installed = kernel
-            .install_skill(crate::contracts::SkillInstallRequest {
-                source: "local:/tmp/outside-skill".to_string(),
-                alias: "outside".to_string(),
-                reference: Some("local".to_string()),
-                hash: Some("hash".to_string()),
-                skill_md: Some(
-                    "---\nname: outside\ndescription: stored metadata text\n---\n".to_string(),
-                ),
-                snapshot_path: Some(outside_snapshot.to_string_lossy().to_string()),
-            })
-            .await
-            .expect("install skill");
+        write_installed_skill(&home, "outside", "outside snapshot text").await;
+        let kernel = kernel_with_home(&home).await;
 
         let sections = kernel
             .build_prompt_sections()
@@ -3326,107 +3024,26 @@ mod tests {
             .expect("build prompt sections");
         let rendered = sections.join("\n\n");
 
-        assert!(!rendered.contains("stored metadata text"));
         assert!(!rendered.contains("outside snapshot text"));
     }
 
     #[tokio::test]
-    async fn runtime_skill_mounts_skip_non_snapshot_paths() {
+    async fn runtime_visible_skills_exclude_channel_bound_aliases() {
         let temp_dir = tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         home.ensure_base_dirs().await.expect("base dirs");
-        let snapshot_file = home.skills_dir().join("not-a-snapshot");
-        tokio::fs::write(&snapshot_file, "not a directory")
+        write_installed_skill(&home, "terminal", "terminal skill").await;
+        let mut config = crate::operator::config::OperatorConfig::load(&home)
             .await
-            .expect("write snapshot file");
-        let nested_snapshot = home.skills_dir().join("snapshot").join("nested");
-        tokio::fs::create_dir_all(&nested_snapshot)
-            .await
-            .expect("create nested snapshot path");
-
-        let kernel = Kernel::new_with_options(
-            &temp_dir.path().join("lionclaw.db"),
-            KernelOptions {
-                skill_snapshot_root: Some(home.skills_dir()),
-                ..KernelOptions::default()
-            },
-        )
-        .await
-        .expect("kernel init");
-        let _root_skill = kernel
-            .install_skill(crate::contracts::SkillInstallRequest {
-                source: "local:/tmp/root-skill".to_string(),
-                alias: "root-skill".to_string(),
-                reference: Some("local".to_string()),
-                hash: Some("root-hash".to_string()),
-                skill_md: Some("---\nname: root\ndescription: root skill\n---\n".to_string()),
-                snapshot_path: Some(home.skills_dir().to_string_lossy().to_string()),
-            })
-            .await
-            .expect("install root skill");
-        let _file_skill = kernel
-            .install_skill(crate::contracts::SkillInstallRequest {
-                source: "local:/tmp/file-skill".to_string(),
-                alias: "file-skill".to_string(),
-                reference: Some("local".to_string()),
-                hash: Some("file-hash".to_string()),
-                skill_md: Some("---\nname: file\ndescription: file skill\n---\n".to_string()),
-                snapshot_path: Some(snapshot_file.to_string_lossy().to_string()),
-            })
-            .await
-            .expect("install file skill");
-        let _nested_skill = kernel
-            .install_skill(crate::contracts::SkillInstallRequest {
-                source: "local:/tmp/nested-skill".to_string(),
-                alias: "nested-skill".to_string(),
-                reference: Some("local".to_string()),
-                hash: Some("nested-hash".to_string()),
-                skill_md: Some("---\nname: nested\ndescription: nested skill\n---\n".to_string()),
-                snapshot_path: Some(nested_snapshot.to_string_lossy().to_string()),
-            })
-            .await
-            .expect("install nested skill");
-
-        let runtime_skills = kernel
-            .runtime_visible_skills()
-            .await
-            .expect("list runtime-visible skills");
-        let mounts = kernel
-            .resolve_runtime_skill_mounts(&runtime_skills)
-            .await
-            .expect("resolve skill mounts");
-
-        assert!(mounts.is_empty());
-    }
-
-    #[tokio::test]
-    async fn runtime_visible_skills_exclude_channel_bound_skills() {
-        let temp_dir = tempdir().expect("temp dir");
-        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
-            .await
-            .expect("kernel init");
-        let installed = kernel
-            .install_skill(crate::contracts::SkillInstallRequest {
-                source: "local:/skills/channel-terminal".to_string(),
-                alias: "terminal".to_string(),
-                reference: Some("local".to_string()),
-                hash: Some("hash".to_string()),
-                skill_md: Some(
-                    "---\nname: terminal\ndescription: terminal skill\n---\n".to_string(),
-                ),
-                snapshot_path: None,
-            })
-            .await
-            .expect("install skill");
-        kernel
-            .bind_channel(crate::contracts::ChannelBindRequest {
-                channel_id: "terminal".to_string(),
-                skill_alias: installed.alias.clone(),
-                enabled: Some(true),
-                config: None,
-            })
-            .await
-            .expect("bind channel");
+            .expect("load config");
+        config.upsert_channel(crate::operator::config::ManagedChannelConfig {
+            id: "terminal".to_string(),
+            skill: "terminal".to_string(),
+            launch_mode: crate::operator::config::ChannelLaunchMode::Service,
+            required_env: Vec::new(),
+        });
+        config.save(&home).await.expect("save config");
+        let kernel = kernel_with_home(&home).await;
 
         let runtime_skills = kernel
             .runtime_visible_skills()
@@ -3434,124 +3051,6 @@ mod tests {
             .expect("list runtime-visible skills");
 
         assert!(runtime_skills.is_empty());
-    }
-
-    #[tokio::test]
-    async fn disabled_channel_binding_restores_runtime_skill_visibility() {
-        let temp_dir = tempdir().expect("temp dir");
-        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
-            .await
-            .expect("kernel init");
-        let installed = kernel
-            .install_skill(crate::contracts::SkillInstallRequest {
-                source: "local:/skills/channel-terminal".to_string(),
-                alias: "terminal".to_string(),
-                reference: Some("local".to_string()),
-                hash: Some("hash".to_string()),
-                skill_md: Some(
-                    "---\nname: terminal\ndescription: terminal skill\n---\n".to_string(),
-                ),
-                snapshot_path: None,
-            })
-            .await
-            .expect("install skill");
-        kernel
-            .bind_channel(crate::contracts::ChannelBindRequest {
-                channel_id: "terminal".to_string(),
-                skill_alias: installed.alias.clone(),
-                enabled: Some(true),
-                config: None,
-            })
-            .await
-            .expect("bind channel");
-        kernel
-            .disable_channel_binding("terminal", "test")
-            .await
-            .expect("disable channel binding");
-
-        let runtime_skills = kernel
-            .runtime_visible_skills()
-            .await
-            .expect("list runtime-visible skills");
-
-        assert_eq!(runtime_skills.len(), 1);
-        assert_eq!(runtime_skills[0].skill_id, installed.skill_id);
-    }
-
-    #[tokio::test]
-    async fn installed_skills_are_runtime_visible_by_default() {
-        let temp_dir = tempdir().expect("temp dir");
-        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
-            .await
-            .expect("kernel init");
-        let installed = kernel
-            .install_skill(crate::contracts::SkillInstallRequest {
-                source: "local:/skills/runtime-visible".to_string(),
-                alias: "runtime-visible".to_string(),
-                reference: Some("local".to_string()),
-                hash: Some("hash".to_string()),
-                skill_md: Some(
-                    "---\nname: runtime-visible\ndescription: runtime visible skill\n---\n"
-                        .to_string(),
-                ),
-                snapshot_path: None,
-            })
-            .await
-            .expect("install skill");
-
-        let listed = kernel.list_skills().await.expect("list skills");
-        let persisted = listed
-            .skills
-            .into_iter()
-            .find(|skill| skill.skill_id == installed.skill_id)
-            .expect("installed skill record");
-        assert_eq!(persisted.alias, "runtime-visible");
-
-        let runtime_skills = kernel
-            .runtime_visible_skills()
-            .await
-            .expect("list runtime-visible skills");
-        assert_eq!(runtime_skills.len(), 1);
-        assert_eq!(runtime_skills[0].skill_id, installed.skill_id);
-    }
-
-    #[tokio::test]
-    async fn reinstalling_existing_skill_reactivates_it() {
-        let temp_dir = tempdir().expect("temp dir");
-        let kernel = Kernel::new(&temp_dir.path().join("lionclaw.db"))
-            .await
-            .expect("kernel init");
-        let request = crate::contracts::SkillInstallRequest {
-            source: "local:/skills/runtime-visible".to_string(),
-            alias: "runtime-visible".to_string(),
-            reference: Some("local".to_string()),
-            hash: Some("hash".to_string()),
-            skill_md: Some(
-                "---\nname: runtime-visible\ndescription: runtime visible skill\n---\n".to_string(),
-            ),
-            snapshot_path: None,
-        };
-        let installed = kernel
-            .install_skill(request.clone())
-            .await
-            .expect("install skill");
-        kernel
-            .remove_skill("runtime-visible")
-            .await
-            .expect("remove skill alias");
-
-        let reinstalled = kernel
-            .install_skill(request)
-            .await
-            .expect("reinstall skill");
-
-        assert_eq!(reinstalled.skill_id, installed.skill_id);
-        let runtime_skills = kernel
-            .runtime_visible_skills()
-            .await
-            .expect("list runtime-visible skills");
-        assert_eq!(runtime_skills.len(), 1);
-        assert_eq!(runtime_skills[0].skill_id, installed.skill_id);
     }
 
     #[tokio::test]
@@ -4175,7 +3674,7 @@ mod tests {
     }
 }
 
-fn to_skill_view(skill: super::skills::SkillRecord) -> SkillView {
+fn to_skill_view(skill: AppliedSkill) -> SkillView {
     SkillView {
         skill_id: skill.skill_id,
         alias: skill.alias,
@@ -4188,14 +3687,11 @@ fn to_skill_view(skill: super::skills::SkillRecord) -> SkillView {
     }
 }
 
-fn to_channel_binding_view(
-    binding: super::channel_state::ChannelBindingRecord,
-) -> ChannelBindingView {
+fn to_channel_binding_view(binding: AppliedChannel) -> ChannelBindingView {
     ChannelBindingView {
-        channel_id: binding.channel_id,
+        channel_id: binding.id,
         skill_alias: binding.skill_alias,
-        enabled: binding.enabled,
-        config: binding.config,
+        config: serde_json::Value::Object(Default::default()),
         updated_at: binding.updated_at,
     }
 }
@@ -4458,16 +3954,6 @@ fn to_stream_event_view(event: RuntimeEvent) -> StreamEventDto {
 
 fn internal(err: anyhow::Error) -> KernelError {
     KernelError::Internal(format!("{err:#}"))
-}
-
-fn skill_install_error(err: anyhow::Error) -> KernelError {
-    if let Some(err) = err.downcast_ref::<SkillAliasValidationError>() {
-        KernelError::BadRequest(err.to_string())
-    } else if let Some(err) = err.downcast_ref::<SkillIdentityCollisionError>() {
-        KernelError::Conflict(err.to_string())
-    } else {
-        internal(err)
-    }
 }
 
 fn draft_request_error(err: anyhow::Error) -> KernelError {
@@ -5401,40 +4887,25 @@ impl Kernel {
     async fn runtime_skills_for_ids(
         &self,
         skill_ids: &[String],
-    ) -> Result<Vec<SkillRecord>, KernelError> {
+    ) -> Result<Vec<AppliedSkill>, KernelError> {
         let mut runtime_skills = Vec::new();
         for skill_id in skill_ids {
-            if let Some(skill) = self.skills.get(skill_id).await.map_err(internal)? {
-                runtime_skills.push(skill);
-            }
+            let Some(skill) = self.applied_state.skill_by_id(skill_id).cloned() else {
+                continue;
+            };
+            runtime_skills.push(skill);
         }
         Ok(runtime_skills)
     }
 
-    async fn runtime_visible_skills(&self) -> Result<Vec<SkillRecord>, KernelError> {
-        let mut runtime_skills = self.skills.list().await.map_err(internal)?;
-        if runtime_skills.is_empty() {
-            return Ok(runtime_skills);
-        }
-
-        let host_only_skill_aliases = self
-            .channel_state
-            .list_bindings()
-            .await
-            .map_err(internal)?
-            .into_iter()
-            .filter(|binding| binding.enabled)
-            .map(|binding| binding.skill_alias)
-            .collect::<HashSet<_>>();
-        runtime_skills.retain(|skill| !host_only_skill_aliases.contains(&skill.alias));
-        runtime_skills.sort_by(|left, right| left.alias.cmp(&right.alias));
-        Ok(runtime_skills)
+    async fn runtime_visible_skills(&self) -> Result<Vec<AppliedSkill>, KernelError> {
+        Ok(self.applied_state.runtime_visible_skills())
     }
 
     #[cfg(test)]
     async fn resolve_runtime_skill_mounts(
         &self,
-        runtime_skills: &[SkillRecord],
+        runtime_skills: &[AppliedSkill],
     ) -> Result<Vec<MountSpec>, KernelError> {
         let (_skills, mounts) = self
             .resolve_runtime_skill_mounts_and_skills(runtime_skills)
@@ -5444,12 +4915,8 @@ impl Kernel {
 
     async fn resolve_runtime_skill_mounts_and_skills(
         &self,
-        runtime_skills: &[SkillRecord],
-    ) -> Result<(Vec<SkillRecord>, Vec<MountSpec>), KernelError> {
-        let Some(snapshot_root) = self.canonical_skill_snapshot_root().await? else {
-            return Ok((Vec::new(), Vec::new()));
-        };
-
+        runtime_skills: &[AppliedSkill],
+    ) -> Result<(Vec<AppliedSkill>, Vec<MountSpec>), KernelError> {
         let mut selected = Vec::new();
         for skill in runtime_skills {
             validate_skill_alias(&skill.alias).map_err(|err| {
@@ -5458,17 +4925,25 @@ impl Kernel {
                     skill.skill_id
                 ))
             })?;
-            let Some(source) = self
-                .resolve_skill_snapshot_dir(&snapshot_root, skill)
-                .await?
-            else {
-                continue;
-            };
+            let metadata = tokio::fs::symlink_metadata(&skill.snapshot_path)
+                .await
+                .map_err(|err| {
+                    KernelError::Runtime(format!(
+                        "failed to stat runtime skill snapshot '{}': {err}",
+                        skill.snapshot_path.display()
+                    ))
+                })?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(KernelError::Runtime(format!(
+                    "runtime skill snapshot '{}' is no longer a regular directory",
+                    skill.snapshot_path.display()
+                )));
+            }
 
             selected.push((
                 skill.clone(),
                 MountSpec {
-                    source,
+                    source: skill.snapshot_path.clone(),
                     target: skill_mount_target(&skill.alias),
                     access: MountAccess::ReadOnly,
                 },
@@ -5492,58 +4967,6 @@ impl Kernel {
         }
 
         Ok((mounted_skills, mounts))
-    }
-
-    async fn canonical_skill_snapshot_root(&self) -> Result<Option<PathBuf>, KernelError> {
-        let Some(snapshot_root) = self.skill_snapshot_root.as_ref() else {
-            return Ok(None);
-        };
-
-        match tokio::fs::canonicalize(snapshot_root).await {
-            Ok(path) => Ok(Some(path)),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(internal(err.into())),
-        }
-    }
-
-    async fn resolve_skill_snapshot_dir(
-        &self,
-        snapshot_root: &Path,
-        skill: &super::skills::SkillRecord,
-    ) -> Result<Option<PathBuf>, KernelError> {
-        let Some(snapshot_path) = skill.snapshot_path.as_ref() else {
-            return Ok(None);
-        };
-
-        let source = match tokio::fs::canonicalize(snapshot_path).await {
-            Ok(path) => path,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(internal(err.into())),
-        };
-        if source.parent() != Some(snapshot_root) {
-            warn!(
-                skill_id = %skill.skill_id,
-                alias = %skill.alias,
-                snapshot_path = %source.display(),
-                snapshot_root = %snapshot_root.display(),
-                "skipping runtime skill snapshot outside canonical LionClaw snapshot directory"
-            );
-            return Ok(None);
-        }
-        let metadata = tokio::fs::metadata(&source)
-            .await
-            .map_err(|err| internal(err.into()))?;
-        if !metadata.is_dir() {
-            warn!(
-                skill_id = %skill.skill_id,
-                alias = %skill.alias,
-                snapshot_path = %source.display(),
-                "skipping runtime skill snapshot that is not a directory"
-            );
-            return Ok(None);
-        }
-
-        Ok(Some(source))
     }
 
     async fn materialize_runtime_plan(
@@ -5637,7 +5060,7 @@ impl Kernel {
 
     async fn resolve_channel_runtime_id(
         &self,
-        channel_id: &str,
+        _channel_id: &str,
         requested_runtime_id: Option<String>,
     ) -> Result<Option<String>, KernelError> {
         if let Some(runtime_id) = requested_runtime_id
@@ -5648,21 +5071,7 @@ impl Kernel {
             return Ok(Some(runtime_id.to_string()));
         }
 
-        let binding = self
-            .channel_state
-            .get_binding(channel_id)
-            .await
-            .map_err(internal)?;
-
-        Ok(binding.and_then(|binding| {
-            binding
-                .config
-                .get("runtime_id")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|value| value.to_string())
-        }))
+        Ok(None)
     }
 
     async fn channel_stream_context_for_session(
@@ -5672,25 +5081,13 @@ impl Kernel {
         peer_id: &str,
         turn_id: Uuid,
     ) -> Result<Option<ChannelStreamContext>, KernelError> {
-        let binding = self
-            .channel_state
-            .get_binding(channel_id)
-            .await
-            .map_err(internal)?;
+        let binding = self.applied_channel(channel_id).cloned();
         let Some(binding) = binding else {
             return Ok(None);
         };
-        if !binding.enabled {
-            return Ok(None);
-        }
 
-        let skill_enabled = self
-            .skills
-            .get_enabled_by_alias(&binding.skill_alias)
-            .await
-            .map_err(internal)?
-            .is_some();
-        if !skill_enabled {
+        let skill_installed = self.applied_skill_by_alias(&binding.skill_alias).is_some();
+        if !skill_installed {
             return Ok(None);
         }
 
@@ -7022,28 +6419,12 @@ impl Kernel {
     }
 
     async fn require_active_channel_binding(&self, channel_id: &str) -> Result<(), KernelError> {
-        let binding = self
-            .channel_state
-            .get_binding(channel_id)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| {
-                KernelError::NotFound(format!("channel '{channel_id}' is not bound to a skill"))
-            })?;
+        let binding = self.applied_channel(channel_id).ok_or_else(|| {
+            KernelError::NotFound(format!("channel '{channel_id}' is not bound to a skill"))
+        })?;
 
-        if !binding.enabled {
-            return Err(KernelError::Conflict(format!(
-                "channel '{channel_id}' binding is disabled"
-            )));
-        }
-
-        let skill_enabled = self
-            .skills
-            .get_enabled_by_alias(&binding.skill_alias)
-            .await
-            .map_err(internal)?
-            .is_some();
-        if !skill_enabled {
+        let skill_installed = self.applied_skill_by_alias(&binding.skill_alias).is_some();
+        if !skill_installed {
             return Err(KernelError::Conflict(format!(
                 "channel '{}' binding skill '{}' is unavailable",
                 channel_id, binding.skill_alias

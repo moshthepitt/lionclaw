@@ -27,7 +27,7 @@ pub struct DaemonServiceSpec<'a> {
     pub runtime_id: &'a str,
     pub workspace: &'a str,
     pub project_workspace_root: &'a Path,
-    pub config_fingerprint: &'a str,
+    pub daemon_fingerprint: &'a str,
     pub codex_home_override: Option<&'a Path>,
 }
 
@@ -73,8 +73,8 @@ pub fn render_daemon_unit(
             spec.project_workspace_root.display().to_string(),
         ),
         (
-            "LIONCLAW_DAEMON_CONFIG_FINGERPRINT".to_string(),
-            spec.config_fingerprint.to_string(),
+            "LIONCLAW_DAEMON_FINGERPRINT".to_string(),
+            spec.daemon_fingerprint.to_string(),
         ),
     ];
     if let Some(codex_home_override) = spec.codex_home_override {
@@ -626,7 +626,7 @@ mod tests {
                 runtime_id: "codex",
                 workspace: "main",
                 project_workspace_root: Path::new("/tmp/project"),
-                config_fingerprint: "daemon-compat-test",
+                daemon_fingerprint: "daemon-state-test",
                 codex_home_override: Some(Path::new("/tmp/custom-codex-home")),
             },
         );
@@ -640,7 +640,7 @@ mod tests {
             .contains("LIONCLAW_WORKSPACE_ROOT=\"/tmp/project\""));
         assert!(daemon
             .env_content
-            .contains("LIONCLAW_DAEMON_CONFIG_FINGERPRINT=\"daemon-compat-test\""));
+            .contains("LIONCLAW_DAEMON_FINGERPRINT=\"daemon-state-test\""));
         assert!(daemon
             .env_content
             .contains("CODEX_HOME=\"/tmp/custom-codex-home\""));

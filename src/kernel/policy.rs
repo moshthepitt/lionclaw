@@ -158,15 +158,6 @@ impl PolicyStore {
         scope: Scope,
         ttl_seconds: Option<i64>,
     ) -> Result<Grant> {
-        let skill_exists = sqlx::query("SELECT 1 FROM skills WHERE skill_id = ?1 LIMIT 1")
-            .bind(&skill_id)
-            .fetch_optional(&mut **tx)
-            .await
-            .context("failed to validate skill existence for grant")?;
-        if skill_exists.is_none() {
-            return Err(anyhow!("skill '{skill_id}' not found"));
-        }
-
         let created_at_ms = now_ms();
         let expires_at_ms = ttl_seconds.map(|seconds| created_at_ms + (seconds * 1000));
         let capability_raw = capability.as_str();
@@ -325,7 +316,7 @@ mod tests {
     use std::str::FromStr;
 
     use super::{Capability, PolicyStore, Scope};
-    use crate::kernel::db::{now_ms, Db};
+    use crate::kernel::db::Db;
 
     #[tokio::test]
     async fn defaults_to_deny() {
@@ -343,7 +334,6 @@ mod tests {
         let db = Db::connect_memory().await.expect("db");
         let store = PolicyStore::new(db.pool());
         let scope = Scope::from_str("*").expect("scope");
-        seed_skill(db.pool(), "skill-a").await;
 
         store
             .grant(
@@ -369,18 +359,5 @@ mod tests {
 
         let parsed = Scope::from_str("channel:telegram").expect("scope");
         assert!(matches!(parsed, Scope::Channel(value) if value == "telegram"));
-    }
-
-    async fn seed_skill(pool: sqlx::SqlitePool, skill_id: &str) {
-        sqlx::query(
-            "INSERT INTO skills \
-             (skill_id, name, description, source, reference, hash, enabled, installed_at_ms) \
-             VALUES (?1, 'seed', 'seed', 'seed', '', 'seed-hash', 0, ?2)",
-        )
-        .bind(skill_id)
-        .bind(now_ms())
-        .execute(&pool)
-        .await
-        .expect("seed skill");
     }
 }

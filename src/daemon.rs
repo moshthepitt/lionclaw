@@ -7,6 +7,7 @@ use tracing::{info, warn};
 
 use crate::{
     api::build_router,
+    applied::{compute_daemon_fingerprint, AppliedState},
     config::Config,
     contracts::DaemonInfoResponse,
     home::runtime_project_partition_key,
@@ -41,7 +42,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         default_runtime_id.as_deref(),
     )
     .await?;
-    let config_fingerprint = runtime_context.daemon_config_fingerprint.clone();
+    let applied_state = AppliedState::load(&config.home).await?;
+    let daemon_fingerprint =
+        compute_daemon_fingerprint(&runtime_context.daemon_config_fingerprint, &applied_state);
 
     let kernel = Arc::new(
         Kernel::new_with_options(
@@ -65,8 +68,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 workspace_root: Some(workspace_root),
                 project_workspace_root: Some(project_workspace_root),
                 runtime_root: Some(config.home.runtime_dir()),
-                skill_snapshot_root: Some(config.home.skills_dir()),
                 workspace_name: Some(operator_config.daemon.workspace.clone()),
+                applied_state,
                 ..KernelOptions::default()
             },
         )
@@ -86,7 +89,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             home_root: config.home.root().display().to_string(),
             bind_addr: config.bind_addr.clone(),
             project_scope,
-            config_fingerprint,
+            daemon_fingerprint,
         },
     );
 

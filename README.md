@@ -313,9 +313,8 @@ LionClaw defaults to `~/.lionclaw`:
 
 - `db/lionclaw.db`
 - `config/lionclaw.toml`
-- `config/lionclaw.lock`
 - `config/runtime-secrets.env`
-- `skills/<skill-id>@<hash>/`
+- `skills/<alias>/`
 - `workspaces/main/`
 - `runtime/`
 - `services/`

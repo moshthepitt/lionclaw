@@ -1548,36 +1548,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_job_with_scope_grants_rolls_back_on_grant_failure() {
+    async fn create_job_with_scope_grants_persists_job_and_grants() {
         let (store, policy) = new_store_and_policy().await;
 
-        let err = store
+        let created = store
             .create_job_with_scope_grants(
                 &policy,
                 NewSchedulerJob {
-                    name: "rollback".to_string(),
+                    name: "granted".to_string(),
                     runtime_id: "mock".to_string(),
                     schedule: JobSchedule::Once {
                         run_at: Utc::now() + ChronoDuration::minutes(1),
                     },
                     prompt_text: "prompt".to_string(),
-                    skill_ids: vec!["missing-skill".to_string()],
+                    skill_ids: vec!["scheduler-skill".to_string()],
                     delivery: None,
                     retry_attempts: 1,
                 },
                 &[Capability::FsRead],
             )
             .await
-            .expect_err("grant failure should roll back job insert");
+            .expect("job creation should succeed");
 
-        assert!(err.to_string().contains("skill 'missing-skill' not found"));
+        assert_eq!(created.skill_ids, vec!["scheduler-skill".to_string()]);
         assert!(
+            policy
+                .is_allowed(
+                    "scheduler-skill",
+                    Capability::FsRead,
+                    &Scope::Job(created.job_id),
+                )
+                .await
+                .expect("policy lookup"),
+            "job-scoped capability grant should be persisted with the job"
+        );
+        assert_eq!(
             store
                 .list_jobs()
                 .await
-                .expect("list jobs after rollback")
-                .is_empty(),
-            "failed grant creation must not leave a scheduler job behind"
+                .expect("list jobs after create")
+                .len(),
+            1
         );
     }
 

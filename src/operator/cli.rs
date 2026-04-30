@@ -23,7 +23,7 @@ use crate::{
             ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig,
         },
         reconcile::{
-            add_channel, add_skill, apply, down, logs, onboard, open_kernel, open_runtime_kernel,
+            add_channel, add_skill, down, logs, onboard, open_kernel, open_runtime_kernel,
             pairing_approve, pairing_block, pairing_list, remove_channel, remove_skill,
             resolve_installed_skill_worker_entrypoint, resolve_stack_binaries, status, up,
             OnboardBindSelection,
@@ -49,7 +49,6 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Onboard(OnboardArgs),
-    Apply,
     Run(RunArgs),
     Runtime {
         #[command(subcommand)]
@@ -385,14 +384,6 @@ pub async fn run() -> Result<()> {
                 config.daemon.bind
             );
         }
-        Command::Apply => {
-            let applied = apply(&home).await?;
-            println!(
-                "applied {} skills and {} channels",
-                applied.lockfile.skills.len(),
-                applied.lockfile.channels.len()
-            );
-        }
         Command::Run(args) => {
             let timeout_override = args.timeout.map(RuntimeTurnTimeouts::with_hard_timeout);
             run_local(
@@ -464,9 +455,7 @@ pub async fn run() -> Result<()> {
                         .config
                         .channels
                         .iter()
-                        .filter(|channel| {
-                            channel.enabled && channel.launch_mode == ChannelLaunchMode::Service
-                        })
+                        .filter(|channel| channel.launch_mode == ChannelLaunchMode::Service)
                         .count();
                     println!(
                         "started LionClaw services with runtime {runtime_id} ({managed_channels} channels)"
@@ -481,11 +470,10 @@ pub async fn run() -> Result<()> {
                     println!("daemon: {}", stack.daemon_status);
                     for channel in stack.channels {
                         println!(
-                            "channel={} skill={} launch={} binding={} unit={} peers(pending={},approved={},blocked={}) inbound={} outbound={}",
+                            "channel={} skill={} launch={} unit={} peers(pending={},approved={},blocked={}) inbound={} outbound={}",
                             channel.id,
                             channel.skill,
                             channel.launch_mode,
-                            channel.binding_enabled,
                             channel.unit_status,
                             channel.pending_peers,
                             channel.approved_peers,
@@ -592,10 +580,10 @@ pub async fn run() -> Result<()> {
             },
         },
         Command::Continuity { command } => {
-            let applied = apply(&home).await?;
+            let config = OperatorConfig::load(&home).await?;
             match command {
                 ContinuityCommand::Drafts { command } => {
-                    let kernel = open_runtime_kernel(&home, &applied.config, None).await?;
+                    let kernel = open_runtime_kernel(&home, &config, None).await?;
                     match command {
                         ContinuityDraftCommand::Ls(args) => {
                             let response = kernel
@@ -644,7 +632,7 @@ pub async fn run() -> Result<()> {
                     }
                 }
                 other => {
-                    let kernel = open_kernel(&home, &applied.config, None).await?;
+                    let kernel = open_kernel(&home, &config, None).await?;
                     match other {
                         ContinuityCommand::Status => {
                             let status = kernel.continuity_status().await?;
@@ -772,8 +760,7 @@ pub async fn run() -> Result<()> {
                         let args = *args;
                         let runtime_id = resolve_runtime_id(&config, args.runtime.as_deref())?;
                         validate_runtime_launch_prerequisites(&home, &config, &runtime_id).await?;
-                        let applied = apply(&home).await?;
-                        let kernel = open_kernel(&home, &applied.config, None).await?;
+                        let kernel = open_kernel(&home, &config, None).await?;
                         let prompt_text = load_job_prompt(args.prompt, args.prompt_file).await?;
                         let schedule = parse_job_schedule_spec(&args.schedule, args.tz.as_deref())?;
                         let delivery = match (args.deliver_channel, args.deliver_peer) {

@@ -288,7 +288,7 @@ Expected:
 - service starts or reconciles cleanly
 - the broken unselected runtime does not block `service up --runtime codex`
 - daemon info reports stable `home_id`, `project_scope`, and
-  `config_fingerprint`
+  `daemon_fingerprint`
 
 Negative selected-runtime check:
 
@@ -325,14 +325,14 @@ for _ in $(seq 1 30); do
 done
 printf '%s\n' "$after_info"
 test -n "$after_info"
-grep -E '^(CODEX_HOME|LIONCLAW_DAEMON_CONFIG_FINGERPRINT)=' \
+grep -E '^(CODEX_HOME|LIONCLAW_DAEMON_FINGERPRINT)=' \
   "$LIONCLAW_HOME/services/env/lionclawd.env" || true
 ```
 
 Expected:
 
 - daemon remains reachable after `service up`
-- `config_fingerprint` changes after the config update
+- `daemon_fingerprint` changes after the config update
 - same `home_id` and `project_scope` are preserved
 - if `CODEX_HOME` was exported at the start of the pass, the generated daemon
   env file contains that exact absolute path

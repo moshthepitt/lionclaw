@@ -66,10 +66,6 @@ impl LionClawHome {
         self.config_dir().join("home-id")
     }
 
-    pub fn lock_path(&self) -> PathBuf {
-        self.config_dir().join("lionclaw.lock")
-    }
-
     pub fn skills_dir(&self) -> PathBuf {
         self.root.join("skills")
     }
@@ -397,10 +393,6 @@ mod tests {
         assert_eq!(
             home.home_id_path(),
             std::path::PathBuf::from("/tmp/lionclaw-home/config/home-id")
-        );
-        assert_eq!(
-            home.lock_path(),
-            std::path::PathBuf::from("/tmp/lionclaw-home/config/lionclaw.lock")
         );
         assert_eq!(
             home.workspace_dir(DEFAULT_WORKSPACE),

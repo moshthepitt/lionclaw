@@ -242,12 +242,10 @@ with the CLI.
 
 ### Skill
 
-- `POST /v0/skills/install`
 - `GET /v0/skills/list`
 
 ### Channel
 
-- `POST /v0/channels/bind`
 - `GET /v0/channels/list`
 - `GET /v0/channels/peers`
 - `POST /v0/channels/peers/approve`

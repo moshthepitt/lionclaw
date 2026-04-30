@@ -1,23 +1,19 @@
 use anyhow::{anyhow, Context, Result};
-use serde_json::json;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 use crate::{
+    applied::{canonical_skills_root, compute_daemon_fingerprint, AppliedState},
     config::resolve_project_workspace_root,
-    contracts::{ChannelBindRequest, ChannelPeerApproveRequest, ChannelPeerResponse, TrustTier},
+    contracts::{ChannelPeerApproveRequest, ChannelPeerResponse, TrustTier},
     home::{runtime_project_partition_key, LionClawHome},
     kernel::{skills::validate_skill_alias, Kernel, KernelOptions, RuntimeExecutionPolicy},
     operator::{
-        config::{
-            normalize_local_source, ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig,
-            OperatorConfig,
-        },
+        config::{normalize_local_source, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
         daemon_probe::{classify_daemon, DaemonClassification},
-        lockfile::{LockedChannel, LockedSkill, OperatorLockfile},
         runtime::{
             register_configured_runtimes, resolve_runtime_execution_context,
             validate_runtime_launch_prerequisites,
@@ -27,16 +23,16 @@ use crate::{
             ChannelServiceSpec, DaemonServiceSpec, ManagedServiceUnit, ServiceManager,
             DAEMON_UNIT_NAME,
         },
-        snapshot::{install_snapshot, InstalledSnapshot},
+        snapshot::{install_snapshot, resolve_local_source},
     },
     runtime_timeouts::RuntimeTurnTimeouts,
     workspace::{bootstrap_workspace, read_workspace_sections, GENERATED_AGENTS_FILE},
 };
 
 #[derive(Debug, Clone)]
-pub struct ApplyResult {
+pub struct OperatorState {
     pub config: OperatorConfig,
-    pub lockfile: OperatorLockfile,
+    pub applied_state: AppliedState,
 }
 
 #[derive(Debug, Clone)]
@@ -51,7 +47,6 @@ pub struct ChannelStatus {
     pub skill: String,
     pub skill_id: String,
     pub launch_mode: String,
-    pub binding_enabled: bool,
     pub unit_status: String,
     pub pending_peers: u64,
     pub approved_peers: u64,
@@ -80,7 +75,6 @@ pub async fn onboard(
     config.daemon.bind = resolve_onboard_bind(&config.daemon.bind, bind_selection.as_ref())?;
     bootstrap_workspace(&config.workspace_root(home)).await?;
     config.save(home).await?;
-    OperatorLockfile::load(home).await?.save(home).await?;
     Ok(config)
 }
 
@@ -91,21 +85,67 @@ pub async fn add_skill(
     reference: String,
 ) -> Result<()> {
     validate_skill_alias(&alias)?;
-    let mut config = OperatorConfig::load(home).await?;
     let source = normalize_local_source(&source)?;
-    config.upsert_skill(ManagedSkillConfig {
-        alias,
-        source,
-        reference,
-    });
-    config.save(home).await
+    home.ensure_base_dirs().await?;
+    let config = OperatorConfig::load(home).await?;
+    if config.channels.iter().any(|channel| channel.skill == alias) {
+        let source_path = resolve_local_source(&source)?;
+        resolve_worker_entrypoint(&source_path).with_context(|| {
+            format!(
+                "skill alias '{alias}' backs a configured channel and must keep a valid 'scripts/worker'"
+            )
+        })?;
+    }
+    install_snapshot(home, &alias, &source, &reference)?;
+    Ok(())
 }
 
 pub async fn remove_skill(home: &LionClawHome, alias: &str) -> Result<bool> {
-    let mut config = OperatorConfig::load(home).await?;
-    let removed = config.remove_skill(alias);
-    config.save(home).await?;
-    Ok(removed)
+    validate_skill_alias(alias)?;
+    let config = OperatorConfig::load(home).await?;
+    if let Some(channel) = config
+        .channels
+        .iter()
+        .find(|channel| channel.skill == alias)
+    {
+        return Err(anyhow!(
+            "skill alias '{}' is in use by channel '{}'; remove the channel first",
+            alias,
+            channel.id
+        ));
+    }
+
+    let skills_root = canonical_skills_root(home)?;
+    let snapshot_root = skills_root.join(alias);
+    let metadata = match tokio::fs::symlink_metadata(&snapshot_root).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to stat installed skill {}", snapshot_root.display())
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "installed skill '{}' must not be a symlink",
+            snapshot_root.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(anyhow!(
+            "installed skill '{}' is not a directory",
+            snapshot_root.display()
+        ));
+    }
+
+    match tokio::fs::remove_dir_all(&snapshot_root).await {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to remove {}", snapshot_root.display()))
+        }
+    }
 }
 
 pub async fn add_channel(
@@ -115,11 +155,12 @@ pub async fn add_channel(
     launch_mode: ChannelLaunchMode,
     required_env: Vec<String>,
 ) -> Result<()> {
+    validate_skill_alias(&skill)?;
+    resolve_installed_skill_worker_entrypoint(home, &skill).await?;
     let mut config = OperatorConfig::load(home).await?;
     config.upsert_channel(ManagedChannelConfig {
         id,
         skill,
-        enabled: true,
         launch_mode,
         required_env,
     });
@@ -133,129 +174,14 @@ pub async fn remove_channel(home: &LionClawHome, id: &str) -> Result<bool> {
     Ok(removed)
 }
 
-pub async fn apply(home: &LionClawHome) -> Result<ApplyResult> {
+pub async fn load_operator_state(home: &LionClawHome) -> Result<OperatorState> {
     home.ensure_base_dirs().await?;
     let config = OperatorConfig::load(home).await?;
     bootstrap_workspace(&config.workspace_root(home)).await?;
-    let previous_lock = OperatorLockfile::load(home).await?;
-
-    let kernel = open_kernel(home, &config, None).await?;
-    let mut next_lock = OperatorLockfile::default();
-    let mut installed_skills = BTreeMap::new();
-    let mut desired_skills = Vec::new();
-    let mut desired_aliases = BTreeSet::new();
-    let mut snapshot_aliases = BTreeMap::new();
-
-    for skill in &config.skills {
-        validate_skill_alias(&skill.alias)?;
-        if !desired_aliases.insert(skill.alias.clone()) {
-            return Err(anyhow!(
-                "skill alias '{}' is configured more than once",
-                skill.alias
-            ));
-        }
-        let snapshot = install_snapshot(home, &skill.alias, &skill.source, &skill.reference)?;
-        if let Some(existing_alias) =
-            snapshot_aliases.insert(snapshot.skill_id.clone(), skill.alias.clone())
-        {
-            return Err(anyhow!(
-                "skill snapshot is configured under both '{}' and '{}'; remove one alias",
-                existing_alias,
-                skill.alias
-            ));
-        }
-        desired_skills.push((skill, snapshot));
-    }
-
-    for channel in &config.channels {
-        if !desired_aliases.contains(channel.skill.as_str()) {
-            return Err(anyhow!(
-                "channel '{}' references missing skill alias '{}'",
-                channel.id,
-                channel.skill
-            ));
-        }
-    }
-
-    for (skill, snapshot) in desired_skills {
-        let installed = kernel
-            .install_skill_with_actor(
-                crate::contracts::SkillInstallRequest {
-                    source: snapshot.source_uri.clone(),
-                    alias: skill.alias.clone(),
-                    reference: Some(snapshot.reference.clone()),
-                    hash: Some(snapshot.hash.clone()),
-                    skill_md: Some(snapshot.skill_md.clone()),
-                    snapshot_path: Some(snapshot.snapshot_abs_dir.to_string_lossy().to_string()),
-                },
-                "operator",
-            )
-            .await
-            .map_err(to_anyhow)?;
-
-        installed_skills.insert(
-            skill.alias.clone(),
-            (snapshot.clone(), installed.skill_id.clone()),
-        );
-        next_lock
-            .skills
-            .push(to_locked_skill(skill, snapshot, installed.skill_id));
-    }
-    let next_skill_aliases = next_lock
-        .skills
-        .iter()
-        .map(|skill| skill.alias.as_str())
-        .collect::<BTreeSet<_>>();
-
-    let desired_channel_ids = config
-        .channels
-        .iter()
-        .map(|channel| channel.id.as_str())
-        .collect::<BTreeSet<_>>();
-
-    for old_channel in &previous_lock.channels {
-        if !desired_channel_ids.contains(old_channel.id.as_str()) {
-            kernel
-                .disable_channel_binding(&old_channel.id, "operator")
-                .await
-                .map_err(to_anyhow)?;
-        }
-    }
-
-    for channel in &config.channels {
-        installed_skills
-            .get(&channel.skill)
-            .ok_or_else(|| anyhow!("skill alias '{}' disappeared during apply", channel.skill))?;
-
-        kernel
-            .bind_channel(ChannelBindRequest {
-                channel_id: channel.id.clone(),
-                skill_alias: channel.skill.clone(),
-                enabled: Some(channel.enabled),
-                config: Some(json!({})),
-            })
-            .await
-            .map_err(to_anyhow)?;
-
-        next_lock.channels.push(LockedChannel {
-            id: channel.id.clone(),
-            skill: channel.skill.clone(),
-            enabled: channel.enabled,
-            launch_mode: channel.launch_mode,
-        });
-    }
-
-    for old_skill in &previous_lock.skills {
-        if !next_skill_aliases.contains(old_skill.alias.as_str()) {
-            remove_stale_skill_alias_if_present(&kernel, &old_skill.alias).await?;
-        }
-    }
-
-    next_lock.save(home).await?;
-
-    Ok(ApplyResult {
+    let applied_state = AppliedState::load(home).await?;
+    Ok(OperatorState {
         config,
-        lockfile: next_lock,
+        applied_state,
     })
 }
 
@@ -264,20 +190,22 @@ pub async fn up<M: ServiceManager>(
     manager: &M,
     runtime_id: &str,
     binaries: &StackBinaryPaths,
-) -> Result<ApplyResult> {
-    let config = OperatorConfig::load(home).await?;
-    let runtime_context =
-        resolve_runtime_execution_context(home, &config, Some(runtime_id)).await?;
+) -> Result<OperatorState> {
+    let state = load_operator_state(home).await?;
+    let config = &state.config;
+    let runtime_context = resolve_runtime_execution_context(home, config, Some(runtime_id)).await?;
     let home_id = home.ensure_home_id().await?;
     let project_root =
         resolve_project_workspace_root().context("failed to resolve project workspace root")?;
     let project_scope = runtime_project_partition_key(Some(project_root.as_path()));
-    let expected_config_fingerprint = runtime_context.daemon_config_fingerprint.clone();
+    let runtime_config_fingerprint = runtime_context.daemon_config_fingerprint.clone();
+    let expected_daemon_fingerprint =
+        compute_daemon_fingerprint(&runtime_config_fingerprint, &state.applied_state);
     match classify_daemon(
         &config.daemon.bind,
         &home_id,
         &project_scope,
-        &expected_config_fingerprint,
+        &expected_daemon_fingerprint,
     )
     .await?
     {
@@ -320,16 +248,15 @@ pub async fn up<M: ServiceManager>(
     }
 
     let previous_units = managed_unit_names(home)?;
-    validate_runtime_launch_prerequisites(home, &config, runtime_id).await?;
-    let applied = apply(home).await?;
-    render_runtime_cache(home, &applied.config, &applied.lockfile, runtime_id).await?;
+    validate_runtime_launch_prerequisites(home, config, runtime_id).await?;
+    render_runtime_cache(home, &state.config, runtime_id).await?;
     let units = build_managed_units(
         home,
-        &applied.config,
-        &applied.lockfile,
+        &state.config,
+        &state.applied_state,
         runtime_id,
         binaries,
-        &runtime_context.daemon_config_fingerprint,
+        &expected_daemon_fingerprint,
         runtime_context.codex_home_override.as_deref(),
     )?;
     let next_units = units
@@ -366,7 +293,7 @@ pub async fn up<M: ServiceManager>(
     if !units_to_restart.is_empty() {
         manager.restart_units(&units_to_restart).await?;
     }
-    Ok(applied)
+    Ok(state)
 }
 
 fn resolve_onboard_bind(
@@ -395,17 +322,11 @@ pub async fn down<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Result
 }
 
 pub async fn status<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Result<StackStatus> {
-    let config = OperatorConfig::load(home).await?;
-    let lockfile = OperatorLockfile::load(home).await?;
-    let kernel = open_kernel(home, &config, None).await?;
+    let state = load_operator_state(home).await?;
+    let kernel = open_kernel(home, &state.config, None).await?;
 
     let mut channels = Vec::new();
-    for channel in &lockfile.channels {
-        let binding = kernel
-            .get_channel_binding(&channel.id)
-            .await
-            .map_err(to_anyhow)?
-            .ok_or_else(|| anyhow!("channel '{}' binding is missing", channel.id))?;
+    for channel in state.applied_state.channels() {
         let health = kernel
             .get_channel_health(&channel.id)
             .await
@@ -417,19 +338,19 @@ pub async fn status<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Resu
         };
         channels.push(ChannelStatus {
             id: channel.id.clone(),
-            skill: channel.skill.clone(),
-            skill_id: lockfile
-                .find_skill(&channel.skill)
+            skill: channel.skill_alias.clone(),
+            skill_id: state
+                .applied_state
+                .skill_by_alias(&channel.skill_alias)
                 .map(|skill| skill.skill_id.clone())
                 .ok_or_else(|| {
                     anyhow!(
                         "channel '{}' skill '{}' is missing",
                         channel.id,
-                        channel.skill
+                        channel.skill_alias
                     )
                 })?,
             launch_mode: channel.launch_mode.as_str().to_string(),
-            binding_enabled: binding.enabled,
             unit_status,
             pending_peers: health.pending_peer_count,
             approved_peers: health.approved_peer_count,
@@ -519,10 +440,10 @@ pub fn resolve_stack_binaries() -> Result<StackBinaryPaths> {
 pub(crate) fn build_managed_units(
     home: &LionClawHome,
     config: &OperatorConfig,
-    lockfile: &OperatorLockfile,
+    applied_state: &AppliedState,
     runtime_id: &str,
     binaries: &StackBinaryPaths,
-    config_fingerprint: &str,
+    daemon_fingerprint: &str,
     codex_home_override: Option<&Path>,
 ) -> Result<Vec<ManagedServiceUnit>> {
     let mut units = Vec::new();
@@ -536,7 +457,7 @@ pub(crate) fn build_managed_units(
             runtime_id,
             workspace: &config.daemon.workspace,
             project_workspace_root: &project_workspace_root,
-            config_fingerprint,
+            daemon_fingerprint,
             codex_home_override,
         },
     ));
@@ -545,16 +466,18 @@ pub(crate) fn build_managed_units(
     for channel in config
         .channels
         .iter()
-        .filter(|channel| channel.enabled && channel.launch_mode == ChannelLaunchMode::Service)
+        .filter(|channel| channel.launch_mode == ChannelLaunchMode::Service)
     {
-        let locked_skill = lockfile.find_skill(&channel.skill).ok_or_else(|| {
-            anyhow!(
-                "managed channel '{}' references unknown locked skill '{}'",
-                channel.id,
-                channel.skill
-            )
-        })?;
-        let worker_path = resolve_worker_entrypoint(home, &locked_skill.snapshot_dir)
+        let installed_skill = applied_state
+            .skill_by_alias(&channel.skill)
+            .ok_or_else(|| {
+                anyhow!(
+                    "managed channel '{}' references unknown installed skill '{}'",
+                    channel.id,
+                    channel.skill
+                )
+            })?;
+        let worker_path = resolve_worker_entrypoint(&installed_skill.snapshot_path)
             .with_context(|| format!("channel '{}' worker resolution failed", channel.id))?;
 
         let mut env = vec![
@@ -595,7 +518,6 @@ pub(crate) fn build_managed_units(
 pub(crate) async fn render_runtime_cache(
     home: &LionClawHome,
     config: &OperatorConfig,
-    _lockfile: &OperatorLockfile,
     runtime_id: &str,
 ) -> Result<()> {
     let workspace = &config.daemon.workspace;
@@ -644,21 +566,6 @@ fn render_marker_file(header: &str, body: &str) -> String {
     format!("{header}\n{start}\n{body}\n{end}\n")
 }
 
-fn to_locked_skill(
-    config: &ManagedSkillConfig,
-    snapshot: InstalledSnapshot,
-    skill_id: String,
-) -> LockedSkill {
-    LockedSkill {
-        alias: config.alias.clone(),
-        source: snapshot.source_uri,
-        reference: snapshot.reference,
-        skill_id,
-        hash: snapshot.hash,
-        snapshot_dir: snapshot.snapshot_rel_dir,
-    }
-}
-
 pub(crate) fn base_url_from_bind(bind: &str) -> String {
     if let Ok(addr) = bind.parse::<std::net::SocketAddr>() {
         match addr {
@@ -672,11 +579,7 @@ pub(crate) fn base_url_from_bind(bind: &str) -> String {
     }
 }
 
-pub(crate) fn resolve_worker_entrypoint(
-    home: &LionClawHome,
-    snapshot_dir: &str,
-) -> Result<PathBuf> {
-    let snapshot_root = resolve_locked_snapshot_dir(home, snapshot_dir)?;
+pub(crate) fn resolve_worker_entrypoint(snapshot_root: &Path) -> Result<PathBuf> {
     let candidate = snapshot_root.join("scripts/worker");
     let metadata = match fs::symlink_metadata(&candidate) {
         Ok(metadata) => metadata,
@@ -719,53 +622,34 @@ pub(crate) async fn resolve_installed_skill_worker_entrypoint(
     alias: &str,
 ) -> Result<PathBuf> {
     validate_skill_alias(alias)?;
-    let lockfile = OperatorLockfile::load(home).await?;
-    let locked_skill = lockfile
-        .find_skill(alias)
-        .ok_or_else(|| anyhow!("skill alias '{alias}' is not installed; run 'lionclaw apply'"))?;
-
-    resolve_worker_entrypoint(home, &locked_skill.snapshot_dir)
+    let snapshot_root = resolve_installed_skill_dir(home, alias)?;
+    resolve_worker_entrypoint(&snapshot_root)
 }
 
-fn resolve_locked_snapshot_dir(home: &LionClawHome, snapshot_dir: &str) -> Result<PathBuf> {
-    let snapshot_path = Path::new(snapshot_dir);
-    let mut components = snapshot_path.components();
-    let valid = matches!(components.next(), Some(Component::Normal(value)) if value == "skills")
-        && matches!(components.next(), Some(Component::Normal(_)))
-        && components.next().is_none();
-    if snapshot_path.is_absolute() || !valid {
-        return Err(anyhow!(
-            "locked skill snapshot_dir '{snapshot_dir}' must be a relative skills/<snapshot> path"
-        ));
-    }
-
-    let snapshot_root = home.root().join(snapshot_path);
-    let metadata = fs::symlink_metadata(&snapshot_root).with_context(|| {
-        format!(
-            "failed to stat locked skill snapshot {}",
-            snapshot_root.display()
-        )
-    })?;
+fn resolve_installed_skill_dir(home: &LionClawHome, alias: &str) -> Result<PathBuf> {
+    validate_skill_alias(alias)?;
+    let skills_root = canonical_skills_root(home)?;
+    let snapshot_root = skills_root.join(alias);
+    let metadata = fs::symlink_metadata(&snapshot_root)
+        .with_context(|| format!("failed to stat installed skill {}", snapshot_root.display()))?;
     if metadata.file_type().is_symlink() {
         return Err(anyhow!(
-            "locked skill snapshot '{}' must not be a symlink",
+            "installed skill '{}' must not be a symlink",
             snapshot_root.display()
         ));
     }
     if !metadata.is_dir() {
         return Err(anyhow!(
-            "locked skill snapshot '{}' is not a directory",
+            "installed skill '{}' is not a directory",
             snapshot_root.display()
         ));
     }
 
-    let skills_root = fs::canonicalize(home.skills_dir())
-        .with_context(|| format!("failed to resolve {}", home.skills_dir().display()))?;
     let snapshot_root = fs::canonicalize(&snapshot_root)
         .with_context(|| format!("failed to resolve {}", snapshot_root.display()))?;
     if snapshot_root.parent() != Some(skills_root.as_path()) {
         return Err(anyhow!(
-            "locked skill snapshot '{}' must stay directly under '{}'",
+            "installed skill '{}' must stay directly under '{}'",
             snapshot_root.display(),
             skills_root.display()
         ));
@@ -861,6 +745,7 @@ async fn open_kernel_with_project_root(
     timeout_override: Option<RuntimeTurnTimeouts>,
 ) -> Result<Kernel> {
     let workspace_root = config.workspace_root(home);
+    let applied_state = AppliedState::load(home).await?;
     let runtime_context =
         resolve_runtime_execution_context(home, config, default_runtime_id.as_deref()).await?;
     let timeouts = timeout_override.unwrap_or_else(RuntimeTurnTimeouts::interactive);
@@ -882,8 +767,8 @@ async fn open_kernel_with_project_root(
             workspace_root: Some(workspace_root),
             project_workspace_root,
             runtime_root: Some(home.runtime_dir()),
-            skill_snapshot_root: Some(home.skills_dir()),
             workspace_name: Some(config.daemon.workspace.clone()),
+            applied_state,
             ..KernelOptions::default()
         },
     )
@@ -896,17 +781,6 @@ fn to_anyhow(err: crate::kernel::KernelError) -> anyhow::Error {
     anyhow!(err.to_string())
 }
 
-async fn remove_stale_skill_alias_if_present(kernel: &Kernel, alias: &str) -> Result<()> {
-    let removed = kernel
-        .remove_skill_with_actor(alias, "operator")
-        .await
-        .map_err(to_anyhow)?;
-    if removed {
-        return Ok(());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -914,33 +788,26 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use axum::{routing::get, Json, Router};
-    use serde_json::json;
-
     use super::{
-        add_skill, apply, onboard, open_kernel, open_kernel_with_project_root, render_marker_file,
-        render_runtime_cache, resolve_installed_skill_worker_entrypoint, resolve_worker_entrypoint,
-        status, up, ApplyResult, OnboardBindSelection, StackBinaryPaths,
+        add_channel, add_skill, onboard, open_kernel, open_kernel_with_project_root,
+        render_marker_file, render_runtime_cache, resolve_installed_skill_worker_entrypoint,
+        resolve_worker_entrypoint, status, up, OnboardBindSelection, StackBinaryPaths,
     };
     use crate::{
+        applied::compute_daemon_fingerprint,
         config::resolve_project_workspace_root,
-        contracts::{DaemonInfoResponse, SkillInstallRequest},
+        contracts::DaemonInfoResponse,
         home::{runtime_project_partition_key, LionClawHome},
-        kernel::{
-            runtime::{ConfinementConfig, OciConfinementConfig},
-            Kernel, KernelOptions,
-        },
+        kernel::runtime::{ConfinementConfig, OciConfinementConfig},
         operator::{
-            config::{
-                ChannelLaunchMode, ManagedChannelConfig, ManagedSkillConfig, OperatorConfig,
-                RuntimeProfileConfig,
-            },
-            lockfile::{LockedSkill, OperatorLockfile},
+            config::{ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig},
+            reconcile::load_operator_state,
             runtime::resolve_runtime_execution_context,
             services::{FakeServiceManager, ServiceManager, DAEMON_UNIT_NAME},
         },
         workspace::GENERATED_AGENTS_FILE,
     };
+    use axum::{routing::get, Json, Router};
 
     async fn spawn_probe_server(app: Router, bind_addr: &str) -> tokio::task::JoinHandle<()> {
         let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -957,25 +824,41 @@ mod tests {
         runtime_project_partition_key(Some(project_root.as_path()))
     }
 
-    async fn current_daemon_config_fingerprint(home: &LionClawHome) -> String {
+    async fn current_daemon_fingerprint(home: &LionClawHome) -> String {
         let config = OperatorConfig::load(home).await.expect("load config");
-        resolve_runtime_execution_context(home, &config, config.defaults.runtime.as_deref())
+        let state = load_operator_state(home)
             .await
-            .expect("resolve runtime context")
-            .daemon_config_fingerprint
+            .expect("load operator state");
+        let runtime_config_fingerprint =
+            resolve_runtime_execution_context(home, &config, config.defaults.runtime.as_deref())
+                .await
+                .expect("resolve runtime context")
+                .daemon_config_fingerprint;
+        compute_daemon_fingerprint(&runtime_config_fingerprint, &state.applied_state)
     }
 
-    fn write_channel_skill_fixture(root: &Path, name: &str, description: &str) -> PathBuf {
+    fn write_skill_source(
+        root: &Path,
+        name: &str,
+        description: &str,
+        with_worker: bool,
+    ) -> PathBuf {
         let skill_source = root.join(name);
-        fs::create_dir_all(skill_source.join("scripts")).expect("skill dir");
+        if skill_source.exists() {
+            fs::remove_dir_all(&skill_source).expect("clear skill source");
+        }
+        fs::create_dir_all(&skill_source).expect("skill dir");
         fs::write(
             skill_source.join("SKILL.md"),
             format!("---\nname: {name}\ndescription: {description}\n---\n"),
         )
         .expect("skill md");
-        let worker = skill_source.join("scripts/worker");
-        fs::write(&worker, "#!/usr/bin/env bash\n").expect("worker");
-        make_executable(&worker);
+        if with_worker {
+            let worker = skill_source.join("scripts/worker");
+            fs::create_dir_all(worker.parent().expect("worker parent")).expect("scripts dir");
+            fs::write(&worker, "#!/usr/bin/env bash\n").expect("worker");
+            make_executable(&worker);
+        }
         skill_source
     }
 
@@ -1066,9 +949,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let config = onboard(&home, None).await.expect("onboard");
-        let lockfile = OperatorLockfile::default();
 
-        render_runtime_cache(&home, &config, &lockfile, "codex")
+        render_runtime_cache(&home, &config, "codex")
             .await
             .expect("render runtime cache");
         let project_workspace_root =
@@ -1109,79 +991,27 @@ mod tests {
     }
 
     #[test]
-    fn worker_entrypoint_requires_canonical_path() {
+    fn worker_entrypoint_requires_scripts_worker() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let snapshot_dir = "skills/example";
-        let scripts_dir = home.root().join(snapshot_dir).join("scripts");
-        fs::create_dir_all(&scripts_dir).expect("scripts dir");
-        fs::write(scripts_dir.join("worker.sh"), "#!/usr/bin/env bash\n").expect("worker");
+        let snapshot_root = temp_dir.path().join("example");
+        fs::create_dir_all(snapshot_root.join("scripts")).expect("scripts dir");
+        fs::write(
+            snapshot_root.join("scripts/worker.sh"),
+            "#!/usr/bin/env bash\n",
+        )
+        .expect("worker");
 
-        let err = resolve_worker_entrypoint(&home, snapshot_dir).expect_err("should fail");
+        let err = resolve_worker_entrypoint(&snapshot_root).expect_err("should fail");
         assert!(err.to_string().contains("expected 'scripts/worker'"));
-    }
-
-    #[test]
-    fn worker_entrypoint_rejects_lockfile_paths_outside_skill_snapshots() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-
-        for snapshot_dir in [
-            "../outside",
-            "/tmp/outside",
-            "runtime/example",
-            "skills",
-            "skills/../outside",
-            "skills/example/nested",
-        ] {
-            let err = resolve_worker_entrypoint(&home, snapshot_dir)
-                .expect_err("snapshot path should stay under skills/");
-            assert!(
-                err.to_string()
-                    .contains("must be a relative skills/<snapshot> path"),
-                "unexpected error for {snapshot_dir}: {err}"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn worker_entrypoint_rejects_symlinked_snapshot_dir() {
-        use std::os::unix::fs::symlink;
-
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let outside = temp_dir.path().join("outside-snapshot");
-        let worker = outside.join("scripts/worker");
-        fs::create_dir_all(worker.parent().expect("worker parent")).expect("outside scripts");
-        fs::write(&worker, "#!/usr/bin/env bash\n").expect("worker");
-        make_executable(&worker);
-        fs::create_dir_all(home.skills_dir()).expect("skills dir");
-        symlink(&outside, home.skills_dir().join("example")).expect("snapshot symlink");
-
-        let err = resolve_worker_entrypoint(&home, "skills/example")
-            .expect_err("symlinked snapshot should fail");
-
-        assert!(
-            err.to_string().contains("must not be a symlink"),
-            "unexpected error: {err}"
-        );
     }
 
     #[test]
     fn worker_entrypoint_rejects_directory_worker_path() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let snapshot_dir = "skills/example";
-        fs::create_dir_all(
-            home.root()
-                .join(snapshot_dir)
-                .join("scripts")
-                .join("worker"),
-        )
-        .expect("worker directory");
+        let snapshot_root = temp_dir.path().join("example");
+        fs::create_dir_all(snapshot_root.join("scripts/worker")).expect("worker directory");
 
-        let err = resolve_worker_entrypoint(&home, snapshot_dir).expect_err("should fail");
+        let err = resolve_worker_entrypoint(&snapshot_root).expect_err("should fail");
         assert!(err.to_string().contains("expected 'scripts/worker'"));
     }
 
@@ -1189,21 +1019,13 @@ mod tests {
     #[test]
     fn worker_entrypoint_rejects_non_executable_worker() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let snapshot_dir = "skills/example";
-        let worker = home
-            .root()
-            .join(snapshot_dir)
-            .join("scripts")
-            .join("worker");
+        let snapshot_root = temp_dir.path().join("example");
+        let worker = snapshot_root.join("scripts/worker");
         fs::create_dir_all(worker.parent().expect("worker parent")).expect("scripts dir");
         fs::write(&worker, "#!/usr/bin/env bash\n").expect("worker");
 
-        let err = resolve_worker_entrypoint(&home, snapshot_dir).expect_err("should fail");
-        assert!(
-            err.to_string().contains("is not executable"),
-            "unexpected error: {err}"
-        );
+        let err = resolve_worker_entrypoint(&snapshot_root).expect_err("should fail");
+        assert!(err.to_string().contains("is not executable"));
     }
 
     #[cfg(unix)]
@@ -1212,94 +1034,181 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let snapshot_dir = "skills/example";
-        let worker = home
-            .root()
-            .join(snapshot_dir)
-            .join("scripts")
-            .join("worker");
+        let snapshot_root = temp_dir.path().join("example");
+        let worker = snapshot_root.join("scripts/worker");
         fs::create_dir_all(worker.parent().expect("worker parent")).expect("scripts dir");
         let outside_worker = temp_dir.path().join("outside-worker");
         fs::write(&outside_worker, "#!/usr/bin/env bash\n").expect("outside worker");
         make_executable(&outside_worker);
         symlink(&outside_worker, &worker).expect("worker symlink");
 
-        let err = resolve_worker_entrypoint(&home, snapshot_dir).expect_err("should fail");
-        assert!(
-            err.to_string().contains("must not be a symlink"),
-            "unexpected error: {err}"
-        );
+        let err = resolve_worker_entrypoint(&snapshot_root).expect_err("should fail");
+        assert!(err.to_string().contains("must not be a symlink"));
     }
 
     #[tokio::test]
-    async fn installed_skill_worker_entrypoint_uses_locked_alias() {
+    async fn installed_skill_worker_entrypoint_uses_alias_directory() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let snapshot_dir = "skills/example";
-        let worker = home
-            .root()
-            .join(snapshot_dir)
-            .join("scripts")
-            .join("worker");
-        fs::create_dir_all(worker.parent().expect("worker parent")).expect("scripts dir");
-        fs::write(&worker, "#!/usr/bin/env bash\n").expect("worker");
-        make_executable(&worker);
-
-        OperatorLockfile {
-            skills: vec![LockedSkill {
-                alias: "telegram".to_string(),
-                source: "local:skills/channel-telegram".to_string(),
-                reference: "local".to_string(),
-                skill_id: "channel-telegram-hash".to_string(),
-                hash: "hash".to_string(),
-                snapshot_dir: snapshot_dir.to_string(),
-            }],
-            ..OperatorLockfile::default()
-        }
-        .save(&home)
+        onboard(&home, None).await.expect("onboard");
+        let skill_source =
+            write_skill_source(temp_dir.path(), "channel-telegram", "telegram", true);
+        add_skill(
+            &home,
+            "telegram".to_string(),
+            skill_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
         .await
-        .expect("save lockfile");
+        .expect("install skill");
 
         let resolved = resolve_installed_skill_worker_entrypoint(&home, "telegram")
             .await
             .expect("resolve worker");
-
-        assert_eq!(resolved, worker.canonicalize().expect("canonical worker"));
+        assert_eq!(
+            resolved,
+            home.skills_dir()
+                .join("telegram")
+                .join("scripts/worker")
+                .canonicalize()
+                .expect("canonical worker")
+        );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn render_runtime_cache_ignores_symlinked_skill_metadata() {
-        use std::os::unix::fs::symlink;
-
+    async fn add_skill_and_remove_skill_manage_installed_directory() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let config = onboard(&home, None).await.expect("onboard");
-        let snapshot_root = home.skills_dir().join("example");
-        fs::create_dir_all(&snapshot_root).expect("snapshot root");
-        let outside_skill_md = temp_dir.path().join("outside-SKILL.md");
-        fs::write(
-            &outside_skill_md,
-            "---\nname: outside\ndescription: outside\n---\n",
-        )
-        .expect("outside skill md");
-        symlink(&outside_skill_md, snapshot_root.join("SKILL.md")).expect("skill md symlink");
-        let lockfile = OperatorLockfile {
-            skills: vec![LockedSkill {
-                alias: "telegram".to_string(),
-                source: "local:skills/channel-telegram".to_string(),
-                reference: "local".to_string(),
-                skill_id: "channel-telegram-hash".to_string(),
-                hash: "hash".to_string(),
-                snapshot_dir: "skills/example".to_string(),
-            }],
-            ..OperatorLockfile::default()
-        };
+        onboard(&home, None).await.expect("onboard");
+        let skill_source = write_skill_source(temp_dir.path(), "test-skill", "test", false);
 
-        render_runtime_cache(&home, &config, &lockfile, "codex")
+        add_skill(
+            &home,
+            "test-skill".to_string(),
+            skill_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install skill");
+        assert!(home.skills_dir().join("test-skill").is_dir());
+
+        assert!(super::remove_skill(&home, "test-skill")
             .await
-            .expect("symlinked skill metadata should be ignored");
+            .expect("remove skill"));
+        assert!(!home.skills_dir().join("test-skill").exists());
+    }
+
+    #[tokio::test]
+    async fn remove_skill_returns_false_when_alias_is_not_installed() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+
+        assert!(!super::remove_skill(&home, "missing-skill")
+            .await
+            .expect("remove missing skill"));
+    }
+
+    #[tokio::test]
+    async fn remove_skill_rejects_channel_bound_alias() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+        let skill_source =
+            write_skill_source(temp_dir.path(), "channel-telegram", "telegram", true);
+        add_skill(
+            &home,
+            "telegram".to_string(),
+            skill_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install skill");
+        add_channel(
+            &home,
+            "telegram".to_string(),
+            "telegram".to_string(),
+            ChannelLaunchMode::Service,
+            Vec::new(),
+        )
+        .await
+        .expect("add channel");
+
+        let err = super::remove_skill(&home, "telegram")
+            .await
+            .expect_err("channel-bound alias should fail");
+        assert!(err.to_string().contains("remove the channel first"));
+    }
+
+    #[tokio::test]
+    async fn add_channel_requires_installed_worker_skill() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+        let skill_source = write_skill_source(temp_dir.path(), "broken-skill", "broken", false);
+        add_skill(
+            &home,
+            "broken".to_string(),
+            skill_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install skill");
+
+        let err = add_channel(
+            &home,
+            "broken".to_string(),
+            "broken".to_string(),
+            ChannelLaunchMode::Service,
+            Vec::new(),
+        )
+        .await
+        .expect_err("workerless skill should fail");
+        assert!(err.to_string().contains("expected 'scripts/worker'"));
+    }
+
+    #[tokio::test]
+    async fn add_skill_preserves_worker_requirements_for_channel_bound_aliases() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+        let good_skill = write_skill_source(temp_dir.path(), "channel-telegram", "telegram", true);
+        let bad_skill = write_skill_source(temp_dir.path(), "broken-telegram", "telegram", false);
+
+        add_skill(
+            &home,
+            "telegram".to_string(),
+            good_skill.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install channel skill");
+        add_channel(
+            &home,
+            "telegram".to_string(),
+            "telegram".to_string(),
+            ChannelLaunchMode::Service,
+            Vec::new(),
+        )
+        .await
+        .expect("add channel");
+
+        let err = add_skill(
+            &home,
+            "telegram".to_string(),
+            bad_skill.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect_err("workerless replacement should fail");
+        assert!(err
+            .to_string()
+            .contains("must keep a valid 'scripts/worker'"));
+        assert!(home
+            .skills_dir()
+            .join("telegram")
+            .join("scripts/worker")
+            .exists());
     }
 
     #[tokio::test]
@@ -1312,45 +1221,40 @@ mod tests {
         write_test_codex_auth(&home).await;
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let permissions = fs::Permissions::from_mode(0o755);
-            fs::set_permissions(&runtime_stub, permissions).expect("chmod runtime stub");
-        }
-
-        let skill_source = write_channel_skill_fixture(temp_dir.path(), "channel-telegram", "test");
+        make_executable(&runtime_stub);
+        let skill_source = write_skill_source(temp_dir.path(), "channel-telegram", "test", true);
 
         config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
             .into_iter()
             .collect();
-        config.skills = vec![ManagedSkillConfig {
-            alias: "telegram".to_string(),
-            source: skill_source.to_string_lossy().to_string(),
-            reference: "local".to_string(),
-        }];
-        config.channels = vec![ManagedChannelConfig {
-            id: "telegram".to_string(),
-            skill: "telegram".to_string(),
-            enabled: true,
-            launch_mode: ChannelLaunchMode::Service,
-            required_env: Vec::new(),
-        }];
         config.save(&home).await.expect("save config");
-        OperatorLockfile::default()
-            .save(&home)
-            .await
-            .expect("save lock");
+        add_skill(
+            &home,
+            "telegram".to_string(),
+            skill_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install skill");
+        add_channel(
+            &home,
+            "telegram".to_string(),
+            "telegram".to_string(),
+            ChannelLaunchMode::Service,
+            Vec::new(),
+        )
+        .await
+        .expect("add channel");
 
         let manager = FakeServiceManager::default();
         let binaries = StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         };
-        let applied: ApplyResult = up(&home, &manager, "codex", &binaries).await.expect("up");
+        let state = up(&home, &manager, "codex", &binaries).await.expect("up");
         let project_workspace_root =
             resolve_project_workspace_root().expect("resolve project workspace root");
 
-        assert_eq!(applied.config.channels.len(), 1);
+        assert_eq!(state.applied_state.channels().len(), 1);
         assert!(home
             .runtime_project_dir("codex", "main", &project_workspace_root)
             .join("AGENTS.generated.md")
@@ -1369,28 +1273,11 @@ mod tests {
             .expect("onboard");
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let permissions = fs::Permissions::from_mode(0o755);
-            fs::set_permissions(&runtime_stub, permissions).expect("chmod runtime stub");
-        }
+        make_executable(&runtime_stub);
 
         config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
             .into_iter()
             .collect();
-        let skill_source = temp_dir.path().join("test-skill");
-        fs::create_dir_all(&skill_source).expect("skill dir");
-        fs::write(
-            skill_source.join("SKILL.md"),
-            "---\nname: test-skill\ndescription: test\n---\n",
-        )
-        .expect("skill md");
-        config.skills.push(ManagedSkillConfig {
-            alias: "test-skill".to_string(),
-            source: skill_source.display().to_string(),
-            reference: "local".to_string(),
-        });
         config.save(&home).await.expect("save config");
 
         let err = up(
@@ -1406,576 +1293,6 @@ mod tests {
 
         assert!(err.to_string().contains("codex login"));
         assert!(err.to_string().contains("auth.json"));
-        let lockfile = OperatorLockfile::load(&home).await.expect("load lockfile");
-        assert!(
-            lockfile.skills.is_empty(),
-            "auth preflight should fail before apply() installs skill snapshots"
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_disables_old_skill_revision_when_alias_is_updated() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
-
-        let skill_source = temp_dir.path().join("channel-telegram");
-        fs::create_dir_all(skill_source.join("scripts")).expect("skill dir");
-        fs::write(
-            skill_source.join("SKILL.md"),
-            "---\nname: channel-telegram\ndescription: first revision\n---\n",
-        )
-        .expect("skill md v1");
-        fs::write(
-            skill_source.join("scripts/worker"),
-            "#!/usr/bin/env bash\necho v1\n",
-        )
-        .expect("worker v1");
-        make_executable(&skill_source.join("scripts/worker"));
-
-        let config = OperatorConfig {
-            skills: vec![ManagedSkillConfig {
-                alias: "telegram".to_string(),
-                source: skill_source.to_string_lossy().to_string(),
-                reference: "local".to_string(),
-            }],
-            ..OperatorConfig::default()
-        };
-        config.save(&home).await.expect("save config");
-        apply(&home).await.expect("apply v1");
-
-        fs::write(
-            skill_source.join("SKILL.md"),
-            "---\nname: channel-telegram\ndescription: second revision\n---\n",
-        )
-        .expect("skill md v2");
-
-        let applied = apply(&home).await.expect("apply v2");
-        let kernel = Kernel::new_with_options(
-            &home.db_path(),
-            KernelOptions {
-                default_runtime_id: None,
-                workspace_root: Some(home.workspace_dir("main")),
-                project_workspace_root: Some(home.workspace_dir("main")),
-                ..KernelOptions::default()
-            },
-        )
-        .await
-        .expect("kernel");
-
-        let skills = kernel.list_skills().await.expect("list skills").skills;
-        let enabled = skills.iter().collect::<Vec<_>>();
-        assert_eq!(
-            enabled.len(),
-            1,
-            "only one current revision should remain listed"
-        );
-        assert_eq!(
-            enabled[0].skill_id, applied.lockfile.skills[0].skill_id,
-            "the latest lockfile revision should be the current one"
-        );
-        assert_eq!(
-            skills.len(),
-            1,
-            "list_skills should only show current aliases"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn apply_converges_when_worker_executable_bit_changes() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
-
-        let skill_source = temp_dir.path().join("channel-terminal");
-        fs::create_dir_all(skill_source.join("scripts")).expect("skill dir");
-        fs::write(
-            skill_source.join("SKILL.md"),
-            "---\nname: channel-terminal\ndescription: test\n---\n",
-        )
-        .expect("skill md");
-        let worker = skill_source.join("scripts/worker");
-        fs::write(&worker, "#!/usr/bin/env bash\n").expect("worker");
-        fs::set_permissions(&worker, fs::Permissions::from_mode(0o644)).expect("chmod 644");
-
-        let config = OperatorConfig {
-            skills: vec![ManagedSkillConfig {
-                alias: "mode-test".to_string(),
-                source: skill_source.to_string_lossy().to_string(),
-                reference: "local".to_string(),
-            }],
-            ..OperatorConfig::default()
-        };
-        config.save(&home).await.expect("save config");
-        let first = apply(&home).await.expect("apply non-executable worker");
-        let err = resolve_installed_skill_worker_entrypoint(&home, "mode-test")
-            .await
-            .expect_err("worker should not be executable yet");
-        assert!(
-            err.to_string().contains("is not executable"),
-            "unexpected error: {err}"
-        );
-
-        fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("chmod 755");
-        let second = apply(&home).await.expect("apply executable worker");
-        let installed_worker = resolve_installed_skill_worker_entrypoint(&home, "mode-test")
-            .await
-            .expect("resolve executable worker");
-
-        assert_ne!(
-            first.lockfile.skills[0].hash, second.lockfile.skills[0].hash,
-            "mode-only changes should create a new snapshot revision"
-        );
-        assert_ne!(
-            installed_worker
-                .metadata()
-                .expect("installed worker metadata")
-                .permissions()
-                .mode()
-                & 0o111,
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn skill_add_reassigns_source_to_new_alias_without_internal_conflict() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
-
-        let terminal_source =
-            write_channel_skill_fixture(temp_dir.path(), "channel-terminal", "terminal");
-        let telegram_source =
-            write_channel_skill_fixture(temp_dir.path(), "channel-telegram", "telegram");
-
-        add_skill(
-            &home,
-            "alpha".to_string(),
-            terminal_source.to_string_lossy().to_string(),
-            "local".to_string(),
-        )
-        .await
-        .expect("add alpha");
-        add_skill(
-            &home,
-            "beta".to_string(),
-            telegram_source.to_string_lossy().to_string(),
-            "local".to_string(),
-        )
-        .await
-        .expect("add beta");
-        apply(&home).await.expect("apply original aliases");
-
-        add_skill(
-            &home,
-            "beta".to_string(),
-            terminal_source.to_string_lossy().to_string(),
-            "local".to_string(),
-        )
-        .await
-        .expect("reassign terminal to beta");
-        let applied = apply(&home).await.expect("apply reassigned alias");
-
-        assert_eq!(applied.config.skills.len(), 1);
-        assert_eq!(applied.lockfile.skills.len(), 1);
-        assert_eq!(applied.lockfile.skills[0].alias, "beta");
-
-        let kernel = Kernel::new_with_options(
-            &home.db_path(),
-            KernelOptions {
-                default_runtime_id: None,
-                workspace_root: Some(home.workspace_dir("main")),
-                project_workspace_root: Some(home.workspace_dir("main")),
-                ..KernelOptions::default()
-            },
-        )
-        .await
-        .expect("kernel");
-        let enabled = kernel.list_skills().await.expect("list skills").skills;
-        assert_eq!(enabled.len(), 1);
-        assert_eq!(enabled[0].alias, "beta");
-        assert_eq!(enabled[0].skill_id, applied.lockfile.skills[0].skill_id);
-    }
-
-    #[tokio::test]
-    async fn apply_swaps_skill_aliases_without_disabling_reassigned_skills() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
-
-        let terminal_source =
-            write_channel_skill_fixture(temp_dir.path(), "channel-terminal", "terminal");
-        let telegram_source =
-            write_channel_skill_fixture(temp_dir.path(), "channel-telegram", "telegram");
-
-        OperatorConfig {
-            skills: vec![
-                ManagedSkillConfig {
-                    alias: "alpha".to_string(),
-                    source: terminal_source.to_string_lossy().to_string(),
-                    reference: "local".to_string(),
-                },
-                ManagedSkillConfig {
-                    alias: "beta".to_string(),
-                    source: telegram_source.to_string_lossy().to_string(),
-                    reference: "local".to_string(),
-                },
-            ],
-            ..OperatorConfig::default()
-        }
-        .save(&home)
-        .await
-        .expect("save original config");
-        apply(&home).await.expect("apply original aliases");
-
-        OperatorConfig {
-            skills: vec![
-                ManagedSkillConfig {
-                    alias: "alpha".to_string(),
-                    source: telegram_source.to_string_lossy().to_string(),
-                    reference: "local".to_string(),
-                },
-                ManagedSkillConfig {
-                    alias: "beta".to_string(),
-                    source: terminal_source.to_string_lossy().to_string(),
-                    reference: "local".to_string(),
-                },
-            ],
-            ..OperatorConfig::default()
-        }
-        .save(&home)
-        .await
-        .expect("save swapped config");
-        let applied = apply(&home).await.expect("apply swapped aliases");
-
-        let expected = applied
-            .lockfile
-            .skills
-            .iter()
-            .map(|skill| (skill.alias.clone(), skill.skill_id.clone()))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(expected.len(), 2);
-
-        let kernel = Kernel::new_with_options(
-            &home.db_path(),
-            KernelOptions {
-                default_runtime_id: None,
-                workspace_root: Some(home.workspace_dir("main")),
-                project_workspace_root: Some(home.workspace_dir("main")),
-                ..KernelOptions::default()
-            },
-        )
-        .await
-        .expect("kernel");
-        let enabled = kernel
-            .list_skills()
-            .await
-            .expect("list skills")
-            .skills
-            .into_iter()
-            .map(|skill| (skill.alias, skill.skill_id))
-            .collect::<std::collections::BTreeMap<_, _>>();
-
-        assert_eq!(enabled, expected);
-    }
-
-    #[tokio::test]
-    async fn apply_preserves_enabled_alias_when_channel_validation_fails() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
-
-        let terminal_source =
-            write_channel_skill_fixture(temp_dir.path(), "channel-terminal", "terminal");
-        let telegram_source =
-            write_channel_skill_fixture(temp_dir.path(), "channel-telegram", "telegram");
-
-        OperatorConfig {
-            skills: vec![ManagedSkillConfig {
-                alias: "alpha".to_string(),
-                source: terminal_source.to_string_lossy().to_string(),
-                reference: "local".to_string(),
-            }],
-            ..OperatorConfig::default()
-        }
-        .save(&home)
-        .await
-        .expect("save original config");
-        let original = apply(&home).await.expect("apply original alias");
-        let original_skill_id = original.lockfile.skills[0].skill_id.clone();
-
-        OperatorConfig {
-            skills: vec![ManagedSkillConfig {
-                alias: "alpha".to_string(),
-                source: telegram_source.to_string_lossy().to_string(),
-                reference: "local".to_string(),
-            }],
-            channels: vec![ManagedChannelConfig {
-                id: "broken".to_string(),
-                skill: "missing".to_string(),
-                enabled: true,
-                launch_mode: ChannelLaunchMode::Service,
-                required_env: Vec::new(),
-            }],
-            ..OperatorConfig::default()
-        }
-        .save(&home)
-        .await
-        .expect("save invalid replacement config");
-
-        let err = apply(&home)
-            .await
-            .expect_err("channel validation should fail before alias switch");
-        assert!(
-            err.to_string()
-                .contains("references missing skill alias 'missing'"),
-            "unexpected error: {err}"
-        );
-
-        let kernel = Kernel::new_with_options(
-            &home.db_path(),
-            KernelOptions {
-                default_runtime_id: None,
-                workspace_root: Some(home.workspace_dir("main")),
-                project_workspace_root: Some(home.workspace_dir("main")),
-                ..KernelOptions::default()
-            },
-        )
-        .await
-        .expect("kernel");
-        let enabled = kernel.list_skills().await.expect("list skills").skills;
-
-        assert_eq!(enabled.len(), 1);
-        assert_eq!(enabled[0].alias, "alpha");
-        assert_eq!(enabled[0].skill_id, original_skill_id);
-
-        let listed = kernel
-            .list_skills()
-            .await
-            .expect("list skills after failure");
-        assert_eq!(
-            listed.skills.len(),
-            1,
-            "channel preflight should fail before staging the replacement skill"
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_disables_enabled_alias_conflict_missing_from_lockfile() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
-
-        let kernel = Kernel::new(&home.db_path()).await.expect("kernel");
-        let stale = kernel
-            .install_skill(SkillInstallRequest {
-                source: "local:/tmp/stale-telegram".to_string(),
-                alias: "telegram".to_string(),
-                reference: Some("local".to_string()),
-                hash: Some("stale-hash".to_string()),
-                skill_md: Some(
-                    "---\nname: stale-telegram\ndescription: stale telegram\n---\n".to_string(),
-                ),
-                snapshot_path: None,
-            })
-            .await
-            .expect("install stale skill");
-        let skill_source =
-            write_channel_skill_fixture(temp_dir.path(), "channel-telegram", "telegram");
-        let config = OperatorConfig {
-            skills: vec![ManagedSkillConfig {
-                alias: "telegram".to_string(),
-                source: skill_source.to_string_lossy().to_string(),
-                reference: "local".to_string(),
-            }],
-            ..OperatorConfig::default()
-        };
-        config.save(&home).await.expect("save config");
-        OperatorLockfile::default()
-            .save(&home)
-            .await
-            .expect("save empty lockfile");
-
-        let applied = apply(&home).await.expect("apply should converge");
-        let enabled = kernel.list_skills().await.expect("list skills").skills;
-
-        assert_eq!(enabled.len(), 1);
-        assert_eq!(enabled[0].alias, "telegram");
-        assert_eq!(enabled[0].skill_id, applied.lockfile.skills[0].skill_id);
-        assert_ne!(enabled[0].skill_id, stale.skill_id);
-    }
-
-    #[tokio::test]
-    async fn apply_rejects_duplicate_skill_snapshots() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
-
-        let skill_source = write_channel_skill_fixture(temp_dir.path(), "channel-terminal", "test");
-        let source = skill_source.to_string_lossy().to_string();
-        let config = OperatorConfig {
-            skills: vec![
-                ManagedSkillConfig {
-                    alias: "alpha".to_string(),
-                    source: source.clone(),
-                    reference: "local".to_string(),
-                },
-                ManagedSkillConfig {
-                    alias: "beta".to_string(),
-                    source,
-                    reference: "other-ref".to_string(),
-                },
-            ],
-            ..OperatorConfig::default()
-        };
-        config.save(&home).await.expect("save config");
-
-        let err = apply(&home)
-            .await
-            .expect_err("duplicate skill snapshots should be rejected");
-        assert!(
-            err.to_string()
-                .contains("configured under both 'alpha' and 'beta'"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_rejects_duplicate_skill_aliases() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
-
-        let terminal_source =
-            write_channel_skill_fixture(temp_dir.path(), "channel-terminal", "terminal");
-        let telegram_source =
-            write_channel_skill_fixture(temp_dir.path(), "channel-telegram", "telegram");
-        let config = OperatorConfig {
-            skills: vec![
-                ManagedSkillConfig {
-                    alias: "shared".to_string(),
-                    source: terminal_source.to_string_lossy().to_string(),
-                    reference: "local".to_string(),
-                },
-                ManagedSkillConfig {
-                    alias: "shared".to_string(),
-                    source: telegram_source.to_string_lossy().to_string(),
-                    reference: "local".to_string(),
-                },
-            ],
-            ..OperatorConfig::default()
-        };
-        config.save(&home).await.expect("save config");
-
-        let err = apply(&home)
-            .await
-            .expect_err("duplicate aliases should be rejected");
-        assert!(
-            err.to_string()
-                .contains("skill alias 'shared' is configured more than once"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_disables_stale_channel_even_when_old_skill_is_disabled() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
-
-        let skill_source = write_channel_skill_fixture(temp_dir.path(), "channel-telegram", "test");
-
-        let mut config = OperatorConfig {
-            skills: vec![ManagedSkillConfig {
-                alias: "telegram".to_string(),
-                source: skill_source.to_string_lossy().to_string(),
-                reference: "local".to_string(),
-            }],
-            channels: vec![ManagedChannelConfig {
-                id: "telegram".to_string(),
-                skill: "telegram".to_string(),
-                enabled: true,
-                launch_mode: ChannelLaunchMode::Service,
-                required_env: Vec::new(),
-            }],
-            ..OperatorConfig::default()
-        };
-        config.save(&home).await.expect("save config");
-        let _applied = apply(&home).await.expect("apply channel");
-
-        let kernel = Kernel::new_with_options(
-            &home.db_path(),
-            KernelOptions {
-                default_runtime_id: None,
-                workspace_root: Some(home.workspace_dir("main")),
-                project_workspace_root: Some(home.workspace_dir("main")),
-                ..KernelOptions::default()
-            },
-        )
-        .await
-        .expect("kernel");
-        config.skills.clear();
-        config.channels.clear();
-        config.save(&home).await.expect("save empty config");
-        apply(&home).await.expect("apply stale cleanup");
-
-        let binding = kernel
-            .get_channel_binding("telegram")
-            .await
-            .expect("load binding")
-            .expect("binding remains for audit history");
-        assert!(!binding.enabled, "stale channel binding should be disabled");
-    }
-
-    #[tokio::test]
-    async fn apply_tolerates_stale_lockfile_skill_missing_from_kernel_db() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
-
-        let skill_source = write_channel_skill_fixture(temp_dir.path(), "channel-telegram", "test");
-
-        let mut config = OperatorConfig {
-            skills: vec![ManagedSkillConfig {
-                alias: "telegram".to_string(),
-                source: skill_source.to_string_lossy().to_string(),
-                reference: "local".to_string(),
-            }],
-            channels: vec![ManagedChannelConfig {
-                id: "telegram".to_string(),
-                skill: "telegram".to_string(),
-                enabled: true,
-                launch_mode: ChannelLaunchMode::Service,
-                required_env: Vec::new(),
-            }],
-            ..OperatorConfig::default()
-        };
-        config.save(&home).await.expect("save config");
-        let applied = apply(&home).await.expect("apply channel");
-        assert_eq!(applied.lockfile.skills.len(), 1);
-
-        tokio::fs::remove_file(home.db_path())
-            .await
-            .expect("remove kernel db");
-
-        config.skills.clear();
-        config.channels.clear();
-        config.save(&home).await.expect("save empty config");
-
-        apply(&home).await.expect("apply stale lockfile cleanup");
-
-        let lockfile = OperatorLockfile::load(&home).await.expect("load lockfile");
-        assert!(
-            lockfile.skills.is_empty(),
-            "lockfile should converge after stale skill cleanup"
-        );
-        assert!(
-            lockfile.channels.is_empty(),
-            "lockfile should converge after stale channel cleanup"
-        );
     }
 
     #[tokio::test]
@@ -1987,52 +1304,39 @@ mod tests {
             .expect("onboard");
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&runtime_stub, fs::Permissions::from_mode(0o755))
-                .expect("chmod runtime stub");
-        }
-
-        let skill_source = temp_dir.path().join("channel-terminal");
-        fs::create_dir_all(skill_source.join("scripts")).expect("skill dir");
-        fs::write(
-            skill_source.join("SKILL.md"),
-            "---\nname: channel-terminal\ndescription: test\n---\n",
-        )
-        .expect("skill md");
-        fs::write(skill_source.join("scripts/worker"), "#!/usr/bin/env bash\n").expect("worker");
-        make_executable(&skill_source.join("scripts/worker"));
+        make_executable(&runtime_stub);
+        let skill_source = write_skill_source(temp_dir.path(), "channel-terminal", "test", true);
 
         config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
             .into_iter()
             .collect();
-        config.skills = vec![ManagedSkillConfig {
-            alias: "terminal".to_string(),
-            source: skill_source.to_string_lossy().to_string(),
-            reference: "local".to_string(),
-        }];
-        config.channels = vec![ManagedChannelConfig {
-            id: "terminal".to_string(),
-            skill: "terminal".to_string(),
-            enabled: true,
-            launch_mode: ChannelLaunchMode::Interactive,
-            required_env: Vec::new(),
-        }];
         config.save(&home).await.expect("save config");
         write_test_codex_auth(&home).await;
-        OperatorLockfile::default()
-            .save(&home)
-            .await
-            .expect("save lock");
+        add_skill(
+            &home,
+            "terminal".to_string(),
+            skill_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install skill");
+        add_channel(
+            &home,
+            "terminal".to_string(),
+            "terminal".to_string(),
+            ChannelLaunchMode::Interactive,
+            Vec::new(),
+        )
+        .await
+        .expect("add channel");
 
         let manager = FakeServiceManager::default();
         let binaries = StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         };
-        let applied = up(&home, &manager, "codex", &binaries).await.expect("up");
+        let state = up(&home, &manager, "codex", &binaries).await.expect("up");
 
-        assert_eq!(applied.lockfile.channels.len(), 1);
+        assert_eq!(state.applied_state.channels().len(), 1);
         assert_eq!(
             manager
                 .unit_status("lionclaw-channel-terminal.service")
@@ -2040,145 +1344,6 @@ mod tests {
                 .expect("unit status"),
             "not-found"
         );
-    }
-
-    #[tokio::test]
-    async fn up_rejects_foreign_home_daemon_on_configured_bind() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, Some(OnboardBindSelection::Auto))
-            .await
-            .expect("onboard");
-        let bind_addr = OperatorConfig::load(&home)
-            .await
-            .expect("load config")
-            .daemon
-            .bind;
-        let config_fingerprint = current_daemon_config_fingerprint(&home).await;
-        let _server = spawn_probe_server(
-            Router::new().route(
-                "/v0/daemon/info",
-                get({
-                    let bind_addr = bind_addr.clone();
-                    move || async move {
-                        Json(DaemonInfoResponse {
-                            service: "lionclawd".to_string(),
-                            status: "ok".to_string(),
-                            home_id: "foreign-home".to_string(),
-                            home_root: "/tmp/foreign-home".to_string(),
-                            bind_addr: bind_addr.clone(),
-                            project_scope: "foreign-project".to_string(),
-                            config_fingerprint: config_fingerprint.clone(),
-                        })
-                    }
-                }),
-            ),
-            &bind_addr,
-        )
-        .await;
-        let manager = FakeServiceManager::default();
-        let binaries = StackBinaryPaths {
-            daemon_bin: "/tmp/lionclawd".into(),
-        };
-
-        let err = up(&home, &manager, "codex", &binaries)
-            .await
-            .expect_err("foreign daemon should fail");
-        assert!(err.to_string().contains("/tmp/foreign-home"));
-    }
-
-    #[tokio::test]
-    async fn up_rejects_same_home_foreground_daemon_without_active_unit() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let config = onboard(&home, Some(OnboardBindSelection::Auto))
-            .await
-            .expect("onboard");
-        let home_id = home.ensure_home_id().await.expect("home id");
-        let bind_addr = config.daemon.bind;
-        let home_root = home.root().display().to_string();
-        let config_fingerprint = current_daemon_config_fingerprint(&home).await;
-        let _server = spawn_probe_server(
-            Router::new().route(
-                "/v0/daemon/info",
-                get({
-                    let bind_addr = bind_addr.clone();
-                    let home_id = home_id.clone();
-                    let home_root = home_root.clone();
-                    let project_scope = current_project_scope();
-                    move || async move {
-                        Json(DaemonInfoResponse {
-                            service: "lionclawd".to_string(),
-                            status: "ok".to_string(),
-                            home_id: home_id.clone(),
-                            home_root: home_root.clone(),
-                            bind_addr: bind_addr.clone(),
-                            project_scope: project_scope.clone(),
-                            config_fingerprint: config_fingerprint.clone(),
-                        })
-                    }
-                }),
-            ),
-            &bind_addr,
-        )
-        .await;
-        let manager = FakeServiceManager::default();
-        manager
-            .set_unit_status(DAEMON_UNIT_NAME, "loaded/inactive/dead")
-            .expect("set unit status");
-        let binaries = StackBinaryPaths {
-            daemon_bin: "/tmp/lionclawd".into(),
-        };
-
-        let err = up(&home, &manager, "codex", &binaries)
-            .await
-            .expect_err("foreground daemon without active unit should fail");
-        assert!(err.to_string().contains("foreground daemon"));
-    }
-
-    #[tokio::test]
-    async fn up_rejects_same_home_different_project_daemon() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let config = onboard(&home, Some(OnboardBindSelection::Auto))
-            .await
-            .expect("onboard");
-        let home_id = home.ensure_home_id().await.expect("home id");
-        let bind_addr = config.daemon.bind;
-        let home_root = home.root().display().to_string();
-        let config_fingerprint = current_daemon_config_fingerprint(&home).await;
-        let _server = spawn_probe_server(
-            Router::new().route(
-                "/v0/daemon/info",
-                get({
-                    let bind_addr = bind_addr.clone();
-                    let home_id = home_id.clone();
-                    let home_root = home_root.clone();
-                    move || async move {
-                        Json(DaemonInfoResponse {
-                            service: "lionclawd".to_string(),
-                            status: "ok".to_string(),
-                            home_id: home_id.clone(),
-                            home_root: home_root.clone(),
-                            bind_addr: bind_addr.clone(),
-                            project_scope: "different-project".to_string(),
-                            config_fingerprint: config_fingerprint.clone(),
-                        })
-                    }
-                }),
-            ),
-            &bind_addr,
-        )
-        .await;
-        let manager = FakeServiceManager::default();
-        let binaries = StackBinaryPaths {
-            daemon_bin: "/tmp/lionclawd".into(),
-        };
-
-        let err = up(&home, &manager, "codex", &binaries)
-            .await
-            .expect_err("same-home different-project daemon should fail");
-        assert!(err.to_string().contains("different project"));
     }
 
     #[tokio::test]
@@ -2190,12 +1355,7 @@ mod tests {
             .expect("onboard");
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&runtime_stub, fs::Permissions::from_mode(0o755))
-                .expect("chmod runtime stub");
-        }
+        make_executable(&runtime_stub);
         config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
             .into_iter()
             .collect();
@@ -2205,7 +1365,7 @@ mod tests {
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
         let home_root = home.root().display().to_string();
-        let config_fingerprint = current_daemon_config_fingerprint(&home).await;
+        let daemon_fingerprint = current_daemon_fingerprint(&home).await;
         let _server = spawn_probe_server(
             Router::new().route(
                 "/v0/daemon/info",
@@ -2222,7 +1382,7 @@ mod tests {
                             home_root: home_root.clone(),
                             bind_addr: bind_addr.clone(),
                             project_scope: project_scope.clone(),
-                            config_fingerprint: config_fingerprint.clone(),
+                            daemon_fingerprint: daemon_fingerprint.clone(),
                         })
                     }
                 }),
@@ -2241,16 +1401,13 @@ mod tests {
         up(&home, &manager, "codex", &binaries)
             .await
             .expect("same-home managed daemon should be reused");
-        assert!(
-            manager
-                .was_restarted(DAEMON_UNIT_NAME)
-                .expect("read restart state"),
-            "changed active daemon unit should be restarted"
-        );
+        assert!(manager
+            .was_restarted(DAEMON_UNIT_NAME)
+            .expect("read restart state"));
     }
 
     #[tokio::test]
-    async fn up_restarts_same_home_daemon_when_config_is_stale() {
+    async fn up_restarts_managed_daemon_when_installed_skills_change() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
@@ -2258,18 +1415,28 @@ mod tests {
             .expect("onboard");
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&runtime_stub, fs::Permissions::from_mode(0o755))
-                .expect("chmod runtime stub");
-        }
+        make_executable(&runtime_stub);
         config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
             .into_iter()
             .collect();
         config.save(&home).await.expect("save config");
         write_test_codex_auth(&home).await;
 
+        let manager = FakeServiceManager::default();
+        let binaries = StackBinaryPaths {
+            daemon_bin: "/tmp/lionclawd".into(),
+        };
+        up(&home, &manager, "codex", &binaries)
+            .await
+            .expect("initial up");
+        assert!(
+            !manager
+                .was_restarted(DAEMON_UNIT_NAME)
+                .expect("read restart state"),
+            "initial start should not count as a restart"
+        );
+
+        let old_daemon_fingerprint = current_daemon_fingerprint(&home).await;
         let home_id = home.ensure_home_id().await.expect("home id");
         let bind_addr = config.daemon.bind.clone();
         let home_root = home.root().display().to_string();
@@ -2289,7 +1456,7 @@ mod tests {
                             home_root: home_root.clone(),
                             bind_addr: bind_addr.clone(),
                             project_scope: project_scope.clone(),
-                            config_fingerprint: "daemon-stale-config".to_string(),
+                            daemon_fingerprint: old_daemon_fingerprint.clone(),
                         })
                     }
                 }),
@@ -2297,54 +1464,26 @@ mod tests {
             &bind_addr,
         )
         .await;
-        let manager = FakeServiceManager::default();
-        manager
-            .set_unit_status(DAEMON_UNIT_NAME, "loaded/active/running")
-            .expect("set unit status");
-        let binaries = StackBinaryPaths {
-            daemon_bin: "/tmp/lionclawd".into(),
-        };
+
+        let skill_source = write_skill_source(temp_dir.path(), "runtime-extra", "runtime", false);
+        add_skill(
+            &home,
+            "runtime-extra".to_string(),
+            skill_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install runtime-visible skill");
 
         up(&home, &manager, "codex", &binaries)
             .await
-            .expect("stale managed daemon should be reconciled");
+            .expect("reconcile changed skills");
         assert!(
             manager
                 .was_restarted(DAEMON_UNIT_NAME)
                 .expect("read restart state"),
-            "managed daemon should be restarted when daemon config fingerprint changes"
+            "daemon should restart after installed skill changes"
         );
-    }
-
-    #[tokio::test]
-    async fn up_rejects_unknown_listener_on_bind() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, Some(OnboardBindSelection::Auto))
-            .await
-            .expect("onboard");
-        let bind_addr = OperatorConfig::load(&home)
-            .await
-            .expect("load config")
-            .daemon
-            .bind;
-        let _server = spawn_probe_server(
-            Router::new().route(
-                "/health",
-                get(|| async { Json(json!({"service": "other", "status": "ok"})) }),
-            ),
-            &bind_addr,
-        )
-        .await;
-        let manager = FakeServiceManager::default();
-        let binaries = StackBinaryPaths {
-            daemon_bin: "/tmp/lionclawd".into(),
-        };
-
-        let err = up(&home, &manager, "codex", &binaries)
-            .await
-            .expect_err("unknown listener should fail");
-        assert!(err.to_string().contains("non-LionClaw listener"));
     }
 
     #[cfg(unix)]
@@ -2403,10 +1542,6 @@ mod tests {
             .set_default_runtime("opencode")
             .expect("set default runtime");
         config.save(&home).await.expect("save config");
-        OperatorLockfile::default()
-            .save(&home)
-            .await
-            .expect("save lockfile");
 
         let manager = FakeServiceManager::default();
         let stack = status(&home, &manager).await.expect("status");

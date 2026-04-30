@@ -49,7 +49,7 @@ pub struct DaemonInfoResponse {
     pub home_root: String,
     pub bind_addr: String,
     pub project_scope: String,
-    pub config_fingerprint: String,
+    pub daemon_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,25 +297,6 @@ pub struct SessionTurnResponse {
     pub runtime_skills: Vec<String>,
     pub runtime_id: String,
     pub stream_events: Vec<StreamEventDto>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillInstallRequest {
-    pub source: String,
-    pub alias: String,
-    pub reference: Option<String>,
-    pub hash: Option<String>,
-    pub skill_md: Option<String>,
-    #[serde(default)]
-    pub snapshot_path: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillInstallResponse {
-    pub skill_id: String,
-    pub alias: String,
-    pub name: String,
-    pub hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -685,27 +666,11 @@ pub struct ContinuityOpenLoopActionResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelBindRequest {
-    pub channel_id: String,
-    pub skill_alias: String,
-    #[serde(default)]
-    pub enabled: Option<bool>,
-    #[serde(default)]
-    pub config: Option<Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelBindingView {
     pub channel_id: String,
     pub skill_alias: String,
-    pub enabled: bool,
     pub config: Value,
     pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelBindResponse {
-    pub binding: ChannelBindingView,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,36 +1,46 @@
-use std::path::PathBuf;
+mod common;
 
 use lionclaw::{
-    contracts::{
-        PolicyGrantRequest, SessionOpenRequest, SessionTurnRequest, SkillInstallRequest, TrustTier,
-    },
-    kernel::{Kernel, KernelError},
+    applied::AppliedState,
+    contracts::{PolicyGrantRequest, SessionOpenRequest, SessionTurnRequest, TrustTier},
+    operator::reconcile::add_skill,
 };
-use tempfile::TempDir;
 use tokio::time::{sleep, Duration};
+
+use common::{write_skill_source, TestHome};
 
 #[tokio::test]
 async fn restart_persists_session_skill_policy_and_audit() {
-    let sandbox = temp_env();
-    let db_path = sandbox.db_path();
+    let env = TestHome::new().await;
+    std::fs::write(
+        env.home().workspace_dir("main").join("README.md"),
+        "restart hardening workspace file",
+    )
+    .expect("write workspace readme");
+    let skill_source = write_skill_source(
+        env.temp_dir(),
+        "restart-skill",
+        "Handles restart durability requests",
+        false,
+    );
+    env.install_skill("restart-skill", &skill_source).await;
 
     let (session_id, skill_id, grant_id) = {
-        let kernel = Kernel::new(&db_path).await.expect("kernel init");
-
+        let kernel = env.kernel().await;
         let opened = open_main_session(&kernel, "peer-restart").await;
-        let installed = install_skill(
-            &kernel,
-            "local/restart-skill",
-            r#"---
-name: restart-skill
-description: Handles restart durability requests
----"#,
-        )
-        .await;
+        let skill_id = kernel
+            .list_skills()
+            .await
+            .expect("list skills")
+            .skills
+            .into_iter()
+            .find(|skill| skill.alias == "restart-skill")
+            .expect("installed skill")
+            .skill_id;
 
         let grant = kernel
             .grant_policy(PolicyGrantRequest {
-                skill_id: installed.skill_id.clone(),
+                skill_id: skill_id.clone(),
                 capability: "fs.read".to_string(),
                 scope: "*".to_string(),
                 ttl_seconds: None,
@@ -49,10 +59,7 @@ description: Handles restart durability requests
             })
             .await
             .expect("turn should succeed");
-        assert!(
-            turn.runtime_skills.contains(&installed.skill_id),
-            "enabled skill should be runtime-visible before restart"
-        );
+        assert!(turn.runtime_skills.contains(&skill_id));
         assert!(turn.stream_events.iter().any(|event| {
             event
                 .text
@@ -64,30 +71,25 @@ description: Handles restart durability requests
             .query_audit(Some(opened.session_id), None, None, Some(50))
             .await
             .expect("query audit");
-        assert!(
-            audit
-                .events
-                .iter()
-                .any(|event| event.event_type == "session.open"),
-            "session.open should be persisted"
-        );
-        assert!(
-            audit
-                .events
-                .iter()
-                .any(|event| event.event_type == "session.turn"),
-            "session.turn should be persisted"
-        );
+        assert!(audit
+            .events
+            .iter()
+            .any(|event| event.event_type == "session.open"));
+        assert!(audit
+            .events
+            .iter()
+            .any(|event| event.event_type == "session.turn"));
 
-        (opened.session_id, installed.skill_id, grant.grant_id)
+        (opened.session_id, skill_id, grant.grant_id)
     };
 
-    let kernel = Kernel::new(&db_path).await.expect("kernel restart init");
-
-    let listed = kernel.list_skills().await.expect("list skills");
-    let persisted_skill = listed
+    let kernel = env.kernel().await;
+    let persisted_skill = kernel
+        .list_skills()
+        .await
+        .expect("list skills")
         .skills
-        .iter()
+        .into_iter()
         .find(|skill| skill.skill_id == skill_id)
         .expect("installed skill must persist");
     assert_eq!(persisted_skill.alias, "restart-skill");
@@ -103,10 +105,7 @@ description: Handles restart durability requests
         })
         .await
         .expect("turn after restart");
-    assert!(
-        turn_after_restart.runtime_skills.contains(&skill_id),
-        "session + policy should persist across restart"
-    );
+    assert!(turn_after_restart.runtime_skills.contains(&skill_id));
     assert!(turn_after_restart.stream_events.iter().any(|event| {
         event
             .text
@@ -118,31 +117,40 @@ description: Handles restart durability requests
         .revoke_policy(grant_id)
         .await
         .expect("revoke persisted grant");
-    assert!(
-        revoked.revoked,
-        "persisted grant should be revocable after restart"
-    );
+    assert!(revoked.revoked);
 }
 
 #[tokio::test]
 async fn expiring_policy_grant_is_enforced() {
-    let sandbox = temp_env();
-    let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
+    let env = TestHome::new().await;
+    std::fs::write(
+        env.home().workspace_dir("main").join("README.md"),
+        "ttl hardening workspace file",
+    )
+    .expect("write workspace readme");
+    let skill_source = write_skill_source(
+        env.temp_dir(),
+        "ttl-skill",
+        "Handles expiring policy windows",
+        false,
+    );
+    env.install_skill("ttl-skill", &skill_source).await;
+    let kernel = env.kernel().await;
 
     let opened = open_main_session(&kernel, "peer-ttl").await;
-    let installed = install_skill(
-        &kernel,
-        "local/ttl-skill",
-        r#"---
-name: ttl-skill
-description: Handles expiring policy windows
----"#,
-    )
-    .await;
+    let skill_id = kernel
+        .list_skills()
+        .await
+        .expect("list skills")
+        .skills
+        .into_iter()
+        .find(|skill| skill.alias == "ttl-skill")
+        .expect("installed skill")
+        .skill_id;
 
     kernel
         .grant_policy(PolicyGrantRequest {
-            skill_id: installed.skill_id.clone(),
+            skill_id: skill_id.clone(),
             capability: "fs.read".to_string(),
             scope: "*".to_string(),
             ttl_seconds: Some(1),
@@ -161,10 +169,7 @@ description: Handles expiring policy windows
         })
         .await
         .expect("turn during ttl");
-    assert!(
-        allowed_turn.runtime_skills.contains(&installed.skill_id),
-        "installed skill should stay runtime-visible before ttl expiry"
-    );
+    assert!(allowed_turn.runtime_skills.contains(&skill_id));
     assert!(allowed_turn.stream_events.iter().any(|event| {
         event
             .text
@@ -185,10 +190,7 @@ description: Handles expiring policy windows
         })
         .await
         .expect("turn after ttl");
-    assert!(
-        denied_turn.runtime_skills.contains(&installed.skill_id),
-        "installed skill should remain runtime-visible after ttl expiry"
-    );
+    assert!(denied_turn.runtime_skills.contains(&skill_id));
     assert!(denied_turn.stream_events.iter().any(|event| {
         event
             .text
@@ -199,8 +201,8 @@ description: Handles expiring policy windows
 
 #[tokio::test]
 async fn audit_query_respects_filters_limit_and_order() {
-    let sandbox = temp_env();
-    let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
+    let env = TestHome::new().await;
+    let kernel = env.kernel().await;
 
     let first_session = open_main_session(&kernel, "peer-audit-a").await;
     let second_session = open_main_session(&kernel, "peer-audit-b").await;
@@ -261,82 +263,51 @@ async fn audit_query_respects_filters_limit_and_order() {
         .await
         .expect("turn three");
 
-    let recent_turns = kernel
+    let first_only = kernel
         .query_audit(
+            Some(first_session.session_id),
+            Some("session.turn".to_string()),
             None,
+            Some(10),
+        )
+        .await
+        .expect("query first session turns");
+    assert_eq!(first_only.events.len(), 2);
+
+    let after_cutoff = kernel
+        .query_audit(
+            Some(first_session.session_id),
             Some("session.turn".to_string()),
             Some(cutoff),
             Some(10),
         )
         .await
-        .expect("query recent turns");
-    assert_eq!(
-        recent_turns.events.len(),
-        2,
-        "since filter should exclude first turn event"
-    );
-    assert!(
-        recent_turns.events[0].timestamp >= recent_turns.events[1].timestamp,
-        "events should be returned in descending timestamp order"
-    );
+        .expect("query cutoff turns");
+    assert_eq!(after_cutoff.events.len(), 1);
 
     let limited = kernel
-        .query_audit(
-            Some(first_session.session_id),
-            Some("session.turn".to_string()),
-            None,
-            Some(1),
-        )
+        .query_audit(None, Some("session.turn".to_string()), None, Some(2))
         .await
         .expect("query limited turns");
-    assert_eq!(limited.events.len(), 1, "limit must cap returned rows");
-    assert_eq!(
-        limited.events[0].session_id,
-        Some(first_session.session_id),
-        "session filter should only include requested session"
-    );
+    assert_eq!(limited.events.len(), 2);
+    assert!(limited.events[0].timestamp >= limited.events[1].timestamp);
 }
 
 #[tokio::test]
-async fn install_is_idempotent_and_revoke_is_safe_to_repeat() {
-    let sandbox = temp_env();
-    let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
+async fn skill_add_is_idempotent_and_policy_revoke_is_safe_to_repeat() {
+    let env = TestHome::new().await;
+    let skill_source = write_skill_source(env.temp_dir(), "repeat-skill", "repeat", false);
+    env.install_skill("repeat-skill", &skill_source).await;
+    env.install_skill("repeat-skill", &skill_source).await;
+    let kernel = env.kernel().await;
 
-    let install_a = install_skill(
-        &kernel,
-        "local/idempotent",
-        r#"---
-name: idempotent-skill
-description: Handles idempotent operations
----"#,
-    )
-    .await;
-
-    let install_b = install_skill(
-        &kernel,
-        "local/idempotent",
-        r#"---
-name: idempotent-skill
-description: Handles idempotent operations
----"#,
-    )
-    .await;
-
-    assert_eq!(
-        install_a.skill_id, install_b.skill_id,
-        "same provenance should map to same installed skill"
-    );
-
-    let listed = kernel.list_skills().await.expect("list skills");
-    assert_eq!(
-        listed.skills.len(),
-        1,
-        "idempotent install must avoid duplicates"
-    );
+    let skills = kernel.list_skills().await.expect("list skills").skills;
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].alias, "repeat-skill");
 
     let grant = kernel
         .grant_policy(PolicyGrantRequest {
-            skill_id: install_a.skill_id.clone(),
+            skill_id: skills[0].skill_id.clone(),
             capability: "fs.read".to_string(),
             scope: "*".to_string(),
             ttl_seconds: None,
@@ -344,271 +315,130 @@ description: Handles idempotent operations
         .await
         .expect("grant policy");
 
-    let first_revoke = kernel
-        .revoke_policy(grant.grant_id)
-        .await
-        .expect("first revoke");
-    assert!(first_revoke.revoked, "first revoke should remove grant");
-
-    let second_revoke = kernel
-        .revoke_policy(grant.grant_id)
-        .await
-        .expect("second revoke");
-    assert!(
-        !second_revoke.revoked,
-        "second revoke should be safe and report no-op"
-    );
-}
-
-#[tokio::test]
-async fn install_reassigns_current_alias_to_latest_revision() {
-    let sandbox = temp_env();
-    let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
-
-    let first = kernel
-        .install_skill(skill_install_request(
-            "local/first-skill",
-            "shared-alias",
-            "first-hash",
-        ))
-        .await
-        .expect("install first skill");
-    let second = kernel
-        .install_skill(skill_install_request(
-            "local/second-skill",
-            "shared-alias",
-            "second-hash",
-        ))
-        .await
-        .expect("install replacement skill revision");
-
-    let listed = kernel.list_skills().await.expect("list skills");
-    assert_eq!(listed.skills.len(), 1);
-    assert_eq!(listed.skills[0].alias, "shared-alias");
-    assert_eq!(listed.skills[0].skill_id, second.skill_id);
-    assert_ne!(listed.skills[0].skill_id, first.skill_id);
-}
-
-#[tokio::test]
-async fn concurrent_installs_converge_to_single_current_alias() {
-    let sandbox = temp_env();
-    let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
-
-    let first_kernel = kernel.clone();
-    let second_kernel = kernel.clone();
-    let (first_result, second_result) = tokio::join!(
-        first_kernel.install_skill(skill_install_request(
-            "local/concurrent-first",
-            "shared-alias",
-            "concurrent-first-hash",
-        )),
-        second_kernel.install_skill(skill_install_request(
-            "local/concurrent-second",
-            "shared-alias",
-            "concurrent-second-hash",
-        ))
-    );
-
-    let first = first_result.expect("install first");
-    let second = second_result.expect("install second");
-    let listed = kernel.list_skills().await.expect("list skills");
-    assert_eq!(listed.skills.len(), 1);
-    assert_eq!(listed.skills[0].alias, "shared-alias");
-    assert!(
-        listed.skills[0].skill_id == first.skill_id || listed.skills[0].skill_id == second.skill_id,
-        "shared alias should converge to one current revision"
-    );
-}
-
-#[tokio::test]
-async fn remove_skill_alias_hides_current_alias_until_reinstall() {
-    let sandbox = temp_env();
-    let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
-
-    let first = kernel
-        .install_skill(skill_install_request(
-            "local/active-alias",
-            "active-alias",
-            "active-alias-hash",
-        ))
-        .await
-        .expect("install first skill");
-
-    let removed = kernel
-        .remove_skill("active-alias")
-        .await
-        .expect("remove active alias");
-    assert!(removed);
     assert!(
         kernel
-            .list_skills()
+            .revoke_policy(grant.grant_id)
             .await
-            .expect("list after removal")
-            .skills
-            .is_empty(),
-        "removed aliases should disappear from the current installed skill list"
+            .expect("revoke grant")
+            .revoked
     );
+    assert!(
+        !kernel
+            .revoke_policy(grant.grant_id)
+            .await
+            .expect("repeat revoke")
+            .revoked
+    );
+}
 
-    let reinstalled = kernel
-        .install_skill(skill_install_request(
-            "local/active-alias",
-            "active-alias",
-            "active-alias-hash",
-        ))
+#[tokio::test]
+async fn skill_add_replaces_alias_revision() {
+    let env = TestHome::new().await;
+    let skill_source = write_skill_source(env.temp_dir(), "active-skill", "first revision", false);
+    env.install_skill("active-alias", &skill_source).await;
+    let first_skill_id = env
+        .kernel()
         .await
-        .expect("reinstall removed alias");
-    assert_eq!(reinstalled.skill_id, first.skill_id);
-
-    let listed = kernel
         .list_skills()
         .await
-        .expect("list skills after reinstall");
-    assert_eq!(listed.skills.len(), 1);
-    assert_eq!(listed.skills[0].alias, "active-alias");
-    assert_eq!(listed.skills[0].skill_id, first.skill_id);
+        .expect("list skills")
+        .skills
+        .into_iter()
+        .find(|skill| skill.alias == "active-alias")
+        .expect("first skill")
+        .skill_id;
+
+    std::fs::write(
+        skill_source.join("SKILL.md"),
+        "---\nname: active-skill\ndescription: second revision\n---\n",
+    )
+    .expect("rewrite skill");
+    env.install_skill("active-alias", &skill_source).await;
+
+    let updated = env
+        .kernel()
+        .await
+        .list_skills()
+        .await
+        .expect("list skills")
+        .skills
+        .into_iter()
+        .find(|skill| skill.alias == "active-alias")
+        .expect("updated skill");
+    assert_ne!(updated.skill_id, first_skill_id);
+    assert_eq!(updated.description, "second revision");
 }
 
 #[tokio::test]
-async fn install_rejects_invalid_alias_as_bad_request() {
-    let sandbox = temp_env();
-    let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
-
-    let err = kernel
-        .install_skill(SkillInstallRequest {
-            source: "local/invalid-alias".to_string(),
-            alias: "not path safe".to_string(),
-            reference: Some("main".to_string()),
-            hash: Some("invalid-alias-hash".to_string()),
-            skill_md: Some(
-                "---\nname: invalid-alias\ndescription: invalid alias\n---\n".to_string(),
-            ),
-            snapshot_path: None,
-        })
+async fn skill_rm_hides_alias_until_reinstall() {
+    let env = TestHome::new().await;
+    let skill_source = write_skill_source(env.temp_dir(), "remove-skill", "remove", false);
+    env.install_skill("active-alias", &skill_source).await;
+    assert!(env
+        .kernel()
         .await
-        .expect_err("invalid alias should be a caller error");
+        .list_skills()
+        .await
+        .expect("list skills")
+        .skills
+        .iter()
+        .any(|skill| skill.alias == "active-alias"));
 
-    match err {
-        KernelError::BadRequest(message) => assert!(
-            message.contains("may only contain ASCII"),
-            "unexpected bad request: {message}"
-        ),
-        other => panic!("expected bad request, got {other:?}"),
-    }
+    assert!(env.remove_skill("active-alias").await);
+    assert!(!env
+        .kernel()
+        .await
+        .list_skills()
+        .await
+        .expect("list skills")
+        .skills
+        .iter()
+        .any(|skill| skill.alias == "active-alias"));
+
+    env.install_skill("active-alias", &skill_source).await;
+    assert!(env
+        .kernel()
+        .await
+        .list_skills()
+        .await
+        .expect("list skills")
+        .skills
+        .iter()
+        .any(|skill| skill.alias == "active-alias"));
 }
 
 #[tokio::test]
-async fn install_reuses_existing_skill_for_same_content_identity() {
-    let sandbox = temp_env();
-    let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
-    let skill_md = "---\nname: duplicate-content\ndescription: same content\n---\n";
+async fn skill_add_rejects_invalid_alias() {
+    let env = TestHome::new().await;
+    let skill_source = write_skill_source(env.temp_dir(), "bad-alias", "invalid", false);
 
-    let first = kernel
-        .install_skill(SkillInstallRequest {
-            source: "local/duplicate-one".to_string(),
-            alias: "duplicate-one".to_string(),
-            reference: Some("main".to_string()),
-            hash: Some("same-content-hash".to_string()),
-            skill_md: Some(skill_md.to_string()),
-            snapshot_path: None,
-        })
-        .await
-        .expect("install first source");
-    let second = kernel
-        .install_skill(SkillInstallRequest {
-            source: "local/duplicate-two".to_string(),
-            alias: "duplicate-two".to_string(),
-            reference: Some("main".to_string()),
-            hash: Some("same-content-hash".to_string()),
-            skill_md: Some(skill_md.to_string()),
-            snapshot_path: None,
-        })
-        .await
-        .expect("install same content from second source");
-
-    assert_eq!(second.skill_id, first.skill_id);
-    assert_eq!(second.alias, "duplicate-two");
-
-    let listed = kernel.list_skills().await.expect("list skills");
-    assert_eq!(listed.skills.len(), 1);
-    assert_eq!(listed.skills[0].skill_id, first.skill_id);
-    assert_eq!(listed.skills[0].alias, "duplicate-two");
+    let err = add_skill(
+        env.home(),
+        "../bad".to_string(),
+        skill_source.display().to_string(),
+        "local".to_string(),
+    )
+    .await
+    .expect_err("invalid alias should fail");
+    assert!(err.to_string().contains("skill alias"));
 }
 
 #[tokio::test]
-async fn install_rejects_distinct_skills_that_collide_on_derived_skill_id() {
-    let sandbox = temp_env();
-    let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
+async fn duplicate_skill_ids_are_rejected_when_loading_applied_state() {
+    let env = TestHome::new().await;
+    let skill_source = write_skill_source(env.temp_dir(), "same-skill", "same", false);
+    env.install_skill("alpha", &skill_source).await;
+    env.install_skill("beta", &skill_source).await;
 
-    let first = kernel
-        .install_skill(SkillInstallRequest {
-            source: "local/collision-one".to_string(),
-            alias: "collision-one".to_string(),
-            reference: Some("main".to_string()),
-            hash: Some("0123456789ab1111".to_string()),
-            skill_md: Some("---\nname: collision\ndescription: one\n---\n".to_string()),
-            snapshot_path: None,
-        })
+    let err = AppliedState::load(env.home())
         .await
-        .expect("install first colliding skill");
-
-    let err = kernel
-        .install_skill(SkillInstallRequest {
-            source: "local/collision-two".to_string(),
-            alias: "collision-two".to_string(),
-            reference: Some("main".to_string()),
-            hash: Some("0123456789ab2222".to_string()),
-            skill_md: Some("---\nname: collision\ndescription: two\n---\n".to_string()),
-            snapshot_path: None,
-        })
-        .await
-        .expect_err("distinct colliding skills should be rejected");
-
-    match err {
-        KernelError::Conflict(message) => assert!(
-            message.contains("derived skill id"),
-            "unexpected conflict: {message}"
-        ),
-        other => panic!("expected conflict, got {other:?}"),
-    }
-
-    let listed = kernel.list_skills().await.expect("list skills");
-    assert_eq!(listed.skills.len(), 1);
-    assert_eq!(listed.skills[0].skill_id, first.skill_id);
-    assert_eq!(listed.skills[0].alias, "collision-one");
-}
-
-struct TestEnv {
-    temp_dir: TempDir,
-}
-
-impl TestEnv {
-    fn db_path(&self) -> PathBuf {
-        self.temp_dir.path().join("lionclaw.db")
-    }
-}
-
-fn temp_env() -> TestEnv {
-    TestEnv {
-        temp_dir: tempfile::tempdir().expect("create temp dir"),
-    }
-}
-
-fn skill_install_request(source: &str, alias: &str, hash: &str) -> SkillInstallRequest {
-    let name = source.split('/').next_back().unwrap_or(alias);
-    SkillInstallRequest {
-        source: source.to_string(),
-        alias: alias.to_string(),
-        reference: Some("main".to_string()),
-        hash: Some(hash.to_string()),
-        skill_md: Some(format!(
-            "---\nname: {name}\ndescription: {name} skill\n---\n"
-        )),
-        snapshot_path: None,
-    }
+        .expect_err("duplicate skill ids should fail");
+    let message = err.to_string();
+    assert!(message.contains("collides with another installed skill"));
 }
 
 async fn open_main_session(
-    kernel: &Kernel,
+    kernel: &lionclaw::kernel::Kernel,
     peer_id: &str,
 ) -> lionclaw::contracts::SessionOpenResponse {
     kernel
@@ -620,26 +450,4 @@ async fn open_main_session(
         })
         .await
         .expect("open session")
-}
-
-async fn install_skill(
-    kernel: &Kernel,
-    source: &str,
-    skill_md: &str,
-) -> lionclaw::contracts::SkillInstallResponse {
-    kernel
-        .install_skill(SkillInstallRequest {
-            source: source.to_string(),
-            alias: source
-                .split('/')
-                .next_back()
-                .unwrap_or("test-skill")
-                .to_string(),
-            reference: Some("main".to_string()),
-            hash: Some("fixed-hash".to_string()),
-            skill_md: Some(skill_md.to_string()),
-            snapshot_path: None,
-        })
-        .await
-        .expect("install skill")
 }

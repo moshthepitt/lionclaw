@@ -86,10 +86,9 @@ LionClaw uses `~/.lionclaw` as canonical state:
 
 - `~/.lionclaw/db/lionclaw.db`
 - `~/.lionclaw/config/lionclaw.toml`
-- `~/.lionclaw/config/lionclaw.lock`
 - `~/.lionclaw/config/runtime-secrets.env`
 - `~/.lionclaw/workspaces/<workspace-id>/`
-- `~/.lionclaw/skills/<skill-id>@<hash>/`
+- `~/.lionclaw/skills/<alias>/`
 - `~/.lionclaw/runtime/`
 - `~/.lionclaw/logs/`
 - `~/.lionclaw/services/`

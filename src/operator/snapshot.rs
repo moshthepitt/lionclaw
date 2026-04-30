@@ -5,13 +5,18 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
+use chrono::Utc;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::{
     home::LionClawHome,
+    kernel::db::now_ms,
     kernel::skills::{derive_skill_id, parse_skill_frontmatter},
     operator::config::normalize_local_source,
 };
+
+pub const SKILL_INSTALL_METADATA_FILE: &str = ".lionclaw-skill.toml";
 
 #[derive(Debug, Clone)]
 pub struct InstalledSnapshot {
@@ -37,19 +42,37 @@ pub fn install_snapshot(
     let (name, _) = parse_skill_frontmatter(&skill_md);
     let hash = hash_directory(&source_path)?;
     let skill_id = derive_skill_id(&name, &hash);
-    let snapshot_dir_name = format!("{skill_id}@{hash}");
-    let snapshot_abs_dir = home.skills_dir().join(&snapshot_dir_name);
+    let snapshot_abs_dir = home.skills_dir().join(alias);
+    let staging_dir = home
+        .skills_dir()
+        .join(format!(".{alias}.tmp-{}", Uuid::new_v4()));
+
+    if staging_dir.exists() {
+        fs::remove_dir_all(&staging_dir)
+            .with_context(|| format!("failed to clean {}", staging_dir.display()))?;
+    }
+    copy_directory(&source_path, &staging_dir)?;
+    write_install_metadata(&staging_dir, &source_uri, reference)?;
 
     match fs::symlink_metadata(&snapshot_abs_dir) {
-        Ok(metadata) => validate_existing_snapshot_dir(&snapshot_abs_dir, &metadata)?,
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            copy_directory(&source_path, &snapshot_abs_dir)?;
+        Ok(metadata) => {
+            validate_existing_snapshot_dir(&snapshot_abs_dir, &metadata)?;
+            fs::remove_dir_all(&snapshot_abs_dir)
+                .with_context(|| format!("failed to replace {}", snapshot_abs_dir.display()))?;
         }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
         Err(err) => {
             return Err(err)
                 .with_context(|| format!("failed to stat {}", snapshot_abs_dir.display()));
         }
     }
+    fs::rename(&staging_dir, &snapshot_abs_dir).with_context(|| {
+        format!(
+            "failed to move '{}' into '{}'",
+            staging_dir.display(),
+            snapshot_abs_dir.display()
+        )
+    })?;
 
     Ok(InstalledSnapshot {
         alias: alias.to_string(),
@@ -57,7 +80,7 @@ pub fn install_snapshot(
         reference: reference.to_string(),
         skill_id,
         hash,
-        snapshot_rel_dir: format!("skills/{snapshot_dir_name}"),
+        snapshot_rel_dir: format!("skills/{alias}"),
         snapshot_abs_dir,
         skill_md,
     })
@@ -106,7 +129,7 @@ fn read_source_skill_md(source_path: &Path) -> Result<String> {
         .with_context(|| format!("failed to read {}", skill_md_path.display()))
 }
 
-fn hash_directory(root: &Path) -> Result<String> {
+pub(crate) fn hash_directory(root: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(b"lionclaw-skill-snapshot-v2\0");
     let mut files = Vec::new();
@@ -285,7 +308,19 @@ fn should_ignore_snapshot_entry(file_name: &str) -> bool {
             | ".pytest_cache"
             | ".mypy_cache"
             | ".ruff_cache"
+            | SKILL_INSTALL_METADATA_FILE
     )
+}
+
+fn write_install_metadata(snapshot_dir: &Path, source: &str, reference: &str) -> Result<()> {
+    let metadata_path = snapshot_dir.join(SKILL_INSTALL_METADATA_FILE);
+    let content = format!(
+        "source = {source:?}\nreference = {reference:?}\ninstalled_at_ms = {}\ninstalled_at = {:?}\n",
+        now_ms(),
+        Utc::now().to_rfc3339()
+    );
+    fs::write(&metadata_path, content)
+        .with_context(|| format!("failed to write {}", metadata_path.display()))
 }
 
 #[cfg(test)]
@@ -458,7 +493,8 @@ mod tests {
         .expect("snapshot 755");
 
         assert_ne!(first.hash, second.hash);
-        assert_ne!(first.snapshot_abs_dir, second.snapshot_abs_dir);
+        assert_ne!(first.skill_id, second.skill_id);
+        assert_eq!(first.snapshot_abs_dir, second.snapshot_abs_dir);
         let installed_mode = fs::metadata(second.snapshot_abs_dir.join("scripts/worker"))
             .expect("installed worker metadata")
             .permissions()

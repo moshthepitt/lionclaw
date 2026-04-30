@@ -12,11 +12,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use lionclaw::{
+    applied::AppliedState,
     contracts::{
-        ChannelBindRequest, ChannelStreamPullRequest, ChannelStreamStartMode, JobCreateRequest,
-        JobRefRequest, JobRunsRequest, SessionHistoryPolicy, SessionHistoryRequest,
-        SessionLatestQuery, SessionOpenRequest, SessionTurnRequest, SkillInstallRequest,
-        StreamEventKindDto, TrustTier,
+        ChannelStreamPullRequest, ChannelStreamStartMode, JobCreateRequest, JobRefRequest,
+        JobRunsRequest, SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery,
+        SessionOpenRequest, SessionTurnRequest, StreamEventKindDto, TrustTier,
     },
     home::LionClawHome,
     kernel::{
@@ -28,6 +28,10 @@ use lionclaw::{
         },
         InboundChannelText, Kernel, KernelError, KernelOptions,
     },
+    operator::{
+        config::ChannelLaunchMode,
+        reconcile::{add_channel, add_skill, onboard, remove_skill},
+    },
     workspace::bootstrap_workspace,
 };
 use sqlx::SqlitePool;
@@ -38,8 +42,8 @@ use uuid::Uuid;
 #[tokio::test]
 async fn scheduled_job_tick_runs_in_fresh_scheduler_session() {
     let env = TestEnv::new();
-    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
-    let skill_id = install_enabled_skill(&kernel, "scheduler-brief").await;
+    let skill_id = install_skill(&env, "scheduler-brief").await;
+    let kernel = env.kernel().await;
 
     let created = kernel
         .create_job(JobCreateRequest {
@@ -113,15 +117,15 @@ async fn scheduled_job_tick_runs_in_fresh_scheduler_session() {
     );
     assert!(
         history.turns[0].assistant_text.contains(&skill_id),
-        "mock runtime should receive the explicit scheduled skill list"
+        "mock runtime should receive the current runtime-visible skills"
     );
 }
 
 #[tokio::test]
-async fn scheduled_job_keeps_creation_time_skills_after_alias_removal() {
+async fn scheduled_job_uses_current_runtime_skills_after_alias_removal() {
     let env = TestEnv::new();
-    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
-    let skill_id = install_enabled_skill(&kernel, "scheduler-disabled").await;
+    let skill_id = install_skill(&env, "scheduler-disabled").await;
+    let kernel = env.kernel().await;
 
     let created = kernel
         .create_job(JobCreateRequest {
@@ -137,11 +141,11 @@ async fn scheduled_job_keeps_creation_time_skills_after_alias_removal() {
         })
         .await
         .expect("create job");
-    kernel
-        .remove_skill("scheduler-disabled")
+    assert!(remove_skill(&env.home, "scheduler-disabled")
         .await
-        .expect("remove skill after job creation");
+        .expect("remove skill after job creation"));
 
+    let kernel = env.kernel().await;
     let tick = kernel.scheduler_tick().await.expect("run scheduler tick");
     assert_eq!(tick.claimed_runs, 1);
 
@@ -163,16 +167,22 @@ async fn scheduled_job_keeps_creation_time_skills_after_alias_removal() {
         .expect("load session history");
 
     assert!(
-        history.turns[0].assistant_text.contains(&skill_id),
-        "scheduled jobs should keep the runtime skill set captured at creation time"
+        !history.turns[0].assistant_text.contains(&skill_id),
+        "removed skills should not remain runtime-visible after restart"
+    );
+    assert!(
+        history.turns[0]
+            .assistant_text
+            .contains("no runtime skills available"),
+        "scheduler jobs should use the daemon's current runtime-visible skill set"
     );
 }
 
 #[tokio::test]
-async fn scheduled_job_keeps_creation_time_runtime_skill_set() {
+async fn scheduled_job_picks_up_runtime_skill_additions_after_restart() {
     let env = TestEnv::new();
-    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
-    let first_skill_id = install_enabled_skill(&kernel, "scheduler-first").await;
+    let first_skill_id = install_skill(&env, "scheduler-first").await;
+    let kernel = env.kernel().await;
 
     let created = kernel
         .create_job(JobCreateRequest {
@@ -189,8 +199,9 @@ async fn scheduled_job_keeps_creation_time_runtime_skill_set() {
         .await
         .expect("create job");
 
-    let later_skill_id = install_enabled_skill(&kernel, "scheduler-later").await;
+    let later_skill_id = install_skill(&env, "scheduler-later").await;
 
+    let kernel = env.kernel().await;
     let tick = kernel.scheduler_tick().await.expect("run scheduler tick");
     assert_eq!(tick.claimed_runs, 1);
 
@@ -213,11 +224,11 @@ async fn scheduled_job_keeps_creation_time_runtime_skill_set() {
 
     assert!(
         history.turns[0].assistant_text.contains(&first_skill_id),
-        "job should keep the runtime skills visible at creation"
+        "existing runtime-visible skills should still be available after restart"
     );
     assert!(
-        !history.turns[0].assistant_text.contains(&later_skill_id),
-        "later skill installs must not change already-created jobs"
+        history.turns[0].assistant_text.contains(&later_skill_id),
+        "restarted daemons should pick up newly installed runtime-visible skills"
     );
 }
 
@@ -505,18 +516,15 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
     bootstrap_workspace(&env.workspace_root())
         .await
         .expect("bootstrap assistant workspace");
-    let kernel = Kernel::new_with_options(
-        &env.db_path(),
-        KernelOptions {
+    install_skill(&env, "job-scope-reader").await;
+    install_and_bind_channel(&env, "terminal", "terminal-delivery").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
             project_workspace_root: Some(std::env::current_dir().expect("current dir")),
             ..KernelOptions::default()
-        },
-    )
-    .await
-    .expect("kernel init");
-    install_enabled_skill(&kernel, "job-scope-reader").await;
-    install_and_bind_channel(&kernel, "terminal", "terminal-delivery").await;
+        })
+        .await;
     approve_channel_peer(&kernel, "terminal", "alice").await;
 
     let seed_session = kernel
@@ -649,11 +657,11 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
 #[tokio::test]
 async fn scheduled_job_failure_delivers_summary_and_dead_letters() {
     let env = TestEnv::new();
-    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    install_and_bind_channel(&env, "terminal", "terminal-failure").await;
+    let kernel = env.kernel().await;
     kernel
         .register_runtime_adapter("always-fail", Arc::new(AlwaysFailRuntimeAdapter))
         .await;
-    install_and_bind_channel(&kernel, "terminal", "terminal-failure").await;
 
     let created = kernel
         .create_job(JobCreateRequest {
@@ -798,8 +806,8 @@ async fn paused_jobs_are_skipped_by_ticks_but_can_run_manually() {
 #[tokio::test]
 async fn removing_job_revokes_job_scoped_policy_grants() {
     let env = TestEnv::new();
-    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
-    install_enabled_skill(&kernel, "scheduler-remove-guard").await;
+    install_skill(&env, "scheduler-remove-guard").await;
+    let kernel = env.kernel().await;
 
     let created = kernel
         .create_job(JobCreateRequest {
@@ -1149,34 +1157,63 @@ impl RuntimeAdapter for BlockingRuntimeAdapter {
     }
 }
 
-async fn install_enabled_skill(kernel: &Kernel, skill_name: &str) -> String {
-    let installed = kernel
-        .install_skill(SkillInstallRequest {
-            source: format!("local/{skill_name}"),
-            alias: skill_name.to_string(),
-            reference: Some("main".to_string()),
-            hash: Some(format!("{skill_name}-hash")),
-            skill_md: Some(format!(
-                "---\nname: {skill_name}\ndescription: {skill_name} test skill\n---"
-            )),
-            snapshot_path: None,
-        })
+async fn install_skill(env: &TestEnv, skill_name: &str) -> String {
+    onboard(&env.home, None).await.expect("onboard");
+    let skill_source = env.temp_dir.path().join("skill-sources").join(skill_name);
+    std::fs::create_dir_all(&skill_source).expect("skill source dir");
+    std::fs::write(
+        skill_source.join("SKILL.md"),
+        format!("---\nname: {skill_name}\ndescription: {skill_name} test skill\n---\n"),
+    )
+    .expect("skill md");
+    add_skill(
+        &env.home,
+        skill_name.to_string(),
+        skill_source.display().to_string(),
+        "local".to_string(),
+    )
+    .await
+    .expect("install skill");
+
+    AppliedState::load(&env.home)
         .await
-        .expect("install skill");
-    installed.skill_id
+        .expect("load applied state")
+        .skill_by_alias(skill_name)
+        .expect("installed skill")
+        .skill_id
+        .clone()
 }
 
-async fn install_and_bind_channel(kernel: &Kernel, channel_id: &str, skill_name: &str) {
-    install_enabled_skill(kernel, skill_name).await;
-    kernel
-        .bind_channel(ChannelBindRequest {
-            channel_id: channel_id.to_string(),
-            skill_alias: skill_name.to_string(),
-            enabled: Some(true),
-            config: None,
-        })
-        .await
-        .expect("bind channel");
+async fn install_and_bind_channel(env: &TestEnv, channel_id: &str, skill_name: &str) {
+    onboard(&env.home, None).await.expect("onboard");
+    let skill_source = env.temp_dir.path().join("skill-sources").join(skill_name);
+    let worker = skill_source.join("scripts/worker");
+    std::fs::create_dir_all(worker.parent().expect("worker parent")).expect("scripts dir");
+    std::fs::write(
+        skill_source.join("SKILL.md"),
+        format!("---\nname: {skill_name}\ndescription: {skill_name} test skill\n---\n"),
+    )
+    .expect("skill md");
+    std::fs::write(&worker, "#!/usr/bin/env bash\n").expect("worker");
+    std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod worker");
+    add_skill(
+        &env.home,
+        skill_name.to_string(),
+        skill_source.display().to_string(),
+        "local".to_string(),
+    )
+    .await
+    .expect("install skill");
+    add_channel(
+        &env.home,
+        channel_id.to_string(),
+        skill_name.to_string(),
+        ChannelLaunchMode::Service,
+        Vec::new(),
+    )
+    .await
+    .expect("bind channel");
 }
 
 async fn approve_channel_peer(kernel: &Kernel, channel_id: &str, peer_id: &str) {
@@ -1215,6 +1252,7 @@ async fn approve_channel_peer(kernel: &Kernel, channel_id: &str, peer_id: &str) 
 
 struct TestEnv {
     temp_dir: TempDir,
+    home: LionClawHome,
 }
 
 async fn write_test_codex_auth(home: &LionClawHome) {
@@ -1234,9 +1272,9 @@ async fn write_test_codex_auth(home: &LionClawHome) {
 
 impl TestEnv {
     fn new() -> Self {
-        Self {
-            temp_dir: tempfile::tempdir().expect("create temp dir"),
-        }
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        Self { temp_dir, home }
     }
 
     fn db_path(&self) -> PathBuf {
@@ -1249,6 +1287,20 @@ impl TestEnv {
 
     fn workspace_root(&self) -> PathBuf {
         self.temp_dir.path().join("workspace")
+    }
+
+    async fn kernel(&self) -> Kernel {
+        self.kernel_with_options(KernelOptions::default()).await
+    }
+
+    async fn kernel_with_options(&self, mut options: KernelOptions) -> Kernel {
+        onboard(&self.home, None).await.expect("onboard");
+        options.applied_state = AppliedState::load(&self.home)
+            .await
+            .expect("load applied state");
+        Kernel::new_with_options(&self.db_path(), options)
+            .await
+            .expect("kernel init")
     }
 }
 
@@ -1270,9 +1322,8 @@ async fn kernel_with_counting_codex_runtime(
     std::fs::set_permissions(&fake_podman, std::fs::Permissions::from_mode(0o755))
         .expect("chmod fake podman");
 
-    let kernel = Kernel::new_with_options(
-        &env.db_path(),
-        KernelOptions {
+    let kernel = env
+        .kernel_with_options(KernelOptions {
             runtime_execution_profiles: BTreeMap::from([(
                 "codex".to_string(),
                 RuntimeExecutionProfile::new(
@@ -1288,10 +1339,8 @@ async fn kernel_with_counting_codex_runtime(
             )]),
             codex_home_override: Some(home.root().join(".codex")),
             ..KernelOptions::default()
-        },
-    )
-    .await
-    .expect("kernel init");
+        })
+        .await;
     kernel
         .register_runtime_adapter("codex", Arc::new(CountingRuntimeAdapter { turn_calls }))
         .await;

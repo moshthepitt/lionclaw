@@ -44,7 +44,7 @@ pub(crate) async fn classify_daemon(
     bind_addr: &str,
     expected_home_id: &str,
     expected_project_scope: &str,
-    expected_config_fingerprint: &str,
+    expected_daemon_fingerprint: &str,
 ) -> Result<DaemonClassification> {
     if !listener_is_present(bind_addr).await {
         return Ok(DaemonClassification::Absent);
@@ -55,7 +55,7 @@ pub(crate) async fn classify_daemon(
             if info.home_id == expected_home_id {
                 if info.project_scope != expected_project_scope {
                     Ok(DaemonClassification::SameHomeDifferentProject)
-                } else if info.config_fingerprint == expected_config_fingerprint {
+                } else if info.daemon_fingerprint == expected_daemon_fingerprint {
                     Ok(DaemonClassification::SameHome)
                 } else {
                     Ok(DaemonClassification::SameHomeDifferentConfig)
@@ -82,7 +82,7 @@ pub(crate) async fn wait_for_same_home_daemon(
     bind_addr: &str,
     expected_home_id: &str,
     expected_project_scope: &str,
-    expected_config_fingerprint: &str,
+    expected_daemon_fingerprint: &str,
     timeout_duration: Duration,
 ) -> Result<DaemonClassification> {
     let deadline = Instant::now() + timeout_duration;
@@ -91,7 +91,7 @@ pub(crate) async fn wait_for_same_home_daemon(
             bind_addr,
             expected_home_id,
             expected_project_scope,
-            expected_config_fingerprint,
+            expected_daemon_fingerprint,
         )
         .await?;
         if matches!(classification, DaemonClassification::SameHome) {

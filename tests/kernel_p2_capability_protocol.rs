@@ -1,18 +1,28 @@
-use std::path::PathBuf;
+mod common;
 
-use lionclaw::{
-    contracts::{
-        PolicyGrantRequest, SessionOpenRequest, SessionTurnRequest, SkillInstallRequest,
-        StreamEventKindDto, TrustTier,
-    },
-    kernel::Kernel,
+use lionclaw::contracts::{
+    PolicyGrantRequest, SessionOpenRequest, SessionTurnRequest, StreamEventKindDto, TrustTier,
 };
-use tempfile::TempDir;
+
+use common::{write_skill_source, TestHome};
 
 #[tokio::test]
 async fn runtime_capability_requests_are_kernel_gated() {
-    let env = TestEnv::new();
-    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let env = TestHome::new().await;
+    std::fs::write(
+        env.home().workspace_dir("main").join("README.md"),
+        "capability protocol",
+    )
+    .expect("seed workspace read target");
+    let skill_source = write_skill_source(
+        env.temp_dir(),
+        "capability-protocol",
+        "Handles capability-gated runtime operations",
+        false,
+    );
+    env.install_skill("capability-protocol", &skill_source)
+        .await;
+    let kernel = env.kernel().await;
 
     let session = kernel
         .open_session(SessionOpenRequest {
@@ -23,24 +33,14 @@ async fn runtime_capability_requests_are_kernel_gated() {
         })
         .await
         .expect("open session");
-
     let skill = kernel
-        .install_skill(SkillInstallRequest {
-            source: "local/capability-protocol".to_string(),
-            alias: "capability-protocol".to_string(),
-            reference: Some("main".to_string()),
-            hash: Some("capability-protocol-hash".to_string()),
-            skill_md: Some(
-                r#"---
-name: capability-protocol
-description: Handles capability-gated runtime operations
----"#
-                    .to_string(),
-            ),
-            snapshot_path: None,
-        })
+        .list_skills()
         .await
-        .expect("install skill");
+        .expect("list skills")
+        .skills
+        .into_iter()
+        .find(|skill| skill.alias == "capability-protocol")
+        .expect("installed skill");
 
     let denied_turn = kernel
         .turn_session(SessionTurnRequest {
@@ -54,16 +54,13 @@ description: Handles capability-gated runtime operations
         .await
         .expect("turn before fs.read grant");
 
-    assert!(
-        denied_turn.stream_events.iter().any(|event| {
-            event.kind == StreamEventKindDto::Status
-                && event
-                    .text
-                    .as_deref()
-                    .is_some_and(|text| text.contains("capability:req-1:denied"))
-        }),
-        "capability request should be denied before capability grant"
-    );
+    assert!(denied_turn.stream_events.iter().any(|event| {
+        event.kind == StreamEventKindDto::Status
+            && event
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("capability:req-1:denied"))
+    }));
 
     kernel
         .grant_policy(PolicyGrantRequest {
@@ -87,16 +84,13 @@ description: Handles capability-gated runtime operations
         .await
         .expect("turn after fs.read grant");
 
-    assert!(
-        granted_turn.stream_events.iter().any(|event| {
-            event.kind == StreamEventKindDto::Status
-                && event
-                    .text
-                    .as_deref()
-                    .is_some_and(|text| text.contains("capability:req-1:granted"))
-        }),
-        "capability request should be granted after explicit fs.read policy grant"
-    );
+    assert!(granted_turn.stream_events.iter().any(|event| {
+        event.kind == StreamEventKindDto::Status
+            && event
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("capability:req-1:granted"))
+    }));
 
     let capability_events = kernel
         .query_audit(
@@ -108,41 +102,21 @@ description: Handles capability-gated runtime operations
         .await
         .expect("query capability audit");
 
-    assert!(
-        capability_events.events.len() >= 2,
-        "capability events should be audited for each request"
-    );
-
+    assert!(capability_events.events.len() >= 2);
     let latest = &capability_events.events[0];
     let previous = &capability_events.events[1];
-
-    let latest_allowed = latest
-        .details
-        .get("allowed")
-        .and_then(|value| value.as_bool())
-        .expect("latest allowed bool");
-    let previous_allowed = previous
-        .details
-        .get("allowed")
-        .and_then(|value| value.as_bool())
-        .expect("previous allowed bool");
-
-    assert!(latest_allowed, "latest request should be allowed");
-    assert!(!previous_allowed, "previous request should be denied");
-}
-
-struct TestEnv {
-    temp_dir: TempDir,
-}
-
-impl TestEnv {
-    fn new() -> Self {
-        Self {
-            temp_dir: tempfile::tempdir().expect("create temp dir"),
-        }
-    }
-
-    fn db_path(&self) -> PathBuf {
-        self.temp_dir.path().join("lionclaw.db")
-    }
+    assert_eq!(
+        latest
+            .details
+            .get("allowed")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        previous
+            .details
+            .get("allowed")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
 }

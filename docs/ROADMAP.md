@@ -173,7 +173,7 @@ Goal: keep skills useful without making them implicitly trusted code.
 - [x] canonical installed snapshot store under `~/.lionclaw/skills`.
 - [x] path traversal and unsafe name protections.
 - [x] deterministic skill folder hashes.
-- [x] deterministic lockfile ordering.
+- [x] deterministic applied skill ordering from the installed alias set.
 - [x] installed non-channel skill snapshots mounted read-only into runtimes by alias.
 - [x] channel-bound skills stay host-only; all other installed skills mount read-only into runtimes by alias.
 - [x] runtime-native skill projection is derived from the canonical `/lionclaw/skills/<alias>` mount tree.
@@ -187,9 +187,9 @@ Goal: keep skills useful without making them implicitly trusted code.
 
 Exit criteria:
 
-- [ ] Reinstall from lockfile reproduces identical snapshots.
-- [ ] Skill updates require explicit operator approval.
-- [ ] Audit includes skill provenance and hash changes.
+ - [ ] Reinstalling the same installed alias set reproduces identical snapshots.
+ - [ ] Skill updates require explicit operator approval.
+ - [ ] Audit includes skill provenance and hash changes.
 
 ## P7 - Security Hardening
 
@@ -224,7 +224,7 @@ Goal: ship a usable LionClaw secure baseline.
 - [ ] `local-safe-default` config profile.
 - [ ] `remote-hardened` config profile.
 - [ ] `dev-relaxed` config profile.
-- [ ] backup/restore workflow for DB, config, lockfile, and skill snapshots.
+- [ ] backup/restore workflow for DB, config, and installed skill snapshots.
 - [ ] upgrade/migration command with rollback plan.
 - [ ] benchmark suite for latency, throughput, and restart recovery.
 
