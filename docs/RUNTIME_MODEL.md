@@ -318,9 +318,10 @@ platform service manager for that job. The current managed-service
 implementation uses systemd user services.
 
 Direct `lionclaw run` reads the current installed skill and channel state each
-time it launches a runtime. Managed daemons read that state at startup, so
-skill or channel changes take effect after the daemon is restarted or
-reconciled through `lionclaw service up` or `lionclaw channel attach`.
+time it launches a runtime. Managed daemons bake an immutable applied skill and
+channel snapshot at startup, so skill or channel changes take effect after the
+daemon is restarted or reconciled through `lionclaw service up` or
+`lionclaw channel attach`.
 
 Raw HTTP is for workers, tests, and debugging. It is not the normal operator
 experience.

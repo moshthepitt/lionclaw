@@ -160,9 +160,10 @@ connect LionClaw to the outside world. They cannot grant permissions by
 putting words in a prompt.
 
 Direct `lionclaw run` picks up the current installed skills and channels every
-time you start a new run. Managed daemons cache that applied state at startup,
-so after changing skills or channels you should rerun `lionclaw service up` or
-reattach the channel to reconcile and restart the daemon when needed.
+time you start a new run. Managed daemons bake an immutable applied snapshot at
+startup, so after changing skills or channels you should rerun
+`lionclaw service up` or reattach the channel to reconcile and restart the
+daemon when needed.
 
 ## One Real Recurring Workflow
 

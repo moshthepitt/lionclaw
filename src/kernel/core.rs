@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
     str::FromStr,
@@ -333,6 +333,8 @@ impl Kernel {
 
     async fn bootstrap(&self) {
         register_builtin_runtime_adapters(&self.runtime).await;
+        self.reconcile_policy_grants_to_applied_state_best_effort()
+            .await;
         if let Some(layout) = &self.continuity {
             if let Err(err) = layout.ensure_base_layout().await {
                 warn!(
@@ -382,6 +384,25 @@ impl Kernel {
         }
         if let Err(err) = self.refresh_active_continuity().await {
             warn!(?err, "failed to refresh active continuity during bootstrap");
+        }
+    }
+
+    async fn reconcile_policy_grants_to_applied_state_best_effort(&self) {
+        let installed_skill_ids = self
+            .applied_state
+            .skills()
+            .iter()
+            .map(|skill| skill.skill_id.clone())
+            .collect::<BTreeSet<_>>();
+        if let Err(err) = self
+            .policy
+            .revoke_uninstalled_skills(&installed_skill_ids)
+            .await
+        {
+            warn!(
+                ?err,
+                "failed to reconcile policy grants against applied skills during bootstrap"
+            );
         }
     }
 
@@ -2978,7 +2999,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_skill_mounts_use_installed_alias_directory() {
+    async fn runtime_skill_mounts_use_materialized_applied_snapshot_directory() {
         let temp_dir = tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         home.ensure_base_dirs().await.expect("base dirs");
@@ -2995,14 +3016,61 @@ mod tests {
             .expect("resolve skill mounts");
 
         assert_eq!(mounts.len(), 1);
-        assert_eq!(
+        assert_ne!(
             mounts[0].source,
             std::fs::canonicalize(&skill_dir).expect("canonical")
         );
+        assert_eq!(
+            mounts[0].source.file_name(),
+            Some(std::ffi::OsStr::new("terminal"))
+        );
+        assert!(mounts[0]
+            .source
+            .components()
+            .any(|component| component.as_os_str() == std::ffi::OsStr::new(".applied")));
         assert_eq!(mounts[0].target, "/lionclaw/skills/terminal");
         assert_eq!(mounts[0].access, MountAccess::ReadOnly);
         assert_eq!(runtime_skills.len(), 1);
         assert_eq!(runtime_skills[0].alias, "terminal");
+    }
+
+    #[tokio::test]
+    async fn runtime_skill_mounts_do_not_follow_live_alias_replacement() {
+        let temp_dir = tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        let skill_dir = write_installed_skill(&home, "terminal", "first revision").await;
+        let kernel = kernel_with_home(&home).await;
+
+        let runtime_skills = kernel
+            .runtime_visible_skills()
+            .await
+            .expect("list runtime-visible skills");
+        let mounts = kernel
+            .resolve_runtime_skill_mounts(&runtime_skills)
+            .await
+            .expect("resolve skill mounts");
+        let mounted_skill_md = mounts[0].source.join("SKILL.md");
+
+        tokio::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: terminal\ndescription: second revision\n---\n",
+        )
+        .await
+        .expect("rewrite installed skill");
+
+        let reread_mounts = kernel
+            .resolve_runtime_skill_mounts(&runtime_skills)
+            .await
+            .expect("resolve skill mounts again");
+        let mounted_skill_md_after =
+            std::fs::read_to_string(&mounted_skill_md).expect("read mounted skill");
+        let installed_skill_md_after =
+            std::fs::read_to_string(skill_dir.join("SKILL.md")).expect("read installed skill");
+
+        assert_eq!(mounts[0].source, reread_mounts[0].source);
+        assert!(mounted_skill_md_after.contains("first revision"));
+        assert!(installed_skill_md_after.contains("second revision"));
     }
 
     #[tokio::test]

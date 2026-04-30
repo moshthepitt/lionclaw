@@ -1326,6 +1326,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_skill_can_repair_missing_channel_bound_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+        let original = write_skill_source(
+            temp_dir.path(),
+            "channel-telegram-original",
+            "telegram",
+            true,
+        );
+        let repaired = write_skill_source(
+            temp_dir.path(),
+            "channel-telegram-repaired",
+            "telegram",
+            true,
+        );
+
+        add_skill(
+            &home,
+            "telegram".to_string(),
+            original.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install original channel skill");
+        add_channel(
+            &home,
+            "telegram".to_string(),
+            "telegram".to_string(),
+            ChannelLaunchMode::Service,
+            Vec::new(),
+        )
+        .await
+        .expect("add channel");
+
+        tokio::fs::remove_dir_all(home.skills_dir().join("telegram"))
+            .await
+            .expect("remove installed snapshot");
+
+        add_skill(
+            &home,
+            "telegram".to_string(),
+            repaired.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("repair missing channel skill");
+
+        assert!(home
+            .skills_dir()
+            .join("telegram")
+            .join("scripts/worker")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn add_skill_can_repair_corrupted_channel_bound_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+        let original = write_skill_source(
+            temp_dir.path(),
+            "channel-telegram-original",
+            "telegram",
+            true,
+        );
+        let repaired = write_skill_source(
+            temp_dir.path(),
+            "channel-telegram-repaired",
+            "telegram",
+            true,
+        );
+
+        add_skill(
+            &home,
+            "telegram".to_string(),
+            original.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install original channel skill");
+        add_channel(
+            &home,
+            "telegram".to_string(),
+            "telegram".to_string(),
+            ChannelLaunchMode::Service,
+            Vec::new(),
+        )
+        .await
+        .expect("add channel");
+
+        tokio::fs::remove_file(home.skills_dir().join("telegram").join("SKILL.md"))
+            .await
+            .expect("remove installed SKILL.md");
+
+        add_skill(
+            &home,
+            "telegram".to_string(),
+            repaired.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("repair corrupted channel skill");
+
+        assert!(home.skills_dir().join("telegram").join("SKILL.md").exists());
+        assert!(home
+            .skills_dir()
+            .join("telegram")
+            .join("scripts/worker")
+            .exists());
+    }
+
+    #[tokio::test]
     async fn up_with_fake_manager_materializes_units() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));

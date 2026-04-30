@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::kernel::db::{ms_to_datetime, now_ms};
@@ -246,6 +246,33 @@ impl PolicyStore {
             .execute(&mut **tx)
             .await
             .context("failed to revoke policy grants for scope")?;
+
+        Ok(deleted.rows_affected())
+    }
+
+    pub async fn revoke_uninstalled_skills(
+        &self,
+        installed_skill_ids: &std::collections::BTreeSet<String>,
+    ) -> Result<u64> {
+        let deleted = if installed_skill_ids.is_empty() {
+            sqlx::query("DELETE FROM policy_grants")
+                .execute(&self.pool)
+                .await
+                .context("failed to revoke policy grants for uninstalled skills")?
+        } else {
+            let mut query =
+                QueryBuilder::<Sqlite>::new("DELETE FROM policy_grants WHERE skill_id NOT IN (");
+            let mut separated = query.separated(", ");
+            for skill_id in installed_skill_ids {
+                separated.push_bind(skill_id);
+            }
+            separated.push_unseparated(")");
+            query
+                .build()
+                .execute(&self.pool)
+                .await
+                .context("failed to revoke policy grants for uninstalled skills")?
+        };
 
         Ok(deleted.rows_affected())
     }

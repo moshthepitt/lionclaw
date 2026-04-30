@@ -77,9 +77,20 @@ pub fn validate_skill_alias(alias: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn derive_skill_id(name: &str, hash: &str) -> String {
+pub fn derive_skill_id(name: &str, hash: &str, install_id: Option<&str>) -> String {
     let short_hash = &hash[..12.min(hash.len())];
-    format!("{}-{}", sanitize_skill_name(name), short_hash)
+    match install_id.filter(|value| !value.trim().is_empty()) {
+        Some(install_id) => {
+            let short_install_id = &install_id[..8.min(install_id.len())];
+            format!(
+                "{}-{}-{}",
+                sanitize_skill_name(name),
+                short_hash,
+                short_install_id
+            )
+        }
+        None => format!("{}-{}", sanitize_skill_name(name), short_hash),
+    }
 }
 
 pub fn parse_skill_frontmatter(content: &str) -> (String, String) {
@@ -136,8 +147,16 @@ body"#;
     #[test]
     fn derives_stable_skill_id() {
         assert_eq!(
-            derive_skill_id("Channel Telegram", "0123456789abcdef"),
+            derive_skill_id("Channel Telegram", "0123456789abcdef", None),
             "channel-telegram-0123456789ab"
+        );
+        assert_eq!(
+            derive_skill_id(
+                "Channel Telegram",
+                "0123456789abcdef",
+                Some("12345678-90ab-cdef-1234-567890abcdef")
+            ),
+            "channel-telegram-0123456789ab-12345678"
         );
         assert_eq!(sanitize_skill_name("Channel Telegram"), "channel-telegram");
     }

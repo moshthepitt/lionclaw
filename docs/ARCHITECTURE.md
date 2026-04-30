@@ -46,7 +46,7 @@ The Rust kernel owns:
 - scheduler definitions and run records
 - policy grants and audit events
 - assistant-home continuity files and derived search index
-- the applied runtime view loaded from channel config and filesystem-installed skills
+- the immutable applied runtime view loaded at startup from channel config and filesystem-installed skills
 
 Kernel-owned mutations are policy checked where privileged and audited where
 security or operator visibility matters.
@@ -62,7 +62,7 @@ Instead, LionClaw constrains the runtime launch:
 - project root mounted at `/workspace`
 - runtime-private state mounted at `/runtime`
 - draft/output area mounted at `/drafts`
-- installed non-channel skill snapshots mounted read-only at `/lionclaw/skills/<alias>`
+- applied non-channel skill snapshots mounted read-only at `/lionclaw/skills/<alias>`
 - network mode chosen by preset
 - runtime secrets mounted only when preset allows it
 - runtime auth staged into the runtime-private home
@@ -383,9 +383,10 @@ Scheduled runs open fresh synthetic sessions:
 - `history_policy = conservative`
 
 Scheduled jobs invoke the selected runtime with explicit job context and the
-runtime-visible skill set captured when the job was created. Optional delivery sends the final result
-through the existing channel stream/outbox path without changing the latest
-interactive session for that peer.
+daemon's current runtime-visible skill set from applied filesystem state.
+Optional delivery sends the final result through the existing channel
+stream/outbox path without changing the latest interactive session for that
+peer.
 
 Paused jobs are skipped by normal scheduler ticks but can still be run
 manually by the operator.

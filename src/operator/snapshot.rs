@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -17,6 +18,12 @@ use crate::{
 };
 
 pub const SKILL_INSTALL_METADATA_FILE: &str = ".lionclaw-skill.toml";
+
+#[derive(Debug, Default, Deserialize)]
+struct InstallMetadataFile {
+    #[serde(default)]
+    install_id: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct InstalledSnapshot {
@@ -41,8 +48,10 @@ pub fn install_snapshot(
     let skill_md = read_source_skill_md(&source_path)?;
     let (name, _) = parse_skill_frontmatter(&skill_md);
     let hash = hash_directory(&source_path)?;
-    let skill_id = derive_skill_id(&name, &hash);
     let snapshot_abs_dir = home.skills_dir().join(alias);
+    let install_id = existing_install_id_for_same_content(&snapshot_abs_dir, &hash)?
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let skill_id = derive_skill_id(&name, &hash, Some(&install_id));
     let staging_dir = home
         .skills_dir()
         .join(format!(".{alias}.tmp-{}", Uuid::new_v4()));
@@ -51,8 +60,8 @@ pub fn install_snapshot(
         fs::remove_dir_all(&staging_dir)
             .with_context(|| format!("failed to clean {}", staging_dir.display()))?;
     }
-    copy_directory(&source_path, &staging_dir)?;
-    write_install_metadata(&staging_dir, &source_uri, reference)?;
+    copy_snapshot_tree(&source_path, &staging_dir)?;
+    write_install_metadata(&staging_dir, &source_uri, reference, &install_id)?;
 
     match fs::symlink_metadata(&snapshot_abs_dir) {
         Ok(metadata) => {
@@ -218,7 +227,7 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn copy_snapshot_tree(source: &Path, destination: &Path) -> Result<()> {
     fs::create_dir_all(destination)
         .with_context(|| format!("failed to create {}", destination.display()))?;
 
@@ -246,7 +255,7 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
         }
 
         if metadata.is_dir() {
-            copy_directory(&path, &target)?;
+            copy_snapshot_tree(&path, &target)?;
         } else if metadata.is_file() {
             fs::copy(&path, &target).with_context(|| {
                 format!(
@@ -283,6 +292,56 @@ fn validate_existing_snapshot_dir(path: &Path, metadata: &fs::Metadata) -> Resul
     Ok(())
 }
 
+fn existing_install_id_for_same_content(
+    snapshot_dir: &Path,
+    source_hash: &str,
+) -> Result<Option<String>> {
+    let metadata = match fs::symlink_metadata(snapshot_dir) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", snapshot_dir.display()));
+        }
+    };
+    validate_existing_snapshot_dir(snapshot_dir, &metadata)?;
+
+    let existing_hash = hash_directory(snapshot_dir)?;
+    if existing_hash != source_hash {
+        return Ok(None);
+    }
+
+    read_existing_install_id(snapshot_dir)
+}
+
+fn read_existing_install_id(snapshot_dir: &Path) -> Result<Option<String>> {
+    let metadata_path = snapshot_dir.join(SKILL_INSTALL_METADATA_FILE);
+    let metadata = match fs::symlink_metadata(&metadata_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", metadata_path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "skill snapshot metadata '{}' must not be a symlink",
+            metadata_path.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "skill snapshot metadata '{}' is not a regular file",
+            metadata_path.display()
+        ));
+    }
+
+    let content = fs::read_to_string(&metadata_path)
+        .with_context(|| format!("failed to read {}", metadata_path.display()))?;
+    let metadata: InstallMetadataFile = toml::from_str(&content)
+        .with_context(|| format!("failed to parse {}", metadata_path.display()))?;
+    Ok((!metadata.install_id.trim().is_empty()).then_some(metadata.install_id))
+}
+
 fn snapshot_mode_bits(metadata: &fs::Metadata) -> u32 {
     #[cfg(unix)]
     {
@@ -312,10 +371,15 @@ fn should_ignore_snapshot_entry(file_name: &str) -> bool {
     )
 }
 
-fn write_install_metadata(snapshot_dir: &Path, source: &str, reference: &str) -> Result<()> {
+fn write_install_metadata(
+    snapshot_dir: &Path,
+    source: &str,
+    reference: &str,
+    install_id: &str,
+) -> Result<()> {
     let metadata_path = snapshot_dir.join(SKILL_INSTALL_METADATA_FILE);
     let content = format!(
-        "source = {source:?}\nreference = {reference:?}\ninstalled_at_ms = {}\ninstalled_at = {:?}\n",
+        "source = {source:?}\nreference = {reference:?}\ninstall_id = {install_id:?}\ninstalled_at_ms = {}\ninstalled_at = {:?}\n",
         now_ms(),
         Utc::now().to_rfc3339()
     );
@@ -368,6 +432,7 @@ mod tests {
         .expect("snapshot");
 
         assert_eq!(first.hash, second.hash);
+        assert_eq!(first.skill_id, second.skill_id);
         assert_eq!(first.snapshot_abs_dir, second.snapshot_abs_dir);
         assert!(first.snapshot_abs_dir.join("scripts/worker").exists());
     }

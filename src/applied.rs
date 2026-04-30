@@ -8,6 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::{
     home::LionClawHome,
@@ -17,7 +18,7 @@ use crate::{
     },
     operator::{
         config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
-        snapshot::{hash_directory, SKILL_INSTALL_METADATA_FILE},
+        snapshot::{copy_snapshot_tree, hash_directory, SKILL_INSTALL_METADATA_FILE},
     },
 };
 
@@ -113,6 +114,7 @@ impl AppliedState {
             channels.push(AppliedChannel::from_config(channel));
         }
 
+        let skills = materialize_applied_skills(&skills_root, skills, &channels)?;
         Ok(Self::from_parts(skills, channels))
     }
 
@@ -150,30 +152,7 @@ impl AppliedState {
     }
 
     pub fn fingerprint(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(b"lionclaw-applied-state-v1\0");
-
-        for skill in &self.skills {
-            hasher.update(b"skill\0");
-            hasher.update(skill.alias.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(skill.skill_id.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(skill.hash.as_bytes());
-            hasher.update(b"\0");
-        }
-
-        for channel in &self.channels {
-            hasher.update(b"channel\0");
-            hasher.update(channel.id.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(channel.skill_alias.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(channel.launch_mode.as_str().as_bytes());
-            hasher.update(b"\0");
-        }
-
-        hex::encode(hasher.finalize())
+        applied_state_fingerprint(&self.skills, &self.channels)
     }
 
     fn from_parts(skills: Vec<AppliedSkill>, channels: Vec<AppliedChannel>) -> Self {
@@ -203,6 +182,186 @@ impl AppliedState {
     }
 }
 
+fn applied_state_fingerprint(skills: &[AppliedSkill], channels: &[AppliedChannel]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lionclaw-applied-state-v1\0");
+
+    for skill in skills {
+        hasher.update(b"skill\0");
+        hasher.update(skill.alias.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(skill.skill_id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(skill.hash.as_bytes());
+        hasher.update(b"\0");
+    }
+
+    for channel in channels {
+        hasher.update(b"channel\0");
+        hasher.update(channel.id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(channel.skill_alias.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(channel.launch_mode.as_str().as_bytes());
+        hasher.update(b"\0");
+    }
+
+    hex::encode(hasher.finalize())
+}
+
+fn materialize_applied_skills(
+    skills_root: &Path,
+    skills: Vec<AppliedSkill>,
+    channels: &[AppliedChannel],
+) -> Result<Vec<AppliedSkill>> {
+    if skills.is_empty() {
+        return Ok(skills);
+    }
+
+    let applied_root = materialize_applied_snapshot_root(
+        skills_root,
+        &applied_state_fingerprint(&skills, channels),
+        &skills,
+    )?;
+
+    skills
+        .into_iter()
+        .map(|mut skill| {
+            skill.snapshot_path = applied_root.join(&skill.alias);
+            Ok(skill)
+        })
+        .collect()
+}
+
+fn materialize_applied_snapshot_root(
+    skills_root: &Path,
+    fingerprint: &str,
+    skills: &[AppliedSkill],
+) -> Result<PathBuf> {
+    let applied_parent = ensure_applied_snapshot_parent(skills_root)?;
+    let applied_root = applied_parent.join(fingerprint);
+    if applied_root.exists() {
+        validate_materialized_snapshot_root(&applied_root, skills)?;
+        return Ok(applied_root);
+    }
+
+    let staging_root = applied_parent.join(format!(".{fingerprint}.tmp-{}", Uuid::new_v4()));
+    if staging_root.exists() {
+        fs::remove_dir_all(&staging_root)
+            .with_context(|| format!("failed to clean {}", staging_root.display()))?;
+    }
+    fs::create_dir_all(&staging_root)
+        .with_context(|| format!("failed to create {}", staging_root.display()))?;
+
+    for skill in skills {
+        copy_snapshot_tree(&skill.snapshot_path, &staging_root.join(&skill.alias))?;
+    }
+
+    match fs::rename(&staging_root, &applied_root) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_dir_all(&staging_root)
+                .with_context(|| format!("failed to clean {}", staging_root.display()))?;
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to move '{}' into '{}'",
+                    staging_root.display(),
+                    applied_root.display()
+                )
+            });
+        }
+    }
+
+    validate_materialized_snapshot_root(&applied_root, skills)?;
+    Ok(applied_root)
+}
+
+fn ensure_applied_snapshot_parent(skills_root: &Path) -> Result<PathBuf> {
+    let applied_parent = skills_root.join(".applied");
+    match fs::symlink_metadata(&applied_parent) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(anyhow!(
+                    "applied skills root '{}' must not be a symlink",
+                    applied_parent.display()
+                ));
+            }
+            if !metadata.is_dir() {
+                return Err(anyhow!(
+                    "applied skills root '{}' is not a directory",
+                    applied_parent.display()
+                ));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            match fs::create_dir(&applied_parent) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("failed to create {}", applied_parent.display()));
+                }
+            }
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to stat {}", applied_parent.display()));
+        }
+    }
+
+    fs::canonicalize(&applied_parent)
+        .with_context(|| format!("failed to resolve {}", applied_parent.display()))
+}
+
+fn validate_materialized_snapshot_root(applied_root: &Path, skills: &[AppliedSkill]) -> Result<()> {
+    let metadata = fs::symlink_metadata(applied_root)
+        .with_context(|| format!("failed to stat {}", applied_root.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "applied skill snapshot '{}' must not be a symlink",
+            applied_root.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(anyhow!(
+            "applied skill snapshot '{}' is not a directory",
+            applied_root.display()
+        ));
+    }
+
+    for skill in skills {
+        let skill_root = applied_root.join(&skill.alias);
+        let metadata = fs::symlink_metadata(&skill_root)
+            .with_context(|| format!("failed to stat {}", skill_root.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(anyhow!(
+                "applied skill '{}' must not be a symlink",
+                skill_root.display()
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(anyhow!(
+                "applied skill '{}' is not a directory",
+                skill_root.display()
+            ));
+        }
+
+        let skill_md_path = skill_root.join("SKILL.md");
+        let skill_md_metadata = fs::symlink_metadata(&skill_md_path)
+            .with_context(|| format!("failed to stat {}", skill_md_path.display()))?;
+        if skill_md_metadata.file_type().is_symlink() || !skill_md_metadata.is_file() {
+            return Err(anyhow!(
+                "applied skill '{}' must contain a regular SKILL.md",
+                skill_root.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 pub fn compute_daemon_fingerprint(
     runtime_config_fingerprint: &str,
     applied_state: &AppliedState,
@@ -222,6 +381,8 @@ struct InstalledSkillMetadata {
     #[serde(default)]
     reference: String,
     #[serde(default)]
+    install_id: String,
+    #[serde(default)]
     installed_at_ms: Option<i64>,
 }
 
@@ -239,7 +400,7 @@ pub struct AppliedSkill {
 }
 
 impl AppliedSkill {
-    fn from_installed(skills_root: &Path, snapshot_path: PathBuf) -> Result<Self> {
+    pub(crate) fn from_installed(skills_root: &Path, snapshot_path: PathBuf) -> Result<Self> {
         let alias = snapshot_path
             .file_name()
             .and_then(|value| value.to_str())
@@ -281,6 +442,10 @@ impl AppliedSkill {
             .as_ref()
             .map(|value| value.reference.trim().to_string())
             .filter(|value| !value.is_empty());
+        let install_id = metadata
+            .as_ref()
+            .map(|value| value.install_id.trim())
+            .filter(|value| !value.is_empty());
         let installed_at = metadata
             .as_ref()
             .and_then(|value| value.installed_at_ms.and_then(ms_to_datetime))
@@ -293,7 +458,7 @@ impl AppliedSkill {
             .unwrap_or_else(Utc::now);
 
         Ok(Self {
-            skill_id: derive_skill_id(&name, &hash),
+            skill_id: derive_skill_id(&name, &hash, install_id),
             alias,
             name,
             description,

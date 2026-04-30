@@ -107,6 +107,141 @@ async fn restart_persists_session_skill_policy_and_audit() {
 }
 
 #[tokio::test]
+async fn running_kernel_keeps_skill_and_policy_until_restart() {
+    let env = TestHome::new().await;
+    std::fs::write(
+        env.home().workspace_dir("main").join("README.md"),
+        "running kernel snapshot workspace file",
+    )
+    .expect("write workspace readme");
+    let skill_source =
+        write_skill_source(env.temp_dir(), "snapshot-skill", "first revision", false);
+    env.install_skill("snapshot-skill", &skill_source).await;
+
+    let kernel = env.kernel().await;
+    let opened = open_main_session(&kernel, "peer-running-snapshot").await;
+    let first_skill_id = env.installed_skill_id("snapshot-skill").await;
+    kernel
+        .grant_policy(PolicyGrantRequest {
+            skill_alias: "snapshot-skill".to_string(),
+            capability: "fs.read".to_string(),
+            scope: "*".to_string(),
+            ttl_seconds: None,
+        })
+        .await
+        .expect("grant policy");
+
+    assert!(env.remove_skill("snapshot-skill").await);
+
+    let turn_before_restart = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: opened.session_id,
+            user_text: "existing kernel should keep loaded skill [cap:fs.read]".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn before restart");
+    assert!(turn_before_restart
+        .runtime_skill_ids
+        .contains(&first_skill_id));
+    assert!(turn_before_restart.stream_events.iter().any(|event| {
+        event
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("capability:req-1:granted"))
+    }));
+
+    let restarted_kernel = env.kernel().await;
+    let turn_after_restart = restarted_kernel
+        .turn_session(SessionTurnRequest {
+            session_id: opened.session_id,
+            user_text: "restarted kernel should drop removed skill [cap:fs.read]".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn after restart");
+    assert!(!turn_after_restart
+        .runtime_skill_ids
+        .contains(&first_skill_id));
+    assert!(turn_after_restart.stream_events.iter().all(|event| {
+        !event
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("capability:req-1:granted"))
+    }));
+}
+
+#[tokio::test]
+async fn running_kernel_keeps_loaded_revision_until_restart() {
+    let env = TestHome::new().await;
+    let skill_source = write_skill_source(
+        env.temp_dir(),
+        "revisioned-running-skill",
+        "first revision",
+        false,
+    );
+    env.install_skill("active-alias", &skill_source).await;
+
+    let kernel = env.kernel().await;
+    let first_skill_id = env.installed_skill_id("active-alias").await;
+
+    std::fs::write(
+        skill_source.join("SKILL.md"),
+        "---\nname: revisioned-running-skill\ndescription: second revision\n---\n",
+    )
+    .expect("rewrite skill");
+    env.install_skill("active-alias", &skill_source).await;
+    let second_skill_id = env.installed_skill_id("active-alias").await;
+    assert_ne!(first_skill_id, second_skill_id);
+
+    let opened_before_restart = open_main_session(&kernel, "peer-running-revision").await;
+    let turn_before_restart = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: opened_before_restart.session_id,
+            user_text: "running kernel should keep first revision".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn before restart");
+    assert!(turn_before_restart
+        .runtime_skill_ids
+        .contains(&first_skill_id));
+    assert!(!turn_before_restart
+        .runtime_skill_ids
+        .contains(&second_skill_id));
+
+    let restarted_kernel = env.kernel().await;
+    let opened_after_restart =
+        open_main_session(&restarted_kernel, "peer-running-revision-new").await;
+    let turn_after_restart = restarted_kernel
+        .turn_session(SessionTurnRequest {
+            session_id: opened_after_restart.session_id,
+            user_text: "restarted kernel should use second revision".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn after restart");
+    assert!(!turn_after_restart
+        .runtime_skill_ids
+        .contains(&first_skill_id));
+    assert!(turn_after_restart
+        .runtime_skill_ids
+        .contains(&second_skill_id));
+}
+
+#[tokio::test]
 async fn expiring_policy_grant_is_enforced() {
     let env = TestHome::new().await;
     std::fs::write(
@@ -353,6 +488,102 @@ async fn skill_rm_hides_alias_until_reinstall() {
 }
 
 #[tokio::test]
+async fn skill_rm_clears_policy_grants_for_reinstall() {
+    let env = TestHome::new().await;
+    let skill_source = write_skill_source(env.temp_dir(), "remove-grant", "remove", false);
+    env.install_skill("active-alias", &skill_source).await;
+
+    let kernel = env.kernel().await;
+    kernel
+        .grant_policy(PolicyGrantRequest {
+            skill_alias: "active-alias".to_string(),
+            capability: "fs.read".to_string(),
+            scope: "*".to_string(),
+            ttl_seconds: None,
+        })
+        .await
+        .expect("grant policy");
+
+    assert!(env.remove_skill("active-alias").await);
+    env.install_skill("active-alias", &skill_source).await;
+
+    let kernel = env.kernel().await;
+    let opened = open_main_session(&kernel, "peer-remove-grant").await;
+    let turn = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: opened.session_id,
+            user_text: "removed skills should not keep old grants [cap:fs.read]".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn after reinstall");
+
+    assert!(turn.stream_events.iter().any(|event| {
+        event
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("capability:req-1:denied"))
+    }));
+}
+
+#[tokio::test]
+async fn skill_alias_replacement_clears_old_policy_grants() {
+    let env = TestHome::new().await;
+    let skill_source =
+        write_skill_source(env.temp_dir(), "revisioned-skill", "first revision", false);
+    env.install_skill("active-alias", &skill_source).await;
+
+    let kernel = env.kernel().await;
+    kernel
+        .grant_policy(PolicyGrantRequest {
+            skill_alias: "active-alias".to_string(),
+            capability: "fs.read".to_string(),
+            scope: "*".to_string(),
+            ttl_seconds: None,
+        })
+        .await
+        .expect("grant policy");
+
+    std::fs::write(
+        skill_source.join("SKILL.md"),
+        "---\nname: revisioned-skill\ndescription: second revision\n---\n",
+    )
+    .expect("rewrite skill to second revision");
+    env.install_skill("active-alias", &skill_source).await;
+
+    std::fs::write(
+        skill_source.join("SKILL.md"),
+        "---\nname: revisioned-skill\ndescription: first revision\n---\n",
+    )
+    .expect("rewrite skill back to first revision");
+    env.install_skill("active-alias", &skill_source).await;
+
+    let kernel = env.kernel().await;
+    let opened = open_main_session(&kernel, "peer-replace-grant").await;
+    let turn = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: opened.session_id,
+            user_text: "replaced aliases should not resurrect old grants [cap:fs.read]".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn after alias replacement");
+
+    assert!(turn.stream_events.iter().any(|event| {
+        event
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("capability:req-1:denied"))
+    }));
+}
+
+#[tokio::test]
 async fn skill_add_rejects_invalid_alias() {
     let env = TestHome::new().await;
     let skill_source = write_skill_source(env.temp_dir(), "bad-alias", "invalid", false);
@@ -369,17 +600,19 @@ async fn skill_add_rejects_invalid_alias() {
 }
 
 #[tokio::test]
-async fn duplicate_skill_ids_are_rejected_when_loading_applied_state() {
+async fn identical_skill_content_can_back_multiple_aliases() {
     let env = TestHome::new().await;
     let skill_source = write_skill_source(env.temp_dir(), "same-skill", "same", false);
     env.install_skill("alpha", &skill_source).await;
     env.install_skill("beta", &skill_source).await;
 
-    let err = AppliedState::load(env.home())
+    let applied = AppliedState::load(env.home())
         .await
-        .expect_err("duplicate skill ids should fail");
-    let message = err.to_string();
-    assert!(message.contains("collides with another installed skill"));
+        .expect("load applied state");
+    let alpha = applied.skill_by_alias("alpha").expect("alpha skill");
+    let beta = applied.skill_by_alias("beta").expect("beta skill");
+
+    assert_ne!(alpha.skill_id, beta.skill_id);
 }
 
 async fn open_main_session(
