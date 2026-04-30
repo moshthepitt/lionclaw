@@ -70,8 +70,7 @@ impl AppliedState {
                 ));
             }
 
-            let metadata = entry
-                .metadata()
+            let metadata = fs::symlink_metadata(entry.path())
                 .with_context(|| format!("failed to stat {}", entry.path().display()))?;
             if metadata.file_type().is_symlink() {
                 return Err(anyhow!(
@@ -413,5 +412,32 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(aliases, vec!["visible"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_rejects_symlinked_installed_aliases() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+
+        let target = home.skills_dir().join("target");
+        fs::create_dir_all(&target).expect("target dir");
+        fs::write(
+            target.join("SKILL.md"),
+            "---\nname: target\ndescription: target\n---\n",
+        )
+        .expect("target skill");
+
+        std::os::unix::fs::symlink(&target, home.skills_dir().join("linked"))
+            .expect("symlink alias");
+
+        let err = AppliedState::load(&home)
+            .await
+            .expect_err("symlinked installed alias should fail");
+        assert!(
+            err.to_string().contains("must not be a symlink"),
+            "unexpected error: {err:#}"
+        );
     }
 }
