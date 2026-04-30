@@ -92,7 +92,8 @@ use super::{
     session_turns::{NewSessionTurn, SessionTurnCompletion, SessionTurnRecord, SessionTurnStore},
     sessions::SessionStore,
     skills::{
-        validate_skill_alias, SkillAliasValidationError, SkillInstallInput, SkillRecord, SkillStore,
+        validate_skill_alias, SkillAliasValidationError, SkillIdentityCollisionError,
+        SkillInstallInput, SkillRecord, SkillStore,
     },
 };
 
@@ -921,6 +922,7 @@ impl Kernel {
 
         let channel_id = req.channel_id.trim().to_string();
         let skill_alias = req.skill_alias.trim().to_string();
+        validate_skill_alias(&skill_alias).map_err(skill_install_error)?;
         let enabled = req.enabled.unwrap_or(true);
         let config = req
             .config
@@ -4461,6 +4463,8 @@ fn internal(err: anyhow::Error) -> KernelError {
 fn skill_install_error(err: anyhow::Error) -> KernelError {
     if let Some(err) = err.downcast_ref::<SkillAliasValidationError>() {
         KernelError::BadRequest(err.to_string())
+    } else if let Some(err) = err.downcast_ref::<SkillIdentityCollisionError>() {
+        KernelError::Conflict(err.to_string())
     } else {
         internal(err)
     }

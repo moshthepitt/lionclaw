@@ -66,6 +66,27 @@ description: channel skill
 }
 
 #[tokio::test]
+async fn channel_bind_rejects_invalid_alias() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+
+    let err = kernel
+        .bind_channel(ChannelBindRequest {
+            channel_id: "local-cli".to_string(),
+            skill_alias: "../not-valid".to_string(),
+            enabled: Some(true),
+            config: None,
+        })
+        .await
+        .expect_err("bind should reject invalid alias");
+
+    assert!(
+        matches!(err, KernelError::BadRequest(_)),
+        "invalid skill alias should be rejected as a bad request"
+    );
+}
+
+#[tokio::test]
 async fn channel_peer_must_be_approved_before_inbound_turn_executes() {
     let env = TestEnv::new();
     let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");

@@ -17,7 +17,6 @@ pub struct SkillRecord {
     pub hash: String,
     pub snapshot_path: Option<String>,
     pub skill_md: Option<String>,
-    pub enabled: bool,
     pub installed_at: DateTime<Utc>,
 }
 
@@ -38,6 +37,20 @@ pub struct SkillAliasValidationError {
 }
 
 impl SkillAliasValidationError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct SkillIdentityCollisionError {
+    message: String,
+}
+
+impl SkillIdentityCollisionError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -119,8 +132,14 @@ impl SkillStore {
             {
                 return self.activate(existing.skill_id, &alias).await;
             }
-            if self.get(&skill_id).await?.is_some() {
-                return self.activate(skill_id, &alias).await;
+            if let Some(existing) = self.get(&skill_id).await? {
+                if existing.hash == hash && existing.name == name {
+                    return self.activate(existing.skill_id, &alias).await;
+                }
+                return Err(SkillIdentityCollisionError::new(format!(
+                    "distinct skills collided on derived skill id '{skill_id}'; choose a different skill name or hash"
+                )))
+                .context("failed to insert skill");
             }
             return Err(err).context("failed to insert skill");
         }
@@ -130,7 +149,7 @@ impl SkillStore {
 
     pub async fn list(&self) -> Result<Vec<SkillRecord>> {
         let rows = sqlx::query(
-            "SELECT skill_id, alias, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms \
+            "SELECT skill_id, alias, name, description, source, reference, hash, snapshot_path, skill_md, installed_at_ms \
              FROM skills \
              WHERE enabled = 1 \
              ORDER BY alias ASC, installed_at_ms ASC",
@@ -144,7 +163,7 @@ impl SkillStore {
 
     pub async fn get(&self, skill_id: &str) -> Result<Option<SkillRecord>> {
         let row = sqlx::query(
-            "SELECT skill_id, alias, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms \
+            "SELECT skill_id, alias, name, description, source, reference, hash, snapshot_path, skill_md, installed_at_ms \
              FROM skills \
              WHERE skill_id = ?1",
         )
@@ -158,7 +177,7 @@ impl SkillStore {
 
     pub async fn get_enabled_by_alias(&self, alias: &str) -> Result<Option<SkillRecord>> {
         let row = sqlx::query(
-            "SELECT skill_id, alias, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms \
+            "SELECT skill_id, alias, name, description, source, reference, hash, snapshot_path, skill_md, installed_at_ms \
              FROM skills \
              WHERE alias = ?1 AND enabled = 1",
         )
@@ -237,7 +256,7 @@ impl SkillStore {
         hash: &str,
     ) -> Result<Option<SkillRecord>> {
         let row = sqlx::query(
-            "SELECT skill_id, alias, name, description, source, reference, hash, snapshot_path, skill_md, enabled, installed_at_ms \
+            "SELECT skill_id, alias, name, description, source, reference, hash, snapshot_path, skill_md, installed_at_ms \
              FROM skills \
              WHERE source = ?1 AND reference = ?2 AND hash = ?3",
         )
@@ -288,7 +307,6 @@ fn map_skill_row(row: SqliteRow) -> Result<SkillRecord> {
         hash: row.get("hash"),
         snapshot_path,
         skill_md,
-        enabled: row.get::<i64, _>("enabled") != 0,
         installed_at,
     })
 }

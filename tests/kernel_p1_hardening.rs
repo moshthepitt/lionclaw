@@ -534,6 +534,49 @@ async fn install_reuses_existing_skill_for_same_content_identity() {
     assert_eq!(listed.skills[0].alias, "duplicate-two");
 }
 
+#[tokio::test]
+async fn install_rejects_distinct_skills_that_collide_on_derived_skill_id() {
+    let sandbox = temp_env();
+    let kernel = Kernel::new(&sandbox.db_path()).await.expect("kernel init");
+
+    let first = kernel
+        .install_skill(SkillInstallRequest {
+            source: "local/collision-one".to_string(),
+            alias: "collision-one".to_string(),
+            reference: Some("main".to_string()),
+            hash: Some("0123456789ab1111".to_string()),
+            skill_md: Some("---\nname: collision\ndescription: one\n---\n".to_string()),
+            snapshot_path: None,
+        })
+        .await
+        .expect("install first colliding skill");
+
+    let err = kernel
+        .install_skill(SkillInstallRequest {
+            source: "local/collision-two".to_string(),
+            alias: "collision-two".to_string(),
+            reference: Some("main".to_string()),
+            hash: Some("0123456789ab2222".to_string()),
+            skill_md: Some("---\nname: collision\ndescription: two\n---\n".to_string()),
+            snapshot_path: None,
+        })
+        .await
+        .expect_err("distinct colliding skills should be rejected");
+
+    match err {
+        KernelError::Conflict(message) => assert!(
+            message.contains("derived skill id"),
+            "unexpected conflict: {message}"
+        ),
+        other => panic!("expected conflict, got {other:?}"),
+    }
+
+    let listed = kernel.list_skills().await.expect("list skills");
+    assert_eq!(listed.skills.len(), 1);
+    assert_eq!(listed.skills[0].skill_id, first.skill_id);
+    assert_eq!(listed.skills[0].alias, "collision-one");
+}
+
 struct TestEnv {
     temp_dir: TempDir,
 }
