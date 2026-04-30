@@ -287,6 +287,8 @@ reuses a daemon when that daemon belongs to the same `LIONCLAW_HOME`, current
 project, and compatible daemon config, including runtime, preset, and workspace
 settings. If installed skills or channel config changed since that daemon
 started, `channel attach` reconciles and restarts it before attaching.
+`lionclaw service status` marks that case as `restart required` and keeps stale
+managed channel units visible until the daemon is reconciled or stopped.
 
 To run multiple local terminal channels at once, register multiple interactive
 channels and attach each one in its own terminal:

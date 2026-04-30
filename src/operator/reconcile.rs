@@ -336,6 +336,12 @@ pub async fn status<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Resu
     }
 
     let mut channels = Vec::new();
+    let configured_channel_ids = state
+        .applied_state
+        .channels()
+        .iter()
+        .map(|channel| channel.id.clone())
+        .collect::<BTreeSet<_>>();
     for channel in state.applied_state.channels() {
         let health = kernel
             .get_channel_health(&channel.id)
@@ -356,6 +362,27 @@ pub async fn status<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Resu
             blocked_peers: health.blocked_peer_count,
             latest_inbound_at: health.latest_inbound_at.map(|value| value.to_rfc3339()),
             latest_outbound_at: health.latest_outbound_at.map(|value| value.to_rfc3339()),
+        });
+    }
+    for unit_name in managed_unit_names(home)? {
+        let Some(channel_id) = managed_channel_unit_id(&unit_name) else {
+            continue;
+        };
+        if configured_channel_ids.contains(channel_id) {
+            continue;
+        }
+        let mut unit_status = manager.unit_status(&unit_name).await?;
+        unit_status.push_str(" (stale)");
+        channels.push(ChannelStatus {
+            id: channel_id.to_string(),
+            skill: "-".to_string(),
+            launch_mode: ChannelLaunchMode::Service.as_str().to_string(),
+            unit_status,
+            pending_peers: 0,
+            approved_peers: 0,
+            blocked_peers: 0,
+            latest_inbound_at: None,
+            latest_outbound_at: None,
         });
     }
 
@@ -826,6 +853,12 @@ fn managed_unit_names(home: &LionClawHome) -> Result<Vec<String>> {
         units.insert(0, DAEMON_UNIT_NAME.to_string());
     }
     Ok(units)
+}
+
+fn managed_channel_unit_id(unit_name: &str) -> Option<&str> {
+    unit_name
+        .strip_prefix("lionclaw-channel-")?
+        .strip_suffix(".service")
 }
 
 pub(crate) async fn open_kernel(
@@ -1965,5 +1998,90 @@ mod tests {
             stack.daemon_status,
             "loaded/active/running (restart required)"
         );
+    }
+
+    #[tokio::test]
+    async fn status_surfaces_stale_service_channel_units() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
+        let runtime_stub = temp_dir.path().join("codex-stub.sh");
+        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
+        make_executable(&runtime_stub);
+        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
+            .into_iter()
+            .collect();
+        config
+            .set_default_runtime("codex")
+            .expect("set default runtime");
+        config.save(&home).await.expect("save config");
+
+        tokio::fs::create_dir_all(home.services_systemd_dir())
+            .await
+            .expect("create services dir");
+        tokio::fs::write(
+            home.services_systemd_dir()
+                .join("lionclaw-channel-telegram.service"),
+            "[Unit]\nDescription=stale\n",
+        )
+        .await
+        .expect("write stale unit");
+
+        let manager = FakeServiceManager::default();
+        manager
+            .set_unit_status(DAEMON_UNIT_NAME, "loaded/active/running")
+            .expect("set daemon status");
+        manager
+            .set_unit_status("lionclaw-channel-telegram.service", "loaded/active/running")
+            .expect("set stale channel status");
+
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let bind_addr = config.daemon.bind.clone();
+        let home_root = home.root().display().to_string();
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    let home_id = home_id.clone();
+                    let home_root = home_root.clone();
+                    let project_scope = current_project_scope();
+                    move || async move {
+                        Json(DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: home_id.clone(),
+                            home_root: home_root.clone(),
+                            bind_addr: bind_addr.clone(),
+                            project_scope: project_scope.clone(),
+                            daemon_fingerprint: "daemon-stale-state".to_string(),
+                        })
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let stack = status(&home, &manager).await.expect("status");
+
+        assert_eq!(
+            stack.daemon_status,
+            "loaded/active/running (restart required)"
+        );
+        assert_eq!(stack.channels.len(), 1);
+        let channel = &stack.channels[0];
+        assert_eq!(channel.id, "telegram");
+        assert_eq!(channel.skill, "-");
+        assert_eq!(channel.launch_mode, "service");
+        assert_eq!(channel.unit_status, "loaded/active/running (stale)");
+        assert_eq!(channel.pending_peers, 0);
+        assert_eq!(channel.approved_peers, 0);
+        assert_eq!(channel.blocked_peers, 0);
+        assert!(channel.latest_inbound_at.is_none());
+        assert!(channel.latest_outbound_at.is_none());
     }
 }

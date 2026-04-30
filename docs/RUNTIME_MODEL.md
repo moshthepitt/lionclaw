@@ -323,7 +323,8 @@ channel snapshot at startup, so skill or channel changes take effect after the
 daemon is restarted or reconciled through `lionclaw service up` or
 `lionclaw channel attach`. `lionclaw service status` marks the daemon as
 `restart required` when the current filesystem/config state no longer matches
-that running snapshot.
+that running snapshot, and it keeps stale managed channel units visible until
+the daemon is reconciled or stopped.
 
 Raw HTTP is for workers, tests, and debugging. It is not the normal operator
 experience.
