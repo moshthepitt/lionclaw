@@ -133,6 +133,8 @@ async fn running_kernel_keeps_skill_and_policy_until_restart() {
 
     assert!(env.remove_skill("snapshot-skill").await);
 
+    let restarted_kernel = env.kernel().await;
+
     let turn_before_restart = kernel
         .turn_session(SessionTurnRequest {
             session_id: opened.session_id,
@@ -154,7 +156,6 @@ async fn running_kernel_keeps_skill_and_policy_until_restart() {
             .is_some_and(|text| text.contains("capability:req-1:granted"))
     }));
 
-    let restarted_kernel = env.kernel().await;
     let turn_after_restart = restarted_kernel
         .turn_session(SessionTurnRequest {
             session_id: opened.session_id,

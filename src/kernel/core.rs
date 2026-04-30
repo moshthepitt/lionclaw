@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
     str::FromStr,
@@ -333,8 +333,6 @@ impl Kernel {
 
     async fn bootstrap(&self) {
         register_builtin_runtime_adapters(&self.runtime).await;
-        self.reconcile_policy_grants_to_applied_state_best_effort()
-            .await;
         if let Some(layout) = &self.continuity {
             if let Err(err) = layout.ensure_base_layout().await {
                 warn!(
@@ -384,25 +382,6 @@ impl Kernel {
         }
         if let Err(err) = self.refresh_active_continuity().await {
             warn!(?err, "failed to refresh active continuity during bootstrap");
-        }
-    }
-
-    async fn reconcile_policy_grants_to_applied_state_best_effort(&self) {
-        let installed_skill_ids = self
-            .applied_state
-            .skills()
-            .iter()
-            .map(|skill| skill.skill_id.clone())
-            .collect::<BTreeSet<_>>();
-        if let Err(err) = self
-            .policy
-            .revoke_uninstalled_skills(&installed_skill_ids)
-            .await
-        {
-            warn!(
-                ?err,
-                "failed to reconcile policy grants against applied skills during bootstrap"
-            );
         }
     }
 
