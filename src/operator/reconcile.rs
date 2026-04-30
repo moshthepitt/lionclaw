@@ -102,6 +102,7 @@ pub async fn add_skill(
 
 pub async fn remove_skill(home: &LionClawHome, alias: &str) -> Result<bool> {
     validate_skill_alias(alias)?;
+    home.ensure_base_dirs().await?;
     let config = OperatorConfig::load(home).await?;
     if let Some(channel) = config
         .channels
@@ -156,6 +157,7 @@ pub async fn add_channel(
     required_env: Vec<String>,
 ) -> Result<()> {
     validate_skill_alias(&skill)?;
+    home.ensure_base_dirs().await?;
     resolve_installed_skill_worker_entrypoint(home, &skill).await?;
     let mut config = OperatorConfig::load(home).await?;
     config.upsert_channel(ManagedChannelConfig {
@@ -168,6 +170,7 @@ pub async fn add_channel(
 }
 
 pub async fn remove_channel(home: &LionClawHome, id: &str) -> Result<bool> {
+    home.ensure_base_dirs().await?;
     let mut config = OperatorConfig::load(home).await?;
     let removed = config.remove_channel(id);
     config.save(home).await?;
@@ -630,8 +633,17 @@ fn resolve_installed_skill_dir(home: &LionClawHome, alias: &str) -> Result<PathB
     validate_skill_alias(alias)?;
     let skills_root = canonical_skills_root(home)?;
     let snapshot_root = skills_root.join(alias);
-    let metadata = fs::symlink_metadata(&snapshot_root)
-        .with_context(|| format!("failed to stat installed skill {}", snapshot_root.display()))?;
+    let metadata = match fs::symlink_metadata(&snapshot_root) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!("installed skill alias '{alias}' not found"));
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to stat installed skill {}", snapshot_root.display())
+            });
+        }
+    };
     if metadata.file_type().is_symlink() {
         return Err(anyhow!(
             "installed skill '{}' must not be a symlink",
@@ -1110,6 +1122,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remove_skill_returns_false_before_onboard() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+
+        assert!(!super::remove_skill(&home, "missing-skill")
+            .await
+            .expect("remove missing skill"));
+    }
+
+    #[tokio::test]
     async fn remove_skill_rejects_channel_bound_alias() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
@@ -1165,6 +1187,25 @@ mod tests {
         .await
         .expect_err("workerless skill should fail");
         assert!(err.to_string().contains("expected 'scripts/worker'"));
+    }
+
+    #[tokio::test]
+    async fn add_channel_reports_missing_installed_alias_before_onboard() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+
+        let err = add_channel(
+            &home,
+            "missing".to_string(),
+            "missing".to_string(),
+            ChannelLaunchMode::Service,
+            Vec::new(),
+        )
+        .await
+        .expect_err("missing alias should fail");
+        assert!(err
+            .to_string()
+            .contains("installed skill alias 'missing' not found"));
     }
 
     #[tokio::test]

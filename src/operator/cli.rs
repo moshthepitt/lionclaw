@@ -495,7 +495,8 @@ pub async fn run() -> Result<()> {
                     .alias
                     .unwrap_or_else(|| derive_skill_alias(&args.source));
                 add_skill(&home, alias.clone(), args.source, args.reference).await?;
-                println!("registered skill {alias}");
+                println!("installed skill {alias}");
+                print_runtime_state_change_note();
             }
             SkillCommand::Rm(args) => {
                 let removed = remove_skill(&home, &args.alias).await?;
@@ -504,6 +505,7 @@ pub async fn run() -> Result<()> {
                     if removed { "removed" } else { "left unchanged" },
                     args.alias
                 );
+                print_runtime_state_change_note();
             }
             SkillCommand::WorkerPath(args) => {
                 let worker = resolve_installed_skill_worker_entrypoint(&home, &args.alias).await?;
@@ -524,11 +526,12 @@ pub async fn run() -> Result<()> {
                 )
                 .await?;
                 println!(
-                    "registered channel {} -> {} ({})",
+                    "configured channel {} -> {} ({})",
                     args.id,
                     skill,
                     launch_mode.as_str()
                 );
+                print_runtime_state_change_note();
             }
             ChannelCommand::Rm(args) => {
                 let removed = remove_channel(&home, &args.id).await?;
@@ -537,6 +540,7 @@ pub async fn run() -> Result<()> {
                     if removed { "removed" } else { "left unchanged" },
                     args.id
                 );
+                print_runtime_state_change_note();
             }
             ChannelCommand::Attach(args) => {
                 let manager = SystemdUserServiceManager;
@@ -905,6 +909,12 @@ pub async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_runtime_state_change_note() {
+    println!(
+        "direct runs pick this up on the next launch; rerun 'lionclaw service up' or 'lionclaw channel attach' if a managed daemon is already running"
+    );
 }
 
 fn parse_onboard_bind(raw: &str) -> Result<OnboardBindSelection> {

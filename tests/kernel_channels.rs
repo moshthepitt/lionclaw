@@ -35,7 +35,9 @@ async fn add_channel_requires_installed_alias() {
     )
     .await
     .expect_err("missing alias should fail");
-    assert!(err.to_string().contains("failed to stat installed skill"));
+    assert!(err
+        .to_string()
+        .contains("installed skill alias 'missing-skill' not found"));
 }
 
 #[tokio::test]
