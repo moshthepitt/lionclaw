@@ -5,10 +5,11 @@ use common::{write_skill_source, TestHome};
 use lionclaw::{
     contracts::{
         ChannelInboundOutcome, ChannelInboundRequest, ChannelPeerApproveRequest,
-        ChannelStreamAckRequest, ChannelStreamEventView, ChannelStreamPullRequest,
-        ChannelStreamStartMode, SessionActionKind, SessionActionRequest, SessionHistoryPolicy,
-        SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest, SessionTurnKind,
-        SessionTurnRequest, SessionTurnStatus, StreamEventKindDto, StreamLaneDto, TrustTier,
+        ChannelPeerBlockRequest, ChannelStreamAckRequest, ChannelStreamEventView,
+        ChannelStreamPullRequest, ChannelStreamStartMode, SessionActionKind, SessionActionRequest,
+        SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest,
+        SessionTurnKind, SessionTurnRequest, SessionTurnStatus, StreamEventKindDto, StreamLaneDto,
+        TrustTier,
     },
     kernel::{
         runtime::{
@@ -20,7 +21,7 @@ use lionclaw::{
     },
     operator::{config::ChannelLaunchMode, reconcile::add_channel},
 };
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, Instant};
 
 #[tokio::test]
 async fn add_channel_requires_installed_alias() {
@@ -255,6 +256,109 @@ async fn channel_stream_pull_and_ack_round_trip() {
 }
 
 #[tokio::test]
+async fn channel_stream_tail_starts_from_current_head() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "channel-tail-skill").await;
+    let kernel = env.kernel().await;
+
+    let pending = kernel
+        .process_inbound_channel_text(InboundChannelText {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-tail".to_string(),
+            text: "hello before tail connect".to_string(),
+            session_id: None,
+            runtime_id: Some("mock".to_string()),
+            update_id: Some(5001),
+            external_message_id: Some("tail-5001".to_string()),
+        })
+        .await
+        .expect("process inbound");
+    assert_eq!(pending.outcome, ChannelInboundOutcome::PairingPending);
+
+    let initial = kernel
+        .pull_channel_stream(ChannelStreamPullRequest {
+            channel_id: "terminal".to_string(),
+            consumer_id: "terminal-worker".to_string(),
+            start_mode: Some(ChannelStreamStartMode::Tail),
+            start_after_sequence: None,
+            limit: Some(10),
+            wait_ms: Some(0),
+        })
+        .await
+        .expect("tail pull");
+    assert!(initial.events.is_empty());
+}
+
+#[tokio::test]
+async fn channel_stream_rejects_tail_with_explicit_start_sequence() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "tail-sequence-skill").await;
+    let kernel = env.kernel().await;
+
+    let err = kernel
+        .pull_channel_stream(ChannelStreamPullRequest {
+            channel_id: "terminal".to_string(),
+            consumer_id: "terminal-worker".to_string(),
+            start_mode: Some(ChannelStreamStartMode::Tail),
+            start_after_sequence: Some(12),
+            limit: Some(10),
+            wait_ms: Some(0),
+        })
+        .await
+        .expect_err("tail and start_after_sequence should be rejected");
+
+    assert!(
+        matches!(err, KernelError::BadRequest(message) if message.contains("start_after_sequence"))
+    );
+}
+
+#[tokio::test]
+async fn channel_stream_long_poll_wakes_for_new_events() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "telegram", "channel-wait-skill").await;
+    let kernel = env.kernel().await;
+
+    let delayed_inbound = async {
+        sleep(Duration::from_millis(50)).await;
+        let pending = kernel
+            .process_inbound_channel_text(InboundChannelText {
+                channel_id: "telegram".to_string(),
+                peer_id: "peer-wait".to_string(),
+                text: "hello after long poll".to_string(),
+                session_id: None,
+                runtime_id: Some("mock".to_string()),
+                update_id: Some(6001),
+                external_message_id: Some("wait-6001".to_string()),
+            })
+            .await
+            .expect("delayed inbound");
+        assert_eq!(pending.outcome, ChannelInboundOutcome::PairingPending);
+    };
+
+    let (stream, _) = tokio::join!(
+        kernel.pull_channel_stream(ChannelStreamPullRequest {
+            channel_id: "telegram".to_string(),
+            consumer_id: "telegram-worker".to_string(),
+            start_mode: Some(ChannelStreamStartMode::Resume),
+            start_after_sequence: None,
+            limit: Some(10),
+            wait_ms: Some(1_000),
+        }),
+        delayed_inbound
+    );
+    let stream = stream.expect("long-poll stream");
+
+    assert!(stream.events.iter().any(|event| {
+        event.kind == StreamEventKindDto::MessageDelta
+            && event.lane == Some(StreamLaneDto::Answer)
+            && event
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("Pairing required"))
+    }));
+}
+
+#[tokio::test]
 async fn channel_backed_session_open_requires_approved_peer() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "terminal", "open-skill").await;
@@ -406,6 +510,170 @@ async fn latest_session_snapshot_is_project_scoped() {
         .await
         .expect("open project-b session");
     assert_ne!(session_a.session_id, session_b.session_id);
+}
+
+#[tokio::test]
+async fn latest_session_snapshot_uses_stream_head_before_first_answer_checkpoint() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "resume-head-skill").await;
+    let kernel = env.kernel().await;
+    kernel
+        .register_runtime_adapter(
+            "slow-answer",
+            std::sync::Arc::new(SlowAnswerAdapter {
+                answer: "later".to_string(),
+                delay: Duration::from_millis(400),
+            }),
+        )
+        .await;
+
+    create_pending_peer(
+        &kernel,
+        "terminal",
+        "peer-resume-head",
+        "slow-answer",
+        7251,
+        "resume-head-7251",
+    )
+    .await;
+    approve_peer(&kernel, "terminal", "peer-resume-head").await;
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-resume-head".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open interactive channel session");
+
+    kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-resume-head".to_string(),
+            text: "resume before answer".to_string(),
+            session_id: Some(session.session_id),
+            update_id: Some(7252),
+            external_message_id: Some("resume-head-7252".to_string()),
+            runtime_id: Some("slow-answer".to_string()),
+        })
+        .await
+        .expect("queue running turn");
+
+    let resume_after_sequence =
+        wait_for_running_snapshot_without_answer(&kernel, "terminal", "peer-resume-head").await;
+
+    let resumed = kernel
+        .pull_channel_stream(ChannelStreamPullRequest {
+            channel_id: "terminal".to_string(),
+            consumer_id: "terminal-resume-head".to_string(),
+            start_mode: None,
+            start_after_sequence: Some(resume_after_sequence),
+            limit: Some(20),
+            wait_ms: Some(1_000),
+        })
+        .await
+        .expect("resume stream");
+    let answer_text = resumed
+        .events
+        .iter()
+        .filter(|event| {
+            event.kind == StreamEventKindDto::MessageDelta
+                && event.lane == Some(StreamLaneDto::Answer)
+        })
+        .filter_map(|event| event.text.as_deref())
+        .collect::<String>();
+    assert_eq!(answer_text, "later");
+}
+
+#[tokio::test]
+async fn channel_session_actions_return_immediately_and_respect_peer_blocking() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "action-skill").await;
+    let kernel = env.kernel().await;
+    kernel
+        .register_runtime_adapter(
+            "slow-answer",
+            std::sync::Arc::new(SlowAnswerAdapter {
+                answer: "completed".to_string(),
+                delay: Duration::from_millis(500),
+            }),
+        )
+        .await;
+
+    create_pending_peer(
+        &kernel,
+        "terminal",
+        "peer-action",
+        "slow-answer",
+        7301,
+        "action-7301",
+    )
+    .await;
+    approve_peer(&kernel, "terminal", "peer-action").await;
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-action".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open interactive action session");
+
+    let first = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "seed action".to_string(),
+            runtime_id: Some("slow-answer".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("seed turn");
+    assert_eq!(first.assistant_text, "completed");
+
+    let started_at = Instant::now();
+    let retry = kernel
+        .session_action(SessionActionRequest {
+            session_id: session.session_id,
+            action: SessionActionKind::RetryLastTurn,
+        })
+        .await
+        .expect("retry session action");
+    assert!(started_at.elapsed() < Duration::from_millis(250));
+    assert_eq!(retry.session_id, session.session_id);
+    assert!(retry.turn_id.is_some());
+
+    wait_for_latest_turn(
+        &kernel,
+        session.session_id,
+        |turn| {
+            turn.kind == SessionTurnKind::Retry
+                && turn.status == SessionTurnStatus::Completed
+                && turn.assistant_text == "completed"
+        },
+        "completed retry turn",
+    )
+    .await;
+
+    kernel
+        .block_channel_peer(ChannelPeerBlockRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-action".to_string(),
+        })
+        .await
+        .expect("block peer");
+
+    let err = kernel
+        .session_action(SessionActionRequest {
+            session_id: session.session_id,
+            action: SessionActionKind::RetryLastTurn,
+        })
+        .await
+        .expect_err("blocked peer should reject action");
+    assert!(matches!(err, KernelError::Conflict(message) if message.contains("blocked")));
 }
 
 #[tokio::test]
@@ -686,6 +954,33 @@ where
     panic!("timed out waiting for {label}");
 }
 
+async fn wait_for_running_snapshot_without_answer(
+    kernel: &Kernel,
+    channel_id: &str,
+    peer_id: &str,
+) -> i64 {
+    for _ in 0..60 {
+        let snapshot = kernel
+            .latest_session_snapshot(SessionLatestQuery {
+                channel_id: channel_id.to_string(),
+                peer_id: peer_id.to_string(),
+                history_policy: Some(SessionHistoryPolicy::Interactive),
+            })
+            .await
+            .expect("latest session snapshot");
+        let no_answer_yet = snapshot.turns.last().is_some_and(|turn| {
+            turn.status == SessionTurnStatus::Running && turn.assistant_text.is_empty()
+        });
+        if no_answer_yet {
+            if let Some(sequence) = snapshot.resume_after_sequence {
+                return sequence;
+            }
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for running snapshot without assistant checkpoint");
+}
+
 struct PartialFailureAdapter {
     partial: String,
     message: String,
@@ -812,6 +1107,134 @@ impl RuntimeAdapter for FailingSessionStartAdapter {
     }
 }
 
+struct ErrorThenCloseFailAdapter {
+    error_code: String,
+    error_text: String,
+    close_text: String,
+}
+
+#[async_trait]
+impl RuntimeAdapter for ErrorThenCloseFailAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "error-close-fail".to_string(),
+            version: "test".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle, anyhow::Error> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("error-close-fail:{}", input.session_id),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        event_tx: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult, anyhow::Error> {
+        event_tx
+            .send(RuntimeEvent::Error {
+                code: Some(self.error_code.clone()),
+                text: self.error_text.clone(),
+            })
+            .expect("send runtime error");
+        Ok(RuntimeTurnResult {
+            capability_requests: Vec::new(),
+        })
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        _event_tx: RuntimeEventSender,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn cancel(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<(), anyhow::Error> {
+        Err(anyhow::anyhow!(self.close_text.clone()))
+    }
+}
+
+struct SlowAnswerAdapter {
+    answer: String,
+    delay: Duration,
+}
+
+#[async_trait]
+impl RuntimeAdapter for SlowAnswerAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "slow-answer".to_string(),
+            version: "test".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle, anyhow::Error> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("slow-answer:{}", input.session_id),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        event_tx: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult, anyhow::Error> {
+        sleep(self.delay).await;
+        event_tx
+            .send(RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: self.answer.clone(),
+            })
+            .expect("send answer");
+        Ok(RuntimeTurnResult {
+            capability_requests: Vec::new(),
+        })
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        _event_tx: RuntimeEventSender,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn cancel(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn channel_session_start_failure_streams_error_before_done() {
     let env = TestHome::new().await;
@@ -895,4 +1318,99 @@ async fn channel_session_start_failure_streams_error_before_done() {
         error_event.text.as_deref(),
         Some("runtime failed before turn")
     );
+}
+
+#[tokio::test]
+async fn channel_close_failure_does_not_override_streamed_runtime_error() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "close-failure-skill").await;
+    let kernel = env.kernel().await;
+    kernel
+        .register_runtime_adapter(
+            "error-close-fail",
+            std::sync::Arc::new(ErrorThenCloseFailAdapter {
+                error_code: "runtime.error".to_string(),
+                error_text: "runtime emitted error".to_string(),
+                close_text: "runtime close failed".to_string(),
+            }),
+        )
+        .await;
+
+    create_pending_peer(
+        &kernel,
+        "terminal",
+        "peer-close-failure",
+        "error-close-fail",
+        7401,
+        "close-failure-7401",
+    )
+    .await;
+    approve_peer(&kernel, "terminal", "peer-close-failure").await;
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-close-failure".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open interactive channel session");
+
+    let err = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "close failure".to_string(),
+            runtime_id: Some("error-close-fail".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect_err("close failure should fail turn");
+    assert!(
+        matches!(err, KernelError::Runtime(message) if message.contains("runtime emitted error"))
+    );
+
+    let history = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: session.session_id,
+            limit: Some(12),
+        })
+        .await
+        .expect("session history");
+    let failed_turn = history.turns.last().expect("failed turn");
+    assert_eq!(failed_turn.status, SessionTurnStatus::Failed);
+    assert_eq!(failed_turn.error_code.as_deref(), Some("runtime.error"));
+    assert_eq!(
+        failed_turn.error_text.as_deref(),
+        Some("runtime emitted error")
+    );
+
+    let stream = kernel
+        .pull_channel_stream(ChannelStreamPullRequest {
+            channel_id: "terminal".to_string(),
+            consumer_id: "terminal-close-failure".to_string(),
+            start_mode: Some(ChannelStreamStartMode::Resume),
+            start_after_sequence: None,
+            limit: Some(50),
+            wait_ms: Some(0),
+        })
+        .await
+        .expect("pull close failure stream");
+    let error_count = stream
+        .events
+        .iter()
+        .filter(|event| {
+            event.turn_id == Some(failed_turn.turn_id) && event.kind == StreamEventKindDto::Error
+        })
+        .count();
+    assert_eq!(
+        error_count, 1,
+        "stream should contain exactly one canonical error"
+    );
+    let (error_position, _) =
+        assert_error_before_done(&stream.events, failed_turn.turn_id, "close failure");
+    let error_event = &stream.events[error_position];
+    assert_eq!(error_event.code.as_deref(), Some("runtime.error"));
+    assert_eq!(error_event.text.as_deref(), Some("runtime emitted error"));
 }

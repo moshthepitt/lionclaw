@@ -4672,7 +4672,22 @@ impl Kernel {
             (Ok(events), Err(close_err)) => {
                 self.clear_runtime_session_ready(&execution_plan).await;
                 let assistant_text = assistant_text_from_events(&events);
-                let stream_error_emitted = runtime_events_include_error(&events);
+                if let Some((error_code, error_text)) = last_runtime_error(&events) {
+                    let status = session_turn_status_for_error_code(&error_code);
+                    self.persist_failed_session_turn(
+                        session,
+                        &persisted_turn,
+                        FailedSessionTurnCompletion {
+                            assistant_text,
+                            error_code,
+                            error_text: error_text.clone(),
+                            stream_error_emitted: true,
+                        },
+                        channel_stream_finalizer,
+                    )
+                    .await?;
+                    return Err(kernel_error_for_turn_status(status, error_text));
+                }
                 self.persist_failed_session_turn(
                     session,
                     &persisted_turn,
@@ -4680,7 +4695,7 @@ impl Kernel {
                         assistant_text,
                         error_code: "runtime.error".to_string(),
                         error_text: close_err.to_string(),
-                        stream_error_emitted,
+                        stream_error_emitted: false,
                     },
                     channel_stream_finalizer,
                 )
