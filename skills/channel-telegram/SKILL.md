@@ -34,7 +34,7 @@ Under the hood, the worker:
 
 ```bash
 lionclaw skill add skills/channel-telegram --alias telegram
-lionclaw channel add telegram
+lionclaw channel add telegram --required-env TELEGRAM_BOT_TOKEN
 ```
 
 2. Start LionClaw for background channels:

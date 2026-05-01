@@ -86,10 +86,9 @@ LionClaw uses `~/.lionclaw` as canonical state:
 
 - `~/.lionclaw/db/lionclaw.db`
 - `~/.lionclaw/config/lionclaw.toml`
-- `~/.lionclaw/config/lionclaw.lock`
 - `~/.lionclaw/config/runtime-secrets.env`
 - `~/.lionclaw/workspaces/<workspace-id>/`
-- `~/.lionclaw/skills/<skill-id>@<hash>/`
+- `~/.lionclaw/skills/<alias>/`
 - `~/.lionclaw/runtime/`
 - `~/.lionclaw/logs/`
 - `~/.lionclaw/services/`
@@ -144,9 +143,8 @@ Per turn, LionClaw composes a runtime-neutral prompt envelope from:
 
 1. kernel safety and product identity sections,
 2. assistant-home identity and hot continuity files,
-3. selected skill context from installed `SKILL.md` snapshots,
-4. current user, channel, or scheduler input,
-5. transcript history or a continuation note depending on runtime state.
+3. current user, channel, or scheduler input,
+4. transcript history or a continuation note depending on runtime state.
 
 The runtime receives the assembled envelope. It does not own LionClaw persona,
 assistant home, policy, or continuity.
@@ -226,11 +224,11 @@ The everyday confined layout is mount-first:
 - `/workspace`: the current project or task root
 - `/runtime`: runtime-private writable state
 - `/drafts`: runtime-private draft/output area
-- `/lionclaw/skills/<alias>`: selected skill snapshot assets mounted read-only
+- `/lionclaw/skills/<alias>`: installed non-channel skill snapshot assets mounted read-only
 
 The planner injects stable runtime-private environment defaults such as
 `HOME=/runtime/home`, `LIONCLAW_DRAFTS_DIR=/drafts`, and
-`LIONCLAW_SKILLS_DIR=/lionclaw/skills` when selected skills have mounted
+`LIONCLAW_SKILLS_DIR=/lionclaw/skills` when runtime-visible skills have mounted
 assets, so engine-specific caches and config stay out of assistant continuity.
 
 ## Runtime State And Continuation
@@ -309,10 +307,24 @@ Operator-facing paths:
 - `lionclaw service status`
 - `lionclaw service logs`
 
+`lionclaw skill add` copies a skill into `~/.lionclaw/skills/<alias>`.
+`lionclaw skill rm` deletes that installed alias from disk. `lionclaw channel
+add --skill <alias>` makes that alias host-only; every other installed alias
+is runtime-visible by default.
+
 Background operation is explicit. If you want long-running channels,
 auto-restart, or channel attach to start the daemon for you, LionClaw uses the
 platform service manager for that job. The current managed-service
 implementation uses systemd user services.
+
+Direct `lionclaw run` reads the current installed skill and channel state each
+time it launches a runtime. Managed daemons bake an immutable applied skill and
+channel snapshot at startup, so skill or channel changes take effect after the
+daemon is restarted or reconciled through `lionclaw service up` or
+`lionclaw channel attach`. `lionclaw service status` marks the daemon as
+`restart required` when the current filesystem/config state no longer matches
+that running snapshot, and it keeps stale managed channel units visible until
+the daemon is reconciled or stopped.
 
 Raw HTTP is for workers, tests, and debugging. It is not the normal operator
 experience.

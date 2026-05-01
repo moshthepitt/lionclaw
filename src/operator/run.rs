@@ -17,7 +17,9 @@ use crate::{
     home::{runtime_project_partition_key, LionClawHome},
     kernel::Kernel,
     operator::{
-        reconcile::{apply, onboard, open_runtime_kernel_with_timeouts, render_runtime_cache},
+        reconcile::{
+            load_operator_state, onboard, open_runtime_kernel_with_timeouts, render_runtime_cache,
+        },
         runtime::{resolve_runtime_id, validate_runtime_launch_prerequisites},
     },
     runtime_timeouts::RuntimeTurnTimeouts,
@@ -72,16 +74,15 @@ pub(crate) async fn run_local_with_io_and_timeouts<R: BufRead + Send, W: Write +
     output: &mut W,
 ) -> Result<()> {
     onboard(home, None).await?;
-    let config = crate::operator::config::OperatorConfig::load(home).await?;
-    let runtime_id = resolve_runtime_id(&config, requested_runtime.as_deref())?;
-    validate_runtime_launch_prerequisites(home, &config, &runtime_id).await?;
-    let applied = apply(home).await?;
-    render_runtime_cache(home, &applied.config, &applied.lockfile, &runtime_id).await?;
+    let state = load_operator_state(home).await?;
+    let runtime_id = resolve_runtime_id(&state.config, requested_runtime.as_deref())?;
+    validate_runtime_launch_prerequisites(home, &state.config, &runtime_id).await?;
+    render_runtime_cache(home, &state.config, &runtime_id).await?;
 
     let effective_timeouts = timeout_override.unwrap_or_else(RuntimeTurnTimeouts::interactive);
     let kernel = open_runtime_kernel_with_timeouts(
         home,
-        &applied.config,
+        &state.config,
         Some(runtime_id.clone()),
         Some(effective_timeouts),
     )
@@ -543,10 +544,7 @@ mod tests {
             runtime::{ConfinementConfig, OciConfinementConfig},
             Kernel, KernelOptions,
         },
-        operator::{
-            config::{ManagedSkillConfig, OperatorConfig, RuntimeProfileConfig},
-            lockfile::OperatorLockfile,
-        },
+        operator::config::{OperatorConfig, RuntimeProfileConfig},
         runtime_timeouts::RuntimeTurnTimeouts,
     };
 
@@ -580,7 +578,6 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         assert!(output.contains("lionclaw> hello from repl"));
         assert!(output.contains("hello from repl"));
         assert!(home.workspace_dir("main").join("SOUL.md").exists());
-        assert!(home.lock_path().exists());
 
         let pool = Db::connect_file(&home.db_path())
             .await
@@ -990,19 +987,6 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
 
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
-        let skill_source = temp_dir.path().join("test-skill");
-        fs::create_dir_all(&skill_source).expect("skill dir");
-        fs::write(
-            skill_source.join("SKILL.md"),
-            "---\nname: test-skill\ndescription: test\n---\n",
-        )
-        .expect("skill md");
-        config.skills.push(ManagedSkillConfig {
-            alias: "test-skill".to_string(),
-            source: skill_source.display().to_string(),
-            reference: "local".to_string(),
-            enabled: true,
-        });
         config.save(&home).await.expect("save config");
 
         let mut input = Cursor::new(Vec::<u8>::new());
@@ -1013,11 +997,6 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
 
         assert!(err.to_string().contains("codex login"));
         assert!(err.to_string().contains("auth.json"));
-        let lockfile = OperatorLockfile::load(&home).await.expect("load lockfile");
-        assert!(
-            lockfile.skills.is_empty(),
-            "auth preflight should fail before apply() installs skill snapshots"
-        );
     }
 
     #[cfg(unix)]

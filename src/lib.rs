@@ -32,6 +32,7 @@
 )]
 
 pub mod api;
+pub mod applied;
 pub mod config;
 pub mod contracts;
 pub mod daemon;

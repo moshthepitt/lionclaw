@@ -11,11 +11,13 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use lionclaw::{
+    applied::AppliedState,
     contracts::{
-        ChannelBindRequest, ChannelPeerApproveRequest, ContinuityPathRequest,
-        ContinuitySearchRequest, JobCreateRequest, PolicyGrantRequest, SessionHistoryPolicy,
-        SessionOpenRequest, SessionTurnRequest, SkillInstallRequest, TrustTier,
+        ChannelPeerApproveRequest, ContinuityPathRequest, ContinuitySearchRequest,
+        JobCreateRequest, PolicyGrantRequest, SessionHistoryPolicy, SessionOpenRequest,
+        SessionTurnRequest, TrustTier,
     },
+    home::LionClawHome,
     kernel::{
         policy::Capability,
         runtime::{
@@ -24,6 +26,10 @@ use lionclaw::{
             RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
         },
         InboundChannelText, Kernel, KernelOptions,
+    },
+    operator::{
+        config::ChannelLaunchMode,
+        reconcile::{add_channel, add_skill, onboard},
     },
     workspace::bootstrap_workspace,
 };
@@ -122,16 +128,14 @@ async fn prompt_loads_assistant_continuity_and_fs_read_uses_project_root() {
     .await
     .expect("write project active");
 
-    let kernel = Kernel::new_with_options(
-        &env.db_path(),
-        KernelOptions {
+    install_skill(&env, "root-split-reader").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
             project_workspace_root: Some(env.project_root()),
             ..KernelOptions::default()
-        },
-    )
-    .await
-    .expect("kernel init");
+        })
+        .await;
 
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let capability_results = Arc::new(Mutex::new(Vec::new()));
@@ -149,10 +153,9 @@ async fn prompt_loads_assistant_continuity_and_fs_read_uses_project_root() {
         )
         .await;
 
-    let skill_id = install_enabled_skill(&kernel, "root-split-reader").await;
     kernel
         .grant_policy(PolicyGrantRequest {
-            skill_id: skill_id.clone(),
+            skill_alias: "root-split-reader".to_string(),
             capability: "fs.read".to_string(),
             scope: "*".to_string(),
             ttl_seconds: None,
@@ -200,16 +203,14 @@ async fn prompt_loading_rejects_symlinked_identity_files() {
     std::fs::remove_file(env.workspace_root().join("SOUL.md")).expect("remove soul file");
     symlink(&outside, env.workspace_root().join("SOUL.md")).expect("symlink soul file");
 
-    let kernel = Kernel::new_with_options(
-        &env.db_path(),
-        KernelOptions {
+    install_and_bind_channel(&env, "terminal").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
             project_workspace_root: Some(env.project_root()),
             ..KernelOptions::default()
-        },
-    )
-    .await
-    .expect("kernel init");
+        })
+        .await;
 
     let prompts = Arc::new(Mutex::new(Vec::new()));
     kernel
@@ -249,21 +250,18 @@ async fn pairing_and_failed_turn_update_active_and_daily_continuity() {
     bootstrap_workspace(&env.workspace_root())
         .await
         .expect("bootstrap workspace");
-    let kernel = Kernel::new_with_options(
-        &env.db_path(),
-        KernelOptions {
+    install_and_bind_channel(&env, "terminal").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
             project_workspace_root: Some(env.project_root()),
             ..KernelOptions::default()
-        },
-    )
-    .await
-    .expect("kernel init");
+        })
+        .await;
 
     kernel
         .register_runtime_adapter("boom", Arc::new(FailingRuntimeAdapter))
         .await;
-    install_and_bind_channel(&kernel, "terminal").await;
 
     kernel
         .process_inbound_channel_text(InboundChannelText {
@@ -312,18 +310,15 @@ async fn scheduler_success_records_artifact_and_updates_active_in_home_workspace
         .await
         .expect("create project root");
 
-    let kernel = Kernel::new_with_options(
-        &env.db_path(),
-        KernelOptions {
+    install_skill(&env, "scheduler-brief").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
             project_workspace_root: Some(env.project_root()),
             ..KernelOptions::default()
-        },
-    )
-    .await
-    .expect("kernel init");
+        })
+        .await;
 
-    let skill_id = install_enabled_skill(&kernel, "scheduler-brief").await;
     let created = kernel
         .create_job(JobCreateRequest {
             name: "daily brief".to_string(),
@@ -332,7 +327,6 @@ async fn scheduler_success_records_artifact_and_updates_active_in_home_workspace
                 run_at: Utc::now() - ChronoDuration::minutes(1),
             },
             prompt_text: "review the current workspace".to_string(),
-            skill_ids: vec![skill_id],
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -413,21 +407,18 @@ async fn active_continuity_global_slices_are_bounded_to_recent_items() {
     bootstrap_workspace(&env.workspace_root())
         .await
         .expect("bootstrap workspace");
-    let kernel = Kernel::new_with_options(
-        &env.db_path(),
-        KernelOptions {
+    install_and_bind_channel(&env, "terminal").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
             project_workspace_root: Some(env.project_root()),
             ..KernelOptions::default()
-        },
-    )
-    .await
-    .expect("kernel init");
+        })
+        .await;
 
     kernel
         .register_runtime_adapter("boom", Arc::new(FailingRuntimeAdapter))
         .await;
-    install_and_bind_channel(&kernel, "terminal").await;
 
     let session = open_local_session(&kernel, "bounded-active-peer").await;
     for index in 0..7 {
@@ -470,7 +461,6 @@ async fn active_continuity_global_slices_are_bounded_to_recent_items() {
                     run_at: Utc::now() + ChronoDuration::minutes(5 + i64::from(index)),
                 },
                 prompt_text: "attention job".to_string(),
-                skill_ids: Vec::new(),
                 allow_capabilities: Vec::new(),
                 delivery: None,
                 retry_attempts: Some(0),
@@ -513,7 +503,6 @@ async fn active_continuity_global_slices_are_bounded_to_recent_items() {
                 run_at: Utc::now() + ChronoDuration::minutes(30),
             },
             prompt_text: "refresh active continuity".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -574,7 +563,6 @@ async fn create_job_rolls_back_when_audit_append_fails() {
                 run_at: Utc::now() + ChronoDuration::minutes(5),
             },
             prompt_text: "job should not persist".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -593,17 +581,14 @@ async fn approve_channel_peer_rolls_back_when_audit_append_fails() {
     bootstrap_workspace(&env.workspace_root())
         .await
         .expect("bootstrap workspace");
-    let kernel = Kernel::new_with_options(
-        &env.db_path(),
-        KernelOptions {
+    install_and_bind_channel(&env, "terminal").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
             project_workspace_root: Some(env.project_root()),
             ..KernelOptions::default()
-        },
-    )
-    .await
-    .expect("kernel init");
-    install_and_bind_channel(&kernel, "terminal").await;
+        })
+        .await;
 
     let pairing_code = seed_pending_peer(&kernel, "terminal", "alice").await;
 
@@ -663,7 +648,6 @@ async fn pause_job_rolls_back_when_audit_append_fails() {
                 run_at: Utc::now() + ChronoDuration::minutes(5),
             },
             prompt_text: "job should stay enabled".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -720,7 +704,6 @@ async fn create_job_succeeds_when_active_continuity_refresh_fails() {
                 run_at: Utc::now() + ChronoDuration::minutes(5),
             },
             prompt_text: "refresh failure should not fail create".to_string(),
-            skill_ids: Vec::new(),
             allow_capabilities: Vec::new(),
             delivery: None,
             retry_attempts: Some(0),
@@ -744,17 +727,14 @@ async fn approve_channel_peer_succeeds_when_active_continuity_refresh_fails() {
     bootstrap_workspace(&env.workspace_root())
         .await
         .expect("bootstrap workspace");
-    let kernel = Kernel::new_with_options(
-        &env.db_path(),
-        KernelOptions {
+    install_and_bind_channel(&env, "terminal").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
             project_workspace_root: Some(env.project_root()),
             ..KernelOptions::default()
-        },
-    )
-    .await
-    .expect("kernel init");
-    install_and_bind_channel(&kernel, "terminal").await;
+        })
+        .await;
 
     let pairing_code = seed_pending_peer(&kernel, "terminal", "alice").await;
     break_active_continuity_refresh(&env);
@@ -780,17 +760,14 @@ async fn pairing_pending_continuity_succeeds_when_active_refresh_fails() {
     bootstrap_workspace(&env.workspace_root())
         .await
         .expect("bootstrap workspace");
-    let kernel = Kernel::new_with_options(
-        &env.db_path(),
-        KernelOptions {
+    install_and_bind_channel(&env, "terminal").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
             project_workspace_root: Some(env.project_root()),
             ..KernelOptions::default()
-        },
-    )
-    .await
-    .expect("kernel init");
-    install_and_bind_channel(&kernel, "terminal").await;
+        })
+        .await;
 
     break_active_continuity_refresh(&env);
 
@@ -2009,47 +1986,69 @@ async fn continuity_lists_reject_symlinked_continuity_roots() {
     );
 }
 
-async fn install_enabled_skill(kernel: &Kernel, name: &str) -> String {
-    let skill = kernel
-        .install_skill(SkillInstallRequest {
-            source: format!("local/{name}"),
-            alias: name.to_string(),
-            reference: Some("main".to_string()),
-            hash: Some(format!("{name}-hash")),
-            skill_md: Some(format!(
-                "---\nname: {name}\ndescription: Handles {name}\n---"
-            )),
-            snapshot_path: None,
-        })
+async fn install_skill(env: &TestEnv, name: &str) -> String {
+    onboard(&env.home, None).await.expect("onboard");
+    let skill_source = env.temp_dir.path().join("skill-sources").join(name);
+    std::fs::create_dir_all(&skill_source).expect("skill source dir");
+    std::fs::write(
+        skill_source.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: Handles {name}\n---\n"),
+    )
+    .expect("skill md");
+    add_skill(
+        &env.home,
+        name.to_string(),
+        skill_source.display().to_string(),
+        "local".to_string(),
+    )
+    .await
+    .expect("install skill");
+
+    AppliedState::load(&env.home)
         .await
-        .expect("install skill");
-    kernel
-        .enable_skill(skill.skill_id.clone())
-        .await
-        .expect("enable skill");
-    kernel
-        .grant_policy(PolicyGrantRequest {
-            skill_id: skill.skill_id.clone(),
-            capability: "skill.use".to_string(),
-            scope: "*".to_string(),
-            ttl_seconds: None,
-        })
-        .await
-        .expect("grant skill.use");
-    skill.skill_id
+        .expect("load applied state")
+        .skill_by_alias(name)
+        .expect("installed skill")
+        .skill_id
+        .clone()
 }
 
-async fn install_and_bind_channel(kernel: &Kernel, channel_id: &str) {
-    let skill_id = install_enabled_skill(kernel, &format!("channel-{channel_id}")).await;
-    kernel
-        .bind_channel(ChannelBindRequest {
-            channel_id: channel_id.to_string(),
-            skill_id,
-            enabled: None,
-            config: None,
-        })
-        .await
-        .expect("bind channel");
+async fn install_and_bind_channel(env: &TestEnv, channel_id: &str) {
+    let skill_alias = format!("channel-{channel_id}");
+    onboard(&env.home, None).await.expect("onboard");
+    let skill_source = env.temp_dir.path().join("skill-sources").join(&skill_alias);
+    let worker = skill_source.join("scripts/worker");
+    std::fs::create_dir_all(worker.parent().expect("worker parent")).expect("scripts dir");
+    std::fs::write(
+        skill_source.join("SKILL.md"),
+        format!("---\nname: {skill_alias}\ndescription: Handles {skill_alias}\n---\n"),
+    )
+    .expect("skill md");
+    std::fs::write(&worker, "#!/usr/bin/env bash\n").expect("worker");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod worker");
+    }
+    add_skill(
+        &env.home,
+        skill_alias.clone(),
+        skill_source.display().to_string(),
+        "local".to_string(),
+    )
+    .await
+    .expect("install skill");
+    add_channel(
+        &env.home,
+        channel_id.to_string(),
+        skill_alias,
+        ChannelLaunchMode::Service,
+        Vec::new(),
+    )
+    .await
+    .expect("bind channel");
 }
 
 async fn open_local_session(
@@ -2096,13 +2095,14 @@ fn read_all_markdown(root: PathBuf) -> String {
 
 struct TestEnv {
     temp_dir: TempDir,
+    home: LionClawHome,
 }
 
 impl TestEnv {
     fn new() -> Self {
-        Self {
-            temp_dir: tempfile::tempdir().expect("create temp dir"),
-        }
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        Self { temp_dir, home }
     }
 
     fn db_path(&self) -> PathBuf {
@@ -2119,6 +2119,16 @@ impl TestEnv {
 
     fn project_root(&self) -> PathBuf {
         self.temp_dir.path().join("project-root")
+    }
+
+    async fn kernel_with_options(&self, mut options: KernelOptions) -> Kernel {
+        onboard(&self.home, None).await.expect("onboard");
+        options.applied_state = AppliedState::load(&self.home)
+            .await
+            .expect("load applied state");
+        Kernel::new_with_options(&self.db_path(), options)
+            .await
+            .expect("kernel init")
     }
 }
 
@@ -2228,7 +2238,7 @@ impl RuntimeAdapter for CapturePromptAdapter {
             .push(current_prompt.clone());
 
         if self.allow_hidden_compaction
-            && input.selected_skills.is_empty()
+            && input.runtime_skill_ids.is_empty()
             && current_prompt.contains("lionclaw_compaction_handoff_v1")
         {
             let first_user = extract_compaction_user(&current_prompt, false);
@@ -2276,10 +2286,10 @@ impl RuntimeAdapter for CapturePromptAdapter {
 
         if self.request_fs_read {
             let skill_id = input
-                .selected_skills
+                .runtime_skill_ids
                 .first()
                 .cloned()
-                .ok_or_else(|| anyhow!("selected skill required"))?;
+                .ok_or_else(|| anyhow!("runtime skill required"))?;
             return Ok(RuntimeTurnResult {
                 capability_requests: vec![RuntimeCapabilityRequest {
                     request_id: "req-1".to_string(),
@@ -2359,7 +2369,7 @@ impl RuntimeAdapter for HangingHiddenCompactionAdapter {
         input: RuntimeTurnInput,
         events: RuntimeEventSender,
     ) -> Result<RuntimeTurnResult> {
-        if input.selected_skills.is_empty()
+        if input.runtime_skill_ids.is_empty()
             && input.prompt.contains("lionclaw_compaction_handoff_v1")
         {
             std::future::pending::<()>().await;

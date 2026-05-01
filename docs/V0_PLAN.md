@@ -13,7 +13,7 @@ It:
 1. runs selected agent CLIs through `lionclaw run [runtime]`,
 2. compiles and enforces runtime execution plans,
 3. keeps durable LionClaw sessions and turn history,
-4. projects assistant identity, continuity, and selected skill context into the runtime,
+4. projects assistant identity and continuity into the runtime while mounting installed non-channel skills for runtime use,
 5. supports Codex and OpenCode as program-backed runtimes,
 6. treats channels as external skill workers,
 7. runs time-based jobs in isolated scheduler sessions,
@@ -86,7 +86,7 @@ Implemented v0 security model:
 
 - Unix-only trusted filesystem assumptions.
 - Runtime launches go through the shared execution planner.
-- Confined runtimes see `/workspace`, `/runtime`, `/drafts`, and selected read-only skill assets.
+- Confined runtimes see `/workspace`, `/runtime`, `/drafts`, and read-only mounts for all installed non-channel skills.
 - Runtime network mode is coarse: `on` or `none`.
 - Runtime-visible secrets are mounted only when the selected preset allows it.
 - The runtime secret file is hardened to owner-only permissions on Unix.

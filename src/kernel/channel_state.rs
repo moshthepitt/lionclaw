@@ -2,7 +2,6 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use serde_json::Value;
 use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
@@ -44,10 +43,8 @@ impl FromStr for ChannelPeerStatus {
 #[derive(Debug, Clone)]
 pub struct ChannelBindingRecord {
     pub channel_id: String,
-    pub skill_id: String,
-    pub enabled: bool,
-    pub config: Value,
-    pub updated_at: DateTime<Utc>,
+    pub skill_alias: String,
+    pub launch_mode: String,
 }
 
 #[derive(Debug, Clone)]
@@ -260,87 +257,6 @@ impl ChannelStateStore {
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
-    }
-
-    pub async fn upsert_binding(
-        &self,
-        channel_id: &str,
-        skill_id: &str,
-        enabled: bool,
-        config: Value,
-    ) -> Result<ChannelBindingRecord> {
-        let config_json =
-            serde_json::to_string(&config).context("failed to encode channel binding config")?;
-        let now = now_ms();
-
-        sqlx::query(
-            "INSERT INTO channel_bindings (channel_id, skill_id, enabled, config_json, updated_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5) \
-             ON CONFLICT(channel_id) DO UPDATE SET \
-                 skill_id = excluded.skill_id, \
-                 enabled = excluded.enabled, \
-                 config_json = excluded.config_json, \
-                 updated_at_ms = excluded.updated_at_ms",
-        )
-        .bind(channel_id)
-        .bind(skill_id)
-        .bind(if enabled { 1 } else { 0 })
-        .bind(config_json)
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .context("failed to upsert channel binding")?;
-
-        self.get_binding(channel_id)
-            .await?
-            .ok_or_else(|| anyhow!("channel binding disappeared after upsert"))
-    }
-
-    pub async fn get_binding(&self, channel_id: &str) -> Result<Option<ChannelBindingRecord>> {
-        let row = sqlx::query(
-            "SELECT channel_id, skill_id, enabled, config_json, updated_at_ms \
-             FROM channel_bindings WHERE channel_id = ?1",
-        )
-        .bind(channel_id)
-        .fetch_optional(&self.pool)
-        .await
-        .context("failed to query channel binding")?;
-
-        row.map(map_binding_row).transpose()
-    }
-
-    pub async fn set_binding_enabled(
-        &self,
-        channel_id: &str,
-        enabled: bool,
-    ) -> Result<Option<ChannelBindingRecord>> {
-        let result = sqlx::query(
-            "UPDATE channel_bindings SET enabled = ?1, updated_at_ms = ?2 WHERE channel_id = ?3",
-        )
-        .bind(if enabled { 1 } else { 0 })
-        .bind(now_ms())
-        .bind(channel_id)
-        .execute(&self.pool)
-        .await
-        .context("failed to update channel binding enabled state")?;
-
-        if result.rows_affected() == 0 {
-            return Ok(None);
-        }
-
-        self.get_binding(channel_id).await
-    }
-
-    pub async fn list_bindings(&self) -> Result<Vec<ChannelBindingRecord>> {
-        let rows = sqlx::query(
-            "SELECT channel_id, skill_id, enabled, config_json, updated_at_ms \
-             FROM channel_bindings ORDER BY updated_at_ms DESC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("failed to list channel bindings")?;
-
-        rows.into_iter().map(map_binding_row).collect()
     }
 
     pub async fn get_peer(
@@ -1062,23 +978,6 @@ impl ChannelStateStore {
             latest_outbound_at,
         })
     }
-}
-
-fn map_binding_row(row: SqliteRow) -> Result<ChannelBindingRecord> {
-    let updated_at_ms: i64 = row.get("updated_at_ms");
-    let updated_at = ms_to_datetime(updated_at_ms)
-        .ok_or_else(|| anyhow!("invalid updated_at_ms '{updated_at_ms}'"))?;
-    let config_json: String = row.get("config_json");
-    let config = serde_json::from_str(&config_json)
-        .with_context(|| format!("invalid config_json '{config_json}'"))?;
-
-    Ok(ChannelBindingRecord {
-        channel_id: row.get("channel_id"),
-        skill_id: row.get("skill_id"),
-        enabled: row.get::<i64, _>("enabled") != 0,
-        config,
-        updated_at,
-    })
 }
 
 fn map_peer_row(row: SqliteRow) -> Result<ChannelPeerRecord> {

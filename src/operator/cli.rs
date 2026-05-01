@@ -22,9 +22,8 @@ use crate::{
             derive_skill_alias, normalize_podman_executable, normalize_runtime_command,
             ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig,
         },
-        lockfile::OperatorLockfile,
         reconcile::{
-            add_channel, add_skill, apply, down, logs, onboard, open_kernel, open_runtime_kernel,
+            add_channel, add_skill, down, logs, onboard, open_kernel, open_runtime_kernel,
             pairing_approve, pairing_block, pairing_list, remove_channel, remove_skill,
             resolve_installed_skill_worker_entrypoint, resolve_stack_binaries, status, up,
             OnboardBindSelection,
@@ -50,7 +49,6 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Onboard(OnboardArgs),
-    Apply,
     Run(RunArgs),
     Runtime {
         #[command(subcommand)]
@@ -337,8 +335,6 @@ struct JobAddArgs {
     prompt_file: Option<String>,
     #[arg(long)]
     runtime: Option<String>,
-    #[arg(long = "skill")]
-    skills: Vec<String>,
     #[arg(long = "allow")]
     allow_capabilities: Vec<String>,
     #[arg(long = "deliver-channel")]
@@ -386,14 +382,6 @@ pub async fn run() -> Result<()> {
                 home.root().display(),
                 config.daemon.workspace,
                 config.daemon.bind
-            );
-        }
-        Command::Apply => {
-            let applied = apply(&home).await?;
-            println!(
-                "applied {} skills and {} channels",
-                applied.lockfile.skills.len(),
-                applied.lockfile.channels.len()
             );
         }
         Command::Run(args) => {
@@ -467,9 +455,7 @@ pub async fn run() -> Result<()> {
                         .config
                         .channels
                         .iter()
-                        .filter(|channel| {
-                            channel.enabled && channel.launch_mode == ChannelLaunchMode::Service
-                        })
+                        .filter(|channel| channel.launch_mode == ChannelLaunchMode::Service)
                         .count();
                     println!(
                         "started LionClaw services with runtime {runtime_id} ({managed_channels} channels)"
@@ -484,11 +470,10 @@ pub async fn run() -> Result<()> {
                     println!("daemon: {}", stack.daemon_status);
                     for channel in stack.channels {
                         println!(
-                            "channel={} skill={} launch={} binding={} unit={} peers(pending={},approved={},blocked={}) inbound={} outbound={}",
+                            "channel={} skill={} launch={} unit={} peers(pending={},approved={},blocked={}) inbound={} outbound={}",
                             channel.id,
                             channel.skill,
                             channel.launch_mode,
-                            channel.binding_enabled,
                             channel.unit_status,
                             channel.pending_peers,
                             channel.approved_peers,
@@ -510,7 +495,8 @@ pub async fn run() -> Result<()> {
                     .alias
                     .unwrap_or_else(|| derive_skill_alias(&args.source));
                 add_skill(&home, alias.clone(), args.source, args.reference).await?;
-                println!("registered skill {alias}");
+                println!("installed skill {alias}");
+                print_runtime_state_change_note();
             }
             SkillCommand::Rm(args) => {
                 let removed = remove_skill(&home, &args.alias).await?;
@@ -519,6 +505,9 @@ pub async fn run() -> Result<()> {
                     if removed { "removed" } else { "left unchanged" },
                     args.alias
                 );
+                if removed {
+                    print_runtime_state_change_note();
+                }
             }
             SkillCommand::WorkerPath(args) => {
                 let worker = resolve_installed_skill_worker_entrypoint(&home, &args.alias).await?;
@@ -539,11 +528,12 @@ pub async fn run() -> Result<()> {
                 )
                 .await?;
                 println!(
-                    "registered channel {} -> {} ({})",
+                    "configured channel {} -> {} ({})",
                     args.id,
                     skill,
                     launch_mode.as_str()
                 );
+                print_runtime_state_change_note();
             }
             ChannelCommand::Rm(args) => {
                 let removed = remove_channel(&home, &args.id).await?;
@@ -552,6 +542,9 @@ pub async fn run() -> Result<()> {
                     if removed { "removed" } else { "left unchanged" },
                     args.id
                 );
+                if removed {
+                    print_runtime_state_change_note();
+                }
             }
             ChannelCommand::Attach(args) => {
                 let manager = SystemdUserServiceManager;
@@ -595,10 +588,10 @@ pub async fn run() -> Result<()> {
             },
         },
         Command::Continuity { command } => {
-            let applied = apply(&home).await?;
+            let config = OperatorConfig::load(&home).await?;
             match command {
                 ContinuityCommand::Drafts { command } => {
-                    let kernel = open_runtime_kernel(&home, &applied.config, None).await?;
+                    let kernel = open_runtime_kernel(&home, &config, None).await?;
                     match command {
                         ContinuityDraftCommand::Ls(args) => {
                             let response = kernel
@@ -647,7 +640,7 @@ pub async fn run() -> Result<()> {
                     }
                 }
                 other => {
-                    let kernel = open_kernel(&home, &applied.config, None).await?;
+                    let kernel = open_kernel(&home, &config, None).await?;
                     match other {
                         ContinuityCommand::Status => {
                             let status = kernel.continuity_status().await?;
@@ -775,8 +768,7 @@ pub async fn run() -> Result<()> {
                         let args = *args;
                         let runtime_id = resolve_runtime_id(&config, args.runtime.as_deref())?;
                         validate_runtime_launch_prerequisites(&home, &config, &runtime_id).await?;
-                        let applied = apply(&home).await?;
-                        let kernel = open_kernel(&home, &applied.config, None).await?;
+                        let kernel = open_kernel(&home, &config, None).await?;
                         let prompt_text = load_job_prompt(args.prompt, args.prompt_file).await?;
                         let schedule = parse_job_schedule_spec(&args.schedule, args.tz.as_deref())?;
                         let delivery = match (args.deliver_channel, args.deliver_peer) {
@@ -793,14 +785,12 @@ pub async fn run() -> Result<()> {
                                     ));
                             }
                         };
-                        let skill_ids = resolve_job_skill_ids(&applied.lockfile, &args.skills)?;
                         let response = kernel
                             .create_job(JobCreateRequest {
                                 name: args.name,
                                 runtime_id,
                                 schedule,
                                 prompt_text,
-                                skill_ids,
                                 allow_capabilities: args.allow_capabilities,
                                 delivery,
                                 retry_attempts: args.retry_attempts,
@@ -925,6 +915,12 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+fn print_runtime_state_change_note() {
+    println!(
+        "direct runs pick this up on the next launch; rerun 'lionclaw service up' or 'lionclaw channel attach' if a managed daemon is already running"
+    );
+}
+
 fn parse_onboard_bind(raw: &str) -> Result<OnboardBindSelection> {
     let bind = raw.trim();
     if bind.is_empty() {
@@ -960,24 +956,6 @@ async fn load_job_prompt(prompt: Option<String>, prompt_file: Option<String>) ->
         (Some(_), Some(_)) => Err(anyhow!("use either --prompt or --prompt-file, not both")),
         (None, None) => Err(anyhow!("either --prompt or --prompt-file is required")),
     }
-}
-
-fn resolve_job_skill_ids(lockfile: &OperatorLockfile, requested: &[String]) -> Result<Vec<String>> {
-    let mut resolved = Vec::new();
-    for raw in requested {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Err(anyhow!("--skill cannot be empty"));
-        }
-        let skill_id = lockfile
-            .find_skill(trimmed)
-            .map(|skill| skill.skill_id.clone())
-            .unwrap_or_else(|| trimmed.to_string());
-        if !resolved.iter().any(|value| value == &skill_id) {
-            resolved.push(skill_id);
-        }
-    }
-    Ok(resolved)
 }
 
 fn parse_job_id(raw: &str) -> Result<uuid::Uuid> {

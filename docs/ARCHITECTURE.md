@@ -41,13 +41,12 @@ LionClaw splits responsibility into three classes.
 The Rust kernel owns:
 
 - sessions and turn history
-- runtime profiles and execution presets
 - runtime launch plans
-- channel bindings, peer approval, inbound queues, outbound streams
+- channel peer approval, inbound queues, outbound streams
 - scheduler definitions and run records
-- installed skill snapshots
-- assistant-home continuity files and derived search index
 - policy grants and audit events
+- assistant-home continuity files and derived search index
+- the immutable applied runtime view loaded at startup from channel config and filesystem-installed skills
 
 Kernel-owned mutations are policy checked where privileged and audited where
 security or operator visibility matters.
@@ -63,7 +62,7 @@ Instead, LionClaw constrains the runtime launch:
 - project root mounted at `/workspace`
 - runtime-private state mounted at `/runtime`
 - draft/output area mounted at `/drafts`
-- selected skill snapshots mounted read-only at `/lionclaw/skills/<alias>`
+- applied non-channel skill snapshots mounted read-only at `/lionclaw/skills/<alias>`
 - network mode chosen by preset
 - runtime secrets mounted only when preset allows it
 - runtime auth staged into the runtime-private home
@@ -83,15 +82,14 @@ Skill text can influence prompt context. It cannot grant permissions.
 
 - `kernel.sessions`: session lifecycle, history policy, and aggregate turn metadata.
 - `kernel.session_turns`: durable per-turn history, recovery state, and partial assistant output.
-- `kernel.skills`: installed skill registry and enable/disable state.
-- `kernel.selector`: deterministic turn-time skill relevance selection.
+- `kernel.skills`: skill alias validation and installed-skill metadata helpers.
 - `kernel.policy`: capability grant/revoke and allow checks.
 - `kernel.jobs`: scheduled job definitions, run records, and SQLite persistence.
 - `kernel.capability_broker`: explicit brokered capability execution for direct runtimes and narrow kernel surfaces.
 - `kernel.runtime`: runtime adapter contract and registry.
 - `kernel.runtime.execution`: execution presets, plan compilation, OCI backend, and process execution.
 - `kernel.scheduler`: due-job claiming, lease coordination, retry, and dispatch.
-- `kernel.channel_state`: channel bindings, peer trust state, inbound logs, queued turns, outbound stream state, and transcript history.
+- `kernel.channel_state`: channel peer trust state, inbound logs, queued turns, outbound stream state, and transcript history.
 - `kernel.continuity`: assistant-home continuity files, `ACTIVE.md` projection, daily notes, artifacts, open loops, proposals, and retrieval helpers.
 - `kernel.continuity_fs`: descriptor-rooted Unix filesystem helper for assistant-home continuity.
 - `kernel.session_compactions`: persisted transcript compaction summaries and ranges.
@@ -173,7 +171,7 @@ The everyday runtime layout is mount-first:
 - `/workspace`: project/task root with preset-controlled read-only or read-write access
 - `/runtime`: runtime-private writable state root
 - `/drafts`: runtime-private draft/output area
-- `/lionclaw/skills/<alias>`: selected skill snapshot assets mounted read-only
+- `/lionclaw/skills/<alias>`: installed non-channel skill snapshot assets mounted read-only
 
 For local `lionclaw run`, the project root defaults to the current working
 directory and is mounted at `/workspace`. `LIONCLAW_HOME` remains LionClaw's
@@ -181,7 +179,7 @@ state root and is not the project tree.
 
 The planner injects runtime-private environment defaults such as
 `HOME=/runtime/home`, `LIONCLAW_DRAFTS_DIR=/drafts`, and
-`LIONCLAW_SKILLS_DIR=/lionclaw/skills` when selected skills have mounted
+`LIONCLAW_SKILLS_DIR=/lionclaw/skills` when runtime-visible skills have mounted
 assets, so engine-specific caches and config stay out of assistant continuity.
 
 Interactive program-backed turns launch a fresh confined process for each
@@ -241,16 +239,8 @@ with the CLI.
 - `POST /v0/sessions/action`
 - `POST /v0/sessions/turn`
 
-### Skill
-
-- `POST /v0/skills/install`
-- `GET /v0/skills/list`
-- `POST /v0/skills/enable`
-- `POST /v0/skills/disable`
-
 ### Channel
 
-- `POST /v0/channels/bind`
 - `GET /v0/channels/list`
 - `GET /v0/channels/peers`
 - `POST /v0/channels/peers/approve`
@@ -392,10 +382,11 @@ Scheduled runs open fresh synthetic sessions:
 - `peer_id = "job:<job-id>"`
 - `history_policy = conservative`
 
-Scheduled jobs invoke the selected runtime with explicit job context and
-optional attached skill context. Optional delivery sends the final result
-through the existing channel stream/outbox path without changing the latest
-interactive session for that peer.
+Scheduled jobs invoke the selected runtime with explicit job context and the
+daemon's current runtime-visible skill set from applied filesystem state.
+Optional delivery sends the final result through the existing channel
+stream/outbox path without changing the latest interactive session for that
+peer.
 
 Paused jobs are skipped by normal scheduler ticks but can still be run
 manually by the operator.
@@ -409,6 +400,8 @@ manually by the operator.
   with `lionclaw channel attach <id>`. If no compatible daemon is already
   running, the attach path starts the daemon through the same systemd-backed
   manager.
+- If a channel declares `required_env`, both launch paths require those host
+  environment variables and pass them through to the worker.
 
 Worker entrypoint resolution requires `scripts/worker`.
 

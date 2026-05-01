@@ -23,8 +23,6 @@ pub struct OperatorConfig {
     #[serde(default)]
     pub runtimes: BTreeMap<String, RuntimeProfileConfig>,
     #[serde(default)]
-    pub skills: Vec<ManagedSkillConfig>,
-    #[serde(default)]
     pub channels: Vec<ManagedChannelConfig>,
 }
 
@@ -63,22 +61,6 @@ impl OperatorConfig {
             .await
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())
-    }
-
-    pub fn upsert_skill(&mut self, skill: ManagedSkillConfig) {
-        self.skills.retain(|existing| {
-            existing.alias != skill.alias
-                && !(existing.source == skill.source && existing.reference == skill.reference)
-        });
-        self.skills.push(skill);
-        self.normalize();
-    }
-
-    pub fn remove_skill(&mut self, alias: &str) -> bool {
-        let before = self.skills.len();
-        self.skills.retain(|skill| skill.alias != alias);
-        self.normalize();
-        before != self.skills.len()
     }
 
     pub fn upsert_channel(&mut self, channel: ManagedChannelConfig) {
@@ -220,7 +202,6 @@ impl OperatorConfig {
                 Some((id, runtime))
             })
             .collect();
-        self.skills.sort_by_key(|skill| skill.alias.clone());
         self.channels.sort_by_key(|channel| channel.id.clone());
         for channel in &mut self.channels {
             channel.required_env.sort();
@@ -298,21 +279,9 @@ impl Default for DaemonConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManagedSkillConfig {
-    pub alias: String,
-    pub source: String,
-    #[serde(default = "default_reference")]
-    pub reference: String,
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagedChannelConfig {
     pub id: String,
     pub skill: String,
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
     #[serde(default)]
     pub launch_mode: ChannelLaunchMode,
     #[serde(default)]
@@ -356,14 +325,6 @@ pub fn default_bind() -> String {
 
 pub fn default_workspace() -> String {
     DEFAULT_WORKSPACE.to_string()
-}
-
-fn default_reference() -> String {
-    "local".to_string()
-}
-
-fn default_enabled() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -722,7 +683,6 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let config = OperatorConfig::load(&home).await.expect("load");
-        assert!(config.skills.is_empty());
         assert!(config.channels.is_empty());
         assert!(config.runtimes.is_empty());
         assert!(config.presets.is_empty());
@@ -736,7 +696,6 @@ mod tests {
         config.upsert_channel(ManagedChannelConfig {
             id: "terminal".to_string(),
             skill: "terminal".to_string(),
-            enabled: true,
             launch_mode: ChannelLaunchMode::default(),
             required_env: Vec::new(),
         });
@@ -755,7 +714,6 @@ mod tests {
         config.upsert_channel(ManagedChannelConfig {
             id: "terminal".to_string(),
             skill: "terminal".to_string(),
-            enabled: true,
             launch_mode: ChannelLaunchMode::Interactive,
             required_env: Vec::new(),
         });

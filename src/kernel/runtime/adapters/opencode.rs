@@ -438,7 +438,7 @@ mod tests {
                 session_id: Uuid::new_v4(),
                 working_dir: None,
                 environment: Vec::new(),
-                selected_skills: Vec::new(),
+                runtime_skill_ids: Vec::new(),
                 runtime_state_root: None,
             })
             .await
@@ -448,7 +448,7 @@ mod tests {
             .build_turn_program(&RuntimeTurnInput {
                 runtime_session_id: handle.runtime_session_id,
                 prompt: "hello".to_string(),
-                selected_skills: Vec::new(),
+                runtime_skill_ids: Vec::new(),
             })
             .expect("program");
 

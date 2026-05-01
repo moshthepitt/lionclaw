@@ -1,15 +1,15 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+mod common;
+
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
+use common::{write_skill_source, TestHome};
 use lionclaw::{
     contracts::{
-        ChannelBindRequest, ChannelPeerApproveRequest, JobCreateRequest, PolicyGrantRequest,
-        SessionOpenRequest, SessionTurnRequest, SkillInstallRequest, StreamEventKindDto, TrustTier,
+        JobCreateRequest, PolicyGrantRequest, SessionOpenRequest, SessionTurnRequest,
+        StreamEventKindDto, TrustTier,
     },
     kernel::{
         policy::Capability,
@@ -22,15 +22,21 @@ use lionclaw::{
     },
 };
 use serde_json::{json, Value};
-use tempfile::TempDir;
 use uuid::Uuid;
 
 #[tokio::test]
 async fn fs_read_capability_executes_through_kernel_broker() {
-    let env = TestEnv::new();
-    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
-    let read_target = env.read_target();
-    env.write_read_target(&read_target, "lionclaw broker fs read test content");
+    let env = TestHome::new().await;
+    let skill_source = write_skill_source(
+        env.temp_dir(),
+        "broker-fs-read",
+        "Capability broker file read skill",
+        false,
+    );
+    env.install_skill("broker-fs-read", &skill_source).await;
+    let kernel = env.kernel().await;
+    let read_target = env.home().workspace_dir("main").join("read-target.txt");
+    std::fs::write(&read_target, "lionclaw broker fs read test content").expect("write target");
 
     kernel
         .register_runtime_adapter(
@@ -42,14 +48,10 @@ async fn fs_read_capability_executes_through_kernel_broker() {
         )
         .await;
 
-    let (session_id, skill_id) = prepare_session_with_skill(
-        &kernel,
-        "peer-cap-broker-fs",
-        "broker-fs-read",
-        "Capability broker file read skill",
-    )
-    .await;
-    grant_capability(&kernel, &skill_id, "fs.read").await;
+    let (session_id, skill_id) =
+        prepare_session_with_skill(env.home(), &kernel, "peer-cap-broker-fs", "broker-fs-read")
+            .await;
+    grant_capability(&kernel, "broker-fs-read", "fs.read").await;
 
     let response = kernel
         .turn_session(SessionTurnRequest {
@@ -63,26 +65,21 @@ async fn fs_read_capability_executes_through_kernel_broker() {
         .await
         .expect("turn should succeed");
 
-    assert!(
-        response.stream_events.iter().any(|event| {
-            event.kind == StreamEventKindDto::Status
-                && event
-                    .text
-                    .as_deref()
-                    .is_some_and(|text| text.contains("capability:req-1:granted"))
-        }),
-        "capability should be granted after broker execution"
-    );
-    assert!(
-        response.stream_events.iter().any(|event| {
-            event.kind == StreamEventKindDto::Status
-                && event
-                    .text
-                    .as_deref()
-                    .is_some_and(|text| text.contains("lionclaw broker fs read test content"))
-        }),
-        "runtime should receive fs.read output content"
-    );
+    assert!(response.runtime_skill_ids.contains(&skill_id));
+    assert!(response.stream_events.iter().any(|event| {
+        event.kind == StreamEventKindDto::Status
+            && event
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("capability:req-1:granted"))
+    }));
+    assert!(response.stream_events.iter().any(|event| {
+        event.kind == StreamEventKindDto::Status
+            && event
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("lionclaw broker fs read test content"))
+    }));
 
     let details = latest_capability_result(&kernel, session_id).await;
     assert_eq!(details["allowed"].as_bool(), Some(true));
@@ -94,8 +91,16 @@ async fn fs_read_capability_executes_through_kernel_broker() {
 
 #[tokio::test]
 async fn invalid_capability_payload_is_denied_by_broker() {
-    let env = TestEnv::new();
-    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let env = TestHome::new().await;
+    let skill_source = write_skill_source(
+        env.temp_dir(),
+        "broker-invalid-payload",
+        "Capability broker invalid payload skill",
+        false,
+    );
+    env.install_skill("broker-invalid-payload", &skill_source)
+        .await;
+    let kernel = env.kernel().await;
     kernel
         .register_runtime_adapter(
             "single-capability",
@@ -107,13 +112,13 @@ async fn invalid_capability_payload_is_denied_by_broker() {
         .await;
 
     let (session_id, skill_id) = prepare_session_with_skill(
+        env.home(),
         &kernel,
         "peer-cap-broker-invalid",
         "broker-invalid-payload",
-        "Capability broker invalid payload skill",
     )
     .await;
-    grant_capability(&kernel, &skill_id, "fs.read").await;
+    grant_capability(&kernel, "broker-invalid-payload", "fs.read").await;
 
     let response = kernel
         .turn_session(SessionTurnRequest {
@@ -127,47 +132,46 @@ async fn invalid_capability_payload_is_denied_by_broker() {
         .await
         .expect("turn should complete with denied capability result");
 
-    assert!(
-        response.stream_events.iter().any(|event| {
-            event.kind == StreamEventKindDto::Status
-                && event
-                    .text
-                    .as_deref()
-                    .is_some_and(|text| text.contains("capability:req-1:denied"))
-        }),
-        "invalid payload should be denied"
-    );
-    assert!(
-        response.stream_events.iter().any(|event| {
-            event.kind == StreamEventKindDto::Status
-                && event
-                    .text
-                    .as_deref()
-                    .is_some_and(|text| text.contains("broker execution failed"))
-        }),
-        "denied event should include broker failure reason"
-    );
+    assert!(response.runtime_skill_ids.contains(&skill_id));
+    assert!(response.stream_events.iter().any(|event| {
+        event.kind == StreamEventKindDto::Status
+            && event
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("capability:req-1:denied"))
+    }));
+    assert!(response.stream_events.iter().any(|event| {
+        event.kind == StreamEventKindDto::Status
+            && event
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("broker execution failed"))
+    }));
 
     let details = latest_capability_result(&kernel, session_id).await;
     assert_eq!(details["allowed"].as_bool(), Some(false));
-    assert!(
-        details["reason"]
-            .as_str()
-            .expect("reason present")
-            .contains("broker execution failed"),
-        "audit should capture broker deny reason"
-    );
+    assert!(details["reason"]
+        .as_str()
+        .expect("reason present")
+        .contains("broker execution failed"));
 }
 
 #[tokio::test]
 async fn runtime_cannot_override_kernel_selected_scope() {
-    let env = TestEnv::new();
-    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
-    let (session_id, skill_id) = prepare_session_with_skill(
+    let env = TestHome::new().await;
+    let skill_source = write_skill_source(
+        env.temp_dir(),
+        "broker-scope-guard",
+        "Capability broker scope guard skill",
+        false,
+    );
+    env.install_skill("broker-scope-guard", &skill_source).await;
+    let kernel = env.kernel().await;
+    let (session_id, _skill_id) = prepare_session_with_skill(
+        env.home(),
         &kernel,
         "peer-cap-broker-scope",
         "broker-scope-guard",
-        "Capability broker scope guard skill",
     )
     .await;
     let created = kernel
@@ -178,7 +182,6 @@ async fn runtime_cannot_override_kernel_selected_scope() {
                 run_at: Utc::now() + ChronoDuration::minutes(10),
             },
             prompt_text: "scheduled scope guard".to_string(),
-            skill_ids: vec![skill_id.clone()],
             allow_capabilities: vec!["fs.read".to_string()],
             delivery: None,
             retry_attempts: Some(0),
@@ -209,16 +212,13 @@ async fn runtime_cannot_override_kernel_selected_scope() {
         .await
         .expect("turn should complete with denied capability result");
 
-    assert!(
-        response.stream_events.iter().any(|event| {
-            event.kind == StreamEventKindDto::Status
-                && event
-                    .text
-                    .as_deref()
-                    .is_some_and(|text| text.contains("capability:req-1:denied"))
-        }),
-        "scope override should be denied"
-    );
+    assert!(response.stream_events.iter().any(|event| {
+        event.kind == StreamEventKindDto::Status
+            && event
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("capability:req-1:denied"))
+    }));
 
     let details = latest_capability_result(&kernel, session_id).await;
     assert_eq!(details["allowed"].as_bool(), Some(false));
@@ -230,8 +230,29 @@ async fn runtime_cannot_override_kernel_selected_scope() {
 
 #[tokio::test]
 async fn channel_send_capability_uses_session_channel_defaults() {
-    let env = TestEnv::new();
-    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let env = TestHome::new().await;
+    let runtime_skill = write_skill_source(
+        env.temp_dir(),
+        "broker-channel-send",
+        "Capability broker channel send skill",
+        false,
+    );
+    let channel_skill = write_skill_source(
+        env.temp_dir(),
+        "channel-local-cli",
+        "local channel worker",
+        true,
+    );
+    env.install_skill("broker-channel-send", &runtime_skill)
+        .await;
+    env.install_skill("channel-local-cli", &channel_skill).await;
+    env.add_channel(
+        "local-cli",
+        "channel-local-cli",
+        lionclaw::operator::config::ChannelLaunchMode::Service,
+    )
+    .await;
+    let kernel = env.kernel().await;
     kernel
         .register_runtime_adapter(
             "single-capability",
@@ -243,22 +264,6 @@ async fn channel_send_capability_uses_session_channel_defaults() {
         .await;
 
     let peer_id = "peer-cap-broker-channel";
-    let (session_id, skill_id) = prepare_session_with_skill(
-        &kernel,
-        peer_id,
-        "broker-channel-send",
-        "Capability broker channel send skill",
-    )
-    .await;
-    kernel
-        .bind_channel(ChannelBindRequest {
-            channel_id: "local-cli".to_string(),
-            skill_id: skill_id.clone(),
-            enabled: Some(true),
-            config: None,
-        })
-        .await
-        .expect("bind local-cli channel to skill");
     let _ = kernel
         .process_inbound_channel_text(InboundChannelText {
             channel_id: "local-cli".to_string(),
@@ -282,7 +287,7 @@ async fn channel_send_capability_uses_session_channel_defaults() {
         .and_then(|peer| peer.pairing_code.clone())
         .expect("pending peer pairing code");
     kernel
-        .approve_channel_peer(ChannelPeerApproveRequest {
+        .approve_channel_peer(lionclaw::contracts::ChannelPeerApproveRequest {
             channel_id: "local-cli".to_string(),
             peer_id: peer_id.to_string(),
             pairing_code,
@@ -290,7 +295,9 @@ async fn channel_send_capability_uses_session_channel_defaults() {
         })
         .await
         .expect("approve peer");
-    grant_capability(&kernel, &skill_id, "channel.send").await;
+    let (session_id, _runtime_skill_id) =
+        prepare_session_with_skill(env.home(), &kernel, peer_id, "broker-channel-send").await;
+    grant_capability(&kernel, "broker-channel-send", "channel.send").await;
 
     let response = kernel
         .turn_session(SessionTurnRequest {
@@ -304,40 +311,27 @@ async fn channel_send_capability_uses_session_channel_defaults() {
         .await
         .expect("turn should succeed");
 
-    assert!(
-        response.stream_events.iter().any(|event| {
-            event.kind == StreamEventKindDto::Status
-                && event
-                    .text
-                    .as_deref()
-                    .is_some_and(|text| text.contains("capability:req-1:granted"))
-        }),
-        "channel send should be granted after broker execution"
-    );
+    assert!(response.stream_events.iter().any(|event| {
+        event.kind == StreamEventKindDto::Status
+            && event
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("capability:req-1:granted"))
+    }));
 
     let details = latest_capability_result(&kernel, session_id).await;
     assert_eq!(details["allowed"].as_bool(), Some(true));
     assert_eq!(
         details["output_summary"]["channel_id"].as_str(),
-        Some("local-cli"),
-        "channel broker should default to the session channel"
+        Some("local-cli")
     );
     assert_eq!(
         details["output_summary"]["conversation_ref"].as_str(),
-        Some(peer_id),
-        "channel broker should default to session peer id"
+        Some(peer_id)
     );
-    let message_ids = details["output_summary"]["message_ids"]
+    assert!(details["output_summary"]["message_ids"]
         .as_array()
-        .expect("message ids");
-    assert!(
-        !message_ids.is_empty(),
-        "queued outbound message ids must exist"
-    );
-    assert!(
-        message_ids.iter().all(|entry| entry.as_str().is_some()),
-        "queued message ids should serialize as strings"
-    );
+        .is_some_and(|entries| !entries.is_empty()));
 }
 
 struct SingleCapabilityRuntimeAdapter {
@@ -393,23 +387,18 @@ impl RuntimeAdapter for SingleCapabilityRuntimeAdapter {
             code: None,
             text: "single capability runtime started turn".to_string(),
         });
-        let mut capability_requests = Vec::new();
-
-        if let Some(skill_id) = input.selected_skills.first() {
-            capability_requests.push(RuntimeCapabilityRequest {
+        let capability_requests = input
+            .runtime_skill_ids
+            .first()
+            .map(|skill_id| RuntimeCapabilityRequest {
                 request_id: "req-1".to_string(),
                 skill_id: skill_id.clone(),
                 capability: self.capability,
                 scope: self.scope.clone(),
                 payload: self.payload.clone(),
-            });
-        } else {
-            let _ = events.send(RuntimeEvent::Status {
-                code: None,
-                text: "single capability runtime had no selected skill".to_string(),
-            });
-            let _ = events.send(RuntimeEvent::Done);
-        }
+            })
+            .into_iter()
+            .collect();
 
         Ok(RuntimeTurnResult {
             capability_requests,
@@ -453,10 +442,10 @@ impl RuntimeAdapter for SingleCapabilityRuntimeAdapter {
 }
 
 async fn prepare_session_with_skill(
+    home: &lionclaw::home::LionClawHome,
     kernel: &Kernel,
     peer_id: &str,
-    skill_name: &str,
-    skill_description: &str,
+    skill_alias: &str,
 ) -> (Uuid, String) {
     let session = kernel
         .open_session(SessionOpenRequest {
@@ -467,34 +456,20 @@ async fn prepare_session_with_skill(
         })
         .await
         .expect("open session");
-
-    let skill = kernel
-        .install_skill(SkillInstallRequest {
-            source: format!("local/{skill_name}"),
-            alias: skill_name.to_string(),
-            reference: Some("main".to_string()),
-            hash: Some(format!("{skill_name}-hash")),
-            skill_md: Some(format!(
-                "---\nname: {skill_name}\ndescription: {skill_description}\n---"
-            )),
-            snapshot_path: None,
-        })
+    let skill_id = lionclaw::applied::AppliedState::load(home)
         .await
-        .expect("install skill");
-
-    kernel
-        .enable_skill(skill.skill_id.clone())
-        .await
-        .expect("enable skill");
-    grant_capability(kernel, &skill.skill_id, "skill.use").await;
-
-    (session.session_id, skill.skill_id)
+        .expect("load applied state")
+        .skill_by_alias(skill_alias)
+        .expect("installed skill")
+        .skill_id
+        .clone();
+    (session.session_id, skill_id)
 }
 
-async fn grant_capability(kernel: &Kernel, skill_id: &str, capability: &str) {
+async fn grant_capability(kernel: &Kernel, skill_alias: &str, capability: &str) {
     kernel
         .grant_policy(PolicyGrantRequest {
-            skill_id: skill_id.to_string(),
+            skill_alias: skill_alias.to_string(),
             capability: capability.to_string(),
             scope: "*".to_string(),
             ttl_seconds: None,
@@ -504,7 +479,7 @@ async fn grant_capability(kernel: &Kernel, skill_id: &str, capability: &str) {
 }
 
 async fn latest_capability_result(kernel: &Kernel, session_id: Uuid) -> Value {
-    let audit = kernel
+    kernel
         .query_audit(
             Some(session_id),
             Some("capability.result".to_string()),
@@ -512,42 +487,10 @@ async fn latest_capability_result(kernel: &Kernel, session_id: Uuid) -> Value {
             Some(1),
         )
         .await
-        .expect("query capability results");
-
-    audit
+        .expect("query capability results")
         .events
         .first()
         .expect("capability result event")
         .details
         .clone()
-}
-
-struct TestEnv {
-    temp_dir: TempDir,
-}
-
-impl TestEnv {
-    fn new() -> Self {
-        Self {
-            temp_dir: tempfile::tempdir().expect("create temp dir"),
-        }
-    }
-
-    fn db_path(&self) -> PathBuf {
-        self.temp_dir.path().join("lionclaw.db")
-    }
-
-    fn read_target(&self) -> PathBuf {
-        std::env::current_dir()
-            .expect("current dir")
-            .join("target")
-            .join("lionclaw-capability-tests")
-            .join(format!("{}.txt", Uuid::new_v4()))
-    }
-
-    fn write_read_target(&self, path: &Path, content: &str) {
-        let parent = path.parent().expect("parent");
-        std::fs::create_dir_all(parent).expect("create parent");
-        std::fs::write(path, content).expect("write file");
-    }
 }

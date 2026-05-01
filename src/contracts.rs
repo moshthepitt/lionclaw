@@ -49,7 +49,7 @@ pub struct DaemonInfoResponse {
     pub home_root: String,
     pub bind_addr: String,
     pub project_scope: String,
-    pub config_fingerprint: String,
+    pub daemon_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,63 +294,14 @@ pub struct SessionTurnResponse {
     pub session_id: Uuid,
     pub turn_id: Uuid,
     pub assistant_text: String,
-    pub selected_skills: Vec<String>,
+    pub runtime_skill_ids: Vec<String>,
     pub runtime_id: String,
     pub stream_events: Vec<StreamEventDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillInstallRequest {
-    pub source: String,
-    pub alias: String,
-    pub reference: Option<String>,
-    pub hash: Option<String>,
-    pub skill_md: Option<String>,
-    #[serde(default)]
-    pub snapshot_path: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillInstallResponse {
-    pub skill_id: String,
-    pub alias: String,
-    pub name: String,
-    pub hash: String,
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillView {
-    pub skill_id: String,
-    pub alias: String,
-    pub name: String,
-    pub description: String,
-    pub source: String,
-    pub reference: Option<String>,
-    pub hash: String,
-    pub enabled: bool,
-    pub installed_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillListResponse {
-    pub skills: Vec<SkillView>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillToggleRequest {
-    pub skill_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillToggleResponse {
-    pub skill_id: String,
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyGrantRequest {
-    pub skill_id: String,
+    pub skill_alias: String,
     pub capability: String,
     pub scope: String,
     pub ttl_seconds: Option<i64>,
@@ -359,7 +310,7 @@ pub struct PolicyGrantRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyGrantResponse {
     pub grant_id: Uuid,
-    pub skill_id: String,
+    pub skill_alias: String,
     pub capability: String,
     pub scope: String,
     pub expires_at: Option<DateTime<Utc>>,
@@ -437,8 +388,6 @@ pub struct JobCreateRequest {
     pub schedule: JobScheduleDto,
     pub prompt_text: String,
     #[serde(default)]
-    pub skill_ids: Vec<String>,
-    #[serde(default)]
     pub allow_capabilities: Vec<String>,
     #[serde(default)]
     pub delivery: Option<JobDeliveryTargetDto>,
@@ -466,7 +415,6 @@ pub struct JobView {
     pub runtime_id: String,
     pub schedule: JobScheduleDto,
     pub prompt_text: String,
-    pub skill_ids: Vec<String>,
     #[serde(default)]
     pub delivery: Option<JobDeliveryTargetDto>,
     pub retry_attempts: u32,
@@ -701,27 +649,10 @@ pub struct ContinuityOpenLoopActionResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelBindRequest {
-    pub channel_id: String,
-    pub skill_id: String,
-    #[serde(default)]
-    pub enabled: Option<bool>,
-    #[serde(default)]
-    pub config: Option<Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelBindingView {
     pub channel_id: String,
-    pub skill_id: String,
-    pub enabled: bool,
-    pub config: Value,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelBindResponse {
-    pub binding: ChannelBindingView,
+    pub skill_alias: String,
+    pub launch_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

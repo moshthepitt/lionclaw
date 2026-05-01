@@ -6,7 +6,6 @@ CREATE TABLE IF NOT EXISTS scheduler_jobs (
     schedule_kind TEXT NOT NULL CHECK (schedule_kind IN ('once', 'interval', 'cron')),
     schedule_json TEXT NOT NULL,
     prompt_text TEXT NOT NULL,
-    skill_ids_json TEXT NOT NULL,
     delivery_json TEXT,
     retry_attempts INTEGER NOT NULL DEFAULT 1,
     next_run_at_ms INTEGER,

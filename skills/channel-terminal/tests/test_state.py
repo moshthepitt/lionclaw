@@ -79,7 +79,7 @@ class ChannelViewStateTests(unittest.TestCase):
         self.assertEqual(state.transcript_text(), "")
         self.assertIn("[message] Pairing required.", state.activity_text())
 
-    def test_backlog_stream_event_does_not_overwrite_active_session(self):
+    def test_backlog_stream_event_for_stale_session_is_ignored(self):
         state = ChannelViewState(peer_id="mosh")
         state.active_session_id = "session-current"
 
@@ -89,14 +89,16 @@ class ChannelViewStateTests(unittest.TestCase):
                 peer_id="mosh",
                 session_id="session-stale",
                 turn_id="turn-stale",
-                kind="status",
-                code="queue.completed",
-                text="older turn completed",
+                kind="message_delta",
+                lane="answer",
+                text="older answer",
             )
         )
 
         self.assertEqual(state.active_session_id, "session-current")
-        self.assertIn("[status] queue.completed: older turn completed", state.activity_text())
+        self.assertEqual(state.transcript_text(), "")
+        self.assertEqual(state.activity_text(), "No activity events yet.")
+        self.assertEqual(state.ordered_turns(), [])
 
     def test_blocked_peer_disables_input(self):
         state = ChannelViewState(peer_id="mosh")
