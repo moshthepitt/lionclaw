@@ -279,25 +279,35 @@ fn materialize_applied_snapshot_root(
         copy_install_metadata_file(&skill.snapshot_path, &staged_skill_root)?;
     }
 
-    match fs::rename(&staging_root, &applied_root) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            fs::remove_dir_all(&staging_root)
-                .with_context(|| format!("failed to clean {}", staging_root.display()))?;
-        }
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to move '{}' into '{}'",
-                    staging_root.display(),
-                    applied_root.display()
-                )
-            });
-        }
-    }
+    publish_materialized_snapshot_root(&staging_root, &applied_root, skills)?;
 
     validate_materialized_snapshot_root(&applied_root, skills)?;
     Ok(applied_root)
+}
+
+fn publish_materialized_snapshot_root(
+    staging_root: &Path,
+    applied_root: &Path,
+    skills: &[AppliedSkill],
+) -> Result<()> {
+    match fs::rename(staging_root, applied_root) {
+        Ok(()) => Ok(()),
+        Err(_err)
+            if applied_root.exists()
+                && validate_materialized_snapshot_root(applied_root, skills).is_ok() =>
+        {
+            fs::remove_dir_all(staging_root)
+                .with_context(|| format!("failed to clean {}", staging_root.display()))?;
+            Ok(())
+        }
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed to move '{}' into '{}'",
+                staging_root.display(),
+                applied_root.display()
+            )
+        }),
+    }
 }
 
 fn ensure_applied_snapshot_parent(skills_root: &Path) -> Result<PathBuf> {
@@ -622,7 +632,7 @@ fn read_installed_skill_metadata(snapshot_root: &Path) -> Result<Option<Installe
 mod tests {
     use std::fs;
 
-    use super::AppliedState;
+    use super::{publish_materialized_snapshot_root, AppliedState};
     use crate::{home::LionClawHome, operator::reconcile::onboard};
 
     #[tokio::test]
@@ -798,5 +808,43 @@ mod tests {
                 .contains("no longer matches installed skill alias"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn publish_materialized_snapshot_root_reuses_existing_valid_target() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+
+        let visible = home.skills_dir().join("visible");
+        fs::create_dir_all(&visible).expect("visible dir");
+        fs::write(
+            visible.join("SKILL.md"),
+            "---\nname: visible\ndescription: visible\n---\n",
+        )
+        .expect("visible skill");
+
+        let initial = AppliedState::load(&home).await.expect("load initial state");
+        let applied_skill = initial.skill_by_alias("visible").expect("visible skill");
+        let applied_root = applied_skill
+            .snapshot_path
+            .parent()
+            .expect("applied root")
+            .to_path_buf();
+        let staging_root = applied_root
+            .parent()
+            .expect("applied parent")
+            .join(".race.tmp");
+        fs::create_dir_all(&staging_root).expect("create staging root");
+        super::copy_snapshot_tree(&applied_skill.snapshot_path, &staging_root.join("visible"))
+            .expect("stage skill");
+
+        publish_materialized_snapshot_root(&staging_root, &applied_root, initial.skills())
+            .expect("existing valid target should win publish race");
+
+        assert!(!staging_root.exists());
+        AppliedState::load(&home)
+            .await
+            .expect("reload state after publish race");
     }
 }
