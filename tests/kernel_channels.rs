@@ -468,6 +468,11 @@ async fn channel_runtime_error_event_persists_failed_turn_and_supports_continue(
     let latest = history.turns.last().expect("failed turn");
     assert_eq!(latest.status, SessionTurnStatus::Failed);
     assert_eq!(latest.assistant_text, "partial before fail");
+    assert_eq!(latest.error_code.as_deref(), Some("runtime.error"));
+    assert_eq!(
+        latest.error_text.as_deref(),
+        Some("adapter failed after partial output")
+    );
 
     let continued = kernel
         .session_action(SessionActionRequest {
@@ -579,8 +584,41 @@ fn assert_turn_completed_before_done(
         .iter()
         .position(|event| event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::Done)
         .unwrap_or_else(|| panic!("{context} should publish done"));
-    assert!(completed_position < done_position);
+    let done_count = events
+        .iter()
+        .filter(|event| event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::Done)
+        .count();
+    assert_eq!(done_count, 1, "{context} should publish exactly one done");
+    assert!(
+        completed_position < done_position,
+        "{context} should publish turn_completed before done"
+    );
     (completed_position, done_position)
+}
+
+fn assert_error_before_done(
+    events: &[ChannelStreamEventView],
+    turn_id: uuid::Uuid,
+    context: &str,
+) -> (usize, usize) {
+    let error_position = events
+        .iter()
+        .position(|event| event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::Error)
+        .unwrap_or_else(|| panic!("{context} should publish error"));
+    let done_position = events
+        .iter()
+        .position(|event| event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::Done)
+        .unwrap_or_else(|| panic!("{context} should publish done"));
+    let done_count = events
+        .iter()
+        .filter(|event| event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::Done)
+        .count();
+    assert_eq!(done_count, 1, "{context} should publish exactly one done");
+    assert!(
+        error_position < done_position,
+        "{context} should publish error before done"
+    );
+    (error_position, done_position)
 }
 
 async fn create_pending_peer(
@@ -721,4 +759,140 @@ impl RuntimeAdapter for PartialFailureAdapter {
     async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<(), anyhow::Error> {
         Ok(())
     }
+}
+
+struct FailingSessionStartAdapter {
+    message: String,
+}
+
+#[async_trait]
+impl RuntimeAdapter for FailingSessionStartAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "failing-start".to_string(),
+            version: "test".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        _input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle, anyhow::Error> {
+        Err(anyhow::anyhow!(self.message.clone()))
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        _event_tx: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult, anyhow::Error> {
+        unreachable!("session_start fails before turn execution")
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        _event_tx: RuntimeEventSender,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn cancel(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn channel_session_start_failure_streams_error_before_done() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "start-failure-skill").await;
+    let kernel = env.kernel().await;
+    kernel
+        .register_runtime_adapter(
+            "failing-start",
+            std::sync::Arc::new(FailingSessionStartAdapter {
+                message: "runtime failed before turn".to_string(),
+            }),
+        )
+        .await;
+
+    create_pending_peer(
+        &kernel,
+        "terminal",
+        "peer-start-failure",
+        "failing-start",
+        7351,
+        "start-failure-7351",
+    )
+    .await;
+    approve_peer(&kernel, "terminal", "peer-start-failure").await;
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-start-failure".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open interactive channel session");
+
+    let err = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "fail before stream".to_string(),
+            runtime_id: Some("failing-start".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect_err("session_start failure should fail turn");
+    assert!(
+        matches!(err, KernelError::Runtime(message) if message.contains("runtime failed before turn"))
+    );
+
+    let history = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: session.session_id,
+            limit: Some(12),
+        })
+        .await
+        .expect("session history");
+    let failed_turn = history.turns.last().expect("failed turn");
+    assert_eq!(failed_turn.status, SessionTurnStatus::Failed);
+    assert_eq!(failed_turn.error_code.as_deref(), Some("runtime.error"));
+    assert_eq!(
+        failed_turn.error_text.as_deref(),
+        Some("runtime failed before turn")
+    );
+
+    let stream = kernel
+        .pull_channel_stream(ChannelStreamPullRequest {
+            channel_id: "terminal".to_string(),
+            consumer_id: "terminal-start-failure".to_string(),
+            start_mode: Some(ChannelStreamStartMode::Resume),
+            start_after_sequence: None,
+            limit: Some(50),
+            wait_ms: Some(0),
+        })
+        .await
+        .expect("pull failure stream");
+    let (error_position, _) =
+        assert_error_before_done(&stream.events, failed_turn.turn_id, "session_start failure");
+    let error_event = &stream.events[error_position];
+    assert_eq!(error_event.code.as_deref(), Some("runtime.error"));
+    assert_eq!(
+        error_event.text.as_deref(),
+        Some("runtime failed before turn")
+    );
 }

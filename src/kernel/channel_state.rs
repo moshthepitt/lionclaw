@@ -628,6 +628,26 @@ impl ChannelStateStore {
         Ok(row.get::<i64, _>("sequence"))
     }
 
+    pub async fn first_answer_stream_sequence_for_turn(
+        &self,
+        channel_id: &str,
+        turn_id: Uuid,
+    ) -> Result<Option<i64>> {
+        let row = sqlx::query(
+            "SELECT MIN(sequence) AS sequence \
+             FROM channel_stream_events \
+             WHERE channel_id = ?1 AND turn_id = ?2 \
+               AND kind = 'message_delta' AND lane = 'answer'",
+        )
+        .bind(channel_id)
+        .bind(turn_id.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to query first answer channel stream event for turn")?;
+
+        Ok(row.get::<Option<i64>, _>("sequence"))
+    }
+
     pub async fn get_stream_consumer_cursor(
         &self,
         channel_id: &str,
