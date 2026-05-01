@@ -97,7 +97,7 @@ class ChannelViewStateTests(unittest.TestCase):
 
         self.assertEqual(state.active_session_id, "session-current")
         self.assertEqual(state.transcript_text(), "")
-        self.assertEqual(state.activity_text(), "")
+        self.assertEqual(state.activity_text(), "No activity events yet.")
         self.assertEqual(state.ordered_turns(), [])
 
     def test_blocked_peer_disables_input(self):
