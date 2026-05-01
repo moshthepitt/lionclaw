@@ -176,6 +176,11 @@ Program-backed runtimes stream two message lanes:
 - `reasoning`: optional live thought/progress text that channels may render or ignore
 
 Only `answer` is treated as the durable assistant reply.
+For channel consumers, the kernel emits `turn_completed` after persisting the
+final turn record. That event carries the canonical assistant text so UIs can
+repair any lost or partial live projection before processing `done`.
+Events that are not tied to a runtime turn may omit `session_id` and `turn_id`;
+those are channel-scoped notices, not resumable turn state.
 
 ## Direct Runtime And Brokered Capabilities
 

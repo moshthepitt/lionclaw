@@ -475,5 +475,5 @@ impl TickLeaseRenewal {
 }
 
 fn internal(err: anyhow::Error) -> KernelError {
-    KernelError::Internal(err.to_string())
+    KernelError::Internal(format!("{err:#}"))
 }

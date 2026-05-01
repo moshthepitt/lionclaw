@@ -262,6 +262,7 @@ pub enum StreamEventKindDto {
     MessageDelta,
     Status,
     Error,
+    TurnCompleted,
     Done,
 }
 
@@ -271,6 +272,7 @@ impl StreamEventKindDto {
             Self::MessageDelta => "message_delta",
             Self::Status => "status",
             Self::Error => "error",
+            Self::TurnCompleted => "turn_completed",
             Self::Done => "done",
         }
     }
@@ -847,8 +849,10 @@ pub struct ChannelStreamEventView {
     pub sequence: i64,
     pub channel_id: String,
     pub peer_id: String,
-    pub session_id: Uuid,
-    pub turn_id: Uuid,
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+    #[serde(default)]
+    pub turn_id: Option<Uuid>,
     pub kind: StreamEventKindDto,
     #[serde(default)]
     pub lane: Option<StreamLaneDto>,

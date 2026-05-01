@@ -142,6 +142,10 @@ Program-backed runtimes stream two message lanes:
 - `reasoning`: optional live thought/progress text that channels may render or ignore
 
 Only `answer` is treated as the durable assistant reply.
+Channel streams also emit a kernel-owned `turn_completed` event after the turn
+record is finalized. Its `text` field is the canonical persisted assistant
+reply and lets channel UIs reconcile live deltas against durable turn state
+before the terminal `done` marker.
 
 Configured OpenCode profiles are pinned to machine-readable JSON output so
 LionClaw receives typed events instead of a degraded plain-text stream. Codex
@@ -322,6 +326,11 @@ stream contract. Kernel-generated lifecycle codes include:
 - `runtime.completed`
 - `runtime.error`
 - `runtime.timeout`
+
+Stream events produced by actual runtime turns include `session_id` and
+`turn_id`. Channel-scoped messages, such as pairing notices or scheduler
+delivery summaries, may omit both fields and must not be treated as active
+session state by channel skills.
 
 ## Session Continuity
 

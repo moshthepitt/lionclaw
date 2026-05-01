@@ -9,8 +9,9 @@ use uuid::Uuid;
 
 use crate::kernel::runtime::{
     ExecutionOutput, RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthKind, RuntimeCapabilityResult,
-    RuntimeEvent, RuntimeEventSender, RuntimeMessageLane, RuntimeProgramSpec, RuntimeSessionHandle,
-    RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
+    RuntimeEvent, RuntimeEventSender, RuntimeMessageLane, RuntimeProgramOutputParser,
+    RuntimeProgramSpec, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
+    RuntimeTurnMode,
 };
 
 #[derive(Debug, Clone)]
@@ -37,6 +38,24 @@ pub struct CodexRuntimeAdapter {
 #[derive(Debug, Clone, Copy)]
 struct CodexSessionState {
     resumes_existing_session: bool,
+}
+
+#[derive(Default)]
+struct CodexOutputParser {
+    emitted_answer: bool,
+    pending_unphased_agent_message: Option<String>,
+}
+
+impl RuntimeProgramOutputParser for CodexOutputParser {
+    fn parse_line(&mut self, line: &str) -> Vec<RuntimeEvent> {
+        parse_codex_output_line(line, self)
+    }
+
+    fn finish(&mut self) -> Vec<RuntimeEvent> {
+        let mut events = Vec::new();
+        flush_pending_agent_message(&mut events, self, RuntimeMessageLane::Answer);
+        events
+    }
 }
 
 impl CodexRuntimeAdapter {
@@ -101,8 +120,13 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
         })
     }
 
+    fn program_output_parser(&self) -> Option<Box<dyn RuntimeProgramOutputParser>> {
+        Some(Box::<CodexOutputParser>::default())
+    }
+
     fn parse_program_output_line(&self, line: &str) -> Vec<RuntimeEvent> {
-        parse_codex_output_line(line)
+        let mut parser = CodexOutputParser::default();
+        parser.parse_line(line)
     }
 
     fn format_program_exit_error(
@@ -199,19 +223,21 @@ fn runtime_session_is_ready(root: &Path) -> Result<bool> {
 fn parse_codex_stdout(stdout: &[u8]) -> Vec<RuntimeEvent> {
     let output = String::from_utf8_lossy(stdout);
     let mut events = Vec::new();
+    let mut parser = CodexOutputParser::default();
 
     for line in output
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        events.extend(parse_codex_output_line(line));
+        events.extend(parser.parse_line(line));
     }
+    events.extend(parser.finish());
 
     events
 }
 
-fn parse_codex_output_line(line: &str) -> Vec<RuntimeEvent> {
+fn parse_codex_output_line(line: &str, parser: &mut CodexOutputParser) -> Vec<RuntimeEvent> {
     let line = line.trim();
     if line.is_empty() {
         return Vec::new();
@@ -219,19 +245,43 @@ fn parse_codex_output_line(line: &str) -> Vec<RuntimeEvent> {
 
     let mut events = Vec::new();
     if let Ok(json) = serde_json::from_str::<Value>(line) {
-        if codex_event_type(&json).is_some() {
-            parse_codex_json_event(&mut events, &json);
-        }
+        parse_codex_json_line(&mut events, &json, parser);
     } else {
-        events.push(RuntimeEvent::MessageDelta {
-            lane: RuntimeMessageLane::Answer,
-            text: line.to_string(),
-        });
+        push_message_delta(
+            &mut events,
+            parser,
+            RuntimeMessageLane::Answer,
+            line.to_string(),
+        );
     }
     events
 }
 
-fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
+fn parse_codex_json_line(
+    events: &mut Vec<RuntimeEvent>,
+    json: &Value,
+    parser: &mut CodexOutputParser,
+) {
+    match json.get("type").and_then(Value::as_str) {
+        Some("event_msg") => {
+            if let Some(payload) = json.get("payload") {
+                parse_codex_json_event(events, payload, parser);
+            }
+        }
+        Some("response_item") => {}
+        _ => {
+            if codex_event_type(json).is_some() {
+                parse_codex_json_event(events, json, parser);
+            }
+        }
+    }
+}
+
+fn parse_codex_json_event(
+    events: &mut Vec<RuntimeEvent>,
+    json: &Value,
+    parser: &mut CodexOutputParser,
+) {
     let payload = codex_event_payload(json);
     let event_type = codex_event_type(json);
     match event_type {
@@ -250,6 +300,7 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
             });
         }
         Some("turn.completed") | Some("turn_complete") => {
+            flush_pending_agent_message(events, parser, RuntimeMessageLane::Answer);
             events.push(RuntimeEvent::Status {
                 code: None,
                 text: "codex turn completed".to_string(),
@@ -257,10 +308,14 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
         }
         Some("task_complete") => {
             if let Some(text) = codex_event_text(payload, &["last_agent_message"]) {
-                events.push(RuntimeEvent::MessageDelta {
-                    lane: RuntimeMessageLane::Answer,
-                    text,
-                });
+                parser.pending_unphased_agent_message = None;
+                if !parser.emitted_answer {
+                    push_message_delta(events, parser, RuntimeMessageLane::Answer, text);
+                }
+            } else if !parser.emitted_answer {
+                flush_pending_agent_message(events, parser, RuntimeMessageLane::Answer);
+            } else {
+                parser.pending_unphased_agent_message = None;
             }
             events.push(RuntimeEvent::Status {
                 code: None,
@@ -273,6 +328,7 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
                 .pointer("/error/message")
                 .and_then(Value::as_str)
                 .unwrap_or("codex turn failed");
+            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
             events.push(RuntimeEvent::Error {
                 code: Some("runtime.error".to_string()),
                 text: format!("codex: {message}"),
@@ -281,6 +337,7 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
         Some("turn_aborted") => {
             let message = codex_event_text(payload, &["reason"])
                 .unwrap_or_else(|| "codex turn aborted".to_string());
+            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
             events.push(RuntimeEvent::Error {
                 code: Some("runtime.error".to_string()),
                 text: format!("codex: {message}"),
@@ -291,6 +348,7 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("codex stream error");
+            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
             events.push(RuntimeEvent::Error {
                 code: Some("runtime.error".to_string()),
                 text: format!("codex: {message}"),
@@ -299,6 +357,7 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
         Some("stream_error") => {
             let message = codex_event_text(payload, &["message", "details"])
                 .unwrap_or_else(|| "codex stream error".to_string());
+            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
             events.push(RuntimeEvent::Error {
                 code: Some("runtime.error".to_string()),
                 text: format!("codex: {message}"),
@@ -306,28 +365,19 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
         }
         Some("agent_message_delta") | Some("agent_message_content_delta") => {
             if let Some(text) = codex_event_text(payload, &["delta", "text", "content"]) {
-                events.push(RuntimeEvent::MessageDelta {
-                    lane: RuntimeMessageLane::Answer,
-                    text,
-                });
+                push_agent_message(events, parser, payload, text);
             }
         }
         Some("agent_message") => {
             if let Some(text) = codex_event_text(payload, &["message", "text", "content"]) {
-                events.push(RuntimeEvent::MessageDelta {
-                    lane: RuntimeMessageLane::Answer,
-                    text,
-                });
+                push_agent_message(events, parser, payload, text);
             }
         }
         Some("agent_reasoning_delta")
         | Some("agent_reasoning_raw_content_delta")
         | Some("reasoning_content_delta") => {
             if let Some(text) = codex_event_text(payload, &["delta", "text", "content"]) {
-                events.push(RuntimeEvent::MessageDelta {
-                    lane: RuntimeMessageLane::Reasoning,
-                    text,
-                });
+                push_message_delta(events, parser, RuntimeMessageLane::Reasoning, text);
             }
         }
         Some("agent_reasoning") | Some("agent_reasoning_raw_content") => {
@@ -335,16 +385,14 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
                 payload,
                 &["text", "content", "reasoning_text", "raw_content"],
             ) {
-                events.push(RuntimeEvent::MessageDelta {
-                    lane: RuntimeMessageLane::Reasoning,
-                    text,
-                });
+                push_message_delta(events, parser, RuntimeMessageLane::Reasoning, text);
             }
         }
         Some("agent_reasoning_section_break")
         | Some("session_configured")
         | Some("token_count") => {}
         Some("exec_command_begin") => {
+            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
             let command = codex_event_text(payload, &["parsed_cmd", "command"])
                 .unwrap_or_else(|| "command".to_string());
             events.push(RuntimeEvent::Status {
@@ -353,6 +401,7 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
             });
         }
         Some("exec_command_end") => {
+            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
             let exit_code = payload
                 .get("exit_code")
                 .and_then(Value::as_i64)
@@ -364,24 +413,28 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
             });
         }
         Some("web_search_begin") => {
+            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
             events.push(RuntimeEvent::Status {
                 code: None,
                 text: "codex web search".to_string(),
             });
         }
         Some("web_search_end") => {
+            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
             events.push(RuntimeEvent::Status {
                 code: None,
                 text: describe_codex_web_search(payload),
             });
         }
         Some("patch_apply_begin") => {
+            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
             events.push(RuntimeEvent::Status {
                 code: None,
                 text: "codex patch apply".to_string(),
             });
         }
         Some("patch_apply_end") => {
+            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
             let status = payload
                 .get("success")
                 .and_then(Value::as_bool)
@@ -399,10 +452,74 @@ fn parse_codex_json_event(events: &mut Vec<RuntimeEvent>, json: &Value) {
         | Some("item_updated")
         | Some("item_completed") => {
             if let Some(item) = payload.get("item") {
-                parse_codex_item(events, item);
+                parse_codex_item(events, item, parser);
             }
         }
         Some(_) | None => {}
+    }
+}
+
+fn push_agent_message(
+    events: &mut Vec<RuntimeEvent>,
+    parser: &mut CodexOutputParser,
+    payload: &Value,
+    text: String,
+) {
+    match codex_agent_message_lane(payload) {
+        Some(lane) => {
+            parser.discard_pending_duplicate(&text);
+            push_message_delta(events, parser, lane, text);
+        }
+        None => parser.push_pending_unphased_agent_message(text),
+    }
+}
+
+fn push_message_delta(
+    events: &mut Vec<RuntimeEvent>,
+    parser: &mut CodexOutputParser,
+    lane: RuntimeMessageLane,
+    text: String,
+) {
+    if matches!(lane, RuntimeMessageLane::Answer) {
+        parser.emitted_answer = true;
+    }
+    events.push(RuntimeEvent::MessageDelta { lane, text });
+}
+
+fn flush_pending_agent_message(
+    events: &mut Vec<RuntimeEvent>,
+    parser: &mut CodexOutputParser,
+    lane: RuntimeMessageLane,
+) {
+    if let Some(text) = parser.pending_unphased_agent_message.take() {
+        push_message_delta(events, parser, lane, text);
+    }
+}
+
+impl CodexOutputParser {
+    fn push_pending_unphased_agent_message(&mut self, text: String) {
+        let Some(pending) = &mut self.pending_unphased_agent_message else {
+            self.pending_unphased_agent_message = Some(text);
+            return;
+        };
+
+        if text == *pending || pending.ends_with(&text) {
+            return;
+        }
+        if text.starts_with(pending.as_str()) {
+            *pending = text;
+            return;
+        }
+        pending.push_str(&text);
+    }
+
+    fn discard_pending_duplicate(&mut self, text: &str) {
+        let Some(pending) = self.pending_unphased_agent_message.as_deref() else {
+            return;
+        };
+        if pending == text || text.starts_with(pending) || pending.ends_with(text) {
+            self.pending_unphased_agent_message = None;
+        }
     }
 }
 
@@ -476,14 +593,11 @@ fn collect_codex_text(value: &Value, depth: usize) -> Option<String> {
     }
 }
 
-fn parse_codex_item(events: &mut Vec<RuntimeEvent>, item: &Value) {
+fn parse_codex_item(events: &mut Vec<RuntimeEvent>, item: &Value, parser: &mut CodexOutputParser) {
     match item.get("type").and_then(Value::as_str) {
         Some("agent_message") => {
             if let Some(text) = item.get("text").and_then(Value::as_str) {
-                events.push(RuntimeEvent::MessageDelta {
-                    lane: RuntimeMessageLane::Answer,
-                    text: text.to_string(),
-                });
+                push_agent_message(events, parser, item, text.to_string());
             }
         }
         Some("error") => {
@@ -497,6 +611,7 @@ fn parse_codex_item(events: &mut Vec<RuntimeEvent>, item: &Value) {
             });
         }
         Some("command_execution") => {
+            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
             let command = item
                 .get("command")
                 .and_then(Value::as_str)
@@ -511,6 +626,7 @@ fn parse_codex_item(events: &mut Vec<RuntimeEvent>, item: &Value) {
             });
         }
         Some("file_change") => {
+            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
             let status = item
                 .get("status")
                 .and_then(Value::as_str)
@@ -521,6 +637,7 @@ fn parse_codex_item(events: &mut Vec<RuntimeEvent>, item: &Value) {
             });
         }
         Some("web_search") => {
+            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
             events.push(RuntimeEvent::Status {
                 code: None,
                 text: describe_codex_web_search(item),
@@ -551,6 +668,17 @@ fn parse_codex_item(events: &mut Vec<RuntimeEvent>, item: &Value) {
                 text: "codex item missing type".to_string(),
             });
         }
+    }
+}
+
+// Codex's final answer authority is either an explicit final_answer phase or
+// a completion boundary after the last unphased assistant message.
+fn codex_agent_message_lane(payload: &Value) -> Option<RuntimeMessageLane> {
+    match payload.get("phase").and_then(Value::as_str) {
+        Some("final_answer") => Some(RuntimeMessageLane::Answer),
+        Some("commentary") => Some(RuntimeMessageLane::Reasoning),
+        Some(_) => Some(RuntimeMessageLane::Reasoning),
+        None => None,
     }
 }
 
@@ -846,6 +974,29 @@ mod tests {
             RuntimeEvent::Status { code: None, text } if text == "codex turn completed"
         ));
         assert!(matches!(&events[4], RuntimeEvent::Done));
+    }
+
+    #[test]
+    fn codex_stdout_routes_unphased_messages_by_turn_boundary() {
+        let events = parse_codex_stdout(
+            br##"{"type":"event_msg","payload":{"type":"turn.started"}}
+{"type":"event_msg","payload":{"type":"item.completed","item":{"type":"agent_message","text":"I am checking the files."}}}
+{"type":"event_msg","payload":{"type":"exec_command_begin","parsed_cmd":"sed -n '1,80p' AGENTS.md"}}
+{"type":"event_msg","payload":{"type":"exec_command_end","exit_code":0}}
+{"type":"event_msg","payload":{"type":"item.completed","item":{"type":"agent_message","text":"# Result\n\n- Read `AGENTS.md`."}}}
+{"type":"event_msg","payload":{"type":"turn.completed"}}"##,
+        );
+
+        assert!(matches!(
+            &events[1],
+            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Reasoning, text }
+                if text == "I am checking the files."
+        ));
+        assert!(matches!(
+            &events[4],
+            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text }
+                if text == "# Result\n\n- Read `AGENTS.md`."
+        ));
     }
 
     #[test]

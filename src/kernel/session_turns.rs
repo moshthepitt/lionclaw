@@ -63,43 +63,28 @@ impl SessionTurnStore {
 
     pub async fn begin_turn(&self, turn: NewSessionTurn) -> Result<SessionTurnRecord> {
         let started_at_ms = now_ms();
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .context("failed to start session turn transaction")?;
-
-        let next_sequence_no: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(sequence_no), 0) + 1 \
-             FROM session_turns \
-             WHERE session_id = ?1",
-        )
-        .bind(turn.session_id.to_string())
-        .fetch_one(&mut *tx)
-        .await
-        .context("failed to allocate next session turn sequence number")?;
 
         sqlx::query(
             "INSERT INTO session_turns \
              (turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, runtime_id, started_at_ms, finished_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '', NULL, NULL, ?8, ?9, NULL)",
+             VALUES (?1, ?2, (SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM session_turns WHERE session_id = ?2), ?3, ?4, ?5, ?6, '', NULL, NULL, ?7, ?8, NULL)",
         )
         .bind(turn.turn_id.to_string())
         .bind(turn.session_id.to_string())
-        .bind(next_sequence_no)
         .bind(turn.kind.as_str())
         .bind(SessionTurnStatus::Running.as_str())
         .bind(&turn.display_user_text)
         .bind(&turn.prompt_user_text)
         .bind(&turn.runtime_id)
         .bind(started_at_ms)
-        .execute(&mut *tx)
+        .execute(&self.pool)
         .await
-        .context("failed to insert session turn")?;
-
-        tx.commit()
-            .await
-            .context("failed to commit session turn transaction")?;
+        .with_context(|| {
+            format!(
+                "failed to insert session turn {} for session {}",
+                turn.turn_id, turn.session_id
+            )
+        })?;
 
         self.get(turn.turn_id)
             .await?
@@ -263,6 +248,37 @@ impl SessionTurnStore {
         .fetch_all(&self.pool)
         .await
         .context("failed to query session turn history")?;
+
+        let mut turns = rows
+            .into_iter()
+            .map(map_session_turn_row)
+            .collect::<Result<Vec<_>>>()?;
+        turns.reverse();
+        Ok(turns)
+    }
+
+    pub async fn list_recent_before_sequence(
+        &self,
+        session_id: Uuid,
+        before_sequence_no: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionTurnRecord>> {
+        let limit = i64::try_from(limit).context("session history limit is too large")?;
+        let before_sequence_no =
+            i64::try_from(before_sequence_no).context("before_sequence_no is too large")?;
+        let rows = sqlx::query(
+            "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, runtime_id, started_at_ms, finished_at_ms \
+             FROM session_turns \
+             WHERE session_id = ?1 AND sequence_no < ?2 \
+             ORDER BY sequence_no DESC \
+             LIMIT ?3",
+        )
+        .bind(session_id.to_string())
+        .bind(before_sequence_no)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to query bounded session turn history")?;
 
         let mut turns = rows
             .into_iter()

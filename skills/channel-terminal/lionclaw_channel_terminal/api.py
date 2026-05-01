@@ -87,7 +87,7 @@ class LionClawApi:
             "/v0/channels/peers",
             params={"channel_id": self.channel_id},
         )
-        response.raise_for_status()
+        _raise_for_status(response)
         payload = response.json()
         for peer in payload.get("peers", []):
             if peer.get("peer_id") != self.peer_id:
@@ -110,7 +110,7 @@ class LionClawApi:
         if history_policy:
             params["history_policy"] = history_policy
         response = await self._client.get("/v0/sessions/latest", params=params)
-        response.raise_for_status()
+        _raise_for_status(response)
         payload = response.json()
         return SessionLatestSnapshot(
             session=_parse_session_open_result(payload.get("session")),
@@ -143,7 +143,7 @@ class LionClawApi:
                 "history_policy": history_policy,
             },
         )
-        response.raise_for_status()
+        _raise_for_status(response)
         opened = _parse_session_open_result(response.json())
         if opened is None:
             raise RuntimeError("session open response missing session payload")
@@ -161,7 +161,7 @@ class LionClawApi:
                 "action": action,
             },
         )
-        response.raise_for_status()
+        _raise_for_status(response)
         data = response.json()
         return SessionActionResult(
             session_id=data["session_id"],
@@ -181,7 +181,7 @@ class LionClawApi:
         if self.runtime_id:
             payload["runtime_id"] = self.runtime_id
         response = await self._client.post("/v0/channels/inbound", json=payload)
-        response.raise_for_status()
+        _raise_for_status(response)
         data = response.json()
         self._inbound_sequence += 1
         return InboundResponse(
@@ -205,7 +205,7 @@ class LionClawApi:
         else:
             payload["start_after_sequence"] = start_after_sequence
         response = await self._client.post("/v0/channels/stream/pull", json=payload)
-        response.raise_for_status()
+        _raise_for_status(response)
         payload = response.json()
         events: list[StreamEvent] = []
         last_sequence: int | None = None
@@ -214,7 +214,7 @@ class LionClawApi:
                 sequence=item["sequence"],
                 peer_id=item.get("peer_id", ""),
                 session_id=item.get("session_id"),
-                turn_id=item["turn_id"],
+                turn_id=item.get("turn_id"),
                 kind=item["kind"],
                 lane=item.get("lane"),
                 code=item.get("code"),
@@ -233,7 +233,7 @@ class LionClawApi:
                 "through_sequence": through_sequence,
             },
         )
-        response.raise_for_status()
+        _raise_for_status(response)
 
 
 def _parse_session_open_result(payload: dict[str, Any] | None) -> SessionOpenResult | None:
@@ -246,3 +246,15 @@ def _parse_session_open_result(payload: dict[str, Any] | None) -> SessionOpenRes
         trust_tier=payload["trust_tier"],
         history_policy=payload["history_policy"],
     )
+
+
+def _raise_for_status(response: httpx.Response) -> None:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as err:
+        body = response.text.strip()
+        if body:
+            raise RuntimeError(
+                f"{response.status_code} {response.reason_phrase}: {body}"
+            ) from err
+        raise

@@ -2,9 +2,9 @@ CREATE TABLE IF NOT EXISTS channel_stream_events (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     channel_id TEXT NOT NULL,
     peer_id TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    turn_id TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('message_delta', 'status', 'error', 'done')),
+    session_id TEXT,
+    turn_id TEXT,
+    kind TEXT NOT NULL CHECK (kind IN ('message_delta', 'status', 'error', 'turn_completed', 'done')),
     lane TEXT CHECK (lane IS NULL OR lane IN ('answer', 'reasoning')),
     text TEXT,
     created_at_ms INTEGER NOT NULL

@@ -292,6 +292,10 @@ flush_stream_once() {
       error)
         print_error_message "$text" "$code"
         ;;
+      turn_completed)
+        # The debug worker prints live answer deltas as they arrive. The Python
+        # TUI uses this event to reconcile its rendered answer pane.
+        ;;
       done)
         ;;
       *)

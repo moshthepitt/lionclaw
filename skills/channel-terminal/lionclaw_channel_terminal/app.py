@@ -5,11 +5,12 @@ import os
 from dataclasses import dataclass
 
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
-from textual.widgets import Footer, Input, RichLog, Static
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.geometry import Size
+from textual.widgets import Footer, Input, Markdown, RichLog, Static
 
 from lionclaw_channel_terminal.api import LionClawApi
-from lionclaw_channel_terminal.state import ChannelViewState
+from lionclaw_channel_terminal.state import ChannelViewState, TurnState
 
 
 @dataclass(slots=True)
@@ -39,6 +40,27 @@ class AppConfig:
         )
 
 
+class _FollowScroll(VerticalScroll):
+    """Vertical scroll container that can stick to the end after layout changes."""
+
+    _follow_end: bool = False
+
+    def follow_end(self) -> None:
+        self._follow_end = True
+        if self.max_scroll_y > 0:
+            self._scroll_to_current_end()
+
+    def cancel_follow_end(self) -> None:
+        self._follow_end = False
+
+    def watch_virtual_size(self, _old: Size, _new: Size) -> None:
+        if self._follow_end:
+            self._scroll_to_current_end()
+
+    def _scroll_to_current_end(self) -> None:
+        self.scroll_end(animate=False, immediate=True, force=True)
+
+
 class TerminalChannelApp(App[None]):
     CSS = """
     Screen {
@@ -57,7 +79,7 @@ class TerminalChannelApp(App[None]):
         height: 1fr;
     }
 
-    #transcript-pane {
+    #answer-pane {
         width: 2fr;
         border: solid $accent;
     }
@@ -67,13 +89,19 @@ class TerminalChannelApp(App[None]):
         border: solid $secondary;
     }
 
-    #transcript-view,
-    #thinking-view,
-    #status-log {
+    #answer-scroll,
+    #thinking-scroll,
+    #activity-log {
         height: 1fr;
     }
 
-    #status-log {
+    #answer-view,
+    #thinking-view {
+        width: 100%;
+        padding: 0 1;
+    }
+
+    #activity-log {
         height: 6;
         border: solid $boost;
     }
@@ -101,28 +129,30 @@ class TerminalChannelApp(App[None]):
         )
         self._initial_stream_start_after_sequence: int | None = None
         self._first_stream_pull = True
+        self._approved_peer_session_restore_complete = False
         self._focus_input_requested = True
         self._input_was_disabled = True
 
     def compose(self) -> ComposeResult:
         yield Static(id="pairing-banner")
         with Horizontal(id="panes"):
-            with Vertical(id="transcript-pane"):
-                yield Static("", id="transcript-view")
+            with Vertical(id="answer-pane"):
+                with _FollowScroll(id="answer-scroll"):
+                    yield Markdown("", id="answer-view")
             with Vertical(id="thinking-pane"):
-                yield Static("No reasoning for the current turn yet.", id="thinking-view")
-        yield RichLog(id="status-log", wrap=True, markup=False, highlight=False)
+                with _FollowScroll(id="thinking-scroll"):
+                    yield Markdown("", id="thinking-view")
+        yield RichLog(id="activity-log", wrap=True, markup=False, highlight=False)
         yield Input(placeholder="Send a message or /quit", id="input")
         yield Footer()
 
     async def on_mount(self) -> None:
         self.title = f"LionClaw {self.config.channel_id}"
         self.sub_title = f"peer={self.config.peer_id}"
-        self.query_one("#transcript-pane", Vertical).border_title = "Transcript"
+        self.query_one("#answer-pane", Vertical).border_title = "Answer"
         self.query_one("#thinking-pane", Vertical).border_title = "Thinking"
-        self.query_one("#status-log", RichLog).border_title = "Status"
+        self.query_one("#activity-log", RichLog).border_title = "Activity"
         await self.refresh_pairing_state()
-        await self.restore_latest_session()
         self._render_views()
         self.run_worker(self.stream_loop(), exclusive=False, group="stream")
         self.set_interval(2.0, self.refresh_pairing_state, pause=False)
@@ -162,11 +192,16 @@ class TerminalChannelApp(App[None]):
             )
             return False
 
+        try:
+            session_id = await self.ensure_interactive_session_for_send()
+        except Exception as err:  # noqa: BLE001
+            await self._push_status(f"send blocked: {err}")
+            return False
+
         self.state.begin_submit(text)
         self._render_views()
 
         try:
-            session_id = await self.ensure_interactive_session_for_send()
             response = await self.api.send_inbound(text, session_id=session_id)
         except Exception as err:  # noqa: BLE001
             self.state.mark_send_failed(str(err))
@@ -233,7 +268,7 @@ class TerminalChannelApp(App[None]):
             await self._push_status(f"reset failed: {err}")
             return False
 
-        self.state.status_lines.append("[status] opened a fresh session")
+        self.state.activity_lines.append("[status] opened a fresh session")
         self._render_views()
         return True
 
@@ -242,7 +277,7 @@ class TerminalChannelApp(App[None]):
         try:
             peer_state = await self.api.fetch_peer_state()
         except Exception as err:  # noqa: BLE001
-            self.state.status_lines.append(f"[error] peer refresh failed: {err}")
+            self.state.activity_lines.append(f"[error] peer refresh failed: {err}")
             self._render_views()
             return
 
@@ -252,8 +287,16 @@ class TerminalChannelApp(App[None]):
             trust_tier=peer_state.trust_tier,
         )
 
+        if peer_state.status != "approved":
+            self._approved_peer_session_restore_complete = False
+
         if previous_status != peer_state.status:
             await self._handle_pairing_transition(previous_status, peer_state.status)
+        elif (
+            peer_state.status == "approved"
+            and not self._approved_peer_session_restore_complete
+        ):
+            await self._restore_approved_peer_session()
 
         self._render_views()
 
@@ -265,7 +308,7 @@ class TerminalChannelApp(App[None]):
         try:
             snapshot = await self.api.fetch_latest_session(history_policy="interactive")
         except Exception as err:  # noqa: BLE001
-            self.state.status_lines.append(f"[error] session restore failed: {err}")
+            self.state.activity_lines.append(f"[error] session restore failed: {err}")
             return False
 
         if snapshot.session is None:
@@ -281,6 +324,11 @@ class TerminalChannelApp(App[None]):
             return self.state.active_session_id
         if self.state.pairing.status != "approved":
             return None
+        if not self._approved_peer_session_restore_complete:
+            if not await self._restore_approved_peer_session():
+                raise RuntimeError("latest session restore failed; retrying")
+            if self.state.active_session_id is not None:
+                return self.state.active_session_id
         return await self.open_interactive_session()
 
     async def open_interactive_session(self) -> str | None:
@@ -293,6 +341,7 @@ class TerminalChannelApp(App[None]):
             history_policy="interactive",
         )
         self.state.active_session_id = session.session_id
+        self._approved_peer_session_restore_complete = True
         return session.session_id
 
     async def stream_loop(self) -> None:
@@ -314,7 +363,7 @@ class TerminalChannelApp(App[None]):
             except asyncio.CancelledError:
                 raise
             except Exception as err:  # noqa: BLE001
-                self.state.status_lines.append(f"[error] stream failed: {err}")
+                self.state.activity_lines.append(f"[error] stream failed: {err}")
                 self._render_views()
                 await asyncio.sleep(1)
                 continue
@@ -322,7 +371,7 @@ class TerminalChannelApp(App[None]):
             self._render_views()
 
     async def _push_status(self, message: str) -> None:
-        self.state.status_lines.append(f"[status] {message}")
+        self.state.activity_lines.append(f"[status] {message}")
         self._render_views()
 
     async def _handle_pairing_transition(
@@ -331,36 +380,58 @@ class TerminalChannelApp(App[None]):
         current_status: str,
     ) -> None:
         if current_status == "approved":
-            restored = await self.restore_latest_session()
-            if restored:
-                if self.state.active_session_id is None:
-                    self.state.clear_transient_view()
-                self.state.status_lines.clear()
-                self.state.status_lines.append("[status] peer approved")
-                self._focus_input_requested = True
+            await self._restore_approved_peer_session()
             return
 
         if previous_status == "approved" and current_status == "blocked":
             self.state.clear_pending_turn()
-            self.state.status_lines.clear()
-            self.state.status_lines.append("[error] peer blocked")
+            self.state.activity_lines.clear()
+            self.state.activity_lines.append("[error] peer blocked")
+
+    async def _restore_approved_peer_session(self) -> bool:
+        restored = await self.restore_latest_session()
+        if not restored:
+            return False
+
+        self._approved_peer_session_restore_complete = True
+        if self.state.active_session_id is None:
+            self.state.clear_transient_view()
+        self.state.activity_lines.clear()
+        self.state.activity_lines.append("[status] peer approved")
+        self._focus_input_requested = True
+        return True
 
     def _render_views(self) -> None:
         self.query_one("#pairing-banner", Static).update(
             self.state.pairing_banner(self.config.channel_id, self.config.peer_id)
         )
-        self.query_one("#transcript-view", Static).update(self.state.transcript_text())
-        self.query_one("#thinking-view", Static).update(self.state.reasoning_text())
+        answer_scroll = self.query_one("#answer-scroll", _FollowScroll)
+        thinking_scroll = self.query_one("#thinking-scroll", _FollowScroll)
+        answer_should_follow = _should_follow(answer_scroll)
+        thinking_should_follow = _should_follow(thinking_scroll)
+        if not answer_should_follow:
+            answer_scroll.cancel_follow_end()
+        if not thinking_should_follow:
+            thinking_scroll.cancel_follow_end()
+
+        self.query_one("#answer-view", Markdown).update(_answer_markdown(self.state))
+        self.query_one("#thinking-view", Markdown).update(_thinking_markdown(self.state))
+
+        if answer_should_follow:
+            answer_scroll.follow_end()
+        if thinking_should_follow:
+            thinking_scroll.follow_end()
+
         input_widget = self.query_one("#input", Input)
         input_is_disabled = self.state.input_disabled()
         input_widget.disabled = input_is_disabled
         self._focus_input_if_enabled(input_widget, self._input_was_disabled)
         self._input_was_disabled = input_is_disabled
 
-        status_log = self.query_one("#status-log", RichLog)
-        status_log.clear()
-        for line in self.state.status_text().splitlines():
-            status_log.write(line)
+        activity_log = self.query_one("#activity-log", RichLog)
+        activity_log.clear()
+        for line in self.state.activity_text().splitlines():
+            activity_log.write(line, scroll_end=True)
 
     def _focus_input_if_enabled(
         self,
@@ -386,20 +457,65 @@ class TerminalChannelApp(App[None]):
             self.state.mark_queued(turn_id, session_id)
             return True
         if outcome == "pairing_pending":
-            self.state.clear_pending_turn()
-            self.state.status_lines.append("[status] pairing pending")
+            self.state.discard_pending_turn()
+            self.state.activity_lines.append("[status] pairing pending")
             return True
         if outcome == "peer_blocked":
-            self.state.clear_pending_turn()
-            self.state.status_lines.append("[error] peer_blocked: peer is blocked")
+            self.state.discard_pending_turn()
+            self.state.activity_lines.append("[error] peer_blocked: peer is blocked")
             return False
         if outcome == "duplicate":
-            self.state.clear_pending_turn()
-            self.state.status_lines.append("[status] duplicate: inbound ignored")
+            self.state.discard_pending_turn()
+            self.state.activity_lines.append("[status] duplicate: inbound ignored")
             return False
 
         self.state.mark_send_failed(f"unexpected inbound outcome: {outcome}")
         return False
+
+
+def _answer_markdown(state: ChannelViewState) -> str:
+    parts: list[str] = []
+
+    for turn in state.ordered_turns():
+        parts.extend(_turn_answer_markdown(turn))
+
+    if not parts:
+        return "_No answer yet._"
+    return "\n\n".join(parts)
+
+
+def _turn_answer_markdown(turn: TurnState) -> list[str]:
+    parts: list[str] = []
+    if turn.user_text:
+        parts.append(f"### You\n\n{_blockquote(turn.user_text)}")
+
+    answer = turn.assistant_display_text()
+    if answer:
+        parts.append(f"### LionClaw\n\n{answer.strip()}")
+    elif turn.is_running:
+        parts.append("### LionClaw\n\n_Working..._")
+
+    if turn.error_text:
+        parts.append(f"### Error\n\n{_blockquote(turn.error_text)}")
+    return parts
+
+
+def _thinking_markdown(state: ChannelViewState) -> str:
+    display = state.reasoning_display()
+    if not display.text:
+        return ""
+    if display.placeholder:
+        return f"_{display.text}_"
+    return display.text.strip()
+
+
+def _blockquote(text: str) -> str:
+    lines = text.splitlines() or [text]
+    return "\n".join(f"> {line}" if line else ">" for line in lines)
+
+
+def _should_follow(scroll: VerticalScroll) -> bool:
+    return scroll.max_scroll_y <= 0 or scroll.is_vertical_scroll_end
 
 
 def run() -> None:

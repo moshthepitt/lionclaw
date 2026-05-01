@@ -186,6 +186,49 @@ async fn conservative_history_uses_failure_note_without_partial_text() {
 }
 
 #[tokio::test]
+async fn prompt_history_does_not_include_current_running_turn() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+
+    let recorded_prompts = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "capture",
+            Arc::new(CapturePromptAdapter {
+                prompts: recorded_prompts.clone(),
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+
+    let session = open_session(
+        &kernel,
+        "current-turn-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    let response = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "fresh input".to_string(),
+            runtime_id: Some("capture".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn");
+    assert_eq!(response.assistant_text, "captured");
+
+    let prompt = recorded_prompts.lock().expect("prompt lock")[0].clone();
+    assert!(prompt.contains("## User Input\n\nfresh input"));
+    assert_eq!(prompt.matches("fresh input").count(), 1);
+    assert!(!prompt.contains("## Prior Turn 1"));
+    assert!(!prompt.contains("previous assistant turn was interrupted"));
+}
+
+#[tokio::test]
 async fn continue_and_retry_actions_create_durable_turns() {
     let env = TestEnv::new();
     let kernel = Kernel::new_with_options(

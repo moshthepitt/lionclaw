@@ -230,7 +230,7 @@ flush_stream() {
 
     sequence="$(jq -r '.sequence' <<<"$event")"
     peer_id="$(jq -r '.peer_id' <<<"$event")"
-    turn_id="$(jq -r '.turn_id' <<<"$event")"
+    turn_id="$(jq -r '.turn_id // ""' <<<"$event")"
     kind="$(jq -r '.kind' <<<"$event")"
     lane="$(jq -r '.lane // empty' <<<"$event")"
     code="$(jq -r '.code // empty' <<<"$event")"
@@ -254,6 +254,10 @@ flush_stream() {
         ;;
       error)
         echo "lionclaw stream error for peer_id=$peer_id turn_id=$turn_id: $text" >&2
+        ;;
+      turn_completed)
+        ANSWER_BUFFERS["$key"]="$text"
+        PENDING_TURNS["$key"]=1
         ;;
       done)
         if [[ -v PENDING_TURNS["$key"] ]]; then

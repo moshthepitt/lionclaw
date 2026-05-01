@@ -66,8 +66,8 @@ pub struct ChannelStreamEventRecord {
     pub sequence: i64,
     pub channel_id: String,
     pub peer_id: String,
-    pub session_id: Uuid,
-    pub turn_id: Uuid,
+    pub session_id: Option<Uuid>,
+    pub turn_id: Option<Uuid>,
     pub kind: ChannelStreamEventKind,
     pub lane: Option<StreamMessageLane>,
     pub code: Option<String>,
@@ -79,8 +79,8 @@ pub struct ChannelStreamEventRecord {
 pub struct ChannelStreamEventInsert<'a> {
     pub channel_id: &'a str,
     pub peer_id: &'a str,
-    pub session_id: Uuid,
-    pub turn_id: Uuid,
+    pub session_id: Option<Uuid>,
+    pub turn_id: Option<Uuid>,
     pub kind: ChannelStreamEventKind,
     pub lane: Option<StreamMessageLane>,
     pub code: Option<&'a str>,
@@ -92,6 +92,7 @@ pub enum ChannelStreamEventKind {
     MessageDelta,
     Status,
     Error,
+    TurnCompleted,
     Done,
 }
 
@@ -101,6 +102,7 @@ impl ChannelStreamEventKind {
             Self::MessageDelta => "message_delta",
             Self::Status => "status",
             Self::Error => "error",
+            Self::TurnCompleted => "turn_completed",
             Self::Done => "done",
         }
     }
@@ -114,6 +116,7 @@ impl FromStr for ChannelStreamEventKind {
             "message_delta" => Ok(Self::MessageDelta),
             "status" => Ok(Self::Status),
             "error" => Ok(Self::Error),
+            "turn_completed" => Ok(Self::TurnCompleted),
             "done" => Ok(Self::Done),
             other => Err(format!("invalid channel stream event kind '{other}'")),
         }
@@ -672,8 +675,8 @@ impl ChannelStateStore {
         )
         .bind(insert.channel_id)
         .bind(insert.peer_id)
-        .bind(insert.session_id.to_string())
-        .bind(insert.turn_id.to_string())
+        .bind(insert.session_id.map(|value| value.to_string()))
+        .bind(insert.turn_id.map(|value| value.to_string()))
         .bind(insert.kind.as_str())
         .bind(insert.lane.map(StreamMessageLane::as_str))
         .bind(insert.code)
@@ -707,6 +710,26 @@ impl ChannelStateStore {
         .context("failed to query current channel stream head")?;
 
         Ok(row.get::<i64, _>("sequence"))
+    }
+
+    pub async fn first_answer_stream_sequence_for_turn(
+        &self,
+        channel_id: &str,
+        turn_id: Uuid,
+    ) -> Result<Option<i64>> {
+        let row = sqlx::query(
+            "SELECT MIN(sequence) AS sequence \
+             FROM channel_stream_events \
+             WHERE channel_id = ?1 AND turn_id = ?2 \
+               AND kind = 'message_delta' AND lane = 'answer'",
+        )
+        .bind(channel_id)
+        .bind(turn_id.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to query first answer channel stream event for turn")?;
+
+        Ok(row.get::<Option<i64>, _>("sequence"))
     }
 
     pub async fn get_stream_consumer_cursor(
@@ -1088,12 +1111,8 @@ fn map_stream_event_row(row: SqliteRow) -> Result<ChannelStreamEventRecord> {
     let created_at_ms: i64 = row.get("created_at_ms");
     let created_at = ms_to_datetime(created_at_ms)
         .ok_or_else(|| anyhow!("invalid created_at_ms '{created_at_ms}'"))?;
-    let session_id_raw: String = row.get("session_id");
-    let session_id = Uuid::parse_str(&session_id_raw)
-        .map_err(|err| anyhow!("invalid session_id '{session_id_raw}': {err}"))?;
-    let turn_id_raw: String = row.get("turn_id");
-    let turn_id = Uuid::parse_str(&turn_id_raw)
-        .map_err(|err| anyhow!("invalid turn_id '{turn_id_raw}': {err}"))?;
+    let session_id = optional_uuid(row.get("session_id"), "session_id")?;
+    let turn_id = optional_uuid(row.get("turn_id"), "turn_id")?;
     let kind_raw: String = row.get("kind");
     let kind = ChannelStreamEventKind::from_str(&kind_raw)
         .map_err(|err| anyhow!("invalid channel stream event kind: {err}"))?;
@@ -1117,6 +1136,13 @@ fn map_stream_event_row(row: SqliteRow) -> Result<ChannelStreamEventRecord> {
         text: row.get("text"),
         created_at,
     })
+}
+
+fn optional_uuid(raw: Option<String>, column: &str) -> Result<Option<Uuid>> {
+    raw.map(|value| {
+        Uuid::parse_str(&value).map_err(|err| anyhow!("invalid {column} '{value}': {err}"))
+    })
+    .transpose()
 }
 
 fn map_message_row(row: SqliteRow) -> Result<ChannelMessageRecord> {

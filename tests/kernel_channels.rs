@@ -5,10 +5,10 @@ use lionclaw::{
     contracts::{
         ChannelBindRequest, ChannelInboundOutcome, ChannelInboundRequest,
         ChannelPeerApproveRequest, ChannelPeerBlockRequest, ChannelStreamAckRequest,
-        ChannelStreamPullRequest, ChannelStreamStartMode, PolicyGrantRequest, SessionActionKind,
-        SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery,
-        SessionOpenRequest, SessionTurnRequest, SessionTurnStatus, SkillInstallRequest,
-        StreamEventKindDto, StreamLaneDto, TrustTier,
+        ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamStartMode,
+        PolicyGrantRequest, SessionActionKind, SessionActionRequest, SessionHistoryPolicy,
+        SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest, SessionTurnRequest,
+        SessionTurnStatus, SkillInstallRequest, StreamEventKindDto, StreamLaneDto, TrustTier,
     },
     kernel::{
         runtime::{
@@ -172,7 +172,9 @@ description: inbound skill for channel flow
         .await
         .expect("approved inbound turn should succeed");
     assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
-    assert!(queued.turn_id.is_some());
+    let queued_turn_id = queued
+        .turn_id
+        .expect("queued inbound response should include turn id");
     assert!(queued.session_id.is_some());
 
     // Duplicate update id should be ignored by dedupe index.
@@ -216,12 +218,14 @@ description: inbound skill for channel flow
     assert!(codes.contains(&"queue.queued"));
     assert!(codes.contains(&"queue.started"));
     assert!(codes.contains(&"queue.completed"));
+    let (completed_position, _) =
+        assert_turn_completed_before_done(&stream.events, queued_turn_id, "queued channel turn");
     assert!(
-        stream
-            .events
-            .iter()
-            .any(|event| event.kind == StreamEventKindDto::Done),
-        "queued channel turn should terminate with done"
+        stream.events[completed_position]
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("[mock]")),
+        "queued channel turn should publish a canonical completed answer snapshot"
     );
 
     let queued_events = kernel
@@ -312,16 +316,25 @@ description: channel outbox skill
         })
         .await
         .expect("pull stream");
-    assert!(
-        stream.events.iter().any(|event| {
+    let pairing_event = stream
+        .events
+        .iter()
+        .find(|event| {
             event.kind == StreamEventKindDto::MessageDelta
                 && event.lane == Some(StreamLaneDto::Answer)
                 && event
                     .text
                     .as_deref()
                     .is_some_and(|text| text.contains("Pairing required"))
-        }),
-        "pairing prompt should stream as answer delta"
+        })
+        .expect("pairing prompt should stream as answer delta");
+    assert_eq!(
+        pairing_event.session_id, None,
+        "channel-scoped pairing prompts must not advertise a fake session"
+    );
+    assert_eq!(
+        pairing_event.turn_id, None,
+        "channel-scoped pairing prompts must not advertise a fake turn"
     );
     let through_sequence = stream
         .events
@@ -574,6 +587,57 @@ async fn channel_backed_session_open_requires_approved_peer() {
         .expect("approved peer session open");
     assert_eq!(opened.trust_tier.as_str(), TrustTier::Main.as_str());
     assert_eq!(opened.history_policy, SessionHistoryPolicy::Interactive);
+}
+
+#[tokio::test]
+async fn direct_channel_session_turn_streams_turn_completed_then_done() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    install_and_bind_channel(&kernel, "terminal", "direct-turn-skill", "mock").await;
+    create_pending_peer(
+        &kernel,
+        "terminal",
+        "peer-direct",
+        "mock",
+        7051,
+        "direct-7051",
+    )
+    .await;
+    approve_peer(&kernel, "terminal", "peer-direct").await;
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-direct".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open direct channel session");
+
+    let response = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "direct channel turn".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("run direct channel turn");
+
+    let stream = kernel
+        .pull_channel_stream(ChannelStreamPullRequest {
+            channel_id: "terminal".to_string(),
+            consumer_id: "terminal-direct-turn".to_string(),
+            start_mode: Some(ChannelStreamStartMode::Resume),
+            start_after_sequence: None,
+            limit: Some(50),
+            wait_ms: Some(0),
+        })
+        .await
+        .expect("pull direct channel stream");
+    assert_turn_completed_before_done(&stream.events, response.turn_id, "direct channel turn");
 }
 
 #[tokio::test]
@@ -1051,6 +1115,58 @@ async fn install_and_bind_channel(
         .expect("grant skill use");
 }
 
+fn assert_turn_completed_before_done(
+    events: &[ChannelStreamEventView],
+    turn_id: uuid::Uuid,
+    context: &str,
+) -> (usize, usize) {
+    let completed_position = events
+        .iter()
+        .position(|event| {
+            event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::TurnCompleted
+        })
+        .unwrap_or_else(|| panic!("{context} should publish turn_completed"));
+    let done_position = events
+        .iter()
+        .position(|event| event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::Done)
+        .unwrap_or_else(|| panic!("{context} should publish done"));
+    let done_count = events
+        .iter()
+        .filter(|event| event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::Done)
+        .count();
+    assert_eq!(done_count, 1, "{context} should publish exactly one done");
+    assert!(
+        completed_position < done_position,
+        "{context} should publish turn_completed before done"
+    );
+    (completed_position, done_position)
+}
+
+fn assert_error_before_done(
+    events: &[ChannelStreamEventView],
+    turn_id: uuid::Uuid,
+    context: &str,
+) -> (usize, usize) {
+    let error_position = events
+        .iter()
+        .position(|event| event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::Error)
+        .unwrap_or_else(|| panic!("{context} should publish error"));
+    let done_position = events
+        .iter()
+        .position(|event| event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::Done)
+        .unwrap_or_else(|| panic!("{context} should publish done"));
+    let done_count = events
+        .iter()
+        .filter(|event| event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::Done)
+        .count();
+    assert_eq!(done_count, 1, "{context} should publish exactly one done");
+    assert!(
+        error_position < done_position,
+        "{context} should publish error before done"
+    );
+    (error_position, done_position)
+}
+
 async fn create_pending_peer(
     kernel: &Kernel,
     channel_id: &str,
@@ -1339,6 +1455,142 @@ impl RuntimeAdapter for PartialFailureAdapter {
     async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<(), anyhow::Error> {
         Ok(())
     }
+}
+
+struct FailingSessionStartAdapter {
+    message: String,
+}
+
+#[async_trait]
+impl RuntimeAdapter for FailingSessionStartAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "failing-start".to_string(),
+            version: "test".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        _input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle, anyhow::Error> {
+        Err(anyhow::anyhow!(self.message.clone()))
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        _event_tx: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult, anyhow::Error> {
+        unreachable!("session_start fails before turn execution")
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        _event_tx: RuntimeEventSender,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn cancel(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn channel_session_start_failure_streams_error_before_done() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    install_and_bind_channel(&kernel, "terminal", "start-failure-skill", "failing-start").await;
+    kernel
+        .register_runtime_adapter(
+            "failing-start",
+            std::sync::Arc::new(FailingSessionStartAdapter {
+                message: "runtime failed before turn".to_string(),
+            }),
+        )
+        .await;
+
+    create_pending_peer(
+        &kernel,
+        "terminal",
+        "peer-start-failure",
+        "failing-start",
+        7351,
+        "start-failure-7351",
+    )
+    .await;
+    approve_peer(&kernel, "terminal", "peer-start-failure").await;
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-start-failure".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open interactive channel session");
+
+    let err = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "fail before stream".to_string(),
+            runtime_id: Some("failing-start".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect_err("session_start failure should fail turn");
+    assert!(
+        matches!(err, KernelError::Runtime(message) if message.contains("runtime failed before turn"))
+    );
+
+    let history = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: session.session_id,
+            limit: Some(12),
+        })
+        .await
+        .expect("session history");
+    let failed_turn = history.turns.last().expect("failed turn");
+    assert_eq!(failed_turn.status, SessionTurnStatus::Failed);
+    assert_eq!(failed_turn.error_code.as_deref(), Some("runtime.error"));
+    assert_eq!(
+        failed_turn.error_text.as_deref(),
+        Some("runtime failed before turn")
+    );
+
+    let stream = kernel
+        .pull_channel_stream(ChannelStreamPullRequest {
+            channel_id: "terminal".to_string(),
+            consumer_id: "terminal-start-failure".to_string(),
+            start_mode: Some(ChannelStreamStartMode::Resume),
+            start_after_sequence: None,
+            limit: Some(50),
+            wait_ms: Some(0),
+        })
+        .await
+        .expect("pull failure stream");
+    let (error_position, _) =
+        assert_error_before_done(&stream.events, failed_turn.turn_id, "session_start failure");
+    let error_event = &stream.events[error_position];
+    assert_eq!(error_event.code.as_deref(), Some("runtime.error"));
+    assert_eq!(
+        error_event.text.as_deref(),
+        Some("runtime failed before turn")
+    );
 }
 
 #[tokio::test]
