@@ -200,6 +200,25 @@ class ChannelViewStateTests(unittest.TestCase):
         self.assertNotIn("partial", transcript)
         self.assertFalse(state.input_disabled())
 
+    def test_done_terminates_stream_without_implying_success(self):
+        state = ChannelViewState(peer_id="mosh")
+        state.begin_submit("hello")
+        state.mark_queued("turn-1")
+
+        state.apply_stream_event(
+            StreamEvent(
+                sequence=1,
+                peer_id="mosh",
+                turn_id="turn-1",
+                kind="done",
+            )
+        )
+
+        turn = state.turns["turn-1"]
+        self.assertEqual(turn.status, "running")
+        self.assertIsNone(state.active_turn_id)
+        self.assertFalse(state.input_disabled())
+
     def test_mark_queued_preserves_completed_stream_events_that_arrived_first(self):
         state = ChannelViewState(peer_id="mosh")
         state.begin_submit("hello")

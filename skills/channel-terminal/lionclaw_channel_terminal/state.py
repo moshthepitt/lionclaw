@@ -257,10 +257,9 @@ class ChannelViewState:
                 return
             self.pending_submission = False
             if event.turn_id == self.active_turn_id:
-                turn = self._ensure_turn(event.turn_id)
-                if turn.status == "running":
-                    turn.status = "completed" if turn.error_text is None else "failed"
-                turn.restored_running = False
+                turn = self.turns.get(event.turn_id)
+                if turn is not None:
+                    turn.restored_running = False
                 self.active_turn_id = None
                 self.restored_running_turn = False
 

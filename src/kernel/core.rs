@@ -537,6 +537,16 @@ impl Kernel {
                 {
                     if let Some(sequence) = channel_turn.answer_checkpoint_sequence {
                         Some(sequence)
+                    } else if let Some(sequence) = self
+                        .channel_state
+                        .first_answer_stream_sequence_for_turn(
+                            &channel_turn.channel_id,
+                            channel_turn.turn_id,
+                        )
+                        .await
+                        .map_err(internal)?
+                    {
+                        Some(sequence.saturating_sub(1))
                     } else {
                         Some(
                             self.channel_state
@@ -4566,6 +4576,12 @@ fn summarize_runtime_events(events: &[RuntimeEvent]) -> SessionTurnArtifacts {
     }
 }
 
+fn runtime_events_include_error(events: &[RuntimeEvent]) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, RuntimeEvent::Error { .. }))
+}
+
 fn last_runtime_error(events: &[RuntimeEvent]) -> Option<(String, String)> {
     events.iter().rev().find_map(|event| match event {
         RuntimeEvent::Error { code, text } => Some((
@@ -4656,6 +4672,13 @@ struct SessionTurnArtifacts {
     assistant_text: String,
     event_views: Vec<StreamEventDto>,
     saw_error: bool,
+}
+
+struct FailedSessionTurnCompletion {
+    assistant_text: String,
+    error_code: String,
+    error_text: String,
+    stream_error_emitted: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -4926,22 +4949,25 @@ impl Kernel {
                 runtime_state_root: Self::runtime_state_root(&execution_plan)
                     .map(Path::to_path_buf),
             })
-            .await
-            .map_err(|err| KernelError::Runtime(err.to_string()));
+            .await;
 
         let handle = match handle {
             Ok(handle) => handle,
             Err(err) => {
+                let error_text = err.to_string();
                 self.persist_failed_session_turn(
                     session,
                     &persisted_turn,
-                    String::new(),
-                    "runtime.error".to_string(),
-                    err.to_string(),
+                    FailedSessionTurnCompletion {
+                        assistant_text: String::new(),
+                        error_code: "runtime.error".to_string(),
+                        error_text: error_text.clone(),
+                        stream_error_emitted: false,
+                    },
                     channel_stream_finalizer,
                 )
                 .await?;
-                return Err(err);
+                return Err(KernelError::Runtime(error_text));
             }
         };
 
@@ -4992,12 +5018,16 @@ impl Kernel {
                     warn!(?err, runtime_id, session_id = %session.session_id, "failed to close runtime session after turn error");
                 }
                 let assistant_text = assistant_text_from_events(&turn_err.events);
+                let stream_error_emitted = runtime_events_include_error(&turn_err.events);
                 self.persist_failed_session_turn(
                     session,
                     &persisted_turn,
-                    assistant_text,
-                    turn_err.error_code.clone(),
-                    turn_err.error_text.clone(),
+                    FailedSessionTurnCompletion {
+                        assistant_text,
+                        error_code: turn_err.error_code.clone(),
+                        error_text: turn_err.error_text.clone(),
+                        stream_error_emitted,
+                    },
                     channel_stream_finalizer,
                 )
                 .await?;
@@ -5067,9 +5097,12 @@ impl Kernel {
                 self.persist_failed_session_turn(
                     session,
                     &persisted_turn,
-                    pre_followup_assistant.clone(),
-                    "runtime.error".to_string(),
-                    err.to_string(),
+                    FailedSessionTurnCompletion {
+                        assistant_text: pre_followup_assistant.clone(),
+                        error_code: "runtime.error".to_string(),
+                        error_text: err.to_string(),
+                        stream_error_emitted: false,
+                    },
                     channel_stream_finalizer,
                 )
                 .await?;
@@ -5078,12 +5111,16 @@ impl Kernel {
             (Ok(events), Err(close_err)) => {
                 self.clear_runtime_session_ready(&execution_plan).await;
                 let assistant_text = assistant_text_from_events(&events);
+                let stream_error_emitted = runtime_events_include_error(&events);
                 self.persist_failed_session_turn(
                     session,
                     &persisted_turn,
-                    assistant_text,
-                    "runtime.error".to_string(),
-                    close_err.to_string(),
+                    FailedSessionTurnCompletion {
+                        assistant_text,
+                        error_code: "runtime.error".to_string(),
+                        error_text: close_err.to_string(),
+                        stream_error_emitted,
+                    },
                     channel_stream_finalizer,
                 )
                 .await?;
@@ -5094,9 +5131,12 @@ impl Kernel {
                 self.persist_failed_session_turn(
                     session,
                     &persisted_turn,
-                    pre_followup_assistant,
-                    "runtime.error".to_string(),
-                    err.to_string(),
+                    FailedSessionTurnCompletion {
+                        assistant_text: pre_followup_assistant,
+                        error_code: "runtime.error".to_string(),
+                        error_text: err.to_string(),
+                        stream_error_emitted: false,
+                    },
                     channel_stream_finalizer,
                 )
                 .await?;
@@ -5111,9 +5151,12 @@ impl Kernel {
             self.persist_failed_session_turn(
                 session,
                 &persisted_turn,
-                artifacts.assistant_text.clone(),
-                error_code,
-                error_text.clone(),
+                FailedSessionTurnCompletion {
+                    assistant_text: artifacts.assistant_text.clone(),
+                    error_code,
+                    error_text: error_text.clone(),
+                    stream_error_emitted: artifacts.saw_error,
+                },
                 channel_stream_finalizer,
             )
             .await?;
@@ -5224,11 +5267,15 @@ impl Kernel {
         &self,
         session: &super::sessions::Session,
         persisted_turn: &SessionTurnRecord,
-        assistant_text: String,
-        error_code: String,
-        error_text: String,
+        failure: FailedSessionTurnCompletion,
         channel_stream_finalizer: ChannelStreamFinalizer<'_>,
     ) -> Result<(), KernelError> {
+        let FailedSessionTurnCompletion {
+            assistant_text,
+            error_code,
+            error_text,
+            stream_error_emitted,
+        } = failure;
         let status = session_turn_status_for_error_code(&error_code);
 
         self.session_turns
@@ -5237,7 +5284,7 @@ impl Kernel {
                 SessionTurnCompletion {
                     status,
                     assistant_text,
-                    error_code: Some(error_code),
+                    error_code: Some(error_code.clone()),
                     error_text: Some(error_text.clone()),
                 },
             )
@@ -5265,6 +5312,13 @@ impl Kernel {
             )
             .await;
         }
+        self.emit_channel_stream_error_if_missing(
+            channel_stream_finalizer,
+            &error_code,
+            &error_text,
+            stream_error_emitted,
+        )
+        .await?;
         self.emit_channel_stream_done_if_requested(channel_stream_finalizer)
             .await?;
         Ok(())
@@ -5720,6 +5774,36 @@ impl Kernel {
             text: Some(assistant_text),
         })
         .await
+    }
+
+    async fn emit_channel_stream_error_if_missing(
+        &self,
+        finalizer: ChannelStreamFinalizer<'_>,
+        error_code: &str,
+        error_text: &str,
+        stream_error_emitted: bool,
+    ) -> Result<(), KernelError> {
+        if stream_error_emitted {
+            return Ok(());
+        }
+
+        let Some(context) = finalizer.stream_context else {
+            return Ok(());
+        };
+
+        self.append_channel_stream_event(ChannelStreamEventInsert {
+            channel_id: &context.channel_id,
+            peer_id: &context.peer_id,
+            session_id: Some(context.session_id),
+            turn_id: Some(context.turn_id),
+            kind: ChannelStreamEventKind::Error,
+            lane: None,
+            code: Some(error_code),
+            text: Some(error_text),
+        })
+        .await?;
+
+        Ok(())
     }
 
     async fn emit_channel_stream_done_if_requested(
