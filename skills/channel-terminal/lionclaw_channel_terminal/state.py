@@ -176,8 +176,8 @@ class ChannelViewState:
         if event.peer_id != self.peer_id:
             return
 
-        if event.session_id is not None:
-            self.active_session_id = event.session_id
+        # Session selection is explicit. Stream replay can contain older sessions for
+        # the same peer, so event.session_id must not retarget the interactive view.
         if event.turn_id is not None and event.turn_id == self.active_turn_id:
             self.restored_running_turn = False
             turn = self.turns.get(event.turn_id)
