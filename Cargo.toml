@@ -50,7 +50,7 @@ async-trait = "0.1"
 axum = { version = "0.7", features = ["macros", "json"] }
 base64 = "0.22"
 chrono-tz = "0.10"
-cron = "0.12"
+cron = "0.16"
 http-body-util = "0.1"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 clap = { version = "4.6", features = ["derive"] }
