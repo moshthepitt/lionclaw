@@ -622,6 +622,7 @@ pub(crate) fn resolve_required_channel_env(
     required_env
         .iter()
         .map(|key| {
+            validate_required_channel_env_key(channel_id, key)?;
             let value = std::env::var(key).with_context(|| {
                 format!(
                     "required environment variable '{key}' is not set for channel '{channel_id}'"
@@ -630,6 +631,17 @@ pub(crate) fn resolve_required_channel_env(
             Ok((key.clone(), value))
         })
         .collect()
+}
+
+fn validate_required_channel_env_key(channel_id: &str, key: &str) -> Result<()> {
+    if key.is_empty() || key.contains('=') || key.contains('\0') {
+        return Err(anyhow!(
+            "channel '{channel_id}' has invalid required environment variable name '{}'",
+            key.escape_default()
+        ));
+    }
+
+    Ok(())
 }
 
 pub(crate) async fn render_runtime_cache(
@@ -915,6 +927,7 @@ async fn open_kernel_with_project_root(
     project_workspace_root: Option<PathBuf>,
     timeout_override: Option<RuntimeTurnTimeouts>,
 ) -> Result<Kernel> {
+    home.ensure_base_dirs().await?;
     let workspace_root = config.workspace_root(home);
     let applied_state = AppliedState::load(home).await?;
     let runtime_context =
@@ -962,8 +975,8 @@ mod tests {
     use super::{
         add_channel, add_skill, daemon_restart_required, managed_daemon_runtime_id, onboard,
         open_kernel, open_kernel_with_project_root, render_marker_file, render_runtime_cache,
-        resolve_installed_skill_worker_entrypoint, resolve_worker_entrypoint, status, up,
-        OnboardBindSelection, StackBinaryPaths,
+        resolve_installed_skill_worker_entrypoint, resolve_required_channel_env,
+        resolve_worker_entrypoint, status, up, OnboardBindSelection, StackBinaryPaths,
     };
     use crate::{
         applied::compute_daemon_fingerprint,
@@ -1152,6 +1165,37 @@ mod tests {
         open_kernel_with_project_root(&home, &config, None, None, None)
             .await
             .expect("state kernel helper should allow a missing project root");
+    }
+
+    #[tokio::test]
+    async fn state_kernel_open_initializes_fresh_home_dirs() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let config = OperatorConfig::load(&home)
+            .await
+            .expect("load default config");
+
+        open_kernel_with_project_root(&home, &config, None, None, None)
+            .await
+            .expect("state kernel helper should initialize a fresh home");
+
+        assert!(home.skills_dir().is_dir());
+        assert!(home.db_dir().is_dir());
+    }
+
+    #[test]
+    fn resolve_required_channel_env_rejects_invalid_env_keys_without_panicking() {
+        for key in ["", "BAD=KEY", "BAD\0KEY"] {
+            let result = std::panic::catch_unwind(|| {
+                resolve_required_channel_env("terminal", &[key.to_string()])
+            })
+            .expect("invalid required_env key should not panic");
+
+            let err = result.expect_err("invalid required_env key should fail");
+            assert!(err
+                .to_string()
+                .contains("invalid required environment variable name"));
+        }
     }
 
     #[test]
