@@ -12,6 +12,10 @@ Use them when you mean it.
 
 ## Available scripts
 - `ci.sh`: runs the local CI gate, mirrors the GitHub Actions `ci` workflow, and is the preferred pre-push verification entrypoint.
+- `lionclaw-project.sh`: incubates a project-local convenience flow that
+  resolves a workspace, project-local LionClaw home, runtime image, runtime,
+  terminal channel, and optional project skills while delegating durable state
+  changes to the canonical `lionclaw` CLI.
 - `bootstrap-terminal-test.sh`: bootstraps or refreshes a manual terminal-channel
   test home, gives a fresh home its own loopback bind, configures the runtime
   image and terminal channel, then attaches it in the current TTY.
@@ -60,6 +64,33 @@ Show options:
 ```bash
 ./scripts/install-channel-skill.sh --help
 ```
+
+Project-local LionClaw helper:
+```bash
+./scripts/lionclaw-project.sh doctor
+./scripts/lionclaw-project.sh configure
+./scripts/lionclaw-project.sh run
+```
+
+By default this uses the current Git root as the project, reuses an existing
+`<project>/lionclaw-home` when present, otherwise stores LionClaw state under
+`<project>/.lionclaw/home`. If the project has a root `Containerfile`, or
+exactly one `<project>/*/Containerfile`, the helper treats that directory as the
+workspace, derives an image tag like `<workspace>-runtime:v1`, and installs
+conventional project skills from `<project>/skills/*/SKILL.md`. Override those
+defaults explicitly when needed:
+```bash
+LIONCLAW_RUNTIME_IMAGE=my-project-runtime:v1 \
+LIONCLAW_RUNTIME_CONTAINERFILE=Containerfile \
+LIONCLAW_PROJECT_SKILLS='pdf-to-markdown=skills/pdf-to-markdown' \
+  ./scripts/lionclaw-project.sh configure
+```
+
+This helper is intentionally an incubation path. It should stay thin: project
+path resolution, preflight, runtime image build, and orchestration only. Durable
+configuration still flows through `lionclaw onboard`, `lionclaw runtime add`,
+`lionclaw skill add`, `lionclaw channel add`, `lionclaw run`,
+`lionclaw channel attach`, and `lionclaw service ...`.
 
 Fresh terminal-channel test home in one command on Linux with systemd user
 services:
