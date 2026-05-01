@@ -623,7 +623,9 @@ pub(crate) fn resolve_required_channel_env(
         .iter()
         .map(|key| {
             let value = std::env::var(key).with_context(|| {
-                format!("required environment variable '{key}' is not set for channel '{channel_id}'")
+                format!(
+                    "required environment variable '{key}' is not set for channel '{channel_id}'"
+                )
             })?;
             Ok((key.clone(), value))
         })
