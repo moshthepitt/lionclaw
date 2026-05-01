@@ -57,6 +57,40 @@ async fn add_channel_rejects_invalid_alias() {
 }
 
 #[tokio::test]
+async fn list_channels_returns_config_derived_binding_fields() {
+    let env = TestHome::new().await;
+    let skill_source = write_skill_source(
+        env.temp_dir(),
+        "interactive-skill",
+        "interactive skill for channel tests",
+        true,
+    );
+    env.install_skill("interactive-skill", &skill_source).await;
+    add_channel(
+        env.home(),
+        "terminal".to_string(),
+        "interactive-skill".to_string(),
+        ChannelLaunchMode::Interactive,
+        Vec::new(),
+    )
+    .await
+    .expect("add interactive channel");
+
+    let kernel = env.kernel().await;
+    let bindings = kernel
+        .list_channels()
+        .await
+        .expect("list channels")
+        .bindings;
+
+    assert_eq!(bindings.len(), 1);
+    let binding = &bindings[0];
+    assert_eq!(binding.channel_id, "terminal");
+    assert_eq!(binding.skill_alias, "interactive-skill");
+    assert_eq!(binding.launch_mode, "interactive");
+}
+
+#[tokio::test]
 async fn channel_peer_must_be_approved_before_inbound_turn_executes() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "local-cli", "channel-inbound-skill").await;

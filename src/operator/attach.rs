@@ -13,8 +13,8 @@ use crate::{
         config::ChannelLaunchMode,
         daemon_probe::{classify_daemon, wait_for_same_home_daemon, DaemonClassification},
         reconcile::{
-            base_url_from_bind, load_operator_state, resolve_applied_skill_worker_entrypoint, up,
-            StackBinaryPaths,
+            base_url_from_bind, load_operator_state, resolve_applied_skill_worker_entrypoint,
+            resolve_required_channel_env, up, StackBinaryPaths,
         },
         runtime::{
             resolve_runtime_execution_context, resolve_runtime_id,
@@ -181,10 +181,8 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
     };
 
     let channel = applied
-        .config
-        .channels
-        .iter()
-        .find(|channel| channel.id == channel_id)
+        .applied_state
+        .channel(&channel_id)
         .ok_or_else(|| anyhow!("channel '{channel_id}' is not configured"))?;
     if channel.launch_mode != ChannelLaunchMode::Interactive {
         return Err(anyhow!(
@@ -195,7 +193,7 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
     }
 
     let worker_path =
-        resolve_applied_skill_worker_entrypoint(&applied.applied_state, &channel.skill)
+        resolve_applied_skill_worker_entrypoint(&applied.applied_state, &channel.skill_alias)
             .with_context(|| format!("channel '{}' worker resolution failed", channel.id))?;
     let effective_runtime_id = match requested_runtime_id.as_deref() {
         Some(runtime_id) => Some(applied.config.resolve_runtime_id(Some(runtime_id))?),
@@ -231,6 +229,9 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
         if !path.trim().is_empty() {
             env.insert("PATH".to_string(), path);
         }
+    }
+    for (key, value) in resolve_required_channel_env(&channel.id, &channel.required_env)? {
+        env.insert(key, value);
     }
     if let Some(runtime_id) = effective_runtime_id {
         env.insert("LIONCLAW_RUNTIME_ID".to_string(), runtime_id);
@@ -633,6 +634,65 @@ mod tests {
                 .expect("unit status"),
             "loaded/active/running"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_channel_attach_requires_and_exports_required_env_for_interactive_channels() {
+        let (_temp_dir, home, manager) =
+            seed_interactive_channel(ChannelLaunchMode::Interactive).await;
+        add_channel(
+            &home,
+            "terminal".to_string(),
+            "terminal".to_string(),
+            ChannelLaunchMode::Interactive,
+            vec!["PATH".to_string()],
+        )
+        .await
+        .expect("update channel required env");
+
+        let spec = prepare_channel_attach(
+            &home,
+            &manager,
+            "terminal".to_string(),
+            Some("mosh".to_string()),
+            Some("codex".to_string()),
+            &current_project_scope(),
+            &binaries(),
+        )
+        .await
+        .expect("prepare attach");
+
+        assert!(spec
+            .env
+            .iter()
+            .any(|(key, value)| key == "PATH" && !value.is_empty()));
+
+        add_channel(
+            &home,
+            "terminal".to_string(),
+            "terminal".to_string(),
+            ChannelLaunchMode::Interactive,
+            vec!["LIONCLAW_TEST_MISSING_REQUIRED_ENV".to_string()],
+        )
+        .await
+        .expect("update channel with missing required env");
+
+        let err = prepare_channel_attach(
+            &home,
+            &manager,
+            "terminal".to_string(),
+            Some("mosh".to_string()),
+            Some("codex".to_string()),
+            &current_project_scope(),
+            &binaries(),
+        )
+        .await
+        .expect_err("missing required env should fail");
+
+        assert!(err
+            .to_string()
+            .contains("LIONCLAW_TEST_MISSING_REQUIRED_ENV"));
     }
 
     #[cfg(unix)]

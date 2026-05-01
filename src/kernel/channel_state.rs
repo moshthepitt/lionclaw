@@ -2,7 +2,6 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use serde_json::Value;
 use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
@@ -45,8 +44,7 @@ impl FromStr for ChannelPeerStatus {
 pub struct ChannelBindingRecord {
     pub channel_id: String,
     pub skill_alias: String,
-    pub config: Value,
-    pub updated_at: DateTime<Utc>,
+    pub launch_mode: String,
 }
 
 #[derive(Debug, Clone)]

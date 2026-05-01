@@ -156,7 +156,7 @@ async fn reconcile_skill_symlinks(root: &Path, desired: &BTreeMap<String, String
         existing.insert(alias.clone());
 
         let Some(target) = desired.get(&alias) else {
-            remove_managed_path(&path).await?;
+            remove_stale_managed_symlink(&path).await?;
             continue;
         };
 
@@ -164,8 +164,7 @@ async fn reconcile_skill_symlinks(root: &Path, desired: &BTreeMap<String, String
             continue;
         }
 
-        remove_managed_path(&path).await?;
-        create_symlink(target, &path).await?;
+        replace_managed_symlink(&path, &alias, target).await?;
     }
 
     for (alias, target) in desired {
@@ -197,19 +196,52 @@ async fn symlink_points_to(path: &Path, expected_target: &str) -> Result<bool> {
     Ok(target == Path::new(expected_target))
 }
 
-async fn remove_managed_path(path: &Path) -> Result<()> {
+async fn remove_stale_managed_symlink(path: &Path) -> Result<()> {
+    if !managed_skill_symlink(path).await? {
+        return Ok(());
+    }
+    remove_symlink(path).await
+}
+
+async fn replace_managed_symlink(path: &Path, alias: &str, target: &str) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .await
         .with_context(|| format!("failed to stat {}", path.display()))?;
-    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-        fs::remove_dir_all(path)
-            .await
-            .with_context(|| format!("failed to remove {}", path.display()))?;
-    } else {
-        fs::remove_file(path)
-            .await
-            .with_context(|| format!("failed to remove {}", path.display()))?;
+    if !metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "runtime skill alias '{}' already exists at '{}' and is not LionClaw-managed",
+            alias,
+            path.display()
+        );
     }
+    if !managed_skill_symlink(path).await? {
+        anyhow::bail!(
+            "runtime skill alias '{}' already exists at '{}' and is not LionClaw-managed",
+            alias,
+            path.display()
+        );
+    }
+    remove_symlink(path).await?;
+    create_symlink(target, path).await
+}
+
+async fn managed_skill_symlink(path: &Path) -> Result<bool> {
+    let metadata = fs::symlink_metadata(path)
+        .await
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    if !metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let target = fs::read_link(path)
+        .await
+        .with_context(|| format!("failed to read link {}", path.display()))?;
+    Ok(target.starts_with(SKILLS_MOUNT_TARGET_ROOT))
+}
+
+async fn remove_symlink(path: &Path) -> Result<()> {
+    fs::remove_file(path)
+        .await
+        .with_context(|| format!("failed to remove {}", path.display()))?;
     Ok(())
 }
 
@@ -327,6 +359,58 @@ mod tests {
         assert!(!tokio::fs::try_exists(stale_root.join("old"))
             .await
             .expect("check stale link"));
+    }
+
+    #[tokio::test]
+    async fn preserves_unmanaged_runtime_skill_entries() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime");
+        let native_root = runtime_root.join("home/.codex/skills");
+        tokio::fs::create_dir_all(native_root.join("native"))
+            .await
+            .expect("create native dir");
+        tokio::task::spawn_blocking({
+            let stale = native_root.join("old");
+            move || std::os::unix::fs::symlink("/lionclaw/skills/old", stale)
+        })
+        .await
+        .expect("join stale link")
+        .expect("create stale link");
+
+        project_runtime_skills("codex", &runtime_root, &[])
+            .await
+            .expect("project empty skill set");
+
+        assert!(tokio::fs::try_exists(native_root.join("native"))
+            .await
+            .expect("check native dir"));
+        assert!(!tokio::fs::try_exists(native_root.join("old"))
+            .await
+            .expect("check stale link"));
+    }
+
+    #[tokio::test]
+    async fn rejects_alias_collision_with_unmanaged_runtime_entry() {
+        let temp_dir = tempdir().expect("temp dir");
+        let runtime_root = temp_dir.path().join("runtime");
+        let native_root = runtime_root.join("home/.codex/skills");
+        tokio::fs::create_dir_all(native_root.join("terminal"))
+            .await
+            .expect("create native dir");
+        let mounts = vec![MountSpec {
+            source: temp_dir.path().join("skills/terminal"),
+            target: "/lionclaw/skills/terminal".to_string(),
+            access: MountAccess::ReadOnly,
+        }];
+
+        let err = project_runtime_skills("codex", &runtime_root, &mounts)
+            .await
+            .expect_err("unmanaged alias collision should fail");
+
+        assert!(err.to_string().contains("not LionClaw-managed"));
+        assert!(tokio::fs::try_exists(native_root.join("terminal"))
+            .await
+            .expect("check native dir"));
     }
 
     #[tokio::test]

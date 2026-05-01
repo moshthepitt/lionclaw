@@ -213,6 +213,11 @@ fn applied_state_fingerprint(skills: &[AppliedSkill], channels: &[AppliedChannel
         hasher.update(b"\0");
         hasher.update(channel.launch_mode.as_str().as_bytes());
         hasher.update(b"\0");
+        for key in &channel.required_env {
+            hasher.update(b"required_env\0");
+            hasher.update(key.as_bytes());
+            hasher.update(b"\0");
+        }
     }
 
     hex::encode(hasher.finalize())
@@ -549,7 +554,7 @@ pub struct AppliedChannel {
     pub id: String,
     pub skill_alias: String,
     pub launch_mode: ChannelLaunchMode,
-    pub updated_at: DateTime<Utc>,
+    pub required_env: Vec<String>,
 }
 
 impl AppliedChannel {
@@ -558,7 +563,7 @@ impl AppliedChannel {
             id: config.id.clone(),
             skill_alias: config.skill.clone(),
             launch_mode: config.launch_mode,
-            updated_at: Utc::now(),
+            required_env: config.required_env.clone(),
         }
     }
 }
@@ -721,6 +726,46 @@ mod tests {
             .clone();
 
         assert_eq!(initial_snapshot, reloaded_snapshot);
+    }
+
+    #[tokio::test]
+    async fn channel_required_env_changes_applied_state_fingerprint() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        onboard(&home, None).await.expect("onboard");
+
+        let visible = home.skills_dir().join("visible");
+        fs::create_dir_all(&visible).expect("visible dir");
+        fs::write(
+            visible.join("SKILL.md"),
+            "---\nname: visible\ndescription: visible\n---\n",
+        )
+        .expect("visible skill");
+
+        let mut config = crate::operator::config::OperatorConfig::load(&home)
+            .await
+            .expect("load config");
+        config.upsert_channel(crate::operator::config::ManagedChannelConfig {
+            id: "terminal".to_string(),
+            skill: "visible".to_string(),
+            launch_mode: crate::operator::config::ChannelLaunchMode::Service,
+            required_env: vec!["FIRST_KEY".to_string()],
+        });
+        config.save(&home).await.expect("save first config");
+
+        let first = AppliedState::load(&home).await.expect("load first state");
+
+        config.upsert_channel(crate::operator::config::ManagedChannelConfig {
+            id: "terminal".to_string(),
+            skill: "visible".to_string(),
+            launch_mode: crate::operator::config::ChannelLaunchMode::Service,
+            required_env: vec!["SECOND_KEY".to_string()],
+        });
+        config.save(&home).await.expect("save second config");
+
+        let second = AppliedState::load(&home).await.expect("load second state");
+
+        assert_ne!(first.fingerprint(), second.fingerprint());
     }
 
     #[tokio::test]

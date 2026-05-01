@@ -400,6 +400,8 @@ manually by the operator.
   with `lionclaw channel attach <id>`. If no compatible daemon is already
   running, the attach path starts the daemon through the same systemd-backed
   manager.
+- If a channel declares `required_env`, both launch paths require those host
+  environment variables and pass them through to the worker.
 
 Worker entrypoint resolution requires `scripts/worker`.
 

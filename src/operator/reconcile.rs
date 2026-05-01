@@ -576,13 +576,14 @@ pub(crate) fn build_managed_units(
     ));
 
     let base_url = base_url_from_bind(&config.daemon.bind);
-    for channel in config
-        .channels
+    for channel in applied_state
+        .channels()
         .iter()
         .filter(|channel| channel.launch_mode == ChannelLaunchMode::Service)
     {
-        let worker_path = resolve_applied_skill_worker_entrypoint(applied_state, &channel.skill)
-            .with_context(|| format!("channel '{}' worker resolution failed", channel.id))?;
+        let worker_path =
+            resolve_applied_skill_worker_entrypoint(applied_state, &channel.skill_alias)
+                .with_context(|| format!("channel '{}' worker resolution failed", channel.id))?;
 
         let mut env = vec![
             (
@@ -596,15 +597,10 @@ pub(crate) fn build_managed_units(
                 home.runtime_channel_dir(&channel.id).display().to_string(),
             ),
         ];
-        for key in &channel.required_env {
-            let value = std::env::var(key).with_context(|| {
-                format!(
-                    "required environment variable '{}' is not set for channel '{}'",
-                    key, channel.id
-                )
-            })?;
-            env.push((key.clone(), value));
-        }
+        env.extend(resolve_required_channel_env(
+            &channel.id,
+            &channel.required_env,
+        )?);
 
         units.push(render_channel_unit(
             home,
@@ -617,6 +613,24 @@ pub(crate) fn build_managed_units(
     }
 
     Ok(units)
+}
+
+pub(crate) fn resolve_required_channel_env(
+    channel_id: &str,
+    required_env: &[String],
+) -> Result<Vec<(String, String)>> {
+    required_env
+        .iter()
+        .map(|key| {
+            let value = std::env::var(key).with_context(|| {
+                format!(
+                    "required environment variable '{}' is not set for channel '{}'",
+                    key, channel_id
+                )
+            })?;
+            Ok((key.clone(), value))
+        })
+        .collect()
 }
 
 pub(crate) async fn render_runtime_cache(

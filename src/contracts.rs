@@ -652,8 +652,7 @@ pub struct ContinuityOpenLoopActionResponse {
 pub struct ChannelBindingView {
     pub channel_id: String,
     pub skill_alias: String,
-    pub config: Value,
-    pub updated_at: DateTime<Utc>,
+    pub launch_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

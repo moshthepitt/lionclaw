@@ -1082,8 +1082,7 @@ impl Kernel {
             super::channel_state::ChannelBindingRecord {
                 channel_id: binding.id,
                 skill_alias: binding.skill_alias,
-                config: serde_json::Value::Object(Default::default()),
-                updated_at: binding.updated_at,
+                launch_mode: binding.launch_mode.as_str().to_string(),
             }
         }))
     }
@@ -3720,8 +3719,7 @@ fn to_channel_binding_view(binding: AppliedChannel) -> ChannelBindingView {
     ChannelBindingView {
         channel_id: binding.id,
         skill_alias: binding.skill_alias,
-        config: serde_json::Value::Object(Default::default()),
-        updated_at: binding.updated_at,
+        launch_mode: binding.launch_mode.as_str().to_string(),
     }
 }
 
