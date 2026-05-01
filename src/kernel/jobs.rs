@@ -1260,7 +1260,7 @@ pub fn compute_initial_next_run(
     now: DateTime<Utc>,
 ) -> Result<Option<DateTime<Utc>>> {
     match schedule {
-        JobSchedule::Once { run_at } => Ok(Some(if *run_at > now { *run_at } else { now })),
+        JobSchedule::Once { run_at } => Ok(Some(*run_at)),
         JobSchedule::Interval {
             every_ms,
             anchor_ms,
@@ -1544,6 +1544,17 @@ mod tests {
         .expect("cron next run present");
 
         assert!(next > now);
+    }
+
+    #[test]
+    fn overdue_one_shot_preserves_requested_run_time() {
+        let now = dt(2026, 3, 31, 9, 7, 0);
+        let run_at = now - ChronoDuration::minutes(5);
+        let next = compute_initial_next_run(&JobSchedule::Once { run_at }, now)
+            .expect("one-shot next run")
+            .expect("one-shot next run present");
+
+        assert_eq!(next, run_at);
     }
 
     #[tokio::test]
