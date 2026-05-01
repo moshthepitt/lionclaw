@@ -1130,6 +1130,11 @@ fn assert_turn_completed_before_done(
         .iter()
         .position(|event| event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::Done)
         .unwrap_or_else(|| panic!("{context} should publish done"));
+    let done_count = events
+        .iter()
+        .filter(|event| event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::Done)
+        .count();
+    assert_eq!(done_count, 1, "{context} should publish exactly one done");
     assert!(
         completed_position < done_position,
         "{context} should publish turn_completed before done"

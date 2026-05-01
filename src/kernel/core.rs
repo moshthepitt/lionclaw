@@ -5726,10 +5726,26 @@ impl Kernel {
         &self,
         finalizer: ChannelStreamFinalizer<'_>,
     ) -> Result<(), KernelError> {
-        if finalizer.emit_done {
-            self.emit_runtime_event(finalizer.stream_context, &None, RuntimeEvent::Done)
-                .await?;
+        if !finalizer.emit_done {
+            return Ok(());
         }
+
+        let Some(context) = finalizer.stream_context else {
+            return Ok(());
+        };
+
+        self.append_channel_stream_event(ChannelStreamEventInsert {
+            channel_id: &context.channel_id,
+            peer_id: &context.peer_id,
+            session_id: Some(context.session_id),
+            turn_id: Some(context.turn_id),
+            kind: ChannelStreamEventKind::Done,
+            lane: None,
+            code: None,
+            text: None,
+        })
+        .await?;
+
         Ok(())
     }
 
