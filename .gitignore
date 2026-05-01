@@ -7,3 +7,4 @@ lionclaw.db-shm
 lionclaw.db-wal
 .lionclaw-telegram-offset
 /.codex
+/.lionclaw/
