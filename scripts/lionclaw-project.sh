@@ -77,18 +77,20 @@ trim() {
 
 abs_dir() {
   local path="$1"
+  [[ -d "$path" ]] || return 1
   (cd "$path" && pwd -P)
 }
 
 abs_file() {
   local path="$1"
-  local parent base
+  local parent base abs_parent
   parent="$(dirname "$path")"
   base="$(basename "$path")"
-  printf '%s/%s\n' "$(abs_dir "$parent")" "$base"
+  abs_parent="$(abs_dir "$parent")" || return
+  printf '%s/%s\n' "$abs_parent" "$base"
 }
 
-resolve_existing_path() {
+resolve_path() {
   local base="$1"
   local raw="$2"
   if [[ "$raw" == /* ]]; then
@@ -96,6 +98,12 @@ resolve_existing_path() {
   else
     printf '%s/%s\n' "$base" "$raw"
   fi
+}
+
+abs_path() {
+  local base="$1"
+  local raw="$2"
+  realpath -m -- "$(resolve_path "$base" "$raw")"
 }
 
 resolve_project_root() {
@@ -136,7 +144,7 @@ resolve_default_workspace_root() {
   local project_containerfile="$2"
 
   if [[ -n "${LIONCLAW_WORKSPACE_ROOT:-}" ]]; then
-    abs_dir "$(resolve_existing_path "$project_root" "$LIONCLAW_WORKSPACE_ROOT")"
+    abs_dir "$(resolve_path "$project_root" "$LIONCLAW_WORKSPACE_ROOT")"
   elif [[ -n "$project_containerfile" ]]; then
     abs_dir "$(dirname "$project_containerfile")"
   else
@@ -148,7 +156,7 @@ resolve_default_home() {
   local project_root="$1"
 
   if [[ -n "${LIONCLAW_HOME:-}" ]]; then
-    printf '%s\n' "$LIONCLAW_HOME"
+    abs_path "$project_root" "$LIONCLAW_HOME"
   elif [[ -d "$project_root/lionclaw-home" || -f "$project_root/lionclaw-home/config/lionclaw.toml" ]]; then
     printf '%s/lionclaw-home\n' "$project_root"
   else
@@ -447,7 +455,7 @@ project_skill_specs_for_python() {
     source="${spec#*=}"
     [[ "$alias" != "$spec" && -n "$alias" && -n "$source" ]] \
       || die "invalid LIONCLAW_PROJECT_SKILLS entry '$spec'; expected alias=path"
-    resolved="$(resolve_existing_path "$PROJECT_ROOT" "$source")"
+    resolved="$(resolve_path "$PROJECT_ROOT" "$source")"
     printf '%s=%s\n' "$alias" "$(abs_dir "$resolved")"
   done
 }
@@ -590,7 +598,7 @@ install_project_skills() {
     source="${spec#*=}"
     [[ "$alias" != "$spec" && -n "$alias" && -n "$source" ]] \
       || die "invalid LIONCLAW_PROJECT_SKILLS entry '$spec'; expected alias=path"
-    resolved="$(resolve_existing_path "$PROJECT_ROOT" "$source")"
+    resolved="$(resolve_path "$PROJECT_ROOT" "$source")"
     [[ -d "$resolved" ]] || die "missing project skill source: $resolved"
     run_lionclaw_action skill add "$(abs_dir "$resolved")" --alias "$alias"
   done
@@ -720,7 +728,12 @@ else
 fi
 
 if [[ -n "${LIONCLAW_RUNTIME_CONTAINERFILE:-}" ]]; then
-  RUNTIME_IMAGE_CONTAINERFILE="$(abs_file "$(resolve_existing_path "$PROJECT_ROOT" "$LIONCLAW_RUNTIME_CONTAINERFILE")")"
+  runtime_containerfile_path="$(resolve_path "$PROJECT_ROOT" "$LIONCLAW_RUNTIME_CONTAINERFILE")"
+  if ! RUNTIME_IMAGE_CONTAINERFILE="$(abs_file "$runtime_containerfile_path")"; then
+    die "invalid LIONCLAW_RUNTIME_CONTAINERFILE parent: $(dirname "$runtime_containerfile_path")"
+  fi
+  [[ -f "$RUNTIME_IMAGE_CONTAINERFILE" ]] \
+    || die "missing runtime Containerfile: $RUNTIME_IMAGE_CONTAINERFILE"
 elif [[ -n "$PROJECT_CONTAINERFILE" ]]; then
   RUNTIME_IMAGE_CONTAINERFILE="$PROJECT_CONTAINERFILE"
 elif [[ -n "$LIONCLAW_REPO" ]]; then
@@ -730,7 +743,7 @@ else
 fi
 
 if [[ -n "${LIONCLAW_IMAGE_CONTEXT:-}" ]]; then
-  RUNTIME_IMAGE_CONTEXT="$(abs_dir "$(resolve_existing_path "$PROJECT_ROOT" "$LIONCLAW_IMAGE_CONTEXT")")"
+  RUNTIME_IMAGE_CONTEXT="$(abs_dir "$(resolve_path "$PROJECT_ROOT" "$LIONCLAW_IMAGE_CONTEXT")")"
 elif [[ -n "$LIONCLAW_REPO" && "$RUNTIME_IMAGE_CONTAINERFILE" == "$LIONCLAW_REPO/containers/runtime/Containerfile" ]]; then
   RUNTIME_IMAGE_CONTEXT="$LIONCLAW_REPO"
 else
