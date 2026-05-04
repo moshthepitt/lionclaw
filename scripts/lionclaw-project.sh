@@ -27,7 +27,7 @@ Environment overrides:
   LIONCLAW_WORKSPACE_ROOT         Default: single project */Containerfile dir, else project root
   LIONCLAW_HOME                   Default: existing <project>/lionclaw-home, else <project>/.lionclaw/home
   LIONCLAW_REPO                   Default: this script's repo, or sibling ../lionclaw
-  LIONCLAW_BIN                    Default: <lionclaw-repo>/target/debug/lionclaw, else PATH
+  LIONCLAW_BIN                    Default: <lionclaw-repo>/target/debug/lionclaw, else current PATH binary
   LIONCLAW_FORCE_BUILD=1          Force cargo build --bins before LionClaw commands
   LIONCLAW_RUNTIME_ID             Default: codex
   LIONCLAW_RUNTIME_KIND           Default: codex
@@ -509,6 +509,7 @@ validate_managed_config() {
     fi
 
     printf 'unable to validate managed project state in %s\n' "$config_file" >&2
+    printf 'Ensure LIONCLAW_BIN points to a current LionClaw binary for this script.\n' >&2
     printf '%s\n' "$validation_output" >&2
     return 2
   fi
