@@ -1,6 +1,6 @@
-use std::{str::FromStr, time::Duration};
+use std::{collections::BTreeMap, process::ExitCode, str::FromStr, time::Duration};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use cron::Schedule;
@@ -34,9 +34,12 @@ use crate::{
             validate_runtime_launch_prerequisites,
         },
         services::SystemdUserServiceManager,
+        snapshot::SKILL_INSTALL_METADATA_FILE,
     },
     runtime_timeouts::{parse_duration, RuntimeTurnTimeouts},
 };
+
+const PROJECT_VALIDATE_MISMATCH_EXIT: u8 = 20;
 
 #[derive(Debug, Parser)]
 #[command(name = "lionclaw")]
@@ -50,6 +53,8 @@ pub struct Cli {
 enum Command {
     Onboard(OnboardArgs),
     Run(RunArgs),
+    #[command(hide = true)]
+    ProjectValidate(ProjectValidateArgs),
     Runtime {
         #[command(subcommand)]
         command: Box<RuntimeCommand>,
@@ -96,6 +101,30 @@ struct OnboardArgs {
         help = "Daemon bind address or 'auto' for an isolated loopback port"
     )]
     bind: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ProjectValidateArgs {
+    #[arg(long = "runtime-id")]
+    runtime_id: String,
+    #[arg(long = "runtime-kind")]
+    runtime_kind: String,
+    #[arg(long = "runtime-bin")]
+    runtime_bin: String,
+    #[arg(long = "podman-bin")]
+    podman_bin: Option<String>,
+    #[arg(long = "runtime-image")]
+    runtime_image: String,
+    #[arg(long = "terminal-alias")]
+    terminal_alias: String,
+    #[arg(long = "terminal-source")]
+    terminal_source: String,
+    #[arg(long = "channel-id")]
+    channel_id: String,
+    #[arg(long = "launch-mode")]
+    launch_mode: String,
+    #[arg(long = "project-skill")]
+    project_skills: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -369,7 +398,7 @@ struct ContinuityPathArgs {
     relative_path: String,
 }
 
-pub async fn run() -> Result<()> {
+pub async fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
     let home = LionClawHome::from_env();
 
@@ -393,6 +422,17 @@ pub async fn run() -> Result<()> {
                 timeout_override,
             )
             .await?;
+        }
+        Command::ProjectValidate(args) => {
+            let issues = validate_project_managed_config(&home, &args).await?;
+            if issues.is_empty() {
+                println!("managed project state matches expected values");
+            } else {
+                for issue in issues {
+                    println!("{issue}");
+                }
+                return Ok(ExitCode::from(PROJECT_VALIDATE_MISMATCH_EXIT));
+            }
         }
         Command::Runtime { command } => match *command {
             RuntimeCommand::Add(args) => {
@@ -912,13 +952,155 @@ pub async fn run() -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn print_runtime_state_change_note() {
     println!(
         "direct runs pick this up on the next launch; rerun 'lionclaw service up' or 'lionclaw channel attach' if a managed daemon is already running"
     );
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ProjectSkillInstallMetadata {
+    #[serde(default)]
+    source: String,
+}
+
+async fn validate_project_managed_config(
+    home: &LionClawHome,
+    args: &ProjectValidateArgs,
+) -> Result<Vec<String>> {
+    let config = OperatorConfig::load(home).await?;
+    let expected_launch_mode =
+        ChannelLaunchMode::from_str(&args.launch_mode).map_err(anyhow::Error::msg)?;
+    let mut issues = Vec::new();
+
+    if let Some(runtime) = config.runtime(&args.runtime_id) {
+        if runtime.kind() != args.runtime_kind {
+            issues.push(format!(
+                "runtime {:?} has kind={:?}; expected {:?}",
+                args.runtime_id,
+                runtime.kind(),
+                args.runtime_kind
+            ));
+        }
+        if runtime.executable() != args.runtime_bin {
+            issues.push(format!(
+                "runtime {:?} has executable={:?}; expected {:?}",
+                args.runtime_id,
+                runtime.executable(),
+                args.runtime_bin
+            ));
+        }
+
+        let ConfinementConfig::Oci(confinement) = runtime.confinement();
+        if let Some(expected_engine) = args
+            .podman_bin
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if confinement.engine != expected_engine {
+                issues.push(format!(
+                    "runtime {:?} confinement.engine={:?}; expected {:?}",
+                    args.runtime_id, confinement.engine, expected_engine
+                ));
+            }
+        }
+        if confinement.image.as_deref() != Some(args.runtime_image.as_str()) {
+            issues.push(format!(
+                "runtime {:?} confinement.image={:?}; expected {:?}",
+                args.runtime_id, confinement.image, args.runtime_image
+            ));
+        }
+    }
+
+    if let Some(actual_default) = config.defaults.runtime.as_deref() {
+        if actual_default != args.runtime_id {
+            issues.push(format!(
+                "default runtime is {:?}; expected {:?}",
+                actual_default, args.runtime_id
+            ));
+        }
+    }
+
+    if let Some(channel) = config
+        .channels
+        .iter()
+        .find(|channel| channel.id == args.channel_id)
+    {
+        if channel.skill != args.terminal_alias {
+            issues.push(format!(
+                "channel {:?} has skill={:?}; expected {:?}",
+                args.channel_id, channel.skill, args.terminal_alias
+            ));
+        }
+        if channel.launch_mode != expected_launch_mode {
+            issues.push(format!(
+                "channel {:?} has launch_mode={:?}; expected {:?}",
+                args.channel_id,
+                channel.launch_mode.as_str(),
+                expected_launch_mode.as_str()
+            ));
+        }
+    }
+
+    let mut expected_skills = BTreeMap::new();
+    expected_skills.insert(
+        args.terminal_alias.clone(),
+        format!("local:{}", args.terminal_source),
+    );
+    for spec in &args.project_skills {
+        let (alias, source) = parse_project_skill_spec(spec)?;
+        expected_skills.insert(alias, source);
+    }
+
+    for (alias, expected_source) in expected_skills {
+        if let Some(actual_source) = installed_skill_source(home, &alias).await? {
+            if actual_source != expected_source {
+                issues.push(format!(
+                    "skill {alias:?} has source={actual_source:?}; expected {expected_source:?}"
+                ));
+            }
+        }
+    }
+
+    Ok(issues)
+}
+
+fn parse_project_skill_spec(raw: &str) -> Result<(String, String)> {
+    let (alias, source) = raw
+        .split_once('=')
+        .ok_or_else(|| anyhow!("invalid --project-skill '{raw}'; expected alias=path"))?;
+    let alias = alias.trim();
+    let source = source.trim();
+    if alias.is_empty() || source.is_empty() {
+        return Err(anyhow!(
+            "invalid --project-skill '{raw}'; expected alias=path"
+        ));
+    }
+    Ok((alias.to_string(), format!("local:{source}")))
+}
+
+async fn installed_skill_source(home: &LionClawHome, alias: &str) -> Result<Option<String>> {
+    let metadata_path = home
+        .skills_dir()
+        .join(alias)
+        .join(SKILL_INSTALL_METADATA_FILE);
+    if !tokio::fs::try_exists(&metadata_path)
+        .await
+        .with_context(|| format!("failed to stat {}", metadata_path.display()))?
+    {
+        return Ok(None);
+    }
+
+    let content = tokio::fs::read_to_string(&metadata_path)
+        .await
+        .with_context(|| format!("failed to read {}", metadata_path.display()))?;
+    let metadata: ProjectSkillInstallMetadata = toml::from_str(&content)
+        .with_context(|| format!("failed to parse {}", metadata_path.display()))?;
+    Ok((!metadata.source.trim().is_empty()).then_some(metadata.source))
 }
 
 fn parse_onboard_bind(raw: &str) -> Result<OnboardBindSelection> {
@@ -1213,6 +1395,92 @@ mod tests {
             .expect("load prompt file");
 
         assert_eq!(prompt, "repo status brief");
+    }
+
+    fn project_validate_args(root: &std::path::Path) -> ProjectValidateArgs {
+        ProjectValidateArgs {
+            runtime_id: "codex".to_string(),
+            runtime_kind: "codex".to_string(),
+            runtime_bin: "codex".to_string(),
+            podman_bin: Some("/usr/bin/podman".to_string()),
+            runtime_image: "project-runtime:v1".to_string(),
+            terminal_alias: "terminal".to_string(),
+            terminal_source: root
+                .join("skills/channel-terminal")
+                .to_string_lossy()
+                .to_string(),
+            channel_id: "terminal".to_string(),
+            launch_mode: "interactive".to_string(),
+            project_skills: Vec::new(),
+        }
+    }
+
+    fn project_runtime(image: &str) -> RuntimeProfileConfig {
+        RuntimeProfileConfig::Codex {
+            executable: "codex".to_string(),
+            model: None,
+            confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                engine: "/usr/bin/podman".to_string(),
+                image: Some(image.to_string()),
+                read_only_rootfs: false,
+                tmpfs: Vec::new(),
+                additional_mounts: Vec::new(),
+                limits: ExecutionLimits::default(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn project_validate_allows_missing_managed_entries() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let args = project_validate_args(temp_dir.path());
+
+        let issues = validate_project_managed_config(&home, &args)
+            .await
+            .expect("validate project config");
+
+        assert!(issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_validate_reports_existing_runtime_mismatch() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), project_runtime("old-runtime:v1"));
+        config.save(&home).await.expect("save config");
+        let args = project_validate_args(temp_dir.path());
+
+        let issues = validate_project_managed_config(&home, &args)
+            .await
+            .expect("validate project config");
+
+        assert!(issues
+            .iter()
+            .any(|issue| issue.contains("confinement.image")));
+    }
+
+    #[tokio::test]
+    async fn project_validate_reports_existing_skill_source_mismatch() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let skill_dir = home.skills_dir().join("terminal");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join(SKILL_INSTALL_METADATA_FILE),
+            "source = \"local:/other/channel-terminal\"\n",
+        )
+        .expect("skill metadata");
+        let args = project_validate_args(temp_dir.path());
+
+        let issues = validate_project_managed_config(&home, &args)
+            .await
+            .expect("validate project config");
+
+        assert!(issues
+            .iter()
+            .any(|issue| issue.contains("skill \"terminal\" has source")));
     }
 
     #[test]
