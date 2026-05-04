@@ -269,7 +269,9 @@ uses_repo_build_bin() {
 }
 
 ensure_lionclaw_bin() {
-  if [[ "${LIONCLAW_FORCE_BUILD:-0}" == "1" || ! -x "$LIONCLAW_BIN" ]] || uses_repo_build_bin; then
+  if [[ "${LIONCLAW_FORCE_BUILD:-0}" == "1" || ! -x "$LIONCLAW_BIN" ]]; then
+    build_lionclaw_bin
+  elif uses_repo_build_bin && has_cmd cargo; then
     build_lionclaw_bin
   fi
 
