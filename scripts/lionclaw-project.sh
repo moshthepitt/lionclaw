@@ -485,7 +485,7 @@ validate_managed_config() {
   config_file="$(config_path)"
   [[ -f "$config_file" ]] || return 0
 
-  local validation_output validation_status mismatch_status project_skill_spec
+  local validation_output validation_status mismatch_status project_skill_spec project_skill_specs_output
   validation_status=0
   mismatch_status=20
   local validate_args=(
@@ -504,10 +504,13 @@ validate_managed_config() {
     validate_args+=(--podman-bin "$PODMAN_BIN")
   fi
 
+  if ! project_skill_specs_output="$(project_skill_specs_for_validator)"; then
+    return 2
+  fi
   while IFS= read -r project_skill_spec; do
     [[ -n "$project_skill_spec" ]] || continue
     validate_args+=(--project-skill "$project_skill_spec")
-  done < <(project_skill_specs_for_validator)
+  done <<<"$project_skill_specs_output"
 
   validation_output="$(run_lionclaw "${validate_args[@]}" 2>&1)" || validation_status=$?
 
