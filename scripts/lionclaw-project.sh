@@ -27,7 +27,7 @@ Environment overrides:
   LIONCLAW_WORKSPACE_ROOT         Default: single project */Containerfile dir, else project root
   LIONCLAW_HOME                   Default: existing <project>/lionclaw-home, else <project>/.lionclaw/home
   LIONCLAW_REPO                   Default: this script's repo, or sibling ../lionclaw
-  LIONCLAW_BIN                    Default: <lionclaw-repo>/target/debug/lionclaw, else PATH
+  LIONCLAW_BIN                    Default: <lionclaw-repo>/target/debug/lionclaw, else current PATH binary
   LIONCLAW_FORCE_BUILD=1          Force cargo build --bins before LionClaw commands
   LIONCLAW_RUNTIME_ID             Default: codex
   LIONCLAW_RUNTIME_KIND           Default: codex
@@ -244,10 +244,6 @@ config_path() {
   printf '%s/config/lionclaw.toml\n' "$LIONCLAW_HOME"
 }
 
-ensure_python3() {
-  has_cmd python3 || die "python3 is required for project config validation"
-}
-
 ensure_podman() {
   [[ -n "$PODMAN_BIN" && -x "$PODMAN_BIN" ]] || die "podman is required; set LIONCLAW_PODMAN_BIN if it is not on PATH"
 }
@@ -258,15 +254,39 @@ ensure_systemd_user() {
     || die "systemd user services are unavailable for this shell"
 }
 
+build_lionclaw_bin() {
+  [[ -n "$LIONCLAW_REPO" ]] || die "missing LionClaw binary and LIONCLAW_REPO is not set"
+  has_cmd cargo || die "cargo is required to build LionClaw"
+  if is_dry_run; then
+    printf '[dry-run] (%s) cargo build --bins\n' "$LIONCLAW_REPO"
+  else
+    (cd "$LIONCLAW_REPO" && cargo build --bins)
+  fi
+}
+
+uses_repo_build_bin() {
+  [[ -n "$LIONCLAW_REPO" && "$LIONCLAW_BIN" == "$LIONCLAW_REPO/target/debug/lionclaw" ]]
+}
+
+repo_build_bin_is_stale() {
+  uses_repo_build_bin || return 1
+  [[ -x "$LIONCLAW_BIN" ]] || return 0
+
+  local path
+  for path in Cargo.toml Cargo.lock build.rs src; do
+    path="$LIONCLAW_REPO/$path"
+    [[ -e "$path" ]] || continue
+    [[ -n "$(find "$path" -newer "$LIONCLAW_BIN" -print -quit)" ]] && return 0
+  done
+
+  return 1
+}
+
 ensure_lionclaw_bin() {
   if [[ "${LIONCLAW_FORCE_BUILD:-0}" == "1" || ! -x "$LIONCLAW_BIN" ]]; then
-    [[ -n "$LIONCLAW_REPO" ]] || die "missing LionClaw binary and LIONCLAW_REPO is not set"
-    has_cmd cargo || die "cargo is required to build LionClaw"
-    if is_dry_run; then
-      printf '[dry-run] (%s) cargo build --bins\n' "$LIONCLAW_REPO"
-    else
-      (cd "$LIONCLAW_REPO" && cargo build --bins)
-    fi
+    build_lionclaw_bin
+  elif repo_build_bin_is_stale && has_cmd cargo; then
+    build_lionclaw_bin
   fi
 
   [[ -x "$LIONCLAW_BIN" ]] || die "missing LionClaw binary: $LIONCLAW_BIN"
@@ -444,7 +464,7 @@ ensure_home_onboarded() {
   fi
 }
 
-project_skill_specs_for_python() {
+project_skill_specs_for_validator() {
   local spec alias source resolved
   [[ -n "$PROJECT_SKILLS" ]] || return 0
   IFS=',' read -r -a skill_specs <<<"$PROJECT_SKILLS"
@@ -465,124 +485,52 @@ validate_managed_config() {
   config_file="$(config_path)"
   [[ -f "$config_file" ]] || return 0
 
-  ensure_python3
+  local validation_output validation_status mismatch_status project_skill_spec project_skill_specs_output
+  validation_status=0
+  mismatch_status=20
+  local validate_args=(
+    project-validate
+    --runtime-id "$RUNTIME_ID"
+    --runtime-kind "$RUNTIME_KIND"
+    --runtime-bin "$RUNTIME_BIN"
+    --runtime-image "$RUNTIME_IMAGE"
+    --terminal-alias "$TERMINAL_ALIAS"
+    --terminal-source "$TERMINAL_SKILL_SOURCE"
+    --channel-id "$CHANNEL_ID"
+    --launch-mode interactive
+  )
 
-  local project_skill_specs validation_output
-  project_skill_specs="$(project_skill_specs_for_python)"
+  if [[ -n "$PODMAN_BIN" ]]; then
+    validate_args+=(--podman-bin "$PODMAN_BIN")
+  fi
 
-  if ! validation_output="$(
-    CONFIG_FILE="$config_file" \
-    LIONCLAW_HOME="$LIONCLAW_HOME" \
-    EXPECT_RUNTIME_ID="$RUNTIME_ID" \
-    EXPECT_RUNTIME_KIND="$RUNTIME_KIND" \
-    EXPECT_RUNTIME_BIN="$RUNTIME_BIN" \
-    EXPECT_PODMAN_BIN="$PODMAN_BIN" \
-    EXPECT_RUNTIME_IMAGE="$RUNTIME_IMAGE" \
-    EXPECT_TERMINAL_ALIAS="$TERMINAL_ALIAS" \
-    EXPECT_TERMINAL_SOURCE="local:$TERMINAL_SKILL_SOURCE" \
-    EXPECT_CHANNEL_ID="$CHANNEL_ID" \
-    EXPECT_LAUNCH_MODE="interactive" \
-    EXPECT_PROJECT_SKILLS="$project_skill_specs" \
-    python3 - <<'PY'
-import os
-import pathlib
-import sys
-import tomllib
+  if ! project_skill_specs_output="$(project_skill_specs_for_validator)"; then
+    return 2
+  fi
+  while IFS= read -r project_skill_spec; do
+    [[ -n "$project_skill_spec" ]] || continue
+    validate_args+=(--project-skill "$project_skill_spec")
+  done <<<"$project_skill_specs_output"
 
-config_path = os.environ["CONFIG_FILE"]
-with open(config_path, "rb") as handle:
-    config = tomllib.load(handle)
+  validation_output="$(run_lionclaw "${validate_args[@]}" 2>&1)" || validation_status=$?
 
-issues = []
-
-runtime_id = os.environ["EXPECT_RUNTIME_ID"]
-runtime = (config.get("runtimes") or {}).get(runtime_id)
-if runtime is not None:
-    for key, expected in {
-        "kind": os.environ["EXPECT_RUNTIME_KIND"],
-        "executable": os.environ["EXPECT_RUNTIME_BIN"],
-    }.items():
-        actual = runtime.get(key)
-        if actual != expected:
-            issues.append(f"runtime {runtime_id!r} has {key}={actual!r}; expected {expected!r}")
-    confinement = runtime.get("confinement") or {}
-    for key, expected in {
-        "backend": "podman",
-        "image": os.environ["EXPECT_RUNTIME_IMAGE"],
-    }.items():
-        actual = confinement.get(key)
-        if actual != expected:
-            issues.append(
-                f"runtime {runtime_id!r} confinement.{key}={actual!r}; expected {expected!r}"
-            )
-    expected_engine = os.environ["EXPECT_PODMAN_BIN"]
-    if expected_engine:
-        actual_engine = confinement.get("engine")
-        if actual_engine != expected_engine:
-            issues.append(
-                f"runtime {runtime_id!r} confinement.engine={actual_engine!r}; expected {expected_engine!r}"
-            )
-
-actual_default = (config.get("defaults") or {}).get("runtime")
-if actual_default is not None and actual_default != runtime_id:
-    issues.append(f"default runtime is {actual_default!r}; expected {runtime_id!r}")
-
-channels = {
-    entry.get("id"): entry
-    for entry in config.get("channels") or []
-    if entry.get("id")
-}
-channel_id = os.environ["EXPECT_CHANNEL_ID"]
-channel = channels.get(channel_id)
-if channel is not None:
-    expected_skill = os.environ["EXPECT_TERMINAL_ALIAS"]
-    if channel.get("skill") != expected_skill:
-        issues.append(
-            f"channel {channel_id!r} has skill={channel.get('skill')!r}; expected {expected_skill!r}"
-        )
-    expected_launch = os.environ["EXPECT_LAUNCH_MODE"]
-    if channel.get("launch_mode") != expected_launch:
-        issues.append(
-            f"channel {channel_id!r} has launch_mode={channel.get('launch_mode')!r}; expected {expected_launch!r}"
-        )
-
-home = pathlib.Path(os.environ["LIONCLAW_HOME"])
-expected_skills = {
-    os.environ["EXPECT_TERMINAL_ALIAS"]: os.environ["EXPECT_TERMINAL_SOURCE"],
-}
-for line in os.environ["EXPECT_PROJECT_SKILLS"].splitlines():
-    if not line.strip():
-        continue
-    alias, source = line.split("=", 1)
-    expected_skills[alias] = f"local:{source}"
-
-for alias, expected_source in expected_skills.items():
-    metadata = home / "skills" / alias / ".lionclaw-skill.toml"
-    if not metadata.exists():
-        continue
-    with metadata.open("rb") as handle:
-        installed = tomllib.load(handle)
-    actual_source = installed.get("source")
-    if actual_source != expected_source:
-        issues.append(
-            f"skill {alias!r} has source={actual_source!r}; expected {expected_source!r}"
-        )
-
-if issues:
-    for issue in issues:
-        print(issue)
-    sys.exit(1)
-PY
-  )"; then
-    if [[ "${LIONCLAW_ALLOW_REWRITE:-0}" == "1" ]]; then
-      warn "continuing despite managed config mismatches because LIONCLAW_ALLOW_REWRITE=1"
+  if [[ "$validation_status" -ne 0 ]]; then
+    if [[ "$validation_status" -eq "$mismatch_status" ]]; then
+      if [[ "${LIONCLAW_ALLOW_REWRITE:-0}" == "1" ]]; then
+        warn "continuing despite managed config mismatches because LIONCLAW_ALLOW_REWRITE=1"
+        printf '%s\n' "$validation_output" >&2
+        return 0
+      fi
+      printf 'managed project state mismatch in %s\n' "$config_file" >&2
       printf '%s\n' "$validation_output" >&2
-      return 0
+      printf 'Set LIONCLAW_ALLOW_REWRITE=1 to let this script overwrite managed entries.\n' >&2
+      return 1
     fi
-    printf 'managed project state mismatch in %s\n' "$config_file" >&2
+
+    printf 'unable to validate managed project state in %s\n' "$config_file" >&2
+    printf 'Ensure LIONCLAW_BIN points to a current LionClaw binary for this script.\n' >&2
     printf '%s\n' "$validation_output" >&2
-    printf 'Set LIONCLAW_ALLOW_REWRITE=1 to let this script overwrite managed entries.\n' >&2
-    return 1
+    return 2
   fi
 }
 
@@ -624,14 +572,13 @@ ensure_project_config() {
 }
 
 doctor() {
-  local status=0 bind_addr config_file image_state image_status base_ref recorded_ref current_base_id recorded_base_id
+  local status=0 bind_addr config_file image_state image_status base_ref recorded_ref current_base_id recorded_base_id validation_status
   config_file="$(config_path)"
 
   print_context
   printf 'Workspace exists:  %s\n' "$( [[ -d "$WORKSPACE_ROOT" ]] && printf yes || printf no )"
   printf 'Config file:       %s\n' "$( [[ -f "$config_file" ]] && printf '%s' "$config_file" || printf 'missing (%s)' "$config_file" )"
   printf 'LionClaw binary:   %s\n' "$( [[ -x "$LIONCLAW_BIN" ]] && printf yes || printf no )"
-  printf 'Python3:           %s\n' "$( has_cmd python3 && printf yes || printf no )"
   printf 'Podman:            %s\n' "$( [[ -n "$PODMAN_BIN" && -x "$PODMAN_BIN" ]] && printf yes || printf no )"
   printf 'Terminal skill:    %s\n' "$( [[ -d "$TERMINAL_SKILL_SOURCE" ]] && printf yes || printf no )"
 
@@ -643,10 +590,24 @@ doctor() {
   if [[ -f "$config_file" ]]; then
     bind_addr="$(configured_bind)"
     printf 'Bind:              %s\n' "${bind_addr:-unknown}"
-    if validate_managed_config >/dev/null; then
-      printf 'Managed entries:   match expected project values\n'
+    if [[ -x "$LIONCLAW_BIN" ]]; then
+      validation_status=0
+      validate_managed_config >/dev/null || validation_status=$?
+      case "$validation_status" in
+        0)
+          printf 'Managed entries:   match expected project values\n'
+          ;;
+        1)
+          printf 'Managed entries:   mismatch expected project values\n'
+          status=1
+          ;;
+        *)
+          printf 'Managed entries:   unable to validate expected project values\n'
+          status=1
+          ;;
+      esac
     else
-      printf 'Managed entries:   mismatch expected project values\n'
+      printf 'Managed entries:   skipped (LionClaw binary missing)\n'
       status=1
     fi
   else
