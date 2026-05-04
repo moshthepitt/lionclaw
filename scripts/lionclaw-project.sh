@@ -268,10 +268,24 @@ uses_repo_build_bin() {
   [[ -n "$LIONCLAW_REPO" && "$LIONCLAW_BIN" == "$LIONCLAW_REPO/target/debug/lionclaw" ]]
 }
 
+repo_build_bin_is_stale() {
+  uses_repo_build_bin || return 1
+  [[ -x "$LIONCLAW_BIN" ]] || return 0
+
+  local path
+  for path in Cargo.toml Cargo.lock build.rs src; do
+    path="$LIONCLAW_REPO/$path"
+    [[ -e "$path" ]] || continue
+    [[ -n "$(find "$path" -newer "$LIONCLAW_BIN" -print -quit)" ]] && return 0
+  done
+
+  return 1
+}
+
 ensure_lionclaw_bin() {
   if [[ "${LIONCLAW_FORCE_BUILD:-0}" == "1" || ! -x "$LIONCLAW_BIN" ]]; then
     build_lionclaw_bin
-  elif uses_repo_build_bin && has_cmd cargo; then
+  elif repo_build_bin_is_stale && has_cmd cargo; then
     build_lionclaw_bin
   fi
 
