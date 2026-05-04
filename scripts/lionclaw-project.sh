@@ -254,15 +254,23 @@ ensure_systemd_user() {
     || die "systemd user services are unavailable for this shell"
 }
 
+build_lionclaw_bin() {
+  [[ -n "$LIONCLAW_REPO" ]] || die "missing LionClaw binary and LIONCLAW_REPO is not set"
+  has_cmd cargo || die "cargo is required to build LionClaw"
+  if is_dry_run; then
+    printf '[dry-run] (%s) cargo build --bins\n' "$LIONCLAW_REPO"
+  else
+    (cd "$LIONCLAW_REPO" && cargo build --bins)
+  fi
+}
+
+uses_repo_build_bin() {
+  [[ -n "$LIONCLAW_REPO" && "$LIONCLAW_BIN" == "$LIONCLAW_REPO/target/debug/lionclaw" ]]
+}
+
 ensure_lionclaw_bin() {
-  if [[ "${LIONCLAW_FORCE_BUILD:-0}" == "1" || ! -x "$LIONCLAW_BIN" ]]; then
-    [[ -n "$LIONCLAW_REPO" ]] || die "missing LionClaw binary and LIONCLAW_REPO is not set"
-    has_cmd cargo || die "cargo is required to build LionClaw"
-    if is_dry_run; then
-      printf '[dry-run] (%s) cargo build --bins\n' "$LIONCLAW_REPO"
-    else
-      (cd "$LIONCLAW_REPO" && cargo build --bins)
-    fi
+  if [[ "${LIONCLAW_FORCE_BUILD:-0}" == "1" || ! -x "$LIONCLAW_BIN" ]] || uses_repo_build_bin; then
+    build_lionclaw_bin
   fi
 
   [[ -x "$LIONCLAW_BIN" ]] || die "missing LionClaw binary: $LIONCLAW_BIN"
