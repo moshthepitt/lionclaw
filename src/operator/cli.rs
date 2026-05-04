@@ -1100,7 +1100,7 @@ async fn installed_skill_source(home: &LionClawHome, alias: &str) -> Result<Opti
         .with_context(|| format!("failed to read {}", metadata_path.display()))?;
     let metadata: ProjectSkillInstallMetadata = toml::from_str(&content)
         .with_context(|| format!("failed to parse {}", metadata_path.display()))?;
-    Ok((!metadata.source.trim().is_empty()).then_some(metadata.source))
+    Ok(Some(metadata.source))
 }
 
 fn parse_onboard_bind(raw: &str) -> Result<OnboardBindSelection> {
@@ -1481,6 +1481,28 @@ mod tests {
         assert!(issues
             .iter()
             .any(|issue| issue.contains("skill \"terminal\" has source")));
+    }
+
+    #[tokio::test]
+    async fn project_validate_reports_existing_skill_metadata_missing_source() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let skill_dir = home.skills_dir().join("terminal");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join(SKILL_INSTALL_METADATA_FILE),
+            "reference = \"local\"\n",
+        )
+        .expect("skill metadata");
+        let args = project_validate_args(temp_dir.path());
+
+        let issues = validate_project_managed_config(&home, &args)
+            .await
+            .expect("validate project config");
+
+        assert!(issues
+            .iter()
+            .any(|issue| issue.contains("skill \"terminal\" has source=\"\"")));
     }
 
     #[test]
