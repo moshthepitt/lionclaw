@@ -1319,7 +1319,7 @@ case "${command_name}" in
         --rm|--interactive|--read-only|--detach)
           shift
           ;;
-        --network|--workdir|--tmpfs|--env|--secret|--memory|--cpus|--pids-limit|--pod|--name|--userns|--user)
+        --network|--workdir|--tmpfs|--env|--secret|--memory|--cpus|--pids-limit|--pod|--name|--userns|--user|--entrypoint)
           shift 2
           ;;
         --volume)
@@ -1338,7 +1338,7 @@ case "${command_name}" in
           ;;
       esac
     done
-    if [ "$#" -eq 1 ]; then
+    if [ "$#" -eq 1 ] || [ "${1:-}" = "-lc" ]; then
       exit 0
     fi
     exec "$@"
