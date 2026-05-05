@@ -349,7 +349,11 @@ The everyday confined runtime layout is:
 Current runtime network policy is intentionally coarse:
 `network-mode = "on"` or `network-mode = "none"`. `on` maps to Podman's
 private network namespace, not host networking. LionClaw does not expose a
-fake allowlist mode before a real egress-control plane exists.
+fake allowlist mode before a real egress-control plane exists. On rootless
+hosts this also depends on Podman being able to create that private network
+namespace, commonly through a working `pasta` and `/dev/net/tun` path. LionClaw
+preflights that requirement before interactive or managed-service startup when
+the effective preset uses `network-mode = "on"`.
 
 Runtime secrets for confined runtimes live separately in
 `~/.lionclaw/config/runtime-secrets.env`. Presets either mount that whole file

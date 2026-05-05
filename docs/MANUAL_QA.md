@@ -458,6 +458,10 @@ network-mode = "on"
 mount-runtime-secrets = true
 ```
 
+This phase assumes the host can create rootless Podman private networking for
+`network-mode = "on"`. If the host `pasta` or `/dev/net/tun` path is broken,
+LionClaw now fails during `service up` instead of waiting for the first turn.
+
 Reconcile the daemon and record the new fingerprint:
 
 ```bash

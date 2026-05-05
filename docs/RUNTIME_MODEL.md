@@ -283,7 +283,9 @@ into the runtime container.
 
 Codex runs inside LionClaw's outer Podman boundary with its official
 external-sandbox mode enabled, then talks upstream directly as it normally
-would.
+would. That path assumes the host OCI engine can create the private network
+namespace required by `network-mode = "on"`; LionClaw now preflights that
+before startup instead of failing on the first turn.
 
 Current runtime-visible secrets are explicit mounts. The longer-term hardening
 direction is a tighter secret broker/proxy for credentials that should be used
