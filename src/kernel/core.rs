@@ -2301,6 +2301,7 @@ impl Kernel {
         let turn_input = RuntimeTurnInput {
             runtime_session_id: handle.runtime_session_id.clone(),
             prompt,
+            fresh_prompt: None,
             runtime_skill_ids: Vec::new(),
         };
         let runtime_secrets_mount = self.resolve_runtime_secrets_mount(&execution_plan).await?;
@@ -4542,6 +4543,19 @@ impl Kernel {
                 Some(persisted_turn.sequence_no),
             )
             .await?;
+        let fresh_prompt_envelope = if handle.resumes_existing_session {
+            Some(
+                self.build_prompt_envelope(
+                    session,
+                    &prompt_user_text,
+                    false,
+                    Some(persisted_turn.sequence_no),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
 
         let turn_result = self
             .execute_runtime_turn(RuntimeTurnExecution {
@@ -4556,6 +4570,7 @@ impl Kernel {
                 input: RuntimeTurnInput {
                     runtime_session_id: handle.runtime_session_id.clone(),
                     prompt: prompt_envelope,
+                    fresh_prompt: fresh_prompt_envelope,
                     runtime_skill_ids: runtime_skill_ids.clone(),
                 },
                 stream_context: channel_stream_context.clone(),

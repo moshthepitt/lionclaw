@@ -279,7 +279,9 @@ operator signs in with `codex login`. Before a confined Codex turn, LionClaw
 reads the host Codex auth store, refreshes host auth when needed, and stages
 session-local copies of `auth.json` and `config.toml` under
 `/runtime/home/.codex` before launch. The real host Codex home is never mounted
-into the runtime container.
+into the runtime container. LionClaw also keeps a session-local
+`.lionclaw-codex-thread-id` file under runtime state so Codex resumes the exact
+provider thread instead of relying on global "last session" state.
 
 Codex runs inside LionClaw's outer Podman boundary with its official
 external-sandbox mode enabled, then talks upstream directly as it normally

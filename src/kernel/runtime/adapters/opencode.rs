@@ -448,6 +448,7 @@ mod tests {
             .build_turn_program(&RuntimeTurnInput {
                 runtime_session_id: handle.runtime_session_id,
                 prompt: "hello".to_string(),
+                fresh_prompt: None,
                 runtime_skill_ids: Vec::new(),
             })
             .expect("program");
