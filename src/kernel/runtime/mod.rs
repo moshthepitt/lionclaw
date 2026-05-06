@@ -310,7 +310,7 @@ where
         .await?;
 
         if attempt.output.success() {
-            flush_buffered_program_output_events(&events, attempt.buffered_events);
+            flush_buffered_program_output_events(&events, attempt.buffered_errors);
             return finish_program_backed_turn(
                 adapter,
                 attempt.output,
@@ -335,7 +335,7 @@ where
             continue;
         }
 
-        flush_buffered_program_output_events(&events, attempt.buffered_events);
+        flush_buffered_program_output_events(&events, attempt.buffered_errors);
         return finish_program_backed_turn(
             adapter,
             attempt.output,
@@ -347,7 +347,7 @@ where
 }
 
 struct ProgramBackedAttemptOutcome {
-    buffered_events: Option<Vec<RuntimeEvent>>,
+    buffered_errors: Option<Vec<RuntimeEvent>>,
     output: ExecutionOutput,
     saw_done: bool,
     last_error_text: Option<String>,
@@ -379,7 +379,7 @@ where
     );
     tokio::pin!(execution);
 
-    let mut buffered_events = input.fresh_prompt.is_some().then(Vec::new);
+    let mut buffered_errors = input.fresh_prompt.is_some().then(Vec::new);
     let mut saw_done = false;
     let mut last_error_text: Option<String> = None;
     let mut output_parser = adapter.program_output_parser(input);
@@ -392,7 +392,7 @@ where
                         adapter,
                         &mut output_parser,
                         events,
-                        &mut buffered_events,
+                        &mut buffered_errors,
                         &line,
                         &mut saw_done,
                         &mut last_error_text,
@@ -401,13 +401,13 @@ where
                         finish_program_output_parser(
                             &mut output_parser,
                             events,
-                            &mut buffered_events,
+                            &mut buffered_errors,
                             &mut saw_done,
                             &mut last_error_text,
                         );
                         let output = execution.await?;
                         return Ok(ProgramBackedAttemptOutcome {
-                            buffered_events,
+                            buffered_errors,
                             output,
                             saw_done,
                             last_error_text,
@@ -422,7 +422,7 @@ where
                         adapter,
                         &mut output_parser,
                         events,
-                        &mut buffered_events,
+                        &mut buffered_errors,
                         &line,
                         &mut saw_done,
                         &mut last_error_text,
@@ -431,12 +431,12 @@ where
                 finish_program_output_parser(
                     &mut output_parser,
                     events,
-                    &mut buffered_events,
+                    &mut buffered_errors,
                     &mut saw_done,
                     &mut last_error_text,
                 );
                 return Ok(ProgramBackedAttemptOutcome {
-                    buffered_events,
+                    buffered_errors,
                     output,
                     saw_done,
                     last_error_text,
@@ -450,7 +450,7 @@ fn observe_program_output_line(
     adapter: &(dyn RuntimeAdapter + Send + Sync),
     output_parser: &mut Option<Box<dyn RuntimeProgramOutputParser>>,
     events: &RuntimeEventSender,
-    buffered_events: &mut Option<Vec<RuntimeEvent>>,
+    buffered_errors: &mut Option<Vec<RuntimeEvent>>,
     line: &str,
     saw_done: &mut bool,
     last_error_text: &mut Option<String>,
@@ -463,7 +463,7 @@ fn observe_program_output_line(
 
     observe_program_output_events(
         events,
-        buffered_events,
+        buffered_errors,
         parsed_events,
         saw_done,
         last_error_text,
@@ -473,14 +473,14 @@ fn observe_program_output_line(
 fn finish_program_output_parser(
     output_parser: &mut Option<Box<dyn RuntimeProgramOutputParser>>,
     events: &RuntimeEventSender,
-    buffered_events: &mut Option<Vec<RuntimeEvent>>,
+    buffered_errors: &mut Option<Vec<RuntimeEvent>>,
     saw_done: &mut bool,
     last_error_text: &mut Option<String>,
 ) {
     if let Some(parser) = output_parser.as_mut() {
         observe_program_output_events(
             events,
-            buffered_events,
+            buffered_errors,
             parser.finish(),
             saw_done,
             last_error_text,
@@ -490,7 +490,7 @@ fn finish_program_output_parser(
 
 fn observe_program_output_events(
     events: &RuntimeEventSender,
-    buffered_events: &mut Option<Vec<RuntimeEvent>>,
+    buffered_errors: &mut Option<Vec<RuntimeEvent>>,
     parsed_events: Vec<RuntimeEvent>,
     saw_done: &mut bool,
     last_error_text: &mut Option<String>,
@@ -502,8 +502,12 @@ fn observe_program_output_events(
         if let RuntimeEvent::Error { text, .. } = &event {
             *last_error_text = Some(text.clone());
         }
-        if let Some(buffer) = buffered_events.as_mut() {
-            buffer.push(event);
+        if matches!(event, RuntimeEvent::Error { .. }) {
+            if let Some(buffer) = buffered_errors.as_mut() {
+                buffer.push(event);
+            } else {
+                drop(events.send(event));
+            }
         } else {
             drop(events.send(event));
         }
@@ -512,10 +516,10 @@ fn observe_program_output_events(
 
 fn flush_buffered_program_output_events(
     events: &RuntimeEventSender,
-    buffered_events: Option<Vec<RuntimeEvent>>,
+    buffered_errors: Option<Vec<RuntimeEvent>>,
 ) {
-    if let Some(buffered_events) = buffered_events {
-        for event in buffered_events {
+    if let Some(buffered_errors) = buffered_errors {
+        for event in buffered_errors {
             drop(events.send(event));
         }
     }
@@ -551,7 +555,10 @@ mod tests {
         time::Duration,
     };
 
-    use tokio::sync::mpsc;
+    use tokio::{
+        sync::mpsc,
+        time::{sleep, timeout},
+    };
     use uuid::Uuid;
 
     use super::{
@@ -754,6 +761,104 @@ mod tests {
                 .expect("read saved thread id"),
             "thread-new\n"
         );
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn resumed_turn_streams_non_error_events_before_attempt_finishes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
+            "",
+        )
+        .expect("write ready marker");
+        std::fs::write(
+            runtime_state_root.join(".lionclaw-codex-thread-id"),
+            "thread-old\n",
+        )
+        .expect("write saved thread id");
+
+        let adapter = Arc::new(CodexRuntimeAdapter::new(CodexRuntimeConfig {
+            executable: "codex".to_string(),
+            model: Some("gpt-5-codex".to_string()),
+        }));
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_state_root),
+            })
+            .await
+            .expect("start");
+        assert!(handle.resumes_existing_session);
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let adapter_for_turn = Arc::clone(&adapter);
+        let runtime_session_id = handle.runtime_session_id.clone();
+        let turn = tokio::spawn(async move {
+            execute_program_backed_turn_with_executor(
+                adapter_for_turn.as_ref(),
+                test_execution_plan(),
+                None,
+                None,
+                RuntimeTurnInput {
+                    runtime_session_id,
+                    prompt: "hello".to_string(),
+                    fresh_prompt: Some("fresh history prompt".to_string()),
+                    runtime_skill_ids: Vec::new(),
+                },
+                event_tx,
+                move |_request, stdout| async move {
+                    stdout
+                        .send(r#"{"id":"0","msg":{"type":"task_started"}}"#.to_string() + "\n")
+                        .expect("send started");
+                    sleep(Duration::from_millis(100)).await;
+                    stdout
+                        .send(
+                            r#"{"id":"1","msg":{"type":"task_complete","last_agent_message":"Done."}}"#
+                                .to_string()
+                                + "\n",
+                        )
+                        .expect("send complete");
+                    Ok(ExecutionOutput {
+                        exit_code: Some(0),
+                        ..ExecutionOutput::default()
+                    })
+                },
+            )
+            .await
+        });
+
+        let first_event = timeout(Duration::from_millis(50), event_rx.recv())
+            .await
+            .expect("expected streamed event before attempt finished")
+            .expect("streamed event");
+        assert!(matches!(
+            first_event,
+            RuntimeEvent::Status { code: None, text } if text == "codex turn started"
+        ));
+
+        let result = turn.await.expect("join turn");
+        assert!(matches!(
+            result,
+            Ok(RuntimeTurnResult {
+                capability_requests
+            }) if capability_requests.is_empty()
+        ));
+
+        let mut remaining_events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            remaining_events.push(event);
+        }
+        assert!(remaining_events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta { text, .. } if text == "Done."
+        )));
 
         adapter.close(&handle).await.expect("close");
     }
