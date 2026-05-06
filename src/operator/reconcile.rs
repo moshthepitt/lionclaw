@@ -1704,6 +1704,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn up_rejects_unavailable_private_network() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
+        let runtime_stub = temp_dir.path().join("codex-stub.sh");
+        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
+        make_executable(&runtime_stub);
+        let broken_podman = temp_dir.path().join("podman");
+        fs::write(
+            &broken_podman,
+            "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"inspect\" ]; then\n  printf 'sha256:test-runtime-image\\n'\n  exit 0\nfi\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"exists\" ]; then\n  exit 0\nfi\nif [ \"${1:-}\" = \"run\" ]; then\n  cat >&2 <<'EOF'\nError: pasta failed with exit code 1:\nFailed to open() /dev/net/tun: No such device\nFailed to set up tap device in namespace\nEOF\n  exit 125\nfi\nexit 0\n",
+        )
+        .expect("write broken podman");
+        make_executable(&broken_podman);
+        write_test_codex_auth(&home).await;
+
+        config.runtimes = [(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "codex".to_string(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: broken_podman.to_string_lossy().to_string(),
+                    image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        )]
+        .into_iter()
+        .collect();
+        config
+            .set_default_runtime("codex")
+            .expect("set default runtime");
+        config.save(&home).await.expect("save config");
+
+        let err = up(
+            &home,
+            &FakeServiceManager::default(),
+            "codex",
+            &StackBinaryPaths {
+                daemon_bin: "/tmp/lionclawd".into(),
+            },
+        )
+        .await
+        .expect_err("private-network failure should block service up");
+
+        assert!(err.to_string().contains("requires network-mode 'on'"));
+        assert!(err
+            .to_string()
+            .contains("could not start a private network"));
+        assert!(err.to_string().contains("/dev/net/tun"));
+    }
+
+    #[tokio::test]
     async fn up_skips_interactive_channels_for_service_units() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));

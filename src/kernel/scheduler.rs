@@ -17,6 +17,7 @@ use super::{
         ClaimedSchedulerJob, SchedulerJobDeliveryStatus, SchedulerJobRecord, SchedulerJobRunRecord,
         SchedulerJobRunStatus, SchedulerJobTriggerKind,
     },
+    runtime::ExecutionPlanPurpose,
 };
 
 #[derive(Debug, Clone)]
@@ -110,7 +111,10 @@ impl SchedulerEngine {
         let mut current_run = claimed.run;
         loop {
             if let Err(err) = kernel
-                .validate_runtime_launch_prerequisites(&job.runtime_id)
+                .validate_runtime_launch_prerequisites_for_purpose(
+                    &job.runtime_id,
+                    ExecutionPlanPurpose::Interactive,
+                )
                 .await
             {
                 match self

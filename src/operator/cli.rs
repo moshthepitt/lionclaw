@@ -29,10 +29,7 @@ use crate::{
             OnboardBindSelection,
         },
         run::run_local,
-        runtime::{
-            resolve_runtime_id, validate_runtime_availability,
-            validate_runtime_launch_prerequisites,
-        },
+        runtime::{resolve_runtime_id, validate_runtime_availability},
         services::SystemdUserServiceManager,
         snapshot::SKILL_INSTALL_METADATA_FILE,
     },
@@ -807,7 +804,6 @@ pub async fn run() -> Result<ExitCode> {
                     JobCommand::Add(args) => {
                         let args = *args;
                         let runtime_id = resolve_runtime_id(&config, args.runtime.as_deref())?;
-                        validate_runtime_launch_prerequisites(&home, &config, &runtime_id).await?;
                         let kernel = open_kernel(&home, &config, None).await?;
                         let prompt_text = load_job_prompt(args.prompt, args.prompt_file).await?;
                         let schedule = parse_job_schedule_spec(&args.schedule, args.tz.as_deref())?;

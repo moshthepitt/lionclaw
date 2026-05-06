@@ -21,10 +21,10 @@ use lionclaw::{
     home::LionClawHome,
     kernel::{
         runtime::{
-            ConfinementConfig, OciConfinementConfig, RuntimeAdapter, RuntimeAdapterInfo,
-            RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender, RuntimeExecutionProfile,
-            RuntimeMessageLane, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
-            RuntimeTurnResult,
+            ConfinementConfig, ExecutionPreset, NetworkMode, OciConfinementConfig, RuntimeAdapter,
+            RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
+            RuntimeExecutionProfile, RuntimeMessageLane, RuntimeSessionHandle,
+            RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult, WorkspaceAccess,
         },
         InboundChannelText, Kernel, KernelError, KernelOptions,
     },
@@ -318,6 +318,72 @@ async fn manual_job_run_rejects_missing_runtime_auth_before_launch() {
 }
 
 #[tokio::test]
+async fn manual_job_run_rejects_unavailable_private_network_before_launch() {
+    let env = TestEnv::new();
+    let home = LionClawHome::new(env.temp_dir.path().join(".lionclaw"));
+    home.ensure_base_dirs().await.expect("base dirs");
+    write_test_codex_auth(&home).await;
+    let turn_calls = Arc::new(AtomicUsize::new(0));
+    let log_path = env.temp_dir.path().join("podman.log");
+    let kernel = kernel_with_counting_codex_runtime_and_podman_body(
+        &env,
+        &home,
+        turn_calls.clone(),
+        &format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"${{1:-}}\" = \"image\" ] && [ \"${{2:-}}\" = \"inspect\" ]; then\n  printf 'sha256:test-runtime-image\\n'\n  exit 0\nfi\nif [ \"${{1:-}}\" = \"run\" ]; then\n  cat >&2 <<'EOF'\nError: pasta failed with exit code 1:\nFailed to open() /dev/net/tun: No such device\nFailed to set up tap device in namespace\nEOF\n  exit 125\nfi\nexit 0\n",
+            log_path.display()
+        ),
+    )
+    .await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "codex manual".to_string(),
+            runtime_id: "codex".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() + ChronoDuration::hours(1),
+            },
+            prompt_text: "manual run".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create job");
+
+    let err = kernel
+        .run_job_now(JobRefRequest {
+            job_id: created.job.job_id,
+        })
+        .await
+        .expect_err("private-network failure should block manual run");
+
+    match err {
+        KernelError::Runtime(message) => {
+            assert!(message.contains("requires network-mode 'on'"));
+            assert!(message.contains("could not start a private network"));
+            assert!(message.contains("/dev/net/tun"));
+        }
+        other => panic!("unexpected error variant: {other}"),
+    }
+    assert_eq!(turn_calls.load(Ordering::SeqCst), 0);
+
+    let runs = kernel
+        .list_job_runs(JobRunsRequest {
+            job_id: created.job.job_id,
+            limit: Some(5),
+        })
+        .await
+        .expect("list job runs");
+    assert!(runs.runs.is_empty(), "manual run should not be claimed");
+
+    let log = std::fs::read_to_string(&log_path).expect("read podman log");
+    assert!(log.contains(
+        "run --rm --pull=never --network private --entrypoint /bin/sh ghcr.io/lionclaw/test-codex-runtime:latest -lc :"
+    ));
+}
+
+#[tokio::test]
 async fn scheduler_tick_dead_letters_missing_runtime_auth_without_launching_runtime() {
     let env = TestEnv::new();
     let home = LionClawHome::new(env.temp_dir.path().join(".lionclaw"));
@@ -379,6 +445,190 @@ async fn scheduler_tick_dead_letters_missing_runtime_auth_without_launching_runt
     );
     assert!(runs.runs[0].session_id.is_none());
     assert!(runs.runs[0].turn_id.is_none());
+}
+
+#[tokio::test]
+async fn scheduler_tick_dead_letters_unavailable_private_network_without_launching_runtime() {
+    let env = TestEnv::new();
+    let home = LionClawHome::new(env.temp_dir.path().join(".lionclaw"));
+    home.ensure_base_dirs().await.expect("base dirs");
+    write_test_codex_auth(&home).await;
+    let turn_calls = Arc::new(AtomicUsize::new(0));
+    let log_path = env.temp_dir.path().join("podman.log");
+    let kernel = kernel_with_counting_codex_runtime_and_podman_body(
+        &env,
+        &home,
+        turn_calls.clone(),
+        &format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"${{1:-}}\" = \"image\" ] && [ \"${{2:-}}\" = \"inspect\" ]; then\n  printf 'sha256:test-runtime-image\\n'\n  exit 0\nfi\nif [ \"${{1:-}}\" = \"run\" ]; then\n  cat >&2 <<'EOF'\nError: pasta failed with exit code 1:\nFailed to open() /dev/net/tun: No such device\nFailed to set up tap device in namespace\nEOF\n  exit 125\nfi\nexit 0\n",
+            log_path.display()
+        ),
+    )
+    .await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "codex scheduled".to_string(),
+            runtime_id: "codex".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "scheduled run".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create job");
+
+    let tick = kernel.scheduler_tick().await.expect("scheduler tick");
+    assert_eq!(tick.claimed_runs, 1);
+    assert_eq!(turn_calls.load(Ordering::SeqCst), 0);
+
+    let job = kernel
+        .get_job(created.job.job_id)
+        .await
+        .expect("load job")
+        .job;
+    assert_eq!(
+        job.last_status,
+        Some(lionclaw::contracts::SchedulerJobRunStatusDto::DeadLetter)
+    );
+    assert!(job
+        .last_error
+        .as_deref()
+        .is_some_and(|error| error.contains("/dev/net/tun")));
+
+    let runs = kernel
+        .list_job_runs(JobRunsRequest {
+            job_id: created.job.job_id,
+            limit: Some(5),
+        })
+        .await
+        .expect("list job runs");
+    assert_eq!(runs.runs.len(), 1);
+    assert_eq!(
+        runs.runs[0].status,
+        lionclaw::contracts::SchedulerJobRunStatusDto::DeadLetter
+    );
+    assert!(runs.runs[0].session_id.is_none());
+    assert!(runs.runs[0].turn_id.is_none());
+
+    let log = std::fs::read_to_string(&log_path).expect("read podman log");
+    assert!(log.contains(
+        "run --rm --pull=never --network private --entrypoint /bin/sh ghcr.io/lionclaw/test-codex-runtime:latest -lc :"
+    ));
+}
+
+#[tokio::test]
+async fn manual_job_run_skips_private_network_probe_when_default_preset_is_offline() {
+    let env = TestEnv::new();
+    let home = LionClawHome::new(env.temp_dir.path().join(".lionclaw"));
+    home.ensure_base_dirs().await.expect("base dirs");
+    write_test_codex_auth(&home).await;
+    let turn_calls = Arc::new(AtomicUsize::new(0));
+    let log_path = env.temp_dir.path().join("podman.log");
+    let kernel = kernel_with_counting_codex_runtime_and_podman_body_and_options(
+        &env,
+        &home,
+        turn_calls.clone(),
+        &format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"${{1:-}}\" = \"image\" ] && [ \"${{2:-}}\" = \"inspect\" ]; then\n  printf 'sha256:test-runtime-image\\n'\n  exit 0\nfi\nif [ \"${{1:-}}\" = \"run\" ]; then\n  echo 'unexpected private-network probe' >&2\n  exit 99\nfi\nexit 0\n",
+            log_path.display()
+        ),
+        offline_kernel_options(),
+    )
+    .await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "codex manual offline".to_string(),
+            runtime_id: "codex".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() + ChronoDuration::hours(1),
+            },
+            prompt_text: "manual run".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create job");
+
+    let response = kernel
+        .run_job_now(JobRefRequest {
+            job_id: created.job.job_id,
+        })
+        .await
+        .expect("offline manual run should succeed");
+
+    assert_eq!(turn_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        response.run.status,
+        lionclaw::contracts::SchedulerJobRunStatusDto::Completed
+    );
+
+    let log = std::fs::read_to_string(&log_path).expect("read podman log");
+    assert!(
+        log.contains("image inspect --format {{.Id}} ghcr.io/lionclaw/test-codex-runtime:latest")
+    );
+    assert!(!log.contains("run --rm --pull=never --network private"));
+}
+
+#[tokio::test]
+async fn scheduler_tick_skips_private_network_probe_when_default_preset_is_offline() {
+    let env = TestEnv::new();
+    let home = LionClawHome::new(env.temp_dir.path().join(".lionclaw"));
+    home.ensure_base_dirs().await.expect("base dirs");
+    write_test_codex_auth(&home).await;
+    let turn_calls = Arc::new(AtomicUsize::new(0));
+    let log_path = env.temp_dir.path().join("podman.log");
+    let kernel = kernel_with_counting_codex_runtime_and_podman_body_and_options(
+        &env,
+        &home,
+        turn_calls.clone(),
+        &format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"${{1:-}}\" = \"image\" ] && [ \"${{2:-}}\" = \"inspect\" ]; then\n  printf 'sha256:test-runtime-image\\n'\n  exit 0\nfi\nif [ \"${{1:-}}\" = \"run\" ]; then\n  echo 'unexpected private-network probe' >&2\n  exit 99\nfi\nexit 0\n",
+            log_path.display()
+        ),
+        offline_kernel_options(),
+    )
+    .await;
+
+    let created = kernel
+        .create_job(JobCreateRequest {
+            name: "codex scheduled offline".to_string(),
+            runtime_id: "codex".to_string(),
+            schedule: lionclaw::contracts::JobScheduleDto::Once {
+                run_at: Utc::now() - ChronoDuration::minutes(1),
+            },
+            prompt_text: "scheduled run".to_string(),
+            allow_capabilities: Vec::new(),
+            delivery: None,
+            retry_attempts: Some(0),
+        })
+        .await
+        .expect("create job");
+
+    let tick = kernel.scheduler_tick().await.expect("scheduler tick");
+    assert_eq!(tick.claimed_runs, 1);
+    assert_eq!(turn_calls.load(Ordering::SeqCst), 1);
+
+    let job = kernel
+        .get_job(created.job.job_id)
+        .await
+        .expect("load job")
+        .job;
+    assert_eq!(
+        job.last_status,
+        Some(lionclaw::contracts::SchedulerJobRunStatusDto::Completed)
+    );
+
+    let log = std::fs::read_to_string(&log_path).expect("read podman log");
+    assert!(
+        log.contains("image inspect --format {{.Id}} ghcr.io/lionclaw/test-codex-runtime:latest")
+    );
+    assert!(!log.contains("run --rm --pull=never --network private"));
 }
 
 #[tokio::test]
@@ -1313,36 +1563,78 @@ async fn kernel_with_counting_codex_runtime(
     home: &LionClawHome,
     turn_calls: Arc<AtomicUsize>,
 ) -> Kernel {
-    let fake_podman = env.temp_dir.path().join("podman");
-    std::fs::write(
-        &fake_podman,
+    kernel_with_counting_codex_runtime_and_podman_body_and_options(
+        env,
+        home,
+        turn_calls,
         "#!/usr/bin/env bash\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"inspect\" ]; then\n  printf 'sha256:test-runtime-image\\n'\n  exit 0\nfi\nexit 0\n",
+        KernelOptions::default(),
     )
-    .expect("write fake podman");
+    .await
+}
+
+async fn kernel_with_counting_codex_runtime_and_podman_body(
+    env: &TestEnv,
+    home: &LionClawHome,
+    turn_calls: Arc<AtomicUsize>,
+    podman_body: &str,
+) -> Kernel {
+    kernel_with_counting_codex_runtime_and_podman_body_and_options(
+        env,
+        home,
+        turn_calls,
+        podman_body,
+        KernelOptions::default(),
+    )
+    .await
+}
+
+async fn kernel_with_counting_codex_runtime_and_podman_body_and_options(
+    env: &TestEnv,
+    home: &LionClawHome,
+    turn_calls: Arc<AtomicUsize>,
+    podman_body: &str,
+    mut options: KernelOptions,
+) -> Kernel {
+    let fake_podman = env.temp_dir.path().join("podman");
+    std::fs::write(&fake_podman, podman_body).expect("write fake podman");
     std::fs::set_permissions(&fake_podman, std::fs::Permissions::from_mode(0o755))
         .expect("chmod fake podman");
 
-    let kernel = env
-        .kernel_with_options(KernelOptions {
-            runtime_execution_profiles: BTreeMap::from([(
-                "codex".to_string(),
-                RuntimeExecutionProfile::new(
-                    ConfinementConfig::Oci(OciConfinementConfig {
-                        engine: fake_podman.display().to_string(),
-                        image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
-                        ..OciConfinementConfig::default()
-                    }),
-                    "codex-auth".to_string(),
-                    None,
-                    Some(lionclaw::kernel::runtime::RuntimeAuthKind::Codex),
-                ),
-            )]),
-            codex_home_override: Some(home.root().join(".codex")),
-            ..KernelOptions::default()
-        })
-        .await;
+    options.runtime_execution_profiles = BTreeMap::from([(
+        "codex".to_string(),
+        RuntimeExecutionProfile::new(
+            ConfinementConfig::Oci(OciConfinementConfig {
+                engine: fake_podman.display().to_string(),
+                image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                ..OciConfinementConfig::default()
+            }),
+            "codex-auth".to_string(),
+            None,
+            Some(lionclaw::kernel::runtime::RuntimeAuthKind::Codex),
+        ),
+    )]);
+    options.codex_home_override = Some(home.root().join(".codex"));
+
+    let kernel = env.kernel_with_options(options).await;
     kernel
         .register_runtime_adapter("codex", Arc::new(CountingRuntimeAdapter { turn_calls }))
         .await;
     kernel
+}
+
+fn offline_kernel_options() -> KernelOptions {
+    KernelOptions {
+        default_preset_name: Some("offline".to_string()),
+        execution_presets: BTreeMap::from([(
+            "offline".to_string(),
+            ExecutionPreset {
+                workspace_access: WorkspaceAccess::ReadWrite,
+                network_mode: NetworkMode::None,
+                mount_runtime_secrets: false,
+                escape_classes: Default::default(),
+            },
+        )]),
+        ..KernelOptions::default()
+    }
 }

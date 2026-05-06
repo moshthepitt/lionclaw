@@ -110,6 +110,45 @@ pub async fn validate_oci_launch_prerequisites(
     Ok(())
 }
 
+pub async fn validate_oci_private_network_prerequisites(
+    runtime_id: &str,
+    confinement: &OciConfinementConfig,
+) -> Result<()> {
+    let image = confinement.image.as_deref().ok_or_else(|| {
+        anyhow!("runtime '{runtime_id}' requires a Podman runtime image in its confinement config")
+    })?;
+    let output = run_oci_preflight_command(
+        &build_oci_private_network_probe_invocation(&confinement.engine, image),
+        &format!("validate private OCI network for runtime '{runtime_id}'"),
+        OCI_PREFLIGHT_TIMEOUT,
+    )
+    .await?;
+
+    // The probe only needs to prove that Podman can stand up its private
+    // network namespace. Distroless runtime images may not ship /bin/sh, so a
+    // missing probe shell still counts as network success once Podman reached
+    // process exec inside the container.
+    if output.success()
+        || private_network_probe_reached_process_exec(&String::from_utf8_lossy(&output.stderr))
+    {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        bail!(
+            "runtime '{runtime_id}' requires network-mode 'on', but OCI engine '{}' exited with code {:?} while starting a private network on this host",
+            confinement.engine,
+            output.exit_code
+        );
+    }
+
+    bail!(
+        "runtime '{runtime_id}' requires network-mode 'on', but OCI engine '{}' could not start a private network on this host: {stderr}",
+        confinement.engine
+    )
+}
+
 pub async fn resolve_oci_image_compatibility_identity(engine: &str, image: &str) -> Result<String> {
     let output = run_oci_preflight_command(
         &ProcessInvocation {
@@ -324,6 +363,32 @@ async fn run_oci_preflight_command(
             invocation.executable
         ),
     }
+}
+
+fn build_oci_private_network_probe_invocation(engine: &str, image: &str) -> ProcessInvocation {
+    ProcessInvocation {
+        executable: engine.to_string(),
+        args: vec![
+            "run".to_string(),
+            "--rm".to_string(),
+            "--pull=never".to_string(),
+            "--network".to_string(),
+            "private".to_string(),
+            "--entrypoint".to_string(),
+            "/bin/sh".to_string(),
+            image.to_string(),
+            "-lc".to_string(),
+            ":".to_string(),
+        ],
+        working_dir: None,
+        environment: Vec::new(),
+        input: String::new(),
+    }
+}
+
+fn private_network_probe_reached_process_exec(stderr: &str) -> bool {
+    let stderr = stderr.trim().to_ascii_lowercase();
+    stderr.contains("/bin/sh") && (stderr.contains("not found") || stderr.contains("no such file"))
 }
 
 fn build_oci_process_invocation(
@@ -629,7 +694,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
-    use super::{build_oci_process_invocation, prepare_oci_process_launch, OciExecutionBackend};
+    use super::{
+        build_oci_process_invocation, prepare_oci_process_launch,
+        private_network_probe_reached_process_exec, OciExecutionBackend,
+    };
     use crate::kernel::runtime::execution::backend::{
         ExecutionBackend, RUNTIME_SECRETS_NAME_PREFIX,
     };
@@ -878,6 +946,23 @@ mod tests {
         .expect_err("missing image should fail");
 
         assert!(err.to_string().contains("requires a Podman runtime image"));
+    }
+
+    #[test]
+    fn private_network_probe_accepts_missing_probe_shell_after_network_setup() {
+        assert!(private_network_probe_reached_process_exec(
+            "Error: executable file `/bin/sh` not found in $PATH: No such file or directory"
+        ));
+        assert!(private_network_probe_reached_process_exec(
+            "Error: stat /bin/sh: no such file or directory"
+        ));
+    }
+
+    #[test]
+    fn private_network_probe_rejects_real_network_failures() {
+        assert!(!private_network_probe_reached_process_exec(
+            "Error: pasta failed with exit code 1:\nFailed to open() /dev/net/tun: No such device"
+        ));
     }
 
     #[test]

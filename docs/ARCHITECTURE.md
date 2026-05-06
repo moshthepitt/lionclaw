@@ -206,7 +206,9 @@ Current runtime network policy is intentionally coarse:
 
 `on` maps to the container engine's private network mode, not host networking.
 LionClaw does not expose a fake allowlist mode before a real egress-control
-plane exists.
+plane exists. On rootless hosts, `on` also requires the container engine to be
+able to stand up its private network namespace. LionClaw preflights that host
+capability before interactive or managed-service startup.
 
 Runtime secrets are loaded from `~/.lionclaw/config/runtime-secrets.env`.
 Presets either mount that whole file or mount no runtime secrets at all with

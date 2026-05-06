@@ -10,7 +10,7 @@ use crate::kernel::skills::validate_skill_alias;
 
 use super::plan::{
     ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset, MountAccess, MountSpec,
-    OciConfinementConfig, RuntimeAuthKind, WorkspaceAccess, SKILLS_MOUNT_TARGET_ROOT,
+    NetworkMode, OciConfinementConfig, RuntimeAuthKind, WorkspaceAccess, SKILLS_MOUNT_TARGET_ROOT,
 };
 
 pub const BUILTIN_PRESET_EVERYDAY: &str = "everyday";
@@ -266,43 +266,25 @@ impl ExecutionPlanner {
         requested_name: Option<&str>,
         purpose: ExecutionPlanPurpose,
     ) -> Result<(String, ExecutionPreset), String> {
-        if purpose == ExecutionPlanPurpose::HiddenCompaction {
-            return Ok((
-                BUILTIN_PRESET_HIDDEN_COMPACTION.to_string(),
-                hidden_compaction_preset(),
-            ));
-        }
+        resolve_execution_preset(
+            purpose,
+            requested_name,
+            self.default_preset_name.as_deref(),
+            &self.presets,
+        )
+    }
 
-        if let Some(name) = requested_name
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        {
-            let preset = self
-                .presets
-                .get(name)
-                .cloned()
-                .ok_or_else(|| format!("preset '{name}' is not configured"))?;
-            return Ok((name.to_string(), preset));
-        }
-
-        if let Some(default_name) = self
-            .default_preset_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        {
-            let preset = self
-                .presets
-                .get(default_name)
-                .cloned()
-                .ok_or_else(|| format!("default preset '{default_name}' is not configured"))?;
-            return Ok((default_name.to_string(), preset));
-        }
-
-        Ok((
-            BUILTIN_PRESET_EVERYDAY.to_string(),
-            ExecutionPreset::default(),
-        ))
+    pub(crate) fn resolve_network_mode(
+        &self,
+        requested_name: Option<&str>,
+        purpose: ExecutionPlanPurpose,
+    ) -> Result<NetworkMode, String> {
+        resolve_execution_network_mode(
+            purpose,
+            requested_name,
+            self.default_preset_name.as_deref(),
+            &self.presets,
+        )
     }
 
     pub fn required_runtime_auth(&self, runtime_id: &str) -> Option<RuntimeAuthKind> {
@@ -391,6 +373,57 @@ impl ExecutionPlanner {
 
         Ok(mounts)
     }
+}
+
+pub(crate) fn resolve_execution_preset(
+    purpose: ExecutionPlanPurpose,
+    requested_name: Option<&str>,
+    default_preset_name: Option<&str>,
+    presets: &BTreeMap<String, ExecutionPreset>,
+) -> Result<(String, ExecutionPreset), String> {
+    if purpose == ExecutionPlanPurpose::HiddenCompaction {
+        return Ok((
+            BUILTIN_PRESET_HIDDEN_COMPACTION.to_string(),
+            hidden_compaction_preset(),
+        ));
+    }
+
+    if let Some(name) = requested_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        let preset = presets
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("preset '{name}' is not configured"))?;
+        return Ok((name.to_string(), preset));
+    }
+
+    if let Some(default_name) = default_preset_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        let preset = presets
+            .get(default_name)
+            .cloned()
+            .ok_or_else(|| format!("default preset '{default_name}' is not configured"))?;
+        return Ok((default_name.to_string(), preset));
+    }
+
+    Ok((
+        BUILTIN_PRESET_EVERYDAY.to_string(),
+        ExecutionPreset::default(),
+    ))
+}
+
+pub(crate) fn resolve_execution_network_mode(
+    purpose: ExecutionPlanPurpose,
+    requested_name: Option<&str>,
+    default_preset_name: Option<&str>,
+    presets: &BTreeMap<String, ExecutionPreset>,
+) -> Result<NetworkMode, String> {
+    resolve_execution_preset(purpose, requested_name, default_preset_name, presets)
+        .map(|(_, preset)| preset.network_mode)
 }
 
 fn workspace_access_to_mount_access(access: WorkspaceAccess) -> MountAccess {

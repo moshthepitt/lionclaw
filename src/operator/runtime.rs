@@ -8,11 +8,11 @@ use anyhow::{anyhow, Result};
 
 use crate::home::LionClawHome;
 use crate::kernel::{
+    runtime::execution::planner::resolve_execution_network_mode,
     runtime::{
-        resolve_oci_image_compatibility_identity,
-        validate_runtime_launch_prerequisites as validate_kernel_runtime_launch_prerequisites,
-        CodexRuntimeAdapter, CodexRuntimeConfig, OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig,
-        RuntimeAuthKind, RuntimeExecutionProfile,
+        resolve_oci_image_compatibility_identity, validate_runtime_execution_prerequisites,
+        CodexRuntimeAdapter, CodexRuntimeConfig, ExecutionPlanPurpose, NetworkMode,
+        OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig, RuntimeAuthKind, RuntimeExecutionProfile,
     },
     Kernel,
 };
@@ -142,11 +142,12 @@ pub async fn validate_runtime_launch_prerequisites(
         .runtime(runtime_id)
         .ok_or_else(|| anyhow!("runtime profile '{runtime_id}' is not configured"))?;
     let codex_home_override = operator_codex_home_override(home)?;
-    validate_kernel_runtime_launch_prerequisites(
+    validate_runtime_execution_prerequisites(
         runtime_id,
         profile.confinement(),
         profile.required_runtime_auth(),
         codex_home_override.as_deref(),
+        interactive_network_mode(config)?,
     )
     .await
 }
@@ -225,6 +226,16 @@ fn normalize_identity_path(path: &Path) -> Result<String> {
     Ok(format!("codex-home:{}", normalized.display()))
 }
 
+fn interactive_network_mode(config: &OperatorConfig) -> Result<NetworkMode> {
+    resolve_execution_network_mode(
+        ExecutionPlanPurpose::Interactive,
+        None,
+        config.defaults.preset.as_deref(),
+        &config.presets,
+    )
+    .map_err(|err| anyhow!(err))
+}
+
 #[cfg(test)]
 mod tests {
     use base64::Engine as _;
@@ -236,7 +247,9 @@ mod tests {
         validate_runtime_availability, validate_runtime_launch_prerequisites,
     };
     use crate::home::LionClawHome;
-    use crate::kernel::runtime::{ConfinementConfig, OciConfinementConfig};
+    use crate::kernel::runtime::{
+        ConfinementConfig, ExecutionPreset, NetworkMode, OciConfinementConfig, WorkspaceAccess,
+    };
     use crate::operator::config::{OperatorConfig, RuntimeProfileConfig};
 
     #[cfg(unix)]
@@ -451,6 +464,101 @@ mod tests {
         validate_runtime_launch_prerequisites(&home, &config, "codex")
             .await
             .expect("runtime auth should validate");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_launch_prereqs_fail_early_when_private_network_is_unavailable() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let log_path = temp_dir.path().join("podman.log");
+        let script = format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"${{1:-}}\" = \"image\" ] && [ \"${{2:-}}\" = \"exists\" ]; then\n  exit 0\nfi\nif [ \"${{1:-}}\" = \"run\" ]; then\n  cat >&2 <<'EOF'\nError: pasta failed with exit code 1:\nFailed to open() /dev/net/tun: No such device\nFailed to set up tap device in namespace\nEOF\n  exit 125\nfi\nexit 0\n",
+            log_path.display()
+        );
+        let (_podman_dir, engine) = fake_podman_with_body(&script);
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        write_test_codex_auth(
+            &home,
+            json!({
+                "OPENAI_API_KEY": null,
+                "last_refresh": Utc::now().to_rfc3339(),
+                "tokens": {
+                    "access_token": format!("a.{}.c", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                        serde_json::to_vec(&json!({ "exp": (Utc::now() + ChronoDuration::hours(1)).timestamp() }))
+                            .expect("jwt payload")
+                    )),
+                    "refresh_token": "refresh-test"
+                }
+            }),
+        )
+        .await;
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine));
+
+        let err = validate_runtime_launch_prerequisites(&home, &config, "codex")
+            .await
+            .expect_err("unavailable private network should fail before startup");
+        assert!(err.to_string().contains("requires network-mode 'on'"));
+        assert!(err
+            .to_string()
+            .contains("could not start a private network"));
+        assert!(err.to_string().contains("/dev/net/tun"));
+
+        let log = std::fs::read_to_string(&log_path).expect("read podman log");
+        assert!(log.contains("image exists ghcr.io/lionclaw/codex-runtime:latest"));
+        assert!(log.contains(
+            "run --rm --pull=never --network private --entrypoint /bin/sh ghcr.io/lionclaw/codex-runtime:latest -lc :"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_launch_prereqs_skip_private_network_probe_when_default_preset_is_offline() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let log_path = temp_dir.path().join("podman.log");
+        let script = format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"${{1:-}}\" = \"image\" ] && [ \"${{2:-}}\" = \"exists\" ]; then\n  exit 0\nfi\nif [ \"${{1:-}}\" = \"run\" ]; then\n  exit 0\nfi\nexit 0\n",
+            log_path.display()
+        );
+        let (_podman_dir, engine) = fake_podman_with_body(&script);
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        write_test_codex_auth(
+            &home,
+            json!({
+                "OPENAI_API_KEY": null,
+                "last_refresh": Utc::now().to_rfc3339(),
+                "tokens": {
+                    "access_token": format!("a.{}.c", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                        serde_json::to_vec(&json!({ "exp": (Utc::now() + ChronoDuration::hours(1)).timestamp() }))
+                            .expect("jwt payload")
+                    )),
+                    "refresh_token": "refresh-test"
+                }
+            }),
+        )
+        .await;
+        let mut config = OperatorConfig::default();
+        config.defaults.preset = Some("offline".to_string());
+        config.upsert_preset(
+            "offline".to_string(),
+            ExecutionPreset {
+                workspace_access: WorkspaceAccess::ReadWrite,
+                network_mode: NetworkMode::None,
+                mount_runtime_secrets: false,
+                escape_classes: Default::default(),
+            },
+        );
+        config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine));
+
+        validate_runtime_launch_prerequisites(&home, &config, "codex")
+            .await
+            .expect("offline preset should skip private-network probe");
+
+        let log = std::fs::read_to_string(&log_path).expect("read podman log");
+        assert!(log.contains("image exists ghcr.io/lionclaw/codex-runtime:latest"));
+        assert!(!log.contains("run --rm --pull=never --network private"));
     }
 
     #[cfg(unix)]
