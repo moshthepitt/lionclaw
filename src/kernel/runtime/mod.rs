@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    future::Future,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -93,6 +94,7 @@ pub struct RuntimeSessionHandle {
 pub struct RuntimeTurnInput {
     pub runtime_session_id: String,
     pub prompt: String,
+    pub fresh_prompt: Option<String>,
     pub runtime_skill_ids: Vec<String>,
 }
 
@@ -191,7 +193,10 @@ pub trait RuntimeAdapter: Send + Sync {
     fn build_turn_program(&self, _input: &RuntimeTurnInput) -> Result<RuntimeProgramSpec> {
         Err(anyhow!("runtime does not support program-backed turns"))
     }
-    fn program_output_parser(&self) -> Option<Box<dyn RuntimeProgramOutputParser>> {
+    fn program_output_parser(
+        &self,
+        _input: &RuntimeTurnInput,
+    ) -> Option<Box<dyn RuntimeProgramOutputParser>> {
         None
     }
     fn parse_program_output_line(&self, _line: &str) -> Vec<RuntimeEvent> {
@@ -213,6 +218,15 @@ pub trait RuntimeAdapter: Send + Sync {
                 format!("runtime process exited with code {code}: {stderr}")
             }
         }
+    }
+    fn prepare_program_retry_after_failure(
+        &self,
+        _input: &RuntimeTurnInput,
+        _output: &ExecutionOutput,
+        _observed_error_text: Option<&str>,
+        _events: &RuntimeEventSender,
+    ) -> Result<bool> {
+        Ok(false)
     }
     async fn resolve_capability_requests(
         &self,
@@ -255,11 +269,105 @@ pub async fn execute_program_backed_turn(
     input: RuntimeTurnInput,
     events: RuntimeEventSender,
 ) -> Result<RuntimeTurnResult> {
-    let program = adapter.build_turn_program(&input)?;
+    execute_program_backed_turn_with_executor(
+        adapter,
+        plan,
+        runtime_secrets_mount,
+        codex_home_override,
+        input,
+        events,
+        execution::execute_streaming,
+    )
+    .await
+}
+
+async fn execute_program_backed_turn_with_executor<E, Fut>(
+    adapter: &(dyn RuntimeAdapter + Send + Sync),
+    plan: EffectiveExecutionPlan,
+    runtime_secrets_mount: Option<RuntimeSecretsMount>,
+    codex_home_override: Option<PathBuf>,
+    input: RuntimeTurnInput,
+    events: RuntimeEventSender,
+    mut executor: E,
+) -> Result<RuntimeTurnResult>
+where
+    E: FnMut(ExecutionRequest, execution::backend::ExecutionStdoutSender) -> Fut,
+    Fut: Future<Output = Result<ExecutionOutput>>,
+{
+    let mut attempted_retry = false;
+    let mut current_input = input;
+
+    loop {
+        let attempt = run_program_backed_attempt(
+            adapter,
+            &plan,
+            runtime_secrets_mount.clone(),
+            codex_home_override.clone(),
+            &current_input,
+            &events,
+            &mut executor,
+        )
+        .await?;
+
+        if attempt.output.success() {
+            return finish_program_backed_turn(
+                adapter,
+                attempt.output,
+                attempt.last_error_text.as_deref(),
+                attempt.saw_done,
+                &events,
+            );
+        }
+
+        if !attempted_retry
+            && adapter.prepare_program_retry_after_failure(
+                &current_input,
+                &attempt.output,
+                attempt.last_error_text.as_deref(),
+                &events,
+            )?
+        {
+            attempted_retry = true;
+            if let Some(fresh_prompt) = current_input.fresh_prompt.take() {
+                current_input.prompt = fresh_prompt;
+            }
+            continue;
+        }
+
+        return finish_program_backed_turn(
+            adapter,
+            attempt.output,
+            attempt.last_error_text.as_deref(),
+            attempt.saw_done,
+            &events,
+        );
+    }
+}
+
+struct ProgramBackedAttemptOutcome {
+    output: ExecutionOutput,
+    saw_done: bool,
+    last_error_text: Option<String>,
+}
+
+async fn run_program_backed_attempt<E, Fut>(
+    adapter: &(dyn RuntimeAdapter + Send + Sync),
+    plan: &EffectiveExecutionPlan,
+    runtime_secrets_mount: Option<RuntimeSecretsMount>,
+    codex_home_override: Option<PathBuf>,
+    input: &RuntimeTurnInput,
+    events: &RuntimeEventSender,
+    executor: &mut E,
+) -> Result<ProgramBackedAttemptOutcome>
+where
+    E: FnMut(ExecutionRequest, execution::backend::ExecutionStdoutSender) -> Fut,
+    Fut: Future<Output = Result<ExecutionOutput>>,
+{
+    let program = adapter.build_turn_program(input)?;
     let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel();
-    let execution = execution::execute_streaming(
+    let execution = executor(
         ExecutionRequest {
-            plan,
+            plan: plan.clone(),
             program,
             runtime_secrets_mount,
             codex_home_override,
@@ -270,7 +378,7 @@ pub async fn execute_program_backed_turn(
 
     let mut saw_done = false;
     let mut last_error_text: Option<String> = None;
-    let mut output_parser = adapter.program_output_parser();
+    let mut output_parser = adapter.program_output_parser(input);
 
     loop {
         tokio::select! {
@@ -279,7 +387,7 @@ pub async fn execute_program_backed_turn(
                     Some(line) => observe_program_output_line(
                         adapter,
                         &mut output_parser,
-                        &events,
+                        events,
                         &line,
                         &mut saw_done,
                         &mut last_error_text,
@@ -287,18 +395,16 @@ pub async fn execute_program_backed_turn(
                     None => {
                         finish_program_output_parser(
                             &mut output_parser,
-                            &events,
+                            events,
                             &mut saw_done,
                             &mut last_error_text,
                         );
                         let output = execution.await?;
-                        return finish_program_backed_turn(
-                            adapter,
+                        return Ok(ProgramBackedAttemptOutcome {
                             output,
-                            last_error_text.as_deref(),
                             saw_done,
-                            &events,
-                        );
+                            last_error_text,
+                        });
                     }
                 }
             }
@@ -308,7 +414,7 @@ pub async fn execute_program_backed_turn(
                     observe_program_output_line(
                         adapter,
                         &mut output_parser,
-                        &events,
+                        events,
                         &line,
                         &mut saw_done,
                         &mut last_error_text,
@@ -316,17 +422,15 @@ pub async fn execute_program_backed_turn(
                 }
                 finish_program_output_parser(
                     &mut output_parser,
-                    &events,
+                    events,
                     &mut saw_done,
                     &mut last_error_text,
                 );
-                return finish_program_backed_turn(
-                    adapter,
+                return Ok(ProgramBackedAttemptOutcome {
                     output,
-                    last_error_text.as_deref(),
                     saw_done,
-                    &events,
-                );
+                    last_error_text,
+                });
             }
         }
     }
@@ -397,4 +501,214 @@ fn finish_program_backed_turn(
     Ok(RuntimeTurnResult {
         capability_requests: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
+    use super::{
+        execute_program_backed_turn_with_executor, CodexRuntimeAdapter, CodexRuntimeConfig,
+        ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionOutput, MountAccess,
+        MountSpec, NetworkMode, OciConfinementConfig, RuntimeAdapter, RuntimeEvent,
+        RuntimeProgramSpec, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
+        WorkspaceAccess,
+    };
+
+    #[derive(Clone)]
+    struct StubAttempt {
+        stdout_lines: Vec<String>,
+        output: ExecutionOutput,
+    }
+
+    fn test_execution_plan() -> EffectiveExecutionPlan {
+        EffectiveExecutionPlan {
+            runtime_id: "codex".to_string(),
+            preset_name: "everyday".to_string(),
+            confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
+            workspace_access: WorkspaceAccess::ReadWrite,
+            network_mode: NetworkMode::On,
+            working_dir: None,
+            environment: Vec::new(),
+            idle_timeout: Duration::from_secs(30),
+            hard_timeout: Duration::from_secs(90),
+            mounts: vec![MountSpec {
+                source: "/tmp/runtime".into(),
+                target: "/runtime".to_string(),
+                access: MountAccess::ReadWrite,
+            }],
+            mount_runtime_secrets: false,
+            escape_classes: Default::default(),
+            limits: ExecutionLimits::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_resume_failure_restarts_once_and_reports_continuity_restart() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
+            "",
+        )
+        .expect("write ready marker");
+        std::fs::write(
+            runtime_state_root.join(".lionclaw-codex-thread-id"),
+            "thread-old\n",
+        )
+        .expect("write saved thread id");
+
+        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig {
+            executable: "codex".to_string(),
+            model: Some("gpt-5-codex".to_string()),
+        });
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_state_root.clone()),
+            })
+            .await
+            .expect("start");
+        assert!(handle.resumes_existing_session);
+
+        let attempts = Arc::new(Mutex::new(VecDeque::from([
+            StubAttempt {
+                stdout_lines: Vec::new(),
+                output: ExecutionOutput {
+                    stderr: b"resume failed\n".to_vec(),
+                    exit_code: Some(1),
+                    ..ExecutionOutput::default()
+                },
+            },
+            StubAttempt {
+                stdout_lines: vec![
+                    r#"{"type":"thread.started","thread_id":"thread-new"}"#.to_string(),
+                    r#"{"id":"2","msg":{"type":"task_complete","last_agent_message":"Done."}}"#
+                        .to_string(),
+                ],
+                output: ExecutionOutput {
+                    exit_code: Some(0),
+                    ..ExecutionOutput::default()
+                },
+            },
+        ])));
+        let recorded_programs = Arc::new(Mutex::new(Vec::<RuntimeProgramSpec>::new()));
+        let recorded_stdin = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let result = execute_program_backed_turn_with_executor(
+            &adapter,
+            test_execution_plan(),
+            None,
+            None,
+            RuntimeTurnInput {
+                runtime_session_id: handle.runtime_session_id.clone(),
+                prompt: "hello".to_string(),
+                fresh_prompt: Some("fresh history prompt".to_string()),
+                runtime_skill_ids: Vec::new(),
+            },
+            event_tx,
+            {
+                let attempts = Arc::clone(&attempts);
+                let recorded_programs = Arc::clone(&recorded_programs);
+                let recorded_stdin = Arc::clone(&recorded_stdin);
+                move |request, stdout| {
+                    let attempts = Arc::clone(&attempts);
+                    let recorded_programs = Arc::clone(&recorded_programs);
+                    let recorded_stdin = Arc::clone(&recorded_stdin);
+                    async move {
+                        recorded_programs
+                            .lock()
+                            .expect("recorded programs lock")
+                            .push(request.program.clone());
+                        recorded_stdin
+                            .lock()
+                            .expect("recorded stdin lock")
+                            .push(request.program.stdin.clone());
+                        let attempt = attempts
+                            .lock()
+                            .expect("attempts lock")
+                            .pop_front()
+                            .expect("attempt");
+                        for line in attempt.stdout_lines {
+                            stdout.send(format!("{line}\n")).expect("send stdout line");
+                        }
+                        Ok(attempt.output)
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Ok(RuntimeTurnResult {
+                capability_requests
+            }) if capability_requests.is_empty()
+        ));
+
+        let programs = recorded_programs
+            .lock()
+            .expect("recorded programs lock")
+            .clone();
+        assert_eq!(programs.len(), 2, "expected one retry");
+        assert_eq!(
+            programs[0].args,
+            vec![
+                "exec".to_string(),
+                "resume".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "--json".to_string(),
+                "--model".to_string(),
+                "gpt-5-codex".to_string(),
+                "thread-old".to_string(),
+                "-".to_string(),
+            ]
+        );
+        assert_eq!(
+            programs[1].args,
+            vec![
+                "exec".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "--json".to_string(),
+                "--model".to_string(),
+                "gpt-5-codex".to_string(),
+            ]
+        );
+        let stdin = recorded_stdin.lock().expect("recorded stdin lock").clone();
+        assert_eq!(stdin.as_slice(), ["hello", "fresh history prompt"]);
+
+        let mut events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            events.push(event);
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::Status { code: None, text }
+                if text == "codex continuity restarted with a fresh thread"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta { text, .. } if text == "Done."
+        )));
+
+        assert_eq!(
+            std::fs::read_to_string(runtime_state_root.join(".lionclaw-codex-thread-id"))
+                .expect("read saved thread id"),
+            "thread-new\n"
+        );
+
+        adapter.close(&handle).await.expect("close");
+    }
 }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::RwLock;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -32,18 +33,31 @@ impl Default for CodexRuntimeConfig {
 #[derive(Debug)]
 pub struct CodexRuntimeAdapter {
     config: CodexRuntimeConfig,
-    sessions: RwLock<HashMap<String, CodexSessionState>>,
+    sessions: Arc<RwLock<HashMap<String, CodexSessionState>>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+const CODEX_THREAD_ID_STATE_FILE: &str = ".lionclaw-codex-thread-id";
+
+#[derive(Debug, Clone)]
 struct CodexSessionState {
-    resumes_existing_session: bool,
+    runtime_state_root: Option<PathBuf>,
+    thread_id: Option<String>,
+    last_launch_resumed_session: bool,
 }
 
 #[derive(Default)]
 struct CodexOutputParser {
     emitted_answer: bool,
     pending_unphased_agent_message: Option<String>,
+    thread_state: Option<CodexThreadState>,
+    saw_thread_id: bool,
+}
+
+#[derive(Clone)]
+struct CodexThreadState {
+    sessions: Arc<RwLock<HashMap<String, CodexSessionState>>>,
+    runtime_session_id: String,
+    expects_new_thread_id: bool,
 }
 
 impl RuntimeProgramOutputParser for CodexOutputParser {
@@ -54,6 +68,15 @@ impl RuntimeProgramOutputParser for CodexOutputParser {
     fn finish(&mut self) -> Vec<RuntimeEvent> {
         let mut events = Vec::new();
         flush_pending_agent_message(&mut events, self, RuntimeMessageLane::Answer);
+        if let Some(state) = &self.thread_state {
+            if state.expects_new_thread_id && !self.saw_thread_id {
+                events.push(RuntimeEvent::Status {
+                    code: None,
+                    text: "codex did not report a thread id; future turns will start fresh"
+                        .to_string(),
+                });
+            }
+        }
         events
     }
 }
@@ -62,7 +85,7 @@ impl CodexRuntimeAdapter {
     pub fn new(config: CodexRuntimeConfig) -> Self {
         Self {
             config,
-            sessions: RwLock::new(HashMap::new()),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -83,19 +106,20 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
 
     async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
         let runtime_session_id = format!("codex-{}", Uuid::new_v4());
-        let resumes_existing_session = input
-            .runtime_state_root
-            .as_deref()
-            .map(runtime_session_is_ready)
-            .transpose()?
-            .unwrap_or(false);
+        let thread_id = match input.runtime_state_root.as_deref() {
+            Some(root) if runtime_session_is_ready(root)? => load_saved_thread_id(root)?,
+            Some(_) | None => None,
+        };
+        let resumes_existing_session = thread_id.is_some();
         self.sessions
             .write()
             .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
             .insert(
                 runtime_session_id.clone(),
                 CodexSessionState {
-                    resumes_existing_session,
+                    runtime_state_root: input.runtime_state_root,
+                    thread_id,
+                    last_launch_resumed_session: false,
                 },
             );
 
@@ -106,22 +130,51 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
     }
 
     fn build_turn_program(&self, input: &RuntimeTurnInput) -> Result<RuntimeProgramSpec> {
-        let session = get_runtime_session(&self.sessions, &input.runtime_session_id)?;
+        let thread_id = {
+            let mut sessions = self
+                .sessions
+                .write()
+                .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?;
+            let thread_id = {
+                let session = sessions.get_mut(&input.runtime_session_id).ok_or_else(|| {
+                    anyhow!("runtime session '{}' not found", input.runtime_session_id)
+                })?;
+                session.last_launch_resumed_session = session.thread_id.is_some();
+                session.thread_id.clone()
+            };
+            drop(sessions);
+            thread_id
+        };
 
         Ok(RuntimeProgramSpec {
             executable: self.config.executable.clone(),
-            args: build_codex_exec_args(
-                self.config.model.as_deref(),
-                session.resumes_existing_session,
-            ),
+            args: build_codex_exec_args(self.config.model.as_deref(), thread_id.as_deref()),
             environment: Vec::new(),
             stdin: input.prompt.clone(),
             auth: Some(RuntimeAuthKind::Codex),
         })
     }
 
-    fn program_output_parser(&self) -> Option<Box<dyn RuntimeProgramOutputParser>> {
-        Some(Box::<CodexOutputParser>::default())
+    fn program_output_parser(
+        &self,
+        input: &RuntimeTurnInput,
+    ) -> Option<Box<dyn RuntimeProgramOutputParser>> {
+        let expects_new_thread_id = self
+            .sessions
+            .read()
+            .ok()
+            .and_then(|sessions| sessions.get(&input.runtime_session_id).cloned())
+            .map(|session| session.thread_id.is_none())
+            .unwrap_or(false);
+
+        Some(Box::new(CodexOutputParser {
+            thread_state: Some(CodexThreadState {
+                sessions: Arc::clone(&self.sessions),
+                runtime_session_id: input.runtime_session_id.clone(),
+                expects_new_thread_id,
+            }),
+            ..CodexOutputParser::default()
+        }))
     }
 
     fn parse_program_output_line(&self, line: &str) -> Vec<RuntimeEvent> {
@@ -141,6 +194,40 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
         } else {
             format!("codex exec exited with code {code}: {stderr}")
         }
+    }
+
+    fn prepare_program_retry_after_failure(
+        &self,
+        input: &RuntimeTurnInput,
+        _output: &ExecutionOutput,
+        _observed_error_text: Option<&str>,
+        events: &RuntimeEventSender,
+    ) -> Result<bool> {
+        let root_to_clear = {
+            let mut sessions = self
+                .sessions
+                .write()
+                .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?;
+            let Some(session) = sessions.get_mut(&input.runtime_session_id) else {
+                return Ok(false);
+            };
+            if !session.last_launch_resumed_session {
+                return Ok(false);
+            }
+            session.thread_id = None;
+            session.last_launch_resumed_session = false;
+            let root = session.runtime_state_root.clone();
+            drop(sessions);
+            root
+        };
+        if let Some(root) = root_to_clear.as_deref() {
+            clear_saved_thread_id(root)?;
+        }
+        drop(events.send(RuntimeEvent::Status {
+            code: None,
+            text: "codex continuity restarted with a fresh thread".to_string(),
+        }));
+        Ok(true)
     }
 
     async fn resolve_capability_requests(
@@ -171,10 +258,10 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
     }
 }
 
-fn build_codex_exec_args(model: Option<&str>, resumes_existing_session: bool) -> Vec<String> {
+fn build_codex_exec_args(model: Option<&str>, thread_id: Option<&str>) -> Vec<String> {
     let mut args = vec!["exec".to_string()];
 
-    if resumes_existing_session {
+    if thread_id.is_some() {
         args.push("resume".to_string());
     }
 
@@ -183,10 +270,6 @@ fn build_codex_exec_args(model: Option<&str>, resumes_existing_session: bool) ->
     // to nest bubblewrap inside the container.
     args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
 
-    if resumes_existing_session {
-        args.push("--last".to_string());
-    }
-
     args.push("--json".to_string());
 
     if let Some(model) = model {
@@ -194,23 +277,84 @@ fn build_codex_exec_args(model: Option<&str>, resumes_existing_session: bool) ->
         args.push(model.to_string());
     }
 
-    if resumes_existing_session {
+    if let Some(thread_id) = thread_id {
+        args.push(thread_id.to_string());
         args.push("-".to_string());
     }
 
     args
 }
 
-fn get_runtime_session(
-    sessions: &RwLock<HashMap<String, CodexSessionState>>,
-    runtime_session_id: &str,
-) -> Result<CodexSessionState> {
-    sessions
-        .read()
-        .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
-        .get(runtime_session_id)
-        .copied()
-        .ok_or_else(|| anyhow!("runtime session '{runtime_session_id}' not found"))
+fn load_saved_thread_id(root: &Path) -> Result<Option<String>> {
+    let path = root.join(CODEX_THREAD_ID_STATE_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(Into::into(err)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "codex thread state file '{}' cannot be a symlink",
+            path.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+
+    let thread_id = match fs::read_to_string(&path) {
+        Ok(contents) => contents.trim().to_string(),
+        Err(_) => return Ok(None),
+    };
+    if thread_id.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(thread_id))
+}
+
+fn save_thread_id(root: &Path, thread_id: &str) -> Result<()> {
+    let thread_id = thread_id.trim();
+    if thread_id.is_empty() {
+        return Ok(());
+    }
+
+    let path = root.join(CODEX_THREAD_ID_STATE_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(anyhow!(
+                    "codex thread state file '{}' cannot be a symlink",
+                    path.display()
+                ));
+            }
+            if !metadata.is_file() {
+                return Err(anyhow!(
+                    "codex thread state path '{}' must be a regular file",
+                    path.display()
+                ));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(Into::into(err)),
+    }
+
+    let temp_path = root.join(format!(
+        "{}.{}.tmp",
+        CODEX_THREAD_ID_STATE_FILE,
+        Uuid::new_v4().simple()
+    ));
+    fs::write(&temp_path, format!("{thread_id}\n"))?;
+    fs::rename(&temp_path, &path)?;
+    Ok(())
+}
+
+fn clear_saved_thread_id(root: &Path) -> Result<()> {
+    let path = root.join(CODEX_THREAD_ID_STATE_FILE);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(Into::into(err)),
+    }
 }
 
 fn runtime_session_is_ready(root: &Path) -> Result<bool> {
@@ -286,7 +430,16 @@ fn parse_codex_json_event(
     let event_type = codex_event_type(json);
     match event_type {
         Some("thread.started") => {
-            if let Some(thread_id) = payload.get("thread_id").and_then(Value::as_str) {
+            if let Some(thread_id) = extract_codex_thread_id(payload) {
+                parser.saw_thread_id = true;
+                if let Some(state) = &parser.thread_state {
+                    if let Err(err) = state.persist_thread_id(thread_id) {
+                        events.push(RuntimeEvent::Status {
+                            code: None,
+                            text: format!("codex thread id could not be saved: {err}"),
+                        });
+                    }
+                }
                 events.push(RuntimeEvent::Status {
                     code: None,
                     text: format!("codex thread started: {thread_id}"),
@@ -523,6 +676,31 @@ impl CodexOutputParser {
     }
 }
 
+impl CodexThreadState {
+    fn persist_thread_id(&self, thread_id: &str) -> Result<()> {
+        let root = self
+            .sessions
+            .read()
+            .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
+            .get(&self.runtime_session_id)
+            .and_then(|session| session.runtime_state_root.clone());
+
+        if let Some(root) = root.as_deref() {
+            save_thread_id(root, thread_id)?;
+        }
+
+        self.sessions
+            .write()
+            .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
+            .entry(self.runtime_session_id.clone())
+            .and_modify(|session| {
+                session.thread_id = Some(thread_id.to_string());
+                session.last_launch_resumed_session = false;
+            });
+        Ok(())
+    }
+}
+
 fn codex_event_payload(json: &Value) -> &Value {
     json.get("msg").unwrap_or(json)
 }
@@ -543,6 +721,18 @@ fn codex_event_text(payload: &Value, keys: &[&str]) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_codex_thread_id(payload: &Value) -> Option<&str> {
+    payload
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .pointer("/payload/thread_id")
+                .and_then(Value::as_str)
+        })
+        .filter(|thread_id| !thread_id.trim().is_empty())
 }
 
 fn collect_codex_text(value: &Value, depth: usize) -> Option<String> {
@@ -778,6 +968,7 @@ mod tests {
 
     use super::{
         build_codex_exec_args, parse_codex_stdout, CodexRuntimeAdapter, CodexRuntimeConfig,
+        CODEX_THREAD_ID_STATE_FILE,
     };
     use uuid::Uuid;
 
@@ -804,6 +995,7 @@ mod tests {
             .build_turn_program(&RuntimeTurnInput {
                 runtime_session_id: handle.runtime_session_id.clone(),
                 prompt: "hello".to_string(),
+                fresh_prompt: None,
                 runtime_skill_ids: Vec::new(),
             })
             .expect("program");
@@ -856,7 +1048,7 @@ mod tests {
 
     #[test]
     fn codex_exec_args_only_include_protocol_fields() {
-        let args = build_codex_exec_args(Some("gpt-5-codex"), false);
+        let args = build_codex_exec_args(Some("gpt-5-codex"), None);
 
         assert_eq!(
             args,
@@ -871,8 +1063,8 @@ mod tests {
     }
 
     #[test]
-    fn codex_resume_args_request_last_session_and_read_prompt_from_stdin() {
-        let args = build_codex_exec_args(Some("gpt-5-codex"), true);
+    fn codex_resume_args_use_saved_thread_id_and_read_prompt_from_stdin() {
+        let args = build_codex_exec_args(Some("gpt-5-codex"), Some("thread-123"));
 
         assert_eq!(
             args,
@@ -880,10 +1072,10 @@ mod tests {
                 "exec".to_string(),
                 "resume".to_string(),
                 "--dangerously-bypass-approvals-and-sandbox".to_string(),
-                "--last".to_string(),
                 "--json".to_string(),
                 "--model".to_string(),
                 "gpt-5-codex".to_string(),
+                "thread-123".to_string(),
                 "-".to_string(),
             ]
         );
@@ -892,7 +1084,7 @@ mod tests {
     #[test]
     fn codex_args_omit_model_when_runtime_model_is_unset() {
         assert_eq!(
-            build_codex_exec_args(None, false),
+            build_codex_exec_args(None, None),
             vec![
                 "exec".to_string(),
                 "--dangerously-bypass-approvals-and-sandbox".to_string(),
@@ -1006,5 +1198,228 @@ mod tests {
             events.is_empty(),
             "non-event JSON should not surface as status spam"
         );
+    }
+
+    #[tokio::test]
+    async fn first_successful_turn_saves_codex_thread_id() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_state_root.clone()),
+            })
+            .await
+            .expect("start");
+        assert!(!handle.resumes_existing_session);
+
+        let turn_input = RuntimeTurnInput {
+            runtime_session_id: handle.runtime_session_id.clone(),
+            prompt: "hello".to_string(),
+            fresh_prompt: None,
+            runtime_skill_ids: Vec::new(),
+        };
+        let mut parser = adapter
+            .program_output_parser(&turn_input)
+            .expect("program output parser");
+        let events = parser.parse_line(r#"{"type":"thread.started","thread_id":"thread-new"}"#);
+        assert!(matches!(
+            &events[0],
+            RuntimeEvent::Status { code: None, text } if text == "codex thread started: thread-new"
+        ));
+        assert_eq!(
+            std::fs::read_to_string(runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE))
+                .expect("read saved thread id"),
+            "thread-new\n"
+        );
+
+        let program = adapter.build_turn_program(&turn_input).expect("program");
+        assert_eq!(
+            program.args,
+            vec![
+                "exec".to_string(),
+                "resume".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "--json".to_string(),
+                "thread-new".to_string(),
+                "-".to_string(),
+            ]
+        );
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn missing_or_invalid_thread_file_starts_fresh_codex_thread() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE), "\n")
+            .expect("write invalid thread id");
+
+        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_state_root),
+            })
+            .await
+            .expect("start");
+        assert!(!handle.resumes_existing_session);
+
+        let program = adapter
+            .build_turn_program(&RuntimeTurnInput {
+                runtime_session_id: handle.runtime_session_id.clone(),
+                prompt: "hello".to_string(),
+                fresh_prompt: None,
+                runtime_skill_ids: Vec::new(),
+            })
+            .expect("program");
+        assert_eq!(
+            program.args,
+            vec![
+                "exec".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "--json".to_string(),
+            ]
+        );
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn saved_thread_file_without_ready_marker_starts_fresh_codex_thread() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE),
+            "thread-old\n",
+        )
+        .expect("write thread id");
+
+        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_state_root),
+            })
+            .await
+            .expect("start");
+        assert!(!handle.resumes_existing_session);
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn symlinked_thread_file_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
+            "",
+        )
+        .expect("write ready marker");
+        let target = temp_dir.path().join("thread-id-target");
+        std::fs::write(&target, "thread-old\n").expect("write target");
+        symlink(&target, runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE))
+            .expect("create symlink");
+
+        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
+        let err = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_state_root),
+            })
+            .await
+            .expect_err("symlinked thread state should fail");
+        assert!(err.to_string().contains("cannot be a symlink"));
+    }
+
+    #[tokio::test]
+    async fn different_lionclaw_sessions_do_not_share_codex_thread_ids() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_a = temp_dir.path().join("runtime-a");
+        let runtime_b = temp_dir.path().join("runtime-b");
+        std::fs::create_dir_all(&runtime_a).expect("create runtime a");
+        std::fs::create_dir_all(&runtime_b).expect("create runtime b");
+        std::fs::write(
+            runtime_a.join(crate::home::RUNTIME_SESSION_READY_MARKER),
+            "",
+        )
+        .expect("write ready marker a");
+        std::fs::write(
+            runtime_b.join(crate::home::RUNTIME_SESSION_READY_MARKER),
+            "",
+        )
+        .expect("write ready marker b");
+        std::fs::write(runtime_a.join(CODEX_THREAD_ID_STATE_FILE), "thread-a\n")
+            .expect("write thread a");
+        std::fs::write(runtime_b.join(CODEX_THREAD_ID_STATE_FILE), "thread-b\n")
+            .expect("write thread b");
+
+        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
+        let handle_a = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_a),
+            })
+            .await
+            .expect("start a");
+        let handle_b = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_b),
+            })
+            .await
+            .expect("start b");
+
+        let program_a = adapter
+            .build_turn_program(&RuntimeTurnInput {
+                runtime_session_id: handle_a.runtime_session_id.clone(),
+                prompt: "hello".to_string(),
+                fresh_prompt: None,
+                runtime_skill_ids: Vec::new(),
+            })
+            .expect("program a");
+        let program_b = adapter
+            .build_turn_program(&RuntimeTurnInput {
+                runtime_session_id: handle_b.runtime_session_id.clone(),
+                prompt: "hello".to_string(),
+                fresh_prompt: None,
+                runtime_skill_ids: Vec::new(),
+            })
+            .expect("program b");
+
+        assert!(program_a.args.contains(&"thread-a".to_string()));
+        assert!(program_b.args.contains(&"thread-b".to_string()));
+        assert!(!program_a.args.contains(&"thread-b".to_string()));
+        assert!(!program_b.args.contains(&"thread-a".to_string()));
+
+        adapter.close(&handle_a).await.expect("close a");
+        adapter.close(&handle_b).await.expect("close b");
     }
 }
