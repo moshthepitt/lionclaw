@@ -9,5 +9,5 @@ description = "Interactive terminal channel skill for LionClaw"
 requires-python = ">=3.12"
 dependencies = [
   "httpx==0.28.1",
-  "textual==0.86.1",
+  "textual==8.2.3",
 ]
