@@ -1,6 +1,8 @@
 /target/
 /dist/
 **/*.log
+**/__pycache__/
+**/*.pyc
 .DS_Store
 lionclaw.db
 lionclaw.db-shm
