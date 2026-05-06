@@ -23,8 +23,8 @@ Under the hood, the worker:
 
 ## Prerequisites
 
-- `curl`
-- `jq`
+- `python3`
+- `uv`
 - Telegram bot token with DM access
 - LionClaw running (default `http://127.0.0.1:8979`)
 
@@ -58,4 +58,4 @@ LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
 - The worker defaults `consumer_id` to `telegram:<channel_id>` and `start_mode=resume`, so undelivered stream events are replayed after worker restart.
 - Telegram delivery is message-oriented by default: typing while a turn is active, final answer on `done`, no reasoning lane delivery.
 - Runtime selection normally comes from `lionclaw service up --runtime ...`. `LIONCLAW_RUNTIME_ID` is an optional per-worker override for low-level testing.
-- The worker stores Telegram offset in `.lionclaw-telegram-offset` by default.
+- The worker stores Telegram offset in `$LIONCLAW_HOME/runtime/channels/$LIONCLAW_CHANNEL_ID/telegram.offset` by default.
