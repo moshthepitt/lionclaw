@@ -10,7 +10,7 @@ use crate::kernel::skills::validate_skill_alias;
 
 use super::plan::{
     ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset, MountAccess, MountSpec,
-    OciConfinementConfig, RuntimeAuthKind, WorkspaceAccess, SKILLS_MOUNT_TARGET_ROOT,
+    NetworkMode, OciConfinementConfig, RuntimeAuthKind, WorkspaceAccess, SKILLS_MOUNT_TARGET_ROOT,
 };
 
 pub const BUILTIN_PRESET_EVERYDAY: &str = "everyday";
@@ -274,6 +274,19 @@ impl ExecutionPlanner {
         )
     }
 
+    pub(crate) fn resolve_network_mode(
+        &self,
+        requested_name: Option<&str>,
+        purpose: ExecutionPlanPurpose,
+    ) -> Result<NetworkMode, String> {
+        resolve_execution_network_mode(
+            purpose,
+            requested_name,
+            self.default_preset_name.as_deref(),
+            &self.presets,
+        )
+    }
+
     pub fn required_runtime_auth(&self, runtime_id: &str) -> Option<RuntimeAuthKind> {
         self.runtimes
             .get(runtime_id)
@@ -401,6 +414,16 @@ pub(crate) fn resolve_execution_preset(
         BUILTIN_PRESET_EVERYDAY.to_string(),
         ExecutionPreset::default(),
     ))
+}
+
+pub(crate) fn resolve_execution_network_mode(
+    purpose: ExecutionPlanPurpose,
+    requested_name: Option<&str>,
+    default_preset_name: Option<&str>,
+    presets: &BTreeMap<String, ExecutionPreset>,
+) -> Result<NetworkMode, String> {
+    resolve_execution_preset(purpose, requested_name, default_preset_name, presets)
+        .map(|(_, preset)| preset.network_mode)
 }
 
 fn workspace_access_to_mount_access(access: WorkspaceAccess) -> MountAccess {

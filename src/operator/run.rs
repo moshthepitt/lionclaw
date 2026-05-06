@@ -1001,6 +1001,54 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn run_local_fails_early_when_private_network_is_unavailable() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let stub = temp_dir.path().join("codex-stub.sh");
+        write_script(&stub, "#!/usr/bin/env bash\ncat >/dev/null\n");
+        let broken_podman = temp_dir.path().join("podman");
+        write_script(
+            &broken_podman,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${1:-}" = "image" ] && [ "${2:-}" = "exists" ]; then
+  exit 0
+fi
+
+if [ "${1:-}" = "run" ]; then
+  cat >&2 <<'EOF'
+Error: pasta failed with exit code 1:
+Failed to open() /dev/net/tun: No such device
+Failed to set up tap device in namespace
+EOF
+  exit 125
+fi
+
+exit 0
+"#,
+        );
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
+        config.save(&home).await.expect("save config");
+        write_codex_runtime_auth(&home).await;
+
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let err = run_local_with_io(&home, None, false, &mut input, &mut output)
+            .await
+            .expect_err("private-network failure should block run");
+
+        assert!(err.to_string().contains("requires network-mode 'on'"));
+        assert!(err
+            .to_string()
+            .contains("could not start a private network"));
+        assert!(err.to_string().contains("/dev/net/tun"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn run_local_streams_codex_reasoning_and_answer_lanes() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));

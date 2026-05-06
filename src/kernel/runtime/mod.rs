@@ -58,11 +58,50 @@ pub async fn validate_runtime_launch_prerequisites(
     required_auth: Option<RuntimeAuthKind>,
     codex_home_override: Option<&Path>,
 ) -> Result<()> {
+    validate_runtime_prerequisites(
+        runtime_id,
+        confinement,
+        required_auth,
+        codex_home_override,
+        None,
+    )
+    .await
+}
+
+pub async fn validate_runtime_execution_prerequisites(
+    runtime_id: &str,
+    confinement: &ConfinementConfig,
+    required_auth: Option<RuntimeAuthKind>,
+    codex_home_override: Option<&Path>,
+    network_mode: NetworkMode,
+) -> Result<()> {
+    validate_runtime_prerequisites(
+        runtime_id,
+        confinement,
+        required_auth,
+        codex_home_override,
+        Some(network_mode),
+    )
+    .await
+}
+
+async fn validate_runtime_prerequisites(
+    runtime_id: &str,
+    confinement: &ConfinementConfig,
+    required_auth: Option<RuntimeAuthKind>,
+    codex_home_override: Option<&Path>,
+    network_mode: Option<NetworkMode>,
+) -> Result<()> {
     validate_runtime_auth_prerequisites(runtime_id, required_auth, codex_home_override).await?;
 
     match confinement {
         ConfinementConfig::Oci(config) => {
-            validate_oci_launch_prerequisites(runtime_id, config, required_auth).await
+            validate_oci_launch_prerequisites(runtime_id, config, required_auth).await?;
+            if network_mode == Some(NetworkMode::On) {
+                execution::oci::validate_oci_private_network_prerequisites(runtime_id, config)
+                    .await?;
+            }
+            Ok(())
         }
     }
 }

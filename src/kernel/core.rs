@@ -73,7 +73,7 @@ use super::{
         execute_program_backed_turn, project_runtime_skills, register_builtin_runtime_adapters,
         resolve_oci_image_compatibility_identity, skill_mount_target, EffectiveExecutionPlan,
         ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
-        ExecutionPreset, HiddenTurnSupport, MountAccess, MountSpec, RuntimeAdapter,
+        ExecutionPreset, HiddenTurnSupport, MountAccess, MountSpec, NetworkMode, RuntimeAdapter,
         RuntimeCapabilityRequest, RuntimeCapabilityResult, RuntimeEvent, RuntimeExecutionProfile,
         RuntimeMessageLane, RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle,
         RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
@@ -230,18 +230,62 @@ impl Kernel {
         &self,
         runtime_id: &str,
     ) -> Result<(), KernelError> {
+        self.validate_runtime_prerequisites(runtime_id, None).await
+    }
+
+    async fn validate_runtime_execution_prerequisites(
+        &self,
+        runtime_id: &str,
+        network_mode: NetworkMode,
+    ) -> Result<(), KernelError> {
+        self.validate_runtime_prerequisites(runtime_id, Some(network_mode))
+            .await
+    }
+
+    pub(super) async fn validate_runtime_launch_prerequisites_for_purpose(
+        &self,
+        runtime_id: &str,
+        purpose: ExecutionPlanPurpose,
+    ) -> Result<(), KernelError> {
+        let network_mode = self
+            .execution_planner
+            .resolve_network_mode(None, purpose)
+            .map_err(KernelError::Runtime)?;
+        self.validate_runtime_execution_prerequisites(runtime_id, network_mode)
+            .await
+    }
+
+    async fn validate_runtime_prerequisites(
+        &self,
+        runtime_id: &str,
+        network_mode: Option<NetworkMode>,
+    ) -> Result<(), KernelError> {
         let profile = self.execution_planner.runtime_profile(runtime_id);
         let Some(profile) = profile else {
             return Ok(());
         };
-        crate::kernel::runtime::validate_runtime_launch_prerequisites(
-            runtime_id,
-            &profile.confinement,
-            profile.required_runtime_auth,
-            self.codex_home_override.as_deref(),
-        )
-        .await
-        .map_err(|err| KernelError::Runtime(err.to_string()))
+        let result = match network_mode {
+            Some(network_mode) => {
+                crate::kernel::runtime::validate_runtime_execution_prerequisites(
+                    runtime_id,
+                    &profile.confinement,
+                    profile.required_runtime_auth,
+                    self.codex_home_override.as_deref(),
+                    network_mode,
+                )
+                .await
+            }
+            None => {
+                crate::kernel::runtime::validate_runtime_launch_prerequisites(
+                    runtime_id,
+                    &profile.confinement,
+                    profile.required_runtime_auth,
+                    self.codex_home_override.as_deref(),
+                )
+                .await
+            }
+        };
+        result.map_err(|err| KernelError::Runtime(err.to_string()))
     }
 
     pub async fn new(db_path: &Path) -> anyhow::Result<Self> {
@@ -1801,8 +1845,11 @@ impl Kernel {
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("job not found".to_string()))?;
-        self.validate_runtime_launch_prerequisites(&existing.runtime_id)
-            .await?;
+        self.validate_runtime_launch_prerequisites_for_purpose(
+            &existing.runtime_id,
+            ExecutionPlanPurpose::Interactive,
+        )
+        .await?;
         let claimed = self
             .jobs
             .claim_manual_run(req.job_id, Utc::now())
@@ -2285,7 +2332,7 @@ impl Kernel {
                 },
             )
             .await?;
-        self.validate_runtime_launch_prerequisites(runtime_id)
+        self.validate_runtime_execution_prerequisites(runtime_id, execution_plan.network_mode)
             .await?;
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
@@ -4483,7 +4530,7 @@ impl Kernel {
                 },
             )
             .await?;
-        self.validate_runtime_launch_prerequisites(&runtime_id)
+        self.validate_runtime_execution_prerequisites(&runtime_id, execution_plan.network_mode)
             .await?;
         if kind == SessionTurnKind::Retry {
             self.reset_runtime_plan_state(&execution_plan).await?;

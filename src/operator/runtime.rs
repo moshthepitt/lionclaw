@@ -8,15 +8,11 @@ use anyhow::{anyhow, Result};
 
 use crate::home::LionClawHome;
 use crate::kernel::{
-    runtime::execution::{
-        oci::validate_oci_private_network_prerequisites, planner::resolve_execution_preset,
-    },
+    runtime::execution::planner::resolve_execution_network_mode,
     runtime::{
-        resolve_oci_image_compatibility_identity,
-        validate_runtime_launch_prerequisites as validate_kernel_runtime_launch_prerequisites,
-        CodexRuntimeAdapter, CodexRuntimeConfig, ConfinementConfig, ExecutionPlanPurpose,
-        NetworkMode, OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig, RuntimeAuthKind,
-        RuntimeExecutionProfile,
+        resolve_oci_image_compatibility_identity, validate_runtime_execution_prerequisites,
+        CodexRuntimeAdapter, CodexRuntimeConfig, ExecutionPlanPurpose, NetworkMode,
+        OpenCodeRuntimeAdapter, OpenCodeRuntimeConfig, RuntimeAuthKind, RuntimeExecutionProfile,
     },
     Kernel,
 };
@@ -146,23 +142,14 @@ pub async fn validate_runtime_launch_prerequisites(
         .runtime(runtime_id)
         .ok_or_else(|| anyhow!("runtime profile '{runtime_id}' is not configured"))?;
     let codex_home_override = operator_codex_home_override(home)?;
-    validate_kernel_runtime_launch_prerequisites(
+    validate_runtime_execution_prerequisites(
         runtime_id,
         profile.confinement(),
         profile.required_runtime_auth(),
         codex_home_override.as_deref(),
+        interactive_network_mode(config)?,
     )
-    .await?;
-
-    if interactive_network_mode(config)? == NetworkMode::On {
-        match profile.confinement() {
-            ConfinementConfig::Oci(oci) => {
-                validate_oci_private_network_prerequisites(runtime_id, oci).await?
-            }
-        }
-    }
-
-    Ok(())
+    .await
 }
 
 pub(crate) fn operator_codex_home_override(_home: &LionClawHome) -> Result<Option<PathBuf>> {
@@ -240,14 +227,13 @@ fn normalize_identity_path(path: &Path) -> Result<String> {
 }
 
 fn interactive_network_mode(config: &OperatorConfig) -> Result<NetworkMode> {
-    let (_, preset) = resolve_execution_preset(
+    resolve_execution_network_mode(
         ExecutionPlanPurpose::Interactive,
         None,
         config.defaults.preset.as_deref(),
         &config.presets,
     )
-    .map_err(|err| anyhow!(err))?;
-    Ok(preset.network_mode)
+    .map_err(|err| anyhow!(err))
 }
 
 #[cfg(test)]
