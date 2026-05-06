@@ -355,6 +355,25 @@ namespace, commonly through a working `pasta` and `/dev/net/tun` path. LionClaw
 preflights that requirement before interactive or managed-service startup when
 the effective preset uses `network-mode = "on"`.
 
+On Arch Linux, a common failure is `pasta failed ... /dev/net/tun: No such
+device` when the `tun` kernel module is not loaded. Load it with:
+
+```bash
+sudo modprobe tun
+```
+
+Verify it is present:
+
+```bash
+ls /sys/module/tun
+```
+
+To keep it loaded across reboots:
+
+```bash
+printf 'tun\n' | sudo tee /etc/modules-load.d/tun.conf
+```
+
 Runtime secrets for confined runtimes live separately in
 `~/.lionclaw/config/runtime-secrets.env`. Presets either mount that whole file
 or mount no runtime secrets at all with `mount-runtime-secrets = true|false`.
