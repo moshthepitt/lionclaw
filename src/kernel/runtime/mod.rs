@@ -310,6 +310,7 @@ where
         .await?;
 
         if attempt.output.success() {
+            flush_buffered_program_output_events(&events, attempt.buffered_events);
             return finish_program_backed_turn(
                 adapter,
                 attempt.output,
@@ -334,6 +335,7 @@ where
             continue;
         }
 
+        flush_buffered_program_output_events(&events, attempt.buffered_events);
         return finish_program_backed_turn(
             adapter,
             attempt.output,
@@ -345,6 +347,7 @@ where
 }
 
 struct ProgramBackedAttemptOutcome {
+    buffered_events: Option<Vec<RuntimeEvent>>,
     output: ExecutionOutput,
     saw_done: bool,
     last_error_text: Option<String>,
@@ -376,6 +379,7 @@ where
     );
     tokio::pin!(execution);
 
+    let mut buffered_events = input.fresh_prompt.is_some().then(Vec::new);
     let mut saw_done = false;
     let mut last_error_text: Option<String> = None;
     let mut output_parser = adapter.program_output_parser(input);
@@ -388,6 +392,7 @@ where
                         adapter,
                         &mut output_parser,
                         events,
+                        &mut buffered_events,
                         &line,
                         &mut saw_done,
                         &mut last_error_text,
@@ -396,11 +401,13 @@ where
                         finish_program_output_parser(
                             &mut output_parser,
                             events,
+                            &mut buffered_events,
                             &mut saw_done,
                             &mut last_error_text,
                         );
                         let output = execution.await?;
                         return Ok(ProgramBackedAttemptOutcome {
+                            buffered_events,
                             output,
                             saw_done,
                             last_error_text,
@@ -415,6 +422,7 @@ where
                         adapter,
                         &mut output_parser,
                         events,
+                        &mut buffered_events,
                         &line,
                         &mut saw_done,
                         &mut last_error_text,
@@ -423,10 +431,12 @@ where
                 finish_program_output_parser(
                     &mut output_parser,
                     events,
+                    &mut buffered_events,
                     &mut saw_done,
                     &mut last_error_text,
                 );
                 return Ok(ProgramBackedAttemptOutcome {
+                    buffered_events,
                     output,
                     saw_done,
                     last_error_text,
@@ -440,6 +450,7 @@ fn observe_program_output_line(
     adapter: &(dyn RuntimeAdapter + Send + Sync),
     output_parser: &mut Option<Box<dyn RuntimeProgramOutputParser>>,
     events: &RuntimeEventSender,
+    buffered_events: &mut Option<Vec<RuntimeEvent>>,
     line: &str,
     saw_done: &mut bool,
     last_error_text: &mut Option<String>,
@@ -450,22 +461,36 @@ fn observe_program_output_line(
         adapter.parse_program_output_line(line)
     };
 
-    observe_program_output_events(events, parsed_events, saw_done, last_error_text);
+    observe_program_output_events(
+        events,
+        buffered_events,
+        parsed_events,
+        saw_done,
+        last_error_text,
+    );
 }
 
 fn finish_program_output_parser(
     output_parser: &mut Option<Box<dyn RuntimeProgramOutputParser>>,
     events: &RuntimeEventSender,
+    buffered_events: &mut Option<Vec<RuntimeEvent>>,
     saw_done: &mut bool,
     last_error_text: &mut Option<String>,
 ) {
     if let Some(parser) = output_parser.as_mut() {
-        observe_program_output_events(events, parser.finish(), saw_done, last_error_text);
+        observe_program_output_events(
+            events,
+            buffered_events,
+            parser.finish(),
+            saw_done,
+            last_error_text,
+        );
     }
 }
 
 fn observe_program_output_events(
     events: &RuntimeEventSender,
+    buffered_events: &mut Option<Vec<RuntimeEvent>>,
     parsed_events: Vec<RuntimeEvent>,
     saw_done: &mut bool,
     last_error_text: &mut Option<String>,
@@ -477,7 +502,22 @@ fn observe_program_output_events(
         if let RuntimeEvent::Error { text, .. } = &event {
             *last_error_text = Some(text.clone());
         }
-        drop(events.send(event));
+        if let Some(buffer) = buffered_events.as_mut() {
+            buffer.push(event);
+        } else {
+            drop(events.send(event));
+        }
+    }
+}
+
+fn flush_buffered_program_output_events(
+    events: &RuntimeEventSender,
+    buffered_events: Option<Vec<RuntimeEvent>>,
+) {
+    if let Some(buffered_events) = buffered_events {
+        for event in buffered_events {
+            drop(events.send(event));
+        }
     }
 }
 
@@ -584,9 +624,10 @@ mod tests {
 
         let attempts = Arc::new(Mutex::new(VecDeque::from([
             StubAttempt {
-                stdout_lines: Vec::new(),
+                stdout_lines: vec![
+                    r#"{"type":"error","message":"thread not found for resume"}"#.to_string(),
+                ],
                 output: ExecutionOutput {
-                    stderr: b"resume failed\n".to_vec(),
                     exit_code: Some(1),
                     ..ExecutionOutput::default()
                 },
@@ -697,6 +738,11 @@ mod tests {
             event,
             RuntimeEvent::Status { code: None, text }
                 if text == "codex continuity restarted with a fresh thread"
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::Error { text, .. }
+                if text.contains("thread not found for resume")
         )));
         assert!(events.iter().any(|event| matches!(
             event,

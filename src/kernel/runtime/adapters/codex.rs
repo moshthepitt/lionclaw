@@ -199,8 +199,8 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
     fn prepare_program_retry_after_failure(
         &self,
         input: &RuntimeTurnInput,
-        _output: &ExecutionOutput,
-        _observed_error_text: Option<&str>,
+        output: &ExecutionOutput,
+        observed_error_text: Option<&str>,
         events: &RuntimeEventSender,
     ) -> Result<bool> {
         let root_to_clear = {
@@ -212,6 +212,9 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
                 return Ok(false);
             };
             if !session.last_launch_resumed_session {
+                return Ok(false);
+            }
+            if !is_stale_codex_resume_failure(output, observed_error_text) {
                 return Ok(false);
             }
             session.thread_id = None;
@@ -355,6 +358,52 @@ fn clear_saved_thread_id(root: &Path) -> Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(Into::into(err)),
     }
+}
+
+fn is_stale_codex_resume_failure(
+    output: &ExecutionOutput,
+    observed_error_text: Option<&str>,
+) -> bool {
+    if let Some(text) = observed_error_text {
+        if is_stale_codex_resume_failure_text(text) {
+            return true;
+        }
+    }
+
+    if output.stderr.is_empty() {
+        return false;
+    }
+
+    is_stale_codex_resume_failure_text(&String::from_utf8_lossy(&output.stderr))
+}
+
+fn is_stale_codex_resume_failure_text(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let references_saved_continuity = ["thread", "conversation", "session", "resume", "continuity"]
+        .iter()
+        .any(|needle| normalized.contains(needle));
+    if !references_saved_continuity {
+        return false;
+    }
+
+    [
+        "not found",
+        "no such",
+        "missing",
+        "unknown",
+        "invalid",
+        "expired",
+        "stale",
+        "does not exist",
+        "cannot be found",
+        "can't be found",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
 }
 
 fn runtime_session_is_ready(root: &Path) -> Result<bool> {
@@ -967,8 +1016,8 @@ mod tests {
     };
 
     use super::{
-        build_codex_exec_args, parse_codex_stdout, CodexRuntimeAdapter, CodexRuntimeConfig,
-        CODEX_THREAD_ID_STATE_FILE,
+        build_codex_exec_args, is_stale_codex_resume_failure_text, parse_codex_stdout,
+        CodexRuntimeAdapter, CodexRuntimeConfig, CODEX_THREAD_ID_STATE_FILE,
     };
     use uuid::Uuid;
 
@@ -1200,6 +1249,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stale_resume_retry_matcher_is_narrow() {
+        assert!(is_stale_codex_resume_failure_text(
+            "codex: thread not found for resume"
+        ));
+        assert!(is_stale_codex_resume_failure_text(
+            "conversation does not exist"
+        ));
+        assert!(!is_stale_codex_resume_failure_text(
+            "network request failed"
+        ));
+        assert!(!is_stale_codex_resume_failure_text(
+            "authentication failed for this thread"
+        ));
+    }
+
     #[tokio::test]
     async fn first_successful_turn_saves_codex_thread_id() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -1249,6 +1314,71 @@ mod tests {
                 "thread-new".to_string(),
                 "-".to_string(),
             ]
+        );
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn non_stale_resume_failure_keeps_saved_thread_id() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
+            "",
+        )
+        .expect("write ready marker");
+        std::fs::write(
+            runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE),
+            "thread-old\n",
+        )
+        .expect("write thread id");
+
+        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_state_root.clone()),
+            })
+            .await
+            .expect("start");
+        assert!(handle.resumes_existing_session);
+
+        let turn_input = RuntimeTurnInput {
+            runtime_session_id: handle.runtime_session_id.clone(),
+            prompt: "hello".to_string(),
+            fresh_prompt: Some("fresh prompt".to_string()),
+            runtime_skill_ids: Vec::new(),
+        };
+        adapter.build_turn_program(&turn_input).expect("program");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let should_retry = adapter
+            .prepare_program_retry_after_failure(
+                &turn_input,
+                &ExecutionOutput {
+                    stderr: b"network request failed\n".to_vec(),
+                    exit_code: Some(1),
+                    ..ExecutionOutput::default()
+                },
+                Some("codex: network request failed"),
+                &event_tx,
+            )
+            .expect("retry decision");
+
+        assert!(!should_retry);
+        assert!(
+            event_rx.try_recv().is_err(),
+            "non-stale failures should not emit retry status"
+        );
+        assert_eq!(
+            std::fs::read_to_string(runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE))
+                .expect("read saved thread id"),
+            "thread-old\n"
         );
 
         adapter.close(&handle).await.expect("close");
