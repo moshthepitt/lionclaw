@@ -47,7 +47,7 @@ useless_concat = "warn"
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
-axum = { version = "0.7", features = ["macros", "json"] }
+axum = { version = "0.8", features = ["macros", "json"] }
 base64 = "0.22"
 chrono-tz = "0.10"
 cron = "0.16"
