@@ -305,6 +305,9 @@ Operator-facing paths:
 - `lionclaw project init`
 - `lionclaw instance create <name>`
 - `lionclaw instance list`
+- `lionclaw configure --runtime codex`
+- `lionclaw status`
+- `lionclaw status --all`
 - `lionclaw runtime add ...`
 - `lionclaw run [runtime]`
 - `lionclaw run --continue-last-session [runtime]`

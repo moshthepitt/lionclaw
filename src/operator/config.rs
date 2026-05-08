@@ -621,8 +621,9 @@ pub fn validate_host_executable(source: &str) -> Result<()> {
 }
 
 pub fn validate_podman_executable(source: &str) -> Result<()> {
-    validate_host_executable(source)?;
-    ensure_podman_executable(&normalize_executable_path(source.trim())?)
+    let raw = source.trim();
+    validate_host_executable(raw)?;
+    ensure_podman_executable(&normalize_executable_path(raw)?)
 }
 
 fn looks_like_path(raw: &str) -> bool {
@@ -662,8 +663,8 @@ mod tests {
     use super::{
         daemon_compat_fingerprint, daemon_compat_fingerprint_with_runtime_context,
         derive_skill_alias, normalize_host_executable, normalize_local_source,
-        normalize_runtime_command, validate_host_executable, ChannelLaunchMode,
-        ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig,
+        normalize_runtime_command, validate_host_executable, validate_podman_executable,
+        ChannelLaunchMode, ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig,
     };
     use crate::kernel::runtime::{
         ConfinementConfig, ExecutionPreset, NetworkMode, OciConfinementConfig, WorkspaceAccess,
@@ -731,6 +732,15 @@ mod tests {
     fn normalizes_local_source_uri() {
         let absolute = normalize_local_source(".").expect("normalize");
         assert!(absolute.starts_with("local:/"));
+    }
+
+    #[test]
+    fn bare_podman_engine_is_rejected_for_stored_profiles() {
+        let err = validate_podman_executable("podman").expect_err("bare podman engine");
+
+        assert!(err
+            .to_string()
+            .contains("must be stored as an absolute or explicit path"));
     }
 
     #[test]
