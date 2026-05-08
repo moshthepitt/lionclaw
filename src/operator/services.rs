@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -826,6 +826,7 @@ fn prune_user_unit_dir(home: &LionClawHome, dir: &Path, desired_names: &[&str]) 
     }
 
     let home_root = canonical_home_root(home)?;
+    let managed_dir = normalize_lexical_path(&home.services_systemd_dir());
     for entry in std::fs::read_dir(dir)
         .with_context(|| format!("failed to read directory {}", dir.display()))?
     {
@@ -843,6 +844,9 @@ fn prune_user_unit_dir(home: &LionClawHome, dir: &Path, desired_names: &[&str]) 
         let metadata = std::fs::symlink_metadata(&path)
             .with_context(|| format!("failed to inspect {}", path.display()))?;
         if metadata.file_type().is_symlink() {
+            if symlink_points_inside(&path, dir, &managed_dir)? {
+                remove_path_if_exists(&path)?;
+            }
             continue;
         }
         if !metadata.is_file() {
@@ -854,6 +858,33 @@ fn prune_user_unit_dir(home: &LionClawHome, dir: &Path, desired_names: &[&str]) 
     }
 
     Ok(())
+}
+
+fn symlink_points_inside(path: &Path, dir: &Path, managed_dir: &Path) -> Result<bool> {
+    let target = std::fs::read_link(path)
+        .with_context(|| format!("failed to read link {}", path.display()))?;
+    let resolved = if target.is_absolute() {
+        target
+    } else {
+        path.parent().unwrap_or(dir).join(target)
+    };
+    Ok(normalize_lexical_path(&resolved).starts_with(managed_dir))
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<()> {
@@ -1139,10 +1170,19 @@ mod tests {
         )
         .expect("managed unit");
 
+        let managed_link_target = home.services_systemd_dir().join("lionclawd.service");
+        fs::write(&managed_link_target, "[Unit]\n").expect("legacy managed target");
+        let managed_link = user_dir.join("lionclawd.service");
+        symlink(&managed_link_target, &managed_link).expect("legacy managed link");
+
         let unrelated_target = temp_dir.path().join("custom.service");
         fs::write(&unrelated_target, "[Unit]\n").expect("custom unit");
         let unrelated_link = user_dir.join("lionclaw-custom.service");
         symlink(&unrelated_target, &unrelated_link).expect("custom link");
+
+        let escaping_target = home.services_systemd_dir().join("../outside.service");
+        let escaping_link = user_dir.join("lionclaw-escape.service");
+        symlink(&escaping_target, &escaping_link).expect("escaping link");
 
         prune_user_unit_dir(&home, &user_dir, &[]).expect("prune");
 
@@ -1151,8 +1191,20 @@ mod tests {
             "managed unit file should be removed"
         );
         assert!(
+            !path_entry_exists(&managed_link).expect("managed link exists"),
+            "legacy managed symlink should be removed"
+        );
+        assert!(
+            managed_link_target.exists(),
+            "managed symlink target should be preserved"
+        );
+        assert!(
             unrelated_link.exists(),
             "unrelated symlink should be preserved"
+        );
+        assert!(
+            path_entry_exists(&escaping_link).expect("escaping link exists"),
+            "escaping symlink should be preserved"
         );
     }
 
