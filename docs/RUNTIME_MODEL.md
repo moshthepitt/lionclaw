@@ -313,8 +313,9 @@ Operator-facing paths:
 - `lionclaw run --continue-last-session [runtime]`
 - `lionclaw run --timeout 4h [runtime]`
 - `lionclaw skill install ...`
-- `lionclaw channel add ...`
-- `lionclaw channel attach ...`
+- `lionclaw connect <channel-or-path>`
+- `lionclaw channel list`
+- `lionclaw channel remove <channel>`
 - `lionclaw job add|ls|show|run|pause|resume|rm`
 - `lionclaw service up --runtime [runtime]`
 - `lionclaw service down`
@@ -322,10 +323,12 @@ Operator-facing paths:
 - `lionclaw service logs`
 
 `lionclaw skill install` copies a skill into the selected instance home's
-`skills/<alias>` directory.
-`lionclaw skill rm` deletes that installed alias from disk. `lionclaw channel
-add --skill <alias>` makes that alias host-only; every other installed alias
-is runtime-visible by default.
+`skills/<alias>` directory. `lionclaw skill rm` deletes that installed alias
+from disk. `lionclaw connect <channel-or-path>` reads channel skill metadata,
+installs or binds the channel skill, records the selected instance's channel
+config, persists required channel env under `config/channels/`, and starts the
+interactive or service worker. Channel-bound skills stay host-only; every
+other installed alias is runtime-visible by default.
 
 Background operation is explicit. If you want long-running channels,
 auto-restart, or channel attach to start the daemon for you, LionClaw uses the
@@ -335,11 +338,11 @@ implementation uses systemd user services.
 Direct `lionclaw run` reads the current installed skill and channel state each
 time it launches a runtime. Managed daemons bake an immutable applied skill and
 channel snapshot at startup, so skill or channel changes take effect after the
-daemon is restarted or reconciled through `lionclaw service up` or
-`lionclaw channel attach`. `lionclaw service status` marks the daemon as
-`restart required` when the current filesystem/config state no longer matches
-that running snapshot, and it keeps stale managed channel units visible until
-the daemon is reconciled or stopped.
+daemon is restarted or reconciled through `lionclaw connect`,
+`lionclaw service up`, or low-level channel attach. `lionclaw service status`
+marks the daemon as `restart required` when the current filesystem/config state
+no longer matches that running snapshot, and it keeps stale managed channel
+units visible until the daemon is reconciled or stopped.
 
 Raw HTTP is for workers, tests, and debugging. It is not the normal operator
 experience.

@@ -29,6 +29,7 @@ use crate::{
             derive_skill_alias, normalize_podman_executable, normalize_runtime_command,
             ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig,
         },
+        connect::{connect_channel, ConnectEnvInputs, ConnectOutcome},
         reconcile::{
             add_channel, add_skill, down, logs, onboard, open_kernel,
             open_runtime_kernel_for_work_root, pairing_approve, pairing_block, pairing_list,
@@ -41,16 +42,19 @@ use crate::{
             configure_runtime_profile_with_engine_resolver, configure_runtime_required_message,
             ConfigureRuntimeOutcome,
         },
-        services::SystemdUserServiceManager,
+        services::{
+            channel_unit_name, existing_service_identity, unit_belongs_to_identity, ServiceManager,
+            SystemdUserServiceManager,
+        },
         snapshot::SKILL_INSTALL_METADATA_FILE,
         status::{
             missing_target_for_status, render_project_status_all, render_target_status,
             validate_status_all_target,
         },
         target::{
-            adopt_project_instance, create_project_instance, init_project, list_project_instances,
-            resolve_existing_project_root, resolve_project_setup_root, resolve_target,
-            TargetSelection, WorkRootRequirement,
+            adopt_project_instance, create_project_instance, init_project,
+            list_project_instance_statuses, list_project_instances, resolve_existing_project_root,
+            resolve_project_setup_root, resolve_target, TargetSelection, WorkRootRequirement,
         },
     },
     runtime_timeouts::{parse_duration, RuntimeTurnTimeouts},
@@ -99,6 +103,7 @@ enum Command {
         command: InstanceCommand,
     },
     Configure(ConfigureArgs),
+    Connect(ConnectArgs),
     Run(RunArgs),
     Status(StatusArgs),
     #[command(hide = true)]
@@ -146,6 +151,15 @@ struct RunArgs {
 struct ConfigureArgs {
     #[arg(long)]
     runtime: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ConnectArgs {
+    channel_or_path: String,
+    #[arg(long = "env-file", value_name = "PATH")]
+    env_file: Option<PathBuf>,
+    #[arg(long = "from-env", value_name = "NAME")]
+    from_env: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -325,6 +339,8 @@ struct SkillWorkerPathArgs {
 #[derive(Debug, Subcommand)]
 enum ChannelCommand {
     Add(ChannelAddArgs),
+    List(ChannelListArgs),
+    Remove(ChannelRmArgs),
     Rm(ChannelRmArgs),
     Attach(ChannelAttachArgs),
     Pairing {
@@ -347,6 +363,12 @@ struct ChannelAddArgs {
 #[derive(Debug, Args)]
 struct ChannelRmArgs {
     id: String,
+}
+
+#[derive(Debug, Args)]
+struct ChannelListArgs {
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Debug, Args)]
@@ -621,6 +643,33 @@ pub async fn run() -> Result<ExitCode> {
             .await?;
             print_configure_outcome(&target.instance_home, &outcome);
         }
+        Command::Connect(args) => {
+            let target = resolved_target
+                .as_ref()
+                .ok_or_else(|| anyhow!("connect requires a resolved LionClaw target"))?;
+            let stdin = std::io::stdin();
+            let interactive = stdin.is_terminal();
+            let mut input = BufReader::new(stdin);
+            let stdout = std::io::stdout();
+            let mut output = stdout;
+            let manager = SystemdUserServiceManager;
+            let outcome = connect_channel(
+                &target.instance_home,
+                &manager,
+                target.require_work_root()?,
+                &args.channel_or_path,
+                ConnectEnvInputs {
+                    env_file: args.env_file,
+                    from_env: args.from_env,
+                },
+                interactive,
+                interactive,
+                &mut input,
+                &mut output,
+            )
+            .await?;
+            print_connect_outcome(&outcome);
+        }
         Command::Run(args) => {
             let target = resolved_target
                 .as_ref()
@@ -786,7 +835,8 @@ pub async fn run() -> Result<ExitCode> {
                 }
             }
             SkillCommand::WorkerPath(args) => {
-                let worker = resolve_installed_skill_worker_entrypoint(&home, &args.alias).await?;
+                let worker =
+                    resolve_installed_skill_worker_entrypoint(&home, &args.alias, None).await?;
                 println!("{}", worker.display());
             }
         },
@@ -811,7 +861,39 @@ pub async fn run() -> Result<ExitCode> {
                 );
                 print_runtime_state_change_note();
             }
-            ChannelCommand::Rm(args) => {
+            ChannelCommand::List(args) => {
+                if args.all {
+                    validate_channel_list_all_target(&target_selection)?;
+                    let project_root =
+                        resolve_existing_project_root(&target_selection).map_err(|_| {
+                            anyhow!(
+                                "channel list --all requires a LionClaw project; run from the project root or pass --project PATH"
+                            )
+                        })?;
+                    let manager = SystemdUserServiceManager;
+                    print!(
+                        "{}",
+                        render_project_channel_list(&project_root, &manager).await?
+                    );
+                } else {
+                    let target = resolved_target.as_ref().ok_or_else(|| {
+                        anyhow!("channel list requires a resolved LionClaw target")
+                    })?;
+                    let manager = SystemdUserServiceManager;
+                    print!(
+                        "{}",
+                        render_instance_channel_list(
+                            target.instance_name.as_deref().unwrap_or("direct-home"),
+                            &target.instance_home,
+                            &manager,
+                        )
+                        .await?
+                    );
+                }
+            }
+            ChannelCommand::Remove(args) | ChannelCommand::Rm(args) => {
+                let manager = SystemdUserServiceManager;
+                stop_owned_channel_unit(&home, &manager, &args.id).await?;
                 let removed = remove_channel(&home, &args.id).await?;
                 println!(
                     "{} {}",
@@ -1208,6 +1290,7 @@ fn resolve_command_target(
 ) -> Result<Option<crate::operator::target::TargetContext>> {
     let requirement = match command {
         Command::Configure(_) => Some(WorkRootRequirement::Optional),
+        Command::Connect(_) => Some(WorkRootRequirement::Required),
         Command::Run(_) => Some(WorkRootRequirement::Required),
         Command::Status(args) => {
             if args.all {
@@ -1222,9 +1305,12 @@ fn resolve_command_target(
         },
         Command::Channel { command } => match command {
             ChannelCommand::Attach(_) => Some(WorkRootRequirement::Required),
-            ChannelCommand::Add(_) | ChannelCommand::Rm(_) | ChannelCommand::Pairing { .. } => {
-                Some(WorkRootRequirement::Optional)
-            }
+            ChannelCommand::List(args) if args.all => None,
+            ChannelCommand::Add(_)
+            | ChannelCommand::List(_)
+            | ChannelCommand::Remove(_)
+            | ChannelCommand::Rm(_)
+            | ChannelCommand::Pairing { .. } => Some(WorkRootRequirement::Optional),
         },
         Command::Continuity { command } => match command {
             ContinuityCommand::Drafts { .. } => Some(WorkRootRequirement::Required),
@@ -1344,9 +1430,119 @@ fn print_configure_outcome(home: &LionClawHome, outcome: &ConfigureRuntimeOutcom
     println!("default runtime set to {}", outcome.runtime_id);
 }
 
+fn print_connect_outcome(outcome: &ConnectOutcome) {
+    println!(
+        "connected channel {} using skill {} ({})",
+        outcome.channel_id,
+        outcome.skill_alias,
+        outcome.launch.as_str()
+    );
+    match outcome.launch {
+        ChannelLaunchMode::Interactive => {
+            println!("interactive channel worker exited");
+        }
+        ChannelLaunchMode::Service => {
+            println!("service channel is running");
+            println!("pair or approve peers with:");
+            println!(
+                "  lionclaw channel pairing list --channel-id {}",
+                outcome.channel_id
+            );
+        }
+    }
+}
+
+fn validate_channel_list_all_target(selection: &TargetSelection) -> Result<()> {
+    if selection.home.is_some() {
+        return Err(anyhow!(
+            "channel list --all requires a project context; run from the project root or pass --project PATH"
+        ));
+    }
+    if selection.instance.is_some() {
+        return Err(anyhow!(
+            "channel list --all is project-wide and cannot be combined with --instance"
+        ));
+    }
+    Ok(())
+}
+
+async fn render_project_channel_list<M: ServiceManager>(
+    project_root: &Path,
+    manager: &M,
+) -> Result<String> {
+    let mut output = String::new();
+    output.push_str(&format!("project: {}\n", project_root.display()));
+    for entry in list_project_instance_statuses(project_root)? {
+        output.push('\n');
+        output.push_str(
+            &render_instance_channel_list(&entry.name, &LionClawHome::new(entry.home), manager)
+                .await?,
+        );
+    }
+    Ok(output)
+}
+
+async fn render_instance_channel_list<M: ServiceManager>(
+    instance_name: &str,
+    home: &LionClawHome,
+    manager: &M,
+) -> Result<String> {
+    let config = OperatorConfig::load(home).await?;
+    let mut output = String::new();
+    output.push_str(&format!("instance: {instance_name}\n"));
+    output.push_str("channel   launch       skill      service\n");
+    if config.channels.is_empty() {
+        output.push_str("(none)\n");
+        return Ok(output);
+    }
+    let identity = existing_service_identity(home)?;
+    for channel in config.channels {
+        let service = match channel.launch_mode {
+            ChannelLaunchMode::Interactive => "n/a".to_string(),
+            ChannelLaunchMode::Service => match identity.as_ref() {
+                Some(identity) => {
+                    manager
+                        .unit_status(&channel_unit_name(identity, &channel.id))
+                        .await?
+                }
+                None => "not-installed".to_string(),
+            },
+        };
+        output.push_str(&format!(
+            "{:<9} {:<12} {:<10} {}\n",
+            channel.id,
+            channel.launch_mode.as_str(),
+            channel.skill,
+            service
+        ));
+    }
+    Ok(output)
+}
+
+async fn stop_owned_channel_unit<M: ServiceManager>(
+    home: &LionClawHome,
+    manager: &M,
+    channel_id: &str,
+) -> Result<()> {
+    let Some(identity) = existing_service_identity(home)? else {
+        return Ok(());
+    };
+    let unit = channel_unit_name(&identity, channel_id);
+    let unit_path = systemd_user_unit_dir_for_cli()?.join(&unit);
+    if !unit_belongs_to_identity(&unit_path, &identity)? {
+        return Ok(());
+    }
+    manager.down_units(&[unit]).await
+}
+
+fn systemd_user_unit_dir_for_cli() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
+    Ok(PathBuf::from(home).join(".config/systemd/user"))
+}
+
 fn print_runtime_state_change_note() {
     println!(
-        "direct runs pick this up on the next launch; rerun 'lionclaw service up' or 'lionclaw channel attach' if a managed daemon is already running"
+        "direct runs pick this up on the next launch; rerun 'lionclaw connect <channel>' or 'lionclaw service up' if a managed daemon is already running"
     );
 }
 

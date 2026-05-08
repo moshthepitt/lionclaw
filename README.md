@@ -119,9 +119,9 @@ bypass project discovery.
 Installed non-channel skills are mounted read-only under `/lionclaw/skills/<alias>`
 and projected into each runtime's native skill directory inside `/runtime/home`.
 `lionclaw skill install` copies a skill into that canonical skills directory, and
-`lionclaw skill rm` removes it physically. `lionclaw channel add --skill <alias>`
-makes that alias host-only; every other installed alias is runtime-visible by
-default.
+`lionclaw skill rm` removes it physically. `lionclaw connect <channel>` binds
+channel skills as host workers; every other installed alias is runtime-visible
+by default.
 
 Runtime-specific provider settings stay with the runtime. For example, if a
 Codex profile leaves `model` unset, LionClaw reuses the current host Codex
@@ -181,32 +181,26 @@ Skills can provide context to the selected runtime, run external workers, and
 connect LionClaw to the outside world. They cannot grant permissions by
 putting words in a prompt.
 
-Direct `lionclaw run` picks up the current installed skills and channels every
-time you start a new run. Managed daemons bake an immutable applied snapshot at
-startup, so after changing skills or channels you should rerun
-`lionclaw service up` or reattach the channel to reconcile and restart the
-daemon when needed.
+`lionclaw run` picks up the current installed skills and channels every time
+you start a new run. `lionclaw connect <channel>` is the normal path for
+adding a channel: it discovers the channel skill, records the binding, handles
+required channel env, and starts the worker in the selected instance.
 
 ## One Real Recurring Workflow
 
 LionClaw can run time-based jobs in fresh isolated sessions and optionally
 deliver the final result back through a channel.
 
-After registering a runtime, keep the terminal channel open in one shell and
-create the recurring job from another shell. `channel attach` starts the
+After configuring a runtime, keep the terminal channel open in one shell and
+create the recurring job from another shell. `connect terminal` starts the
 foreground worker and owns that terminal until you exit it.
 
 Terminal A:
 
 ```bash
-export LIONCLAW_RUNTIME=codex
 export LIONCLAW_PEER="${USER:-local}"
 
-./target/release/lionclaw skill install skills/channel-terminal --alias terminal
-./target/release/lionclaw channel add terminal --launch interactive
-./target/release/lionclaw channel attach terminal \
-  --runtime "$LIONCLAW_RUNTIME" \
-  --peer "$LIONCLAW_PEER"
+./target/release/lionclaw connect terminal
 ```
 
 On first contact, approve the peer with the command printed by the terminal
@@ -277,68 +271,33 @@ LionClaw and the selected runtime keep separate continuity layers:
 
 ## Channels And Background Mode
 
-When you want LionClaw somewhere other than the direct CLI path, install a
-channel skill.
-
-For a local channel in your current terminal on Linux with systemd user
-services:
+When you want LionClaw somewhere other than the direct CLI path, connect a
+channel skill. The command targets the resolved project instance, so the same
+shape works for the default instance, a named instance, or an exact home:
 
 ```bash
-./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e
+./target/release/lionclaw connect terminal
+./target/release/lionclaw connect telegram --env-file ./telegram.env
+./target/release/lionclaw --instance reviewer connect telegram --from-env TELEGRAM_BOT_TOKEN
 ```
 
-That command bootstraps a fresh test home on its own loopback bind, configures
-the runtime and terminal channel, starts the managed daemon if needed, and
-attaches it in your current TTY.
+Interactive channels run in the current terminal. Service channels use systemd
+user services on Linux and store required channel env in the selected instance
+home, not in accidental shell state. Missing env in a non-interactive connect
+prints the exact variable names and scriptable repair commands.
 
-For an existing LionClaw home with a configured runtime, the manual channel
-steps are:
+Inspect or remove channels on the selected instance:
 
 ```bash
-./target/release/lionclaw skill install skills/channel-terminal --alias terminal
-./target/release/lionclaw channel add terminal --launch interactive
-./target/release/lionclaw channel attach terminal --runtime <runtime>
+./target/release/lionclaw channel list
+./target/release/lionclaw channel list --all
+./target/release/lionclaw channel remove telegram
 ```
 
-`channel attach` opens the worker in your current TTY. If needed, it starts
-LionClaw for you through the managed daemon path, which currently uses systemd
-user services. It restores the latest interactive terminal session for that
-peer, resumes any still-running answer stream from the last durable checkpoint,
-and prints the pairing code and approval command on first contact. It only
-reuses a daemon when that daemon belongs to the same instance home, current
-project target, and compatible daemon config, including runtime, preset, and
-work-root settings. If installed skills or channel config changed since that daemon
-started, `channel attach` reconciles and restarts it before attaching.
-`lionclaw service status` marks that case as `restart required` and keeps stale
-managed channel units visible until the daemon is reconciled or stopped.
-
-To run multiple local terminal channels at once, register multiple interactive
-channels and attach each one in its own terminal:
+Pairing and logs remain explicit:
 
 ```bash
-./target/release/lionclaw channel add terminal2 --skill terminal --launch interactive
-./target/release/lionclaw channel attach terminal2
-```
-
-For Telegram:
-
-```bash
-./target/release/lionclaw skill install skills/channel-telegram --alias telegram
-./target/release/lionclaw channel add telegram
-```
-
-On Linux systems with systemd user services, run channels or automation in the
-background with service mode:
-
-```bash
-TELEGRAM_BOT_TOKEN=... ./target/release/lionclaw service up --runtime <runtime>
-```
-
-Then inspect or manage it with:
-
-```bash
-./target/release/lionclaw service status
-./target/release/lionclaw channel pairing list
+./target/release/lionclaw channel pairing list --channel-id telegram
 ./target/release/lionclaw service logs
 ```
 
@@ -355,6 +314,7 @@ Each instance home contains:
 - `db/lionclaw.db`
 - `config/lionclaw.toml`
 - `config/instance.toml`
+- `config/channels/<channel>.env`
 - `config/runtime-secrets.env`
 - `skills/<alias>/`
 - `workspaces/main/`

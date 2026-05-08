@@ -1,6 +1,9 @@
 pub mod attach;
+pub mod channel_env;
+pub mod channel_metadata;
 pub mod cli;
 pub mod config;
+pub mod connect;
 pub mod daemon_probe;
 pub mod reconcile;
 pub mod run;

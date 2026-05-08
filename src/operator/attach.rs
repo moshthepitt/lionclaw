@@ -198,9 +198,12 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
         ));
     }
 
-    let worker_path =
-        resolve_applied_skill_worker_entrypoint(&applied.applied_state, &channel.skill_alias)
-            .with_context(|| format!("channel '{}' worker resolution failed", channel.id))?;
+    let worker_path = resolve_applied_skill_worker_entrypoint(
+        &applied.applied_state,
+        &channel.skill_alias,
+        Some(&channel.worker),
+    )
+    .with_context(|| format!("channel '{}' worker resolution failed", channel.id))?;
     let effective_runtime_id = match requested_runtime_id.as_deref() {
         Some(runtime_id) => Some(applied.config.resolve_runtime_id(Some(runtime_id))?),
         None => None,
@@ -236,7 +239,7 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
             env.insert("PATH".to_string(), path);
         }
     }
-    for (key, value) in resolve_required_channel_env(&channel.id, &channel.required_env)? {
+    for (key, value) in resolve_required_channel_env(home, &channel.id, &channel.required_env)? {
         env.insert(key, value);
     }
     if let Some(runtime_id) = effective_runtime_id {
@@ -310,10 +313,13 @@ mod tests {
         home::{runtime_project_partition_key, LionClawHome},
         kernel::runtime::{ConfinementConfig, OciConfinementConfig},
         operator::{
+            channel_env::{merge_channel_env, ChannelEnv},
             config::{ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig},
             reconcile::{add_channel, add_skill},
             runtime::resolve_runtime_execution_context,
-            services::{FakeServiceManager, ServiceManager},
+            services::{
+                daemon_unit_name, ensure_service_identity, FakeServiceManager, ServiceManager,
+            },
         },
     };
 
@@ -330,6 +336,11 @@ mod tests {
     fn current_project_scope() -> String {
         let project_root = current_work_root();
         runtime_project_partition_key(Some(project_root.as_path()))
+    }
+
+    fn test_daemon_unit_name(home: &LionClawHome) -> String {
+        let identity = ensure_service_identity(home).expect("service identity");
+        daemon_unit_name(&identity)
     }
 
     async fn current_daemon_fingerprint(
@@ -636,7 +647,7 @@ mod tests {
             .is_some_and(|value| value.starts_with("interactive:terminal:mosh:")));
         assert_eq!(
             manager
-                .unit_status(crate::operator::services::DAEMON_UNIT_NAME)
+                .unit_status(&test_daemon_unit_name(&home))
                 .await
                 .expect("unit status"),
             "loaded/active/running"
@@ -657,6 +668,9 @@ mod tests {
         )
         .await
         .expect("update channel required env");
+        let mut channel_env = ChannelEnv::new();
+        channel_env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+        merge_channel_env(&home, "terminal", &channel_env).expect("persist channel env");
 
         let spec = prepare_channel_attach(
             &home,
@@ -673,7 +687,7 @@ mod tests {
         assert!(spec
             .env
             .iter()
-            .any(|(key, value)| key == "PATH" && !value.is_empty()));
+            .any(|(key, value)| key == "PATH" && value == "/usr/bin:/bin"));
 
         add_channel(
             &home,
@@ -874,11 +888,9 @@ mod tests {
             listener,
         )
         .await;
+        let daemon_unit = test_daemon_unit_name(&home);
         manager
-            .set_unit_status(
-                crate::operator::services::DAEMON_UNIT_NAME,
-                "loaded/active/running",
-            )
+            .set_unit_status(&daemon_unit, "loaded/active/running")
             .expect("set unit status");
 
         let spec = prepare_channel_attach(
@@ -896,7 +908,7 @@ mod tests {
         assert!(spec.started_services, "stale daemon should be reconciled");
         assert!(
             manager
-                .was_restarted(crate::operator::services::DAEMON_UNIT_NAME)
+                .was_restarted(&daemon_unit)
                 .expect("read restart state"),
             "managed daemon should be restarted when config fingerprint changes"
         );

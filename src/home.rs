@@ -62,8 +62,20 @@ impl LionClawHome {
         resolve_private_env_file(&self.runtime_secrets_env_path(), "runtime secrets").await
     }
 
+    pub fn channel_env_dir(&self) -> PathBuf {
+        self.config_dir().join("channels")
+    }
+
+    pub fn channel_env_path(&self, channel_id: &str) -> PathBuf {
+        self.channel_env_dir().join(format!("{channel_id}.env"))
+    }
+
     pub fn home_id_path(&self) -> PathBuf {
         self.config_dir().join("home-id")
+    }
+
+    pub fn service_id_path(&self) -> PathBuf {
+        self.config_dir().join("service-id")
     }
 
     pub fn skills_dir(&self) -> PathBuf {
@@ -165,6 +177,7 @@ impl LionClawHome {
             self.root(),
             self.db_dir(),
             self.config_dir(),
+            self.channel_env_dir(),
             self.skills_dir(),
             self.runtime_dir(),
             self.logs_dir(),

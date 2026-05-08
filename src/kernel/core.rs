@@ -3139,6 +3139,7 @@ mod tests {
             id: "terminal".to_string(),
             skill: "terminal".to_string(),
             launch_mode: crate::operator::config::ChannelLaunchMode::Service,
+            worker: crate::operator::config::default_channel_worker(),
             required_env: Vec::new(),
         });
         config.save(&home).await.expect("save config");
