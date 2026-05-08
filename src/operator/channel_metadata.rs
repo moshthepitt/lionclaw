@@ -12,6 +12,7 @@ use crate::{
 
 pub const CHANNEL_METADATA_FILE: &str = "lionclaw.toml";
 pub const DEFAULT_CHANNEL_WORKER: &str = "scripts/worker";
+const RESERVED_CHANNEL_ENV_PREFIX: &str = "LIONCLAW_";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelMetadata {
@@ -200,6 +201,11 @@ pub fn validate_channel_env_name(name: &str) -> Result<()> {
     if chars.any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_')) {
         bail!(
             "environment variable name '{name}' may only contain ASCII letters, numbers, and '_'"
+        );
+    }
+    if trimmed.starts_with(RESERVED_CHANNEL_ENV_PREFIX) {
+        bail!(
+            "environment variable name '{name}' uses the reserved LionClaw namespace '{RESERVED_CHANNEL_ENV_PREFIX}'"
         );
     }
     Ok(())
@@ -460,6 +466,23 @@ mod tests {
 
         assert!(err.to_string().contains("channel id"));
         validate_channel_env_name("BAD-NAME").expect_err("invalid env name");
+        validate_channel_env_name("LIONCLAW_HOME").expect_err("reserved env name");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_reserved_channel_env_metadata_values() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let skill = write_channel_skill(temp_dir.path(), "channel-telegram", "telegram");
+        fs::write(
+            skill.join("lionclaw.toml"),
+            "version = 1\n\n[channel]\nid = \"telegram\"\nlaunch = \"service\"\nworker = \"scripts/worker\"\nenv = [\"LIONCLAW_HOME\"]\n",
+        )
+        .expect("metadata");
+
+        let err = load_channel_metadata(&skill).expect_err("reserved env should fail");
+
+        assert!(err.to_string().contains("reserved LionClaw namespace"));
     }
 
     #[cfg(unix)]

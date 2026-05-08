@@ -293,6 +293,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn channel_env_rejects_reserved_lionclaw_namespace() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut values = ChannelEnv::new();
+        values.insert("LIONCLAW_HOME".to_string(), "/tmp/other".to_string());
+
+        let err = save_channel_env(&home, "telegram", &values).expect_err("reserved env");
+
+        assert!(err.to_string().contains("reserved LionClaw namespace"));
+        assert!(!home.channel_env_path("telegram").exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn channel_env_file_is_private_and_rejects_symlink() {
