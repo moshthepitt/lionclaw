@@ -25,7 +25,7 @@ use crate::{
             StackBinaryPaths,
         },
         runtime::resolve_runtime_id,
-        services::ServiceManager,
+        services::{channel_unit_name, existing_service_identity, ServiceManager},
     },
 };
 
@@ -108,17 +108,7 @@ where
     let discovered = discover_channel_skill(home, channel_or_path)?;
     let channel_id = discovered.metadata.id.clone();
     let skill_alias = install_or_select_skill(home, &discovered).await?;
-    add_channel_with_worker(
-        home,
-        channel_id.clone(),
-        skill_alias.clone(),
-        discovered.metadata.launch,
-        discovered.metadata.worker.clone(),
-        discovered.metadata.env.clone(),
-    )
-    .await?;
-
-    ensure_required_env(
+    let required_env = ensure_required_env(
         RequiredEnvRequest {
             home,
             channel_id: &channel_id,
@@ -130,6 +120,15 @@ where
         input,
         output,
     )?;
+    add_channel_with_worker(
+        home,
+        channel_id.clone(),
+        skill_alias.clone(),
+        discovered.metadata.launch,
+        discovered.metadata.worker.clone(),
+        discovered.metadata.env.clone(),
+    )
+    .await?;
 
     let action = match discovered.metadata.launch {
         ChannelLaunchMode::Interactive => {
@@ -146,7 +145,11 @@ where
             ConnectAction::InteractiveAttach
         }
         ChannelLaunchMode::Service => {
+            let channel_was_active = service_channel_is_active(home, manager, &channel_id).await?;
             up_for_work_root(home, manager, &runtime_id, binaries, work_root).await?;
+            if required_env.changed && channel_was_active {
+                restart_service_channel(home, manager, &channel_id).await?;
+            }
             ConnectAction::ServiceStarted
         }
     };
@@ -179,6 +182,33 @@ async fn install_or_select_skill(
     }
 }
 
+async fn service_channel_is_active<M: ServiceManager>(
+    home: &LionClawHome,
+    manager: &M,
+    channel_id: &str,
+) -> Result<bool> {
+    let Some(identity) = existing_service_identity(home)? else {
+        return Ok(false);
+    };
+    let status = manager
+        .unit_status(&channel_unit_name(&identity, channel_id))
+        .await?;
+    Ok(crate::operator::services::unit_status_is_active(&status))
+}
+
+async fn restart_service_channel<M: ServiceManager>(
+    home: &LionClawHome,
+    manager: &M,
+    channel_id: &str,
+) -> Result<()> {
+    let Some(identity) = existing_service_identity(home)? else {
+        return Ok(());
+    };
+    manager
+        .restart_units(&[channel_unit_name(&identity, channel_id)])
+        .await
+}
+
 struct RequiredEnvRequest<'a> {
     home: &'a LionClawHome,
     channel_id: &'a str,
@@ -188,11 +218,16 @@ struct RequiredEnvRequest<'a> {
     hide_prompt_input: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RequiredEnvOutcome {
+    changed: bool,
+}
+
 fn ensure_required_env<R: BufRead, W: Write>(
     request: RequiredEnvRequest<'_>,
     input: &mut R,
     output: &mut W,
-) -> Result<()> {
+) -> Result<RequiredEnvOutcome> {
     let RequiredEnvRequest {
         home,
         channel_id,
@@ -202,6 +237,7 @@ fn ensure_required_env<R: BufRead, W: Write>(
         hide_prompt_input,
     } = request;
     let mut updates = ChannelEnv::new();
+    let mut changed = false;
     if let Some(path) = env_inputs.env_file.as_deref() {
         let file_updates = parse_env_file(path)?;
         validate_declared_env_updates(channel_id, required_env, &file_updates, "env file")?;
@@ -211,29 +247,44 @@ fn ensure_required_env<R: BufRead, W: Write>(
     updates.extend(collect_from_process_env(&env_inputs.from_env)?);
     validate_no_undeclared_channel_env(home, channel_id, required_env)?;
     if !updates.is_empty() {
-        merge_channel_env(home, channel_id, &updates)?;
+        changed |= merge_changed_channel_env(home, channel_id, &updates)?;
     }
 
     let stored = load_channel_env(home, channel_id)?;
     validate_no_undeclared_channel_env(home, channel_id, required_env)?;
     let missing = missing_required_env(&stored, required_env)?;
     if missing.is_empty() {
-        return Ok(());
+        return Ok(RequiredEnvOutcome { changed });
     }
     if !interactive {
         return Err(anyhow!(render_missing_env_repair(channel_id, &missing)));
     }
 
     let prompted = prompt_required_env(channel_id, &missing, hide_prompt_input, input, output)?;
-    merge_channel_env(home, channel_id, &prompted)?;
+    changed |= merge_changed_channel_env(home, channel_id, &prompted)?;
     let stored = load_channel_env(home, channel_id)?;
     validate_no_undeclared_channel_env(home, channel_id, required_env)?;
     let missing = missing_required_env(&stored, required_env)?;
     if missing.is_empty() {
-        Ok(())
+        Ok(RequiredEnvOutcome { changed })
     } else {
         Err(anyhow!(render_missing_env_repair(channel_id, &missing)))
     }
+}
+
+fn merge_changed_channel_env(
+    home: &LionClawHome,
+    channel_id: &str,
+    updates: &ChannelEnv,
+) -> Result<bool> {
+    let existing = load_channel_env(home, channel_id)?;
+    let changed = updates
+        .iter()
+        .any(|(key, value)| existing.get(key) != Some(value));
+    if changed {
+        merge_channel_env(home, channel_id, updates)?;
+    }
+    Ok(changed)
 }
 
 fn prompt_required_env<R: BufRead, W: Write>(
@@ -382,7 +433,7 @@ mod tests {
             channel_env::{load_channel_env, save_channel_env, ChannelEnv},
             config::{ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig},
             reconcile::{onboard, OnboardBindSelection, StackBinaryPaths},
-            services::FakeServiceManager,
+            services::{channel_unit_name, ensure_service_identity, FakeServiceManager},
         },
     };
 
@@ -643,6 +694,112 @@ mod tests {
                 && channel.launch_mode == ChannelLaunchMode::Service
                 && channel.required_env == ["TELEGRAM_BOT_TOKEN"]
         }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_service_connect_does_not_record_channel() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let manager = FakeServiceManager::default();
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let err = connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                work_root: temp_dir.path(),
+                channel_or_path: "telegram",
+                env_inputs: ConnectEnvInputs::default(),
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut input,
+            &mut output,
+        )
+        .await
+        .expect_err("missing env should fail");
+
+        assert!(err.to_string().contains("TELEGRAM_BOT_TOKEN"));
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        assert!(!config
+            .channels
+            .iter()
+            .any(|channel| channel.id == "telegram"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_service_restarts_active_channel_when_env_changes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let first_env_file = temp_dir.path().join("telegram-first.env");
+        fs::write(&first_env_file, "TELEGRAM_BOT_TOKEN=old-token\n").expect("first env file");
+        let second_env_file = temp_dir.path().join("telegram-second.env");
+        fs::write(&second_env_file, "TELEGRAM_BOT_TOKEN=new-token\n").expect("second env file");
+        let manager = FakeServiceManager::default();
+
+        connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                work_root: temp_dir.path(),
+                channel_or_path: "telegram",
+                env_inputs: ConnectEnvInputs {
+                    env_file: Some(first_env_file),
+                    from_env: Vec::new(),
+                },
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .expect("first connect");
+        let identity = ensure_service_identity(&home).expect("service identity");
+        let channel_unit = channel_unit_name(&identity, "telegram");
+        assert!(
+            !manager.was_restarted(&channel_unit).expect("restart state"),
+            "initial start should not restart the channel"
+        );
+
+        connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                work_root: temp_dir.path(),
+                channel_or_path: "telegram",
+                env_inputs: ConnectEnvInputs {
+                    env_file: Some(second_env_file),
+                    from_env: Vec::new(),
+                },
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .expect("second connect");
+
+        assert!(
+            manager.was_restarted(&channel_unit).expect("restart state"),
+            "active service channel should restart after env changes"
+        );
+        assert_eq!(
+            load_channel_env(&home, "telegram")
+                .expect("channel env")
+                .get("TELEGRAM_BOT_TOKEN")
+                .map(String::as_str),
+            Some("new-token")
+        );
     }
 
     #[cfg(unix)]
