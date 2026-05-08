@@ -578,8 +578,12 @@ pub async fn logs<M: ServiceManager>(
     manager: &M,
     lines: usize,
 ) -> Result<String> {
-    let redactor = SecretRedactor::from_home(home)?;
     let units = managed_unit_names(home)?;
+    if units.is_empty() {
+        return Ok(String::new());
+    }
+
+    let redactor = SecretRedactor::from_home(home)?;
     match manager.logs(&units, lines).await {
         Ok(output) => Ok(redactor.redact(&output)),
         Err(err) => Err(anyhow!(redactor.redact(&format!("{err:#}")))),
@@ -1973,6 +1977,21 @@ mod tests {
         let output = logs(&home, &manager, 100).await.expect("logs");
 
         assert_eq!(output, "boot [REDACTED] done");
+    }
+
+    #[tokio::test]
+    async fn service_logs_without_service_identity_returns_empty() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        let manager = FakeServiceManager::default();
+        manager
+            .fail_logs("log manager should not be called")
+            .expect("fail logs");
+
+        let output = logs(&home, &manager, 100).await.expect("logs");
+
+        assert_eq!(output, "");
     }
 
     #[tokio::test]
