@@ -79,6 +79,36 @@ pub(crate) fn read_private_file_to_string(
         .map(Some)
 }
 
+pub(crate) fn private_file_exists(home: &LionClawHome, path: &Path, label: &str) -> Result<bool> {
+    if !private_parent_chain_exists(home, path, label)? {
+        return Ok(false);
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("failed to stat {}", path.display())),
+    };
+    ensure_private_file_metadata(path, label, metadata)?;
+    Ok(true)
+}
+
+pub(crate) fn remove_private_file_if_exists(
+    home: &LionClawHome,
+    path: &Path,
+    label: &str,
+) -> Result<()> {
+    if !private_parent_chain_exists(home, path, label)? {
+        return Ok(());
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("failed to stat {}", path.display())),
+    };
+    ensure_private_file_metadata(path, label, metadata)?;
+    fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
+}
+
 pub(crate) fn read_private_dir_file_paths(
     home: &LionClawHome,
     path: &Path,

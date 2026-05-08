@@ -1,10 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{BufRead, Write},
+    fs,
+    io::{BufRead, ErrorKind, Write},
     path::{Path, PathBuf},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use uuid::Uuid;
 
 use crate::{
     home::LionClawHome,
@@ -12,14 +14,15 @@ use crate::{
         attach::attach_channel_with_binaries,
         channel_env::{
             collect_from_process_env, load_channel_env, merge_channel_env, missing_required_env,
-            parse_env_file, render_missing_env_repair, validate_no_undeclared_channel_env,
-            ChannelEnv,
+            parse_env_file, render_missing_env_repair, save_channel_env,
+            validate_no_undeclared_channel_env, ChannelEnv,
         },
         channel_metadata::{
             discover_channel_skill, validate_channel_env_name, ChannelSkillSource,
             DiscoveredChannelSkill,
         },
-        config::{ChannelLaunchMode, OperatorConfig},
+        config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
+        private_paths::{private_file_exists, remove_private_file_if_exists},
         reconcile::{
             add_channel_with_worker, add_skill, resolve_stack_binaries, up_for_work_root,
             StackBinaryPaths,
@@ -107,8 +110,13 @@ where
 
     let discovered = discover_channel_skill(home, channel_or_path)?;
     let channel_id = discovered.metadata.id.clone();
-    let skill_alias = install_or_select_skill(home, &discovered).await?;
-    let required_env = ensure_required_env(
+    let previous_channel = config
+        .channels
+        .iter()
+        .find(|channel| channel.id == channel_id)
+        .cloned();
+    let rollback = ConnectRollback::capture(home, &channel_id, previous_channel, &discovered)?;
+    let required_env = match ensure_required_env(
         RequiredEnvRequest {
             home,
             channel_id: &channel_id,
@@ -119,8 +127,15 @@ where
         },
         input,
         output,
-    )?;
-    add_channel_with_worker(
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => return Err(rollback.restore_channel_env_only(home, &channel_id, err)),
+    };
+    let skill_alias = match install_or_select_skill(home, &discovered).await {
+        Ok(skill_alias) => skill_alias,
+        Err(err) => return rollback_all_and_return(home, &channel_id, rollback, err).await,
+    };
+    if let Err(err) = add_channel_with_worker(
         home,
         channel_id.clone(),
         skill_alias.clone(),
@@ -128,10 +143,14 @@ where
         discovered.metadata.worker.clone(),
         discovered.metadata.env.clone(),
     )
-    .await?;
+    .await
+    {
+        return rollback_all_and_return(home, &channel_id, rollback, err).await;
+    }
 
     let action = match discovered.metadata.launch {
         ChannelLaunchMode::Interactive => {
+            rollback.commit()?;
             attach_channel_with_binaries(
                 home,
                 manager,
@@ -146,10 +165,17 @@ where
         }
         ChannelLaunchMode::Service => {
             let channel_was_active = service_channel_is_active(home, manager, &channel_id).await?;
-            up_for_work_root(home, manager, &runtime_id, binaries, work_root).await?;
-            if required_env.changed && channel_was_active {
-                restart_service_channel(home, manager, &channel_id).await?;
+            if let Err(err) =
+                up_for_work_root(home, manager, &runtime_id, binaries, work_root).await
+            {
+                return rollback_all_and_return(home, &channel_id, rollback, err).await;
             }
+            if required_env.changed && channel_was_active {
+                if let Err(err) = restart_service_channel(home, manager, &channel_id).await {
+                    return rollback_all_and_return(home, &channel_id, rollback, err).await;
+                }
+            }
+            rollback.commit()?;
             ConnectAction::ServiceStarted
         }
     };
@@ -179,6 +205,259 @@ async fn install_or_select_skill(
             .await?;
             Ok(alias)
         }
+    }
+}
+
+struct ConnectRollback {
+    previous_channel: Option<ManagedChannelConfig>,
+    previous_env: ChannelEnvSnapshot,
+    skill: SkillRollback,
+}
+
+impl ConnectRollback {
+    fn capture(
+        home: &LionClawHome,
+        channel_id: &str,
+        previous_channel: Option<ManagedChannelConfig>,
+        discovered: &DiscoveredChannelSkill,
+    ) -> Result<Self> {
+        Ok(Self {
+            previous_channel,
+            previous_env: ChannelEnvSnapshot::capture(home, channel_id)?,
+            skill: SkillRollback::capture(home, discovered)?,
+        })
+    }
+
+    fn restore_channel_env_only(
+        self,
+        home: &LionClawHome,
+        channel_id: &str,
+        err: anyhow::Error,
+    ) -> anyhow::Error {
+        if let Err(rollback_err) = self
+            .previous_env
+            .restore(home, channel_id)
+            .and_then(|()| self.skill.discard())
+        {
+            return anyhow!(
+                "{err}; additionally failed to roll back partial channel env state: {rollback_err}"
+            );
+        }
+        err
+    }
+
+    async fn rollback_all(self, home: &LionClawHome, channel_id: &str) -> Result<()> {
+        restore_channel_config(home, channel_id, self.previous_channel).await?;
+        self.previous_env.restore(home, channel_id)?;
+        self.skill.restore()?;
+        Ok(())
+    }
+
+    fn commit(self) -> Result<()> {
+        self.skill.discard()
+    }
+}
+
+struct ChannelEnvSnapshot {
+    existed: bool,
+    values: ChannelEnv,
+}
+
+impl ChannelEnvSnapshot {
+    fn capture(home: &LionClawHome, channel_id: &str) -> Result<Self> {
+        let values = load_channel_env(home, channel_id)?;
+        Ok(Self {
+            existed: channel_env_file_exists(home, channel_id)?,
+            values,
+        })
+    }
+
+    fn restore(self, home: &LionClawHome, channel_id: &str) -> Result<()> {
+        if self.existed {
+            save_channel_env(home, channel_id, &self.values)
+        } else {
+            remove_channel_env_file(home, channel_id)
+        }
+    }
+}
+
+enum SkillRollback {
+    None,
+    Snapshot {
+        snapshot_dir: PathBuf,
+        backup_dir: Option<PathBuf>,
+    },
+}
+
+impl SkillRollback {
+    fn capture(home: &LionClawHome, discovered: &DiscoveredChannelSkill) -> Result<Self> {
+        if matches!(discovered.source, ChannelSkillSource::Installed { .. }) {
+            return Ok(Self::None);
+        }
+
+        let alias = &discovered.metadata.id;
+        let snapshot_dir = home.skills_dir().join(alias);
+        let backup_dir = match fs::symlink_metadata(&snapshot_dir) {
+            Ok(metadata) => {
+                ensure_skill_snapshot_dir(&snapshot_dir, &metadata)?;
+                let backup_dir = home
+                    .skills_dir()
+                    .join(format!(".{alias}.rollback-{}", Uuid::new_v4()));
+                copy_skill_snapshot_for_rollback(&snapshot_dir, &backup_dir)?;
+                Some(backup_dir)
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to stat {}", snapshot_dir.display()));
+            }
+        };
+        Ok(Self::Snapshot {
+            snapshot_dir,
+            backup_dir,
+        })
+    }
+
+    fn restore(self) -> Result<()> {
+        match self {
+            Self::None => Ok(()),
+            Self::Snapshot {
+                snapshot_dir,
+                backup_dir,
+            } => {
+                remove_skill_snapshot(&snapshot_dir)?;
+                if let Some(backup_dir) = backup_dir {
+                    fs::rename(&backup_dir, &snapshot_dir).with_context(|| {
+                        format!(
+                            "failed to restore '{}' from '{}'",
+                            snapshot_dir.display(),
+                            backup_dir.display()
+                        )
+                    })?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn discard(self) -> Result<()> {
+        match self {
+            Self::None => Ok(()),
+            Self::Snapshot {
+                backup_dir: Some(backup_dir),
+                ..
+            } => remove_skill_snapshot(&backup_dir),
+            Self::Snapshot {
+                backup_dir: None, ..
+            } => Ok(()),
+        }
+    }
+}
+
+async fn rollback_all_and_return<T>(
+    home: &LionClawHome,
+    channel_id: &str,
+    rollback: ConnectRollback,
+    err: anyhow::Error,
+) -> Result<T> {
+    if let Err(rollback_err) = rollback.rollback_all(home, channel_id).await {
+        return Err(anyhow!(
+            "{err}; additionally failed to roll back partial channel state: {rollback_err}"
+        ));
+    }
+    Err(err)
+}
+
+async fn restore_channel_config(
+    home: &LionClawHome,
+    channel_id: &str,
+    previous_channel: Option<ManagedChannelConfig>,
+) -> Result<()> {
+    let mut config = OperatorConfig::load(home).await?;
+    match previous_channel {
+        Some(channel) => {
+            config.upsert_channel(channel);
+            config.save(home).await?;
+        }
+        None => {
+            if config.remove_channel(channel_id) {
+                config.save(home).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn channel_env_file_exists(home: &LionClawHome, channel_id: &str) -> Result<bool> {
+    let path = home.channel_env_path(channel_id);
+    private_file_exists(home, &path, "channel env file")
+}
+
+fn remove_channel_env_file(home: &LionClawHome, channel_id: &str) -> Result<()> {
+    let path = home.channel_env_path(channel_id);
+    remove_private_file_if_exists(home, &path, "channel env file")
+}
+
+fn ensure_skill_snapshot_dir(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink() {
+        bail!("skill snapshot {} must not be a symlink", path.display());
+    }
+    if !metadata.is_dir() {
+        bail!("skill snapshot {} is not a directory", path.display());
+    }
+    Ok(())
+}
+
+fn copy_skill_snapshot_for_rollback(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+    let mut entries = fs::read_dir(source)
+        .with_context(|| format!("failed to read {}", source.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("failed to iterate {}", source.display()))?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        let target = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to stat {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "skill snapshot entry {} must not be a symlink",
+                path.display()
+            );
+        }
+        if metadata.is_dir() {
+            copy_skill_snapshot_for_rollback(&path, &target)?;
+        } else if metadata.is_file() {
+            fs::copy(&path, &target).with_context(|| {
+                format!(
+                    "failed to copy '{}' to '{}'",
+                    path.display(),
+                    target.display()
+                )
+            })?;
+            fs::set_permissions(&target, metadata.permissions())
+                .with_context(|| format!("failed to chmod {}", target.display()))?;
+        } else {
+            bail!(
+                "skill snapshot entry {} is not a regular file or directory",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn remove_skill_snapshot(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            ensure_skill_snapshot_dir(path, &metadata)?;
+            fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
     }
 }
 
@@ -432,7 +711,7 @@ mod tests {
         operator::{
             channel_env::{load_channel_env, save_channel_env, ChannelEnv},
             config::{ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig},
-            reconcile::{onboard, OnboardBindSelection, StackBinaryPaths},
+            reconcile::{add_skill, onboard, OnboardBindSelection, StackBinaryPaths},
             services::{channel_unit_name, ensure_service_identity, FakeServiceManager},
         },
     };
@@ -492,6 +771,32 @@ mod tests {
             .set_default_runtime("codex")
             .expect("set default runtime");
         config.save(home).await.expect("save config");
+    }
+
+    #[cfg(unix)]
+    fn write_channel_skill(root: &Path, skill_name: &str, token: &str) {
+        fs::create_dir_all(root.join("scripts")).expect("scripts dir");
+        fs::write(
+            root.join("SKILL.md"),
+            format!("---\nname: {skill_name}\ndescription: test channel\n---\n{token}\n"),
+        )
+        .expect("skill md");
+        fs::write(
+            root.join("lionclaw.toml"),
+            r#"version = 1
+
+[channel]
+id = "telegram"
+launch = "service"
+worker = "scripts/worker"
+env = ["TELEGRAM_BOT_TOKEN"]
+"#,
+        )
+        .expect("channel metadata");
+        write_executable(
+            root.join("scripts/worker").as_path(),
+            "#!/usr/bin/env bash\n",
+        );
     }
 
     #[test]
@@ -724,6 +1029,133 @@ mod tests {
         .expect_err("missing env should fail");
 
         assert!(err.to_string().contains("TELEGRAM_BOT_TOKEN"));
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        assert!(!config
+            .channels
+            .iter()
+            .any(|channel| channel.id == "telegram"));
+        assert!(
+            !home.skills_dir().join("telegram").exists(),
+            "failed connect must not leave an unbound channel skill visible to runtimes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_service_start_rolls_back_channel_skill_and_env() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve daemon bind");
+        let mut config = OperatorConfig::load(&home).await.expect("load config");
+        config.daemon.bind = format!(
+            "127.0.0.1:{}",
+            listener.local_addr().expect("listener addr").port()
+        );
+        config.daemon.bind_configured = true;
+        config.save(&home).await.expect("save config");
+        let env_file = temp_dir.path().join("telegram.env");
+        fs::write(&env_file, "TELEGRAM_BOT_TOKEN=secret-token\n").expect("env file");
+        let manager = FakeServiceManager::default();
+
+        let err = connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                work_root: temp_dir.path(),
+                channel_or_path: "telegram",
+                env_inputs: ConnectEnvInputs {
+                    env_file: Some(env_file),
+                    from_env: Vec::new(),
+                },
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("reserved non-LionClaw listener should block service startup");
+
+        assert!(err.to_string().contains("non-LionClaw listener"));
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        assert!(!config
+            .channels
+            .iter()
+            .any(|channel| channel.id == "telegram"));
+        assert!(
+            !home.skills_dir().join("telegram").exists(),
+            "failed service startup must roll back the installed channel skill"
+        );
+        assert!(
+            !home.channel_env_path("telegram").exists(),
+            "failed service startup must roll back newly stored channel env"
+        );
+        assert!(load_channel_env(&home, "telegram")
+            .expect("channel env")
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_path_service_start_restores_existing_skill_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let old_skill = temp_dir.path().join("old-telegram");
+        write_channel_skill(&old_skill, "Old Telegram", "old snapshot");
+        add_skill(
+            &home,
+            "telegram".to_string(),
+            old_skill.display().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install old skill");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve daemon bind");
+        let mut config = OperatorConfig::load(&home).await.expect("load config");
+        config.daemon.bind = format!(
+            "127.0.0.1:{}",
+            listener.local_addr().expect("listener addr").port()
+        );
+        config.daemon.bind_configured = true;
+        config.save(&home).await.expect("save config");
+        let new_skill = temp_dir.path().join("new-telegram");
+        write_channel_skill(&new_skill, "New Telegram", "new snapshot");
+        let env_file = temp_dir.path().join("telegram.env");
+        fs::write(&env_file, "TELEGRAM_BOT_TOKEN=secret-token\n").expect("env file");
+        let manager = FakeServiceManager::default();
+
+        connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                work_root: temp_dir.path(),
+                channel_or_path: new_skill.to_str().expect("utf8 path"),
+                env_inputs: ConnectEnvInputs {
+                    env_file: Some(env_file),
+                    from_env: Vec::new(),
+                },
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("reserved non-LionClaw listener should block service startup");
+
+        let restored_skill = fs::read_to_string(home.skills_dir().join("telegram/SKILL.md"))
+            .expect("restored skill");
+        assert!(restored_skill.contains("Old Telegram"));
+        assert!(restored_skill.contains("old snapshot"));
+        assert!(home
+            .skills_dir()
+            .join("telegram/.lionclaw-skill.toml")
+            .exists());
         let config = OperatorConfig::load(&home).await.expect("load config");
         assert!(!config
             .channels
