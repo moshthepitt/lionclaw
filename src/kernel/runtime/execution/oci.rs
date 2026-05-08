@@ -34,7 +34,7 @@ const READ_ONLY_BIND_MOUNT_OPTIONS: &str = "ro,Z";
 const READ_WRITE_BIND_MOUNT_OPTIONS: &str = "rw,Z";
 const WORKSPACE_MOUNT_TARGET: &str = "/workspace";
 const LIONCLAW_METADATA_DIR: &str = ".lionclaw";
-const WORKSPACE_LIONCLAW_METADATA_TMPFS: &str = "/workspace/.lionclaw:size=1m,mode=700";
+const WORKSPACE_LIONCLAW_METADATA_TMPFS: &str = "/workspace/.lionclaw:size=1m,mode=700,notmpcopyup";
 
 #[derive(Debug, Clone)]
 struct PreparedOciProcessLaunch {
@@ -333,7 +333,7 @@ async fn run_oci_image_probe(engine: &str, image: &str) -> Result<OciImageProbeR
 
     match output.exit_code {
         Some(0) => Ok(OciImageProbeResult::Present),
-        Some(1) => Ok(OciImageProbeResult::Missing),
+        Some(1) if output.stderr.is_empty() => Ok(OciImageProbeResult::Missing),
         _ => {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if stderr.is_empty() {
@@ -757,6 +757,7 @@ mod tests {
                 super::WORKSPACE_LIONCLAW_METADATA_TMPFS.to_string(),
             ]
         }));
+        assert!(super::WORKSPACE_LIONCLAW_METADATA_TMPFS.contains("notmpcopyup"));
     }
 
     #[test]
