@@ -712,7 +712,10 @@ mod tests {
             channel_env::{load_channel_env, save_channel_env, ChannelEnv},
             config::{ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig},
             reconcile::{add_skill, onboard, OnboardBindSelection, StackBinaryPaths},
-            services::{channel_unit_name, ensure_service_identity, FakeServiceManager},
+            services::{
+                channel_unit_name, daemon_unit_name, ensure_service_identity, FakeServiceManager,
+                ServiceManager,
+            },
         },
     };
 
@@ -1042,6 +1045,49 @@ env = ["TELEGRAM_BOT_TOKEN"]
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn service_connect_rejects_empty_required_env_without_persisting_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let env_file = temp_dir.path().join("telegram.env");
+        fs::write(&env_file, "TELEGRAM_BOT_TOKEN=\n").expect("env file");
+        let manager = FakeServiceManager::default();
+
+        let err = connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                work_root: temp_dir.path(),
+                channel_or_path: "telegram",
+                env_inputs: ConnectEnvInputs {
+                    env_file: Some(env_file),
+                    from_env: Vec::new(),
+                },
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("empty required env should fail");
+
+        assert!(err.to_string().contains("TELEGRAM_BOT_TOKEN"));
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        assert!(!config
+            .channels
+            .iter()
+            .any(|channel| channel.id == "telegram"));
+        assert!(!home.skills_dir().join("telegram").exists());
+        assert!(
+            !home.channel_env_path("telegram").exists(),
+            "failed connect must not keep empty required env"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn failed_service_start_rolls_back_channel_skill_and_env() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
@@ -1095,6 +1141,66 @@ env = ["TELEGRAM_BOT_TOKEN"]
         assert!(load_channel_env(&home, "telegram")
             .expect("channel env")
             .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_partial_service_start_stops_units_and_rolls_back_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let env_file = temp_dir.path().join("telegram.env");
+        fs::write(&env_file, "TELEGRAM_BOT_TOKEN=secret-token\n").expect("env file");
+        let manager = FakeServiceManager::default();
+        manager
+            .fail_up_after_started(1)
+            .expect("configure start failure");
+
+        let err = connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                work_root: temp_dir.path(),
+                channel_or_path: "telegram",
+                env_inputs: ConnectEnvInputs {
+                    env_file: Some(env_file),
+                    from_env: Vec::new(),
+                },
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("configured service start failure should fail");
+
+        assert!(err.to_string().contains("configured service start failure"));
+        let identity = ensure_service_identity(&home).expect("service identity");
+        let daemon_unit = daemon_unit_name(&identity);
+        let channel_unit = channel_unit_name(&identity, "telegram");
+        assert_eq!(
+            manager
+                .unit_status(&daemon_unit)
+                .await
+                .expect("daemon status"),
+            "loaded/inactive/dead"
+        );
+        assert_eq!(
+            manager
+                .unit_status(&channel_unit)
+                .await
+                .expect("channel status"),
+            "loaded/inactive/dead"
+        );
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        assert!(!config
+            .channels
+            .iter()
+            .any(|channel| channel.id == "telegram"));
+        assert!(!home.skills_dir().join("telegram").exists());
+        assert!(!home.channel_env_path("telegram").exists());
     }
 
     #[cfg(unix)]

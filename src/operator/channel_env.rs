@@ -66,7 +66,7 @@ pub fn validate_required_channel_env(
     let stored = load_channel_env(home, channel_id)?;
     for key in required_env {
         validate_channel_env_name(key)?;
-        if !stored.contains_key(key) {
+        if required_value_is_missing(&stored, key) {
             return Err(anyhow!(
                 "required environment value '{key}' is not configured for channel '{channel_id}'"
             ));
@@ -84,7 +84,8 @@ pub fn validate_channel_env_contract(
     validate_stored_channel_env_keys(home, channel_id, required_env, &stored)?;
 
     for key in required_env {
-        if !stored.contains_key(key) {
+        validate_channel_env_name(key)?;
+        if required_value_is_missing(&stored, key) {
             return Err(anyhow!(
                 "required environment value '{key}' is not configured for channel '{channel_id}'"
             ));
@@ -111,11 +112,11 @@ pub fn load_required_channel_env(
     let mut values = Vec::with_capacity(required_env.len());
     for key in required_env {
         validate_channel_env_name(key)?;
-        let value = stored.get(key).ok_or_else(|| {
-            anyhow!(
+        let Some(value) = stored.get(key).filter(|value| !value.is_empty()) else {
+            return Err(anyhow!(
                 "required environment value '{key}' is not configured for channel '{channel_id}'"
-            )
-        })?;
+            ));
+        };
         values.push((key.clone(), value.clone()));
     }
     Ok(values)
@@ -125,11 +126,15 @@ pub fn missing_required_env(stored: &ChannelEnv, required_env: &[String]) -> Res
     let mut missing = Vec::new();
     for key in required_env {
         validate_channel_env_name(key)?;
-        if !stored.contains_key(key) {
+        if required_value_is_missing(stored, key) {
             missing.push(key.clone());
         }
     }
     Ok(missing)
+}
+
+fn required_value_is_missing(stored: &ChannelEnv, key: &str) -> bool {
+    stored.get(key).map(String::is_empty).unwrap_or(true)
 }
 
 fn validate_stored_channel_env_keys(
@@ -273,7 +278,8 @@ mod tests {
     use std::fs;
 
     use super::{
-        load_channel_env, missing_required_env, parse_env_file, save_channel_env, ChannelEnv,
+        load_channel_env, load_required_channel_env, missing_required_env, parse_env_file,
+        save_channel_env, ChannelEnv,
     };
     use crate::home::LionClawHome;
 
@@ -369,5 +375,30 @@ mod tests {
             missing_required_env(&values, &["OTHER_TOKEN".to_string()]).expect("missing"),
             vec!["OTHER_TOKEN".to_string()]
         );
+    }
+
+    #[test]
+    fn required_env_treats_empty_values_as_missing() {
+        let mut values = ChannelEnv::new();
+        values.insert("TELEGRAM_BOT_TOKEN".to_string(), String::new());
+
+        assert_eq!(
+            missing_required_env(&values, &["TELEGRAM_BOT_TOKEN".to_string()]).expect("missing"),
+            vec!["TELEGRAM_BOT_TOKEN".to_string()]
+        );
+    }
+
+    #[test]
+    fn load_required_channel_env_rejects_empty_values() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut values = ChannelEnv::new();
+        values.insert("TELEGRAM_BOT_TOKEN".to_string(), String::new());
+        save_channel_env(&home, "telegram", &values).expect("save env");
+
+        let err = load_required_channel_env(&home, "telegram", &["TELEGRAM_BOT_TOKEN".to_string()])
+            .expect_err("empty required env should fail");
+
+        assert!(err.to_string().contains("TELEGRAM_BOT_TOKEN"));
     }
 }

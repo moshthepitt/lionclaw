@@ -333,7 +333,14 @@ pub async fn up_for_work_root<M: ServiceManager>(
         }
     }
     if !units_to_start.is_empty() {
-        manager.up_units(&units_to_start).await?;
+        if let Err(err) = manager.up_units(&units_to_start).await {
+            if let Err(cleanup_err) = manager.down_units(&units_to_start).await {
+                return Err(anyhow!(
+                    "{err}; additionally failed to stop partially started units: {cleanup_err}"
+                ));
+            }
+            return Err(err);
+        }
     }
     if !units_to_restart.is_empty() {
         manager.restart_units(&units_to_restart).await?;

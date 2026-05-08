@@ -543,6 +543,7 @@ pub struct FakeServiceManager {
     restarted: Mutex<Vec<String>>,
     log_output: Mutex<Option<String>>,
     log_error: Mutex<Option<String>>,
+    fail_up_after_started: Mutex<Option<usize>>,
 }
 
 impl FakeServiceManager {
@@ -591,6 +592,14 @@ impl FakeServiceManager {
             .map_err(|_| anyhow!("log error lock poisoned"))? = Some(error.into());
         Ok(())
     }
+
+    pub fn fail_up_after_started(&self, started_units: usize) -> Result<()> {
+        *self
+            .fail_up_after_started
+            .lock()
+            .map_err(|_| anyhow!("fail up lock poisoned"))? = Some(started_units);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -626,12 +635,21 @@ impl ServiceManager for FakeServiceManager {
     }
 
     async fn up_units(&self, units: &[String]) -> Result<()> {
+        let fail_after_started = *self
+            .fail_up_after_started
+            .lock()
+            .map_err(|_| anyhow!("fail up lock poisoned"))?;
         {
             let mut states = self
                 .states
                 .lock()
                 .map_err(|_| anyhow!("states lock poisoned"))?;
-            for unit in units {
+            for (started, unit) in units.iter().enumerate() {
+                if fail_after_started == Some(started) {
+                    return Err(anyhow!(
+                        "configured service start failure after {started} unit(s)"
+                    ));
+                }
                 states.insert(unit.clone(), "loaded/active/running".to_string());
             }
         }
