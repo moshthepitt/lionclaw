@@ -9,7 +9,12 @@ use tokio::process::Command;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::home::LionClawHome;
+use crate::{
+    home::LionClawHome,
+    operator::private_paths::{
+        create_private_dir_all, ensure_private_file_readable, ensure_private_file_write_target,
+    },
+};
 
 pub const DAEMON_UNIT_NAME: &str = "lionclawd.service";
 
@@ -198,11 +203,7 @@ fn read_service_id(home: &LionClawHome) -> Result<Option<String>> {
 fn write_service_id(home: &LionClawHome, service_id: &str) -> Result<()> {
     Uuid::parse_str(service_id).context("service id must be a UUID")?;
     let path = home.service_id_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    ensure_file_write_target_not_symlink(&path, "service id file")?;
+    ensure_private_file_write_target(home, &path, "service id file")?;
     std::fs::write(&path, format!("{service_id}\n"))
         .with_context(|| format!("failed to write {}", path.display()))?;
     #[cfg(unix)]
@@ -211,22 +212,6 @@ fn write_service_id(home: &LionClawHome, service_id: &str) -> Result<()> {
             .with_context(|| format!("failed to chmod {}", path.display()))?;
     }
     Ok(())
-}
-
-fn ensure_file_write_target_not_symlink(path: &Path, label: &str) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                bail!("{label} {} must not be a symlink", path.display());
-            }
-            if metadata.is_dir() {
-                bail!("{label} {} is not a file", path.display());
-            }
-            Ok(())
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
-    }
 }
 
 fn futures_home_id(home: &LionClawHome) -> Result<Option<String>> {
@@ -431,16 +416,11 @@ impl ServiceManager for SystemdUserServiceManager {
         tokio::fs::create_dir_all(&user_unit_dir)
             .await
             .with_context(|| format!("failed to create {}", user_unit_dir.display()))?;
+        ensure_private_service_paths(home, units)?;
         prune_stale_generated_files(home, &user_unit_dir, units)?;
 
         let mut changed_units = Vec::new();
         for unit in units {
-            if let Some(parent) = unit.env_path.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .with_context(|| format!("failed to create {}", parent.display()))?;
-            }
-
             let unit_path = user_unit_dir.join(&unit.name);
             ensure_owned_or_absent(home, &unit_path)?;
             let unit_changed = file_content_differs(&unit_path, &unit.unit_content)
@@ -535,6 +515,22 @@ impl ServiceManager for SystemdUserServiceManager {
     }
 }
 
+fn ensure_private_service_paths(home: &LionClawHome, units: &[ManagedServiceUnit]) -> Result<()> {
+    create_private_dir_all(
+        home,
+        &home.services_systemd_dir(),
+        "managed service directory",
+    )?;
+    create_private_dir_all(home, &home.services_env_dir(), "service env directory")?;
+    for unit in units {
+        ensure_private_file_write_target(home, &unit.env_path, "service env file")?;
+        for extra_env_file in &unit.extra_env_files {
+            ensure_private_file_readable(home, extra_env_file, "channel env file")?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 pub struct FakeServiceManager {
     states: Mutex<HashMap<String, String>>,
@@ -562,6 +558,15 @@ impl FakeServiceManager {
             .map_err(|_| anyhow!("restarted lock poisoned"))?
             .iter()
             .any(|value| value == unit))
+    }
+
+    pub fn managed_unit(&self, unit: &str) -> Result<Option<ManagedServiceUnit>> {
+        Ok(self
+            .units
+            .lock()
+            .map_err(|_| anyhow!("units lock poisoned"))?
+            .get(unit)
+            .cloned())
     }
 }
 
@@ -879,9 +884,10 @@ mod tests {
 
     use super::{
         channel_unit_name, daemon_unit_name, ensure_identity_not_colliding_in_dir,
-        path_entry_exists, prune_user_unit_dir, read_or_create_service_identity,
-        render_channel_unit, render_daemon_unit, unit_belongs_to_identity, write_service_id,
-        ChannelServiceSpec, DaemonServiceSpec, ServiceIdentity,
+        ensure_private_service_paths, path_entry_exists, prune_user_unit_dir,
+        read_or_create_service_identity, render_channel_unit, render_daemon_unit,
+        unit_belongs_to_identity, write_service_id, ChannelServiceSpec, DaemonServiceSpec,
+        ManagedServiceUnit, ServiceIdentity,
     };
 
     fn seed_home(root: &Path) -> crate::home::LionClawHome {
@@ -1121,5 +1127,30 @@ mod tests {
             path_entry_exists(&link_path).expect("inspect path"),
             "broken symlink should still count as an existing entry"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_service_paths_reject_symlinked_env_directory() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        fs::create_dir_all(home.services_dir()).expect("services dir");
+        let outside_env = temp_dir.path().join("outside-env");
+        fs::create_dir_all(&outside_env).expect("outside env");
+        symlink(&outside_env, home.services_env_dir()).expect("symlink env dir");
+        let unit = ManagedServiceUnit {
+            name: "lionclaw-test.service".to_string(),
+            unit_path: home.services_systemd_dir().join("lionclaw-test.service"),
+            unit_content: "[Unit]\n".to_string(),
+            env_path: home.services_env_dir().join("lionclaw-test.env"),
+            env_content: "TOKEN=\"secret\"\n".to_string(),
+            extra_env_files: Vec::new(),
+        };
+
+        let err = ensure_private_service_paths(&home, &[unit])
+            .expect_err("symlinked service env directory should fail");
+
+        assert!(err.to_string().contains("must not be a symlink"));
+        assert!(!outside_env.join("lionclaw-test.env").exists());
     }
 }

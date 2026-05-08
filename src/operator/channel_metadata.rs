@@ -166,7 +166,9 @@ pub fn validate_channel_id(id: &str) -> Result<()> {
         bail!("channel id is required");
     }
     let mut chars = trimmed.chars();
-    let first = chars.next().expect("non-empty channel id");
+    let Some(first) = chars.next() else {
+        bail!("channel id is required");
+    };
     if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
         bail!("channel id '{id}' must start with a lowercase ASCII letter or digit");
     }

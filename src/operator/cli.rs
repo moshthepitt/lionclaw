@@ -29,7 +29,7 @@ use crate::{
             derive_skill_alias, normalize_podman_executable, normalize_runtime_command,
             ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig,
         },
-        connect::{connect_channel, ConnectEnvInputs, ConnectOutcome},
+        connect::{connect_channel, ConnectChannelRequest, ConnectEnvInputs, ConnectOutcome},
         reconcile::{
             add_channel, add_skill, down, logs, onboard, open_kernel,
             open_runtime_kernel_for_work_root, pairing_approve, pairing_block, pairing_list,
@@ -654,16 +654,18 @@ pub async fn run() -> Result<ExitCode> {
             let mut output = stdout;
             let manager = SystemdUserServiceManager;
             let outcome = connect_channel(
-                &target.instance_home,
-                &manager,
-                target.require_work_root()?,
-                &args.channel_or_path,
-                ConnectEnvInputs {
-                    env_file: args.env_file,
-                    from_env: args.from_env,
+                ConnectChannelRequest {
+                    home: &target.instance_home,
+                    manager: &manager,
+                    work_root: target.require_work_root()?,
+                    channel_or_path: &args.channel_or_path,
+                    env_inputs: ConnectEnvInputs {
+                        env_file: args.env_file,
+                        from_env: args.from_env,
+                    },
+                    interactive,
+                    hide_prompt_input: interactive,
                 },
-                interactive,
-                interactive,
                 &mut input,
                 &mut output,
             )
@@ -2211,6 +2213,61 @@ mod tests {
         assert_eq!(config.defaults.runtime.as_deref(), Some("codex"));
         let prompt = String::from_utf8(output).expect("utf8 prompt");
         assert!(prompt.contains("Runtime to configure:"));
+    }
+
+    #[tokio::test]
+    async fn channel_list_renders_instance_channels() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = OperatorConfig::default();
+        config.upsert_channel(crate::operator::config::ManagedChannelConfig {
+            id: "terminal".to_string(),
+            skill: "terminal".to_string(),
+            launch_mode: ChannelLaunchMode::Interactive,
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env: Vec::new(),
+        });
+        config.upsert_channel(crate::operator::config::ManagedChannelConfig {
+            id: "telegram".to_string(),
+            skill: "telegram".to_string(),
+            launch_mode: ChannelLaunchMode::Service,
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+        });
+        config.save(&home).await.expect("save config");
+        let manager = crate::operator::services::FakeServiceManager::default();
+
+        let rendered = render_instance_channel_list("main", &home, &manager)
+            .await
+            .expect("channel list");
+
+        assert!(rendered.contains("instance: main"));
+        assert!(rendered.contains("terminal"));
+        assert!(rendered.contains("interactive"));
+        assert!(rendered.contains("telegram"));
+        assert!(rendered.contains("service"));
+        assert!(rendered.contains("not-installed"));
+    }
+
+    #[tokio::test]
+    async fn channel_remove_deletes_configured_channel() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = OperatorConfig::default();
+        config.upsert_channel(crate::operator::config::ManagedChannelConfig {
+            id: "telegram".to_string(),
+            skill: "telegram".to_string(),
+            launch_mode: ChannelLaunchMode::Service,
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+        });
+        config.save(&home).await.expect("save config");
+
+        assert!(remove_channel(&home, "telegram")
+            .await
+            .expect("remove channel"));
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        assert!(config.channels.is_empty());
     }
 
     #[tokio::test]

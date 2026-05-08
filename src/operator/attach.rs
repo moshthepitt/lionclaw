@@ -46,6 +46,27 @@ pub async fn attach_channel<M: ServiceManager>(
     requested_runtime_id: Option<String>,
 ) -> Result<()> {
     let binaries = crate::operator::reconcile::resolve_stack_binaries()?;
+    attach_channel_with_binaries(
+        home,
+        manager,
+        work_root,
+        channel_id,
+        requested_peer_id,
+        requested_runtime_id,
+        &binaries,
+    )
+    .await
+}
+
+pub(crate) async fn attach_channel_with_binaries<M: ServiceManager>(
+    home: &LionClawHome,
+    manager: &M,
+    work_root: &Path,
+    channel_id: String,
+    requested_peer_id: Option<String>,
+    requested_runtime_id: Option<String>,
+    binaries: &StackBinaryPaths,
+) -> Result<()> {
     let home_id = home.ensure_home_id().await?;
     let project_scope = project_scope_for_work_root(work_root);
     let spec = prepare_channel_attach(
@@ -55,7 +76,7 @@ pub async fn attach_channel<M: ServiceManager>(
         channel_id,
         requested_peer_id,
         requested_runtime_id,
-        &binaries,
+        binaries,
     )
     .await?;
 

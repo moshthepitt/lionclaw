@@ -6,24 +6,30 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::{home::LionClawHome, operator::channel_metadata::validate_channel_env_name};
+use crate::{
+    home::LionClawHome,
+    operator::{
+        channel_metadata::validate_channel_env_name,
+        private_paths::{
+            ensure_private_file_write_target, read_private_file_to_string,
+            set_private_file_permissions,
+        },
+    },
+};
 
 pub type ChannelEnv = BTreeMap<String, String>;
 
 pub fn load_channel_env(home: &LionClawHome, channel_id: &str) -> Result<ChannelEnv> {
     let path = home.channel_env_path(channel_id);
-    let Some(content) = read_private_env_file(&path, "channel env")? else {
+    let Some(content) = read_private_file_to_string(home, &path, "channel env")? else {
         return Ok(ChannelEnv::new());
     };
     parse_env_content(&content)
 }
 
 pub fn save_channel_env(home: &LionClawHome, channel_id: &str, values: &ChannelEnv) -> Result<()> {
-    let dir = home.channel_env_dir();
-    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    ensure_private_dir(&dir, "channel env directory")?;
     let path = home.channel_env_path(channel_id);
-    ensure_file_write_target_not_symlink(&path, "channel env file")?;
+    ensure_private_file_write_target(home, &path, "channel env file")?;
 
     let mut content = String::new();
     for (key, value) in values {
@@ -50,6 +56,23 @@ pub fn merge_channel_env(
     }
     save_channel_env(home, channel_id, &existing)?;
     Ok(existing)
+}
+
+pub fn validate_required_channel_env(
+    home: &LionClawHome,
+    channel_id: &str,
+    required_env: &[String],
+) -> Result<()> {
+    let stored = load_channel_env(home, channel_id)?;
+    for key in required_env {
+        validate_channel_env_name(key)?;
+        if !stored.contains_key(key) {
+            return Err(anyhow!(
+                "required environment value '{key}' is not configured for channel '{channel_id}'"
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn load_required_channel_env(
@@ -110,8 +133,7 @@ pub fn render_missing_env_repair(channel_id: &str, missing: &[String]) -> String
         .map(|key| format!(" --from-env {key}"))
         .collect::<String>();
     format!(
-        "missing required environment values for channel '{channel_id}': {names}\nRun:\n  lionclaw connect {channel_id} --env-file ./{}.env\n  lionclaw connect {channel_id}{from_env}",
-        channel_id
+        "missing required environment values for channel '{channel_id}': {names}\nRun:\n  lionclaw connect {channel_id} --env-file ./{channel_id}.env\n  lionclaw connect {channel_id}{from_env}"
     )
 }
 
@@ -174,14 +196,6 @@ fn unquote_env_value(value: &str) -> Result<String> {
     Ok(out)
 }
 
-fn read_private_env_file(path: &Path, label: &str) -> Result<Option<String>> {
-    let content = read_private_or_regular_env_file(path, label)?;
-    if content.is_some() {
-        harden_private_env_file(path, label)?;
-    }
-    Ok(content)
-}
-
 fn read_private_or_regular_env_file(path: &Path, label: &str) -> Result<Option<String>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -197,66 +211,6 @@ fn read_private_or_regular_env_file(path: &Path, label: &str) -> Result<Option<S
     fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))
         .map(Some)
-}
-
-fn harden_private_env_file(path: &Path, label: &str) -> Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        anyhow!(
-            "{label} {} does not have a parent directory",
-            path.display()
-        )
-    })?;
-    ensure_private_dir(parent, &format!("{label} directory"))?;
-    set_private_file_permissions(path)
-}
-
-fn ensure_private_dir(path: &Path, label: &str) -> Result<()> {
-    let metadata =
-        fs::symlink_metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        bail!("{label} {} must not be a symlink", path.display());
-    }
-    if !metadata.is_dir() {
-        bail!("{label} {} is not a directory", path.display());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mode = metadata.permissions().mode();
-        if mode & 0o077 != 0 {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("failed to chmod {}", path.display()))?;
-        }
-    }
-    Ok(())
-}
-
-fn set_private_file_permissions(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to chmod {}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn ensure_file_write_target_not_symlink(path: &Path, label: &str) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                bail!("{label} {} must not be a symlink", path.display());
-            }
-            if metadata.is_dir() {
-                bail!("{label} {} is not a file", path.display());
-            }
-            Ok(())
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| format!("failed to stat {}", path.display())),
-    }
 }
 
 #[cfg(test)]
@@ -308,6 +262,27 @@ mod tests {
         let err = save_channel_env(&home, "telegram", &values).expect_err("symlink should fail");
         assert!(err.to_string().contains("must not be a symlink"));
         assert!(!outside.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn channel_env_rejects_symlinked_config_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        fs::create_dir_all(home.root()).expect("home root");
+        let outside_config = temp_dir.path().join("outside-config");
+        fs::create_dir_all(&outside_config).expect("outside config");
+        symlink(&outside_config, home.config_dir()).expect("symlink config");
+
+        let mut values = ChannelEnv::new();
+        values.insert("TOKEN".to_string(), "secret".to_string());
+        let err = save_channel_env(&home, "telegram", &values)
+            .expect_err("symlinked config parent should fail");
+
+        assert!(err.to_string().contains("must not be a symlink"));
+        assert!(!outside_config.join("channels/telegram.env").exists());
     }
 
     #[test]

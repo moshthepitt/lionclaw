@@ -9,14 +9,17 @@ use anyhow::{anyhow, Context, Result};
 use crate::{
     home::LionClawHome,
     operator::{
-        attach::attach_channel,
+        attach::attach_channel_with_binaries,
         channel_env::{
             collect_from_process_env, load_channel_env, merge_channel_env, missing_required_env,
             parse_env_file, render_missing_env_repair, ChannelEnv,
         },
         channel_metadata::{discover_channel_skill, ChannelSkillSource, DiscoveredChannelSkill},
         config::{ChannelLaunchMode, OperatorConfig},
-        reconcile::{add_channel_with_worker, add_skill, resolve_stack_binaries, up_for_work_root},
+        reconcile::{
+            add_channel_with_worker, add_skill, resolve_stack_binaries, up_for_work_root,
+            StackBinaryPaths,
+        },
         runtime::resolve_runtime_id,
         services::ServiceManager,
     },
@@ -26,6 +29,16 @@ use crate::{
 pub struct ConnectEnvInputs {
     pub env_file: Option<PathBuf>,
     pub from_env: Vec<String>,
+}
+
+pub struct ConnectChannelRequest<'a, M> {
+    pub home: &'a LionClawHome,
+    pub manager: &'a M,
+    pub work_root: &'a Path,
+    pub channel_or_path: &'a str,
+    pub env_inputs: ConnectEnvInputs,
+    pub interactive: bool,
+    pub hide_prompt_input: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,13 +56,7 @@ pub struct ConnectOutcome {
 }
 
 pub async fn connect_channel<R, W, M>(
-    home: &LionClawHome,
-    manager: &M,
-    work_root: &Path,
-    channel_or_path: &str,
-    env_inputs: ConnectEnvInputs,
-    interactive: bool,
-    hide_prompt_input: bool,
+    request: ConnectChannelRequest<'_, M>,
     input: &mut R,
     output: &mut W,
 ) -> Result<ConnectOutcome>
@@ -58,6 +65,30 @@ where
     W: Write,
     M: ServiceManager,
 {
+    let binaries = resolve_stack_binaries()?;
+    connect_channel_with_binaries(request, &binaries, input, output).await
+}
+
+async fn connect_channel_with_binaries<R, W, M>(
+    request: ConnectChannelRequest<'_, M>,
+    binaries: &StackBinaryPaths,
+    input: &mut R,
+    output: &mut W,
+) -> Result<ConnectOutcome>
+where
+    R: BufRead,
+    W: Write,
+    M: ServiceManager,
+{
+    let ConnectChannelRequest {
+        home,
+        manager,
+        work_root,
+        channel_or_path,
+        env_inputs,
+        interactive,
+        hide_prompt_input,
+    } = request;
     let config = OperatorConfig::load(home).await?;
     let runtime_id = resolve_runtime_id(&config, None).map_err(|_| {
         anyhow!(
@@ -84,24 +115,34 @@ where
     .await?;
 
     ensure_required_env(
-        home,
-        &channel_id,
-        &discovered.metadata.env,
-        env_inputs,
-        interactive,
-        hide_prompt_input,
+        RequiredEnvRequest {
+            home,
+            channel_id: &channel_id,
+            required_env: &discovered.metadata.env,
+            env_inputs,
+            interactive,
+            hide_prompt_input,
+        },
         input,
         output,
     )?;
 
     let action = match discovered.metadata.launch {
         ChannelLaunchMode::Interactive => {
-            attach_channel(home, manager, work_root, channel_id.clone(), None, None).await?;
+            attach_channel_with_binaries(
+                home,
+                manager,
+                work_root,
+                channel_id.clone(),
+                None,
+                None,
+                binaries,
+            )
+            .await?;
             ConnectAction::InteractiveAttach
         }
         ChannelLaunchMode::Service => {
-            let binaries = resolve_stack_binaries()?;
-            up_for_work_root(home, manager, &runtime_id, &binaries, work_root).await?;
+            up_for_work_root(home, manager, &runtime_id, binaries, work_root).await?;
             ConnectAction::ServiceStarted
         }
     };
@@ -134,16 +175,28 @@ async fn install_or_select_skill(
     }
 }
 
-fn ensure_required_env<R: BufRead, W: Write>(
-    home: &LionClawHome,
-    channel_id: &str,
-    required_env: &[String],
+struct RequiredEnvRequest<'a> {
+    home: &'a LionClawHome,
+    channel_id: &'a str,
+    required_env: &'a [String],
     env_inputs: ConnectEnvInputs,
     interactive: bool,
     hide_prompt_input: bool,
+}
+
+fn ensure_required_env<R: BufRead, W: Write>(
+    request: RequiredEnvRequest<'_>,
     input: &mut R,
     output: &mut W,
 ) -> Result<()> {
+    let RequiredEnvRequest {
+        home,
+        channel_id,
+        required_env,
+        env_inputs,
+        interactive,
+        hide_prompt_input,
+    } = request;
     let mut updates = ChannelEnv::new();
     if let Some(path) = env_inputs.env_file.as_deref() {
         updates.extend(parse_env_file(path)?);
@@ -221,7 +274,7 @@ fn read_secret_line() -> Result<String> {
 
     impl Drop for EchoGuard<'_> {
         fn drop(&mut self) {
-            let _ = tcsetattr(self.tty, OptionalActions::Now, &self.original);
+            let _restore_result = tcsetattr(self.tty, OptionalActions::Now, &self.original);
         }
     }
 
@@ -253,10 +306,79 @@ fn read_secret_line() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::{fs, io::Cursor, net::TcpListener, path::Path};
 
-    use super::{ensure_required_env, ConnectEnvInputs};
-    use crate::{home::LionClawHome, operator::channel_env::load_channel_env};
+    use super::{
+        connect_channel_with_binaries, ensure_required_env, ConnectAction, ConnectChannelRequest,
+        ConnectEnvInputs, RequiredEnvRequest,
+    };
+    use crate::{
+        home::LionClawHome,
+        kernel::runtime::{ConfinementConfig, OciConfinementConfig},
+        operator::{
+            channel_env::load_channel_env,
+            config::{ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig},
+            reconcile::{onboard, OnboardBindSelection, StackBinaryPaths},
+            services::FakeServiceManager,
+        },
+    };
+
+    fn binaries() -> StackBinaryPaths {
+        StackBinaryPaths {
+            daemon_bin: "/tmp/lionclawd".into(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, content: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, content).expect("write executable");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    #[cfg(unix)]
+    async fn seed_configured_runtime(home: &LionClawHome, temp_dir: &Path) {
+        onboard(home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
+        let codex_home = home.root().join(".codex");
+        fs::create_dir_all(&codex_home).expect("codex home");
+        fs::write(
+            codex_home.join("auth.json"),
+            r#"{
+  "OPENAI_API_KEY": "sk-test"
+}"#,
+        )
+        .expect("runtime auth");
+        let runtime_stub = temp_dir.join("codex-stub.sh");
+        write_executable(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n");
+        let podman = temp_dir.join("podman");
+        write_executable(
+            &podman,
+            "#!/usr/bin/env bash\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"inspect\" ]; then\n  printf 'sha256:test-runtime-image\\n'\n  exit 0\nfi\nexit 0\n",
+        );
+
+        let mut config = OperatorConfig::load(home).await.expect("load config");
+        config.runtimes = [(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "codex".to_string(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: podman.to_string_lossy().to_string(),
+                    image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        )]
+        .into_iter()
+        .collect();
+        config
+            .set_default_runtime("codex")
+            .expect("set default runtime");
+        config.save(home).await.expect("save config");
+    }
 
     #[test]
     fn noninteractive_missing_env_reports_repair_commands() {
@@ -266,12 +388,14 @@ mod tests {
         let mut output = Vec::new();
 
         let err = ensure_required_env(
-            &home,
-            "telegram",
-            &["TELEGRAM_BOT_TOKEN".to_string()],
-            ConnectEnvInputs::default(),
-            false,
-            false,
+            RequiredEnvRequest {
+                home: &home,
+                channel_id: "telegram",
+                required_env: &["TELEGRAM_BOT_TOKEN".to_string()],
+                env_inputs: ConnectEnvInputs::default(),
+                interactive: false,
+                hide_prompt_input: false,
+            },
             &mut input,
             &mut output,
         )
@@ -291,12 +415,14 @@ mod tests {
         let mut output = Vec::new();
 
         ensure_required_env(
-            &home,
-            "telegram",
-            &["TELEGRAM_BOT_TOKEN".to_string()],
-            ConnectEnvInputs::default(),
-            true,
-            false,
+            RequiredEnvRequest {
+                home: &home,
+                channel_id: "telegram",
+                required_env: &["TELEGRAM_BOT_TOKEN".to_string()],
+                env_inputs: ConnectEnvInputs::default(),
+                interactive: true,
+                hide_prompt_input: false,
+            },
             &mut input,
             &mut output,
         )
@@ -310,5 +436,99 @@ mod tests {
             stored.get("TELEGRAM_BOT_TOKEN").map(String::as_str),
             Some("secret-token")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_telegram_stores_env_and_starts_service_channel() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let env_file = temp_dir.path().join("telegram.env");
+        fs::write(&env_file, "TELEGRAM_BOT_TOKEN=secret-token\n").expect("env file");
+        let manager = FakeServiceManager::default();
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let outcome = connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                work_root: temp_dir.path(),
+                channel_or_path: "telegram",
+                env_inputs: ConnectEnvInputs {
+                    env_file: Some(env_file),
+                    from_env: Vec::new(),
+                },
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut input,
+            &mut output,
+        )
+        .await
+        .expect("connect telegram");
+
+        assert_eq!(outcome.channel_id, "telegram");
+        assert_eq!(outcome.launch, ChannelLaunchMode::Service);
+        assert_eq!(outcome.action, ConnectAction::ServiceStarted);
+        assert_eq!(
+            load_channel_env(&home, "telegram")
+                .expect("channel env")
+                .get("TELEGRAM_BOT_TOKEN")
+                .map(String::as_str),
+            Some("secret-token")
+        );
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        assert!(config.channels.iter().any(|channel| {
+            channel.id == "telegram"
+                && channel.skill == "telegram"
+                && channel.launch_mode == ChannelLaunchMode::Service
+                && channel.required_env == ["TELEGRAM_BOT_TOKEN"]
+        }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_terminal_configures_interactive_channel_before_attaching() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve daemon bind");
+        let mut config = OperatorConfig::load(&home).await.expect("load config");
+        config.daemon.bind = format!(
+            "127.0.0.1:{}",
+            listener.local_addr().expect("listener addr").port()
+        );
+        config.save(&home).await.expect("save config");
+        let manager = FakeServiceManager::default();
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let err = connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                work_root: temp_dir.path(),
+                channel_or_path: "terminal",
+                env_inputs: ConnectEnvInputs::default(),
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut input,
+            &mut output,
+        )
+        .await
+        .expect_err("reserved non-LionClaw listener should block attach");
+
+        assert!(err.to_string().contains("non-LionClaw listener"));
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        assert!(config.channels.iter().any(|channel| {
+            channel.id == "terminal"
+                && channel.skill == "terminal"
+                && channel.launch_mode == ChannelLaunchMode::Interactive
+        }));
     }
 }

@@ -677,7 +677,7 @@ pub(crate) fn build_managed_units(
         )
         .with_context(|| format!("channel '{}' worker resolution failed", channel.id))?;
 
-        let mut env = vec![
+        let env = vec![
             (
                 "LIONCLAW_HOME".to_string(),
                 home.root().display().to_string(),
@@ -692,13 +692,9 @@ pub(crate) fn build_managed_units(
         let channel_env_path = if channel.required_env.is_empty() {
             None
         } else {
+            validate_required_channel_env(home, &channel.id, &channel.required_env)?;
             Some(home.channel_env_path(&channel.id))
         };
-        env.extend(resolve_required_channel_env(
-            home,
-            &channel.id,
-            &channel.required_env,
-        )?);
 
         units.push(render_channel_unit(
             home,
@@ -721,6 +717,14 @@ pub(crate) fn resolve_required_channel_env(
     required_env: &[String],
 ) -> Result<Vec<(String, String)>> {
     crate::operator::channel_env::load_required_channel_env(home, channel_id, required_env)
+}
+
+pub(crate) fn validate_required_channel_env(
+    home: &LionClawHome,
+    channel_id: &str,
+    required_env: &[String],
+) -> Result<()> {
+    crate::operator::channel_env::validate_required_channel_env(home, channel_id, required_env)
 }
 
 #[cfg(test)]
@@ -1085,6 +1089,7 @@ mod tests {
         home::{runtime_project_partition_key, LionClawHome},
         kernel::runtime::{ConfinementConfig, OciConfinementConfig},
         operator::{
+            channel_env::{merge_channel_env, ChannelEnv},
             config::{ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig},
             daemon_probe::{classify_daemon, DaemonClassification},
             reconcile::load_operator_state,
@@ -1783,6 +1788,75 @@ mod tests {
         assert!(home
             .runtime_project_drafts_dir("codex", "main", &project_workspace_root)
             .exists());
+    }
+
+    #[tokio::test]
+    async fn service_channel_env_uses_private_channel_env_without_secret_copy() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
+        write_test_codex_auth(&home).await;
+        let runtime_stub = temp_dir.path().join("codex-stub.sh");
+        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
+        make_executable(&runtime_stub);
+        let skill_source = write_skill_source(temp_dir.path(), "channel-telegram", "test", true);
+
+        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
+            .into_iter()
+            .collect();
+        config
+            .set_default_runtime("codex")
+            .expect("set default runtime");
+        config.save(&home).await.expect("save config");
+        add_skill(
+            &home,
+            "telegram".to_string(),
+            skill_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install skill");
+        add_channel(
+            &home,
+            "telegram".to_string(),
+            "telegram".to_string(),
+            ChannelLaunchMode::Service,
+            vec!["TELEGRAM_BOT_TOKEN".to_string()],
+        )
+        .await
+        .expect("add channel");
+        let mut env = ChannelEnv::new();
+        env.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
+        merge_channel_env(&home, "telegram", &env).expect("store channel env");
+
+        let manager = FakeServiceManager::default();
+        let binaries = StackBinaryPaths {
+            daemon_bin: "/tmp/lionclawd".into(),
+        };
+        up_for_work_root(&home, &manager, "codex", &binaries, &current_work_root())
+            .await
+            .expect("up");
+        let telegram_unit_name = channel_unit_name(&test_service_identity(&home), "telegram");
+        let unit = manager
+            .managed_unit(&telegram_unit_name)
+            .expect("managed unit lookup")
+            .expect("telegram unit");
+
+        assert!(!unit.env_content.contains("TELEGRAM_BOT_TOKEN"));
+        assert!(!unit.env_content.contains("secret-token"));
+        assert_eq!(
+            unit.extra_env_files,
+            vec![home.channel_env_path("telegram")]
+        );
+        assert!(unit
+            .unit_content
+            .contains(&format!("EnvironmentFile={}", unit.env_path.display())));
+        assert!(unit.unit_content.contains(&format!(
+            "EnvironmentFile={}",
+            home.channel_env_path("telegram").display()
+        )));
     }
 
     #[tokio::test]

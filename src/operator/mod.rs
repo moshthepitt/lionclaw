@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod connect;
 pub mod daemon_probe;
+pub(crate) mod private_paths;
 pub mod reconcile;
 pub mod run;
 pub mod runtime;
