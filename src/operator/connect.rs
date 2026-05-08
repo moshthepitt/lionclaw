@@ -131,7 +131,7 @@ where
         Ok(outcome) => outcome,
         Err(err) => return Err(rollback.restore_channel_env_only(home, &channel_id, err)),
     };
-    let skill_alias = match install_or_select_skill(home, &discovered).await {
+    let skill_alias = match install_or_select_skill(home, &discovered, &config).await {
         Ok(skill_alias) => skill_alias,
         Err(err) => return rollback_all_and_return(home, &channel_id, rollback, err).await,
     };
@@ -191,11 +191,18 @@ where
 async fn install_or_select_skill(
     home: &LionClawHome,
     discovered: &DiscoveredChannelSkill,
+    config: &OperatorConfig,
 ) -> Result<String> {
     match &discovered.source {
         ChannelSkillSource::Installed { alias } => Ok(alias.clone()),
         ChannelSkillSource::Path | ChannelSkillSource::Bundled => {
             let alias = discovered.metadata.id.clone();
+            validate_channel_skill_alias_install_target(
+                home,
+                config,
+                &alias,
+                &discovered.metadata.id,
+            )?;
             add_skill(
                 home,
                 alias.clone(),
@@ -205,6 +212,42 @@ async fn install_or_select_skill(
             .await?;
             Ok(alias)
         }
+    }
+}
+
+fn validate_channel_skill_alias_install_target(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+    alias: &str,
+    channel_id: &str,
+) -> Result<()> {
+    let alias_path = home.skills_dir().join(alias);
+    let exists = match fs::symlink_metadata(&alias_path) {
+        Ok(_) => true,
+        Err(err) if err.kind() == ErrorKind::NotFound => false,
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", alias_path.display()))
+        }
+    };
+    if !exists {
+        return Ok(());
+    }
+
+    let bound_channels = config
+        .channels
+        .iter()
+        .filter(|channel| channel.skill == alias)
+        .map(|channel| channel.id.as_str())
+        .collect::<Vec<_>>();
+    match bound_channels.as_slice() {
+        [existing_channel] if *existing_channel == channel_id => Ok(()),
+        [] => bail!(
+            "skill alias '{alias}' already exists and is not bound to channel '{channel_id}'; remove or rename it before connecting this channel"
+        ),
+        channels => bail!(
+            "skill alias '{alias}' is already used by configured channel(s): {}; remove the channel before replacing the alias",
+            channels.join(", ")
+        ),
     }
 }
 
@@ -802,6 +845,16 @@ env = ["TELEGRAM_BOT_TOKEN"]
         );
     }
 
+    #[cfg(unix)]
+    fn write_normal_skill(root: &Path, skill_name: &str, token: &str) {
+        fs::create_dir_all(root).expect("skill dir");
+        fs::write(
+            root.join("SKILL.md"),
+            format!("---\nname: {skill_name}\ndescription: normal skill\n---\n{token}\n"),
+        )
+        .expect("skill md");
+    }
+
     #[test]
     fn noninteractive_missing_env_reports_repair_commands() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -1084,6 +1137,60 @@ env = ["TELEGRAM_BOT_TOKEN"]
             !home.channel_env_path("telegram").exists(),
             "failed connect must not keep empty required env"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_rejects_existing_normal_skill_alias_collision() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        seed_configured_runtime(&home, temp_dir.path()).await;
+        let normal_skill = temp_dir.path().join("normal-telegram");
+        write_normal_skill(&normal_skill, "Normal Telegram", "normal snapshot");
+        add_skill(
+            &home,
+            "telegram".to_string(),
+            normal_skill.display().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install normal skill");
+        let env_file = temp_dir.path().join("telegram.env");
+        fs::write(&env_file, "TELEGRAM_BOT_TOKEN=secret-token\n").expect("env file");
+        let manager = FakeServiceManager::default();
+
+        let err = connect_channel_with_binaries(
+            ConnectChannelRequest {
+                home: &home,
+                manager: &manager,
+                work_root: temp_dir.path(),
+                channel_or_path: "telegram",
+                env_inputs: ConnectEnvInputs {
+                    env_file: Some(env_file),
+                    from_env: Vec::new(),
+                },
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &binaries(),
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("normal skill alias collision should fail");
+
+        assert!(err
+            .to_string()
+            .contains("skill alias 'telegram' already exists"));
+        let installed = fs::read_to_string(home.skills_dir().join("telegram/SKILL.md"))
+            .expect("installed skill");
+        assert!(installed.contains("Normal Telegram"));
+        assert!(installed.contains("normal snapshot"));
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        assert!(!config
+            .channels
+            .iter()
+            .any(|channel| channel.id == "telegram"));
     }
 
     #[cfg(unix)]

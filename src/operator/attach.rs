@@ -279,6 +279,7 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
 async fn launch_channel_attach(spec: ChannelAttachSpec) -> Result<()> {
     let mut command = Command::new(&spec.worker_path);
     command
+        .env_clear()
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -326,7 +327,7 @@ mod tests {
     use axum::{routing::get, Json, Router};
     use serde_json::json;
 
-    use super::prepare_channel_attach;
+    use super::{launch_channel_attach, prepare_channel_attach, ChannelAttachSpec};
     use crate::{
         applied::{compute_daemon_fingerprint, AppliedState},
         config::resolve_project_workspace_root,
@@ -735,6 +736,40 @@ mod tests {
         assert!(err
             .to_string()
             .contains("LIONCLAW_TEST_MISSING_REQUIRED_ENV"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_channel_attach_clears_inherited_environment() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let worker = temp_dir.path().join("worker.sh");
+        let output = temp_dir.path().join("env.txt");
+        write_executable(
+            &worker,
+            &format!(
+                "#!/bin/sh\n/usr/bin/env | /usr/bin/sort > '{}'\n",
+                output.display()
+            ),
+        );
+
+        launch_channel_attach(ChannelAttachSpec {
+            worker_path: worker,
+            bind_addr: "127.0.0.1:0".to_string(),
+            env: vec![("LIONCLAW_CHANNEL_ID".to_string(), "terminal".to_string())],
+            started_services: false,
+            expected_daemon_fingerprint: String::new(),
+        })
+        .await
+        .expect("launch worker");
+
+        let env_output = fs::read_to_string(output).expect("env output");
+        assert!(env_output.contains("LIONCLAW_CHANNEL_ID=terminal\n"));
+        if std::env::var_os("HOME").is_some() {
+            assert!(
+                !env_output.lines().any(|line| line.starts_with("HOME=")),
+                "worker should not inherit operator HOME"
+            );
+        }
     }
 
     #[cfg(unix)]
