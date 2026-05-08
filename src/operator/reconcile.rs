@@ -649,13 +649,22 @@ pub(crate) async fn render_runtime_cache(
     config: &OperatorConfig,
     runtime_id: &str,
 ) -> Result<()> {
-    let workspace = &config.daemon.workspace;
     let project_workspace_root =
         resolve_project_workspace_root().context("failed to resolve project workspace root")?;
-    let target_dir = home.runtime_project_dir(runtime_id, workspace, &project_workspace_root);
+    render_runtime_cache_for_work_root(home, config, runtime_id, &project_workspace_root).await
+}
+
+pub(crate) async fn render_runtime_cache_for_work_root(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+    runtime_id: &str,
+    project_workspace_root: &Path,
+) -> Result<()> {
+    let workspace = &config.daemon.workspace;
+    let target_dir = home.runtime_project_dir(runtime_id, workspace, project_workspace_root);
     for path in [
         target_dir.clone(),
-        home.runtime_project_drafts_dir(runtime_id, workspace, &project_workspace_root),
+        home.runtime_project_drafts_dir(runtime_id, workspace, project_workspace_root),
     ] {
         tokio::fs::create_dir_all(&path)
             .await
@@ -915,6 +924,23 @@ pub(crate) async fn open_runtime_kernel_with_timeouts(
         config,
         default_runtime_id,
         Some(project_workspace_root),
+        timeout_override,
+    )
+    .await
+}
+
+pub(crate) async fn open_runtime_kernel_for_work_root(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+    default_runtime_id: Option<String>,
+    work_root: &Path,
+    timeout_override: Option<RuntimeTurnTimeouts>,
+) -> Result<Kernel> {
+    open_kernel_with_project_root(
+        home,
+        config,
+        default_runtime_id,
+        Some(work_root.to_path_buf()),
         timeout_override,
     )
     .await

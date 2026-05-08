@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, process::ExitCode, str::FromStr, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, process::ExitCode, str::FromStr, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
@@ -32,6 +32,11 @@ use crate::{
         runtime::{resolve_runtime_id, validate_runtime_availability},
         services::SystemdUserServiceManager,
         snapshot::SKILL_INSTALL_METADATA_FILE,
+        target::{
+            adopt_project_instance, create_project_instance, init_project, list_project_instances,
+            resolve_existing_project_root, resolve_project_setup_root, resolve_target,
+            TargetSelection, WorkRootRequirement,
+        },
     },
     runtime_timeouts::{parse_duration, RuntimeTurnTimeouts},
 };
@@ -42,6 +47,27 @@ const PROJECT_VALIDATE_MISMATCH_EXIT: u8 = 20;
 #[command(name = "lionclaw")]
 #[command(about = "LionClaw operator CLI")]
 pub struct Cli {
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "Target an exact LionClaw instance home"
+    )]
+    home: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "Target a LionClaw project root"
+    )]
+    project: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        value_name = "NAME",
+        help = "Target a project instance"
+    )]
+    instance: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -49,6 +75,14 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Onboard(OnboardArgs),
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
+    Instance {
+        #[command(subcommand)]
+        command: InstanceCommand,
+    },
     Run(RunArgs),
     #[command(hide = true)]
     ProjectValidate(ProjectValidateArgs),
@@ -89,6 +123,45 @@ struct RunArgs {
     )]
     timeout: Option<Duration>,
     runtime: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectCommand {
+    Init,
+}
+
+#[derive(Debug, Subcommand)]
+enum InstanceCommand {
+    Create(InstanceCreateArgs),
+    List,
+    Adopt(InstanceAdoptArgs),
+}
+
+#[derive(Debug, Args)]
+struct InstanceCreateArgs {
+    name: String,
+    #[arg(
+        long = "work-root",
+        value_name = "PATH",
+        help = "Default host directory this instance operates on, resolved from the project root"
+    )]
+    work_root: Option<PathBuf>,
+    #[arg(long = "create-work-root", help = "Create the work root during setup")]
+    create_work_root: bool,
+}
+
+#[derive(Debug, Args)]
+struct InstanceAdoptArgs {
+    name: String,
+    home: PathBuf,
+    #[arg(
+        long = "work-root",
+        value_name = "PATH",
+        help = "Default host directory this instance operates on, resolved from the project root"
+    )]
+    work_root: Option<PathBuf>,
+    #[arg(long = "create-work-root", help = "Create the work root during setup")]
+    create_work_root: bool,
 }
 
 #[derive(Debug, Args)]
@@ -194,6 +267,7 @@ struct RuntimeSetDefaultArgs {
 
 #[derive(Debug, Subcommand)]
 enum SkillCommand {
+    Install(SkillAddArgs),
     Add(SkillAddArgs),
     Rm(SkillRmArgs),
     #[command(hide = true)]
@@ -397,9 +471,20 @@ struct ContinuityPathArgs {
 
 pub async fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
-    let home = LionClawHome::from_env();
+    let target_selection = TargetSelection {
+        home: cli.home,
+        project: cli.project,
+        instance: cli.instance,
+    };
+    let command = cli.command;
+    let env_home = LionClawHome::from_env();
+    let resolved_target = resolve_command_target(&target_selection, &command)?;
+    let home = resolved_target
+        .as_ref()
+        .map(|target| target.instance_home.clone())
+        .unwrap_or(env_home);
 
-    match cli.command {
+    match command {
         Command::Onboard(args) => {
             let bind_selection = args.bind.as_deref().map(parse_onboard_bind).transpose()?;
             let config = onboard(&home, bind_selection).await?;
@@ -410,10 +495,92 @@ pub async fn run() -> Result<ExitCode> {
                 config.daemon.bind
             );
         }
+        Command::Project { command } => match command {
+            ProjectCommand::Init => {
+                let project_root = resolve_project_setup_root(&target_selection)?;
+                let result = init_project(&project_root)?;
+                println!(
+                    "initialized LionClaw project {}",
+                    result.project_root.display()
+                );
+                println!(
+                    "* {} home={} work-root={}",
+                    result.instance.name,
+                    result.instance.home.display(),
+                    result.instance.work_root.display()
+                );
+            }
+        },
+        Command::Instance { command } => match command {
+            InstanceCommand::Create(args) => {
+                let project_root = resolve_existing_project_root(&target_selection)?;
+                let instance = create_project_instance(
+                    &project_root,
+                    &args.name,
+                    args.work_root.as_deref(),
+                    args.create_work_root,
+                )?;
+                println!(
+                    "created instance {} home={} work-root={}",
+                    instance.name,
+                    instance.home.display(),
+                    instance.work_root.display()
+                );
+            }
+            InstanceCommand::List => {
+                let project_root = resolve_existing_project_root(&target_selection)?;
+                let entries = list_project_instances(&project_root)?;
+                if entries.is_empty() {
+                    println!("no instances found");
+                } else {
+                    for entry in entries {
+                        let marker = if entry.is_default { "*" } else { " " };
+                        let work_root = entry
+                            .work_root
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "-".to_string());
+                        let shared = if entry.shared_work_root_count > 1 {
+                            entry.shared_work_root_count.to_string()
+                        } else {
+                            "-".to_string()
+                        };
+                        println!(
+                            "{} {} home={} work-root={} shared={}",
+                            marker,
+                            entry.name,
+                            entry.home.display(),
+                            work_root,
+                            shared
+                        );
+                    }
+                }
+            }
+            InstanceCommand::Adopt(args) => {
+                let project_root = resolve_existing_project_root(&target_selection)?;
+                let instance = adopt_project_instance(
+                    &project_root,
+                    &args.name,
+                    &args.home,
+                    args.work_root.as_deref(),
+                    args.create_work_root,
+                )?;
+                println!(
+                    "adopted instance {} home={} work-root={}",
+                    instance.name,
+                    instance.home.display(),
+                    instance.work_root.display()
+                );
+            }
+        },
         Command::Run(args) => {
+            let target = resolved_target
+                .as_ref()
+                .ok_or_else(|| anyhow!("run requires a resolved LionClaw target"))?;
             let timeout_override = args.timeout.map(RuntimeTurnTimeouts::with_hard_timeout);
             run_local(
-                &home,
+                &target.instance_home,
+                target.require_work_root()?,
                 args.runtime,
                 args.continue_last_session,
                 timeout_override,
@@ -527,7 +694,7 @@ pub async fn run() -> Result<ExitCode> {
             }
         }
         Command::Skill { command } => match command {
-            SkillCommand::Add(args) => {
+            SkillCommand::Add(args) | SkillCommand::Install(args) => {
                 let alias = args
                     .alias
                     .unwrap_or_else(|| derive_skill_alias(&args.source));
@@ -949,6 +1116,29 @@ pub async fn run() -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+fn resolve_command_target(
+    selection: &TargetSelection,
+    command: &Command,
+) -> Result<Option<crate::operator::target::TargetContext>> {
+    let requirement = match command {
+        Command::Run(_) => Some(WorkRootRequirement::Required),
+        Command::Runtime { .. }
+        | Command::Skill { .. }
+        | Command::Channel { .. }
+        | Command::Service { .. }
+        | Command::Continuity { .. }
+        | Command::Job { .. } => Some(WorkRootRequirement::Optional),
+        Command::Onboard(_)
+        | Command::Project { .. }
+        | Command::Instance { .. }
+        | Command::ProjectValidate(_) => None,
+    };
+
+    requirement
+        .map(|requirement| resolve_target(selection, requirement))
+        .transpose()
 }
 
 fn print_runtime_state_change_note() {

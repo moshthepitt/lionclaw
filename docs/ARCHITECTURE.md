@@ -59,7 +59,7 @@ mediate every private step inside those harnesses.
 
 Instead, LionClaw constrains the runtime launch:
 
-- project root mounted at `/workspace`
+- selected work root mounted at `/workspace`
 - runtime-private state mounted at `/runtime`
 - draft/output area mounted at `/drafts`
 - applied non-channel skill snapshots mounted read-only at `/lionclaw/skills/<alias>`
@@ -168,14 +168,15 @@ narrow non-runtime surfaces, and tests.
 
 The everyday runtime layout is mount-first:
 
-- `/workspace`: project/task root with preset-controlled read-only or read-write access
+- `/workspace`: selected work root with preset-controlled read-only or read-write access
 - `/runtime`: runtime-private writable state root
 - `/drafts`: runtime-private draft/output area
 - `/lionclaw/skills/<alias>`: installed non-channel skill snapshot assets mounted read-only
 
-For local `lionclaw run`, the project root defaults to the current working
-directory and is mounted at `/workspace`. `LIONCLAW_HOME` remains LionClaw's
-state root and is not the project tree.
+For local `lionclaw run`, target resolution selects one project instance and
+uses that instance's recorded work root. The work root is mounted at
+`/workspace`. The instance home remains LionClaw's state root and is not the
+project tree or work root.
 
 The planner injects runtime-private environment defaults such as
 `HOME=/runtime/home`, `LIONCLAW_DRAFTS_DIR=/drafts`, and
@@ -184,7 +185,7 @@ assets, so engine-specific caches and config stay out of assistant continuity.
 
 Interactive program-backed turns launch a fresh confined process for each
 request, but the mounted `/runtime` state root is scoped to the LionClaw
-session, project root, and execution security shape. That lets the harness
+session, work root, and execution security shape. That lets the harness
 resume its own conversation state across turns without sharing private runtime
 state across different projects or secret/network shapes.
 
@@ -210,7 +211,8 @@ plane exists. On rootless hosts, `on` also requires the container engine to be
 able to stand up its private network namespace. LionClaw preflights that host
 capability before interactive or managed-service startup.
 
-Runtime secrets are loaded from `~/.lionclaw/config/runtime-secrets.env`.
+Runtime secrets are loaded from the selected instance home's
+`config/runtime-secrets.env`.
 Presets either mount that whole file or mount no runtime secrets at all with
 `mount-runtime-secrets = true|false`. The Podman backend mounts it read-only
 under `/run/secrets/` with a LionClaw-managed name that starts with
@@ -353,8 +355,8 @@ Kernel bootstrap converts stale `running` session turns into durable
 
 ## Assistant Continuity
 
-Continuity lives under the assistant home workspace inside
-`LIONCLAW_HOME/workspaces/<daemon.workspace>/`.
+Continuity lives under the assistant home workspace inside the selected
+instance home at `workspaces/<daemon.workspace>/`.
 
 The assistant home workspace contains:
 
@@ -427,8 +429,8 @@ home id, current project scope, and daemon-compat fingerprint.
    override, and constrained env passthrough. Configured kernel defaults are
    trusted directly; policy timeout bounds apply to explicit per-turn override
    requests.
-7. Ordinary confined runtime file work stays inside mounted
-   workspace/runtime/drafts paths.
+7. Ordinary confined runtime file work stays inside mounted work-root, runtime,
+   and drafts paths.
 8. Kernel brokers are reserved for explicit side effects and direct-runtime
    requests. `channel.send` records outbound transcript entries and appends
    typed stream events. `net.egress`, `secret.request`, and `scheduler.run`

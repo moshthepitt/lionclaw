@@ -8,7 +8,6 @@ use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
 use crate::{
-    config::resolve_project_workspace_root,
     contracts::{
         SessionActionKind, SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest,
         SessionOpenRequest, SessionTurnRequest, SessionTurnStatus, SessionTurnView, StreamEventDto,
@@ -18,7 +17,8 @@ use crate::{
     kernel::Kernel,
     operator::{
         reconcile::{
-            load_operator_state, onboard, open_runtime_kernel_with_timeouts, render_runtime_cache,
+            load_operator_state, onboard, open_runtime_kernel_for_work_root,
+            render_runtime_cache_for_work_root,
         },
         runtime::{resolve_runtime_id, validate_runtime_launch_prerequisites},
     },
@@ -27,6 +27,7 @@ use crate::{
 
 pub async fn run_local(
     home: &LionClawHome,
+    work_root: &Path,
     requested_runtime: Option<String>,
     continue_last_session: bool,
     timeout_override: Option<RuntimeTurnTimeouts>,
@@ -37,6 +38,7 @@ pub async fn run_local(
     let mut output = stdout;
     run_local_with_io_and_timeouts(
         home,
+        work_root,
         requested_runtime,
         continue_last_session,
         timeout_override,
@@ -54,8 +56,11 @@ pub(crate) async fn run_local_with_io<R: BufRead + Send, W: Write + Send>(
     input: &mut R,
     output: &mut W,
 ) -> Result<()> {
+    let work_root = crate::config::resolve_project_workspace_root()
+        .map_err(|err| anyhow!("failed to resolve project workspace root: {err}"))?;
     run_local_with_io_and_timeouts(
         home,
+        &work_root,
         requested_runtime,
         continue_last_session,
         None,
@@ -67,6 +72,7 @@ pub(crate) async fn run_local_with_io<R: BufRead + Send, W: Write + Send>(
 
 pub(crate) async fn run_local_with_io_and_timeouts<R: BufRead + Send, W: Write + Send>(
     home: &LionClawHome,
+    work_root: &Path,
     requested_runtime: Option<String>,
     continue_last_session: bool,
     timeout_override: Option<RuntimeTurnTimeouts>,
@@ -77,20 +83,19 @@ pub(crate) async fn run_local_with_io_and_timeouts<R: BufRead + Send, W: Write +
     let state = load_operator_state(home).await?;
     let runtime_id = resolve_runtime_id(&state.config, requested_runtime.as_deref())?;
     validate_runtime_launch_prerequisites(home, &state.config, &runtime_id).await?;
-    render_runtime_cache(home, &state.config, &runtime_id).await?;
+    render_runtime_cache_for_work_root(home, &state.config, &runtime_id, work_root).await?;
 
     let effective_timeouts = timeout_override.unwrap_or_else(RuntimeTurnTimeouts::interactive);
-    let kernel = open_runtime_kernel_with_timeouts(
+    let kernel = open_runtime_kernel_for_work_root(
         home,
         &state.config,
         Some(runtime_id.clone()),
+        work_root,
         Some(effective_timeouts),
     )
     .await?;
-    let project_workspace_root = resolve_project_workspace_root()
-        .map_err(|err| anyhow!("failed to resolve project workspace root: {err}"))?;
-    let peer_id = local_peer_id_for_project(&project_workspace_root);
-    let project_workspace_root = project_workspace_root.display().to_string();
+    let peer_id = local_peer_id_for_project(work_root);
+    let project_workspace_root = work_root.display().to_string();
     run_repl(
         &kernel,
         ReplContext {
@@ -127,7 +132,7 @@ async fn run_repl<R: BufRead + Send, W: Write + Send>(
 
     writeln!(
         output,
-        "LionClaw interactive mode\nruntime: {}\nproject: {}\ntimeout: idle {}, hard {}\nType /continue, /retry, /reset, or /exit.\n",
+        "LionClaw interactive mode\nruntime: {}\nwork root: {}\ntimeout: idle {}, hard {}\nType /continue, /retry, /reset, or /exit.\n",
         context.runtime_id,
         context.project_workspace_root,
         crate::runtime_timeouts::format_duration(context.timeouts.idle),
@@ -612,8 +617,10 @@ sleep 1
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
         let mut output = Vec::new();
+        let work_root = std::env::current_dir().expect("current dir");
         run_local_with_io_and_timeouts(
             &home,
+            &work_root,
             None,
             false,
             Some(RuntimeTurnTimeouts::with_hard_timeout(

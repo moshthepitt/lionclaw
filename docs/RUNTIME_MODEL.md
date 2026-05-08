@@ -42,7 +42,7 @@ to perform inside its own tool loop: shell commands, file edits, local search,
 MCP tools, web access, or future runtime-specific features.
 
 LionClaw does not rebuild those tools in Rust. It constrains the runtime with
-the execution plan: mounted workspace, runtime state, drafts directory, network
+the execution plan: mounted work root, runtime state, drafts directory, network
 mode, secrets, timeouts, resource limits, and runtime image.
 
 ### LionClaw-Owned Capabilities
@@ -82,16 +82,18 @@ the trusted Rust core.
 
 ## Installed Layout
 
-LionClaw uses `~/.lionclaw` as canonical state:
+LionClaw stores canonical state under the selected instance home. In the
+project layout that is `.lionclaw/instances/<name>/`:
 
-- `~/.lionclaw/db/lionclaw.db`
-- `~/.lionclaw/config/lionclaw.toml`
-- `~/.lionclaw/config/runtime-secrets.env`
-- `~/.lionclaw/workspaces/<workspace-id>/`
-- `~/.lionclaw/skills/<alias>/`
-- `~/.lionclaw/runtime/`
-- `~/.lionclaw/logs/`
-- `~/.lionclaw/services/`
+- `db/lionclaw.db`
+- `config/lionclaw.toml`
+- `config/instance.toml`
+- `config/runtime-secrets.env`
+- `workspaces/<workspace-id>/`
+- `skills/<alias>/`
+- `runtime/`
+- `logs/`
+- `services/`
 
 No normal runtime flow should depend on repository-relative paths.
 
@@ -102,17 +104,20 @@ LionClaw uses "home" in three distinct layers.
 ### 1. Instance Home
 
 `LIONCLAW_HOME` is the installation and state root for one LionClaw instance.
+In the project UX, instance homes live under
+`.lionclaw/instances/<name>/`.
 
 It owns the database, operator config, installed skill snapshots, runtime
 cache artifacts, logs, generated service files, and machine-owned
 `config/home-id`.
 
 This is infrastructure state. It is not the assistant's personality, memory,
-or project workspace.
+project root, or work root.
 
 ### 2. Assistant Home Workspace
 
-`~/.lionclaw/workspaces/main/` is the default assistant home workspace.
+`workspaces/main/` inside the selected instance home is the default assistant
+home workspace.
 
 It contains the runtime-independent identity and continuity files that shape
 prompt assembly:
@@ -124,8 +129,8 @@ prompt assembly:
 - `MEMORY.md`
 - `continuity/ACTIVE.md`
 
-This is the assistant's durable life context. It is distinct from the project
-root mounted into a confined runtime.
+This is the assistant's durable life context. It is distinct from the work root
+mounted into a confined runtime.
 
 ### 3. Home Channel
 
@@ -206,11 +211,11 @@ The execution plan is the security contract for a runtime launch.
 It includes:
 
 - runtime id and kind
-- project workspace root
+- selected work root
 - runtime-private state root
 - drafts root
 - execution preset
-- workspace access mode
+- work-root access mode
 - network mode
 - secret mount decision
 - OCI image and backend
@@ -221,7 +226,7 @@ It includes:
 
 The everyday confined layout is mount-first:
 
-- `/workspace`: the current project or task root
+- `/workspace`: the selected work root
 - `/runtime`: runtime-private writable state
 - `/drafts`: runtime-private draft/output area
 - `/lionclaw/skills/<alias>`: installed non-channel skill snapshot assets mounted read-only
@@ -265,8 +270,8 @@ full prior transcript on every turn.
 
 ## Runtime Auth And Secrets
 
-Runtime secrets live separately in
-`~/.lionclaw/config/runtime-secrets.env`.
+Runtime secrets live separately in the selected instance home's
+`config/runtime-secrets.env`.
 
 Presets either mount that whole file or mount no runtime secrets at all with
 `mount-runtime-secrets = true|false`. When mounted, the Podman backend mounts
@@ -297,12 +302,14 @@ without handing raw long-lived values to the runtime.
 
 Operator-facing paths:
 
-- `lionclaw onboard`
+- `lionclaw project init`
+- `lionclaw instance create <name>`
+- `lionclaw instance list`
 - `lionclaw runtime add ...`
 - `lionclaw run [runtime]`
 - `lionclaw run --continue-last-session [runtime]`
 - `lionclaw run --timeout 4h [runtime]`
-- `lionclaw skill add ...`
+- `lionclaw skill install ...`
 - `lionclaw channel add ...`
 - `lionclaw channel attach ...`
 - `lionclaw job add|ls|show|run|pause|resume|rm`
@@ -311,7 +318,8 @@ Operator-facing paths:
 - `lionclaw service status`
 - `lionclaw service logs`
 
-`lionclaw skill add` copies a skill into `~/.lionclaw/skills/<alias>`.
+`lionclaw skill install` copies a skill into the selected instance home's
+`skills/<alias>` directory.
 `lionclaw skill rm` deletes that installed alias from disk. `lionclaw channel
 add --skill <alias>` makes that alias host-only; every other installed alias
 is runtime-visible by default.
@@ -352,9 +360,9 @@ automatically.
 ## Implementation Checklist Anchor
 
 - [x] Add `lionclaw` onboarding and declarative state reconciliation.
-- [x] Move skill installs to canonical snapshot store under `~/.lionclaw/skills`.
+- [x] Move skill installs to canonical snapshot store under the selected instance home.
 - [x] Remove repo-path assumptions from worker resolution.
-- [x] Add workspace identity bootstrap templates in `~/.lionclaw/workspaces/main/`.
+- [x] Add assistant home workspace identity bootstrap templates.
 - [x] Add runtime selection at invocation with default/global routing.
 - [x] Add program-backed Codex runtime path.
 - [x] Add program-backed OpenCode runtime path.
