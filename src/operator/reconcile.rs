@@ -20,7 +20,7 @@ use crate::{
             validate_runtime_launch_prerequisites,
         },
         services::{
-            channel_unit_name, daemon_unit_name, ensure_service_identity,
+            channel_unit_name, daemon_env_path, daemon_unit_name, ensure_service_identity,
             existing_service_identity, render_channel_unit, render_daemon_unit,
             unit_belongs_to_identity, unit_status_is_active, ChannelServiceSpec, DaemonServiceSpec,
             ManagedServiceUnit, ServiceIdentity, ServiceManager,
@@ -519,7 +519,10 @@ fn managed_daemon_runtime_id(
     home: &LionClawHome,
     config: &OperatorConfig,
 ) -> Result<Option<String>> {
-    let env_path = home.services_env_dir().join("lionclawd.env");
+    let Some(identity) = existing_service_identity(home)? else {
+        return Ok(config.defaults.runtime.clone());
+    };
+    let env_path = daemon_env_path(home, &identity);
     let content = match fs::read_to_string(&env_path) {
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1102,8 +1105,8 @@ mod tests {
             reconcile::load_operator_state,
             runtime::resolve_runtime_execution_context,
             services::{
-                channel_unit_name, daemon_unit_name, ensure_service_identity, FakeServiceManager,
-                ServiceIdentity, ServiceManager,
+                channel_unit_name, daemon_env_path, daemon_unit_name, ensure_service_identity,
+                FakeServiceManager, ServiceIdentity, ServiceManager,
             },
         },
         workspace::GENERATED_AGENTS_FILE,
@@ -1330,6 +1333,39 @@ mod tests {
         assert_eq!(
             rendered,
             "# Header\n<!-- LIONCLAW:START -->\nbody\n<!-- LIONCLAW:END -->\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_daemon_runtime_id_reads_uuid_scoped_daemon_env() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        let mut config = OperatorConfig::default();
+        let runtime_stub = temp_dir.path().join("codex-stub.sh");
+        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
+        make_executable(&runtime_stub);
+        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
+            .into_iter()
+            .collect();
+        config
+            .set_default_runtime("codex")
+            .expect("set default runtime");
+        let identity = ensure_service_identity(&home).expect("service identity");
+        fs::write(
+            home.services_env_dir().join("lionclawd.env"),
+            "LIONCLAW_DEFAULT_RUNTIME_ID=codex\n",
+        )
+        .expect("old env");
+        fs::write(
+            daemon_env_path(&home, &identity),
+            "LIONCLAW_DEFAULT_RUNTIME_ID=opencode\n",
+        )
+        .expect("scoped env");
+
+        assert_eq!(
+            managed_daemon_runtime_id(&home, &config).expect("runtime id"),
+            Some("opencode".to_string())
         );
     }
 

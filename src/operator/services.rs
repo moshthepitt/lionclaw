@@ -57,6 +57,10 @@ pub fn daemon_unit_name(identity: &ServiceIdentity) -> String {
     format!("lionclaw-{}.service", identity.service_id)
 }
 
+pub fn daemon_env_path(home: &LionClawHome, identity: &ServiceIdentity) -> PathBuf {
+    service_env_path(home, &daemon_unit_name(identity))
+}
+
 pub fn channel_unit_name(identity: &ServiceIdentity, channel_id: &str) -> String {
     format!(
         "lionclaw-channel-{}-{channel_id}.service",
@@ -291,9 +295,7 @@ pub fn render_daemon_unit(
     spec: DaemonServiceSpec<'_>,
 ) -> ManagedServiceUnit {
     let name = daemon_unit_name(identity);
-    let env_path = home
-        .services_env_dir()
-        .join(format!("{}.env", name.trim_end_matches(".service")));
+    let env_path = daemon_env_path(home, identity);
     let unit_path = home.services_systemd_dir().join(&name);
 
     let (host, port) = parse_bind_addr(spec.bind_addr);
@@ -355,9 +357,7 @@ pub fn render_channel_unit(
 ) -> ManagedServiceUnit {
     let daemon_name = daemon_unit_name(identity);
     let name = channel_unit_name(identity, &spec.channel_id);
-    let env_path = home
-        .services_env_dir()
-        .join(format!("{}.env", name.trim_end_matches(".service")));
+    let env_path = service_env_path(home, &name);
     let unit_path = home.services_systemd_dir().join(&name);
     let env_content = spec
         .env
@@ -387,6 +387,11 @@ pub fn render_channel_unit(
         env_content,
         extra_env_files: spec.channel_env_path.iter().cloned().collect(),
     }
+}
+
+fn service_env_path(home: &LionClawHome, unit_name: &str) -> PathBuf {
+    home.services_env_dir()
+        .join(format!("{}.env", unit_name.trim_end_matches(".service")))
 }
 
 #[async_trait]
