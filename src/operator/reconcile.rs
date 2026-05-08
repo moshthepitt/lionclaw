@@ -344,10 +344,12 @@ pub async fn status_for_work_root<M: ServiceManager>(
     let state = load_operator_state(home).await?;
     let kernel = open_kernel(home, &state.config, None).await?;
     let mut daemon_status = manager.unit_status(DAEMON_UNIT_NAME).await?;
-    if unit_status_is_active(&daemon_status)
-        && daemon_restart_required(home, &state.config, &state.applied_state, work_root).await?
-    {
-        daemon_status.push_str(" (restart required)");
+    if unit_status_is_active(&daemon_status) {
+        if let Some(problem) =
+            daemon_status_problem(home, &state.config, &state.applied_state, work_root).await?
+        {
+            daemon_status.push_str(problem.status_suffix());
+        }
     }
 
     let mut channels = Vec::new();
@@ -407,35 +409,60 @@ pub async fn status_for_work_root<M: ServiceManager>(
     })
 }
 
-async fn daemon_restart_required(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonStatusProblem {
+    RestartRequired,
+    DifferentWorkRoot,
+}
+
+impl DaemonStatusProblem {
+    fn status_suffix(self) -> &'static str {
+        match self {
+            Self::RestartRequired => " (restart required)",
+            Self::DifferentWorkRoot => " (different work root)",
+        }
+    }
+}
+
+async fn daemon_status_problem(
     home: &LionClawHome,
     config: &OperatorConfig,
     applied_state: &AppliedState,
     work_root: &Path,
-) -> Result<bool> {
+) -> Result<Option<DaemonStatusProblem>> {
     let Some(runtime_id) = managed_daemon_runtime_id(home, config)? else {
-        return Ok(false);
+        return Ok(None);
     };
     let runtime_context =
         match resolve_runtime_execution_context(home, config, Some(&runtime_id)).await {
             Ok(context) => context,
-            Err(_) => return Ok(false),
+            Err(_) => return Ok(None),
         };
     let home_id = home.ensure_home_id().await?;
     let project_scope = runtime_project_partition_key(Some(work_root));
     let expected_daemon_fingerprint =
         compute_daemon_fingerprint(&runtime_context.daemon_config_fingerprint, applied_state);
 
-    Ok(matches!(
-        classify_daemon(
-            &config.daemon.bind,
-            &home_id,
-            &project_scope,
-            &expected_daemon_fingerprint,
-        )
-        .await?,
-        DaemonClassification::SameHomeDifferentConfig
-    ))
+    match classify_daemon(
+        &config.daemon.bind,
+        &home_id,
+        &project_scope,
+        &expected_daemon_fingerprint,
+    )
+    .await?
+    {
+        DaemonClassification::SameHomeDifferentConfig => {
+            Ok(Some(DaemonStatusProblem::RestartRequired))
+        }
+        DaemonClassification::SameHomeDifferentProject => {
+            Ok(Some(DaemonStatusProblem::DifferentWorkRoot))
+        }
+        DaemonClassification::Absent
+        | DaemonClassification::SameHome
+        | DaemonClassification::ForeignHome(_)
+        | DaemonClassification::IncompatibleLionClaw
+        | DaemonClassification::UnknownListener => Ok(None),
+    }
 }
 
 fn managed_daemon_runtime_id(
@@ -985,8 +1012,8 @@ mod tests {
     };
 
     use super::{
-        add_channel, add_skill, daemon_restart_required, managed_daemon_runtime_id, onboard,
-        open_kernel, open_kernel_with_project_root, render_marker_file, render_runtime_cache,
+        add_channel, add_skill, managed_daemon_runtime_id, onboard, open_kernel,
+        open_kernel_with_project_root, render_marker_file, render_runtime_cache,
         resolve_installed_skill_worker_entrypoint, resolve_required_channel_env,
         resolve_worker_entrypoint, status_for_work_root, up_for_work_root, OnboardBindSelection,
         StackBinaryPaths,
@@ -2122,13 +2149,6 @@ mod tests {
             .expect("classify daemon"),
             DaemonClassification::SameHomeDifferentConfig
         ));
-        assert!(
-            daemon_restart_required(&home, &config, &state.applied_state, &current_work_root())
-                .await
-                .expect("daemon restart required"),
-            "status should see the daemon as stale"
-        );
-
         let stack = status_for_work_root(&home, &manager, &current_work_root())
             .await
             .expect("status");
@@ -2136,6 +2156,94 @@ mod tests {
         assert_eq!(
             stack.daemon_status,
             "loaded/active/running (restart required)"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_marks_daemon_running_for_different_work_root() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
+        let runtime_stub = temp_dir.path().join("codex-stub.sh");
+        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
+        make_executable(&runtime_stub);
+        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
+            .into_iter()
+            .collect();
+        config
+            .set_default_runtime("codex")
+            .expect("set default runtime");
+        config.save(&home).await.expect("save config");
+
+        let manager = FakeServiceManager::default();
+        manager
+            .set_unit_status(DAEMON_UNIT_NAME, "loaded/active/running")
+            .expect("set unit status");
+
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let bind_addr = config.daemon.bind.clone();
+        let home_root = home.root().display().to_string();
+        let daemon_fingerprint = current_daemon_fingerprint(&home).await;
+        let other_work_root = temp_dir.path().join("other-work-root");
+        let other_project_scope = runtime_project_partition_key(Some(other_work_root.as_path()));
+        let _server = spawn_probe_server(
+            Router::new().route(
+                "/v0/daemon/info",
+                get({
+                    let bind_addr = bind_addr.clone();
+                    let home_id = home_id.clone();
+                    let home_root = home_root.clone();
+                    let project_scope = other_project_scope.clone();
+                    move || async move {
+                        Json(DaemonInfoResponse {
+                            service: "lionclawd".to_string(),
+                            status: "ok".to_string(),
+                            home_id: home_id.clone(),
+                            home_root: home_root.clone(),
+                            bind_addr: bind_addr.clone(),
+                            project_scope: project_scope.clone(),
+                            daemon_fingerprint: daemon_fingerprint.clone(),
+                        })
+                    }
+                }),
+            ),
+            &bind_addr,
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let state = load_operator_state(&home)
+            .await
+            .expect("load operator state");
+        let runtime_context =
+            resolve_runtime_execution_context(&home, &config, config.defaults.runtime.as_deref())
+                .await
+                .expect("resolve runtime context");
+        let expected_daemon_fingerprint = compute_daemon_fingerprint(
+            &runtime_context.daemon_config_fingerprint,
+            &state.applied_state,
+        );
+        assert!(matches!(
+            classify_daemon(
+                &bind_addr,
+                &home_id,
+                &current_project_scope(),
+                &expected_daemon_fingerprint,
+            )
+            .await
+            .expect("classify daemon"),
+            DaemonClassification::SameHomeDifferentProject
+        ));
+
+        let stack = status_for_work_root(&home, &manager, &current_work_root())
+            .await
+            .expect("status");
+
+        assert_eq!(
+            stack.daemon_status,
+            "loaded/active/running (different work root)"
         );
     }
 
