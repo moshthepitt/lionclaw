@@ -422,12 +422,12 @@ ensure_runtime_image() {
 }
 
 run_lionclaw() {
-  (cd "$WORKSPACE_ROOT" && env LIONCLAW_HOME="$LIONCLAW_HOME" "$LIONCLAW_BIN" "$@")
+  (cd "$WORKSPACE_ROOT" && env LIONCLAW_HOME="$LIONCLAW_HOME" "$LIONCLAW_BIN" --home "$LIONCLAW_HOME" "$@")
 }
 
 run_lionclaw_action() {
   if is_dry_run; then
-    printf '[dry-run] (%s) LIONCLAW_HOME=%q %q' "$WORKSPACE_ROOT" "$LIONCLAW_HOME" "$LIONCLAW_BIN"
+    printf '[dry-run] (%s) LIONCLAW_HOME=%q %q --home %q' "$WORKSPACE_ROOT" "$LIONCLAW_HOME" "$LIONCLAW_BIN" "$LIONCLAW_HOME"
     for arg in "$@"; do
       printf ' %q' "$arg"
     done
@@ -742,7 +742,7 @@ case "$cmd" in
       exit 0
     fi
     cd "$WORKSPACE_ROOT"
-    exec env LIONCLAW_HOME="$LIONCLAW_HOME" "$LIONCLAW_BIN" run "$@" "$RUNTIME_ID"
+    exec env LIONCLAW_HOME="$LIONCLAW_HOME" "$LIONCLAW_BIN" --home "$LIONCLAW_HOME" run "$@" "$RUNTIME_ID"
     ;;
   attach)
     print_context
@@ -753,7 +753,7 @@ case "$cmd" in
       exit 0
     fi
     cd "$WORKSPACE_ROOT"
-    exec env LIONCLAW_HOME="$LIONCLAW_HOME" "$LIONCLAW_BIN" channel attach "$CHANNEL_ID" "$@" --runtime "$RUNTIME_ID"
+    exec env LIONCLAW_HOME="$LIONCLAW_HOME" "$LIONCLAW_BIN" --home "$LIONCLAW_HOME" channel attach "$CHANNEL_ID" "$@" --runtime "$RUNTIME_ID"
     ;;
   up)
     ensure_systemd_user
