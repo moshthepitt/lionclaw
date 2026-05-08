@@ -112,11 +112,25 @@ pub fn init_project(project_root: &Path) -> Result<ProjectInitResult> {
     let project_root = canonical_existing_dir(project_root, "project root")?;
     let project_dir = project_dir(&project_root);
     let project_file = project_file(&project_root);
-    if project_file.exists() {
-        bail!(
-            "LionClaw project already exists at {}; use 'lionclaw instance create <name>' to add an instance",
-            project_file.display()
-        );
+    match fs::symlink_metadata(&project_file) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "project config {} must not be a symlink",
+                    project_file.display()
+                );
+            }
+            bail!(
+                "LionClaw project already exists at {}; use 'lionclaw instance create <name>' to add an instance",
+                project_file.display()
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to stat project config {}", project_file.display())
+            });
+        }
     }
     if project_dir.exists() {
         ensure_directory_not_symlink(&project_dir, "project metadata directory")?;
@@ -1039,6 +1053,28 @@ mod tests {
             .to_string()
             .contains("inside LionClaw metadata"));
         assert!(file_err.to_string().contains("not a directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_init_rejects_dangling_project_config_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let metadata_dir = temp_dir.path().join(".lionclaw");
+        fs::create_dir(&metadata_dir).expect("metadata dir");
+        let outside_target = temp_dir.path().join("outside-project.toml");
+        symlink(&outside_target, metadata_dir.join("project.toml")).expect("project symlink");
+
+        let err =
+            init_project(temp_dir.path()).expect_err("dangling project config symlink should fail");
+
+        assert!(err.to_string().contains("project config"));
+        assert!(err.to_string().contains("must not be a symlink"));
+        assert!(
+            !outside_target.exists(),
+            "project init must not follow dangling project.toml symlinks"
+        );
     }
 
     #[cfg(unix)]
