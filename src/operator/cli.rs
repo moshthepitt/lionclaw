@@ -1526,11 +1526,21 @@ async fn stop_owned_channel_unit<M: ServiceManager>(
     manager: &M,
     channel_id: &str,
 ) -> Result<()> {
+    stop_owned_channel_unit_in_dir(home, manager, channel_id, &systemd_user_unit_dir_for_cli()?)
+        .await
+}
+
+async fn stop_owned_channel_unit_in_dir<M: ServiceManager>(
+    home: &LionClawHome,
+    manager: &M,
+    channel_id: &str,
+    systemd_dir: &Path,
+) -> Result<()> {
     let Some(identity) = existing_service_identity(home)? else {
         return Ok(());
     };
     let unit = channel_unit_name(&identity, channel_id);
-    let unit_path = systemd_user_unit_dir_for_cli()?.join(&unit);
+    let unit_path = systemd_dir.join(&unit);
     if !unit_belongs_to_identity(&unit_path, &identity)? {
         return Ok(());
     }
@@ -2253,6 +2263,7 @@ mod tests {
     async fn channel_remove_deletes_configured_channel() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
         let mut config = OperatorConfig::default();
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
             id: "telegram".to_string(),
@@ -2262,12 +2273,69 @@ mod tests {
             required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
         });
         config.save(&home).await.expect("save config");
+        let identity =
+            crate::operator::services::ensure_service_identity(&home).expect("service identity");
+        let unit = channel_unit_name(&identity, "telegram");
+        let foreign_unit = channel_unit_name(&identity, "foreign");
+        let systemd_dir = temp_dir.path().join("systemd-user");
+        std::fs::create_dir_all(&systemd_dir).expect("systemd dir");
+        std::fs::write(
+            systemd_dir.join(&unit),
+            format!(
+                "[Unit]\nX-LionClaw-ServiceId={}\nX-LionClaw-HomeRoot={}\nX-LionClaw-Channel=telegram\n",
+                identity.service_id,
+                identity.home_root.display()
+            ),
+        )
+        .expect("owned unit");
+        std::fs::write(
+            systemd_dir.join(&foreign_unit),
+            format!(
+                "[Unit]\nX-LionClaw-ServiceId=00000000-0000-0000-0000-000000000000\nX-LionClaw-HomeRoot={}\nX-LionClaw-Channel=foreign\n",
+                identity.home_root.display()
+            ),
+        )
+        .expect("foreign unit");
+        let mut env = crate::operator::channel_env::ChannelEnv::new();
+        env.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
+        crate::operator::channel_env::save_channel_env(&home, "telegram", &env).expect("save env");
+        let manager = crate::operator::services::FakeServiceManager::default();
+        manager
+            .set_unit_status(&unit, "loaded/active/running")
+            .expect("owned status");
+        manager
+            .set_unit_status(&foreign_unit, "loaded/active/running")
+            .expect("foreign status");
 
+        stop_owned_channel_unit_in_dir(&home, &manager, "telegram", &systemd_dir)
+            .await
+            .expect("stop owned unit");
+        stop_owned_channel_unit_in_dir(&home, &manager, "foreign", &systemd_dir)
+            .await
+            .expect("skip foreign unit");
         assert!(remove_channel(&home, "telegram")
             .await
             .expect("remove channel"));
         let config = OperatorConfig::load(&home).await.expect("load config");
         assert!(config.channels.is_empty());
+        assert_eq!(
+            manager.unit_status(&unit).await.expect("owned status"),
+            "loaded/inactive/dead"
+        );
+        assert_eq!(
+            manager
+                .unit_status(&foreign_unit)
+                .await
+                .expect("foreign status"),
+            "loaded/active/running"
+        );
+        assert_eq!(
+            crate::operator::channel_env::load_channel_env(&home, "telegram")
+                .expect("load env")
+                .get("TELEGRAM_BOT_TOKEN")
+                .map(String::as_str),
+            Some("secret-token")
+        );
     }
 
     #[tokio::test]

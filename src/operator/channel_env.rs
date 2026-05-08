@@ -75,6 +75,33 @@ pub fn validate_required_channel_env(
     Ok(())
 }
 
+pub fn validate_channel_env_contract(
+    home: &LionClawHome,
+    channel_id: &str,
+    required_env: &[String],
+) -> Result<()> {
+    let stored = load_channel_env(home, channel_id)?;
+    validate_stored_channel_env_keys(home, channel_id, required_env, &stored)?;
+
+    for key in required_env {
+        if !stored.contains_key(key) {
+            return Err(anyhow!(
+                "required environment value '{key}' is not configured for channel '{channel_id}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_no_undeclared_channel_env(
+    home: &LionClawHome,
+    channel_id: &str,
+    required_env: &[String],
+) -> Result<()> {
+    let stored = load_channel_env(home, channel_id)?;
+    validate_stored_channel_env_keys(home, channel_id, required_env, &stored)
+}
+
 pub fn load_required_channel_env(
     home: &LionClawHome,
     channel_id: &str,
@@ -103,6 +130,34 @@ pub fn missing_required_env(stored: &ChannelEnv, required_env: &[String]) -> Res
         }
     }
     Ok(missing)
+}
+
+fn validate_stored_channel_env_keys(
+    home: &LionClawHome,
+    channel_id: &str,
+    required_env: &[String],
+    stored: &ChannelEnv,
+) -> Result<()> {
+    let mut declared = BTreeSet::new();
+    for key in required_env {
+        validate_channel_env_name(key)?;
+        declared.insert(key.as_str());
+    }
+
+    let mut undeclared = Vec::new();
+    for key in stored.keys() {
+        if !declared.contains(key.as_str()) {
+            undeclared.push(key.as_str());
+        }
+    }
+    if !undeclared.is_empty() {
+        return Err(anyhow!(
+            "stored channel env {} contains values not declared by channel '{channel_id}' metadata: {}",
+            home.channel_env_path(channel_id).display(),
+            undeclared.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 pub fn parse_env_file(path: &Path) -> Result<ChannelEnv> {

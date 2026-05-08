@@ -14,6 +14,7 @@ use crate::{
         channel_metadata::resolve_channel_worker_entrypoint,
         config::{normalize_local_source, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
         daemon_probe::{classify_daemon, DaemonClassification},
+        redaction::SecretRedactor,
         runtime::{
             register_configured_runtimes, resolve_runtime_execution_context,
             validate_runtime_launch_prerequisites,
@@ -574,8 +575,12 @@ pub async fn logs<M: ServiceManager>(
     manager: &M,
     lines: usize,
 ) -> Result<String> {
+    let redactor = SecretRedactor::from_home(home)?;
     let units = managed_unit_names(home)?;
-    manager.logs(&units, lines).await
+    match manager.logs(&units, lines).await {
+        Ok(output) => Ok(redactor.redact(&output)),
+        Err(err) => Err(anyhow!(redactor.redact(&format!("{err:#}")))),
+    }
 }
 
 pub async fn pairing_list(
@@ -724,7 +729,7 @@ pub(crate) fn validate_required_channel_env(
     channel_id: &str,
     required_env: &[String],
 ) -> Result<()> {
-    crate::operator::channel_env::validate_required_channel_env(home, channel_id, required_env)
+    crate::operator::channel_env::validate_channel_env_contract(home, channel_id, required_env)
 }
 
 #[cfg(test)]
@@ -1076,7 +1081,7 @@ mod tests {
     };
 
     use super::{
-        add_channel, add_skill, managed_daemon_runtime_id, onboard, open_kernel,
+        add_channel, add_skill, logs, managed_daemon_runtime_id, onboard, open_kernel,
         open_kernel_with_project_root, render_marker_file, render_runtime_cache,
         resolve_installed_skill_worker_entrypoint, resolve_required_channel_env,
         resolve_worker_entrypoint, status_for_work_root, up_for_work_root, OnboardBindSelection,
@@ -1090,7 +1095,9 @@ mod tests {
         kernel::runtime::{ConfinementConfig, OciConfinementConfig},
         operator::{
             channel_env::{merge_channel_env, ChannelEnv},
-            config::{ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig},
+            config::{
+                ChannelLaunchMode, ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig,
+            },
             daemon_probe::{classify_daemon, DaemonClassification},
             reconcile::load_operator_state,
             runtime::resolve_runtime_execution_context,
@@ -1857,6 +1864,132 @@ mod tests {
             "EnvironmentFile={}",
             home.channel_env_path("telegram").display()
         )));
+    }
+
+    #[tokio::test]
+    async fn service_channel_env_rejects_undeclared_stored_values() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
+            .await
+            .expect("onboard");
+        write_test_codex_auth(&home).await;
+        let runtime_stub = temp_dir.path().join("codex-stub.sh");
+        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
+        make_executable(&runtime_stub);
+        let skill_source = write_skill_source(temp_dir.path(), "channel-telegram", "test", true);
+
+        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
+            .into_iter()
+            .collect();
+        config
+            .set_default_runtime("codex")
+            .expect("set default runtime");
+        config.save(&home).await.expect("save config");
+        add_skill(
+            &home,
+            "telegram".to_string(),
+            skill_source.to_string_lossy().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install skill");
+        add_channel(
+            &home,
+            "telegram".to_string(),
+            "telegram".to_string(),
+            ChannelLaunchMode::Service,
+            vec!["TELEGRAM_BOT_TOKEN".to_string()],
+        )
+        .await
+        .expect("add channel");
+        let mut env = ChannelEnv::new();
+        env.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
+        env.insert("EXTRA_SECRET".to_string(), "do-not-expose".to_string());
+        merge_channel_env(&home, "telegram", &env).expect("store channel env");
+
+        let manager = FakeServiceManager::default();
+        let binaries = StackBinaryPaths {
+            daemon_bin: "/tmp/lionclawd".into(),
+        };
+        let err = up_for_work_root(&home, &manager, "codex", &binaries, &current_work_root())
+            .await
+            .expect_err("undeclared env should fail");
+
+        assert!(err.to_string().contains("EXTRA_SECRET"));
+        assert!(!err.to_string().contains("do-not-expose"));
+    }
+
+    #[tokio::test]
+    async fn service_logs_redact_private_channel_env_values() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        test_service_identity(&home);
+        let mut env = ChannelEnv::new();
+        env.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
+        merge_channel_env(&home, "telegram", &env).expect("store channel env");
+        let manager = FakeServiceManager::default();
+        manager
+            .set_logs("boot secret-token done")
+            .expect("set logs");
+
+        let output = logs(&home, &manager, 100).await.expect("logs");
+
+        assert_eq!(output, "boot [REDACTED] done");
+    }
+
+    #[tokio::test]
+    async fn service_logs_redact_manager_errors() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        test_service_identity(&home);
+        let mut env = ChannelEnv::new();
+        env.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
+        merge_channel_env(&home, "telegram", &env).expect("store channel env");
+        let manager = FakeServiceManager::default();
+        manager
+            .fail_logs("worker stderr included secret-token")
+            .expect("fail logs");
+
+        let err = logs(&home, &manager, 100)
+            .await
+            .expect_err("logs should fail");
+
+        assert!(err.to_string().contains("[REDACTED]"));
+        assert!(!err.to_string().contains("secret-token"));
+    }
+
+    #[tokio::test]
+    async fn service_logs_redact_secrets_preserved_after_channel_remove() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        test_service_identity(&home);
+        let mut config = OperatorConfig::default();
+        config.upsert_channel(ManagedChannelConfig {
+            id: "telegram".to_string(),
+            skill: "telegram".to_string(),
+            launch_mode: ChannelLaunchMode::Service,
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+        });
+        config.save(&home).await.expect("save config");
+        let mut env = ChannelEnv::new();
+        env.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
+        merge_channel_env(&home, "telegram", &env).expect("store channel env");
+        assert!(super::remove_channel(&home, "telegram")
+            .await
+            .expect("remove channel"));
+        let manager = FakeServiceManager::default();
+        manager
+            .set_logs("old worker printed secret-token")
+            .expect("set logs");
+
+        let output = logs(&home, &manager, 100).await.expect("logs");
+
+        assert_eq!(output, "old worker printed [REDACTED]");
     }
 
     #[tokio::test]

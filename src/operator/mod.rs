@@ -7,6 +7,7 @@ pub mod connect;
 pub mod daemon_probe;
 pub(crate) mod private_paths;
 pub mod reconcile;
+pub(crate) mod redaction;
 pub mod run;
 pub mod runtime;
 pub mod runtime_integration;

@@ -79,6 +79,35 @@ pub(crate) fn read_private_file_to_string(
         .map(Some)
 }
 
+pub(crate) fn read_private_dir_file_paths(
+    home: &LionClawHome,
+    path: &Path,
+    label: &str,
+) -> Result<Vec<std::path::PathBuf>> {
+    if !private_dir_exists(home, path, label)? {
+        return Ok(Vec::new());
+    }
+
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
+        let entry = entry.with_context(|| format!("failed to iterate {}", path.display()))?;
+        let entry_path = entry.path();
+        let metadata = fs::symlink_metadata(&entry_path)
+            .with_context(|| format!("failed to stat {}", entry_path.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "{label} entry {} must not be a symlink",
+                entry_path.display()
+            );
+        }
+        if metadata.is_file() {
+            paths.push(entry_path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 pub(crate) fn ensure_private_file_readable(
     home: &LionClawHome,
     path: &Path,
@@ -224,6 +253,48 @@ fn harden_private_file(path: &Path, label: &str) -> Result<()> {
     })?;
     ensure_private_dir(parent, &format!("{label} directory"))?;
     set_private_file_permissions(path)
+}
+
+fn private_dir_exists(home: &LionClawHome, path: &Path, label: &str) -> Result<bool> {
+    let root = home.root();
+    ensure_path_under_home(&root, path, label)?;
+    let relative = path.strip_prefix(&root).with_context(|| {
+        format!(
+            "{label} {} is not under LionClaw home {}",
+            path.display(),
+            root.display()
+        )
+    })?;
+
+    let mut current = root;
+    let metadata = match fs::symlink_metadata(&current) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", current.display()));
+        }
+    };
+    ensure_private_dir_metadata(&current, "LionClaw home", metadata)?;
+
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            bail!(
+                "{label} {} contains an unsupported path component",
+                path.display()
+            );
+        };
+        current.push(name);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to stat {}", current.display()));
+            }
+        };
+        ensure_private_dir_metadata(&current, label, metadata)?;
+    }
+
+    Ok(true)
 }
 
 fn ensure_file_target_not_symlink(path: &Path, label: &str) -> Result<()> {

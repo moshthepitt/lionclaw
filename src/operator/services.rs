@@ -536,6 +536,8 @@ pub struct FakeServiceManager {
     states: Mutex<HashMap<String, String>>,
     units: Mutex<HashMap<String, ManagedServiceUnit>>,
     restarted: Mutex<Vec<String>>,
+    log_output: Mutex<Option<String>>,
+    log_error: Mutex<Option<String>>,
 }
 
 impl FakeServiceManager {
@@ -567,6 +569,22 @@ impl FakeServiceManager {
             .map_err(|_| anyhow!("units lock poisoned"))?
             .get(unit)
             .cloned())
+    }
+
+    pub fn set_logs(&self, output: impl Into<String>) -> Result<()> {
+        *self
+            .log_output
+            .lock()
+            .map_err(|_| anyhow!("log output lock poisoned"))? = Some(output.into());
+        Ok(())
+    }
+
+    pub fn fail_logs(&self, error: impl Into<String>) -> Result<()> {
+        *self
+            .log_error
+            .lock()
+            .map_err(|_| anyhow!("log error lock poisoned"))? = Some(error.into());
+        Ok(())
     }
 }
 
@@ -663,6 +681,22 @@ impl ServiceManager for FakeServiceManager {
     }
 
     async fn logs(&self, units: &[String], _lines: usize) -> Result<String> {
+        let log_error = self
+            .log_error
+            .lock()
+            .map_err(|_| anyhow!("log error lock poisoned"))?
+            .clone();
+        if let Some(error) = log_error {
+            return Err(anyhow!(error));
+        }
+        let log_output = self
+            .log_output
+            .lock()
+            .map_err(|_| anyhow!("log output lock poisoned"))?
+            .clone();
+        if let Some(output) = log_output {
+            return Ok(output);
+        }
         Ok(units.join("\n"))
     }
 }

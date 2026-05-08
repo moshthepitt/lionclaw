@@ -1,10 +1,10 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{BufRead, Write},
     path::{Path, PathBuf},
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::{
     home::LionClawHome,
@@ -12,9 +12,13 @@ use crate::{
         attach::attach_channel_with_binaries,
         channel_env::{
             collect_from_process_env, load_channel_env, merge_channel_env, missing_required_env,
-            parse_env_file, render_missing_env_repair, ChannelEnv,
+            parse_env_file, render_missing_env_repair, validate_no_undeclared_channel_env,
+            ChannelEnv,
         },
-        channel_metadata::{discover_channel_skill, ChannelSkillSource, DiscoveredChannelSkill},
+        channel_metadata::{
+            discover_channel_skill, validate_channel_env_name, ChannelSkillSource,
+            DiscoveredChannelSkill,
+        },
         config::{ChannelLaunchMode, OperatorConfig},
         reconcile::{
             add_channel_with_worker, add_skill, resolve_stack_binaries, up_for_work_root,
@@ -199,14 +203,19 @@ fn ensure_required_env<R: BufRead, W: Write>(
     } = request;
     let mut updates = ChannelEnv::new();
     if let Some(path) = env_inputs.env_file.as_deref() {
-        updates.extend(parse_env_file(path)?);
+        let file_updates = parse_env_file(path)?;
+        validate_declared_env_updates(channel_id, required_env, &file_updates, "env file")?;
+        updates.extend(file_updates);
     }
+    validate_declared_env_input_names(channel_id, required_env, &env_inputs.from_env)?;
     updates.extend(collect_from_process_env(&env_inputs.from_env)?);
+    validate_no_undeclared_channel_env(home, channel_id, required_env)?;
     if !updates.is_empty() {
         merge_channel_env(home, channel_id, &updates)?;
     }
 
     let stored = load_channel_env(home, channel_id)?;
+    validate_no_undeclared_channel_env(home, channel_id, required_env)?;
     let missing = missing_required_env(&stored, required_env)?;
     if missing.is_empty() {
         return Ok(());
@@ -218,6 +227,7 @@ fn ensure_required_env<R: BufRead, W: Write>(
     let prompted = prompt_required_env(channel_id, &missing, hide_prompt_input, input, output)?;
     merge_channel_env(home, channel_id, &prompted)?;
     let stored = load_channel_env(home, channel_id)?;
+    validate_no_undeclared_channel_env(home, channel_id, required_env)?;
     let missing = missing_required_env(&stored, required_env)?;
     if missing.is_empty() {
         Ok(())
@@ -249,6 +259,59 @@ fn prompt_required_env<R: BufRead, W: Write>(
         values.insert(key.clone(), value);
     }
     Ok(values)
+}
+
+fn validate_declared_env_updates(
+    channel_id: &str,
+    required_env: &[String],
+    updates: &ChannelEnv,
+    source: &str,
+) -> Result<()> {
+    let declared = declared_env_set(required_env)?;
+    let mut undeclared = Vec::new();
+    for key in updates.keys() {
+        if !declared.contains(key.as_str()) {
+            undeclared.push(key.as_str());
+        }
+    }
+    if undeclared.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{source} contains environment values not declared by channel '{channel_id}' metadata: {}",
+        undeclared.join(", ")
+    )
+}
+
+fn validate_declared_env_input_names(
+    channel_id: &str,
+    required_env: &[String],
+    input_names: &[String],
+) -> Result<()> {
+    let declared = declared_env_set(required_env)?;
+    let mut undeclared = Vec::new();
+    for key in input_names {
+        validate_channel_env_name(key)?;
+        if !declared.contains(key.as_str()) {
+            undeclared.push(key.as_str());
+        }
+    }
+    if undeclared.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "--from-env references environment values not declared by channel '{channel_id}' metadata: {}",
+        undeclared.join(", ")
+    )
+}
+
+fn declared_env_set(required_env: &[String]) -> Result<BTreeSet<&str>> {
+    let mut declared = BTreeSet::new();
+    for key in required_env {
+        validate_channel_env_name(key)?;
+        declared.insert(key.as_str());
+    }
+    Ok(declared)
 }
 
 fn read_prompt_line<R: BufRead>(input: &mut R, hide_input: bool) -> Result<String> {
@@ -316,7 +379,7 @@ mod tests {
         home::LionClawHome,
         kernel::runtime::{ConfinementConfig, OciConfinementConfig},
         operator::{
-            channel_env::load_channel_env,
+            channel_env::{load_channel_env, save_channel_env, ChannelEnv},
             config::{ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig},
             reconcile::{onboard, OnboardBindSelection, StackBinaryPaths},
             services::FakeServiceManager,
@@ -405,6 +468,99 @@ mod tests {
         assert!(err.to_string().contains("--env-file"));
         assert!(err.to_string().contains("--from-env TELEGRAM_BOT_TOKEN"));
         assert!(!err.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn env_file_rejects_undeclared_values_without_persisting() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let env_file = temp_dir.path().join("telegram.env");
+        fs::write(
+            &env_file,
+            "TELEGRAM_BOT_TOKEN=secret-token\nEXTRA_SECRET=do-not-store\n",
+        )
+        .expect("env file");
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let err = ensure_required_env(
+            RequiredEnvRequest {
+                home: &home,
+                channel_id: "telegram",
+                required_env: &["TELEGRAM_BOT_TOKEN".to_string()],
+                env_inputs: ConnectEnvInputs {
+                    env_file: Some(env_file),
+                    from_env: Vec::new(),
+                },
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &mut input,
+            &mut output,
+        )
+        .expect_err("undeclared env should fail");
+
+        assert!(err.to_string().contains("EXTRA_SECRET"));
+        assert!(load_channel_env(&home, "telegram")
+            .expect("load env")
+            .is_empty());
+    }
+
+    #[test]
+    fn from_env_rejects_undeclared_names_before_reading_process_env() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let err = ensure_required_env(
+            RequiredEnvRequest {
+                home: &home,
+                channel_id: "telegram",
+                required_env: &["TELEGRAM_BOT_TOKEN".to_string()],
+                env_inputs: ConnectEnvInputs {
+                    env_file: None,
+                    from_env: vec!["EXTRA_SECRET".to_string()],
+                },
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &mut input,
+            &mut output,
+        )
+        .expect_err("undeclared env should fail");
+
+        assert!(err.to_string().contains("EXTRA_SECRET"));
+        assert!(!err.to_string().contains("is not set"));
+    }
+
+    #[test]
+    fn stored_env_rejects_values_outside_channel_metadata_contract() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut env = ChannelEnv::new();
+        env.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
+        env.insert("EXTRA_SECRET".to_string(), "do-not-expose".to_string());
+        save_channel_env(&home, "telegram", &env).expect("save env");
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let err = ensure_required_env(
+            RequiredEnvRequest {
+                home: &home,
+                channel_id: "telegram",
+                required_env: &["TELEGRAM_BOT_TOKEN".to_string()],
+                env_inputs: ConnectEnvInputs::default(),
+                interactive: false,
+                hide_prompt_input: false,
+            },
+            &mut input,
+            &mut output,
+        )
+        .expect_err("stored extra env should fail");
+
+        assert!(err.to_string().contains("EXTRA_SECRET"));
+        assert!(!err.to_string().contains("do-not-expose"));
     }
 
     #[test]
