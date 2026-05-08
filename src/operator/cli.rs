@@ -25,6 +25,7 @@ use crate::{
     },
     operator::{
         attach::attach_channel,
+        command_display::{lionclaw_home_command_prefix, shell_quote_arg},
         config::{
             derive_skill_alias, normalize_podman_executable, normalize_runtime_command,
             ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig,
@@ -670,7 +671,7 @@ pub async fn run() -> Result<ExitCode> {
                 &mut output,
             )
             .await?;
-            print_connect_outcome(&outcome);
+            print_connect_outcome(&target.instance_home, &outcome);
         }
         Command::Run(args) => {
             let target = resolved_target
@@ -1432,7 +1433,7 @@ fn print_configure_outcome(home: &LionClawHome, outcome: &ConfigureRuntimeOutcom
     println!("default runtime set to {}", outcome.runtime_id);
 }
 
-fn print_connect_outcome(outcome: &ConnectOutcome) {
+fn print_connect_outcome(home: &LionClawHome, outcome: &ConnectOutcome) {
     println!(
         "connected channel {} using skill {} ({})",
         outcome.channel_id,
@@ -1447,11 +1448,19 @@ fn print_connect_outcome(outcome: &ConnectOutcome) {
             println!("service channel is running");
             println!("pair or approve peers with:");
             println!(
-                "  lionclaw channel pairing list --channel-id {}",
-                outcome.channel_id
+                "  {}",
+                channel_pairing_list_command(home, &outcome.channel_id)
             );
         }
     }
+}
+
+fn channel_pairing_list_command(home: &LionClawHome, channel_id: &str) -> String {
+    format!(
+        "{} channel pairing list --channel-id {}",
+        lionclaw_home_command_prefix(home),
+        shell_quote_arg(channel_id)
+    )
 }
 
 fn validate_channel_list_all_target(selection: &TargetSelection) -> Result<()> {
@@ -2133,6 +2142,19 @@ mod tests {
             target.require_work_root().expect("run requires work root"),
             reviewer.work_root.as_path()
         );
+    }
+
+    #[test]
+    fn service_connect_pairing_command_targets_selected_home() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("reviewer home"));
+
+        let command = channel_pairing_list_command(&home, "telegram");
+
+        assert!(command.starts_with("lionclaw --home "));
+        assert!(command.contains(&home.root().display().to_string()));
+        assert!(command.contains("channel pairing list --channel-id telegram"));
+        assert!(!command.starts_with("lionclaw channel pairing"));
     }
 
     #[test]

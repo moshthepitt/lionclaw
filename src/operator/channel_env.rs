@@ -10,6 +10,7 @@ use crate::{
     home::LionClawHome,
     operator::{
         channel_metadata::validate_channel_env_name,
+        command_display::shell_quote_arg,
         private_paths::{
             ensure_private_file_write_target, read_private_file_to_string,
             set_private_file_permissions,
@@ -186,14 +187,20 @@ pub fn collect_from_process_env(keys: &[String]) -> Result<ChannelEnv> {
     Ok(values)
 }
 
-pub fn render_missing_env_repair(channel_id: &str, missing: &[String]) -> String {
+pub fn render_missing_env_repair(
+    command_prefix: &str,
+    channel_id: &str,
+    missing: &[String],
+) -> String {
     let names = missing.join(", ");
+    let channel_arg = shell_quote_arg(channel_id);
+    let env_file_arg = shell_quote_arg(&format!("./{channel_id}.env"));
     let from_env = missing
         .iter()
-        .map(|key| format!(" --from-env {key}"))
+        .map(|key| format!(" --from-env {}", shell_quote_arg(key)))
         .collect::<String>();
     format!(
-        "missing required environment values for channel '{channel_id}': {names}\nRun:\n  lionclaw connect {channel_id} --env-file ./{channel_id}.env\n  lionclaw connect {channel_id}{from_env}"
+        "missing required environment values for channel '{channel_id}': {names}\nRun:\n  {command_prefix} connect {channel_arg} --env-file {env_file_arg}\n  {command_prefix} connect {channel_arg}{from_env}"
     )
 }
 

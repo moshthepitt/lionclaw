@@ -2,6 +2,7 @@ pub mod attach;
 pub mod channel_env;
 pub mod channel_metadata;
 pub mod cli;
+pub(crate) mod command_display;
 pub mod config;
 pub mod connect;
 pub mod daemon_probe;

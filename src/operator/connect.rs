@@ -21,6 +21,7 @@ use crate::{
             discover_channel_skill, validate_channel_env_name, ChannelSkillSource,
             DiscoveredChannelSkill,
         },
+        command_display::lionclaw_home_command_prefix,
         config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
         private_paths::{private_file_exists, remove_private_file_if_exists},
         reconcile::{
@@ -578,8 +579,13 @@ fn ensure_required_env<R: BufRead, W: Write>(
     if missing.is_empty() {
         return Ok(RequiredEnvOutcome { changed });
     }
+    let repair_command = lionclaw_home_command_prefix(home);
     if !interactive {
-        return Err(anyhow!(render_missing_env_repair(channel_id, &missing)));
+        return Err(anyhow!(render_missing_env_repair(
+            &repair_command,
+            channel_id,
+            &missing
+        )));
     }
 
     let prompted = prompt_required_env(channel_id, &missing, hide_prompt_input, input, output)?;
@@ -590,7 +596,11 @@ fn ensure_required_env<R: BufRead, W: Write>(
     if missing.is_empty() {
         Ok(RequiredEnvOutcome { changed })
     } else {
-        Err(anyhow!(render_missing_env_repair(channel_id, &missing)))
+        Err(anyhow!(render_missing_env_repair(
+            &repair_command,
+            channel_id,
+            &missing
+        )))
     }
 }
 
@@ -877,6 +887,8 @@ env = ["TELEGRAM_BOT_TOKEN"]
         .expect_err("missing env should fail");
 
         assert!(err.to_string().contains("TELEGRAM_BOT_TOKEN"));
+        assert!(err.to_string().contains("lionclaw --home"));
+        assert!(err.to_string().contains(&home.root().display().to_string()));
         assert!(err.to_string().contains("--env-file"));
         assert!(err.to_string().contains("--from-env TELEGRAM_BOT_TOKEN"));
         assert!(!err.to_string().contains("secret"));
