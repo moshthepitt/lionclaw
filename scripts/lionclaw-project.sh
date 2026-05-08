@@ -827,6 +827,7 @@ case "$cmd" in
       printf 'Project home is not onboarded yet.\n'
       exit 0
     fi
+    ensure_home_work_root_recorded
     printf 'Bind:              %s\n' "$(configured_bind || true)"
     run_lionclaw service status
     ;;
