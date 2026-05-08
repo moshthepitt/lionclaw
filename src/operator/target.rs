@@ -503,7 +503,9 @@ fn write_toml_file<T: Serialize>(path: &Path, value: &T, label: &str) -> Result<
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
+        ensure_directory_not_symlink(parent, &format!("{label} directory"))?;
     }
+    ensure_file_write_target_not_symlink(path, label)?;
     let content =
         toml::to_string_pretty(value).with_context(|| format!("failed to encode {label}"))?;
     fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))
@@ -708,6 +710,22 @@ fn ensure_regular_file_not_symlink(path: &Path, label: &str) -> Result<()> {
         bail!("{label} {} is not a file", path.display());
     }
     Ok(())
+}
+
+fn ensure_file_write_target_not_symlink(path: &Path, label: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!("{label} {} must not be a symlink", path.display());
+            }
+            if metadata.is_dir() {
+                bail!("{label} {} is not a file", path.display());
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to stat {label} {}", path.display())),
+    }
 }
 
 fn validate_instance_name(name: &str) -> Result<()> {
@@ -1053,6 +1071,36 @@ mod tests {
             .to_string()
             .contains("inside LionClaw metadata"));
         assert!(file_err.to_string().contains("not a directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopt_rejects_symlinked_instance_config_before_write() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().expect("temp dir");
+        init_project(temp_dir.path()).expect("init project");
+        let home = temp_dir.path().join(".lionclaw/instances/adopted");
+        let config_dir = home.join("config");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        let outside_target = temp_dir.path().join("outside-instance.toml");
+        symlink(&outside_target, config_dir.join("instance.toml")).expect("instance symlink");
+
+        let err = adopt_project_instance(
+            temp_dir.path(),
+            "adopted",
+            home.as_path(),
+            Some(std::path::Path::new(".")),
+            false,
+        )
+        .expect_err("symlinked instance config should fail");
+
+        assert!(err.to_string().contains("instance config"));
+        assert!(err.to_string().contains("must not be a symlink"));
+        assert!(
+            !outside_target.exists(),
+            "instance adopt must not follow config/instance.toml symlinks"
+        );
     }
 
     #[cfg(unix)]

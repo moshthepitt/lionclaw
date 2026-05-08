@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use cron::Schedule;
@@ -1175,6 +1175,10 @@ fn resolve_command_target(
             | JobCommand::Runs(_) => Some(WorkRootRequirement::Optional),
         },
         Command::Runtime { .. } | Command::Skill { .. } => Some(WorkRootRequirement::Optional),
+        Command::Onboard(_) if selection.home.is_some() => Some(WorkRootRequirement::Optional),
+        Command::Onboard(_) if selection.project.is_some() || selection.instance.is_some() => {
+            bail!("onboard cannot be combined with --project or --instance; use --home PATH to choose a home")
+        }
         Command::Onboard(_)
         | Command::Project { .. }
         | Command::Instance { .. }
@@ -1695,6 +1699,51 @@ mod tests {
         .expect("runtime ls should resolve target");
         assert_eq!(runtime_list.instance_home.root(), home.as_path());
         assert!(runtime_list.work_root.is_none());
+    }
+
+    #[test]
+    fn onboard_honors_explicit_home_target() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = temp_dir.path().join("home");
+        let selection = TargetSelection {
+            home: Some(home.clone()),
+            project: None,
+            instance: None,
+        };
+        let command = Command::Onboard(OnboardArgs { bind: None });
+
+        let target = resolve_command_target(&selection, &command)
+            .expect("onboard should accept --home")
+            .expect("onboard should resolve explicit home");
+
+        assert_eq!(target.instance_home.root(), home.as_path());
+        assert!(target.project_root.is_none());
+        assert!(target.instance_name.is_none());
+        assert!(target.work_root.is_none());
+    }
+
+    #[test]
+    fn onboard_rejects_project_instance_targets() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let command = Command::Onboard(OnboardArgs { bind: None });
+        let selections = [
+            TargetSelection {
+                home: None,
+                project: Some(temp_dir.path().to_path_buf()),
+                instance: None,
+            },
+            TargetSelection {
+                home: None,
+                project: None,
+                instance: Some("main".to_string()),
+            },
+        ];
+
+        for selection in selections {
+            let err = resolve_command_target(&selection, &command)
+                .expect_err("onboard should reject project and instance selectors");
+            assert!(err.to_string().contains("onboard cannot be combined"));
+        }
     }
 
     #[tokio::test]
