@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, path::PathBuf, process::ExitCode, str::FromStr, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    str::FromStr,
+    time::Duration,
+};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
@@ -23,10 +29,10 @@ use crate::{
             ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig,
         },
         reconcile::{
-            add_channel, add_skill, down, logs, onboard, open_kernel, open_runtime_kernel,
-            pairing_approve, pairing_block, pairing_list, remove_channel, remove_skill,
-            resolve_installed_skill_worker_entrypoint, resolve_stack_binaries, status, up,
-            OnboardBindSelection,
+            add_channel, add_skill, down, logs, onboard, open_kernel,
+            open_runtime_kernel_for_work_root, pairing_approve, pairing_block, pairing_list,
+            remove_channel, remove_skill, resolve_installed_skill_worker_entrypoint,
+            resolve_stack_binaries, status_for_work_root, up_for_work_root, OnboardBindSelection,
         },
         run::run_local,
         runtime::{resolve_runtime_id, validate_runtime_availability},
@@ -654,7 +660,10 @@ pub async fn run() -> Result<ExitCode> {
                     let config = OperatorConfig::load(&home).await?;
                     let runtime_id = resolve_runtime_id(&config, args.runtime.as_deref())?;
                     let binaries = resolve_stack_binaries()?;
-                    let applied = up(&home, &manager, &runtime_id, &binaries).await?;
+                    let work_root = required_command_work_root(&resolved_target, "service up")?;
+                    let applied =
+                        up_for_work_root(&home, &manager, &runtime_id, &binaries, work_root)
+                            .await?;
                     let managed_channels = applied
                         .config
                         .channels
@@ -670,7 +679,8 @@ pub async fn run() -> Result<ExitCode> {
                     println!("stopped managed LionClaw services");
                 }
                 ServiceCommand::Status => {
-                    let stack = status(&home, &manager).await?;
+                    let work_root = required_command_work_root(&resolved_target, "service status")?;
+                    let stack = status_for_work_root(&home, &manager, work_root).await?;
                     println!("daemon: {}", stack.daemon_status);
                     for channel in stack.channels {
                         println!(
@@ -752,7 +762,9 @@ pub async fn run() -> Result<ExitCode> {
             }
             ChannelCommand::Attach(args) => {
                 let manager = SystemdUserServiceManager;
-                attach_channel(&home, &manager, args.id, args.peer, args.runtime).await?;
+                let work_root = required_command_work_root(&resolved_target, "channel attach")?;
+                attach_channel(&home, &manager, work_root, args.id, args.peer, args.runtime)
+                    .await?;
             }
             ChannelCommand::Pairing { command } => match command {
                 ChannelPairingCommand::List(args) => {
@@ -795,7 +807,11 @@ pub async fn run() -> Result<ExitCode> {
             let config = OperatorConfig::load(&home).await?;
             match command {
                 ContinuityCommand::Drafts { command } => {
-                    let kernel = open_runtime_kernel(&home, &config, None).await?;
+                    let work_root =
+                        required_command_work_root(&resolved_target, "continuity drafts")?;
+                    let kernel =
+                        open_runtime_kernel_for_work_root(&home, &config, None, work_root, None)
+                            .await?;
                     match command {
                         ContinuityDraftCommand::Ls(args) => {
                             let response = kernel
@@ -954,7 +970,10 @@ pub async fn run() -> Result<ExitCode> {
             let config = OperatorConfig::load(&home).await?;
             match command {
                 JobCommand::Run(args) => {
-                    let kernel = open_runtime_kernel(&home, &config, None).await?;
+                    let work_root = required_command_work_root(&resolved_target, "job run")?;
+                    let kernel =
+                        open_runtime_kernel_for_work_root(&home, &config, None, work_root, None)
+                            .await?;
                     let job_id = parse_job_id(&args.job_id)?;
                     let response = kernel.run_job_now(JobRefRequest { job_id }).await?;
                     println!(
@@ -963,7 +982,10 @@ pub async fn run() -> Result<ExitCode> {
                     );
                 }
                 JobCommand::Tick => {
-                    let kernel = open_runtime_kernel(&home, &config, None).await?;
+                    let work_root = required_command_work_root(&resolved_target, "job tick")?;
+                    let kernel =
+                        open_runtime_kernel_for_work_root(&home, &config, None, work_root, None)
+                            .await?;
                     let response = kernel.scheduler_tick().await?;
                     println!("claimed {} scheduled runs", response.claimed_runs);
                 }
@@ -1124,12 +1146,35 @@ fn resolve_command_target(
 ) -> Result<Option<crate::operator::target::TargetContext>> {
     let requirement = match command {
         Command::Run(_) => Some(WorkRootRequirement::Required),
-        Command::Runtime { .. }
-        | Command::Skill { .. }
-        | Command::Channel { .. }
-        | Command::Service { .. }
-        | Command::Continuity { .. }
-        | Command::Job { .. } => Some(WorkRootRequirement::Optional),
+        Command::Service { command } => match command {
+            ServiceCommand::Up(_) | ServiceCommand::Status => Some(WorkRootRequirement::Required),
+            ServiceCommand::Down | ServiceCommand::Logs(_) => Some(WorkRootRequirement::Optional),
+        },
+        Command::Channel { command } => match command {
+            ChannelCommand::Attach(_) => Some(WorkRootRequirement::Required),
+            ChannelCommand::Add(_) | ChannelCommand::Rm(_) | ChannelCommand::Pairing { .. } => {
+                Some(WorkRootRequirement::Optional)
+            }
+        },
+        Command::Continuity { command } => match command {
+            ContinuityCommand::Drafts { .. } => Some(WorkRootRequirement::Required),
+            ContinuityCommand::Status
+            | ContinuityCommand::Search(_)
+            | ContinuityCommand::Get(_)
+            | ContinuityCommand::Loops { .. }
+            | ContinuityCommand::Proposals { .. } => Some(WorkRootRequirement::Optional),
+        },
+        Command::Job { command } => match command {
+            JobCommand::Run(_) | JobCommand::Tick => Some(WorkRootRequirement::Required),
+            JobCommand::Add(_)
+            | JobCommand::Ls
+            | JobCommand::Show(_)
+            | JobCommand::Pause(_)
+            | JobCommand::Resume(_)
+            | JobCommand::Rm(_)
+            | JobCommand::Runs(_) => Some(WorkRootRequirement::Optional),
+        },
+        Command::Runtime { .. } | Command::Skill { .. } => Some(WorkRootRequirement::Optional),
         Command::Onboard(_)
         | Command::Project { .. }
         | Command::Instance { .. }
@@ -1139,6 +1184,16 @@ fn resolve_command_target(
     requirement
         .map(|requirement| resolve_target(selection, requirement))
         .transpose()
+}
+
+fn required_command_work_root<'a>(
+    resolved_target: &'a Option<crate::operator::target::TargetContext>,
+    command: &str,
+) -> Result<&'a Path> {
+    let target = resolved_target
+        .as_ref()
+        .ok_or_else(|| anyhow!("{command} requires a resolved LionClaw target"))?;
+    target.require_work_root()
 }
 
 fn print_runtime_state_change_note() {
@@ -1556,6 +1611,90 @@ mod tests {
     #[test]
     fn rejects_invalid_schedule() {
         assert!(parse_job_schedule_spec("not-a-schedule", None).is_err());
+    }
+
+    #[test]
+    fn runtime_opening_commands_require_recorded_home_work_root() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = temp_dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let selection = TargetSelection {
+            home: Some(home.clone()),
+            project: None,
+            instance: None,
+        };
+
+        let commands = vec![
+            (
+                "service up",
+                Command::Service {
+                    command: ServiceCommand::Up(ServiceUpArgs { runtime: None }),
+                },
+            ),
+            (
+                "service status",
+                Command::Service {
+                    command: ServiceCommand::Status,
+                },
+            ),
+            (
+                "channel attach",
+                Command::Channel {
+                    command: ChannelCommand::Attach(ChannelAttachArgs {
+                        id: "terminal".to_string(),
+                        peer: None,
+                        runtime: None,
+                    }),
+                },
+            ),
+            (
+                "continuity drafts",
+                Command::Continuity {
+                    command: ContinuityCommand::Drafts {
+                        command: ContinuityDraftCommand::Ls(ContinuityDraftListArgs {
+                            runtime: None,
+                        }),
+                    },
+                },
+            ),
+            (
+                "job run",
+                Command::Job {
+                    command: JobCommand::Run(JobRefArgs {
+                        job_id: "1".to_string(),
+                    }),
+                },
+            ),
+            (
+                "job tick",
+                Command::Job {
+                    command: JobCommand::Tick,
+                },
+            ),
+        ];
+
+        for (label, command) in commands {
+            let err = match resolve_command_target(&selection, &command) {
+                Ok(_) => panic!("{label} should require a work root"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string()
+                    .contains("does not contain a recorded work root"),
+                "{label} returned unexpected error: {err}"
+            );
+        }
+
+        let runtime_list = resolve_command_target(
+            &selection,
+            &Command::Runtime {
+                command: Box::new(RuntimeCommand::Ls),
+            },
+        )
+        .expect("runtime ls should target home without work root")
+        .expect("runtime ls should resolve target");
+        assert_eq!(runtime_list.instance_home.root(), home.as_path());
+        assert!(runtime_list.work_root.is_none());
     }
 
     #[tokio::test]

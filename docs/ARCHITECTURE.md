@@ -125,7 +125,7 @@ For `lionclaw run <runtime>`, channel turns, or scheduled jobs:
 2. The kernel opens or reuses a durable session.
 3. The kernel renders the prompt envelope from identity, continuity, skills,
    history, and current input.
-4. The execution planner resolves the runtime profile, preset, project root,
+4. The execution planner resolves the runtime profile, preset, work root,
    runtime state root, drafts root, network mode, secret mount decision, image,
    timeouts, and compatibility key.
 5. The kernel audits `runtime.plan.allow` or `runtime.plan.deny`.

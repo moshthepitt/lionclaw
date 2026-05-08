@@ -7,7 +7,6 @@ use std::{
 
 use crate::{
     applied::{compute_daemon_fingerprint, AppliedState},
-    config::resolve_project_workspace_root,
     contracts::{ChannelPeerApproveRequest, ChannelPeerResponse, TrustTier},
     home::{runtime_project_partition_key, LionClawHome},
     kernel::{skills::validate_skill_alias, Kernel, KernelOptions, RuntimeExecutionPolicy},
@@ -28,6 +27,9 @@ use crate::{
     runtime_timeouts::RuntimeTurnTimeouts,
     workspace::{bootstrap_workspace, read_workspace_sections, GENERATED_AGENTS_FILE},
 };
+
+#[cfg(test)]
+use crate::config::resolve_project_workspace_root;
 
 #[derive(Debug, Clone)]
 pub struct OperatorState {
@@ -57,6 +59,13 @@ pub struct ChannelStatus {
 #[derive(Debug, Clone)]
 pub struct StackBinaryPaths {
     pub daemon_bin: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ManagedDaemonContext<'a> {
+    pub work_root: &'a Path,
+    pub fingerprint: &'a str,
+    pub codex_home_override: Option<&'a Path>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,19 +198,18 @@ pub async fn load_operator_state(home: &LionClawHome) -> Result<OperatorState> {
     })
 }
 
-pub async fn up<M: ServiceManager>(
+pub async fn up_for_work_root<M: ServiceManager>(
     home: &LionClawHome,
     manager: &M,
     runtime_id: &str,
     binaries: &StackBinaryPaths,
+    work_root: &Path,
 ) -> Result<OperatorState> {
     let state = load_operator_state(home).await?;
     let config = &state.config;
     let runtime_context = resolve_runtime_execution_context(home, config, Some(runtime_id)).await?;
     let home_id = home.ensure_home_id().await?;
-    let project_root =
-        resolve_project_workspace_root().context("failed to resolve project workspace root")?;
-    let project_scope = runtime_project_partition_key(Some(project_root.as_path()));
+    let project_scope = runtime_project_partition_key(Some(work_root));
     let runtime_config_fingerprint = runtime_context.daemon_config_fingerprint.clone();
     let expected_daemon_fingerprint =
         compute_daemon_fingerprint(&runtime_config_fingerprint, &state.applied_state);
@@ -253,15 +261,18 @@ pub async fn up<M: ServiceManager>(
 
     let previous_units = managed_unit_names(home)?;
     validate_runtime_launch_prerequisites(home, config, runtime_id).await?;
-    render_runtime_cache(home, &state.config, runtime_id).await?;
+    render_runtime_cache_for_work_root(home, &state.config, runtime_id, work_root).await?;
     let units = build_managed_units(
         home,
         &state.config,
         &state.applied_state,
         runtime_id,
         binaries,
-        &expected_daemon_fingerprint,
-        runtime_context.codex_home_override.as_deref(),
+        ManagedDaemonContext {
+            work_root,
+            fingerprint: &expected_daemon_fingerprint,
+            codex_home_override: runtime_context.codex_home_override.as_deref(),
+        },
     )?;
     let next_units = units
         .iter()
@@ -325,12 +336,16 @@ pub async fn down<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Result
     manager.down_units(&units).await
 }
 
-pub async fn status<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Result<StackStatus> {
+pub async fn status_for_work_root<M: ServiceManager>(
+    home: &LionClawHome,
+    manager: &M,
+    work_root: &Path,
+) -> Result<StackStatus> {
     let state = load_operator_state(home).await?;
     let kernel = open_kernel(home, &state.config, None).await?;
     let mut daemon_status = manager.unit_status(DAEMON_UNIT_NAME).await?;
     if unit_status_is_active(&daemon_status)
-        && daemon_restart_required(home, &state.config, &state.applied_state).await?
+        && daemon_restart_required(home, &state.config, &state.applied_state, work_root).await?
     {
         daemon_status.push_str(" (restart required)");
     }
@@ -396,6 +411,7 @@ async fn daemon_restart_required(
     home: &LionClawHome,
     config: &OperatorConfig,
     applied_state: &AppliedState,
+    work_root: &Path,
 ) -> Result<bool> {
     let Some(runtime_id) = managed_daemon_runtime_id(home, config)? else {
         return Ok(false);
@@ -406,9 +422,7 @@ async fn daemon_restart_required(
             Err(_) => return Ok(false),
         };
     let home_id = home.ensure_home_id().await?;
-    let project_root =
-        resolve_project_workspace_root().context("failed to resolve project workspace root")?;
-    let project_scope = runtime_project_partition_key(Some(project_root.as_path()));
+    let project_scope = runtime_project_partition_key(Some(work_root));
     let expected_daemon_fingerprint =
         compute_daemon_fingerprint(&runtime_context.daemon_config_fingerprint, applied_state);
 
@@ -556,12 +570,9 @@ pub(crate) fn build_managed_units(
     applied_state: &AppliedState,
     runtime_id: &str,
     binaries: &StackBinaryPaths,
-    daemon_fingerprint: &str,
-    codex_home_override: Option<&Path>,
+    daemon_context: ManagedDaemonContext<'_>,
 ) -> Result<Vec<ManagedServiceUnit>> {
     let mut units = Vec::new();
-    let project_workspace_root = resolve_project_workspace_root()
-        .context("failed to resolve project workspace root for managed daemon")?;
     units.push(render_daemon_unit(
         home,
         &binaries.daemon_bin,
@@ -569,9 +580,9 @@ pub(crate) fn build_managed_units(
             bind_addr: &config.daemon.bind,
             runtime_id,
             workspace: &config.daemon.workspace,
-            project_workspace_root: &project_workspace_root,
-            daemon_fingerprint,
-            codex_home_override,
+            project_workspace_root: daemon_context.work_root,
+            daemon_fingerprint: daemon_context.fingerprint,
+            codex_home_override: daemon_context.codex_home_override,
         },
     ));
 
@@ -644,6 +655,7 @@ fn validate_required_channel_env_key(channel_id: &str, key: &str) -> Result<()> 
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn render_runtime_cache(
     home: &LionClawHome,
     config: &OperatorConfig,
@@ -903,32 +915,6 @@ pub(crate) async fn open_kernel(
     open_kernel_with_project_root(home, config, default_runtime_id, None, None).await
 }
 
-pub(crate) async fn open_runtime_kernel(
-    home: &LionClawHome,
-    config: &OperatorConfig,
-    default_runtime_id: Option<String>,
-) -> Result<Kernel> {
-    open_runtime_kernel_with_timeouts(home, config, default_runtime_id, None).await
-}
-
-pub(crate) async fn open_runtime_kernel_with_timeouts(
-    home: &LionClawHome,
-    config: &OperatorConfig,
-    default_runtime_id: Option<String>,
-    timeout_override: Option<RuntimeTurnTimeouts>,
-) -> Result<Kernel> {
-    let project_workspace_root =
-        resolve_project_workspace_root().context("failed to resolve project workspace root")?;
-    open_kernel_with_project_root(
-        home,
-        config,
-        default_runtime_id,
-        Some(project_workspace_root),
-        timeout_override,
-    )
-    .await
-}
-
 pub(crate) async fn open_runtime_kernel_for_work_root(
     home: &LionClawHome,
     config: &OperatorConfig,
@@ -1002,7 +988,8 @@ mod tests {
         add_channel, add_skill, daemon_restart_required, managed_daemon_runtime_id, onboard,
         open_kernel, open_kernel_with_project_root, render_marker_file, render_runtime_cache,
         resolve_installed_skill_worker_entrypoint, resolve_required_channel_env,
-        resolve_worker_entrypoint, status, up, OnboardBindSelection, StackBinaryPaths,
+        resolve_worker_entrypoint, status_for_work_root, up_for_work_root, OnboardBindSelection,
+        StackBinaryPaths,
     };
     use crate::{
         applied::compute_daemon_fingerprint,
@@ -1030,9 +1017,12 @@ mod tests {
         })
     }
 
+    fn current_work_root() -> PathBuf {
+        resolve_project_workspace_root().expect("resolve project workspace root")
+    }
+
     fn current_project_scope() -> String {
-        let project_root =
-            resolve_project_workspace_root().expect("resolve project workspace root");
+        let project_root = current_work_root();
         runtime_project_partition_key(Some(project_root.as_path()))
     }
 
@@ -1681,7 +1671,9 @@ mod tests {
         let binaries = StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         };
-        let state = up(&home, &manager, "codex", &binaries).await.expect("up");
+        let state = up_for_work_root(&home, &manager, "codex", &binaries, &current_work_root())
+            .await
+            .expect("up");
         let project_workspace_root =
             resolve_project_workspace_root().expect("resolve project workspace root");
 
@@ -1714,13 +1706,14 @@ mod tests {
             .expect("set default runtime");
         config.save(&home).await.expect("save config");
 
-        let err = up(
+        let err = up_for_work_root(
             &home,
             &FakeServiceManager::default(),
             "codex",
             &StackBinaryPaths {
                 daemon_bin: "/tmp/lionclawd".into(),
             },
+            &current_work_root(),
         )
         .await
         .expect_err("missing runtime auth should fail");
@@ -1767,13 +1760,14 @@ mod tests {
             .expect("set default runtime");
         config.save(&home).await.expect("save config");
 
-        let err = up(
+        let err = up_for_work_root(
             &home,
             &FakeServiceManager::default(),
             "codex",
             &StackBinaryPaths {
                 daemon_bin: "/tmp/lionclawd".into(),
             },
+            &current_work_root(),
         )
         .await
         .expect_err("private-network failure should block service up");
@@ -1827,7 +1821,9 @@ mod tests {
         let binaries = StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         };
-        let state = up(&home, &manager, "codex", &binaries).await.expect("up");
+        let state = up_for_work_root(&home, &manager, "codex", &binaries, &current_work_root())
+            .await
+            .expect("up");
 
         assert_eq!(state.applied_state.channels().len(), 1);
         assert_eq!(
@@ -1894,7 +1890,7 @@ mod tests {
             daemon_bin: "/tmp/lionclawd".into(),
         };
 
-        up(&home, &manager, "codex", &binaries)
+        up_for_work_root(&home, &manager, "codex", &binaries, &current_work_root())
             .await
             .expect("same-home managed daemon should be reused");
         assert!(manager
@@ -1922,7 +1918,7 @@ mod tests {
         let binaries = StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         };
-        up(&home, &manager, "codex", &binaries)
+        up_for_work_root(&home, &manager, "codex", &binaries, &current_work_root())
             .await
             .expect("initial up");
         assert!(
@@ -1971,7 +1967,7 @@ mod tests {
         .await
         .expect("install runtime-visible skill");
 
-        up(&home, &manager, "codex", &binaries)
+        up_for_work_root(&home, &manager, "codex", &binaries, &current_work_root())
             .await
             .expect("reconcile changed skills");
         assert!(
@@ -2040,7 +2036,9 @@ mod tests {
         config.save(&home).await.expect("save config");
 
         let manager = FakeServiceManager::default();
-        let stack = status(&home, &manager).await.expect("status");
+        let stack = status_for_work_root(&home, &manager, &current_work_root())
+            .await
+            .expect("status");
 
         assert_eq!(stack.daemon_status, "not-found");
         assert!(stack.channels.is_empty());
@@ -2125,13 +2123,15 @@ mod tests {
             DaemonClassification::SameHomeDifferentConfig
         ));
         assert!(
-            daemon_restart_required(&home, &config, &state.applied_state)
+            daemon_restart_required(&home, &config, &state.applied_state, &current_work_root())
                 .await
                 .expect("daemon restart required"),
             "status should see the daemon as stale"
         );
 
-        let stack = status(&home, &manager).await.expect("status");
+        let stack = status_for_work_root(&home, &manager, &current_work_root())
+            .await
+            .expect("status");
 
         assert_eq!(
             stack.daemon_status,
@@ -2205,7 +2205,9 @@ mod tests {
         .await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let stack = status(&home, &manager).await.expect("status");
+        let stack = status_for_work_root(&home, &manager, &current_work_root())
+            .await
+            .expect("status");
 
         assert_eq!(
             stack.daemon_status,

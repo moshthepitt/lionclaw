@@ -259,7 +259,7 @@ The runtime owns:
 
 Interactive program-backed turns still launch a fresh confined process for
 each request, but the mounted `/runtime` state root is scoped to the LionClaw
-session, project root, and execution security shape. That lets the harness
+session, work root, and execution security shape. That lets the harness
 resume its own conversation state across turns without sharing private runtime
 state across different projects, networks, or secret profiles.
 

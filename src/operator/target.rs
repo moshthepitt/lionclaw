@@ -120,14 +120,12 @@ pub fn init_project(project_root: &Path) -> Result<ProjectInitResult> {
     }
     if project_dir.exists() {
         ensure_directory_not_symlink(&project_dir, "project metadata directory")?;
+    } else {
+        fs::create_dir(&project_dir)
+            .with_context(|| format!("failed to create {}", project_dir.display()))?;
     }
 
-    fs::create_dir_all(instances_dir(&project_root)).with_context(|| {
-        format!(
-            "failed to create {}",
-            instances_dir(&project_root).display()
-        )
-    })?;
+    ensure_instances_dir(&project_root)?;
     let config = ProjectFileConfig {
         version: Some(1),
         default_instance: Some(DEFAULT_INSTANCE.to_string()),
@@ -150,6 +148,7 @@ pub fn create_project_instance(
 ) -> Result<InstanceRecord> {
     let project_root = canonical_project_root(project_root)?;
     validate_instance_name(name)?;
+    ensure_instances_dir(&project_root)?;
     let home = instance_home(&project_root, name);
     if home.exists() {
         bail!(
@@ -183,6 +182,7 @@ pub fn adopt_project_instance(
 ) -> Result<InstanceRecord> {
     let project_root = canonical_project_root(project_root)?;
     validate_instance_name(name)?;
+    ensure_instances_dir(&project_root)?;
     let source_home = absolutize_from(&std::env::current_dir()?, source_home);
     ensure_directory_not_symlink(&source_home, "source instance home")?;
     let source_home = fs::canonicalize(&source_home)
@@ -359,6 +359,7 @@ fn resolve_instance_name(
 
     if let Some(name) = config.default_instance.as_deref() {
         validate_instance_name(name)?;
+        ensure_instances_dir(project_root)?;
         if !instance_home(project_root, name).exists() {
             bail!(
                 "default instance '{name}' is configured but missing; repair with 'lionclaw instance create {name}' or update {}",
@@ -382,6 +383,7 @@ fn resolve_instance_name(
 }
 
 fn resolve_project_instance_home(project_root: &Path, instance_name: &str) -> Result<PathBuf> {
+    ensure_instances_dir(project_root)?;
     let home = instance_home(project_root, instance_name);
     if !home.exists() {
         bail!(
@@ -639,6 +641,35 @@ fn canonical_existing_dir(path: &Path, label: &str) -> Result<PathBuf> {
 
 fn validate_project_metadata_dir(project_root: &Path) -> Result<()> {
     ensure_directory_not_symlink(&project_dir(project_root), "project metadata directory")
+}
+
+fn ensure_instances_dir(project_root: &Path) -> Result<()> {
+    validate_project_metadata_dir(project_root)?;
+    let instances = instances_dir(project_root);
+    match fs::symlink_metadata(&instances) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "instances directory {} must not be a symlink",
+                    instances.display()
+                );
+            }
+            if !metadata.is_dir() {
+                bail!(
+                    "instances directory {} is not a directory",
+                    instances.display()
+                );
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&instances)
+                .with_context(|| format!("failed to create {}", instances.display()))?;
+            ensure_directory_not_symlink(&instances, "instances directory")
+        }
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to stat instances directory {}", instances.display())),
+    }
 }
 
 fn ensure_directory_not_symlink(path: &Path, label: &str) -> Result<()> {
@@ -1029,6 +1060,35 @@ mod tests {
         .expect_err("symlink escape");
 
         assert!(err.to_string().contains("outside project root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_instances_directory_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().expect("temp dir");
+        init_project(temp_dir.path()).expect("init project");
+        let outside = tempdir().expect("outside");
+        let instances = temp_dir.path().join(".lionclaw/instances");
+        fs::remove_dir_all(&instances).expect("remove instances");
+        symlink(outside.path(), &instances).expect("symlink instances");
+
+        let create_err = create_project_instance(temp_dir.path(), "reviewer", None, false)
+            .expect_err("symlinked instances dir should reject create");
+        let resolve_err = resolve_target_from_cwd(
+            &TargetSelection::default(),
+            WorkRootRequirement::Required,
+            temp_dir.path(),
+        )
+        .expect_err("symlinked instances dir should reject resolution");
+
+        assert!(create_err.to_string().contains("must not be a symlink"));
+        assert!(resolve_err.to_string().contains("must not be a symlink"));
+        assert!(
+            !outside.path().join("reviewer").exists(),
+            "instance create must not follow .lionclaw/instances symlinks"
+        );
     }
 
     #[test]
