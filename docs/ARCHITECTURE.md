@@ -8,9 +8,9 @@ contract around that work: sessions, channels, scheduled jobs, continuity,
 runtime configuration, confinement, policy, and audit.
 
 LionClaw currently targets Unix-like systems only. The direct `lionclaw run`
-path is designed for Linux/macOS-style Unix environments. Managed daemon paths,
-including service mode and channel auto-start, currently use systemd user
-services; launchd support is a future portability item.
+path is designed for Linux/macOS-style Unix environments. Managed background
+paths, including `lionclaw up` and channel auto-start, currently use systemd
+user services; launchd support is a future portability item.
 
 ## System Shape
 
@@ -227,8 +227,8 @@ session-local copies of `auth.json` and `config.toml` under
 into the runtime container.
 
 `lionclaw run` inherits an interactive shell's `CODEX_HOME` when set, and
-`lionclaw service up` persists that same override into the managed daemon
-environment for background jobs and channels.
+`lionclaw up` persists that same override into the managed daemon environment
+for background jobs and channels.
 
 ## API Contracts
 

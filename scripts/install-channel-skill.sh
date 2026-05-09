@@ -87,7 +87,7 @@ echo "  $LIONCLAW_BIN channel pairing list --channel-id $CHANNEL_ID"
 if [[ -z "$RUNTIME_ID" ]]; then
   echo
   echo "Runtime selection:"
-  echo "  use '$LIONCLAW_BIN service up --runtime <id>' for the normal managed flow"
+  echo "  use '$LIONCLAW_BIN runtime set-default <id>' before '$LIONCLAW_BIN up'"
 fi
 
 if [[ "$START_WORKER" == true ]]; then

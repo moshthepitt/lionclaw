@@ -7,14 +7,27 @@ use crate::home::LionClawHome;
 use super::{
     config::{ManagedChannelConfig, OperatorConfig},
     runtime_integration::{runtime_auth_guidance, runtime_profile_facts},
+    services::{
+        channel_unit_name, daemon_unit_name, existing_service_identity, ServiceManager,
+        SystemdUserServiceManager,
+    },
     target::{
         inspect_target_work_root, list_project_instance_statuses, TargetContext, TargetSelection,
     },
 };
 
 pub async fn render_target_status(target: &TargetContext) -> Result<String> {
+    render_target_status_with_manager(target, &SystemdUserServiceManager).await
+}
+
+pub async fn render_target_status_with_manager<M: ServiceManager>(
+    target: &TargetContext,
+    manager: &M,
+) -> Result<String> {
     let work_root = inspect_target_work_root(target);
     let config = OperatorConfig::load(&target.instance_home).await?;
+    let managed_services =
+        load_managed_service_snapshot(&target.instance_home, &config, manager).await?;
     let name = target
         .instance_name
         .clone()
@@ -37,12 +50,20 @@ pub async fn render_target_status(target: &TargetContext) -> Result<String> {
         work_root_finding: work_root.finding,
         shared_work_root_count: shared_count,
         config,
+        managed_services,
         include_project_header: true,
         selected: true,
     }))
 }
 
 pub async fn render_project_status_all(project_root: &Path) -> Result<String> {
+    render_project_status_all_with_manager(project_root, &SystemdUserServiceManager).await
+}
+
+pub async fn render_project_status_all_with_manager<M: ServiceManager>(
+    project_root: &Path,
+    manager: &M,
+) -> Result<String> {
     let entries = list_project_instance_statuses(project_root)?;
     let project_root = project_root.canonicalize()?;
     let mut output = format!("project: {}\n", project_root.display());
@@ -54,6 +75,9 @@ pub async fn render_project_status_all(project_root: &Path) -> Result<String> {
 
     for entry in entries {
         let config = OperatorConfig::load(&LionClawHome::new(entry.home.clone())).await?;
+        let managed_services =
+            load_managed_service_snapshot(&LionClawHome::new(entry.home.clone()), &config, manager)
+                .await?;
         output.push('\n');
         output.push_str(&render_instance_status(InstanceRenderInput {
             project_root: Some(project_root.clone()),
@@ -64,6 +88,7 @@ pub async fn render_project_status_all(project_root: &Path) -> Result<String> {
             work_root_finding: entry.work_root_finding,
             shared_work_root_count: entry.shared_work_root_count,
             config,
+            managed_services,
             include_project_header: false,
             selected: false,
         }));
@@ -91,8 +116,21 @@ struct InstanceRenderInput {
     work_root_finding: Option<String>,
     shared_work_root_count: usize,
     config: OperatorConfig,
+    managed_services: ManagedServiceSnapshot,
     include_project_header: bool,
     selected: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedServiceSnapshot {
+    daemon: String,
+    workers: Vec<ManagedWorkerStatus>,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedWorkerStatus {
+    channel_id: String,
+    status: String,
 }
 
 fn render_instance_status(input: InstanceRenderInput) -> String {
@@ -128,6 +166,7 @@ fn render_instance_status(input: InstanceRenderInput) -> String {
     ));
     push_runtime_status(&mut output, &input.config);
     push_channel_status(&mut output, &input.config.channels);
+    push_managed_service_status(&mut output, &input.managed_services);
     push_readiness(&mut output, &input);
 
     if input.selected {
@@ -135,6 +174,38 @@ fn render_instance_status(input: InstanceRenderInput) -> String {
     }
 
     output
+}
+
+async fn load_managed_service_snapshot<M: ServiceManager>(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+    manager: &M,
+) -> Result<ManagedServiceSnapshot> {
+    let identity = existing_service_identity(home)?;
+    let daemon = match identity.as_ref() {
+        Some(identity) => manager.unit_status(&daemon_unit_name(identity)).await?,
+        None => "not-installed".to_string(),
+    };
+    let mut workers = Vec::new();
+    for channel in config
+        .channels
+        .iter()
+        .filter(|channel| channel.launch_mode == super::config::ChannelLaunchMode::Service)
+    {
+        let status = match identity.as_ref() {
+            Some(identity) => {
+                manager
+                    .unit_status(&channel_unit_name(identity, &channel.id))
+                    .await?
+            }
+            None => "not-installed".to_string(),
+        };
+        workers.push(ManagedWorkerStatus {
+            channel_id: channel.id.clone(),
+            status,
+        });
+    }
+    Ok(ManagedServiceSnapshot { daemon, workers })
 }
 
 fn push_runtime_status(output: &mut String, config: &OperatorConfig) {
@@ -175,6 +246,18 @@ fn push_channel_status(output: &mut String, channels: &[ManagedChannelConfig]) {
             channel.skill,
             channel.launch_mode.as_str()
         ));
+    }
+}
+
+fn push_managed_service_status(output: &mut String, services: &ManagedServiceSnapshot) {
+    output.push_str(&format!("  managed daemon: {}\n", services.daemon));
+    if services.workers.is_empty() {
+        output.push_str("  managed workers: none\n");
+        return;
+    }
+    output.push_str("  managed workers:\n");
+    for worker in &services.workers {
+        output.push_str(&format!("    {}: {}\n", worker.channel_id, worker.status));
     }
 }
 

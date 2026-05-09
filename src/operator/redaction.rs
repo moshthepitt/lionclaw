@@ -16,16 +16,25 @@ pub(crate) struct SecretRedactor {
 
 impl SecretRedactor {
     pub(crate) fn from_home(home: &LionClawHome) -> Result<Self> {
+        Self::from_homes(std::iter::once(home))
+    }
+
+    pub(crate) fn from_homes<'a, I>(homes: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = &'a LionClawHome>,
+    {
         let mut values = BTreeSet::new();
-        for path in
-            read_private_dir_file_paths(home, &home.channel_env_dir(), "channel env directory")?
-        {
-            let Some(channel_id) = channel_id_from_env_path(&path)? else {
-                continue;
-            };
-            let env = load_channel_env(home, &channel_id)?;
-            for value in env.values() {
-                insert_redaction_value(&mut values, value);
+        for home in homes {
+            for path in
+                read_private_dir_file_paths(home, &home.channel_env_dir(), "channel env directory")?
+            {
+                let Some(channel_id) = channel_id_from_env_path(&path)? else {
+                    continue;
+                };
+                let env = load_channel_env(home, &channel_id)?;
+                for value in env.values() {
+                    insert_redaction_value(&mut values, value);
+                }
             }
         }
 

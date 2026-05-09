@@ -22,7 +22,7 @@ Use them when you mean it.
 - `install-channel-skill.sh`: wraps the canonical `lionclaw skill add`,
   `lionclaw channel add`, and `lionclaw apply` flow for a channel skill, then
   optionally starts the worker from the installed snapshot's `scripts/worker`.
-- `attach-terminal-test.sh`: rebuilds LionClaw, stops managed services for a specific `LIONCLAW_HOME`, and attaches the interactive terminal channel in the current TTY.
+- `attach-terminal-test.sh`: rebuilds LionClaw, stops the managed daemon for a specific `LIONCLAW_HOME`, and attaches the interactive terminal channel in the current TTY.
 
 ## Usage
 Run the same checks as GitHub CI:
@@ -90,7 +90,9 @@ This helper is intentionally an incubation path. It should stay thin: project
 path resolution, preflight, runtime image build, and orchestration only. Durable
 configuration still flows through `lionclaw onboard`, `lionclaw runtime add`,
 `lionclaw skill add`, `lionclaw channel add`, `lionclaw run`,
-`lionclaw channel attach`, and `lionclaw service ...`.
+`lionclaw channel attach`, and the product operation commands:
+`lionclaw up`, `lionclaw down`, `lionclaw status`, `lionclaw logs`, and
+`lionclaw doctor`.
 
 Fresh terminal-channel test home in one command on Linux with systemd user
 services:

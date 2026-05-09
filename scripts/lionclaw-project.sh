@@ -15,9 +15,9 @@ Commands:
   run              Configure the project, then run the runtime in the workspace
   attach           Configure the project, then attach the interactive terminal channel
   up               Configure the project and start the managed LionClaw daemon
-  down             Stop managed LionClaw services for this project home
-  status           Show managed service status for this project home
-  logs             Show managed service logs for this project home
+  down             Stop the managed LionClaw daemon and channel workers
+  status           Show LionClaw status for this project home
+  logs             Show LionClaw daemon and channel logs for this project home
   pairing-list     List channel pairing requests
   pairing-approve  Approve a pairing request: pairing-approve <peer-id> <code> [trust-tier]
   help             Show this message
@@ -807,7 +807,7 @@ case "$cmd" in
     print_context
     ensure_runtime_image
     ensure_project_config
-    run_lionclaw_action service up --runtime "$RUNTIME_ID"
+    run_lionclaw_action up
     ;;
   down)
     ensure_systemd_user
@@ -817,7 +817,7 @@ case "$cmd" in
       printf 'Project home is not onboarded yet; nothing to stop.\n'
       exit 0
     fi
-    run_lionclaw_action service down
+    run_lionclaw_action down
     ;;
   status)
     ensure_systemd_user
@@ -829,7 +829,7 @@ case "$cmd" in
     fi
     ensure_home_work_root_recorded
     printf 'Bind:              %s\n' "$(configured_bind || true)"
-    run_lionclaw service status
+    run_lionclaw status
     ;;
   logs)
     ensure_systemd_user
@@ -839,7 +839,7 @@ case "$cmd" in
       printf 'Project home is not onboarded yet.\n'
       exit 0
     fi
-    run_lionclaw service logs "$@"
+    run_lionclaw logs "$@"
     ;;
   pairing-list)
     print_context

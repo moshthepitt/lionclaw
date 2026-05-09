@@ -124,6 +124,14 @@ pub fn resolve_existing_project_root(selection: &TargetSelection) -> Result<Path
     resolve_project_root_from_cwd(selection.project.as_deref(), &cwd)
 }
 
+pub fn discover_project_root(selection: &TargetSelection) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    if selection.home.is_some() || selection.instance.is_some() {
+        bail!("project-wide commands cannot be combined with --home or --instance");
+    }
+    discover_project_root_from_cwd(selection.project.as_deref(), &cwd)
+}
+
 pub fn init_project(project_root: &Path) -> Result<ProjectInitResult> {
     let project_root = canonical_existing_dir(project_root, "project root")?;
     let project_dir = project_dir(&project_root);
@@ -427,6 +435,30 @@ fn resolve_project_root_from_cwd(project: Option<&Path>, cwd: &Path) -> Result<P
 
     bail!(
         "no LionClaw project found from {}; run from the project root, pass --project PATH, or pass --home PATH",
+        cwd.display()
+    )
+}
+
+fn discover_project_root_from_cwd(project: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
+    if let Some(project) = project {
+        return canonical_existing_dir(&absolutize_from(cwd, project), "project root");
+    }
+
+    let cwd = canonical_existing_dir(cwd, "current directory")?;
+    if let Some(_instance_home) = containing_project_instance_home(&cwd) {
+        bail!(
+            "This looks like a LionClaw instance home, not a project root.\nRun from the project root, or use --project <path>."
+        );
+    }
+
+    for candidate in [Some(cwd.as_path()), cwd.parent()].into_iter().flatten() {
+        if project_file(candidate).exists() {
+            return canonical_existing_dir(candidate, "project root");
+        }
+    }
+
+    bail!(
+        "no LionClaw project found from {}; run from the project root or pass --project PATH",
         cwd.display()
     )
 }
@@ -909,6 +941,22 @@ fn instances_dir(project_root: &Path) -> PathBuf {
 
 fn instance_home(project_root: &Path, name: &str) -> PathBuf {
     instances_dir(project_root).join(name)
+}
+
+pub fn project_dir_path(project_root: &Path) -> PathBuf {
+    project_dir(project_root)
+}
+
+pub fn project_file_path(project_root: &Path) -> PathBuf {
+    project_file(project_root)
+}
+
+pub fn instances_dir_path(project_root: &Path) -> PathBuf {
+    instances_dir(project_root)
+}
+
+pub fn instance_home_path(project_root: &Path, name: &str) -> PathBuf {
+    instance_home(project_root, name)
 }
 
 fn instance_config_path(home: &Path) -> PathBuf {

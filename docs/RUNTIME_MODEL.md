@@ -308,25 +308,35 @@ Operator-facing paths:
 - `lionclaw configure --runtime codex`
 - `lionclaw status`
 - `lionclaw status --all`
+- `lionclaw project status`
+- `lionclaw doctor`
+- `lionclaw doctor --all`
+- `lionclaw project doctor`
 - `lionclaw runtime add ...`
 - `lionclaw run [runtime]`
 - `lionclaw run --continue-last-session [runtime]`
 - `lionclaw run --timeout 4h [runtime]`
 - `lionclaw skill install ...`
+- `lionclaw skill list`
+- `lionclaw skill remove <alias>`
 - `lionclaw connect <channel-or-path>`
 - `lionclaw channel list`
 - `lionclaw channel remove <channel>`
 - `lionclaw job add|ls|show|run|pause|resume|rm`
-- `lionclaw service up --runtime [runtime]`
-- `lionclaw service down`
-- `lionclaw service status`
-- `lionclaw service logs`
+- `lionclaw up`
+- `lionclaw up --all`
+- `lionclaw down`
+- `lionclaw down --all`
+- `lionclaw logs [--daemon|--workers|--worker <channel>] [--tail N] [--since TIME] [-f]`
+- `lionclaw logs --all [--daemon|--workers|--worker <channel>]`
 
 `lionclaw skill install` copies a skill into the selected instance home's
-`skills/<alias>` directory. `lionclaw skill rm` deletes that installed alias
-from disk. `lionclaw connect <channel-or-path>` reads channel skill metadata,
-installs or binds the channel skill, records the selected instance's channel
-config, persists required channel env under `config/channels/`, and starts the
+`skills/<alias>` directory. `lionclaw skill list` reports installed aliases
+without following symlinks. `lionclaw skill remove <alias>` deletes that
+installed alias from disk only when no configured channel still uses it.
+`lionclaw connect <channel-or-path>` reads channel skill metadata, installs or
+binds the channel skill, records the selected instance's channel config,
+persists required channel env under `config/channels/`, and starts the
 interactive or service worker. Channel-bound skills stay host-only; every
 other installed alias is runtime-visible by default.
 
@@ -339,10 +349,17 @@ Direct `lionclaw run` reads the current installed skill and channel state each
 time it launches a runtime. Managed daemons bake an immutable applied skill and
 channel snapshot at startup, so skill or channel changes take effect after the
 daemon is restarted or reconciled through `lionclaw connect`,
-`lionclaw service up`, or low-level channel attach. `lionclaw service status`
-marks the daemon as `restart required` when the current filesystem/config state
-no longer matches that running snapshot, and it keeps stale managed channel
-units visible until the daemon is reconciled or stopped.
+`lionclaw up`, or low-level channel attach. `lionclaw status` marks the daemon
+as `restart required` when the current filesystem/config state no longer
+matches that running snapshot, and it keeps stale managed channel units visible
+until the daemon is reconciled or stopped.
+
+`lionclaw doctor` is read-only. It diagnoses target resolution, project and
+instance metadata, runtime configuration, managed unit state, channel skill
+metadata, and channel environment contracts. Errors exit with code 1, warnings
+alone exit with code 0, and an internal doctor failure exits with code 2.
+Project-wide operations use the current project or `--project PATH` only; they
+do not search global state or arbitrary instance homes.
 
 Raw HTTP is for workers, tests, and debugging. It is not the normal operator
 experience.

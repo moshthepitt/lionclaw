@@ -31,11 +31,16 @@ use crate::{
             ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig,
         },
         connect::{connect_channel, ConnectChannelRequest, ConnectEnvInputs, ConnectOutcome},
+        doctor::run_doctor,
+        operations::{
+            down_instance, no_managed_units_message, operate_project_instances,
+            project_log_components, selected_log_components, up_instance, write_journal_logs,
+            LogFilter, LogOptions, StackOperation,
+        },
         reconcile::{
-            add_channel, add_skill, down, logs, onboard, open_kernel,
-            open_runtime_kernel_for_work_root, pairing_approve, pairing_block, pairing_list,
-            remove_channel, remove_skill, resolve_installed_skill_worker_entrypoint,
-            resolve_stack_binaries, status_for_work_root, up_for_work_root, OnboardBindSelection,
+            add_channel, add_skill, onboard, open_kernel, open_runtime_kernel_for_work_root,
+            pairing_approve, pairing_block, pairing_list, remove_channel, remove_skill,
+            resolve_installed_skill_worker_entrypoint, OnboardBindSelection,
         },
         run::run_local,
         runtime::{resolve_runtime_id, validate_runtime_availability},
@@ -47,13 +52,14 @@ use crate::{
             channel_unit_name, existing_service_identity, unit_belongs_to_identity, ServiceManager,
             SystemdUserServiceManager,
         },
+        skills::{list_installed_skills, InstalledSkill},
         snapshot::SKILL_INSTALL_METADATA_FILE,
         status::{
-            missing_target_for_status, render_project_status_all, render_target_status,
-            validate_status_all_target,
+            missing_target_for_status, render_project_status_all_with_manager,
+            render_target_status_with_manager, validate_status_all_target,
         },
         target::{
-            adopt_project_instance, create_project_instance, init_project,
+            adopt_project_instance, create_project_instance, discover_project_root, init_project,
             list_project_instance_statuses, list_project_instances, resolve_existing_project_root,
             resolve_project_setup_root, resolve_target, TargetSelection, WorkRootRequirement,
         },
@@ -106,16 +112,16 @@ enum Command {
     Configure(ConfigureArgs),
     Connect(ConnectArgs),
     Run(RunArgs),
+    Up(AllArgs),
+    Down(AllArgs),
+    Logs(ProductLogsArgs),
     Status(StatusArgs),
+    Doctor(DoctorArgs),
     #[command(hide = true)]
     ProjectValidate(ProjectValidateArgs),
     Runtime {
         #[command(subcommand)]
         command: Box<RuntimeCommand>,
-    },
-    Service {
-        #[command(subcommand)]
-        command: ServiceCommand,
     },
     Skill {
         #[command(subcommand)]
@@ -169,9 +175,41 @@ struct StatusArgs {
     all: bool,
 }
 
+#[derive(Debug, Args)]
+struct AllArgs {
+    #[arg(long)]
+    all: bool,
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    #[arg(long)]
+    all: bool,
+}
+
+#[derive(Debug, Args)]
+struct ProductLogsArgs {
+    #[arg(short = 'f', long)]
+    follow: bool,
+    #[arg(long, default_value_t = 200)]
+    tail: usize,
+    #[arg(long)]
+    since: Option<String>,
+    #[arg(long)]
+    daemon: bool,
+    #[arg(long)]
+    workers: bool,
+    #[arg(long, value_name = "CHANNEL")]
+    worker: Option<String>,
+    #[arg(long)]
+    all: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum ProjectCommand {
     Init,
+    Status,
+    Doctor,
 }
 
 #[derive(Debug, Subcommand)]
@@ -197,7 +235,8 @@ struct InstanceCreateArgs {
 #[derive(Debug, Args)]
 struct InstanceAdoptArgs {
     name: String,
-    home: PathBuf,
+    #[arg(value_name = "HOME")]
+    source_home: PathBuf,
     #[arg(
         long = "work-root",
         value_name = "PATH",
@@ -239,26 +278,6 @@ struct ProjectValidateArgs {
     launch_mode: String,
     #[arg(long = "project-skill")]
     project_skills: Vec<String>,
-}
-
-#[derive(Debug, Subcommand)]
-enum ServiceCommand {
-    Up(ServiceUpArgs),
-    Down,
-    Status,
-    Logs(LogsArgs),
-}
-
-#[derive(Debug, Args)]
-struct ServiceUpArgs {
-    #[arg(long)]
-    runtime: Option<String>,
-}
-
-#[derive(Debug, Args)]
-struct LogsArgs {
-    #[arg(long, default_value_t = 200)]
-    lines: usize,
 }
 
 #[derive(Debug, Subcommand)]
@@ -313,6 +332,9 @@ struct RuntimeSetDefaultArgs {
 enum SkillCommand {
     Install(SkillAddArgs),
     Add(SkillAddArgs),
+    List,
+    Remove(SkillRmArgs),
+    #[command(hide = true)]
     Rm(SkillRmArgs),
     #[command(hide = true)]
     WorkerPath(SkillWorkerPathArgs),
@@ -562,6 +584,18 @@ pub async fn run() -> Result<ExitCode> {
                     result.instance.work_root.display()
                 );
             }
+            ProjectCommand::Status => {
+                validate_project_wide_target("project status", &target_selection)?;
+                let project_root = discover_project_root(&target_selection)?;
+                let manager = SystemdUserServiceManager;
+                let status =
+                    render_project_status_all_with_manager(&project_root, &manager).await?;
+                print!("{status}");
+            }
+            ProjectCommand::Doctor => {
+                validate_project_wide_target("project doctor", &target_selection)?;
+                return run_doctor_command(&target_selection, true).await;
+            }
         },
         Command::Instance { command } => match command {
             InstanceCommand::Create(args) => {
@@ -613,7 +647,7 @@ pub async fn run() -> Result<ExitCode> {
                 let instance = adopt_project_instance(
                     &project_root,
                     &args.name,
-                    &args.home,
+                    &args.source_home,
                     args.work_root.as_deref(),
                     args.create_work_root,
                 )?;
@@ -688,24 +722,103 @@ pub async fn run() -> Result<ExitCode> {
             )
             .await?;
         }
+        Command::Up(args) => {
+            let manager = SystemdUserServiceManager;
+            if args.all {
+                validate_project_wide_target("up --all", &target_selection)?;
+                let project_root = discover_project_root(&target_selection)?;
+                let report =
+                    operate_project_instances(&project_root, &manager, StackOperation::Up).await;
+                print!("{}", report.render());
+                if report.has_failures() {
+                    return Ok(ExitCode::from(1));
+                }
+            } else {
+                let target = resolved_target
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("up requires a resolved LionClaw target"))?;
+                let message =
+                    up_instance(&target.instance_home, &manager, target.require_work_root()?)
+                        .await?;
+                println!("{message}");
+            }
+        }
+        Command::Down(args) => {
+            let manager = SystemdUserServiceManager;
+            if args.all {
+                validate_project_wide_target("down --all", &target_selection)?;
+                let project_root = discover_project_root(&target_selection)?;
+                let report =
+                    operate_project_instances(&project_root, &manager, StackOperation::Down).await;
+                print!("{}", report.render());
+                if report.has_failures() {
+                    return Ok(ExitCode::from(1));
+                }
+            } else {
+                let target = resolved_target
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("down requires a resolved LionClaw target"))?;
+                let message = down_instance(&target.instance_home, &manager).await?;
+                println!("{message}");
+            }
+        }
+        Command::Logs(args) => {
+            let filter = parse_log_filter(&args)?;
+            let options = LogOptions {
+                follow: args.follow,
+                tail: args.tail,
+                since: args.since,
+            };
+            if args.all {
+                validate_project_wide_target("logs --all", &target_selection)?;
+                let project_root = discover_project_root(&target_selection)?;
+                let components = project_log_components(&project_root, &filter).await?;
+                if components.is_empty() {
+                    println!("{}", no_managed_units_message(true));
+                } else {
+                    let mut stdout = std::io::stdout();
+                    write_journal_logs(&components, &options, true, &mut stdout).await?;
+                }
+            } else {
+                let target = resolved_target
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("logs requires a resolved LionClaw target"))?;
+                let components = selected_log_components(
+                    &target.instance_home,
+                    target.instance_name.as_deref(),
+                    &filter,
+                )
+                .await?;
+                if components.is_empty() {
+                    println!("{}", no_managed_units_message(false));
+                } else {
+                    let mut stdout = std::io::stdout();
+                    write_journal_logs(&components, &options, false, &mut stdout).await?;
+                }
+            }
+        }
         Command::Status(args) => {
             if args.all {
                 validate_status_all_target(&target_selection)?;
-                let project_root =
-                    resolve_existing_project_root(&target_selection).map_err(|_| {
-                        anyhow!(
-                            "status --all requires a LionClaw project; run from the project root or pass --project PATH"
-                        )
-                    })?;
-                let status = render_project_status_all(&project_root).await?;
+                let project_root = discover_project_root(&target_selection)?;
+                let manager = SystemdUserServiceManager;
+                let status =
+                    render_project_status_all_with_manager(&project_root, &manager).await?;
                 print!("{status}");
             } else {
                 let target = resolved_target
                     .as_ref()
                     .ok_or_else(missing_target_for_status)?;
-                let status = render_target_status(target).await?;
+                let manager = SystemdUserServiceManager;
+                let status = render_target_status_with_manager(target, &manager).await?;
                 print!("{status}");
             }
+        }
+        Command::Doctor(args) => {
+            if args.all {
+                validate_project_wide_target("doctor --all", &target_selection)?;
+            }
+            return run_doctor_command(&target_selection, args.all).await;
         }
         Command::ProjectValidate(args) => {
             let issues = validate_project_managed_config(&home, &args).await?;
@@ -767,56 +880,6 @@ pub async fn run() -> Result<ExitCode> {
                 println!("default runtime set to {}", args.id);
             }
         },
-        Command::Service { command } => {
-            let manager = SystemdUserServiceManager;
-            match command {
-                ServiceCommand::Up(args) => {
-                    let config = OperatorConfig::load(&home).await?;
-                    let runtime_id = resolve_runtime_id(&config, args.runtime.as_deref())?;
-                    let binaries = resolve_stack_binaries()?;
-                    let work_root = required_command_work_root(&resolved_target, "service up")?;
-                    let applied =
-                        up_for_work_root(&home, &manager, &runtime_id, &binaries, work_root)
-                            .await?;
-                    let managed_channels = applied
-                        .config
-                        .channels
-                        .iter()
-                        .filter(|channel| channel.launch_mode == ChannelLaunchMode::Service)
-                        .count();
-                    println!(
-                        "started LionClaw services with runtime {runtime_id} ({managed_channels} channels)"
-                    );
-                }
-                ServiceCommand::Down => {
-                    down(&home, &manager).await?;
-                    println!("stopped managed LionClaw services");
-                }
-                ServiceCommand::Status => {
-                    let work_root = required_command_work_root(&resolved_target, "service status")?;
-                    let stack = status_for_work_root(&home, &manager, work_root).await?;
-                    println!("daemon: {}", stack.daemon_status);
-                    for channel in stack.channels {
-                        println!(
-                            "channel={} skill={} launch={} unit={} peers(pending={},approved={},blocked={}) inbound={} outbound={}",
-                            channel.id,
-                            channel.skill,
-                            channel.launch_mode,
-                            channel.unit_status,
-                            channel.pending_peers,
-                            channel.approved_peers,
-                            channel.blocked_peers,
-                            channel.latest_inbound_at.as_deref().unwrap_or("-"),
-                            channel.latest_outbound_at.as_deref().unwrap_or("-"),
-                        );
-                    }
-                }
-                ServiceCommand::Logs(args) => {
-                    let output = logs(&home, &manager, args.lines).await?;
-                    print!("{output}");
-                }
-            }
-        }
         Command::Skill { command } => match command {
             SkillCommand::Add(args) | SkillCommand::Install(args) => {
                 let alias = args
@@ -826,7 +889,11 @@ pub async fn run() -> Result<ExitCode> {
                 println!("installed skill {alias}");
                 print_runtime_state_change_note();
             }
-            SkillCommand::Rm(args) => {
+            SkillCommand::List => {
+                let skills = list_installed_skills(&home).await?;
+                print_installed_skills(&skills);
+            }
+            SkillCommand::Remove(args) | SkillCommand::Rm(args) => {
                 let removed = remove_skill(&home, &args.alias).await?;
                 println!(
                     "{} {}",
@@ -1295,6 +1362,27 @@ fn resolve_command_target(
         Command::Configure(_) => Some(WorkRootRequirement::Optional),
         Command::Connect(_) => Some(WorkRootRequirement::Required),
         Command::Run(_) => Some(WorkRootRequirement::Required),
+        Command::Up(args) => {
+            if args.all {
+                None
+            } else {
+                Some(WorkRootRequirement::Required)
+            }
+        }
+        Command::Down(args) => {
+            if args.all {
+                None
+            } else {
+                Some(WorkRootRequirement::Optional)
+            }
+        }
+        Command::Logs(args) => {
+            if args.all {
+                None
+            } else {
+                Some(WorkRootRequirement::Optional)
+            }
+        }
         Command::Status(args) => {
             if args.all {
                 None
@@ -1302,10 +1390,7 @@ fn resolve_command_target(
                 Some(WorkRootRequirement::Optional)
             }
         }
-        Command::Service { command } => match command {
-            ServiceCommand::Up(_) | ServiceCommand::Status => Some(WorkRootRequirement::Required),
-            ServiceCommand::Down | ServiceCommand::Logs(_) => Some(WorkRootRequirement::Optional),
-        },
+        Command::Doctor(_) => None,
         Command::Channel { command } => match command {
             ChannelCommand::Attach(_) => Some(WorkRootRequirement::Required),
             ChannelCommand::List(args) if args.all => None,
@@ -1357,6 +1442,68 @@ fn required_command_work_root<'a>(
         .as_ref()
         .ok_or_else(|| anyhow!("{command} requires a resolved LionClaw target"))?;
     target.require_work_root()
+}
+
+fn validate_project_wide_target(command: &str, selection: &TargetSelection) -> Result<()> {
+    if selection.home.is_some() {
+        bail!("{command} requires a project context and cannot be combined with --home");
+    }
+    if selection.instance.is_some() {
+        bail!("{command} is project-wide and cannot be combined with --instance");
+    }
+    Ok(())
+}
+
+fn parse_log_filter(args: &ProductLogsArgs) -> Result<LogFilter> {
+    let selected =
+        usize::from(args.daemon) + usize::from(args.workers) + usize::from(args.worker.is_some());
+    if selected > 1 {
+        bail!("logs accepts only one of --daemon, --workers, or --worker");
+    }
+    if args.daemon {
+        Ok(LogFilter::Daemon)
+    } else if args.workers {
+        Ok(LogFilter::Workers)
+    } else if let Some(worker) = args.worker.as_deref() {
+        Ok(LogFilter::Worker(worker.to_string()))
+    } else {
+        Ok(LogFilter::Default)
+    }
+}
+
+async fn run_doctor_command(selection: &TargetSelection, all: bool) -> Result<ExitCode> {
+    let manager = SystemdUserServiceManager;
+    match run_doctor(selection, all, &manager).await {
+        Ok(report) => {
+            print!("{}", report.render());
+            if report.has_errors() {
+                Ok(ExitCode::from(1))
+            } else {
+                Ok(ExitCode::SUCCESS)
+            }
+        }
+        Err(err) => {
+            eprintln!("doctor: {err:#}");
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
+fn print_installed_skills(skills: &[InstalledSkill]) {
+    if skills.is_empty() {
+        println!("no skills installed");
+        return;
+    }
+    println!("skill       source                         reference  status");
+    for skill in skills {
+        println!(
+            "{:<11} {:<30} {:<10} {}",
+            skill.alias,
+            skill.source.as_deref().unwrap_or("-"),
+            skill.reference.as_deref().unwrap_or("-"),
+            skill.status.as_str()
+        );
+    }
 }
 
 async fn configure_runtime_with_io<R: BufRead, W: Write>(
@@ -1563,7 +1710,7 @@ fn systemd_user_unit_dir_for_cli() -> Result<PathBuf> {
 
 fn print_runtime_state_change_note() {
     println!(
-        "direct runs pick this up on the next launch; rerun 'lionclaw connect <channel>' or 'lionclaw service up' if a managed daemon is already running"
+        "direct runs pick this up on the next launch; rerun 'lionclaw connect <channel>' or 'lionclaw up' if a managed daemon is already running"
     );
 }
 
@@ -1932,6 +2079,81 @@ mod tests {
         )
     }
 
+    fn default_logs_args() -> ProductLogsArgs {
+        ProductLogsArgs {
+            follow: false,
+            tail: 200,
+            since: None,
+            daemon: false,
+            workers: false,
+            worker: None,
+            all: false,
+        }
+    }
+
+    #[test]
+    fn parses_product_log_filter_exclusively() {
+        let mut args = default_logs_args();
+        args.worker = Some("telegram".to_string());
+        assert_eq!(
+            parse_log_filter(&args).expect("worker filter"),
+            LogFilter::Worker("telegram".to_string())
+        );
+
+        args.daemon = true;
+        let err = parse_log_filter(&args).expect_err("conflicting filters should fail");
+        assert!(err.to_string().contains("only one"));
+    }
+
+    #[test]
+    fn instance_adopt_positional_home_does_not_set_global_home() {
+        let cli = Cli::try_parse_from([
+            "lionclaw",
+            "instance",
+            "adopt",
+            "shared",
+            "/tmp/lionclaw-home",
+            "--work-root",
+            ".",
+        ])
+        .expect("parse instance adopt");
+
+        assert!(cli.home.is_none());
+        match cli.command {
+            Command::Instance {
+                command: InstanceCommand::Adopt(args),
+            } => {
+                assert_eq!(args.name, "shared");
+                assert_eq!(args.source_home, PathBuf::from("/tmp/lionclaw-home"));
+                assert_eq!(args.work_root, Some(PathBuf::from(".")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_wide_commands_reject_home_and_instance_selectors() {
+        let with_home = TargetSelection {
+            home: Some(PathBuf::from("/tmp/lionclaw-home")),
+            project: None,
+            instance: None,
+        };
+        let err =
+            validate_project_wide_target("logs --all", &with_home).expect_err("--home should fail");
+        assert!(err.to_string().contains("cannot be combined with --home"));
+
+        let with_instance = TargetSelection {
+            home: None,
+            project: None,
+            instance: Some("reviewer".to_string()),
+        };
+        let err = validate_project_wide_target("logs --all", &with_instance)
+            .expect_err("--instance should fail");
+        assert!(err
+            .to_string()
+            .contains("cannot be combined with --instance"));
+    }
+
     #[test]
     fn parses_duration_schedule_as_once() {
         let before = Utc::now();
@@ -2033,18 +2255,7 @@ mod tests {
                     runtime: None,
                 }),
             ),
-            (
-                "service up",
-                Command::Service {
-                    command: ServiceCommand::Up(ServiceUpArgs { runtime: None }),
-                },
-            ),
-            (
-                "service status",
-                Command::Service {
-                    command: ServiceCommand::Status,
-                },
-            ),
+            ("up", Command::Up(AllArgs { all: false })),
             (
                 "channel attach",
                 Command::Channel {

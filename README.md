@@ -15,9 +15,9 @@ credentials, and long-running workflows while keeping them inside an
 environment you define.
 
 Note: LionClaw's direct `lionclaw run` path currently supports Unix-like
-systems (Linux/macOS). Managed daemon paths, including `service up` and channel
-auto-start, currently require Linux with systemd user services. Windows is out
-of scope.
+systems (Linux/macOS). Managed background paths, including `lionclaw up` and
+channel auto-start, currently require Linux with systemd user services.
+Windows is out of scope.
 
 ## Why LionClaw
 
@@ -116,12 +116,33 @@ and its immediate parent. It does not walk arbitrarily up the filesystem.
 Use `--home PATH` only when you need to target one exact instance home and
 bypass project discovery.
 
+Everyday operations stay at the top level:
+
+```bash
+./target/release/lionclaw status
+./target/release/lionclaw project status
+./target/release/lionclaw up
+./target/release/lionclaw logs --tail 200
+./target/release/lionclaw logs -f --worker telegram
+./target/release/lionclaw doctor
+```
+
+Project-wide forms are explicit and never scan arbitrary LionClaw homes:
+
+```bash
+./target/release/lionclaw up --all
+./target/release/lionclaw down --all
+./target/release/lionclaw logs --all --tail 200
+./target/release/lionclaw doctor --all
+```
+
 Installed non-channel skills are mounted read-only under `/lionclaw/skills/<alias>`
 and projected into each runtime's native skill directory inside `/runtime/home`.
-`lionclaw skill install` copies a skill into that canonical skills directory, and
-`lionclaw skill rm` removes it physically. `lionclaw connect <channel>` binds
-channel skills as host workers; every other installed alias is runtime-visible
-by default.
+`lionclaw skill install` copies a skill into that canonical skills directory,
+`lionclaw skill list` shows installed aliases, and `lionclaw skill remove`
+removes one physically when no configured channel still uses it.
+`lionclaw connect <channel>` binds channel skills as host workers; every other
+installed alias is runtime-visible by default.
 
 Runtime-specific provider settings stay with the runtime. For example, if a
 Codex profile leaves `model` unset, LionClaw reuses the current host Codex
@@ -298,7 +319,7 @@ Pairing and logs remain explicit:
 
 ```bash
 ./target/release/lionclaw channel pairing list --channel-id telegram
-./target/release/lionclaw service logs
+./target/release/lionclaw logs --worker telegram
 ```
 
 ## State Layout

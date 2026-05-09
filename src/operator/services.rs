@@ -241,7 +241,7 @@ fn canonical_home_root(home: &LionClawHome) -> Result<PathBuf> {
         .with_context(|| format!("failed to resolve {}", home.root().display()))
 }
 
-fn unit_home_root(path: &Path) -> Result<Option<PathBuf>> {
+pub fn unit_recorded_home_root(path: &Path) -> Result<Option<PathBuf>> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -775,7 +775,7 @@ fn ensure_owned_or_absent(home: &LionClawHome, path: &Path) -> Result<()> {
             path.display()
         );
     }
-    let recorded_home = unit_home_root(path)?;
+    let recorded_home = unit_recorded_home_root(path)?;
     let home_root = canonical_home_root(home)?;
     match recorded_home {
         Some(recorded) if recorded == home_root || !recorded.exists() => Ok(()),
@@ -870,7 +870,7 @@ fn prune_user_unit_dir(home: &LionClawHome, dir: &Path, desired_names: &[&str]) 
         if !metadata.is_file() {
             continue;
         }
-        if unit_home_root(&path)?.as_deref() == Some(home_root.as_path()) {
+        if unit_recorded_home_root(&path)?.as_deref() == Some(home_root.as_path()) {
             remove_path_if_exists(&path)?;
         }
     }

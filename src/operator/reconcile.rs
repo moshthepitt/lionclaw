@@ -123,8 +123,9 @@ pub async fn remove_skill(home: &LionClawHome, alias: &str) -> Result<bool> {
         .find(|channel| channel.skill == alias)
     {
         return Err(anyhow!(
-            "skill alias '{}' is in use by channel '{}'; remove the channel first",
+            "skill alias '{}' is in use by channel '{}'; remove the channel first with 'lionclaw channel remove {}'",
             alias,
+            channel.id,
             channel.id
         ));
     }
@@ -255,7 +256,7 @@ pub async fn up_for_work_root<M: ServiceManager>(
             let daemon_status = manager.unit_status(&daemon_unit).await?;
             if !unit_status_is_active(&daemon_status) {
                 return Err(anyhow!(
-                    "bind '{}' is already served by this LionClaw home, but not by the managed {} unit; stop the foreground daemon before running 'lionclaw service up'",
+                    "bind '{}' is already served by this LionClaw home, but not by the managed {} unit; stop the foreground daemon before running 'lionclaw up'",
                     config.daemon.bind,
                     daemon_unit
                 ));
@@ -263,7 +264,7 @@ pub async fn up_for_work_root<M: ServiceManager>(
         }
         DaemonClassification::SameHomeDifferentProject => {
             return Err(anyhow!(
-                "bind '{}' is already served by this LionClaw home for a different project; stop that daemon before running 'lionclaw service up' from this project",
+                "bind '{}' is already served by this LionClaw home for a different project; stop that daemon before running 'lionclaw up' from this project",
                 config.daemon.bind
             ));
         }
@@ -276,7 +277,7 @@ pub async fn up_for_work_root<M: ServiceManager>(
         }
         DaemonClassification::IncompatibleLionClaw => {
             return Err(anyhow!(
-                "bind '{}' is already served by an older LionClaw daemon; restart that daemon before running 'lionclaw service up'",
+                "bind '{}' is already served by an older LionClaw daemon; restart that daemon before running 'lionclaw up'",
                 config.daemon.bind
             ));
         }
@@ -2137,7 +2138,7 @@ mod tests {
             &current_work_root(),
         )
         .await
-        .expect_err("private-network failure should block service up");
+        .expect_err("private-network failure should block up");
 
         assert!(err.to_string().contains("requires network-mode 'on'"));
         assert!(err

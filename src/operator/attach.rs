@@ -213,7 +213,7 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
         .ok_or_else(|| anyhow!("channel '{channel_id}' is not configured"))?;
     if channel.launch_mode != ChannelLaunchMode::Interactive {
         return Err(anyhow!(
-            "channel '{}' uses launch mode '{}'; use 'lionclaw service up' for service channels",
+            "channel '{}' uses launch mode '{}'; run 'lionclaw up' to start managed channels",
             channel_id,
             channel.launch_mode.as_str()
         ));
@@ -595,7 +595,7 @@ mod tests {
         )
         .await
         .expect_err("service launch mode should fail");
-        assert!(err.to_string().contains("use 'lionclaw service up'"));
+        assert!(err.to_string().contains("run 'lionclaw up'"));
     }
 
     #[cfg(unix)]
