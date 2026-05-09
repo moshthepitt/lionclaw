@@ -2044,7 +2044,7 @@ async fn install_and_bind_channel(env: &TestEnv, channel_id: &str) {
         &env.home,
         channel_id.to_string(),
         skill_alias,
-        ChannelLaunchMode::Service,
+        ChannelLaunchMode::Background,
         Vec::new(),
     )
     .await

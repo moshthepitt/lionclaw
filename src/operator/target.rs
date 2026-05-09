@@ -983,9 +983,9 @@ fn ensure_instance_base_dirs(home: &LionClawHome) -> Result<()> {
         home.skills_dir(),
         home.runtime_dir(),
         home.logs_dir(),
-        home.services_dir(),
-        home.services_env_dir(),
-        home.services_systemd_dir(),
+        home.units_dir(),
+        home.units_env_dir(),
+        home.units_systemd_dir(),
         home.workspace_dir(crate::home::DEFAULT_WORKSPACE),
     ] {
         fs::create_dir_all(&path)

@@ -725,7 +725,7 @@ mod tests {
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
             id: "terminal".to_string(),
             skill: "visible".to_string(),
-            launch_mode: crate::operator::config::ChannelLaunchMode::Service,
+            launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: Vec::new(),
         });
@@ -763,7 +763,7 @@ mod tests {
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
             id: "terminal".to_string(),
             skill: "visible".to_string(),
-            launch_mode: crate::operator::config::ChannelLaunchMode::Service,
+            launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: vec!["FIRST_KEY".to_string()],
         });
@@ -774,7 +774,7 @@ mod tests {
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
             id: "terminal".to_string(),
             skill: "visible".to_string(),
-            launch_mode: crate::operator::config::ChannelLaunchMode::Service,
+            launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: vec!["SECOND_KEY".to_string()],
         });

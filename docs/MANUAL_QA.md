@@ -20,7 +20,7 @@ Run this before merging behavior-changing work that touches:
 - runtime execution or Podman confinement
 - Codex auth/config staging
 - runtime image identity or selected-runtime resolution
-- daemon compatibility, service reuse, or project scoping
+- daemon compatibility, daemon reuse, or project scoping
 - `lionclaw run`, `lionclaw up`, `channel attach`, terminal channels, or jobs
 - runtime secrets, drafts, continuity, or session recovery
 
@@ -326,7 +326,7 @@ done
 printf '%s\n' "$after_info"
 test -n "$after_info"
 grep -E '^(CODEX_HOME|LIONCLAW_DAEMON_FINGERPRINT)=' \
-  "$LIONCLAW_HOME/services/env/lionclawd.env" || true
+  "$LIONCLAW_HOME/units/env/lionclawd.env" || true
 ```
 
 Expected:

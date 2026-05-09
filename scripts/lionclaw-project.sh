@@ -260,9 +260,9 @@ ensure_podman() {
 }
 
 ensure_systemd_user() {
-  has_cmd systemctl || die "systemd user services are required for this command"
+  has_cmd systemctl || die "the systemd user manager is required for this command"
   systemctl --user show-environment >/dev/null 2>&1 \
-    || die "systemd user services are unavailable for this shell"
+    || die "the systemd user manager is unavailable for this shell"
 }
 
 build_lionclaw_bin() {

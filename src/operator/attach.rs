@@ -16,6 +16,7 @@ use crate::{
     operator::{
         config::ChannelLaunchMode,
         daemon_probe::{classify_daemon, wait_for_same_home_daemon, DaemonClassification},
+        managed_units::UnitManager,
         reconcile::{
             base_url_from_bind, load_operator_state, resolve_applied_skill_worker_entrypoint,
             resolve_required_channel_env, up_for_work_root, StackBinaryPaths,
@@ -24,7 +25,6 @@ use crate::{
             resolve_runtime_execution_context, resolve_runtime_id,
             validate_runtime_launch_prerequisites,
         },
-        services::ServiceManager,
     },
 };
 
@@ -33,11 +33,11 @@ pub(crate) struct ChannelAttachSpec {
     pub worker_path: PathBuf,
     pub bind_addr: String,
     pub env: Vec<(String, String)>,
-    pub started_services: bool,
+    pub started_managed_units: bool,
     pub expected_daemon_fingerprint: String,
 }
 
-pub async fn attach_channel<M: ServiceManager>(
+pub async fn attach_channel<M: UnitManager>(
     home: &LionClawHome,
     manager: &M,
     work_root: &Path,
@@ -58,7 +58,7 @@ pub async fn attach_channel<M: ServiceManager>(
     .await
 }
 
-pub(crate) async fn attach_channel_with_binaries<M: ServiceManager>(
+pub(crate) async fn attach_channel_with_binaries<M: UnitManager>(
     home: &LionClawHome,
     manager: &M,
     work_root: &Path,
@@ -80,7 +80,7 @@ pub(crate) async fn attach_channel_with_binaries<M: ServiceManager>(
     )
     .await?;
 
-    if spec.started_services {
+    if spec.started_managed_units {
         match wait_for_same_home_daemon(
             &spec.bind_addr,
             &home_id,
@@ -134,7 +134,7 @@ pub(crate) async fn attach_channel_with_binaries<M: ServiceManager>(
     launch_channel_attach(spec).await
 }
 
-pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
+pub(crate) async fn prepare_channel_attach<M: UnitManager>(
     home: &LionClawHome,
     manager: &M,
     work_root: &Path,
@@ -162,7 +162,7 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
         &local_state.applied_state,
     );
     let home_id = home.ensure_home_id().await?;
-    let mut started_services = false;
+    let mut started_managed_units = false;
     let applied = match classify_daemon(
         &initial_config.daemon.bind,
         &home_id,
@@ -172,12 +172,12 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
     .await?
     {
         DaemonClassification::Absent => {
-            started_services = true;
+            started_managed_units = true;
             up_for_work_root(home, manager, &initial_runtime_id, binaries, work_root).await?
         }
         DaemonClassification::SameHome => local_state,
         DaemonClassification::SameHomeDifferentConfig => {
-            started_services = true;
+            started_managed_units = true;
             up_for_work_root(home, manager, &initial_runtime_id, binaries, work_root).await?
         }
         DaemonClassification::SameHomeDifferentProject => {
@@ -271,7 +271,7 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
         worker_path,
         bind_addr: applied.config.daemon.bind,
         env: env.into_iter().collect(),
-        started_services,
+        started_managed_units,
         expected_daemon_fingerprint,
     })
 }
@@ -337,11 +337,9 @@ mod tests {
         operator::{
             channel_env::{merge_channel_env, ChannelEnv},
             config::{ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig},
+            managed_units::{daemon_unit_name, ensure_unit_identity, FakeUnitManager, UnitManager},
             reconcile::{add_channel, add_skill},
             runtime::resolve_runtime_execution_context,
-            services::{
-                daemon_unit_name, ensure_service_identity, FakeServiceManager, ServiceManager,
-            },
         },
     };
 
@@ -361,7 +359,7 @@ mod tests {
     }
 
     fn test_daemon_unit_name(home: &LionClawHome) -> String {
-        let identity = ensure_service_identity(home).expect("service identity");
+        let identity = ensure_unit_identity(home).expect("unit identity");
         daemon_unit_name(&identity)
     }
 
@@ -390,7 +388,7 @@ mod tests {
     #[cfg(unix)]
     async fn seed_interactive_channel(
         launch_mode: ChannelLaunchMode,
-    ) -> (tempfile::TempDir, LionClawHome, FakeServiceManager) {
+    ) -> (tempfile::TempDir, LionClawHome, FakeUnitManager) {
         let (temp_dir, home, manager, _listener) =
             seed_interactive_channel_with_bind(launch_mode, false).await;
         (temp_dir, home, manager)
@@ -402,7 +400,7 @@ mod tests {
     ) -> (
         tempfile::TempDir,
         LionClawHome,
-        FakeServiceManager,
+        FakeUnitManager,
         std::net::TcpListener,
     ) {
         let (temp_dir, home, manager, listener) =
@@ -422,7 +420,7 @@ mod tests {
     ) -> (
         tempfile::TempDir,
         LionClawHome,
-        FakeServiceManager,
+        FakeUnitManager,
         Option<std::net::TcpListener>,
     ) {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -502,7 +500,7 @@ mod tests {
         .await
         .expect("add channel");
 
-        (temp_dir, home, FakeServiceManager::default(), listener)
+        (temp_dir, home, FakeUnitManager::default(), listener)
     }
 
     async fn spawn_probe_server(
@@ -520,7 +518,7 @@ mod tests {
 
     #[cfg(unix)]
     struct RemovingInstalledSkillOnStartManager {
-        inner: FakeServiceManager,
+        inner: FakeUnitManager,
         home: LionClawHome,
         alias: String,
     }
@@ -529,7 +527,7 @@ mod tests {
     impl RemovingInstalledSkillOnStartManager {
         fn new(home: &LionClawHome, alias: &str) -> Self {
             Self {
-                inner: FakeServiceManager::default(),
+                inner: FakeUnitManager::default(),
                 home: home.clone(),
                 alias: alias.to_string(),
             }
@@ -547,11 +545,11 @@ mod tests {
 
     #[cfg(unix)]
     #[async_trait]
-    impl ServiceManager for RemovingInstalledSkillOnStartManager {
+    impl UnitManager for RemovingInstalledSkillOnStartManager {
         async fn apply_units(
             &self,
             home: &LionClawHome,
-            units: &[crate::operator::services::ManagedServiceUnit],
+            units: &[crate::operator::managed_units::ManagedUnit],
         ) -> Result<Vec<String>> {
             self.inner.apply_units(home, units).await
         }
@@ -581,8 +579,9 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn prepare_channel_attach_rejects_service_channels() {
-        let (_temp_dir, home, manager) = seed_interactive_channel(ChannelLaunchMode::Service).await;
+    async fn prepare_channel_attach_rejects_background_channels() {
+        let (_temp_dir, home, manager) =
+            seed_interactive_channel(ChannelLaunchMode::Background).await;
 
         let err = prepare_channel_attach(
             &home,
@@ -594,7 +593,7 @@ mod tests {
             &binaries(),
         )
         .await
-        .expect_err("service launch mode should fail");
+        .expect_err("background launch mode should fail");
         assert!(err.to_string().contains("run 'lionclaw up'"));
     }
 
@@ -626,7 +625,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn prepare_channel_attach_builds_ephemeral_tail_env_and_starts_services() {
+    async fn prepare_channel_attach_builds_ephemeral_tail_env_and_starts_managed_units() {
         let (_temp_dir, home, manager) =
             seed_interactive_channel(ChannelLaunchMode::Interactive).await;
 
@@ -643,7 +642,7 @@ mod tests {
         .expect("prepare attach");
 
         assert!(
-            spec.started_services,
+            spec.started_managed_units,
             "daemon should be ensured when unreachable"
         );
         assert!(
@@ -756,7 +755,7 @@ mod tests {
             worker_path: worker,
             bind_addr: "127.0.0.1:0".to_string(),
             env: vec![("LIONCLAW_CHANNEL_ID".to_string(), "terminal".to_string())],
-            started_services: false,
+            started_managed_units: false,
             expected_daemon_fingerprint: String::new(),
         })
         .await
@@ -792,7 +791,7 @@ mod tests {
         .expect("prepare attach");
 
         assert!(
-            spec.started_services,
+            spec.started_managed_units,
             "daemon should be ensured when unreachable"
         );
         assert!(
@@ -825,7 +824,7 @@ mod tests {
                     let project_scope = current_project_scope();
                     move || {
                         let response = DaemonInfoResponse {
-                            service: "lionclawd".to_string(),
+                            daemon: "lionclawd".to_string(),
                             status: "ok".to_string(),
                             home_id: home_id.clone(),
                             home_root: home_root.clone(),
@@ -853,7 +852,10 @@ mod tests {
         .await
         .expect("prepare attach");
 
-        assert!(!spec.started_services, "same-home daemon should be reused");
+        assert!(
+            !spec.started_managed_units,
+            "same-home daemon should be reused"
+        );
     }
 
     #[cfg(unix)]
@@ -875,7 +877,7 @@ mod tests {
                     let project_scope = current_project_scope();
                     move || {
                         let response = DaemonInfoResponse {
-                            service: "lionclawd".to_string(),
+                            daemon: "lionclawd".to_string(),
                             status: "ok".to_string(),
                             home_id: home_id.clone(),
                             home_root: home_root.clone(),
@@ -908,7 +910,10 @@ mod tests {
             env.get("LIONCLAW_RUNTIME_ID").map(String::as_str),
             Some("codex")
         );
-        assert!(!spec.started_services, "same-home daemon should be reused");
+        assert!(
+            !spec.started_managed_units,
+            "same-home daemon should be reused"
+        );
     }
 
     #[cfg(unix)]
@@ -929,7 +934,7 @@ mod tests {
                     let project_scope = current_project_scope();
                     move || {
                         let response = DaemonInfoResponse {
-                            service: "lionclawd".to_string(),
+                            daemon: "lionclawd".to_string(),
                             status: "ok".to_string(),
                             home_id: home_id.clone(),
                             home_root: home_root.clone(),
@@ -961,7 +966,10 @@ mod tests {
         .await
         .expect("prepare attach");
 
-        assert!(spec.started_services, "stale daemon should be reconciled");
+        assert!(
+            spec.started_managed_units,
+            "stale daemon should be reconciled"
+        );
         assert!(
             manager
                 .was_restarted(&daemon_unit)
@@ -990,7 +998,7 @@ mod tests {
                     let project_scope = current_project_scope();
                     move || {
                         let response = DaemonInfoResponse {
-                            service: "lionclawd".to_string(),
+                            daemon: "lionclawd".to_string(),
                             status: "ok".to_string(),
                             home_id: home_id.clone(),
                             home_root: home_root.clone(),
@@ -1038,7 +1046,7 @@ mod tests {
                     let bind_addr = bind_addr.clone();
                     move || async move {
                         Json(DaemonInfoResponse {
-                            service: "lionclawd".to_string(),
+                            daemon: "lionclawd".to_string(),
                             status: "ok".to_string(),
                             home_id: "foreign-home".to_string(),
                             home_root: "/tmp/foreign-home".to_string(),
@@ -1076,7 +1084,7 @@ mod tests {
         let _server = spawn_probe_server(
             Router::new().route(
                 "/health",
-                get(|| async { Json(json!({"service": "lionclawd", "status": "ok"})) }),
+                get(|| async { Json(json!({"daemon": "lionclawd", "status": "ok"})) }),
             ),
             listener,
         )
@@ -1116,7 +1124,7 @@ mod tests {
                     let home_root = home_root.clone();
                     move || async move {
                         Json(DaemonInfoResponse {
-                            service: "lionclawd".to_string(),
+                            daemon: "lionclawd".to_string(),
                             status: "ok".to_string(),
                             home_id: home_id.clone(),
                             home_root: home_root.clone(),

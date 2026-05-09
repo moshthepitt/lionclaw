@@ -13,10 +13,10 @@ use crate::home::LionClawHome;
 
 use super::{
     config::{ChannelLaunchMode, OperatorConfig},
+    managed_units::{channel_unit_name, daemon_unit_name, existing_unit_identity, UnitManager},
     reconcile::{down, resolve_stack_binaries, up_for_work_root},
     redaction::SecretRedactor,
     runtime::resolve_runtime_id,
-    services::{channel_unit_name, daemon_unit_name, existing_service_identity, ServiceManager},
     target::{list_project_instance_statuses, InstanceStatusEntry},
 };
 
@@ -59,7 +59,7 @@ impl ProjectOperationReport {
     }
 }
 
-pub async fn up_instance<M: ServiceManager>(
+pub async fn up_instance<M: UnitManager>(
     home: &LionClawHome,
     manager: &M,
     work_root: &Path,
@@ -74,19 +74,19 @@ pub async fn up_instance<M: ServiceManager>(
         .config
         .channels
         .iter()
-        .filter(|channel| channel.launch_mode == ChannelLaunchMode::Service)
+        .filter(|channel| channel.launch_mode == ChannelLaunchMode::Background)
         .count();
     Ok(format!(
-        "started daemon and {worker_count} service worker(s) with runtime {runtime_id}"
+        "started daemon and {worker_count} background worker(s) with runtime {runtime_id}"
     ))
 }
 
-pub async fn down_instance<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Result<String> {
+pub async fn down_instance<M: UnitManager>(home: &LionClawHome, manager: &M) -> Result<String> {
     down(home, manager).await?;
     Ok("stopped owned managed units".to_string())
 }
 
-pub async fn operate_project_instances<M: ServiceManager>(
+pub async fn operate_project_instances<M: UnitManager>(
     project_root: &Path,
     manager: &M,
     operation: StackOperation,
@@ -174,7 +174,7 @@ pub async fn selected_log_components(
     instance: Option<&str>,
     filter: &LogFilter,
 ) -> Result<Vec<LogComponent>> {
-    let Some(identity) = existing_service_identity(home)? else {
+    let Some(identity) = existing_unit_identity(home)? else {
         return Ok(Vec::new());
     };
     let config = OperatorConfig::load(home).await?;
@@ -188,7 +188,7 @@ pub async fn selected_log_components(
     let worker_components = config
         .channels
         .iter()
-        .filter(|channel| channel.launch_mode == ChannelLaunchMode::Service)
+        .filter(|channel| channel.launch_mode == ChannelLaunchMode::Background)
         .map(|channel| LogComponent {
             home: home.clone(),
             instance: instance.clone(),
@@ -215,7 +215,7 @@ pub async fn selected_log_components(
                     "channel '{channel_id}' is not configured for the selected instance"
                 ));
             };
-            if channel.launch_mode != ChannelLaunchMode::Service {
+            if channel.launch_mode != ChannelLaunchMode::Background {
                 return Err(anyhow!(
                     "channel '{channel_id}' is configured as {}; logs --worker targets background channel workers only",
                     channel.launch_mode.as_str()

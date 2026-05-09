@@ -68,7 +68,7 @@ the trusted Rust core.
 1. LionClaw is runtime-agnostic, but not runtime-flattening. Different agents
    may expose different strengths.
 2. `lionclaw run [runtime]` is the canonical interactive product path.
-3. Runtime selection happens at invocation or service startup, not when a
+3. Runtime selection happens at invocation or background startup, not when a
    channel is installed.
 4. Identity and continuity are runtime-independent and come from assistant-home
    files plus durable LionClaw session state.
@@ -93,7 +93,7 @@ project layout that is `.lionclaw/instances/<name>/`:
 - `skills/<alias>/`
 - `runtime/`
 - `logs/`
-- `services/`
+- `units/`
 
 No normal runtime flow should depend on repository-relative paths.
 
@@ -108,7 +108,7 @@ In the project UX, instance homes live under
 `.lionclaw/instances/<name>/`.
 
 It owns the database, operator config, installed skill snapshots, runtime
-cache artifacts, logs, generated service files, and machine-owned
+cache artifacts, logs, generated unit files, and machine-owned
 `config/home-id`.
 
 This is infrastructure state. It is not the assistant's personality, memory,
@@ -298,7 +298,7 @@ Current runtime-visible secrets are explicit mounts. The longer-term hardening
 direction is a tighter secret broker/proxy for credentials that should be used
 without handing raw long-lived values to the runtime.
 
-## CLI And Service Model
+## CLI And Background Model
 
 Operator-facing paths:
 
@@ -337,13 +337,13 @@ installed alias from disk only when no configured channel still uses it.
 `lionclaw connect <channel-or-path>` reads channel skill metadata, installs or
 binds the channel skill, records the selected instance's channel config,
 persists required channel env under `config/channels/`, and starts the
-interactive or service worker. Channel-bound skills stay host-only; every
+interactive or background worker. Channel-bound skills stay host-only; every
 other installed alias is runtime-visible by default.
 
 Background operation is explicit. If you want long-running channels,
 auto-restart, or channel attach to start the daemon for you, LionClaw uses the
-platform service manager for that job. The current managed-service
-implementation uses systemd user services.
+platform backend for that job. The current managed-background implementation
+uses systemd user units.
 
 Direct `lionclaw run` reads the current installed skill and channel state each
 time it launches a runtime. Managed daemons bake an immutable applied skill and
@@ -391,6 +391,6 @@ automatically.
 - [x] Add program-backed OpenCode runtime path.
 - [x] Add rootless Podman execution backend.
 - [x] Add runtime-private `/workspace`, `/runtime`, and `/drafts` layout.
-- [x] Add supervisor/service generation with restart policies.
+- [x] Add supervisor unit generation with restart policies.
 - [x] Add pairing and channel health workflows.
 - [x] Add marker-based skill injection cache as non-authoritative derived output.

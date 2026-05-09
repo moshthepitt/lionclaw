@@ -23,13 +23,13 @@ use crate::{
         },
         command_display::lionclaw_home_command_prefix,
         config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
+        managed_units::{channel_unit_name, existing_unit_identity, UnitManager},
         private_paths::{private_file_exists, remove_private_file_if_exists},
         reconcile::{
             add_channel_with_worker, add_skill, resolve_stack_binaries, up_for_work_root,
             StackBinaryPaths,
         },
         runtime::resolve_runtime_id,
-        services::{channel_unit_name, existing_service_identity, ServiceManager},
     },
 };
 
@@ -52,7 +52,7 @@ pub struct ConnectChannelRequest<'a, M> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectAction {
     InteractiveAttach,
-    ServiceStarted,
+    BackgroundStarted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +71,7 @@ pub async fn connect_channel<R, W, M>(
 where
     R: BufRead,
     W: Write,
-    M: ServiceManager,
+    M: UnitManager,
 {
     let binaries = resolve_stack_binaries()?;
     connect_channel_with_binaries(request, &binaries, input, output).await
@@ -86,7 +86,7 @@ async fn connect_channel_with_binaries<R, W, M>(
 where
     R: BufRead,
     W: Write,
-    M: ServiceManager,
+    M: UnitManager,
 {
     let ConnectChannelRequest {
         home,
@@ -164,20 +164,21 @@ where
             .await?;
             ConnectAction::InteractiveAttach
         }
-        ChannelLaunchMode::Service => {
-            let channel_was_active = service_channel_is_active(home, manager, &channel_id).await?;
+        ChannelLaunchMode::Background => {
+            let channel_was_active =
+                background_channel_is_active(home, manager, &channel_id).await?;
             if let Err(err) =
                 up_for_work_root(home, manager, &runtime_id, binaries, work_root).await
             {
                 return rollback_all_and_return(home, &channel_id, rollback, err).await;
             }
             if required_env.changed && channel_was_active {
-                if let Err(err) = restart_service_channel(home, manager, &channel_id).await {
+                if let Err(err) = restart_background_channel(home, manager, &channel_id).await {
                     return rollback_all_and_return(home, &channel_id, rollback, err).await;
                 }
             }
             rollback.commit()?;
-            ConnectAction::ServiceStarted
+            ConnectAction::BackgroundStarted
         }
     };
 
@@ -505,26 +506,28 @@ fn remove_skill_snapshot(path: &Path) -> Result<()> {
     }
 }
 
-async fn service_channel_is_active<M: ServiceManager>(
+async fn background_channel_is_active<M: UnitManager>(
     home: &LionClawHome,
     manager: &M,
     channel_id: &str,
 ) -> Result<bool> {
-    let Some(identity) = existing_service_identity(home)? else {
+    let Some(identity) = existing_unit_identity(home)? else {
         return Ok(false);
     };
     let status = manager
         .unit_status(&channel_unit_name(&identity, channel_id))
         .await?;
-    Ok(crate::operator::services::unit_status_is_active(&status))
+    Ok(crate::operator::managed_units::unit_status_is_active(
+        &status,
+    ))
 }
 
-async fn restart_service_channel<M: ServiceManager>(
+async fn restart_background_channel<M: UnitManager>(
     home: &LionClawHome,
     manager: &M,
     channel_id: &str,
 ) -> Result<()> {
-    let Some(identity) = existing_service_identity(home)? else {
+    let Some(identity) = existing_unit_identity(home)? else {
         return Ok(());
     };
     manager
@@ -764,11 +767,11 @@ mod tests {
         operator::{
             channel_env::{load_channel_env, save_channel_env, ChannelEnv},
             config::{ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig},
-            reconcile::{add_skill, onboard, OnboardBindSelection, StackBinaryPaths},
-            services::{
-                channel_unit_name, daemon_unit_name, ensure_service_identity, FakeServiceManager,
-                ServiceManager,
+            managed_units::{
+                channel_unit_name, daemon_unit_name, ensure_unit_identity, FakeUnitManager,
+                UnitManager,
             },
+            reconcile::{add_skill, onboard, OnboardBindSelection, StackBinaryPaths},
         },
     };
 
@@ -843,7 +846,7 @@ mod tests {
 
 [channel]
 id = "telegram"
-launch = "service"
+launch = "background"
 worker = "scripts/worker"
 env = ["TELEGRAM_BOT_TOKEN"]
 "#,
@@ -1020,13 +1023,13 @@ env = ["TELEGRAM_BOT_TOKEN"]
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn connect_telegram_stores_env_and_starts_service_channel() {
+    async fn connect_telegram_stores_env_and_starts_background_channel() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         seed_configured_runtime(&home, temp_dir.path()).await;
         let env_file = temp_dir.path().join("telegram.env");
         fs::write(&env_file, "TELEGRAM_BOT_TOKEN=secret-token\n").expect("env file");
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
         let mut input = Cursor::new(Vec::<u8>::new());
         let mut output = Vec::new();
 
@@ -1051,8 +1054,8 @@ env = ["TELEGRAM_BOT_TOKEN"]
         .expect("connect telegram");
 
         assert_eq!(outcome.channel_id, "telegram");
-        assert_eq!(outcome.launch, ChannelLaunchMode::Service);
-        assert_eq!(outcome.action, ConnectAction::ServiceStarted);
+        assert_eq!(outcome.launch, ChannelLaunchMode::Background);
+        assert_eq!(outcome.action, ConnectAction::BackgroundStarted);
         assert_eq!(
             load_channel_env(&home, "telegram")
                 .expect("channel env")
@@ -1064,18 +1067,18 @@ env = ["TELEGRAM_BOT_TOKEN"]
         assert!(config.channels.iter().any(|channel| {
             channel.id == "telegram"
                 && channel.skill == "telegram"
-                && channel.launch_mode == ChannelLaunchMode::Service
+                && channel.launch_mode == ChannelLaunchMode::Background
                 && channel.required_env == ["TELEGRAM_BOT_TOKEN"]
         }));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn failed_service_connect_does_not_record_channel() {
+    async fn failed_background_connect_does_not_record_channel() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         seed_configured_runtime(&home, temp_dir.path()).await;
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
         let mut input = Cursor::new(Vec::<u8>::new());
         let mut output = Vec::new();
 
@@ -1110,13 +1113,13 @@ env = ["TELEGRAM_BOT_TOKEN"]
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn service_connect_rejects_empty_required_env_without_persisting_state() {
+    async fn background_connect_rejects_empty_required_env_without_persisting_state() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         seed_configured_runtime(&home, temp_dir.path()).await;
         let env_file = temp_dir.path().join("telegram.env");
         fs::write(&env_file, "TELEGRAM_BOT_TOKEN=\n").expect("env file");
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
 
         let err = connect_channel_with_binaries(
             ConnectChannelRequest {
@@ -1169,7 +1172,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
         .expect("install normal skill");
         let env_file = temp_dir.path().join("telegram.env");
         fs::write(&env_file, "TELEGRAM_BOT_TOKEN=secret-token\n").expect("env file");
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
 
         let err = connect_channel_with_binaries(
             ConnectChannelRequest {
@@ -1207,7 +1210,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn failed_service_start_rolls_back_channel_skill_and_env() {
+    async fn failed_background_start_rolls_back_channel_skill_and_env() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         seed_configured_runtime(&home, temp_dir.path()).await;
@@ -1221,7 +1224,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
         config.save(&home).await.expect("save config");
         let env_file = temp_dir.path().join("telegram.env");
         fs::write(&env_file, "TELEGRAM_BOT_TOKEN=secret-token\n").expect("env file");
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
 
         let err = connect_channel_with_binaries(
             ConnectChannelRequest {
@@ -1241,7 +1244,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
             &mut Vec::new(),
         )
         .await
-        .expect_err("reserved non-LionClaw listener should block service startup");
+        .expect_err("reserved non-LionClaw listener should block background startup");
 
         assert!(err.to_string().contains("non-LionClaw listener"));
         let config = OperatorConfig::load(&home).await.expect("load config");
@@ -1251,11 +1254,11 @@ env = ["TELEGRAM_BOT_TOKEN"]
             .any(|channel| channel.id == "telegram"));
         assert!(
             !home.skills_dir().join("telegram").exists(),
-            "failed service startup must roll back the installed channel skill"
+            "failed background startup must roll back the installed channel skill"
         );
         assert!(
             !home.channel_env_path("telegram").exists(),
-            "failed service startup must roll back newly stored channel env"
+            "failed background startup must roll back newly stored channel env"
         );
         assert!(load_channel_env(&home, "telegram")
             .expect("channel env")
@@ -1264,13 +1267,13 @@ env = ["TELEGRAM_BOT_TOKEN"]
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn failed_partial_service_start_stops_units_and_rolls_back_state() {
+    async fn failed_partial_background_start_stops_units_and_rolls_back_state() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         seed_configured_runtime(&home, temp_dir.path()).await;
         let env_file = temp_dir.path().join("telegram.env");
         fs::write(&env_file, "TELEGRAM_BOT_TOKEN=secret-token\n").expect("env file");
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
         manager
             .fail_up_after_started(1)
             .expect("configure start failure");
@@ -1293,10 +1296,10 @@ env = ["TELEGRAM_BOT_TOKEN"]
             &mut Vec::new(),
         )
         .await
-        .expect_err("configured service start failure should fail");
+        .expect_err("configured unit start failure should fail");
 
-        assert!(err.to_string().contains("configured service start failure"));
-        let identity = ensure_service_identity(&home).expect("service identity");
+        assert!(err.to_string().contains("configured unit start failure"));
+        let identity = ensure_unit_identity(&home).expect("unit identity");
         let daemon_unit = daemon_unit_name(&identity);
         let channel_unit = channel_unit_name(&identity, "telegram");
         assert_eq!(
@@ -1324,7 +1327,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn failed_path_service_start_restores_existing_skill_snapshot() {
+    async fn failed_path_background_start_restores_existing_skill_snapshot() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         seed_configured_runtime(&home, temp_dir.path()).await;
@@ -1351,7 +1354,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
         write_channel_skill(&new_skill, "New Telegram", "new snapshot");
         let env_file = temp_dir.path().join("telegram.env");
         fs::write(&env_file, "TELEGRAM_BOT_TOKEN=secret-token\n").expect("env file");
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
 
         connect_channel_with_binaries(
             ConnectChannelRequest {
@@ -1371,7 +1374,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
             &mut Vec::new(),
         )
         .await
-        .expect_err("reserved non-LionClaw listener should block service startup");
+        .expect_err("reserved non-LionClaw listener should block background startup");
 
         let restored_skill = fs::read_to_string(home.skills_dir().join("telegram/SKILL.md"))
             .expect("restored skill");
@@ -1390,7 +1393,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn connect_service_restarts_active_channel_when_env_changes() {
+    async fn connect_background_restarts_active_channel_when_env_changes() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         seed_configured_runtime(&home, temp_dir.path()).await;
@@ -1398,7 +1401,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
         fs::write(&first_env_file, "TELEGRAM_BOT_TOKEN=old-token\n").expect("first env file");
         let second_env_file = temp_dir.path().join("telegram-second.env");
         fs::write(&second_env_file, "TELEGRAM_BOT_TOKEN=new-token\n").expect("second env file");
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
 
         connect_channel_with_binaries(
             ConnectChannelRequest {
@@ -1419,7 +1422,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
         )
         .await
         .expect("first connect");
-        let identity = ensure_service_identity(&home).expect("service identity");
+        let identity = ensure_unit_identity(&home).expect("unit identity");
         let channel_unit = channel_unit_name(&identity, "telegram");
         assert!(
             !manager.was_restarted(&channel_unit).expect("restart state"),
@@ -1448,7 +1451,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
 
         assert!(
             manager.was_restarted(&channel_unit).expect("restart state"),
-            "active service channel should restart after env changes"
+            "active background channel should restart after env changes"
         );
         assert_eq!(
             load_channel_env(&home, "telegram")
@@ -1472,7 +1475,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
             listener.local_addr().expect("listener addr").port()
         );
         config.save(&home).await.expect("save config");
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
         let mut input = Cursor::new(Vec::<u8>::new());
         let mut output = Vec::new();
 

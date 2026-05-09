@@ -94,8 +94,8 @@ configuration still flows through `lionclaw onboard`, `lionclaw runtime add`,
 `lionclaw up`, `lionclaw down`, `lionclaw status`, `lionclaw logs`, and
 `lionclaw doctor`.
 
-Fresh terminal-channel test home in one command on Linux with systemd user
-services:
+Fresh terminal-channel test home in one command on Linux with the systemd user
+manager:
 ```bash
 ./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e
 ```
@@ -104,7 +104,7 @@ That command uses `lionclaw onboard --bind auto` for a fresh home, so manual
 test homes do not collide with another LionClaw daemon already using the
 default bind. It configures the runtime with `lionclaw-runtime:v1` and builds
 that shared local image first when it is missing. The attach step uses
-LionClaw's managed daemon path, which currently needs systemd user services.
+LionClaw's managed daemon path, which currently needs the systemd user manager.
 
 Override the runtime id, command, or channel:
 ```bash

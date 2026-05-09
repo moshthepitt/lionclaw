@@ -9,7 +9,7 @@ Use this skill when the user wants Telegram as a LionClaw channel.
 
 What you run:
 
-1. start LionClaw in service mode,
+1. start LionClaw for background work,
 2. run the Telegram worker,
 3. let it bridge Telegram traffic into LionClaw.
 
@@ -40,7 +40,7 @@ lionclaw channel add telegram --required-env TELEGRAM_BOT_TOKEN
 2. Start LionClaw for background channels:
 
 ```bash
-lionclaw service up --runtime codex
+lionclaw up
 ```
 
 3. Run the worker script:
@@ -57,5 +57,5 @@ LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
 - `peer_id` is Telegram `chat.id` serialized as string.
 - The worker defaults `consumer_id` to `telegram:<channel_id>` and `start_mode=resume`, so undelivered stream events are replayed after worker restart.
 - Telegram delivery is message-oriented by default: typing while a turn is active, final answer on `done`, no reasoning lane delivery.
-- Runtime selection normally comes from `lionclaw service up --runtime ...`. `LIONCLAW_RUNTIME_ID` is an optional per-worker override for low-level testing.
+- Runtime selection normally comes from the selected instance's default runtime. `LIONCLAW_RUNTIME_ID` is an optional per-worker override for low-level testing.
 - The worker stores Telegram offset in `$LIONCLAW_HOME/runtime/channels/$LIONCLAW_CHANNEL_ID/telegram.offset` by default.

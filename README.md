@@ -16,7 +16,7 @@ environment you define.
 
 Note: LionClaw's direct `lionclaw run` path currently supports Unix-like
 systems (Linux/macOS). Managed background paths, including `lionclaw up` and
-channel auto-start, currently require Linux with systemd user services.
+channel auto-start, currently require Linux with the systemd user manager.
 Windows is out of scope.
 
 ## Why LionClaw
@@ -302,10 +302,11 @@ shape works for the default instance, a named instance, or an exact home:
 ./target/release/lionclaw --instance reviewer connect telegram --from-env TELEGRAM_BOT_TOKEN
 ```
 
-Interactive channels run in the current terminal. Service channels use systemd
-user services on Linux and store required channel env in the selected instance
-home, not in accidental shell state. Missing env in a non-interactive connect
-prints the exact variable names and scriptable repair commands.
+Interactive channels run in the current terminal. Background channels are
+managed through the platform backend, currently systemd user units on Linux,
+and store required channel env in the selected instance home, not in accidental
+shell state. Missing env in a non-interactive connect prints the exact variable
+names and scriptable repair commands.
 
 Inspect or remove channels on the selected instance:
 
@@ -340,7 +341,7 @@ Each instance home contains:
 - `skills/<alias>/`
 - `workspaces/main/`
 - `runtime/`
-- `services/`
+- `units/`
 
 Use `--home PATH` when you need to target one instance home directly and bypass
 project discovery.
@@ -363,7 +364,7 @@ private network namespace, not host networking. LionClaw does not expose a
 fake allowlist mode before a real egress-control plane exists. On rootless
 hosts this also depends on Podman being able to create that private network
 namespace, commonly through a working `pasta` and `/dev/net/tun` path. LionClaw
-preflights that requirement before interactive or managed-service startup when
+preflights that requirement before interactive or managed-background startup when
 the effective preset uses `network-mode = "on"`.
 
 On Arch Linux, a common failure is `pasta failed ... /dev/net/tun: No such

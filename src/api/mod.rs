@@ -100,7 +100,7 @@ pub fn build_router(kernel: Arc<Kernel>, daemon_info: DaemonInfoResponse) -> Rou
 }
 
 async fn health() -> impl IntoResponse {
-    Json(json!({"status": "ok", "service": "lionclawd"}))
+    Json(json!({"status": "ok", "daemon": "lionclawd"}))
 }
 
 async fn daemon_info_endpoint(State(state): State<ApiState>) -> Json<DaemonInfoResponse> {

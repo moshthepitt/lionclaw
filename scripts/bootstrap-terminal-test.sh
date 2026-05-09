@@ -21,7 +21,7 @@ Environment:
 
 Prerequisites:
   podman
-  systemd user services for the channel attach daemon auto-start path
+  the systemd user manager for the channel attach daemon auto-start path
 EOF
 }
 
@@ -80,10 +80,10 @@ ensure_runtime_image() {
 }
 
 ensure_systemd_user() {
-  command -v systemctl >/dev/null 2>&1 || die "systemd user services are required for this helper"
+  command -v systemctl >/dev/null 2>&1 || die "the systemd user manager is required for this helper"
 
   if ! systemctl --user show-environment >/dev/null 2>&1; then
-    die "systemd user services are unavailable; this helper needs them to auto-start the LionClaw daemon"
+    die "the systemd user manager is unavailable; this helper needs it to auto-start the LionClaw daemon"
   fi
 }
 

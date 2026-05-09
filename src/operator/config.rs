@@ -303,14 +303,14 @@ pub struct ManagedChannelConfig {
 #[serde(rename_all = "lowercase")]
 pub enum ChannelLaunchMode {
     #[default]
-    Service,
+    Background,
     Interactive,
 }
 
 impl ChannelLaunchMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Service => "service",
+            Self::Background => "background",
             Self::Interactive => "interactive",
         }
     }
@@ -321,10 +321,10 @@ impl std::str::FromStr for ChannelLaunchMode {
 
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         match value.trim() {
-            "service" => Ok(Self::Service),
+            "background" => Ok(Self::Background),
             "interactive" => Ok(Self::Interactive),
             other => Err(format!(
-                "invalid channel launch mode '{other}'; expected 'service' or 'interactive'"
+                "invalid channel launch mode '{other}'; expected 'background' or 'interactive'"
             )),
         }
     }
@@ -706,7 +706,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn channel_launch_mode_defaults_to_service() {
+    async fn channel_launch_mode_defaults_to_background() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let mut config = OperatorConfig::default();
@@ -721,7 +721,10 @@ mod tests {
 
         let loaded = OperatorConfig::load(&home).await.expect("load config");
         assert_eq!(loaded.channels.len(), 1);
-        assert_eq!(loaded.channels[0].launch_mode, ChannelLaunchMode::Service);
+        assert_eq!(
+            loaded.channels[0].launch_mode,
+            ChannelLaunchMode::Background
+        );
     }
 
     #[tokio::test]

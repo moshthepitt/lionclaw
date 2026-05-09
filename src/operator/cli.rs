@@ -32,6 +32,10 @@ use crate::{
         },
         connect::{connect_channel, ConnectChannelRequest, ConnectEnvInputs, ConnectOutcome},
         doctor::run_doctor,
+        managed_units::{
+            channel_unit_name, existing_unit_identity, unit_belongs_to_identity,
+            SystemdUserUnitManager, UnitManager,
+        },
         operations::{
             down_instance, no_managed_units_message, operate_project_instances,
             project_log_components, selected_log_components, up_instance, write_journal_logs,
@@ -47,10 +51,6 @@ use crate::{
         runtime_integration::{
             configure_runtime_profile_with_engine_resolver, configure_runtime_required_message,
             ConfigureRuntimeOutcome,
-        },
-        services::{
-            channel_unit_name, existing_service_identity, unit_belongs_to_identity, ServiceManager,
-            SystemdUserServiceManager,
         },
         skills::{list_installed_skills, InstalledSkill},
         snapshot::SKILL_INSTALL_METADATA_FILE,
@@ -377,7 +377,7 @@ struct ChannelAddArgs {
     id: String,
     #[arg(long)]
     skill: Option<String>,
-    #[arg(long, default_value = "service")]
+    #[arg(long, default_value = "background")]
     launch: String,
     #[arg(long = "required-env")]
     required_env: Vec<String>,
@@ -587,7 +587,7 @@ pub async fn run() -> Result<ExitCode> {
             ProjectCommand::Status => {
                 validate_project_wide_target("project status", &target_selection)?;
                 let project_root = discover_project_root(&target_selection)?;
-                let manager = SystemdUserServiceManager;
+                let manager = SystemdUserUnitManager;
                 let status =
                     render_project_status_all_with_manager(&project_root, &manager).await?;
                 print!("{status}");
@@ -687,7 +687,7 @@ pub async fn run() -> Result<ExitCode> {
             let mut input = BufReader::new(stdin);
             let stdout = std::io::stdout();
             let mut output = stdout;
-            let manager = SystemdUserServiceManager;
+            let manager = SystemdUserUnitManager;
             let outcome = connect_channel(
                 ConnectChannelRequest {
                     home: &target.instance_home,
@@ -723,7 +723,7 @@ pub async fn run() -> Result<ExitCode> {
             .await?;
         }
         Command::Up(args) => {
-            let manager = SystemdUserServiceManager;
+            let manager = SystemdUserUnitManager;
             if args.all {
                 validate_project_wide_target("up --all", &target_selection)?;
                 let project_root = discover_project_root(&target_selection)?;
@@ -744,7 +744,7 @@ pub async fn run() -> Result<ExitCode> {
             }
         }
         Command::Down(args) => {
-            let manager = SystemdUserServiceManager;
+            let manager = SystemdUserUnitManager;
             if args.all {
                 validate_project_wide_target("down --all", &target_selection)?;
                 let project_root = discover_project_root(&target_selection)?;
@@ -801,7 +801,7 @@ pub async fn run() -> Result<ExitCode> {
             if args.all {
                 validate_status_all_target(&target_selection)?;
                 let project_root = discover_project_root(&target_selection)?;
-                let manager = SystemdUserServiceManager;
+                let manager = SystemdUserUnitManager;
                 let status =
                     render_project_status_all_with_manager(&project_root, &manager).await?;
                 print!("{status}");
@@ -809,7 +809,7 @@ pub async fn run() -> Result<ExitCode> {
                 let target = resolved_target
                     .as_ref()
                     .ok_or_else(missing_target_for_status)?;
-                let manager = SystemdUserServiceManager;
+                let manager = SystemdUserUnitManager;
                 let status = render_target_status_with_manager(target, &manager).await?;
                 print!("{status}");
             }
@@ -940,7 +940,7 @@ pub async fn run() -> Result<ExitCode> {
                                 "channel list --all requires a LionClaw project; run from the project root or pass --project PATH"
                             )
                         })?;
-                    let manager = SystemdUserServiceManager;
+                    let manager = SystemdUserUnitManager;
                     print!(
                         "{}",
                         render_project_channel_list(&project_root, &manager).await?
@@ -949,7 +949,7 @@ pub async fn run() -> Result<ExitCode> {
                     let target = resolved_target.as_ref().ok_or_else(|| {
                         anyhow!("channel list requires a resolved LionClaw target")
                     })?;
-                    let manager = SystemdUserServiceManager;
+                    let manager = SystemdUserUnitManager;
                     print!(
                         "{}",
                         render_instance_channel_list(
@@ -962,7 +962,7 @@ pub async fn run() -> Result<ExitCode> {
                 }
             }
             ChannelCommand::Remove(args) | ChannelCommand::Rm(args) => {
-                let manager = SystemdUserServiceManager;
+                let manager = SystemdUserUnitManager;
                 stop_owned_channel_unit(&home, &manager, &args.id).await?;
                 let removed = remove_channel(&home, &args.id).await?;
                 println!(
@@ -975,7 +975,7 @@ pub async fn run() -> Result<ExitCode> {
                 }
             }
             ChannelCommand::Attach(args) => {
-                let manager = SystemdUserServiceManager;
+                let manager = SystemdUserUnitManager;
                 let work_root = required_command_work_root(&resolved_target, "channel attach")?;
                 attach_channel(&home, &manager, work_root, args.id, args.peer, args.runtime)
                     .await?;
@@ -1472,7 +1472,7 @@ fn parse_log_filter(args: &ProductLogsArgs) -> Result<LogFilter> {
 }
 
 async fn run_doctor_command(selection: &TargetSelection, all: bool) -> Result<ExitCode> {
-    let manager = SystemdUserServiceManager;
+    let manager = SystemdUserUnitManager;
     match run_doctor(selection, all, &manager).await {
         Ok(report) => {
             print!("{}", report.render());
@@ -1591,8 +1591,8 @@ fn print_connect_outcome(home: &LionClawHome, outcome: &ConnectOutcome) {
         ChannelLaunchMode::Interactive => {
             println!("interactive channel worker exited");
         }
-        ChannelLaunchMode::Service => {
-            println!("service channel is running");
+        ChannelLaunchMode::Background => {
+            println!("background channel worker is running");
             println!("pair or approve peers with:");
             println!(
                 "  {}",
@@ -1624,7 +1624,7 @@ fn validate_channel_list_all_target(selection: &TargetSelection) -> Result<()> {
     Ok(())
 }
 
-async fn render_project_channel_list<M: ServiceManager>(
+async fn render_project_channel_list<M: UnitManager>(
     project_root: &Path,
     manager: &M,
 ) -> Result<String> {
@@ -1640,7 +1640,7 @@ async fn render_project_channel_list<M: ServiceManager>(
     Ok(output)
 }
 
-async fn render_instance_channel_list<M: ServiceManager>(
+async fn render_instance_channel_list<M: UnitManager>(
     instance_name: &str,
     home: &LionClawHome,
     manager: &M,
@@ -1648,16 +1648,16 @@ async fn render_instance_channel_list<M: ServiceManager>(
     let config = OperatorConfig::load(home).await?;
     let mut output = String::new();
     output.push_str(&format!("instance: {instance_name}\n"));
-    output.push_str("channel   launch       skill      service\n");
+    output.push_str("channel   launch       skill      unit\n");
     if config.channels.is_empty() {
         output.push_str("(none)\n");
         return Ok(output);
     }
-    let identity = existing_service_identity(home)?;
+    let identity = existing_unit_identity(home)?;
     for channel in config.channels {
-        let service = match channel.launch_mode {
+        let unit = match channel.launch_mode {
             ChannelLaunchMode::Interactive => "n/a".to_string(),
-            ChannelLaunchMode::Service => match identity.as_ref() {
+            ChannelLaunchMode::Background => match identity.as_ref() {
                 Some(identity) => {
                     manager
                         .unit_status(&channel_unit_name(identity, &channel.id))
@@ -1671,13 +1671,13 @@ async fn render_instance_channel_list<M: ServiceManager>(
             channel.id,
             channel.launch_mode.as_str(),
             channel.skill,
-            service
+            unit
         ));
     }
     Ok(output)
 }
 
-async fn stop_owned_channel_unit<M: ServiceManager>(
+async fn stop_owned_channel_unit<M: UnitManager>(
     home: &LionClawHome,
     manager: &M,
     channel_id: &str,
@@ -1686,13 +1686,13 @@ async fn stop_owned_channel_unit<M: ServiceManager>(
         .await
 }
 
-async fn stop_owned_channel_unit_in_dir<M: ServiceManager>(
+async fn stop_owned_channel_unit_in_dir<M: UnitManager>(
     home: &LionClawHome,
     manager: &M,
     channel_id: &str,
     systemd_dir: &Path,
 ) -> Result<()> {
-    let Some(identity) = existing_service_identity(home)? else {
+    let Some(identity) = existing_unit_identity(home)? else {
         return Ok(());
     };
     let unit = channel_unit_name(&identity, channel_id);
@@ -2356,7 +2356,7 @@ mod tests {
     }
 
     #[test]
-    fn service_connect_pairing_command_targets_selected_home() {
+    fn connect_pairing_command_targets_selected_home() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join("reviewer home"));
 
@@ -2473,12 +2473,12 @@ mod tests {
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
             id: "telegram".to_string(),
             skill: "telegram".to_string(),
-            launch_mode: ChannelLaunchMode::Service,
+            launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
         });
         config.save(&home).await.expect("save config");
-        let manager = crate::operator::services::FakeServiceManager::default();
+        let manager = crate::operator::managed_units::FakeUnitManager::default();
 
         let rendered = render_instance_channel_list("main", &home, &manager)
             .await
@@ -2488,7 +2488,8 @@ mod tests {
         assert!(rendered.contains("terminal"));
         assert!(rendered.contains("interactive"));
         assert!(rendered.contains("telegram"));
-        assert!(rendered.contains("service"));
+        assert!(rendered.contains("background"));
+        assert!(rendered.contains("unit"));
         assert!(rendered.contains("not-installed"));
     }
 
@@ -2501,13 +2502,13 @@ mod tests {
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
             id: "telegram".to_string(),
             skill: "telegram".to_string(),
-            launch_mode: ChannelLaunchMode::Service,
+            launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
         });
         config.save(&home).await.expect("save config");
         let identity =
-            crate::operator::services::ensure_service_identity(&home).expect("service identity");
+            crate::operator::managed_units::ensure_unit_identity(&home).expect("unit identity");
         let unit = channel_unit_name(&identity, "telegram");
         let foreign_unit = channel_unit_name(&identity, "foreign");
         let systemd_dir = temp_dir.path().join("systemd-user");
@@ -2515,8 +2516,8 @@ mod tests {
         std::fs::write(
             systemd_dir.join(&unit),
             format!(
-                "[Unit]\nX-LionClaw-ServiceId={}\nX-LionClaw-HomeRoot={}\nX-LionClaw-Channel=telegram\n",
-                identity.service_id,
+                "[Unit]\nX-LionClaw-UnitGroupId={}\nX-LionClaw-HomeRoot={}\nX-LionClaw-Channel=telegram\n",
+                identity.unit_group_id,
                 identity.home_root.display()
             ),
         )
@@ -2524,7 +2525,7 @@ mod tests {
         std::fs::write(
             systemd_dir.join(&foreign_unit),
             format!(
-                "[Unit]\nX-LionClaw-ServiceId=00000000-0000-0000-0000-000000000000\nX-LionClaw-HomeRoot={}\nX-LionClaw-Channel=foreign\n",
+                "[Unit]\nX-LionClaw-UnitGroupId=00000000-0000-0000-0000-000000000000\nX-LionClaw-HomeRoot={}\nX-LionClaw-Channel=foreign\n",
                 identity.home_root.display()
             ),
         )
@@ -2532,7 +2533,7 @@ mod tests {
         let mut env = crate::operator::channel_env::ChannelEnv::new();
         env.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
         crate::operator::channel_env::save_channel_env(&home, "telegram", &env).expect("save env");
-        let manager = crate::operator::services::FakeServiceManager::default();
+        let manager = crate::operator::managed_units::FakeUnitManager::default();
         manager
             .set_unit_status(&unit, "loaded/active/running")
             .expect("owned status");

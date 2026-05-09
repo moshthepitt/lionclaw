@@ -17,7 +17,7 @@ Status key:
 - [x] `lionclaw run [runtime]` is the canonical interactive path.
 - [x] LionClaw runs real agent CLIs instead of replacing their tool loops.
 - [x] Codex and OpenCode are program-backed runtimes.
-- [x] Runtime selection happens at invocation or service startup.
+- [x] Runtime selection happens at invocation or background startup.
 - [x] Channels remain external skill workers.
 - [x] Installed state lives under `~/.lionclaw`, not repository-relative paths.
 - [x] The runtime boundary is mount-first: `/workspace`, `/runtime`, `/drafts`, and read-only mounts for installed non-channel skills.
@@ -133,7 +133,7 @@ Goal: turn the local agent into a practical assistant without growing the core i
 - [x] Telegram channel skill path.
 - [x] typed stream pull/ack contract.
 - [x] answer and reasoning lanes.
-- [x] scheduler service for `once`, anchored `interval`, and cron-with-timezone jobs.
+- [x] scheduler loop for `once`, anchored `interval`, and cron-with-timezone jobs.
 - [x] job run records, retries, dead-letter storage, and audit trail.
 - [x] final-result channel delivery for scheduled jobs.
 - [x] CLI controls for channel and scheduler operations.
@@ -152,7 +152,7 @@ Exit criteria:
 Goal: support more real agents without flattening them into one fake protocol.
 
 - [x] runtime profiles configured in LionClaw state.
-- [x] selected runtime at `run`, channel attach, service, and job boundaries.
+- [x] selected runtime at `run`, channel attach, background, and job boundaries.
 - [x] Codex runtime.
 - [x] OpenCode runtime.
 - [ ] Claude Code runtime.
@@ -220,7 +220,7 @@ Exit criteria:
 Goal: ship a usable LionClaw secure baseline.
 
 - [ ] install script.
-- [ ] service unit templates for systemd/launchd.
+- [ ] platform unit templates for systemd/launchd.
 - [ ] `local-safe-default` config profile.
 - [ ] `remote-hardened` config profile.
 - [ ] `dev-relaxed` config profile.

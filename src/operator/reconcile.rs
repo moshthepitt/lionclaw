@@ -14,16 +14,16 @@ use crate::{
         channel_metadata::resolve_channel_worker_entrypoint,
         config::{normalize_local_source, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
         daemon_probe::{classify_daemon, DaemonClassification},
+        managed_units::{
+            channel_unit_name, daemon_env_path, daemon_unit_name, ensure_unit_identity,
+            existing_unit_identity, render_channel_unit, render_daemon_unit,
+            unit_belongs_to_identity, unit_status_is_active, ChannelUnitSpec, DaemonUnitSpec,
+            ManagedUnit, UnitIdentity, UnitManager,
+        },
         redaction::SecretRedactor,
         runtime::{
             register_configured_runtimes, resolve_runtime_execution_context,
             validate_runtime_launch_prerequisites,
-        },
-        services::{
-            channel_unit_name, daemon_env_path, daemon_unit_name, ensure_service_identity,
-            existing_service_identity, render_channel_unit, render_daemon_unit,
-            unit_belongs_to_identity, unit_status_is_active, ChannelServiceSpec, DaemonServiceSpec,
-            ManagedServiceUnit, ServiceIdentity, ServiceManager,
         },
         snapshot::{install_snapshot, resolve_local_source},
     },
@@ -225,7 +225,7 @@ pub async fn load_operator_state(home: &LionClawHome) -> Result<OperatorState> {
     })
 }
 
-pub async fn up_for_work_root<M: ServiceManager>(
+pub async fn up_for_work_root<M: UnitManager>(
     home: &LionClawHome,
     manager: &M,
     runtime_id: &str,
@@ -235,7 +235,7 @@ pub async fn up_for_work_root<M: ServiceManager>(
     let mut state = load_operator_state(home).await?;
     ensure_managed_bind_configured(home, &mut state.config).await?;
     let config = &state.config;
-    let service_identity = ensure_service_identity(home)?;
+    let unit_identity = ensure_unit_identity(home)?;
     let runtime_context = resolve_runtime_execution_context(home, config, Some(runtime_id)).await?;
     let home_id = home.ensure_home_id().await?;
     let project_scope = runtime_project_partition_key(Some(work_root));
@@ -252,7 +252,7 @@ pub async fn up_for_work_root<M: ServiceManager>(
     {
         DaemonClassification::Absent => {}
         DaemonClassification::SameHome | DaemonClassification::SameHomeDifferentConfig => {
-            let daemon_unit = daemon_unit_name(&service_identity);
+            let daemon_unit = daemon_unit_name(&unit_identity);
             let daemon_status = manager.unit_status(&daemon_unit).await?;
             if !unit_status_is_active(&daemon_status) {
                 return Err(anyhow!(
@@ -298,7 +298,7 @@ pub async fn up_for_work_root<M: ServiceManager>(
         &state.applied_state,
         runtime_id,
         binaries,
-        &service_identity,
+        &unit_identity,
         ManagedDaemonContext {
             work_root,
             fingerprint: &expected_daemon_fingerprint,
@@ -381,20 +381,20 @@ async fn ensure_managed_bind_configured(
     config.save(home).await
 }
 
-pub async fn down<M: ServiceManager>(home: &LionClawHome, manager: &M) -> Result<()> {
+pub async fn down<M: UnitManager>(home: &LionClawHome, manager: &M) -> Result<()> {
     let units = managed_unit_names(home)?;
     manager.down_units(&units).await
 }
 
-pub async fn status_for_work_root<M: ServiceManager>(
+pub async fn status_for_work_root<M: UnitManager>(
     home: &LionClawHome,
     manager: &M,
     work_root: &Path,
 ) -> Result<StackStatus> {
     let state = load_operator_state(home).await?;
     let kernel = open_kernel(home, &state.config, None).await?;
-    let service_identity = existing_service_identity(home)?;
-    let mut daemon_status = match service_identity.as_ref() {
+    let unit_identity = existing_unit_identity(home)?;
+    let mut daemon_status = match unit_identity.as_ref() {
         Some(identity) => manager.unit_status(&daemon_unit_name(identity)).await?,
         None => "not-installed".to_string(),
     };
@@ -420,7 +420,7 @@ pub async fn status_for_work_root<M: ServiceManager>(
             .map_err(to_anyhow)?;
         let unit_status = if channel.launch_mode == ChannelLaunchMode::Interactive {
             "interactive".to_string()
-        } else if let Some(identity) = service_identity.as_ref() {
+        } else if let Some(identity) = unit_identity.as_ref() {
             manager
                 .unit_status(&channel_unit_name(identity, &channel.id))
                 .await?
@@ -451,7 +451,7 @@ pub async fn status_for_work_root<M: ServiceManager>(
         channels.push(ChannelStatus {
             id: channel_id,
             skill: "-".to_string(),
-            launch_mode: ChannelLaunchMode::Service.as_str().to_string(),
+            launch_mode: ChannelLaunchMode::Background.as_str().to_string(),
             unit_status,
             pending_peers: 0,
             approved_peers: 0,
@@ -527,7 +527,7 @@ fn managed_daemon_runtime_id(
     home: &LionClawHome,
     config: &OperatorConfig,
 ) -> Result<Option<String>> {
-    let Some(identity) = existing_service_identity(home)? else {
+    let Some(identity) = existing_unit_identity(home)? else {
         return Ok(config.defaults.runtime.clone());
     };
     let env_path = daemon_env_path(home, &identity);
@@ -581,7 +581,7 @@ fn unescape_managed_env_value(raw: &str) -> String {
     value
 }
 
-pub async fn logs<M: ServiceManager>(
+pub async fn logs<M: UnitManager>(
     home: &LionClawHome,
     manager: &M,
     lines: usize,
@@ -666,15 +666,15 @@ pub(crate) fn build_managed_units(
     applied_state: &AppliedState,
     runtime_id: &str,
     binaries: &StackBinaryPaths,
-    service_identity: &ServiceIdentity,
+    unit_identity: &UnitIdentity,
     daemon_context: ManagedDaemonContext<'_>,
-) -> Result<Vec<ManagedServiceUnit>> {
+) -> Result<Vec<ManagedUnit>> {
     let mut units = Vec::new();
     units.push(render_daemon_unit(
         home,
-        service_identity,
+        unit_identity,
         &binaries.daemon_bin,
-        DaemonServiceSpec {
+        DaemonUnitSpec {
             bind_addr: &config.daemon.bind,
             runtime_id,
             workspace: &config.daemon.workspace,
@@ -688,7 +688,7 @@ pub(crate) fn build_managed_units(
     for channel in applied_state
         .channels()
         .iter()
-        .filter(|channel| channel.launch_mode == ChannelLaunchMode::Service)
+        .filter(|channel| channel.launch_mode == ChannelLaunchMode::Background)
     {
         let worker_path = resolve_applied_skill_worker_entrypoint(
             applied_state,
@@ -718,8 +718,8 @@ pub(crate) fn build_managed_units(
 
         units.push(render_channel_unit(
             home,
-            service_identity,
-            &ChannelServiceSpec {
+            unit_identity,
+            &ChannelUnitSpec {
                 channel_id: channel.id.clone(),
                 worker_path,
                 env,
@@ -966,13 +966,13 @@ fn is_executable_file(metadata: &fs::Metadata) -> bool {
 }
 
 fn managed_unit_names(home: &LionClawHome) -> Result<Vec<String>> {
-    let Some(identity) = existing_service_identity(home)? else {
+    let Some(identity) = existing_unit_identity(home)? else {
         return Ok(Vec::new());
     };
     let mut units = BTreeSet::new();
     for systemd_dir in [
         systemd_user_unit_dir_for_reconcile()?,
-        home.services_systemd_dir(),
+        home.units_systemd_dir(),
     ] {
         if !systemd_dir.exists() {
             continue;
@@ -1003,10 +1003,10 @@ fn managed_unit_names(home: &LionClawHome) -> Result<Vec<String>> {
 }
 
 fn managed_channel_unit_id(home: &LionClawHome, unit_name: &str) -> Result<Option<String>> {
-    let Some(identity) = existing_service_identity(home)? else {
+    let Some(identity) = existing_unit_identity(home)? else {
         return Ok(None);
     };
-    let prefix = format!("lionclaw-channel-{}-", identity.service_id);
+    let prefix = format!("lionclaw-channel-{}-", identity.unit_group_id);
     Ok(unit_name
         .strip_prefix(&prefix)
         .and_then(|value| value.strip_suffix(".service"))
@@ -1114,12 +1114,12 @@ mod tests {
                 ChannelLaunchMode, ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig,
             },
             daemon_probe::{classify_daemon, DaemonClassification},
+            managed_units::{
+                channel_unit_name, daemon_env_path, daemon_unit_name, ensure_unit_identity,
+                FakeUnitManager, UnitIdentity, UnitManager,
+            },
             reconcile::load_operator_state,
             runtime::resolve_runtime_execution_context,
-            services::{
-                channel_unit_name, daemon_env_path, daemon_unit_name, ensure_service_identity,
-                FakeServiceManager, ServiceIdentity, ServiceManager,
-            },
         },
         workspace::GENERATED_AGENTS_FILE,
     };
@@ -1143,12 +1143,12 @@ mod tests {
         runtime_project_partition_key(Some(project_root.as_path()))
     }
 
-    fn test_service_identity(home: &LionClawHome) -> ServiceIdentity {
-        ensure_service_identity(home).expect("service identity")
+    fn test_unit_identity(home: &LionClawHome) -> UnitIdentity {
+        ensure_unit_identity(home).expect("unit identity")
     }
 
     fn test_daemon_unit_name(home: &LionClawHome) -> String {
-        daemon_unit_name(&test_service_identity(home))
+        daemon_unit_name(&test_unit_identity(home))
     }
 
     async fn current_daemon_fingerprint(home: &LionClawHome) -> String {
@@ -1363,9 +1363,9 @@ mod tests {
         config
             .set_default_runtime("codex")
             .expect("set default runtime");
-        let identity = ensure_service_identity(&home).expect("service identity");
+        let identity = ensure_unit_identity(&home).expect("unit identity");
         fs::write(
-            home.services_env_dir().join("lionclawd.env"),
+            home.units_env_dir().join("lionclawd.env"),
             "LIONCLAW_DEFAULT_RUNTIME_ID=codex\n",
         )
         .expect("old env");
@@ -1533,7 +1533,7 @@ mod tests {
             &home,
             "telegram".to_string(),
             "telegram".to_string(),
-            ChannelLaunchMode::Service,
+            ChannelLaunchMode::Background,
             Vec::new(),
         )
         .await
@@ -1564,7 +1564,7 @@ mod tests {
             &home,
             "broken".to_string(),
             "broken".to_string(),
-            ChannelLaunchMode::Service,
+            ChannelLaunchMode::Background,
             Vec::new(),
         )
         .await
@@ -1581,7 +1581,7 @@ mod tests {
             &home,
             "missing".to_string(),
             "missing".to_string(),
-            ChannelLaunchMode::Service,
+            ChannelLaunchMode::Background,
             Vec::new(),
         )
         .await
@@ -1650,7 +1650,7 @@ mod tests {
             &home,
             "telegram".to_string(),
             "telegram".to_string(),
-            ChannelLaunchMode::Service,
+            ChannelLaunchMode::Background,
             Vec::new(),
         )
         .await
@@ -1704,7 +1704,7 @@ mod tests {
             &home,
             "telegram".to_string(),
             "telegram".to_string(),
-            ChannelLaunchMode::Service,
+            ChannelLaunchMode::Background,
             Vec::new(),
         )
         .await
@@ -1760,7 +1760,7 @@ mod tests {
             &home,
             "telegram".to_string(),
             "telegram".to_string(),
-            ChannelLaunchMode::Service,
+            ChannelLaunchMode::Background,
             Vec::new(),
         )
         .await
@@ -1819,13 +1819,13 @@ mod tests {
             &home,
             "telegram".to_string(),
             "telegram".to_string(),
-            ChannelLaunchMode::Service,
+            ChannelLaunchMode::Background,
             Vec::new(),
         )
         .await
         .expect("add channel");
 
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
         let binaries = StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         };
@@ -1846,7 +1846,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_channel_env_uses_private_channel_env_without_secret_copy() {
+    async fn background_channel_env_uses_private_channel_env_without_secret_copy() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
@@ -1877,7 +1877,7 @@ mod tests {
             &home,
             "telegram".to_string(),
             "telegram".to_string(),
-            ChannelLaunchMode::Service,
+            ChannelLaunchMode::Background,
             vec!["TELEGRAM_BOT_TOKEN".to_string()],
         )
         .await
@@ -1886,14 +1886,14 @@ mod tests {
         env.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
         merge_channel_env(&home, "telegram", &env).expect("store channel env");
 
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
         let binaries = StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         };
         up_for_work_root(&home, &manager, "codex", &binaries, &current_work_root())
             .await
             .expect("up");
-        let telegram_unit_name = channel_unit_name(&test_service_identity(&home), "telegram");
+        let telegram_unit_name = channel_unit_name(&test_unit_identity(&home), "telegram");
         let unit = manager
             .managed_unit(&telegram_unit_name)
             .expect("managed unit lookup")
@@ -1915,7 +1915,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_channel_env_rejects_undeclared_stored_values() {
+    async fn background_channel_env_rejects_undeclared_stored_values() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
@@ -1946,7 +1946,7 @@ mod tests {
             &home,
             "telegram".to_string(),
             "telegram".to_string(),
-            ChannelLaunchMode::Service,
+            ChannelLaunchMode::Background,
             vec!["TELEGRAM_BOT_TOKEN".to_string()],
         )
         .await
@@ -1956,7 +1956,7 @@ mod tests {
         env.insert("EXTRA_SECRET".to_string(), "do-not-expose".to_string());
         merge_channel_env(&home, "telegram", &env).expect("store channel env");
 
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
         let binaries = StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         };
@@ -1969,15 +1969,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_logs_redact_private_channel_env_values() {
+    async fn managed_logs_redact_private_channel_env_values() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         home.ensure_base_dirs().await.expect("base dirs");
-        test_service_identity(&home);
+        test_unit_identity(&home);
         let mut env = ChannelEnv::new();
         env.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
         merge_channel_env(&home, "telegram", &env).expect("store channel env");
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
         manager
             .set_logs("boot secret-token done")
             .expect("set logs");
@@ -1988,11 +1988,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_logs_without_service_identity_returns_empty() {
+    async fn managed_logs_without_unit_identity_returns_empty() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         home.ensure_base_dirs().await.expect("base dirs");
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
         manager
             .fail_logs("log manager should not be called")
             .expect("fail logs");
@@ -2003,15 +2003,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_logs_redact_manager_errors() {
+    async fn managed_logs_redact_manager_errors() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         home.ensure_base_dirs().await.expect("base dirs");
-        test_service_identity(&home);
+        test_unit_identity(&home);
         let mut env = ChannelEnv::new();
         env.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
         merge_channel_env(&home, "telegram", &env).expect("store channel env");
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
         manager
             .fail_logs("worker stderr included secret-token")
             .expect("fail logs");
@@ -2025,16 +2025,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_logs_redact_secrets_preserved_after_channel_remove() {
+    async fn managed_logs_redact_secrets_preserved_after_channel_remove() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         home.ensure_base_dirs().await.expect("base dirs");
-        test_service_identity(&home);
+        test_unit_identity(&home);
         let mut config = OperatorConfig::default();
         config.upsert_channel(ManagedChannelConfig {
             id: "telegram".to_string(),
             skill: "telegram".to_string(),
-            launch_mode: ChannelLaunchMode::Service,
+            launch_mode: ChannelLaunchMode::Background,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
         });
@@ -2045,7 +2045,7 @@ mod tests {
         assert!(super::remove_channel(&home, "telegram")
             .await
             .expect("remove channel"));
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
         manager
             .set_logs("old worker printed secret-token")
             .expect("set logs");
@@ -2076,7 +2076,7 @@ mod tests {
 
         let err = up_for_work_root(
             &home,
-            &FakeServiceManager::default(),
+            &FakeUnitManager::default(),
             "codex",
             &StackBinaryPaths {
                 daemon_bin: "/tmp/lionclawd".into(),
@@ -2130,7 +2130,7 @@ mod tests {
 
         let err = up_for_work_root(
             &home,
-            &FakeServiceManager::default(),
+            &FakeUnitManager::default(),
             "codex",
             &StackBinaryPaths {
                 daemon_bin: "/tmp/lionclawd".into(),
@@ -2148,7 +2148,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn up_skips_interactive_channels_for_service_units() {
+    async fn up_skips_interactive_channels_for_background_units() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
@@ -2185,7 +2185,7 @@ mod tests {
         .await
         .expect("add channel");
 
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
         let binaries = StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         };
@@ -2236,7 +2236,7 @@ mod tests {
                     let project_scope = current_project_scope();
                     move || async move {
                         Json(DaemonInfoResponse {
-                            service: "lionclawd".to_string(),
+                            daemon: "lionclawd".to_string(),
                             status: "ok".to_string(),
                             home_id: home_id.clone(),
                             home_root: home_root.clone(),
@@ -2250,7 +2250,7 @@ mod tests {
             &bind_addr,
         )
         .await;
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
         let daemon_unit = test_daemon_unit_name(&home);
         manager
             .set_unit_status(&daemon_unit, "loaded/active/running")
@@ -2283,7 +2283,7 @@ mod tests {
         config.save(&home).await.expect("save config");
         write_test_codex_auth(&home).await;
 
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
         let binaries = StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         };
@@ -2312,7 +2312,7 @@ mod tests {
                     let project_scope = current_project_scope();
                     move || async move {
                         Json(DaemonInfoResponse {
-                            service: "lionclawd".to_string(),
+                            daemon: "lionclawd".to_string(),
                             status: "ok".to_string(),
                             home_id: home_id.clone(),
                             home_root: home_root.clone(),
@@ -2405,7 +2405,7 @@ mod tests {
             .expect("set default runtime");
         config.save(&home).await.expect("save config");
 
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
         let stack = status_for_work_root(&home, &manager, &current_work_root())
             .await
             .expect("status");
@@ -2432,7 +2432,7 @@ mod tests {
             .expect("set default runtime");
         config.save(&home).await.expect("save config");
 
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
         let daemon_unit = test_daemon_unit_name(&home);
         manager
             .set_unit_status(&daemon_unit, "loaded/active/running")
@@ -2451,7 +2451,7 @@ mod tests {
                     let project_scope = current_project_scope();
                     move || async move {
                         Json(DaemonInfoResponse {
-                            service: "lionclawd".to_string(),
+                            daemon: "lionclawd".to_string(),
                             status: "ok".to_string(),
                             home_id: home_id.clone(),
                             home_root: home_root.clone(),
@@ -2521,7 +2521,7 @@ mod tests {
             .expect("set default runtime");
         config.save(&home).await.expect("save config");
 
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
         let daemon_unit = test_daemon_unit_name(&home);
         manager
             .set_unit_status(&daemon_unit, "loaded/active/running")
@@ -2543,7 +2543,7 @@ mod tests {
                     let project_scope = other_project_scope.clone();
                     move || async move {
                         Json(DaemonInfoResponse {
-                            service: "lionclawd".to_string(),
+                            daemon: "lionclawd".to_string(),
                             status: "ok".to_string(),
                             home_id: home_id.clone(),
                             home_root: home_root.clone(),
@@ -2593,7 +2593,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_surfaces_stale_service_channel_units() {
+    async fn status_surfaces_stale_background_channel_units() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
@@ -2610,25 +2610,25 @@ mod tests {
             .expect("set default runtime");
         config.save(&home).await.expect("save config");
 
-        let identity = test_service_identity(&home);
+        let identity = test_unit_identity(&home);
         let daemon_unit = daemon_unit_name(&identity);
         let stale_unit = channel_unit_name(&identity, "telegram");
 
-        tokio::fs::create_dir_all(home.services_systemd_dir())
+        tokio::fs::create_dir_all(home.units_systemd_dir())
             .await
-            .expect("create services dir");
+            .expect("create units dir");
         tokio::fs::write(
-            home.services_systemd_dir().join(&stale_unit),
+            home.units_systemd_dir().join(&stale_unit),
             format!(
-                "[Unit]\nDescription=stale\nX-LionClaw-ServiceId={}\nX-LionClaw-HomeRoot={}\n",
-                identity.service_id,
+                "[Unit]\nDescription=stale\nX-LionClaw-UnitGroupId={}\nX-LionClaw-HomeRoot={}\n",
+                identity.unit_group_id,
                 identity.home_root.display()
             ),
         )
         .await
         .expect("write stale unit");
 
-        let manager = FakeServiceManager::default();
+        let manager = FakeUnitManager::default();
         manager
             .set_unit_status(&daemon_unit, "loaded/active/running")
             .expect("set daemon status");
@@ -2649,7 +2649,7 @@ mod tests {
                     let project_scope = current_project_scope();
                     move || async move {
                         Json(DaemonInfoResponse {
-                            service: "lionclawd".to_string(),
+                            daemon: "lionclawd".to_string(),
                             status: "ok".to_string(),
                             home_id: home_id.clone(),
                             home_root: home_root.clone(),
@@ -2677,7 +2677,7 @@ mod tests {
         let channel = &stack.channels[0];
         assert_eq!(channel.id, "telegram");
         assert_eq!(channel.skill, "-");
-        assert_eq!(channel.launch_mode, "service");
+        assert_eq!(channel.launch_mode, "background");
         assert_eq!(channel.unit_status, "loaded/active/running (stale)");
         assert_eq!(channel.pending_peers, 0);
         assert_eq!(channel.approved_peers, 0);

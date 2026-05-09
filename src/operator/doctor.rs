@@ -16,11 +16,11 @@ use crate::{
         channel_metadata::{load_channel_metadata, validate_channel_id},
         command_display::{lionclaw_home_command_prefix, shell_quote_arg},
         config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig},
-        runtime_integration::runtime_auth_guidance,
-        services::{
-            channel_unit_name, daemon_unit_name, existing_service_identity, unit_channel_id,
-            unit_recorded_home_root, unit_status_is_active, ServiceIdentity, ServiceManager,
+        managed_units::{
+            channel_unit_name, daemon_unit_name, existing_unit_identity, unit_channel_id,
+            unit_recorded_home_root, unit_status_is_active, UnitIdentity, UnitManager,
         },
+        runtime_integration::runtime_auth_guidance,
         target::{
             discover_project_root, instance_home_path, instances_dir_path, project_file_path,
             TargetSelection,
@@ -201,7 +201,7 @@ impl DoctorCommands {
     }
 }
 
-pub async fn run_doctor<M: ServiceManager>(
+pub async fn run_doctor<M: UnitManager>(
     selection: &TargetSelection,
     all: bool,
     manager: &M,
@@ -233,7 +233,7 @@ pub async fn run_doctor<M: ServiceManager>(
     .await
 }
 
-async fn inspect_project<M: ServiceManager>(
+async fn inspect_project<M: UnitManager>(
     project_root: &Path,
     selected_instance: Option<&str>,
     all: bool,
@@ -355,7 +355,7 @@ fn selected_project_instance_names(
     }
 }
 
-async fn inspect_direct_home<M: ServiceManager>(home: &Path, manager: &M) -> Result<DoctorReport> {
+async fn inspect_direct_home<M: UnitManager>(home: &Path, manager: &M) -> Result<DoctorReport> {
     let mut report = DoctorReport::default();
     let name = "direct-home";
     for finding in inspect_instance(None, name, home, manager).await {
@@ -364,7 +364,7 @@ async fn inspect_direct_home<M: ServiceManager>(home: &Path, manager: &M) -> Res
     Ok(report)
 }
 
-async fn inspect_instance<M: ServiceManager>(
+async fn inspect_instance<M: UnitManager>(
     project_root: Option<&Path>,
     name: &str,
     home: &Path,
@@ -754,7 +754,7 @@ fn inspect_channel_metadata_match(
     }
 }
 
-async fn inspect_expected_units<M: ServiceManager>(
+async fn inspect_expected_units<M: UnitManager>(
     home: &LionClawHome,
     name: &str,
     commands: &DoctorCommands,
@@ -765,18 +765,18 @@ async fn inspect_expected_units<M: ServiceManager>(
     let service_channels = config
         .channels
         .iter()
-        .filter(|channel| channel.launch_mode == ChannelLaunchMode::Service)
+        .filter(|channel| channel.launch_mode == ChannelLaunchMode::Background)
         .collect::<Vec<_>>();
-    if service_channels.is_empty() && existing_service_identity(home).ok().flatten().is_none() {
+    if service_channels.is_empty() && existing_unit_identity(home).ok().flatten().is_none() {
         return;
     }
-    let identity = match existing_service_identity(home) {
+    let identity = match existing_unit_identity(home) {
         Ok(Some(identity)) => identity,
         Ok(None) => {
             findings.push(
                 DoctorFinding::error(
                     format!("managed daemon unit is missing for instance \"{name}\""),
-                    "service channels are configured but this home has no service identity",
+                    "background channels are configured but this home has no managed unit identity",
                 )
                 .with_repair(commands.selected("up")),
             );
@@ -784,7 +784,7 @@ async fn inspect_expected_units<M: ServiceManager>(
         }
         Err(err) => {
             findings.push(DoctorFinding::error(
-                format!("service identity is invalid for instance \"{name}\""),
+                format!("managed unit identity is invalid for instance \"{name}\""),
                 err.to_string(),
             ));
             return;
@@ -813,7 +813,7 @@ async fn inspect_expected_units<M: ServiceManager>(
     }
 }
 
-async fn inspect_unit_status<M: ServiceManager>(
+async fn inspect_unit_status<M: UnitManager>(
     instance: &str,
     subject: &str,
     unit: &str,
@@ -841,7 +841,7 @@ async fn inspect_unit_status<M: ServiceManager>(
     }
 }
 
-async fn inspect_owned_stale_units<M: ServiceManager>(
+async fn inspect_owned_stale_units<M: UnitManager>(
     home: &LionClawHome,
     name: &str,
     commands: &DoctorCommands,
@@ -849,7 +849,7 @@ async fn inspect_owned_stale_units<M: ServiceManager>(
     manager: &M,
     findings: &mut Vec<DoctorFinding>,
 ) {
-    let Some(identity) = existing_service_identity(home).ok().flatten() else {
+    let Some(identity) = existing_unit_identity(home).ok().flatten() else {
         return;
     };
     let expected = expected_unit_names(config, &identity);
@@ -937,10 +937,10 @@ fn inspect_project_units(
     Ok(findings)
 }
 
-fn expected_unit_names(config: &OperatorConfig, identity: &ServiceIdentity) -> BTreeSet<String> {
+fn expected_unit_names(config: &OperatorConfig, identity: &UnitIdentity) -> BTreeSet<String> {
     let mut expected = BTreeSet::from([daemon_unit_name(identity)]);
     for channel in &config.channels {
-        if channel.launch_mode == ChannelLaunchMode::Service {
+        if channel.launch_mode == ChannelLaunchMode::Background {
             expected.insert(channel_unit_name(identity, &channel.id));
         }
     }
