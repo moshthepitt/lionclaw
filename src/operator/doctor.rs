@@ -260,19 +260,22 @@ async fn inspect_project<M: UnitManager>(
         None
     };
 
-    let instances = if metadata_dir_ok {
+    let (instances, instances_loaded) = if metadata_dir_ok {
         match read_instance_homes(project_root) {
-            Ok(instances) => instances,
+            Ok(instances) => (instances, true),
             Err(finding) => {
                 report.push(finding);
-                BTreeMap::new()
+                (BTreeMap::new(), false)
             }
         }
     } else {
-        BTreeMap::new()
+        (BTreeMap::new(), false)
     };
 
     let selected_names = if all {
+        if instances_loaded && instances.is_empty() && project_config.is_some() {
+            report.push(project_has_no_instances_finding(project_root));
+        }
         instances.keys().cloned().collect::<Vec<_>>()
     } else if let Some(name) = selected_instance {
         vec![name.to_string()]
@@ -281,13 +284,14 @@ async fn inspect_project<M: UnitManager>(
             project_root,
             project_config.as_ref(),
             &instances,
+            instances_loaded,
             &mut report,
         )
     };
 
     if let Some(config) = project_config.as_ref() {
         if let Some(default_instance) = config.default_instance.as_deref() {
-            if !instances.contains_key(default_instance) {
+            if instances_loaded && !instances.contains_key(default_instance) {
                 report.push(
                     DoctorFinding::error(
                         format!(
@@ -327,6 +331,7 @@ fn selected_project_instance_names(
     project_root: &Path,
     project_config: Option<&DiagnosticProjectFile>,
     instances: &BTreeMap<String, PathBuf>,
+    instances_loaded: bool,
     report: &mut DoctorReport,
 ) -> Vec<String> {
     if let Some(default_instance) = project_config
@@ -338,19 +343,11 @@ fn selected_project_instance_names(
 
     match instances.keys().cloned().collect::<Vec<_>>().as_slice() {
         [only] => vec![only.clone()],
-        [] => {
-            report.push(
-                DoctorFinding::error(
-                    "project has no instances",
-                    format!(
-                        "{} contains no instance homes",
-                        instances_dir_path(project_root).display()
-                    ),
-                )
-                .with_repair(project_command(project_root, "instance create main")),
-            );
+        [] if instances_loaded => {
+            report.push(project_has_no_instances_finding(project_root));
             Vec::new()
         }
+        [] => Vec::new(),
         _ => {
             report.push(
                 DoctorFinding::error(
@@ -368,6 +365,17 @@ fn selected_project_instance_names(
             Vec::new()
         }
     }
+}
+
+fn project_has_no_instances_finding(project_root: &Path) -> DoctorFinding {
+    DoctorFinding::error(
+        "project has no instances",
+        format!(
+            "{} contains no instance homes",
+            instances_dir_path(project_root).display()
+        ),
+    )
+    .with_repair(project_command(project_root, "instance create main"))
 }
 
 async fn inspect_direct_home<M: UnitManager>(home: &Path, manager: &M) -> Result<DoctorReport> {
@@ -1261,6 +1269,23 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.subject == "project file is missing or unreadable"));
+    }
+
+    #[tokio::test]
+    async fn doctor_all_reports_project_with_no_instances() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir_all(instances_dir_path(temp_dir.path())).expect("instances dir");
+        fs::write(project_file_path(temp_dir.path()), "version = 1\n").expect("project file");
+
+        let report = inspect_project(temp_dir.path(), None, true, &FakeUnitManager::default())
+            .await
+            .expect("doctor report");
+
+        assert!(report.has_errors());
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.subject == "project has no instances"));
     }
 
     #[test]
