@@ -23,7 +23,7 @@ use crate::{
         runtime_integration::runtime_auth_guidance,
         target::{
             discover_diagnostic_project_root, instance_home_path, instances_dir_path,
-            project_dir_path, project_file_path, TargetSelection,
+            project_dir_path, project_file_path, validate_home_target_exclusive, TargetSelection,
         },
     },
 };
@@ -209,6 +209,7 @@ pub async fn run_doctor<M: UnitManager>(
     if all && (selection.home.is_some() || selection.instance.is_some()) {
         bail!("doctor --all requires a project context and cannot be combined with --home or --instance");
     }
+    validate_home_target_exclusive(selection)?;
 
     if let Some(home) = selection.home.as_deref() {
         let home = absolute_path(home)?;
@@ -1286,6 +1287,32 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.subject == "project has no instances"));
+    }
+
+    #[tokio::test]
+    async fn doctor_rejects_home_with_project_or_instance_selectors() {
+        let selections = [
+            TargetSelection {
+                home: Some(PathBuf::from("home")),
+                project: Some(PathBuf::from("project")),
+                instance: None,
+            },
+            TargetSelection {
+                home: Some(PathBuf::from("home")),
+                project: None,
+                instance: Some("main".to_string()),
+            },
+        ];
+
+        for selection in selections {
+            let err = run_doctor(&selection, false, &FakeUnitManager::default())
+                .await
+                .expect_err("conflicting doctor target should fail");
+
+            assert!(err
+                .to_string()
+                .contains("--home cannot be combined with --project or --instance"));
+        }
     }
 
     #[test]

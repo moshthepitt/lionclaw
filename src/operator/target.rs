@@ -140,6 +140,13 @@ pub fn discover_diagnostic_project_root(selection: &TargetSelection) -> Result<P
     discover_diagnostic_project_root_from_cwd(selection.project.as_deref(), &cwd)
 }
 
+pub fn validate_home_target_exclusive(selection: &TargetSelection) -> Result<()> {
+    if selection.home.is_some() && (selection.project.is_some() || selection.instance.is_some()) {
+        bail!("--home cannot be combined with --project or --instance");
+    }
+    Ok(())
+}
+
 pub fn init_project(project_root: &Path) -> Result<ProjectInitResult> {
     let project_root = canonical_existing_dir(project_root, "project root")?;
     let project_dir = project_dir(&project_root);
@@ -376,9 +383,7 @@ fn resolve_target_from_cwd(
     cwd: &Path,
 ) -> Result<TargetContext> {
     if let Some(home) = selection.home.as_deref() {
-        if selection.project.is_some() || selection.instance.is_some() {
-            bail!("--home cannot be combined with --project or --instance");
-        }
+        validate_home_target_exclusive(selection)?;
         let home = absolutize_from(cwd, home);
         let work_root = match work_root {
             WorkRootRequirement::Optional => None,
