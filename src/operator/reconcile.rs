@@ -71,27 +71,6 @@ pub(crate) struct ManagedDaemonContext<'a> {
     pub codex_home_override: Option<&'a Path>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OnboardBindSelection {
-    Explicit(String),
-    Auto,
-}
-
-pub async fn onboard(
-    home: &LionClawHome,
-    bind_selection: Option<OnboardBindSelection>,
-) -> Result<OperatorConfig> {
-    home.ensure_base_dirs().await?;
-    let mut config = OperatorConfig::load(home).await?;
-    if bind_selection.is_some() {
-        config.daemon.bind = resolve_onboard_bind(&config.daemon.bind, bind_selection.as_ref())?;
-        config.daemon.bind_configured = true;
-    }
-    bootstrap_workspace(&config.workspace_root(home)).await?;
-    config.save(home).await?;
-    Ok(config)
-}
-
 pub async fn add_skill(
     home: &LionClawHome,
     alias: String,
@@ -347,17 +326,6 @@ pub async fn up_for_work_root<M: UnitManager>(
         manager.restart_units(&units_to_restart).await?;
     }
     Ok(state)
-}
-
-fn resolve_onboard_bind(
-    current_bind: &str,
-    selection: Option<&OnboardBindSelection>,
-) -> Result<String> {
-    match selection {
-        None => Ok(current_bind.to_string()),
-        Some(OnboardBindSelection::Explicit(bind)) => Ok(bind.trim().to_string()),
-        Some(OnboardBindSelection::Auto) => allocate_auto_bind(),
-    }
 }
 
 fn allocate_auto_bind() -> Result<String> {
@@ -1096,11 +1064,10 @@ mod tests {
     };
 
     use super::{
-        add_channel, add_skill, logs, managed_daemon_runtime_id, onboard, open_kernel,
-        open_kernel_with_project_root, render_marker_file, render_runtime_cache,
+        add_channel, add_skill, ensure_managed_bind_configured, logs, managed_daemon_runtime_id,
+        open_kernel, open_kernel_with_project_root, render_marker_file, render_runtime_cache,
         resolve_installed_skill_worker_entrypoint, resolve_required_channel_env,
-        resolve_worker_entrypoint, status_for_work_root, up_for_work_root, OnboardBindSelection,
-        StackBinaryPaths,
+        resolve_worker_entrypoint, status_for_work_root, up_for_work_root, StackBinaryPaths,
     };
     use crate::{
         applied::compute_daemon_fingerprint,
@@ -1141,6 +1108,23 @@ mod tests {
     fn current_project_scope() -> String {
         let project_root = current_work_root();
         runtime_project_partition_key(Some(project_root.as_path()))
+    }
+
+    fn test_project_home(project_root: &Path) -> LionClawHome {
+        let project = crate::operator::target::init_project(project_root).expect("init project");
+        LionClawHome::new(project.instance.home)
+    }
+
+    async fn load_test_config(home: &LionClawHome) -> OperatorConfig {
+        OperatorConfig::load(home).await.expect("load config")
+    }
+
+    async fn load_test_config_with_managed_bind(home: &LionClawHome) -> OperatorConfig {
+        let mut config = OperatorConfig::load(home).await.expect("load config");
+        ensure_managed_bind_configured(home, &mut config)
+            .await
+            .expect("configure managed bind");
+        config
     }
 
     fn test_unit_identity(home: &LionClawHome) -> UnitIdentity {
@@ -1245,24 +1229,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn onboard_bootstraps_workspace_and_config() {
+    async fn load_operator_state_bootstraps_instance_workspace() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let config = onboard(&home, None).await.expect("onboard");
+        let home = test_project_home(temp_dir.path());
+        let state = load_operator_state(&home)
+            .await
+            .expect("load operator state");
 
-        assert_eq!(config.daemon.workspace, "main");
-        assert!(home.config_path().exists());
+        assert_eq!(state.config.daemon.workspace, "main");
         assert!(home.home_id_path().exists());
         assert!(home.workspace_dir("main").join("SOUL.md").exists());
     }
 
     #[tokio::test]
-    async fn onboard_with_auto_bind_persists_loopback_port() {
+    async fn managed_bind_allocation_persists_loopback_port() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let config = onboard(&home, Some(OnboardBindSelection::Auto))
-            .await
-            .expect("onboard");
+        let home = test_project_home(temp_dir.path());
+        let config = load_test_config_with_managed_bind(&home).await;
 
         assert!(config.daemon.bind.starts_with("127.0.0.1:"));
         assert_ne!(config.daemon.bind, "127.0.0.1:8979");
@@ -1274,8 +1257,8 @@ mod tests {
     #[tokio::test]
     async fn render_runtime_cache_includes_runtime_secret_guidance() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let config = onboard(&home, None).await.expect("onboard");
+        let home = test_project_home(temp_dir.path());
+        let config = load_test_config(&home).await;
 
         render_runtime_cache(&home, &config, "codex")
             .await
@@ -1297,8 +1280,8 @@ mod tests {
     #[tokio::test]
     async fn state_kernel_open_does_not_require_project_workspace_root() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let config = onboard(&home, None).await.expect("onboard");
+        let home = test_project_home(temp_dir.path());
+        let config = load_test_config(&home).await;
 
         open_kernel(&home, &config, None)
             .await
@@ -1440,8 +1423,7 @@ mod tests {
     #[tokio::test]
     async fn installed_skill_worker_entrypoint_uses_alias_directory() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_project_home(temp_dir.path());
         let skill_source =
             write_skill_source(temp_dir.path(), "channel-telegram", "telegram", true);
         add_skill(
@@ -1469,8 +1451,7 @@ mod tests {
     #[tokio::test]
     async fn add_skill_and_remove_skill_manage_installed_directory() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_project_home(temp_dir.path());
         let skill_source = write_skill_source(temp_dir.path(), "test-skill", "test", false);
 
         add_skill(
@@ -1492,8 +1473,7 @@ mod tests {
     #[tokio::test]
     async fn remove_skill_returns_false_when_alias_is_not_installed() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_project_home(temp_dir.path());
 
         assert!(!super::remove_skill(&home, "missing-skill")
             .await
@@ -1501,7 +1481,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_skill_returns_false_before_onboard() {
+    async fn remove_skill_returns_false_before_home_exists() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
 
@@ -1517,8 +1497,7 @@ mod tests {
     #[tokio::test]
     async fn remove_skill_rejects_channel_bound_alias() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_project_home(temp_dir.path());
         let skill_source =
             write_skill_source(temp_dir.path(), "channel-telegram", "telegram", true);
         add_skill(
@@ -1548,8 +1527,7 @@ mod tests {
     #[tokio::test]
     async fn add_channel_requires_installed_worker_skill() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_project_home(temp_dir.path());
         let skill_source = write_skill_source(temp_dir.path(), "broken-skill", "broken", false);
         add_skill(
             &home,
@@ -1573,7 +1551,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_channel_reports_missing_installed_alias_before_onboard() {
+    async fn add_channel_reports_missing_installed_alias_before_home_exists() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
 
@@ -1596,7 +1574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_channel_returns_false_before_onboard() {
+    async fn remove_channel_returns_false_before_home_exists() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
 
@@ -1633,8 +1611,7 @@ mod tests {
     #[tokio::test]
     async fn add_skill_preserves_worker_requirements_for_channel_bound_aliases() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_project_home(temp_dir.path());
         let good_skill = write_skill_source(temp_dir.path(), "channel-telegram", "telegram", true);
         let bad_skill = write_skill_source(temp_dir.path(), "broken-telegram", "telegram", false);
 
@@ -1677,8 +1654,7 @@ mod tests {
     #[tokio::test]
     async fn add_skill_can_repair_missing_channel_bound_snapshot() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_project_home(temp_dir.path());
         let original = write_skill_source(
             temp_dir.path(),
             "channel-telegram-original",
@@ -1733,8 +1709,7 @@ mod tests {
     #[tokio::test]
     async fn add_skill_can_repair_corrupted_channel_bound_snapshot() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_project_home(temp_dir.path());
         let original = write_skill_source(
             temp_dir.path(),
             "channel-telegram-original",
@@ -1790,10 +1765,8 @@ mod tests {
     #[tokio::test]
     async fn up_with_fake_manager_materializes_units() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
-            .await
-            .expect("onboard");
+        let home = test_project_home(temp_dir.path());
+        let mut config = load_test_config_with_managed_bind(&home).await;
         write_test_codex_auth(&home).await;
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
@@ -1848,10 +1821,8 @@ mod tests {
     #[tokio::test]
     async fn background_channel_env_uses_private_channel_env_without_secret_copy() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
-            .await
-            .expect("onboard");
+        let home = test_project_home(temp_dir.path());
+        let mut config = load_test_config_with_managed_bind(&home).await;
         write_test_codex_auth(&home).await;
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
@@ -1917,10 +1888,8 @@ mod tests {
     #[tokio::test]
     async fn background_channel_env_rejects_undeclared_stored_values() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
-            .await
-            .expect("onboard");
+        let home = test_project_home(temp_dir.path());
+        let mut config = load_test_config_with_managed_bind(&home).await;
         write_test_codex_auth(&home).await;
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
@@ -2058,10 +2027,8 @@ mod tests {
     #[tokio::test]
     async fn up_rejects_missing_codex_runtime_auth() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
-            .await
-            .expect("onboard");
+        let home = test_project_home(temp_dir.path());
+        let mut config = load_test_config_with_managed_bind(&home).await;
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
         make_executable(&runtime_stub);
@@ -2093,10 +2060,8 @@ mod tests {
     #[tokio::test]
     async fn up_rejects_unavailable_private_network() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
-            .await
-            .expect("onboard");
+        let home = test_project_home(temp_dir.path());
+        let mut config = load_test_config_with_managed_bind(&home).await;
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
         make_executable(&runtime_stub);
@@ -2150,10 +2115,8 @@ mod tests {
     #[tokio::test]
     async fn up_skips_interactive_channels_for_background_units() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
-            .await
-            .expect("onboard");
+        let home = test_project_home(temp_dir.path());
+        let mut config = load_test_config_with_managed_bind(&home).await;
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
         make_executable(&runtime_stub);
@@ -2206,10 +2169,8 @@ mod tests {
     #[tokio::test]
     async fn up_reuses_same_home_daemon_when_managed_unit_is_active() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
-            .await
-            .expect("onboard");
+        let home = test_project_home(temp_dir.path());
+        let mut config = load_test_config_with_managed_bind(&home).await;
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
         make_executable(&runtime_stub);
@@ -2270,10 +2231,8 @@ mod tests {
     #[tokio::test]
     async fn up_restarts_managed_daemon_when_installed_skills_change() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
-            .await
-            .expect("onboard");
+        let home = test_project_home(temp_dir.path());
+        let mut config = load_test_config_with_managed_bind(&home).await;
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
         make_executable(&runtime_stub);
@@ -2354,8 +2313,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_project_home(temp_dir.path());
 
         let broken_podman = temp_dir.path().join("podman");
         fs::write(
@@ -2417,10 +2375,8 @@ mod tests {
     #[tokio::test]
     async fn status_marks_restart_required_when_daemon_fingerprint_is_stale() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
-            .await
-            .expect("onboard");
+        let home = test_project_home(temp_dir.path());
+        let mut config = load_test_config_with_managed_bind(&home).await;
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
         make_executable(&runtime_stub);
@@ -2506,10 +2462,8 @@ mod tests {
     #[tokio::test]
     async fn status_marks_daemon_running_for_different_work_root() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
-            .await
-            .expect("onboard");
+        let home = test_project_home(temp_dir.path());
+        let mut config = load_test_config_with_managed_bind(&home).await;
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
         make_executable(&runtime_stub);
@@ -2595,10 +2549,8 @@ mod tests {
     #[tokio::test]
     async fn status_surfaces_stale_background_channel_units() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        let mut config = onboard(&home, Some(OnboardBindSelection::Auto))
-            .await
-            .expect("onboard");
+        let home = test_project_home(temp_dir.path());
+        let mut config = load_test_config_with_managed_bind(&home).await;
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
         make_executable(&runtime_stub);

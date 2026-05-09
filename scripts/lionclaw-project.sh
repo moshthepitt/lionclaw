@@ -9,7 +9,7 @@ Project helper for making one repository easy to use with LionClaw.
 
 Commands:
   doctor           Check prerequisites and project-managed state
-  configure        Onboard the project home and register runtime, skills, and channel
+  configure        Configure the project instance, runtime, skills, and channel
   build-image      Build the configured runtime image if missing or stale
   rebuild-image    Force rebuild the configured runtime image
   run              Configure the project, then run the runtime in the workspace
@@ -25,7 +25,7 @@ Commands:
 Environment overrides:
   LIONCLAW_PROJECT_ROOT           Default: git root for $PWD, else $PWD
   LIONCLAW_WORKSPACE_ROOT         Default: single project */Containerfile dir, else project root
-  LIONCLAW_HOME                   Default: existing <project>/lionclaw-home, else <project>/.lionclaw/home
+  LIONCLAW_HOME                   Default: <project>/.lionclaw/instances/main
   LIONCLAW_REPO                   Default: this script's repo, or sibling ../lionclaw
   LIONCLAW_BIN                    Default: <lionclaw-repo>/target/debug/lionclaw, else current PATH binary
   LIONCLAW_FORCE_BUILD=1          Force cargo build --bins before LionClaw commands
@@ -157,10 +157,8 @@ resolve_default_home() {
 
   if [[ -n "${LIONCLAW_HOME:-}" ]]; then
     abs_path "$project_root" "$LIONCLAW_HOME"
-  elif [[ -d "$project_root/lionclaw-home" || -f "$project_root/lionclaw-home/config/lionclaw.toml" ]]; then
-    printf '%s/lionclaw-home\n' "$project_root"
   else
-    printf '%s/.lionclaw/home\n' "$project_root"
+    printf '%s/.lionclaw/instances/main\n' "$project_root"
   fi
 }
 
@@ -463,15 +461,26 @@ print_context() {
   printf 'Dry run:           %s\n' "${LIONCLAW_DRY_RUN:-0}"
 }
 
-ensure_home_onboarded() {
-  if is_dry_run; then
-    printf '[dry-run] would mkdir -p %q\n' "$LIONCLAW_HOME"
-  else
-    mkdir -p "$LIONCLAW_HOME"
-  fi
+ensure_instance_home_configured() {
+  local dirs=(
+    "$LIONCLAW_HOME"
+    "$LIONCLAW_HOME/db"
+    "$LIONCLAW_HOME/config"
+    "$LIONCLAW_HOME/config/channels"
+    "$LIONCLAW_HOME/skills"
+    "$LIONCLAW_HOME/runtime"
+    "$LIONCLAW_HOME/logs"
+    "$LIONCLAW_HOME/units"
+    "$LIONCLAW_HOME/units/env"
+    "$LIONCLAW_HOME/units/systemd"
+    "$LIONCLAW_HOME/workspaces/main"
+  )
 
-  if [[ ! -f "$(config_path)" ]]; then
-    run_lionclaw_action onboard --bind auto
+  if is_dry_run; then
+    printf '[dry-run] would create LionClaw instance dirs under %q\n' "$LIONCLAW_HOME"
+  else
+    mkdir -p "${dirs[@]}"
+    chmod 700 "$LIONCLAW_HOME/config"
   fi
 
   ensure_home_work_root_recorded
@@ -601,7 +610,7 @@ install_project_skills() {
 
 ensure_project_config() {
   ensure_lionclaw_bin
-  ensure_home_onboarded
+  ensure_instance_home_configured
   validate_managed_config
   ensure_podman
 

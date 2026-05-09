@@ -9,7 +9,8 @@ use lionclaw::{
     kernel::{Kernel, KernelOptions},
     operator::{
         config::ChannelLaunchMode,
-        reconcile::{add_channel, add_skill, onboard, remove_skill},
+        reconcile::{add_channel, add_skill, remove_skill},
+        target::init_project,
     },
 };
 use tempfile::TempDir;
@@ -23,8 +24,8 @@ pub struct TestHome {
 impl TestHome {
     pub async fn new() -> Self {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let project = init_project(temp_dir.path()).expect("init project");
+        let home = LionClawHome::new(project.instance.home);
         Self { temp_dir, home }
     }
 

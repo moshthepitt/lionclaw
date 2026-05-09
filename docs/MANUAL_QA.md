@@ -155,7 +155,7 @@ Configure LionClaw from project A:
 
 ```bash
 cd "$PROJ_A"
-"$LIONCLAW_BIN" onboard --bind auto
+"$LIONCLAW_BIN" project init
 "$LIONCLAW_BIN" runtime add codex --kind codex --bin codex --image lionclaw-runtime:v1
 "$LIONCLAW_BIN" runtime set-default codex
 "$LIONCLAW_BIN" skill add "$REPO_ROOT/skills/channel-terminal" --alias terminal

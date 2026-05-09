@@ -771,7 +771,7 @@ mod tests {
                 channel_unit_name, daemon_unit_name, ensure_unit_identity, FakeUnitManager,
                 UnitManager,
             },
-            reconcile::{add_skill, onboard, OnboardBindSelection, StackBinaryPaths},
+            reconcile::{add_skill, StackBinaryPaths},
         },
     };
 
@@ -779,6 +779,12 @@ mod tests {
         StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         }
+    }
+
+    fn test_bind() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("allocate test bind");
+        let addr = listener.local_addr().expect("read test bind");
+        format!("127.0.0.1:{}", addr.port())
     }
 
     #[cfg(unix)]
@@ -791,9 +797,7 @@ mod tests {
 
     #[cfg(unix)]
     async fn seed_configured_runtime(home: &LionClawHome, temp_dir: &Path) {
-        onboard(home, Some(OnboardBindSelection::Auto))
-            .await
-            .expect("onboard");
+        home.ensure_base_dirs().await.expect("create base dirs");
         let codex_home = home.root().join(".codex");
         fs::create_dir_all(&codex_home).expect("codex home");
         fs::write(
@@ -812,6 +816,8 @@ mod tests {
         );
 
         let mut config = OperatorConfig::load(home).await.expect("load config");
+        config.daemon.bind = test_bind();
+        config.daemon.bind_configured = true;
         config.runtimes = [(
             "codex".to_string(),
             RuntimeProfileConfig::Codex {

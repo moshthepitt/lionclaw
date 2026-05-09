@@ -182,7 +182,7 @@ impl DoctorCommands {
                 "{prefix} instance create {}",
                 shell_quote_arg(&self.instance)
             ),
-            None => self.selected("onboard"),
+            None => "lionclaw project init".to_string(),
         }
     }
 

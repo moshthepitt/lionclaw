@@ -259,6 +259,8 @@ pub fn adopt_project_instance(
             )
         })?;
     }
+    let lionclaw_home = LionClawHome::new(target_home.clone());
+    ensure_instance_base_dirs(&lionclaw_home)?;
     save_instance_config(target_home.as_path(), &work_root)?;
 
     Ok(InstanceRecord {
@@ -980,6 +982,7 @@ fn ensure_instance_base_dirs(home: &LionClawHome) -> Result<()> {
         home.root(),
         home.db_dir(),
         home.config_dir(),
+        home.channel_env_dir(),
         home.skills_dir(),
         home.runtime_dir(),
         home.logs_dir(),

@@ -429,9 +429,7 @@ mod tests {
         let addr = listener.local_addr().expect("listener addr");
         let bind = format!("127.0.0.1:{}", addr.port());
         let listener = reserve_bind.then_some(listener);
-        crate::operator::reconcile::onboard(&home, None)
-            .await
-            .expect("onboard");
+        home.ensure_base_dirs().await.expect("create base dirs");
         let codex_home = home.root().join(".codex");
         tokio::fs::create_dir_all(&codex_home)
             .await

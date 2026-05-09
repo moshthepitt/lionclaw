@@ -88,7 +88,7 @@ LIONCLAW_PROJECT_SKILLS='pdf-to-markdown=skills/pdf-to-markdown' \
 
 This helper is intentionally an incubation path. It should stay thin: project
 path resolution, preflight, runtime image build, and orchestration only. Durable
-configuration still flows through `lionclaw onboard`, `lionclaw runtime add`,
+configuration still flows through `lionclaw project init`, `lionclaw runtime add`,
 `lionclaw skill add`, `lionclaw channel add`, `lionclaw run`,
 `lionclaw channel attach`, and the product operation commands:
 `lionclaw up`, `lionclaw down`, `lionclaw status`, `lionclaw logs`, and
@@ -100,10 +100,11 @@ manager:
 ./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e
 ```
 
-That command uses `lionclaw onboard --bind auto` for a fresh home, so manual
-test homes do not collide with another LionClaw daemon already using the
-default bind. It configures the runtime with `lionclaw-runtime:v1` and builds
-that shared local image first when it is missing. The attach step uses
+That command initializes a fresh project instance and lets `lionclaw up`
+allocate the managed bind, so manual test projects do not collide with another
+LionClaw daemon already using the default bind. It configures the runtime with
+`lionclaw-runtime:v1` and builds that shared local image first when it is
+missing. The attach step uses
 LionClaw's managed daemon path, which currently needs the systemd user manager.
 
 Override the runtime id, command, or channel:

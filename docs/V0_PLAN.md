@@ -60,7 +60,7 @@ It does not:
 
 ## v0 Deliverables
 
-1. Operator CLI for onboarding, runtime registration, local runs, background
+1. Operator CLI for project setup, runtime registration, local runs, background
    control, channels, jobs, and continuity.
 2. SQLite-backed kernel subsystems for sessions, turns, skills, policy, audit,
    channels, jobs, and continuity metadata.

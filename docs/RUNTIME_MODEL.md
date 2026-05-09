@@ -382,7 +382,7 @@ automatically.
 
 ## Implementation Checklist Anchor
 
-- [x] Add `lionclaw` onboarding and declarative state reconciliation.
+- [x] Add `lionclaw` project setup and declarative state reconciliation.
 - [x] Move skill installs to canonical snapshot store under the selected instance home.
 - [x] Remove repo-path assumptions from worker resolution.
 - [x] Add assistant home workspace identity bootstrap templates.

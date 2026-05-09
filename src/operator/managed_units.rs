@@ -104,7 +104,7 @@ fn read_or_create_unit_identity(home: &LionClawHome) -> Result<UnitIdentity> {
     };
     let home_id = futures_home_id(home)?.ok_or_else(|| {
         anyhow!(
-            "home id is not configured for {}; run lionclaw project init or onboard first",
+            "home id is not configured for {}; create a LionClaw project instance first",
             home.root().display()
         )
     })?;

@@ -3,13 +3,13 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/bootstrap-terminal-test.sh <home> [runtime-id] [runtime-command] [channel-id]
+Usage: ./scripts/bootstrap-terminal-test.sh <project-root> [runtime-id] [runtime-command] [channel-id]
 
-Create or refresh a LionClaw home for manual terminal-channel testing, then
+Create or refresh a LionClaw project for manual terminal-channel testing, then
 attach the interactive terminal channel in the current TTY.
 
 Arguments:
-  home            Path to the LionClaw home to create or reuse
+  project-root    Path to the LionClaw project root to create or reuse
   runtime-id      Optional runtime id to configure (default: codex)
   runtime-command Optional runtime command or executable (default: runtime-id)
   channel-id      Optional channel id to attach (default: terminal)
@@ -30,7 +30,7 @@ die() {
   exit 1
 }
 
-resolve_home() {
+resolve_project_root() {
   local raw="$1"
   if [[ "$raw" == "~"* ]]; then
     printf '%s\n' "${raw/#\~/$HOME}"
@@ -93,7 +93,7 @@ if [[ $# -lt 1 || $# -gt 4 ]]; then
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-lionclaw_home="$(resolve_home "$1")"
+project_root="$(resolve_project_root "$1")"
 runtime_id="${2:-codex}"
 runtime_command="${3:-$runtime_id}"
 channel_id="${4:-terminal}"
@@ -101,32 +101,34 @@ runtime_kind="$(runtime_kind_for "$runtime_id")"
 runtime_image="${LIONCLAW_RUNTIME_IMAGE:-lionclaw-runtime:v1}"
 
 cd "$repo_root"
-export LIONCLAW_HOME="$lionclaw_home"
 
 ensure_systemd_user
 
-mkdir -p "$LIONCLAW_HOME"
+mkdir -p "$project_root"
 cargo build --bins
 
-if [[ ! -f "$LIONCLAW_HOME/config/lionclaw.toml" ]]; then
-  "./target/debug/lionclaw" onboard --bind auto
+if [[ ! -f "$project_root/.lionclaw/project.toml" ]]; then
+  "./target/debug/lionclaw" --project "$project_root" project init
 fi
 
+lionclaw_home="$project_root/.lionclaw/instances/main"
+export LIONCLAW_HOME="$lionclaw_home"
 bind_addr="$(configured_bind)"
 
+printf 'Using project root=%s\n' "$project_root"
 printf 'Using LIONCLAW_HOME=%s\n' "$LIONCLAW_HOME"
 printf 'Using bind=%s\n' "${bind_addr:-unknown}"
 printf 'Ensuring runtime=%s kind=%s command=%s image=%s channel=%s\n' \
   "$runtime_id" "$runtime_kind" "$runtime_command" "$runtime_image" "$channel_id"
 
 ensure_runtime_image "$runtime_image"
-"./target/debug/lionclaw" runtime add "$runtime_id" \
+"./target/debug/lionclaw" --project "$project_root" runtime add "$runtime_id" \
   --kind "$runtime_kind" \
   --bin "$runtime_command" \
   --image "$runtime_image"
-"./target/debug/lionclaw" runtime set-default "$runtime_id"
-"./target/debug/lionclaw" skill add skills/channel-terminal --alias terminal
-"./target/debug/lionclaw" channel add "$channel_id" --skill terminal --launch interactive
+"./target/debug/lionclaw" --project "$project_root" runtime set-default "$runtime_id"
+"./target/debug/lionclaw" --project "$project_root" skill add skills/channel-terminal --alias terminal
+"./target/debug/lionclaw" --project "$project_root" channel add "$channel_id" --skill terminal --launch interactive
 
 export LIONCLAW_SKIP_BUILD=1
 exec "./scripts/attach-terminal-test.sh" "$LIONCLAW_HOME" "$runtime_id" "$channel_id"

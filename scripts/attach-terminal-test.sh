@@ -56,7 +56,7 @@ cd "$repo_root"
 export LIONCLAW_HOME="$lionclaw_home"
 
 [[ -d "$LIONCLAW_HOME" ]] || die "LionClaw home does not exist: $LIONCLAW_HOME"
-[[ -f "$LIONCLAW_HOME/config/lionclaw.toml" ]] || die "missing config at $LIONCLAW_HOME/config/lionclaw.toml; run lionclaw onboard first"
+[[ -f "$LIONCLAW_HOME/config/lionclaw.toml" ]] || die "missing config at $LIONCLAW_HOME/config/lionclaw.toml; configure the project instance first"
 
 runtime_id="${2:-$(resolve_default_runtime)}"
 bind_addr="$(configured_bind)"

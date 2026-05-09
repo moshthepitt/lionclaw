@@ -990,7 +990,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         assert!(message.contains("lionclaw configure --runtime codex"));
         assert!(
             !home.config_path().exists(),
-            "run should not onboard or create runtime config implicitly"
+            "run should not create runtime config implicitly"
         );
     }
 

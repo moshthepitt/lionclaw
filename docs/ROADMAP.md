@@ -40,7 +40,7 @@ Status key:
 
 Goal: make the product obvious and usable from one command path.
 
-- [x] `lionclaw onboard`
+- [x] `lionclaw project init`
 - [x] `lionclaw runtime add ...`
 - [x] `lionclaw run [runtime]`
 - [x] `lionclaw run --continue-last-session [runtime]`
@@ -51,7 +51,7 @@ Goal: make the product obvious and usable from one command path.
 
 Exit criteria:
 
-- [x] A fresh user can build, onboard, register a supported runtime, and start a confined local run.
+- [x] A fresh user can build, initialize a project, register a supported runtime, and start a confined local run.
 - [x] The README explains LionClaw as a personal local assistant using real agents.
 
 ## P1 - Durable Kernel
