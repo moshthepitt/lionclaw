@@ -966,7 +966,6 @@ fn managed_unit_names(home: &LionClawHome) -> Result<Vec<String>> {
         }
     }
 
-    units.insert(daemon_unit_name(&identity));
     Ok(units.into_iter().collect())
 }
 
@@ -1064,10 +1063,11 @@ mod tests {
     };
 
     use super::{
-        add_channel, add_skill, ensure_managed_bind_configured, logs, managed_daemon_runtime_id,
-        open_kernel, open_kernel_with_project_root, render_marker_file, render_runtime_cache,
-        resolve_installed_skill_worker_entrypoint, resolve_required_channel_env,
-        resolve_worker_entrypoint, status_for_work_root, up_for_work_root, StackBinaryPaths,
+        add_channel, add_skill, down, ensure_managed_bind_configured, logs,
+        managed_daemon_runtime_id, managed_unit_names, open_kernel, open_kernel_with_project_root,
+        render_marker_file, render_runtime_cache, resolve_installed_skill_worker_entrypoint,
+        resolve_required_channel_env, resolve_worker_entrypoint, status_for_work_root,
+        up_for_work_root, StackBinaryPaths,
     };
     use crate::{
         applied::compute_daemon_fingerprint,
@@ -1133,6 +1133,59 @@ mod tests {
 
     fn test_daemon_unit_name(home: &LionClawHome) -> String {
         daemon_unit_name(&test_unit_identity(home))
+    }
+
+    fn write_test_unit_metadata(path: &Path, unit_group_id: &str, home_root: &Path) {
+        fs::create_dir_all(path.parent().expect("unit parent")).expect("create unit parent");
+        fs::write(
+            path,
+            format!(
+                "[Unit]\nDescription=test\nX-LionClaw-UnitGroupId={unit_group_id}\nX-LionClaw-HomeRoot={}\n",
+                home_root.display()
+            ),
+        )
+        .expect("write unit metadata");
+    }
+
+    #[test]
+    fn managed_unit_names_excludes_daemon_without_matching_ownership() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_project_home(temp_dir.path());
+        let identity = test_unit_identity(&home);
+        let daemon_unit = daemon_unit_name(&identity);
+        write_test_unit_metadata(
+            &home.units_systemd_dir().join(&daemon_unit),
+            &uuid::Uuid::new_v4().to_string(),
+            &identity.home_root,
+        );
+
+        let units = managed_unit_names(&home).expect("managed units");
+
+        assert!(!units.iter().any(|unit| unit == &daemon_unit));
+    }
+
+    #[tokio::test]
+    async fn down_reports_owned_unit_stop_failures() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = test_project_home(temp_dir.path());
+        let identity = test_unit_identity(&home);
+        let daemon_unit = daemon_unit_name(&identity);
+        write_test_unit_metadata(
+            &home.units_systemd_dir().join(&daemon_unit),
+            &identity.unit_group_id,
+            &identity.home_root,
+        );
+        let manager = FakeUnitManager::default();
+        manager
+            .fail_down_unit(&daemon_unit)
+            .expect("configure stop failure");
+
+        let err = down(&home, &manager)
+            .await
+            .expect_err("down should report stop failure");
+
+        assert!(err.to_string().contains("failed to stop 1 managed unit"));
+        assert!(err.to_string().contains("configured unit stop failure"));
     }
 
     async fn current_daemon_fingerprint(home: &LionClawHome) -> String {
@@ -1942,7 +1995,12 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         home.ensure_base_dirs().await.expect("base dirs");
-        test_unit_identity(&home);
+        let identity = test_unit_identity(&home);
+        write_test_unit_metadata(
+            &home.units_systemd_dir().join(daemon_unit_name(&identity)),
+            &identity.unit_group_id,
+            &identity.home_root,
+        );
         let mut env = ChannelEnv::new();
         env.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
         merge_channel_env(&home, "telegram", &env).expect("store channel env");
@@ -1976,7 +2034,12 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         home.ensure_base_dirs().await.expect("base dirs");
-        test_unit_identity(&home);
+        let identity = test_unit_identity(&home);
+        write_test_unit_metadata(
+            &home.units_systemd_dir().join(daemon_unit_name(&identity)),
+            &identity.unit_group_id,
+            &identity.home_root,
+        );
         let mut env = ChannelEnv::new();
         env.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
         merge_channel_env(&home, "telegram", &env).expect("store channel env");
@@ -1998,7 +2061,12 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         home.ensure_base_dirs().await.expect("base dirs");
-        test_unit_identity(&home);
+        let identity = test_unit_identity(&home);
+        write_test_unit_metadata(
+            &home.units_systemd_dir().join(daemon_unit_name(&identity)),
+            &identity.unit_group_id,
+            &identity.home_root,
+        );
         let mut config = OperatorConfig::default();
         config.upsert_channel(ManagedChannelConfig {
             id: "telegram".to_string(),

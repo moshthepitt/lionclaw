@@ -317,15 +317,24 @@ pub fn missing_target_for_status() -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
     use super::*;
     use crate::operator::{
         runtime_integration::configure_runtime_profile_with_engine_resolver,
         target::{create_project_instance, init_project},
     };
 
-    fn configure_test_codex(config: &mut OperatorConfig) {
+    fn fake_podman(root: &std::path::Path) -> std::path::PathBuf {
+        let path = root.join("podman");
+        fs::write(&path, "#!/usr/bin/env bash\nexit 0\n").expect("write fake podman");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod fake podman");
+        path
+    }
+
+    fn configure_test_codex(config: &mut OperatorConfig, engine: &std::path::Path) {
         configure_runtime_profile_with_engine_resolver(config, "codex", |_| {
-            Ok("/usr/bin/podman".to_string())
+            Ok(engine.to_string_lossy().to_string())
         })
         .expect("configure codex");
     }
@@ -336,7 +345,7 @@ mod tests {
         let project = init_project(temp_dir.path()).expect("init project");
         let home = LionClawHome::new(project.instance.home.clone());
         let mut config = OperatorConfig::load(&home).await.expect("load config");
-        configure_test_codex(&mut config);
+        configure_test_codex(&mut config, &fake_podman(temp_dir.path()));
         config.save(&home).await.expect("save config");
         let target = TargetContext {
             project_root: Some(project.project_root.clone()),
@@ -384,7 +393,7 @@ mod tests {
         create_project_instance(&project.project_root, "reviewer", None, false).expect("reviewer");
         let home = LionClawHome::new(project.instance.home.clone());
         let mut config = OperatorConfig::load(&home).await.expect("load config");
-        configure_test_codex(&mut config);
+        configure_test_codex(&mut config, &fake_podman(temp_dir.path()));
         config.save(&home).await.expect("save config");
 
         let output = render_project_status_all(&project.project_root)

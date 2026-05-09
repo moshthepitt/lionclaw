@@ -521,24 +521,36 @@ fn inspect_instance_work_root(
             format!("{} is not a directory", work_root.display()),
         ));
     }
+    let canonical_work_root = match fs::canonicalize(&work_root) {
+        Ok(path) => path,
+        Err(err) => {
+            findings.push(DoctorFinding::error(
+                format!("instance \"{name}\" work root is not canonical"),
+                format!("{}: {err}", work_root.display()),
+            ));
+            return;
+        }
+    };
     if let Some(project_root) = project_root {
-        if !work_root.starts_with(project_root) {
+        let canonical_project_root =
+            fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+        if !canonical_work_root.starts_with(&canonical_project_root) {
             findings.push(DoctorFinding::error(
                 format!("instance \"{name}\" work root escapes project root"),
                 format!(
                     "{} is outside {}",
-                    work_root.display(),
-                    project_root.display()
+                    canonical_work_root.display(),
+                    canonical_project_root.display()
                 ),
             ));
         }
-        let metadata_root = project_root.join(".lionclaw");
-        if work_root == metadata_root || work_root.starts_with(&metadata_root) {
+        let metadata_root = canonical_project_root.join(".lionclaw");
+        if canonical_work_root == metadata_root || canonical_work_root.starts_with(&metadata_root) {
             findings.push(DoctorFinding::error(
                 format!("instance \"{name}\" work root points inside LionClaw metadata"),
                 format!(
                     "{} is inside {}",
-                    work_root.display(),
+                    canonical_work_root.display(),
                     metadata_root.display()
                 ),
             ));
@@ -1107,6 +1119,8 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::symlink;
+
     use super::*;
 
     #[test]
@@ -1139,5 +1153,34 @@ mod tests {
         };
         assert!(error.has_errors());
         assert!(error.render().contains("error: missing runtime"));
+    }
+
+    #[test]
+    fn doctor_reports_work_root_symlink_escape() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project_root = temp_dir.path().join("project");
+        let outside_root = temp_dir.path().join("outside");
+        let home = project_root.join(".lionclaw/instances/main");
+        let link = project_root.join("work");
+        fs::create_dir_all(home.join("config")).expect("create instance config dir");
+        fs::create_dir_all(&outside_root).expect("create outside root");
+        symlink(&outside_root, &link).expect("symlink outside root");
+        let escaped_work_root = link
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        fs::write(
+            home.join("config/instance.toml"),
+            format!("version = 1\nwork_root = \"{escaped_work_root}\"\n"),
+        )
+        .expect("write instance config");
+        let commands = DoctorCommands::for_target(Some(&project_root), "main", &home);
+        let mut findings = Vec::new();
+
+        inspect_instance_work_root(Some(&project_root), "main", &home, &commands, &mut findings);
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.subject == "instance \"main\" work root escapes project root"));
     }
 }

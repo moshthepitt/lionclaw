@@ -6,10 +6,11 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
+use chrono::{Duration as ChronoDuration, Local, NaiveDateTime};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use crate::home::LionClawHome;
+use crate::{home::LionClawHome, runtime_timeouts::parse_duration};
 
 use super::{
     config::{ChannelLaunchMode, OperatorConfig},
@@ -345,12 +346,29 @@ fn journal_command(components: &[LogComponent], options: &LogOptions) -> tokio::
         command.arg("--follow");
     }
     if let Some(since) = options.since.as_deref() {
-        command.arg("--since").arg(since);
+        command.arg("--since").arg(journal_since_arg(since));
     }
     for unit in components {
         command.arg("-u").arg(&unit.unit);
     }
     command
+}
+
+fn journal_since_arg(raw: &str) -> String {
+    journal_since_arg_at(raw, Local::now().naive_local())
+}
+
+fn journal_since_arg_at(raw: &str, now: NaiveDateTime) -> String {
+    let Ok(duration) = parse_duration(raw) else {
+        return raw.to_string();
+    };
+    let Ok(delta) = ChronoDuration::from_std(duration) else {
+        return raw.to_string();
+    };
+    let Some(since) = now.checked_sub_signed(delta) else {
+        return raw.to_string();
+    };
+    since.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 struct LogRenderContext {
@@ -494,5 +512,20 @@ mod tests {
             .expect("line");
 
         assert_eq!(line, "main/daemon | Started");
+    }
+
+    #[test]
+    fn translates_duration_since_for_journalctl() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 5, 9)
+            .expect("date")
+            .and_hms_opt(12, 0, 0)
+            .expect("time");
+
+        assert_eq!(journal_since_arg_at("10m", now), "2026-05-09 11:50:00");
+        assert_eq!(journal_since_arg_at("2h", now), "2026-05-09 10:00:00");
+        assert_eq!(
+            journal_since_arg_at("2026-05-09 11:00:00", now),
+            "2026-05-09 11:00:00"
+        );
     }
 }

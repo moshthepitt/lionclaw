@@ -466,10 +466,19 @@ impl UnitManager for SystemdUserUnitManager {
     }
 
     async fn down_units(&self, units: &[String]) -> Result<()> {
+        let mut failures = Vec::new();
         for unit in units {
             if let Err(err) = run_systemctl(["--user", "disable", "--now", unit]).await {
                 warn!(?err, unit, "failed to stop systemd user unit");
+                failures.push(format!("{unit}: {err:#}"));
             }
+        }
+        if !failures.is_empty() {
+            bail!(
+                "failed to stop {} managed unit(s): {}",
+                failures.len(),
+                failures.join("; ")
+            );
         }
         Ok(())
     }
@@ -538,6 +547,7 @@ pub struct FakeUnitManager {
     log_output: Mutex<Option<String>>,
     log_error: Mutex<Option<String>>,
     fail_up_after_started: Mutex<Option<usize>>,
+    fail_down_units: Mutex<Vec<String>>,
 }
 
 impl FakeUnitManager {
@@ -592,6 +602,14 @@ impl FakeUnitManager {
             .fail_up_after_started
             .lock()
             .map_err(|_| anyhow!("fail up lock poisoned"))? = Some(started_units);
+        Ok(())
+    }
+
+    pub fn fail_down_unit(&self, unit: impl Into<String>) -> Result<()> {
+        self.fail_down_units
+            .lock()
+            .map_err(|_| anyhow!("fail down lock poisoned"))?
+            .push(unit.into());
         Ok(())
     }
 }
@@ -671,14 +689,31 @@ impl UnitManager for FakeUnitManager {
     }
 
     async fn down_units(&self, units: &[String]) -> Result<()> {
+        let fail_units = self
+            .fail_down_units
+            .lock()
+            .map_err(|_| anyhow!("fail down lock poisoned"))?
+            .clone();
+        let mut failures = Vec::new();
         {
             let mut states = self
                 .states
                 .lock()
                 .map_err(|_| anyhow!("states lock poisoned"))?;
             for unit in units {
+                if fail_units.iter().any(|value| value == unit) {
+                    failures.push(format!("{unit}: configured unit stop failure"));
+                    continue;
+                }
                 states.insert(unit.clone(), "loaded/inactive/dead".to_string());
             }
+        }
+        if !failures.is_empty() {
+            bail!(
+                "failed to stop {} managed unit(s): {}",
+                failures.len(),
+                failures.join("; ")
+            );
         }
         Ok(())
     }
