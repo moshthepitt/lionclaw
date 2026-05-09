@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
@@ -33,6 +33,31 @@ pub struct UnitIdentity {
     pub unit_group_id: String,
     pub home_id: String,
     pub home_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnedManagedUnits {
+    names: BTreeSet<String>,
+    daemon: Option<String>,
+    channels: BTreeMap<String, String>,
+}
+
+impl OwnedManagedUnits {
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.names.iter().cloned().collect()
+    }
+
+    pub fn daemon(&self) -> Option<&str> {
+        self.daemon.as_deref()
+    }
+
+    pub fn channel(&self, channel_id: &str) -> Option<&str> {
+        self.channels.get(channel_id).map(String::as_str)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -91,6 +116,74 @@ pub fn existing_unit_identity(home: &LionClawHome) -> Result<Option<UnitIdentity
         home_id,
         home_root,
     }))
+}
+
+pub fn owned_managed_units(home: &LionClawHome) -> Result<OwnedManagedUnits> {
+    let Some(identity) = existing_unit_identity(home)? else {
+        return Ok(OwnedManagedUnits::default());
+    };
+    let mut names = BTreeSet::new();
+    for systemd_dir in [systemd_user_unit_dir()?, home.units_systemd_dir()] {
+        scan_owned_unit_names(&systemd_dir, &identity, &mut names)?;
+    }
+    Ok(owned_managed_units_from_names(&identity, names))
+}
+
+fn scan_owned_unit_names(
+    systemd_dir: &Path,
+    identity: &UnitIdentity,
+    names: &mut BTreeSet<String>,
+) -> Result<()> {
+    if !systemd_dir.exists() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(systemd_dir)
+        .with_context(|| format!("failed to read directory {}", systemd_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to iterate {}", systemd_dir.display()))?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if name.starts_with("lionclaw")
+            && name.ends_with(".service")
+            && unit_belongs_to_identity(&path, identity)?
+        {
+            names.insert(name.to_string());
+        }
+    }
+
+    Ok(())
+}
+
+fn owned_managed_units_from_names(
+    identity: &UnitIdentity,
+    names: BTreeSet<String>,
+) -> OwnedManagedUnits {
+    let daemon_name = daemon_unit_name(identity);
+    let daemon = names.contains(&daemon_name).then_some(daemon_name);
+    let channel_prefix = format!("lionclaw-channel-{}-", identity.unit_group_id);
+    let channels = names
+        .iter()
+        .filter_map(|name| {
+            let channel_id = name
+                .strip_prefix(&channel_prefix)?
+                .strip_suffix(".service")?;
+            Some((channel_id.to_string(), name.clone()))
+        })
+        .collect();
+    OwnedManagedUnits {
+        names,
+        daemon,
+        channels,
+    }
 }
 
 fn read_or_create_unit_identity(home: &LionClawHome) -> Result<UnitIdentity> {
@@ -1001,7 +1094,7 @@ mod tests {
 
     use super::{
         channel_unit_name, daemon_unit_name, ensure_identity_not_colliding_in_dir,
-        ensure_private_unit_paths, path_entry_exists, prune_user_unit_dir,
+        ensure_private_unit_paths, owned_managed_units, path_entry_exists, prune_user_unit_dir,
         read_or_create_unit_identity, render_channel_unit, render_daemon_unit,
         unit_belongs_to_identity, write_unit_group_id, ChannelUnitSpec, DaemonUnitSpec,
         ManagedUnit, UnitIdentity,
@@ -1195,6 +1288,46 @@ mod tests {
             !unit_belongs_to_identity(&unit_path, &other).expect("foreign unit"),
             "different unit group id should not be owned"
         );
+    }
+
+    #[test]
+    fn owned_managed_units_only_reports_metadata_owned_units() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = seed_home(&temp_dir.path().join(".lionclaw"));
+        let identity = read_or_create_unit_identity(&home).expect("identity");
+        fs::create_dir_all(home.units_systemd_dir()).expect("managed unit dir");
+        let daemon = daemon_unit_name(&identity);
+        let worker = channel_unit_name(&identity, "telegram");
+        write_unit(
+            &home.units_systemd_dir().join(&daemon),
+            &identity.unit_group_id,
+            &identity.home_root,
+            None,
+        );
+        write_unit(
+            &home.units_systemd_dir().join(&worker),
+            &identity.unit_group_id,
+            &identity.home_root,
+            Some("telegram"),
+        );
+        write_unit(
+            &home
+                .units_systemd_dir()
+                .join(channel_unit_name(&identity, "foreign")),
+            &uuid::Uuid::new_v4().to_string(),
+            &identity.home_root,
+            Some("foreign"),
+        );
+
+        let owned = owned_managed_units(&home).expect("owned units");
+
+        assert_eq!(owned.daemon(), Some(daemon.as_str()));
+        assert_eq!(owned.channel("telegram"), Some(worker.as_str()));
+        assert_eq!(owned.channel("foreign"), None);
+        let names = owned.names();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&daemon));
+        assert!(names.contains(&worker));
     }
 
     #[test]

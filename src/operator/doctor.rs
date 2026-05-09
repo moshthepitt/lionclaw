@@ -17,8 +17,9 @@ use crate::{
         command_display::{lionclaw_home_command_prefix, shell_quote_arg},
         config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig},
         managed_units::{
-            channel_unit_name, daemon_unit_name, existing_unit_identity, unit_channel_id,
-            unit_recorded_home_root, unit_status_is_active, UnitIdentity, UnitManager,
+            channel_unit_name, daemon_unit_name, existing_unit_identity, owned_managed_units,
+            unit_channel_id, unit_recorded_home_root, unit_status_is_active, UnitIdentity,
+            UnitManager,
         },
         runtime_integration::runtime_auth_guidance,
         target::{
@@ -774,54 +775,50 @@ async fn inspect_expected_units<M: UnitManager>(
     manager: &M,
     findings: &mut Vec<DoctorFinding>,
 ) {
-    let service_channels = config
+    let background_channels = config
         .channels
         .iter()
         .filter(|channel| channel.launch_mode == ChannelLaunchMode::Background)
         .collect::<Vec<_>>();
-    if service_channels.is_empty() && existing_unit_identity(home).ok().flatten().is_none() {
-        return;
-    }
-    let identity = match existing_unit_identity(home) {
-        Ok(Some(identity)) => identity,
-        Ok(None) => {
-            findings.push(
-                DoctorFinding::error(
-                    format!("managed daemon unit is missing for instance \"{name}\""),
-                    "background channels are configured but this home has no managed unit identity",
-                )
-                .with_repair(commands.selected("up")),
-            );
-            return;
-        }
+    let owned_units = match owned_managed_units(home) {
+        Ok(units) => units,
         Err(err) => {
             findings.push(DoctorFinding::error(
-                format!("managed unit identity is invalid for instance \"{name}\""),
+                format!("managed unit ownership is invalid for instance \"{name}\""),
                 err.to_string(),
             ));
             return;
         }
     };
+    if background_channels.is_empty() && owned_units.is_empty() {
+        return;
+    }
 
-    inspect_unit_status(
-        name,
-        "daemon",
-        &daemon_unit_name(&identity),
-        commands,
-        manager,
-        findings,
-    )
-    .await;
-    for channel in service_channels {
-        inspect_unit_status(
-            name,
-            &format!("worker \"{}\"", channel.id),
-            &channel_unit_name(&identity, &channel.id),
-            commands,
-            manager,
-            findings,
-        )
-        .await;
+    if let Some(unit) = owned_units.daemon() {
+        inspect_unit_status(name, "daemon", unit, commands, manager, findings).await;
+    } else {
+        findings.push(
+            DoctorFinding::error(
+                format!("managed daemon unit is missing for instance \"{name}\""),
+                "no owned systemd unit metadata was found for the selected home",
+            )
+            .with_repair(commands.selected("up")),
+        );
+    }
+
+    for channel in background_channels {
+        let subject = format!("worker \"{}\"", channel.id);
+        if let Some(unit) = owned_units.channel(&channel.id) {
+            inspect_unit_status(name, &subject, unit, commands, manager, findings).await;
+        } else {
+            findings.push(
+                DoctorFinding::error(
+                    format!("{subject} is not running for instance \"{name}\""),
+                    "no owned systemd unit metadata was found for the selected home",
+                )
+                .with_repair(commands.selected("up")),
+            );
+        }
     }
 }
 
@@ -1122,6 +1119,7 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+    use crate::operator::managed_units::{ensure_unit_identity, FakeUnitManager};
 
     #[test]
     fn doctor_commands_keep_project_repairs_project_scoped() {
@@ -1182,5 +1180,50 @@ mod tests {
         assert!(findings
             .iter()
             .any(|finding| finding.subject == "instance \"main\" work root escapes project root"));
+    }
+
+    #[tokio::test]
+    async fn doctor_does_not_accept_unowned_derived_unit_status() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        home.ensure_home_id().await.expect("home id");
+        let identity = ensure_unit_identity(&home).expect("unit identity");
+        let mut config = OperatorConfig::default();
+        config.upsert_channel(ManagedChannelConfig {
+            id: "telegram".to_string(),
+            skill: "telegram".to_string(),
+            launch_mode: ChannelLaunchMode::Background,
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env: Vec::new(),
+        });
+        let manager = FakeUnitManager::default();
+        manager
+            .set_unit_status(daemon_unit_name(&identity), "loaded/active/running")
+            .expect("set daemon status");
+        manager
+            .set_unit_status(
+                channel_unit_name(&identity, "telegram"),
+                "loaded/active/running",
+            )
+            .expect("set worker status");
+        let home_root = home.root();
+        let commands = DoctorCommands::for_target(None, "direct-home", &home_root);
+        let mut findings = Vec::new();
+
+        inspect_expected_units(
+            &home,
+            "direct-home",
+            &commands,
+            &config,
+            &manager,
+            &mut findings,
+        )
+        .await;
+
+        assert!(findings.iter().any(|finding| finding.subject
+            == "managed daemon unit is missing for instance \"direct-home\""));
+        assert!(findings.iter().any(|finding| finding.subject
+            == "worker \"telegram\" is not running for instance \"direct-home\""));
     }
 }

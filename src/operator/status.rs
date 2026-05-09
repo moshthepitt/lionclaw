@@ -6,10 +6,7 @@ use crate::home::LionClawHome;
 
 use super::{
     config::{ManagedChannelConfig, OperatorConfig},
-    managed_units::{
-        channel_unit_name, daemon_unit_name, existing_unit_identity, SystemdUserUnitManager,
-        UnitManager,
-    },
+    managed_units::{owned_managed_units, SystemdUserUnitManager, UnitManager},
     runtime_integration::{runtime_auth_guidance, runtime_profile_facts},
     target::{
         inspect_target_work_root, list_project_instance_statuses, TargetContext, TargetSelection,
@@ -180,9 +177,9 @@ async fn load_managed_unit_snapshot<M: UnitManager>(
     config: &OperatorConfig,
     manager: &M,
 ) -> Result<ManagedUnitSnapshot> {
-    let identity = existing_unit_identity(home)?;
-    let daemon = match identity.as_ref() {
-        Some(identity) => manager.unit_status(&daemon_unit_name(identity)).await?,
+    let owned_units = owned_managed_units(home)?;
+    let daemon = match owned_units.daemon() {
+        Some(unit) => manager.unit_status(unit).await?,
         None => "not-installed".to_string(),
     };
     let mut workers = Vec::new();
@@ -191,12 +188,8 @@ async fn load_managed_unit_snapshot<M: UnitManager>(
         .iter()
         .filter(|channel| channel.launch_mode == super::config::ChannelLaunchMode::Background)
     {
-        let status = match identity.as_ref() {
-            Some(identity) => {
-                manager
-                    .unit_status(&channel_unit_name(identity, &channel.id))
-                    .await?
-            }
+        let status = match owned_units.channel(&channel.id) {
+            Some(unit) => manager.unit_status(unit).await?,
             None => "not-installed".to_string(),
         };
         workers.push(ManagedWorkerStatus {
@@ -321,6 +314,7 @@ mod tests {
 
     use super::*;
     use crate::operator::{
+        managed_units::{daemon_unit_name, ensure_unit_identity, FakeUnitManager},
         runtime_integration::configure_runtime_profile_with_engine_resolver,
         target::{create_project_instance, init_project},
     };
@@ -384,6 +378,31 @@ mod tests {
         assert!(!output.contains("selected instance: main"));
         assert!(output.contains("default runtime: not configured"));
         assert!(output.contains("no default runtime configured"));
+    }
+
+    #[tokio::test]
+    async fn status_does_not_report_unowned_derived_unit_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        let home = LionClawHome::new(project.instance.home.clone());
+        let identity = ensure_unit_identity(&home).expect("unit identity");
+        let manager = FakeUnitManager::default();
+        manager
+            .set_unit_status(daemon_unit_name(&identity), "loaded/active/running")
+            .expect("set daemon status");
+        let target = TargetContext {
+            project_root: Some(project.project_root.clone()),
+            instance_name: Some("main".to_string()),
+            instance_home: home,
+            work_root: None,
+        };
+
+        let output = render_target_status_with_manager(&target, &manager)
+            .await
+            .expect("status");
+
+        assert!(output.contains("managed daemon: not-installed"));
+        assert!(!output.contains("managed daemon: loaded/active/running"));
     }
 
     #[tokio::test]

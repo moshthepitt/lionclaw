@@ -16,9 +16,9 @@ use crate::{
         daemon_probe::{classify_daemon, DaemonClassification},
         managed_units::{
             channel_unit_name, daemon_env_path, daemon_unit_name, ensure_unit_identity,
-            existing_unit_identity, render_channel_unit, render_daemon_unit,
-            unit_belongs_to_identity, unit_status_is_active, ChannelUnitSpec, DaemonUnitSpec,
-            ManagedUnit, UnitIdentity, UnitManager,
+            existing_unit_identity, owned_managed_units, render_channel_unit, render_daemon_unit,
+            unit_status_is_active, ChannelUnitSpec, DaemonUnitSpec, ManagedUnit, UnitIdentity,
+            UnitManager,
         },
         redaction::SecretRedactor,
         runtime::{
@@ -934,39 +934,7 @@ fn is_executable_file(metadata: &fs::Metadata) -> bool {
 }
 
 fn managed_unit_names(home: &LionClawHome) -> Result<Vec<String>> {
-    let Some(identity) = existing_unit_identity(home)? else {
-        return Ok(Vec::new());
-    };
-    let mut units = BTreeSet::new();
-    for systemd_dir in [
-        systemd_user_unit_dir_for_reconcile()?,
-        home.units_systemd_dir(),
-    ] {
-        if !systemd_dir.exists() {
-            continue;
-        }
-
-        for entry in std::fs::read_dir(&systemd_dir)
-            .with_context(|| format!("failed to read directory {}", systemd_dir.display()))?
-        {
-            let entry =
-                entry.with_context(|| format!("failed to iterate {}", systemd_dir.display()))?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
-                if name.starts_with("lionclaw")
-                    && name.ends_with(".service")
-                    && unit_belongs_to_identity(&path, &identity)?
-                {
-                    units.insert(name.to_string());
-                }
-            }
-        }
-    }
-
-    Ok(units.into_iter().collect())
+    Ok(owned_managed_units(home)?.names())
 }
 
 fn managed_channel_unit_id(home: &LionClawHome, unit_name: &str) -> Result<Option<String>> {
@@ -978,11 +946,6 @@ fn managed_channel_unit_id(home: &LionClawHome, unit_name: &str) -> Result<Optio
         .strip_prefix(&prefix)
         .and_then(|value| value.strip_suffix(".service"))
         .map(str::to_string))
-}
-
-fn systemd_user_unit_dir_for_reconcile() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".config/systemd/user"))
 }
 
 pub(crate) async fn open_kernel(

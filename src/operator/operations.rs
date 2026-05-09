@@ -14,7 +14,7 @@ use crate::{home::LionClawHome, runtime_timeouts::parse_duration};
 
 use super::{
     config::{ChannelLaunchMode, OperatorConfig},
-    managed_units::{channel_unit_name, daemon_unit_name, existing_unit_identity, UnitManager},
+    managed_units::{owned_managed_units, UnitManager},
     reconcile::{down, resolve_stack_binaries, up_for_work_root},
     redaction::SecretRedactor,
     runtime::resolve_runtime_id,
@@ -175,36 +175,37 @@ pub async fn selected_log_components(
     instance: Option<&str>,
     filter: &LogFilter,
 ) -> Result<Vec<LogComponent>> {
-    let Some(identity) = existing_unit_identity(home)? else {
-        return Ok(Vec::new());
-    };
+    let owned_units = owned_managed_units(home)?;
     let config = OperatorConfig::load(home).await?;
     let instance = instance.map(str::to_string);
-    let daemon = LogComponent {
+    let daemon = owned_units.daemon().map(|unit| LogComponent {
         home: home.clone(),
         instance: instance.clone(),
         component: "daemon".to_string(),
-        unit: daemon_unit_name(&identity),
-    };
+        unit: unit.to_string(),
+    });
     let worker_components = config
         .channels
         .iter()
         .filter(|channel| channel.launch_mode == ChannelLaunchMode::Background)
-        .map(|channel| LogComponent {
-            home: home.clone(),
-            instance: instance.clone(),
-            component: channel.id.clone(),
-            unit: channel_unit_name(&identity, &channel.id),
+        .filter_map(|channel| {
+            let unit = owned_units.channel(&channel.id)?;
+            Some(LogComponent {
+                home: home.clone(),
+                instance: instance.clone(),
+                component: channel.id.clone(),
+                unit: unit.to_string(),
+            })
         })
         .collect::<Vec<_>>();
 
     match filter {
         LogFilter::Default => {
-            let mut components = vec![daemon];
+            let mut components = daemon.into_iter().collect::<Vec<_>>();
             components.extend(worker_components);
             Ok(components)
         }
-        LogFilter::Daemon => Ok(vec![daemon]),
+        LogFilter::Daemon => Ok(daemon.into_iter().collect()),
         LogFilter::Workers => Ok(worker_components),
         LogFilter::Worker(channel_id) => {
             let Some(channel) = config
@@ -222,12 +223,16 @@ pub async fn selected_log_components(
                     channel.launch_mode.as_str()
                 ));
             }
-            Ok(vec![LogComponent {
-                home: home.clone(),
-                instance,
-                component: channel.id.clone(),
-                unit: channel_unit_name(&identity, &channel.id),
-            }])
+            Ok(owned_units
+                .channel(&channel.id)
+                .map(|unit| LogComponent {
+                    home: home.clone(),
+                    instance,
+                    component: channel.id.clone(),
+                    unit: unit.to_string(),
+                })
+                .into_iter()
+                .collect())
         }
     }
 }
@@ -463,7 +468,11 @@ pub fn work_root_for_operation(entry: &InstanceStatusEntry) -> Result<&Path> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operator::channel_env::{save_channel_env, ChannelEnv};
+    use crate::operator::{
+        channel_env::{save_channel_env, ChannelEnv},
+        config::ManagedChannelConfig,
+        managed_units::ensure_unit_identity,
+    };
 
     #[test]
     fn renders_prefixed_redacted_journal_json() {
@@ -512,6 +521,30 @@ mod tests {
             .expect("line");
 
         assert_eq!(line, "main/daemon | Started");
+    }
+
+    #[tokio::test]
+    async fn selected_logs_require_owned_unit_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        home.ensure_home_id().await.expect("home id");
+        ensure_unit_identity(&home).expect("unit identity");
+        let mut config = OperatorConfig::default();
+        config.upsert_channel(ManagedChannelConfig {
+            id: "telegram".to_string(),
+            skill: "telegram".to_string(),
+            launch_mode: ChannelLaunchMode::Background,
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env: Vec::new(),
+        });
+        config.save(&home).await.expect("save config");
+
+        let components = selected_log_components(&home, Some("main"), &LogFilter::Default)
+            .await
+            .expect("components");
+
+        assert!(components.is_empty());
     }
 
     #[test]

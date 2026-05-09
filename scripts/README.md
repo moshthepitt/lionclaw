@@ -6,7 +6,8 @@ This directory contains the sharp tools.
 Most users should stay on the main `lionclaw` path: register a real agent
 runtime, run it through LionClaw, and add channels or jobs through the CLI.
 
-These scripts are here for the moments when you want direct control over install, bind, and worker startup. Manual setup. Debugging. Tight feedback loops.
+These scripts are here for local CI and manual terminal-channel smoke testing.
+Manual setup. Debugging. Tight feedback loops.
 
 Use them when you mean it.
 
@@ -15,50 +16,12 @@ Use them when you mean it.
 - `bootstrap-terminal-test.sh`: bootstraps or refreshes a manual terminal-channel
   test home, gives a fresh home its own loopback bind, configures the runtime
   image and terminal channel, then attaches it in the current TTY.
-- `install-channel-skill.sh`: wraps the canonical `lionclaw skill add`,
-  `lionclaw channel add`, and `lionclaw apply` flow for a channel skill, then
-  optionally starts the worker from the installed snapshot's `scripts/worker`.
 - `attach-terminal-test.sh`: rebuilds LionClaw, stops the managed daemon for a specific `LIONCLAW_HOME`, and attaches the interactive terminal channel in the current TTY.
 
 ## Usage
 Run the same checks as GitHub CI:
 ```bash
 ./scripts/ci.sh
-```
-
-For channel-install scripts, prerequisites are:
-- `lionclaw` on `PATH`, or `--lionclaw-bin /path/to/lionclaw`
-- LionClaw running when `--start-worker` is used (default `http://127.0.0.1:8979`)
-- `curl` when `--start-worker` is used
-- A valid skill folder with `SKILL.md`
-
-Basic install + bind:
-```bash
-./scripts/install-channel-skill.sh \
-  --channel-id telegram \
-  --skill-source skills/channel-telegram
-```
-
-Install + bind + start worker:
-```bash
-TELEGRAM_BOT_TOKEN=... ./scripts/install-channel-skill.sh \
-  --channel-id telegram \
-  --skill-source skills/channel-telegram \
-  --start-worker
-```
-
-Optional low-level per-worker runtime override:
-```bash
-./scripts/install-channel-skill.sh \
-  --channel-id telegram \
-  --skill-source skills/channel-telegram \
-  --skill-alias telegram \
-  --runtime-id codex
-```
-
-Show options:
-```bash
-./scripts/install-channel-skill.sh --help
 ```
 
 Fresh terminal-channel test home in one command on Linux with the systemd user
