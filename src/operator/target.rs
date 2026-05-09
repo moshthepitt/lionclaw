@@ -935,7 +935,7 @@ fn ensure_file_write_target_not_symlink(path: &Path, label: &str) -> Result<()> 
     }
 }
 
-fn validate_instance_name(name: &str) -> Result<()> {
+pub fn validate_instance_name(name: &str) -> Result<()> {
     let trimmed = name.trim();
     if name != trimmed {
         bail!("instance name '{name}' has surrounding whitespace");

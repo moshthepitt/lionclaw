@@ -23,7 +23,8 @@ use crate::{
         runtime_integration::runtime_auth_guidance,
         target::{
             discover_diagnostic_project_root, instance_home_path, instances_dir_path,
-            project_dir_path, project_file_path, validate_home_target_exclusive, TargetSelection,
+            project_dir_path, project_file_path, validate_home_target_exclusive,
+            validate_instance_name, TargetSelection,
         },
     },
 };
@@ -137,6 +138,13 @@ struct DiagnosticProjectFile {
     default_instance: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticDefaultInstance<'a> {
+    Missing,
+    Invalid,
+    Valid(&'a str),
+}
+
 #[derive(Debug, Deserialize)]
 struct DiagnosticInstanceFile {
     #[serde(default)]
@@ -210,6 +218,13 @@ pub async fn run_doctor<M: UnitManager>(
         bail!("doctor --all requires a project context and cannot be combined with --home or --instance");
     }
     validate_home_target_exclusive(selection)?;
+    let selected_instance = selection
+        .instance
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    if let Some(name) = selected_instance {
+        validate_instance_name(name)?;
+    }
 
     if let Some(home) = selection.home.as_deref() {
         let home = absolute_path(home)?;
@@ -222,16 +237,7 @@ pub async fn run_doctor<M: UnitManager>(
         instance: None,
     };
     let project_root = discover_diagnostic_project_root(&project_selection)?;
-    inspect_project(
-        &project_root,
-        selection
-            .instance
-            .as_deref()
-            .filter(|value| !value.is_empty()),
-        all,
-        manager,
-    )
-    .await
+    inspect_project(&project_root, selected_instance, all, manager).await
 }
 
 async fn inspect_project<M: UnitManager>(
@@ -272,6 +278,10 @@ async fn inspect_project<M: UnitManager>(
     } else {
         (BTreeMap::new(), false)
     };
+    let default_instance = project_config
+        .as_ref()
+        .map(|config| inspect_default_instance(project_root, config, &mut report))
+        .unwrap_or(DiagnosticDefaultInstance::Missing);
 
     let selected_names = if all {
         if instances_loaded && instances.is_empty() && project_config.is_some() {
@@ -279,37 +289,34 @@ async fn inspect_project<M: UnitManager>(
         }
         instances.keys().cloned().collect::<Vec<_>>()
     } else if let Some(name) = selected_instance {
+        validate_instance_name(name)?;
         vec![name.to_string()]
     } else {
         selected_project_instance_names(
             project_root,
-            project_config.as_ref(),
+            default_instance,
             &instances,
             instances_loaded,
             &mut report,
         )
     };
 
-    if let Some(config) = project_config.as_ref() {
-        if let Some(default_instance) = config.default_instance.as_deref() {
-            if instances_loaded && !instances.contains_key(default_instance) {
-                report.push(
-                    DoctorFinding::error(
-                        format!(
-                            "default instance \"{default_instance}\" is configured but missing"
-                        ),
-                        format!(
-                            "{} points at an instance that is not present under {}",
-                            project_file.display(),
-                            instances_dir_path(project_root).display()
-                        ),
-                    )
-                    .with_repair(project_command(
-                        project_root,
-                        &format!("instance create {}", shell_quote_arg(default_instance)),
-                    )),
-                );
-            }
+    if let DiagnosticDefaultInstance::Valid(default_instance) = default_instance {
+        if instances_loaded && !instances.contains_key(default_instance) {
+            report.push(
+                DoctorFinding::error(
+                    format!("default instance \"{default_instance}\" is configured but missing"),
+                    format!(
+                        "{} points at an instance that is not present under {}",
+                        project_file.display(),
+                        instances_dir_path(project_root).display()
+                    ),
+                )
+                .with_repair(project_command(
+                    project_root,
+                    &format!("instance create {}", shell_quote_arg(default_instance)),
+                )),
+            );
         }
     }
 
@@ -328,18 +335,43 @@ async fn inspect_project<M: UnitManager>(
     Ok(report)
 }
 
+fn inspect_default_instance<'a>(
+    project_root: &Path,
+    config: &'a DiagnosticProjectFile,
+    report: &mut DoctorReport,
+) -> DiagnosticDefaultInstance<'a> {
+    let Some(name) = config.default_instance.as_deref() else {
+        return DiagnosticDefaultInstance::Missing;
+    };
+    if let Err(err) = validate_instance_name(name) {
+        report.push(
+            DoctorFinding::error(
+                format!("default instance \"{name}\" is invalid"),
+                format!("{}: {err}", project_file_path(project_root).display()),
+            )
+            .with_repair(format!(
+                "edit {}",
+                project_file_path(project_root).display()
+            )),
+        );
+        return DiagnosticDefaultInstance::Invalid;
+    }
+    DiagnosticDefaultInstance::Valid(name)
+}
+
 fn selected_project_instance_names(
     project_root: &Path,
-    project_config: Option<&DiagnosticProjectFile>,
+    default_instance: DiagnosticDefaultInstance<'_>,
     instances: &BTreeMap<String, PathBuf>,
     instances_loaded: bool,
     report: &mut DoctorReport,
 ) -> Vec<String> {
-    if let Some(default_instance) = project_config
-        .and_then(|config| config.default_instance.as_deref())
-        .filter(|value| !value.is_empty())
-    {
-        return vec![default_instance.to_string()];
+    match default_instance {
+        DiagnosticDefaultInstance::Valid(default_instance) => {
+            return vec![default_instance.to_string()];
+        }
+        DiagnosticDefaultInstance::Invalid => return Vec::new(),
+        DiagnosticDefaultInstance::Missing => {}
     }
 
     match instances.keys().cloned().collect::<Vec<_>>().as_slice() {
@@ -1313,6 +1345,43 @@ mod tests {
                 .to_string()
                 .contains("--home cannot be combined with --project or --instance"));
         }
+    }
+
+    #[tokio::test]
+    async fn doctor_rejects_path_like_instance_selector() {
+        let selection = TargetSelection {
+            home: None,
+            project: None,
+            instance: Some("../../some-home".to_string()),
+        };
+
+        let err = run_doctor(&selection, false, &FakeUnitManager::default())
+            .await
+            .expect_err("path-like instance selector should fail");
+
+        assert!(err
+            .to_string()
+            .contains("instance name '../../some-home' is not path-safe"));
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_invalid_project_default_instance() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir_all(instances_dir_path(temp_dir.path())).expect("instances dir");
+        fs::write(
+            project_file_path(temp_dir.path()),
+            "version = 1\ndefault_instance = \"../../some-home\"\n",
+        )
+        .expect("project file");
+
+        let report = inspect_project(temp_dir.path(), None, false, &FakeUnitManager::default())
+            .await
+            .expect("doctor report");
+
+        assert!(report.has_errors());
+        assert!(report.findings.iter().any(|finding| {
+            finding.subject == "default instance \"../../some-home\" is invalid"
+        }));
     }
 
     #[test]
