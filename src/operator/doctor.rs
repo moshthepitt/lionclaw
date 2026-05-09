@@ -17,13 +17,13 @@ use crate::{
         command_display::{lionclaw_home_command_prefix, shell_quote_arg},
         config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig},
         managed_units::{
-            daemon_unit_name, existing_unit_identity, unit_belongs_to_identity, unit_channel_id,
-            unit_recorded_home_root, unit_status_is_active, UnitManager,
+            daemon_unit_name, existing_unit_identity, unit_file_metadata, unit_status_is_active,
+            UnitManager,
         },
         runtime_integration::runtime_auth_guidance,
         target::{
-            discover_project_root, instance_home_path, instances_dir_path, project_file_path,
-            TargetSelection,
+            discover_diagnostic_project_root, instance_home_path, instances_dir_path,
+            project_dir_path, project_file_path, TargetSelection,
         },
     },
 };
@@ -220,7 +220,7 @@ pub async fn run_doctor<M: UnitManager>(
         project: selection.project.clone(),
         instance: None,
     };
-    let project_root = discover_project_root(&project_selection)?;
+    let project_root = discover_diagnostic_project_root(&project_selection)?;
     inspect_project(
         &project_root,
         selection
@@ -241,20 +241,35 @@ async fn inspect_project<M: UnitManager>(
 ) -> Result<DoctorReport> {
     let mut report = DoctorReport::default();
     let project_file = project_file_path(project_root);
-    let project_config = match read_project_file(project_root) {
-        Ok(config) => Some(config),
+    let metadata_dir_ok = match inspect_project_metadata_dir(project_root) {
+        Ok(()) => true,
         Err(finding) => {
             report.push(finding);
-            None
+            false
         }
     };
-
-    let instances = match read_instance_homes(project_root) {
-        Ok(instances) => instances,
-        Err(finding) => {
-            report.push(finding);
-            BTreeMap::new()
+    let project_config = if metadata_dir_ok {
+        match read_project_file(project_root) {
+            Ok(config) => Some(config),
+            Err(finding) => {
+                report.push(finding);
+                None
+            }
         }
+    } else {
+        None
+    };
+
+    let instances = if metadata_dir_ok {
+        match read_instance_homes(project_root) {
+            Ok(instances) => instances,
+            Err(finding) => {
+                report.push(finding);
+                BTreeMap::new()
+            }
+        }
+    } else {
+        BTreeMap::new()
     };
 
     let selected_names = if all {
@@ -878,16 +893,19 @@ async fn inspect_owned_stale_units<M: UnitManager>(
         let Some(unit_name) = unit_path.file_name().and_then(|value| value.to_str()) else {
             continue;
         };
-        let Ok(true) = unit_belongs_to_identity(&unit_path, &identity) else {
+        let Ok(Some(metadata)) = unit_file_metadata(&unit_path) else {
             continue;
         };
+        if !metadata.belongs_to_identity(&identity) {
+            continue;
+        }
         if unit_name == daemon_unit {
             continue;
         }
-        if unit_channel_id(&unit_path)
-            .ok()
-            .flatten()
-            .is_some_and(|channel_id| expected_channels.contains(channel_id.as_str()))
+        if metadata
+            .channel_id
+            .as_deref()
+            .is_some_and(|channel_id| expected_channels.contains(channel_id))
         {
             continue;
         }
@@ -914,6 +932,15 @@ fn inspect_project_units(
         .values()
         .filter_map(|path| fs::canonicalize(path).ok())
         .collect::<BTreeSet<_>>();
+    let known_identities = known_homes
+        .iter()
+        .filter_map(|home| {
+            existing_unit_identity(&LionClawHome::new(home.clone()))
+                .ok()
+                .flatten()
+                .map(|identity| (home.clone(), identity))
+        })
+        .collect::<BTreeMap<_, _>>();
     for unit_path in user_lionclaw_unit_files()? {
         let Some(unit_name) = unit_path.file_name().and_then(|value| value.to_str()) else {
             continue;
@@ -921,7 +948,20 @@ fn inspect_project_units(
         if !unit_name.starts_with("lionclaw") || !unit_name.ends_with(".service") {
             continue;
         }
-        let recorded_home = match unit_recorded_home_root(&unit_path)? {
+        let metadata = match unit_file_metadata(&unit_path)? {
+            Some(metadata) => metadata,
+            None => {
+                findings.push(DoctorFinding::warning(
+                    "unowned LionClaw-looking unit",
+                    format!(
+                        "{} is not a regular unit file with readable LionClaw metadata",
+                        unit_path.display()
+                    ),
+                ));
+                continue;
+            }
+        };
+        let recorded_home = match metadata.home_root.as_ref() {
             Some(home) => home,
             None => {
                 findings.push(DoctorFinding::warning(
@@ -937,7 +977,40 @@ fn inspect_project_units(
         if !recorded_home.starts_with(project_root) {
             continue;
         }
-        if known_homes.contains(&recorded_home) {
+        if metadata.unit_group_id.is_none() {
+            findings.push(DoctorFinding::warning(
+                "incomplete LionClaw unit metadata",
+                format!(
+                    "{} records {} but has no X-LionClaw-UnitGroupId metadata",
+                    unit_path.display(),
+                    recorded_home.display()
+                ),
+            ));
+            continue;
+        }
+        if let Some(identity) = known_identities.get(recorded_home) {
+            if metadata.belongs_to_identity(identity) {
+                continue;
+            }
+            findings.push(DoctorFinding::warning(
+                "LionClaw unit metadata does not match instance identity",
+                format!(
+                    "{} records {} but is not owned by that instance's unit group",
+                    unit_path.display(),
+                    recorded_home.display()
+                ),
+            ));
+            continue;
+        }
+        if known_homes.contains(recorded_home) {
+            findings.push(DoctorFinding::warning(
+                "LionClaw unit points at instance without unit identity",
+                format!(
+                    "{} records {} but the instance has no unit group id",
+                    unit_path.display(),
+                    recorded_home.display()
+                ),
+            ));
             continue;
         }
         findings.push(DoctorFinding::warning(
@@ -948,11 +1021,32 @@ fn inspect_project_units(
                 recorded_home.display()
             ),
         ));
-        if unit_channel_id(&unit_path)?.is_some() {
-            continue;
-        }
     }
     Ok(findings)
+}
+
+fn inspect_project_metadata_dir(project_root: &Path) -> std::result::Result<(), DoctorFinding> {
+    let path = project_dir_path(project_root);
+    let metadata = fs::symlink_metadata(&path).map_err(|err| {
+        DoctorFinding::error(
+            "project metadata directory is missing or unreadable",
+            format!("{}: {err}", path.display()),
+        )
+        .with_repair("lionclaw project init")
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(DoctorFinding::error(
+            "project metadata directory is a symlink",
+            format!("{} must be a real directory", path.display()),
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(DoctorFinding::error(
+            "project metadata path is not a directory",
+            format!("{} is not a directory", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 fn read_project_file(
@@ -1152,6 +1246,21 @@ mod tests {
         };
         assert!(error.has_errors());
         assert!(error.render().contains("error: missing runtime"));
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_missing_project_file_inside_existing_metadata_dir() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir(temp_dir.path().join(".lionclaw")).expect("metadata dir");
+
+        let report = inspect_project(temp_dir.path(), None, false, &FakeUnitManager::default())
+            .await
+            .expect("doctor report");
+
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.subject == "project file is missing or unreadable"));
     }
 
     #[test]

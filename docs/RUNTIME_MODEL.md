@@ -353,6 +353,9 @@ daemon is restarted or reconciled through `lionclaw connect`,
 selected instance configuration and current backend-owned systemd unit state.
 `lionclaw doctor` diagnoses drift, and `lionclaw up` reconciles the selected
 instance by applying the current desired units and stopping stale owned units.
+LionClaw treats a user systemd unit as owned only when both its
+`X-LionClaw-UnitGroupId` and `X-LionClaw-HomeRoot` metadata match the selected
+instance.
 
 `lionclaw doctor` is read-only. It diagnoses target resolution, project and
 instance metadata, runtime configuration, managed unit state, channel skill

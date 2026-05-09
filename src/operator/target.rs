@@ -132,6 +132,14 @@ pub fn discover_project_root(selection: &TargetSelection) -> Result<PathBuf> {
     discover_project_root_from_cwd(selection.project.as_deref(), &cwd)
 }
 
+pub fn discover_diagnostic_project_root(selection: &TargetSelection) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    if selection.home.is_some() || selection.instance.is_some() {
+        bail!("project-wide commands cannot be combined with --home or --instance");
+    }
+    discover_diagnostic_project_root_from_cwd(selection.project.as_deref(), &cwd)
+}
+
 pub fn init_project(project_root: &Path) -> Result<ProjectInitResult> {
     let project_root = canonical_existing_dir(project_root, "project root")?;
     let project_dir = project_dir(&project_root);
@@ -442,6 +450,27 @@ fn resolve_project_root_from_cwd(project: Option<&Path>, cwd: &Path) -> Result<P
 }
 
 fn discover_project_root_from_cwd(project: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
+    discover_project_root_from_cwd_with_marker(project, cwd, ProjectRootMarker::ProjectFile)
+}
+
+fn discover_diagnostic_project_root_from_cwd(
+    project: Option<&Path>,
+    cwd: &Path,
+) -> Result<PathBuf> {
+    discover_project_root_from_cwd_with_marker(project, cwd, ProjectRootMarker::MetadataDirectory)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectRootMarker {
+    ProjectFile,
+    MetadataDirectory,
+}
+
+fn discover_project_root_from_cwd_with_marker(
+    project: Option<&Path>,
+    cwd: &Path,
+    marker: ProjectRootMarker,
+) -> Result<PathBuf> {
     if let Some(project) = project {
         return canonical_existing_dir(&absolutize_from(cwd, project), "project root");
     }
@@ -454,7 +483,7 @@ fn discover_project_root_from_cwd(project: Option<&Path>, cwd: &Path) -> Result<
     }
 
     for candidate in [Some(cwd.as_path()), cwd.parent()].into_iter().flatten() {
-        if project_file(candidate).exists() {
+        if project_root_marker_exists(candidate, marker) {
             return canonical_existing_dir(candidate, "project root");
         }
     }
@@ -463,6 +492,14 @@ fn discover_project_root_from_cwd(project: Option<&Path>, cwd: &Path) -> Result<
         "no LionClaw project found from {}; run from the project root or pass --project PATH",
         cwd.display()
     )
+}
+
+fn project_root_marker_exists(project_root: &Path, marker: ProjectRootMarker) -> bool {
+    if project_file(project_root).exists() {
+        return true;
+    }
+    marker == ProjectRootMarker::MetadataDirectory
+        && fs::symlink_metadata(project_dir(project_root)).is_ok()
 }
 
 fn resolve_instance_name(
@@ -1014,9 +1051,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        adopt_project_instance, create_project_instance, init_project, list_project_instances,
-        resolve_project_setup_root_from_cwd, resolve_target_from_cwd, TargetSelection,
-        WorkRootRequirement, DEFAULT_INSTANCE, PROJECT_DIR,
+        adopt_project_instance, create_project_instance, discover_diagnostic_project_root_from_cwd,
+        init_project, list_project_instances, resolve_project_setup_root_from_cwd,
+        resolve_target_from_cwd, TargetSelection, WorkRootRequirement, DEFAULT_INSTANCE,
+        PROJECT_DIR,
     };
 
     #[test]
@@ -1067,6 +1105,27 @@ mod tests {
         assert_eq!(from_root.project_root, from_child.project_root);
         assert_eq!(from_child.work_root, from_root.work_root);
         assert!(err.to_string().contains("no LionClaw project found"));
+    }
+
+    #[test]
+    fn diagnostic_resolver_discovers_project_metadata_without_project_file() {
+        let temp_dir = tempdir().expect("temp dir");
+        fs::create_dir(temp_dir.path().join(PROJECT_DIR)).expect("metadata dir");
+
+        let project_root = discover_diagnostic_project_root_from_cwd(None, temp_dir.path())
+            .expect("diagnostic project root");
+        let target_err = resolve_target_from_cwd(
+            &TargetSelection::default(),
+            WorkRootRequirement::Optional,
+            temp_dir.path(),
+        )
+        .expect_err("operational target still requires project config");
+
+        assert_eq!(
+            project_root,
+            temp_dir.path().canonicalize().expect("canonical")
+        );
+        assert!(target_err.to_string().contains("no LionClaw project found"));
     }
 
     #[test]

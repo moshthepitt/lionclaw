@@ -16,6 +16,10 @@ use crate::{
     },
 };
 
+const UNIT_GROUP_ID_METADATA: &str = "X-LionClaw-UnitGroupId";
+const HOME_ROOT_METADATA: &str = "X-LionClaw-HomeRoot";
+const CHANNEL_METADATA: &str = "X-LionClaw-Channel";
+
 #[derive(Debug, Clone)]
 pub struct ManagedUnit {
     pub name: String,
@@ -30,6 +34,20 @@ pub struct UnitIdentity {
     pub unit_group_id: String,
     pub home_id: String,
     pub home_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnitFileMetadata {
+    pub unit_group_id: Option<String>,
+    pub home_root: Option<PathBuf>,
+    pub channel_id: Option<String>,
+}
+
+impl UnitFileMetadata {
+    pub fn belongs_to_identity(&self, identity: &UnitIdentity) -> bool {
+        self.unit_group_id.as_deref() == Some(identity.unit_group_id.as_str())
+            && self.home_root.as_deref() == Some(identity.home_root.as_path())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -156,19 +174,15 @@ fn scan_owned_units(
         let entry =
             entry.with_context(|| format!("failed to iterate {}", systemd_dir.display()))?;
         let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path)
-            .with_context(|| format!("failed to inspect {}", path.display()))?;
-        if !metadata.is_file() {
-            continue;
-        }
         let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
             continue;
         };
         if !name.starts_with("lionclaw") || !name.ends_with(".service") {
             continue;
         }
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
+        let Some(content) = read_regular_unit_file(&path)? else {
+            continue;
+        };
         if unit_content_belongs_to_identity(&content, identity) {
             record_owned_unit(name, &content, daemon_name, channel_prefix, units);
         }
@@ -191,7 +205,7 @@ fn record_owned_unit(
         return;
     }
     if name.starts_with(channel_prefix) {
-        if let Some(channel_id) = unit_content_channel_id(content) {
+        if let Some(channel_id) = unit_content_metadata(content).channel_id {
             units.channels.entry(channel_id).or_insert(name);
         }
     }
@@ -259,26 +273,16 @@ fn find_existing_unit_group_id_collision(
         let entry =
             entry.with_context(|| format!("failed to iterate {}", systemd_dir.display()))?;
         let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path)
-            .with_context(|| format!("failed to inspect {}", path.display()))?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
+        let Some(content) = read_regular_unit_file(&path)? else {
             continue;
-        }
-
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        if unit_metadata_value(&content, "X-LionClaw-UnitGroupId").as_deref()
+        };
+        if unit_metadata_value(&content, UNIT_GROUP_ID_METADATA).as_deref()
             != Some(identity.unit_group_id.as_str())
         {
             continue;
         }
-        let Some(recorded_home) =
-            unit_metadata_value(&content, "X-LionClaw-HomeRoot").map(PathBuf::from)
-        else {
-            continue;
-        };
-        if recorded_home != identity.home_root && recorded_home.exists() {
-            return Ok(Some(recorded_home));
+        if !unit_content_belongs_to_identity(&content, identity) {
+            return Ok(Some(path));
         }
     }
 
@@ -349,50 +353,26 @@ fn canonical_home_root(home: &LionClawHome) -> Result<PathBuf> {
         .with_context(|| format!("failed to resolve {}", home.root().display()))
 }
 
-pub fn unit_recorded_home_root(path: &Path) -> Result<Option<PathBuf>> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
-    };
-    Ok(unit_metadata_value(&content, "X-LionClaw-HomeRoot").map(PathBuf::from))
-}
-
-pub fn unit_channel_id(path: &Path) -> Result<Option<String>> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
-    };
-    Ok(unit_content_channel_id(&content))
+pub fn unit_file_metadata(path: &Path) -> Result<Option<UnitFileMetadata>> {
+    Ok(read_regular_unit_file(path)?.map(|content| unit_content_metadata(&content)))
 }
 
 pub fn unit_belongs_to_identity(path: &Path, identity: &UnitIdentity) -> Result<bool> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to inspect {}", path.display()))
-        }
-    };
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Ok(false);
-    }
-
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(unit_content_belongs_to_identity(&content, identity))
+    Ok(unit_file_metadata(path)?
+        .as_ref()
+        .is_some_and(|metadata| metadata.belongs_to_identity(identity)))
 }
 
 fn unit_content_belongs_to_identity(content: &str, identity: &UnitIdentity) -> bool {
-    let unit_group_id = unit_metadata_value(content, "X-LionClaw-UnitGroupId");
-    let home_root = unit_metadata_value(content, "X-LionClaw-HomeRoot");
-    unit_group_id.as_deref() == Some(identity.unit_group_id.as_str())
-        && home_root.as_deref() == Some(identity.home_root.to_string_lossy().as_ref())
+    unit_content_metadata(content).belongs_to_identity(identity)
 }
 
-fn unit_content_channel_id(content: &str) -> Option<String> {
-    unit_metadata_value(content, "X-LionClaw-Channel")
+fn unit_content_metadata(content: &str) -> UnitFileMetadata {
+    UnitFileMetadata {
+        unit_group_id: unit_metadata_value(content, UNIT_GROUP_ID_METADATA),
+        home_root: unit_metadata_value(content, HOME_ROOT_METADATA).map(PathBuf::from),
+        channel_id: unit_metadata_value(content, CHANNEL_METADATA),
+    }
 }
 
 fn unit_metadata_value(content: &str, key: &str) -> Option<String> {
@@ -531,12 +511,16 @@ impl UnitManager for SystemdUserUnitManager {
             .await
             .with_context(|| format!("failed to create {}", user_unit_dir.display()))?;
         ensure_private_unit_paths(home, units)?;
-        prune_stale_generated_files(home, &user_unit_dir, units)?;
+        let identity = require_existing_unit_identity(home)?;
+        ensure_desired_units_belong_to_identity(&identity, units)?;
+
+        ensure_unit_paths_owned_or_absent(&identity, &user_unit_dir, units)?;
+        prune_stale_generated_files(home, &user_unit_dir, &identity, units)?;
 
         let mut changed_units = Vec::new();
+        ensure_unit_paths_owned_or_absent(&identity, &user_unit_dir, units)?;
         for unit in units {
             let unit_path = user_unit_dir.join(&unit.name);
-            ensure_owned_or_absent(home, &unit_path)?;
             let unit_changed = file_content_differs(&unit_path, &unit.unit_content)
                 .with_context(|| format!("failed to compare {}", unit_path.display()))?;
             let env_changed = file_content_differs(&unit.env_path, &unit.env_content)
@@ -649,6 +633,30 @@ fn ensure_private_unit_paths(home: &LionClawHome, units: &[ManagedUnit]) -> Resu
     Ok(())
 }
 
+fn require_existing_unit_identity(home: &LionClawHome) -> Result<UnitIdentity> {
+    existing_unit_identity(home)?.ok_or_else(|| {
+        anyhow!(
+            "home {} does not have a complete LionClaw unit identity",
+            home.root().display()
+        )
+    })
+}
+
+fn ensure_desired_units_belong_to_identity(
+    identity: &UnitIdentity,
+    units: &[ManagedUnit],
+) -> Result<()> {
+    for unit in units {
+        if !unit_content_belongs_to_identity(&unit.unit_content, identity) {
+            bail!(
+                "rendered unit {} does not carry the selected LionClaw ownership metadata",
+                unit.name
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 pub struct FakeUnitManager {
     states: Mutex<HashMap<String, String>>,
@@ -754,7 +762,8 @@ impl UnitManager for FakeUnitManager {
 
     async fn apply_units(&self, home: &LionClawHome, units: &[ManagedUnit]) -> Result<Vec<String>> {
         ensure_private_unit_paths(home, units)?;
-        let identity = existing_unit_identity(home)?;
+        let identity = require_existing_unit_identity(home)?;
+        ensure_desired_units_belong_to_identity(&identity, units)?;
         let desired_names = units
             .iter()
             .map(|unit| unit.name.as_str())
@@ -764,12 +773,15 @@ impl UnitManager for FakeUnitManager {
                 .units
                 .lock()
                 .map_err(|_| anyhow!("units lock poisoned"))?;
-            if let Some(identity) = &identity {
-                stored.retain(|name, unit| {
-                    desired_names.contains(name.as_str())
-                        || !unit_content_belongs_to_identity(&unit.unit_content, identity)
-                });
+            for unit in units {
+                if let Some(existing) = stored.get(&unit.name) {
+                    ensure_unit_content_owned(&identity, &unit.name, &existing.unit_content)?;
+                }
             }
+            stored.retain(|name, unit| {
+                desired_names.contains(name.as_str())
+                    || !unit_content_belongs_to_identity(&unit.unit_content, &identity)
+            });
             let mut changed = Vec::new();
             for unit in units {
                 let was_changed = stored
@@ -926,6 +938,7 @@ fn escape_env_value(value: &str) -> String {
 fn prune_stale_generated_files(
     home: &LionClawHome,
     user_unit_dir: &Path,
+    identity: &UnitIdentity,
     units: &[ManagedUnit],
 ) -> Result<()> {
     let desired_names = units
@@ -933,11 +946,22 @@ fn prune_stale_generated_files(
         .map(|unit| unit.name.as_str())
         .collect::<Vec<_>>();
     prune_env_dir(&home.units_env_dir(), units)?;
-    prune_user_unit_dir(home, user_unit_dir, &desired_names)?;
+    prune_user_unit_dir(identity, user_unit_dir, &desired_names)?;
     Ok(())
 }
 
-fn ensure_owned_or_absent(home: &LionClawHome, path: &Path) -> Result<()> {
+fn ensure_unit_paths_owned_or_absent(
+    identity: &UnitIdentity,
+    user_unit_dir: &Path,
+    units: &[ManagedUnit],
+) -> Result<()> {
+    for unit in units {
+        ensure_owned_or_absent(identity, &user_unit_dir.join(&unit.name))?;
+    }
+    Ok(())
+}
+
+fn ensure_owned_or_absent(identity: &UnitIdentity, path: &Path) -> Result<()> {
     if !path_entry_exists(path)? {
         return Ok(());
     }
@@ -949,21 +973,30 @@ fn ensure_owned_or_absent(home: &LionClawHome, path: &Path) -> Result<()> {
             path.display()
         );
     }
-    let recorded_home = unit_recorded_home_root(path)?;
-    let home_root = canonical_home_root(home)?;
-    match recorded_home {
-        Some(recorded) if recorded == home_root || !recorded.exists() => Ok(()),
-        Some(recorded) => bail!(
-            "managed unit {} belongs to {}; refusing to overwrite it for {}",
-            path.display(),
-            recorded.display(),
-            home_root.display()
-        ),
-        None => bail!(
-            "managed unit {} exists without LionClaw ownership metadata; refusing to overwrite it",
+    if !metadata.is_file() {
+        bail!(
+            "managed unit {} is not a regular file; refusing to overwrite it",
             path.display()
-        ),
+        );
     }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    ensure_unit_content_owned(identity, &path.display().to_string(), &content)
+}
+
+fn ensure_unit_content_owned(
+    identity: &UnitIdentity,
+    unit_label: &str,
+    content: &str,
+) -> Result<()> {
+    if unit_content_belongs_to_identity(content, identity) {
+        return Ok(());
+    }
+    bail!(
+        "managed unit {unit_label} is not owned by unit group {} at {}; refusing to overwrite it",
+        identity.unit_group_id,
+        identity.home_root.display()
+    )
 }
 
 fn prune_env_dir(dir: &Path, units: &[ManagedUnit]) -> Result<()> {
@@ -988,12 +1021,11 @@ fn prune_env_dir(dir: &Path, units: &[ManagedUnit]) -> Result<()> {
     Ok(())
 }
 
-fn prune_user_unit_dir(home: &LionClawHome, dir: &Path, desired_names: &[&str]) -> Result<()> {
+fn prune_user_unit_dir(identity: &UnitIdentity, dir: &Path, desired_names: &[&str]) -> Result<()> {
     if !dir.exists() {
         return Ok(());
     }
 
-    let home_root = canonical_home_root(home)?;
     for entry in std::fs::read_dir(dir)
         .with_context(|| format!("failed to read directory {}", dir.display()))?
     {
@@ -1008,12 +1040,7 @@ fn prune_user_unit_dir(home: &LionClawHome, dir: &Path, desired_names: &[&str]) 
             continue;
         }
 
-        let metadata = std::fs::symlink_metadata(&path)
-            .with_context(|| format!("failed to inspect {}", path.display()))?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            continue;
-        }
-        if unit_recorded_home_root(&path)?.as_deref() == Some(home_root.as_path()) {
+        if unit_belongs_to_identity(&path, identity)? {
             remove_path_if_exists(&path)?;
         }
     }
@@ -1044,6 +1071,22 @@ fn path_entry_exists(path: &Path) -> Result<bool> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err).with_context(|| format!("failed to inspect {}", path.display())),
     }
+}
+
+fn read_regular_unit_file(path: &Path) -> Result<Option<String>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", path.display()))
+        }
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))
+        .map(Some)
 }
 
 fn file_content_differs(path: &Path, expected: &str) -> Result<bool> {
@@ -1088,10 +1131,10 @@ mod tests {
 
     use super::{
         channel_unit_name, daemon_unit_name, discover_owned_units_in_dir,
-        ensure_identity_not_colliding_in_dir, ensure_private_unit_paths, path_entry_exists,
-        prune_user_unit_dir, read_or_create_unit_identity, render_channel_unit, render_daemon_unit,
-        unit_belongs_to_identity, write_unit_group_id, ChannelUnitSpec, DaemonUnitSpec,
-        ManagedUnit, UnitIdentity,
+        ensure_identity_not_colliding_in_dir, ensure_owned_or_absent, ensure_private_unit_paths,
+        path_entry_exists, prune_user_unit_dir, read_or_create_unit_identity, render_channel_unit,
+        render_daemon_unit, unit_belongs_to_identity, write_unit_group_id, ChannelUnitSpec,
+        DaemonUnitSpec, ManagedUnit, UnitIdentity,
     };
 
     fn seed_home(root: &Path) -> crate::home::LionClawHome {
@@ -1231,7 +1274,7 @@ mod tests {
     }
 
     #[test]
-    fn moved_home_reclaims_missing_recorded_home_root() {
+    fn same_unit_group_with_different_home_root_rotates_even_when_recorded_home_is_missing() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let selected = seed_home(&temp_dir.path().join("selected"));
         let systemd_dir = temp_dir.path().join("systemd-user");
@@ -1247,10 +1290,10 @@ mod tests {
             None,
         );
 
-        let reclaimed = ensure_identity_not_colliding_in_dir(&selected, identity, &systemd_dir)
-            .expect("reclaim identity");
+        let rotated = ensure_identity_not_colliding_in_dir(&selected, identity, &systemd_dir)
+            .expect("rotate identity");
 
-        assert_eq!(reclaimed.unit_group_id, unit_group_id);
+        assert_ne!(rotated.unit_group_id, unit_group_id);
     }
 
     #[test]
@@ -1347,49 +1390,83 @@ mod tests {
     #[test]
     fn prunes_only_owned_user_unit_files() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let home = seed_home(&temp_dir.path().join(".lionclaw"));
+        let identity = read_or_create_unit_identity(&home).expect("identity");
         let user_dir = temp_dir.path().join("systemd-user");
         std::fs::create_dir_all(&user_dir).expect("user dir");
-        std::fs::create_dir_all(home.root()).expect("home root");
-        let home_root = std::fs::canonicalize(home.root()).expect("home root");
 
         let stale_owned = user_dir.join("lionclaw-channel-old.service");
-        fs::write(
+        write_unit(
             &stale_owned,
-            format!(
-                "[Unit]\nDescription=old\nX-LionClaw-HomeRoot={}\n",
-                home_root.display()
-            ),
-        )
-        .expect("stale owned unit");
+            &identity.unit_group_id,
+            &identity.home_root,
+            None,
+        );
 
         let desired = user_dir.join("lionclaw-current.service");
+        write_unit(&desired, &identity.unit_group_id, &identity.home_root, None);
+
+        let home_root_only = user_dir.join("lionclaw-home-root-only.service");
         fs::write(
-            &desired,
+            &home_root_only,
             format!(
-                "[Unit]\nDescription=current\nX-LionClaw-HomeRoot={}\n",
-                home_root.display()
+                "[Unit]\nDescription=incomplete\nX-LionClaw-HomeRoot={}\n",
+                identity.home_root.display()
             ),
         )
-        .expect("desired unit");
+        .expect("home-root-only unit");
 
         let foreign = user_dir.join("lionclaw-foreign.service");
-        fs::write(&foreign, "[Unit]\nDescription=foreign\n").expect("foreign unit");
+        write_unit(
+            &foreign,
+            &uuid::Uuid::new_v4().to_string(),
+            &identity.home_root,
+            None,
+        );
 
         let symlink_target = temp_dir.path().join("custom.service");
         fs::write(&symlink_target, "[Unit]\n").expect("custom unit");
         let symlink_unit = user_dir.join("lionclaw-link.service");
         symlink(&symlink_target, &symlink_unit).expect("unit symlink");
 
-        prune_user_unit_dir(&home, &user_dir, &["lionclaw-current.service"]).expect("prune");
+        prune_user_unit_dir(&identity, &user_dir, &["lionclaw-current.service"]).expect("prune");
 
         assert!(
             !stale_owned.exists(),
             "stale owned unit file should be removed"
         );
         assert!(desired.exists(), "desired owned unit should be preserved");
+        assert!(
+            home_root_only.exists(),
+            "home-root-only unit should not be treated as owned"
+        );
         assert!(foreign.exists(), "foreign unit should be preserved");
         assert!(path_entry_exists(&symlink_unit).expect("symlink unit exists"));
+    }
+
+    #[test]
+    fn overwrite_requires_complete_ownership_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = seed_home(&temp_dir.path().join(".lionclaw"));
+        let identity = read_or_create_unit_identity(&home).expect("identity");
+        let unit_path = temp_dir.path().join(daemon_unit_name(&identity));
+        fs::write(
+            &unit_path,
+            format!(
+                "[Unit]\nDescription=incomplete\nX-LionClaw-HomeRoot={}\n",
+                identity.home_root.display()
+            ),
+        )
+        .expect("home-root-only unit");
+
+        let err =
+            ensure_owned_or_absent(&identity, &unit_path).expect_err("incomplete unit is foreign");
+
+        assert!(err.to_string().contains("is not owned"));
+        assert!(
+            unit_path.exists(),
+            "foreign-looking unit should be left untouched"
+        );
     }
 
     #[test]
