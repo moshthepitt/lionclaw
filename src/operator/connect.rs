@@ -23,7 +23,7 @@ use crate::{
         },
         command_display::lionclaw_home_command_prefix,
         config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
-        managed_units::{owned_managed_units, UnitManager},
+        managed_units::UnitManager,
         private_paths::{private_file_exists, remove_private_file_if_exists},
         reconcile::{
             add_channel_with_worker, add_skill, resolve_stack_binaries, up_for_work_root,
@@ -511,7 +511,7 @@ async fn background_channel_is_active<M: UnitManager>(
     manager: &M,
     channel_id: &str,
 ) -> Result<bool> {
-    let owned_units = owned_managed_units(home)?;
+    let owned_units = manager.owned_units(home)?;
     let Some(unit) = owned_units.channel(channel_id) else {
         return Ok(false);
     };
@@ -526,7 +526,7 @@ async fn restart_background_channel<M: UnitManager>(
     manager: &M,
     channel_id: &str,
 ) -> Result<()> {
-    let owned_units = owned_managed_units(home)?;
+    let owned_units = manager.owned_units(home)?;
     let Some(unit) = owned_units.channel(channel_id) else {
         return Ok(());
     };

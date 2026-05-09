@@ -349,10 +349,10 @@ Direct `lionclaw run` reads the current installed skill and channel state each
 time it launches a runtime. Managed daemons bake an immutable applied skill and
 channel snapshot at startup, so skill or channel changes take effect after the
 daemon is restarted or reconciled through `lionclaw connect`,
-`lionclaw up`, or low-level channel attach. `lionclaw status` marks the daemon
-as `restart required` when the current filesystem/config state no longer
-matches that running snapshot, and it keeps stale managed channel units visible
-until the daemon is reconciled or stopped.
+`lionclaw up`, or low-level channel attach. `lionclaw status` reports the
+selected instance configuration and current backend-owned systemd unit state.
+`lionclaw doctor` diagnoses drift, and `lionclaw up` reconciles the selected
+instance by applying the current desired units and stopping stale owned units.
 
 `lionclaw doctor` is read-only. It diagnoses target resolution, project and
 instance metadata, runtime configuration, managed unit state, channel skill

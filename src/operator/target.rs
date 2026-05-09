@@ -988,7 +988,6 @@ fn ensure_instance_base_dirs(home: &LionClawHome) -> Result<()> {
         home.logs_dir(),
         home.units_dir(),
         home.units_env_dir(),
-        home.units_systemd_dir(),
         home.workspace_dir(crate::home::DEFAULT_WORKSPACE),
     ] {
         fs::create_dir_all(&path)

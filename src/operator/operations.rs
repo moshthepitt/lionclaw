@@ -14,7 +14,7 @@ use crate::{home::LionClawHome, runtime_timeouts::parse_duration};
 
 use super::{
     config::{ChannelLaunchMode, OperatorConfig},
-    managed_units::{owned_managed_units, UnitManager},
+    managed_units::{SystemdUserUnitManager, UnitManager},
     reconcile::{down, resolve_stack_binaries, up_for_work_root},
     redaction::SecretRedactor,
     runtime::resolve_runtime_id,
@@ -175,7 +175,7 @@ pub async fn selected_log_components(
     instance: Option<&str>,
     filter: &LogFilter,
 ) -> Result<Vec<LogComponent>> {
-    let owned_units = owned_managed_units(home)?;
+    let owned_units = SystemdUserUnitManager.owned_units(home)?;
     let config = OperatorConfig::load(home).await?;
     let instance = instance.map(str::to_string);
     let daemon = owned_units.daemon().map(|unit| LogComponent {

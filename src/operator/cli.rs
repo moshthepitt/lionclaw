@@ -32,10 +32,7 @@ use crate::{
         },
         connect::{connect_channel, ConnectChannelRequest, ConnectEnvInputs, ConnectOutcome},
         doctor::run_doctor,
-        managed_units::{
-            channel_unit_name, existing_unit_identity, owned_managed_units,
-            unit_belongs_to_identity, SystemdUserUnitManager, UnitManager,
-        },
+        managed_units::{SystemdUserUnitManager, UnitManager},
         operations::{
             down_instance, no_managed_units_message, operate_project_instances,
             project_log_components, selected_log_components, up_instance, write_journal_logs,
@@ -1626,7 +1623,7 @@ async fn render_instance_channel_list<M: UnitManager>(
         output.push_str("(none)\n");
         return Ok(output);
     }
-    let owned_units = owned_managed_units(home)?;
+    let owned_units = manager.owned_units(home)?;
     for channel in config.channels {
         let unit = match channel.launch_mode {
             ChannelLaunchMode::Interactive => "n/a".to_string(),
@@ -1651,30 +1648,14 @@ async fn stop_owned_channel_unit<M: UnitManager>(
     manager: &M,
     channel_id: &str,
 ) -> Result<()> {
-    stop_owned_channel_unit_in_dir(home, manager, channel_id, &systemd_user_unit_dir_for_cli()?)
-        .await
-}
-
-async fn stop_owned_channel_unit_in_dir<M: UnitManager>(
-    home: &LionClawHome,
-    manager: &M,
-    channel_id: &str,
-    systemd_dir: &Path,
-) -> Result<()> {
-    let Some(identity) = existing_unit_identity(home)? else {
+    let Some(unit) = manager
+        .owned_units(home)?
+        .channel(channel_id)
+        .map(str::to_string)
+    else {
         return Ok(());
     };
-    let unit = channel_unit_name(&identity, channel_id);
-    let unit_path = systemd_dir.join(&unit);
-    if !unit_belongs_to_identity(&unit_path, &identity)? {
-        return Ok(());
-    }
     manager.down_units(&[unit]).await
-}
-
-fn systemd_user_unit_dir_for_cli() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".config/systemd/user"))
 }
 
 fn print_runtime_state_change_note() {
@@ -2004,6 +1985,9 @@ fn validate_codex_profile_args(args: &RuntimeAddArgs) -> Result<()> {
 mod tests {
     use super::*;
     use crate::kernel::runtime::ConfinementConfig;
+    use crate::operator::managed_units::{
+        channel_unit_name, ensure_unit_identity, render_channel_unit, ChannelUnitSpec,
+    };
     use chrono::Duration as ChronoDuration;
     use std::io::Cursor;
     use tempfile::{NamedTempFile, TempDir};
@@ -2412,8 +2396,7 @@ mod tests {
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         home.ensure_base_dirs().await.expect("base dirs");
         home.ensure_home_id().await.expect("home id");
-        let identity =
-            crate::operator::managed_units::ensure_unit_identity(&home).expect("unit identity");
+        let identity = ensure_unit_identity(&home).expect("unit identity");
         let unit = channel_unit_name(&identity, "telegram");
         let mut config = OperatorConfig::default();
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
@@ -2451,33 +2434,27 @@ mod tests {
             required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
         });
         config.save(&home).await.expect("save config");
-        let identity =
-            crate::operator::managed_units::ensure_unit_identity(&home).expect("unit identity");
+        let identity = ensure_unit_identity(&home).expect("unit identity");
         let unit = channel_unit_name(&identity, "telegram");
         let foreign_unit = channel_unit_name(&identity, "foreign");
-        let systemd_dir = temp_dir.path().join("systemd-user");
-        std::fs::create_dir_all(&systemd_dir).expect("systemd dir");
-        std::fs::write(
-            systemd_dir.join(&unit),
-            format!(
-                "[Unit]\nX-LionClaw-UnitGroupId={}\nX-LionClaw-HomeRoot={}\nX-LionClaw-Channel=telegram\n",
-                identity.unit_group_id,
-                identity.home_root.display()
-            ),
-        )
-        .expect("owned unit");
-        std::fs::write(
-            systemd_dir.join(&foreign_unit),
-            format!(
-                "[Unit]\nX-LionClaw-UnitGroupId=00000000-0000-0000-0000-000000000000\nX-LionClaw-HomeRoot={}\nX-LionClaw-Channel=foreign\n",
-                identity.home_root.display()
-            ),
-        )
-        .expect("foreign unit");
         let mut env = crate::operator::channel_env::ChannelEnv::new();
         env.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
         crate::operator::channel_env::save_channel_env(&home, "telegram", &env).expect("save env");
         let manager = crate::operator::managed_units::FakeUnitManager::default();
+        let channel_unit = render_channel_unit(
+            &home,
+            &identity,
+            &ChannelUnitSpec {
+                channel_id: "telegram".to_string(),
+                worker_path: temp_dir.path().join("worker"),
+                env: Vec::new(),
+                channel_env_path: None,
+            },
+        );
+        manager
+            .apply_units(&home, &[channel_unit])
+            .await
+            .expect("apply channel unit");
         manager
             .set_unit_status(&unit, "loaded/active/running")
             .expect("owned status");
@@ -2485,10 +2462,10 @@ mod tests {
             .set_unit_status(&foreign_unit, "loaded/active/running")
             .expect("foreign status");
 
-        stop_owned_channel_unit_in_dir(&home, &manager, "telegram", &systemd_dir)
+        stop_owned_channel_unit(&home, &manager, "telegram")
             .await
             .expect("stop owned unit");
-        stop_owned_channel_unit_in_dir(&home, &manager, "foreign", &systemd_dir)
+        stop_owned_channel_unit(&home, &manager, "foreign")
             .await
             .expect("skip foreign unit");
         assert!(remove_channel(&home, "telegram")

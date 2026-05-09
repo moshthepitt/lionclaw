@@ -164,10 +164,6 @@ impl LionClawHome {
         self.units_dir().join("env")
     }
 
-    pub fn units_systemd_dir(&self) -> PathBuf {
-        self.units_dir().join("systemd")
-    }
-
     pub fn workspace_dir(&self, workspace: &str) -> PathBuf {
         self.root.join("workspaces").join(workspace)
     }
@@ -183,7 +179,6 @@ impl LionClawHome {
             self.logs_dir(),
             self.units_dir(),
             self.units_env_dir(),
-            self.units_systemd_dir(),
             self.workspace_dir(DEFAULT_WORKSPACE),
         ] {
             tokio::fs::create_dir_all(&path)

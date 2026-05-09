@@ -6,7 +6,7 @@ use crate::home::LionClawHome;
 
 use super::{
     config::{ManagedChannelConfig, OperatorConfig},
-    managed_units::{owned_managed_units, SystemdUserUnitManager, UnitManager},
+    managed_units::{SystemdUserUnitManager, UnitManager},
     runtime_integration::{runtime_auth_guidance, runtime_profile_facts},
     target::{
         inspect_target_work_root, list_project_instance_statuses, TargetContext, TargetSelection,
@@ -177,7 +177,7 @@ async fn load_managed_unit_snapshot<M: UnitManager>(
     config: &OperatorConfig,
     manager: &M,
 ) -> Result<ManagedUnitSnapshot> {
-    let owned_units = owned_managed_units(home)?;
+    let owned_units = manager.owned_units(home)?;
     let daemon = match owned_units.daemon() {
         Some(unit) => manager.unit_status(unit).await?,
         None => "not-installed".to_string(),

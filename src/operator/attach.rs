@@ -544,6 +544,13 @@ mod tests {
     #[cfg(unix)]
     #[async_trait]
     impl UnitManager for RemovingInstalledSkillOnStartManager {
+        fn owned_units(
+            &self,
+            home: &LionClawHome,
+        ) -> Result<crate::operator::managed_units::OwnedManagedUnits> {
+            self.inner.owned_units(home)
+        }
+
         async fn apply_units(
             &self,
             home: &LionClawHome,

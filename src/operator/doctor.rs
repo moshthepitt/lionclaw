@@ -17,9 +17,8 @@ use crate::{
         command_display::{lionclaw_home_command_prefix, shell_quote_arg},
         config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig},
         managed_units::{
-            daemon_unit_name, existing_unit_identity, owned_managed_units,
-            unit_belongs_to_identity, unit_channel_id, unit_recorded_home_root,
-            unit_status_is_active, UnitManager,
+            daemon_unit_name, existing_unit_identity, unit_belongs_to_identity, unit_channel_id,
+            unit_recorded_home_root, unit_status_is_active, UnitManager,
         },
         runtime_integration::runtime_auth_guidance,
         target::{
@@ -780,7 +779,7 @@ async fn inspect_expected_units<M: UnitManager>(
         .iter()
         .filter(|channel| channel.launch_mode == ChannelLaunchMode::Background)
         .collect::<Vec<_>>();
-    let owned_units = match owned_managed_units(home) {
+    let owned_units = match manager.owned_units(home) {
         Ok(units) => units,
         Err(err) => {
             findings.push(DoctorFinding::error(
@@ -926,7 +925,7 @@ fn inspect_project_units(
             Some(home) => home,
             None => {
                 findings.push(DoctorFinding::warning(
-                    "legacy or unowned LionClaw-looking unit",
+                    "unowned LionClaw-looking unit",
                     format!(
                         "{} has no X-LionClaw-HomeRoot metadata",
                         unit_path.display()

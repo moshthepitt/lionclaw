@@ -325,8 +325,11 @@ for _ in $(seq 1 30); do
 done
 printf '%s\n' "$after_info"
 test -n "$after_info"
+daemon_env=$(find "$LIONCLAW_HOME/units/env" -maxdepth 1 \
+  -name 'lionclaw-*.env' ! -name 'lionclaw-channel-*' -print -quit)
+test -n "$daemon_env"
 grep -E '^(CODEX_HOME|LIONCLAW_DAEMON_FINGERPRINT)=' \
-  "$LIONCLAW_HOME/units/env/lionclawd.env" || true
+  "$daemon_env"
 ```
 
 Expected:
