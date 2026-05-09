@@ -33,8 +33,8 @@ use crate::{
         connect::{connect_channel, ConnectChannelRequest, ConnectEnvInputs, ConnectOutcome},
         doctor::run_doctor,
         managed_units::{
-            channel_unit_name, existing_unit_identity, unit_belongs_to_identity,
-            SystemdUserUnitManager, UnitManager,
+            channel_unit_name, existing_unit_identity, owned_managed_units,
+            unit_belongs_to_identity, SystemdUserUnitManager, UnitManager,
         },
         operations::{
             down_instance, no_managed_units_message, operate_project_instances,
@@ -1626,16 +1626,12 @@ async fn render_instance_channel_list<M: UnitManager>(
         output.push_str("(none)\n");
         return Ok(output);
     }
-    let identity = existing_unit_identity(home)?;
+    let owned_units = owned_managed_units(home)?;
     for channel in config.channels {
         let unit = match channel.launch_mode {
             ChannelLaunchMode::Interactive => "n/a".to_string(),
-            ChannelLaunchMode::Background => match identity.as_ref() {
-                Some(identity) => {
-                    manager
-                        .unit_status(&channel_unit_name(identity, &channel.id))
-                        .await?
-                }
+            ChannelLaunchMode::Background => match owned_units.channel(&channel.id) {
+                Some(unit) => manager.unit_status(unit).await?,
                 None => "not-installed".to_string(),
             },
         };
@@ -2408,6 +2404,37 @@ mod tests {
         assert!(rendered.contains("background"));
         assert!(rendered.contains("unit"));
         assert!(rendered.contains("not-installed"));
+    }
+
+    #[tokio::test]
+    async fn channel_list_requires_owned_unit_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        home.ensure_home_id().await.expect("home id");
+        let identity =
+            crate::operator::managed_units::ensure_unit_identity(&home).expect("unit identity");
+        let unit = channel_unit_name(&identity, "telegram");
+        let mut config = OperatorConfig::default();
+        config.upsert_channel(crate::operator::config::ManagedChannelConfig {
+            id: "telegram".to_string(),
+            skill: "telegram".to_string(),
+            launch_mode: ChannelLaunchMode::Background,
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+        });
+        config.save(&home).await.expect("save config");
+        let manager = crate::operator::managed_units::FakeUnitManager::default();
+        manager
+            .set_unit_status(&unit, "loaded/active/running")
+            .expect("unit status");
+
+        let rendered = render_instance_channel_list("main", &home, &manager)
+            .await
+            .expect("channel list");
+
+        assert!(rendered.contains("not-installed"));
+        assert!(!rendered.contains("loaded/active/running"));
     }
 
     #[tokio::test]

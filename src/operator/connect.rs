@@ -23,7 +23,7 @@ use crate::{
         },
         command_display::lionclaw_home_command_prefix,
         config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
-        managed_units::{channel_unit_name, existing_unit_identity, UnitManager},
+        managed_units::{owned_managed_units, UnitManager},
         private_paths::{private_file_exists, remove_private_file_if_exists},
         reconcile::{
             add_channel_with_worker, add_skill, resolve_stack_binaries, up_for_work_root,
@@ -511,12 +511,11 @@ async fn background_channel_is_active<M: UnitManager>(
     manager: &M,
     channel_id: &str,
 ) -> Result<bool> {
-    let Some(identity) = existing_unit_identity(home)? else {
+    let owned_units = owned_managed_units(home)?;
+    let Some(unit) = owned_units.channel(channel_id) else {
         return Ok(false);
     };
-    let status = manager
-        .unit_status(&channel_unit_name(&identity, channel_id))
-        .await?;
+    let status = manager.unit_status(unit).await?;
     Ok(crate::operator::managed_units::unit_status_is_active(
         &status,
     ))
@@ -527,12 +526,12 @@ async fn restart_background_channel<M: UnitManager>(
     manager: &M,
     channel_id: &str,
 ) -> Result<()> {
-    let Some(identity) = existing_unit_identity(home)? else {
+    let owned_units = owned_managed_units(home)?;
+    let Some(unit) = owned_units.channel(channel_id) else {
         return Ok(());
     };
-    manager
-        .restart_units(&[channel_unit_name(&identity, channel_id)])
-        .await
+    let units = vec![unit.to_string()];
+    manager.restart_units(&units).await
 }
 
 struct RequiredEnvRequest<'a> {

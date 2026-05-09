@@ -17,9 +17,9 @@ use crate::{
         command_display::{lionclaw_home_command_prefix, shell_quote_arg},
         config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig},
         managed_units::{
-            channel_unit_name, daemon_unit_name, existing_unit_identity, owned_managed_units,
-            unit_channel_id, unit_recorded_home_root, unit_status_is_active, UnitIdentity,
-            UnitManager,
+            daemon_unit_name, existing_unit_identity, owned_managed_units,
+            unit_belongs_to_identity, unit_channel_id, unit_recorded_home_root,
+            unit_status_is_active, UnitManager,
         },
         runtime_integration::runtime_auth_guidance,
         target::{
@@ -861,7 +861,13 @@ async fn inspect_owned_stale_units<M: UnitManager>(
     let Some(identity) = existing_unit_identity(home).ok().flatten() else {
         return;
     };
-    let expected = expected_unit_names(config, &identity);
+    let daemon_unit = daemon_unit_name(&identity);
+    let expected_channels = config
+        .channels
+        .iter()
+        .filter(|channel| channel.launch_mode == ChannelLaunchMode::Background)
+        .map(|channel| channel.id.as_str())
+        .collect::<BTreeSet<_>>();
     for unit_path in user_lionclaw_unit_files().unwrap_or_default() {
         if !unit_path
             .file_name()
@@ -873,13 +879,17 @@ async fn inspect_owned_stale_units<M: UnitManager>(
         let Some(unit_name) = unit_path.file_name().and_then(|value| value.to_str()) else {
             continue;
         };
-        let Ok(recorded_home) = unit_recorded_home_root(&unit_path) else {
+        let Ok(true) = unit_belongs_to_identity(&unit_path, &identity) else {
             continue;
         };
-        if recorded_home.as_deref() != Some(identity.home_root.as_path()) {
+        if unit_name == daemon_unit {
             continue;
         }
-        if expected.contains(unit_name) {
+        if unit_channel_id(&unit_path)
+            .ok()
+            .flatten()
+            .is_some_and(|channel_id| expected_channels.contains(channel_id.as_str()))
+        {
             continue;
         }
         let status = manager
@@ -944,16 +954,6 @@ fn inspect_project_units(
         }
     }
     Ok(findings)
-}
-
-fn expected_unit_names(config: &OperatorConfig, identity: &UnitIdentity) -> BTreeSet<String> {
-    let mut expected = BTreeSet::from([daemon_unit_name(identity)]);
-    for channel in &config.channels {
-        if channel.launch_mode == ChannelLaunchMode::Background {
-            expected.insert(channel_unit_name(identity, &channel.id));
-        }
-    }
-    expected
 }
 
 fn read_project_file(
@@ -1119,7 +1119,9 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
-    use crate::operator::managed_units::{ensure_unit_identity, FakeUnitManager};
+    use crate::operator::managed_units::{
+        channel_unit_name, ensure_unit_identity, FakeUnitManager,
+    };
 
     #[test]
     fn doctor_commands_keep_project_repairs_project_scoped() {

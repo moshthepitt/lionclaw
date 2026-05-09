@@ -15,10 +15,9 @@ use crate::{
         config::{normalize_local_source, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
         daemon_probe::{classify_daemon, DaemonClassification},
         managed_units::{
-            channel_unit_name, daemon_env_path, daemon_unit_name, ensure_unit_identity,
-            existing_unit_identity, owned_managed_units, render_channel_unit, render_daemon_unit,
-            unit_status_is_active, ChannelUnitSpec, DaemonUnitSpec, ManagedUnit, UnitIdentity,
-            UnitManager,
+            daemon_unit_name, ensure_unit_identity, owned_managed_units, render_channel_unit,
+            render_daemon_unit, unit_status_is_active, ChannelUnitSpec, DaemonUnitSpec,
+            ManagedUnit, UnitIdentity, UnitManager,
         },
         redaction::SecretRedactor,
         runtime::{
@@ -38,25 +37,6 @@ use crate::config::resolve_project_workspace_root;
 pub struct OperatorState {
     pub config: OperatorConfig,
     pub applied_state: AppliedState,
-}
-
-#[derive(Debug, Clone)]
-pub struct StackStatus {
-    pub daemon_status: String,
-    pub channels: Vec<ChannelStatus>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ChannelStatus {
-    pub id: String,
-    pub skill: String,
-    pub launch_mode: String,
-    pub unit_status: String,
-    pub pending_peers: u64,
-    pub approved_peers: u64,
-    pub blocked_peers: u64,
-    pub latest_inbound_at: Option<String>,
-    pub latest_outbound_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -354,201 +334,6 @@ pub async fn down<M: UnitManager>(home: &LionClawHome, manager: &M) -> Result<()
     manager.down_units(&units).await
 }
 
-pub async fn status_for_work_root<M: UnitManager>(
-    home: &LionClawHome,
-    manager: &M,
-    work_root: &Path,
-) -> Result<StackStatus> {
-    let state = load_operator_state(home).await?;
-    let kernel = open_kernel(home, &state.config, None).await?;
-    let unit_identity = existing_unit_identity(home)?;
-    let mut daemon_status = match unit_identity.as_ref() {
-        Some(identity) => manager.unit_status(&daemon_unit_name(identity)).await?,
-        None => "not-installed".to_string(),
-    };
-    if unit_status_is_active(&daemon_status) {
-        if let Some(problem) =
-            daemon_status_problem(home, &state.config, &state.applied_state, work_root).await?
-        {
-            daemon_status.push_str(problem.status_suffix());
-        }
-    }
-
-    let mut channels = Vec::new();
-    let configured_channel_ids = state
-        .applied_state
-        .channels()
-        .iter()
-        .map(|channel| channel.id.clone())
-        .collect::<BTreeSet<_>>();
-    for channel in state.applied_state.channels() {
-        let health = kernel
-            .get_channel_health(&channel.id)
-            .await
-            .map_err(to_anyhow)?;
-        let unit_status = if channel.launch_mode == ChannelLaunchMode::Interactive {
-            "interactive".to_string()
-        } else if let Some(identity) = unit_identity.as_ref() {
-            manager
-                .unit_status(&channel_unit_name(identity, &channel.id))
-                .await?
-        } else {
-            "not-installed".to_string()
-        };
-        channels.push(ChannelStatus {
-            id: channel.id.clone(),
-            skill: channel.skill_alias.clone(),
-            launch_mode: channel.launch_mode.as_str().to_string(),
-            unit_status,
-            pending_peers: health.pending_peer_count,
-            approved_peers: health.approved_peer_count,
-            blocked_peers: health.blocked_peer_count,
-            latest_inbound_at: health.latest_inbound_at.map(|value| value.to_rfc3339()),
-            latest_outbound_at: health.latest_outbound_at.map(|value| value.to_rfc3339()),
-        });
-    }
-    for unit_name in managed_unit_names(home)? {
-        let Some(channel_id) = managed_channel_unit_id(home, &unit_name)? else {
-            continue;
-        };
-        if configured_channel_ids.contains(&channel_id) {
-            continue;
-        }
-        let mut unit_status = manager.unit_status(&unit_name).await?;
-        unit_status.push_str(" (stale)");
-        channels.push(ChannelStatus {
-            id: channel_id,
-            skill: "-".to_string(),
-            launch_mode: ChannelLaunchMode::Background.as_str().to_string(),
-            unit_status,
-            pending_peers: 0,
-            approved_peers: 0,
-            blocked_peers: 0,
-            latest_inbound_at: None,
-            latest_outbound_at: None,
-        });
-    }
-
-    Ok(StackStatus {
-        daemon_status,
-        channels,
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DaemonStatusProblem {
-    RestartRequired,
-    DifferentWorkRoot,
-}
-
-impl DaemonStatusProblem {
-    fn status_suffix(self) -> &'static str {
-        match self {
-            Self::RestartRequired => " (restart required)",
-            Self::DifferentWorkRoot => " (different work root)",
-        }
-    }
-}
-
-async fn daemon_status_problem(
-    home: &LionClawHome,
-    config: &OperatorConfig,
-    applied_state: &AppliedState,
-    work_root: &Path,
-) -> Result<Option<DaemonStatusProblem>> {
-    let Some(runtime_id) = managed_daemon_runtime_id(home, config)? else {
-        return Ok(None);
-    };
-    let runtime_context =
-        match resolve_runtime_execution_context(home, config, Some(&runtime_id)).await {
-            Ok(context) => context,
-            Err(_) => return Ok(None),
-        };
-    let home_id = home.ensure_home_id().await?;
-    let project_scope = runtime_project_partition_key(Some(work_root));
-    let expected_daemon_fingerprint =
-        compute_daemon_fingerprint(&runtime_context.daemon_config_fingerprint, applied_state);
-
-    match classify_daemon(
-        &config.daemon.bind,
-        &home_id,
-        &project_scope,
-        &expected_daemon_fingerprint,
-    )
-    .await?
-    {
-        DaemonClassification::SameHomeDifferentConfig => {
-            Ok(Some(DaemonStatusProblem::RestartRequired))
-        }
-        DaemonClassification::SameHomeDifferentProject => {
-            Ok(Some(DaemonStatusProblem::DifferentWorkRoot))
-        }
-        DaemonClassification::Absent
-        | DaemonClassification::SameHome
-        | DaemonClassification::ForeignHome(_)
-        | DaemonClassification::IncompatibleLionClaw
-        | DaemonClassification::UnknownListener => Ok(None),
-    }
-}
-
-fn managed_daemon_runtime_id(
-    home: &LionClawHome,
-    config: &OperatorConfig,
-) -> Result<Option<String>> {
-    let Some(identity) = existing_unit_identity(home)? else {
-        return Ok(config.defaults.runtime.clone());
-    };
-    let env_path = daemon_env_path(home, &identity);
-    let content = match fs::read_to_string(&env_path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(config.defaults.runtime.clone());
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to read {}", env_path.display()));
-        }
-    };
-
-    for line in content.lines() {
-        let Some(value) = line.strip_prefix("LIONCLAW_DEFAULT_RUNTIME_ID=") else {
-            continue;
-        };
-        let value = unescape_managed_env_value(value.trim());
-        if !value.is_empty() {
-            return Ok(Some(value));
-        }
-    }
-
-    Ok(config.defaults.runtime.clone())
-}
-
-fn unescape_managed_env_value(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let body = trimmed
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .unwrap_or(trimmed);
-    let mut value = String::with_capacity(body.len());
-    let mut chars = body.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            value.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => value.push('\n'),
-            Some('"') => value.push('"'),
-            Some('\\') => value.push('\\'),
-            Some(other) => {
-                value.push('\\');
-                value.push(other);
-            }
-            None => value.push('\\'),
-        }
-    }
-    value
-}
-
 pub async fn logs<M: UnitManager>(
     home: &LionClawHome,
     manager: &M,
@@ -613,6 +398,10 @@ pub async fn pairing_block(
         })
         .await
         .map_err(to_anyhow)
+}
+
+fn to_anyhow(err: crate::kernel::KernelError) -> anyhow::Error {
+    anyhow!(err.to_string())
 }
 
 pub fn resolve_stack_binaries() -> Result<StackBinaryPaths> {
@@ -937,17 +726,6 @@ fn managed_unit_names(home: &LionClawHome) -> Result<Vec<String>> {
     Ok(owned_managed_units(home)?.names())
 }
 
-fn managed_channel_unit_id(home: &LionClawHome, unit_name: &str) -> Result<Option<String>> {
-    let Some(identity) = existing_unit_identity(home)? else {
-        return Ok(None);
-    };
-    let prefix = format!("lionclaw-channel-{}-", identity.unit_group_id);
-    Ok(unit_name
-        .strip_prefix(&prefix)
-        .and_then(|value| value.strip_suffix(".service"))
-        .map(str::to_string))
-}
-
 pub(crate) async fn open_kernel(
     home: &LionClawHome,
     config: &OperatorConfig,
@@ -1014,10 +792,6 @@ async fn open_kernel_with_project_root(
     Ok(kernel)
 }
 
-fn to_anyhow(err: crate::kernel::KernelError) -> anyhow::Error {
-    anyhow!(err.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1026,11 +800,10 @@ mod tests {
     };
 
     use super::{
-        add_channel, add_skill, down, ensure_managed_bind_configured, logs,
-        managed_daemon_runtime_id, managed_unit_names, open_kernel, open_kernel_with_project_root,
-        render_marker_file, render_runtime_cache, resolve_installed_skill_worker_entrypoint,
-        resolve_required_channel_env, resolve_worker_entrypoint, status_for_work_root,
-        up_for_work_root, StackBinaryPaths,
+        add_channel, add_skill, down, ensure_managed_bind_configured, logs, managed_unit_names,
+        open_kernel, open_kernel_with_project_root, render_marker_file, render_runtime_cache,
+        resolve_installed_skill_worker_entrypoint, resolve_required_channel_env,
+        resolve_worker_entrypoint, up_for_work_root, StackBinaryPaths,
     };
     use crate::{
         applied::compute_daemon_fingerprint,
@@ -1043,10 +816,9 @@ mod tests {
             config::{
                 ChannelLaunchMode, ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig,
             },
-            daemon_probe::{classify_daemon, DaemonClassification},
             managed_units::{
-                channel_unit_name, daemon_env_path, daemon_unit_name, ensure_unit_identity,
-                FakeUnitManager, UnitIdentity, UnitManager,
+                channel_unit_name, daemon_unit_name, ensure_unit_identity, FakeUnitManager,
+                UnitIdentity, UnitManager,
             },
             reconcile::load_operator_state,
             runtime::resolve_runtime_execution_context,
@@ -1344,39 +1116,6 @@ mod tests {
         assert_eq!(
             rendered,
             "# Header\n<!-- LIONCLAW:START -->\nbody\n<!-- LIONCLAW:END -->\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn managed_daemon_runtime_id_reads_uuid_scoped_daemon_env() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        home.ensure_base_dirs().await.expect("base dirs");
-        let mut config = OperatorConfig::default();
-        let runtime_stub = temp_dir.path().join("codex-stub.sh");
-        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
-        make_executable(&runtime_stub);
-        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
-            .into_iter()
-            .collect();
-        config
-            .set_default_runtime("codex")
-            .expect("set default runtime");
-        let identity = ensure_unit_identity(&home).expect("unit identity");
-        fs::write(
-            home.units_env_dir().join("lionclawd.env"),
-            "LIONCLAW_DEFAULT_RUNTIME_ID=codex\n",
-        )
-        .expect("old env");
-        fs::write(
-            daemon_env_path(&home, &identity),
-            "LIONCLAW_DEFAULT_RUNTIME_ID=opencode\n",
-        )
-        .expect("scoped env");
-
-        assert_eq!(
-            managed_daemon_runtime_id(&home, &config).expect("runtime id"),
-            Some("opencode".to_string())
         );
     }
 
@@ -2336,336 +2075,5 @@ mod tests {
                 .expect("read restart state"),
             "daemon should restart after installed skill changes"
         );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn status_ignores_unselected_runtime_image_probe_failures() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = test_project_home(temp_dir.path());
-
-        let broken_podman = temp_dir.path().join("podman");
-        fs::write(
-            &broken_podman,
-            "#!/usr/bin/env bash\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"inspect\" ]; then\n  echo 'storage denied' >&2\n  exit 1\nfi\nexit 0\n",
-        )
-        .expect("write broken podman");
-        fs::set_permissions(&broken_podman, fs::Permissions::from_mode(0o755))
-            .expect("chmod broken podman");
-
-        let healthy_runtime = temp_dir.path().join("opencode-stub.sh");
-        fs::write(&healthy_runtime, "#!/usr/bin/env bash\ncat >/dev/null\n")
-            .expect("write runtime stub");
-        fs::set_permissions(&healthy_runtime, fs::Permissions::from_mode(0o755))
-            .expect("chmod runtime stub");
-
-        let mut config = OperatorConfig::load(&home).await.expect("load config");
-        config.upsert_runtime(
-            "codex".to_string(),
-            RuntimeProfileConfig::Codex {
-                executable: "codex".to_string(),
-                model: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine: broken_podman.to_string_lossy().to_string(),
-                    image: Some("ghcr.io/lionclaw/test-codex-runtime:latest".to_string()),
-                    ..OciConfinementConfig::default()
-                }),
-            },
-        );
-        config.upsert_runtime(
-            "opencode".to_string(),
-            RuntimeProfileConfig::OpenCode {
-                executable: healthy_runtime.to_string_lossy().to_string(),
-                model: None,
-                agent: None,
-                confinement: ConfinementConfig::Oci(OciConfinementConfig {
-                    engine: ensure_fake_podman(&healthy_runtime)
-                        .to_string_lossy()
-                        .to_string(),
-                    image: Some("ghcr.io/lionclaw/test-opencode-runtime:latest".to_string()),
-                    ..OciConfinementConfig::default()
-                }),
-            },
-        );
-        config
-            .set_default_runtime("opencode")
-            .expect("set default runtime");
-        config.save(&home).await.expect("save config");
-
-        let manager = FakeUnitManager::default();
-        let stack = status_for_work_root(&home, &manager, &current_work_root())
-            .await
-            .expect("status");
-
-        assert_eq!(stack.daemon_status, "not-installed");
-        assert!(stack.channels.is_empty());
-    }
-
-    #[tokio::test]
-    async fn status_marks_restart_required_when_daemon_fingerprint_is_stale() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = test_project_home(temp_dir.path());
-        let mut config = load_test_config_with_managed_bind(&home).await;
-        let runtime_stub = temp_dir.path().join("codex-stub.sh");
-        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
-        make_executable(&runtime_stub);
-        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
-            .into_iter()
-            .collect();
-        config
-            .set_default_runtime("codex")
-            .expect("set default runtime");
-        config.save(&home).await.expect("save config");
-
-        let manager = FakeUnitManager::default();
-        let daemon_unit = test_daemon_unit_name(&home);
-        manager
-            .set_unit_status(&daemon_unit, "loaded/active/running")
-            .expect("set unit status");
-
-        let home_id = home.ensure_home_id().await.expect("home id");
-        let bind_addr = config.daemon.bind.clone();
-        let home_root = home.root().display().to_string();
-        let _server = spawn_probe_server(
-            Router::new().route(
-                "/v0/daemon/info",
-                get({
-                    let bind_addr = bind_addr.clone();
-                    let home_id = home_id.clone();
-                    let home_root = home_root.clone();
-                    let project_scope = current_project_scope();
-                    move || async move {
-                        Json(DaemonInfoResponse {
-                            daemon: "lionclawd".to_string(),
-                            status: "ok".to_string(),
-                            home_id: home_id.clone(),
-                            home_root: home_root.clone(),
-                            bind_addr: bind_addr.clone(),
-                            project_scope: project_scope.clone(),
-                            daemon_fingerprint: "daemon-stale-state".to_string(),
-                        })
-                    }
-                }),
-            ),
-            &bind_addr,
-        )
-        .await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let state = load_operator_state(&home)
-            .await
-            .expect("load operator state");
-        assert_eq!(
-            managed_daemon_runtime_id(&home, &config).expect("managed daemon runtime id"),
-            Some("codex".to_string())
-        );
-        let runtime_context =
-            resolve_runtime_execution_context(&home, &config, config.defaults.runtime.as_deref())
-                .await
-                .expect("resolve runtime context");
-        let expected_daemon_fingerprint = compute_daemon_fingerprint(
-            &runtime_context.daemon_config_fingerprint,
-            &state.applied_state,
-        );
-        assert!(matches!(
-            classify_daemon(
-                &bind_addr,
-                &home_id,
-                &current_project_scope(),
-                &expected_daemon_fingerprint,
-            )
-            .await
-            .expect("classify daemon"),
-            DaemonClassification::SameHomeDifferentConfig
-        ));
-        let stack = status_for_work_root(&home, &manager, &current_work_root())
-            .await
-            .expect("status");
-
-        assert_eq!(
-            stack.daemon_status,
-            "loaded/active/running (restart required)"
-        );
-    }
-
-    #[tokio::test]
-    async fn status_marks_daemon_running_for_different_work_root() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = test_project_home(temp_dir.path());
-        let mut config = load_test_config_with_managed_bind(&home).await;
-        let runtime_stub = temp_dir.path().join("codex-stub.sh");
-        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
-        make_executable(&runtime_stub);
-        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
-            .into_iter()
-            .collect();
-        config
-            .set_default_runtime("codex")
-            .expect("set default runtime");
-        config.save(&home).await.expect("save config");
-
-        let manager = FakeUnitManager::default();
-        let daemon_unit = test_daemon_unit_name(&home);
-        manager
-            .set_unit_status(&daemon_unit, "loaded/active/running")
-            .expect("set unit status");
-
-        let home_id = home.ensure_home_id().await.expect("home id");
-        let bind_addr = config.daemon.bind.clone();
-        let home_root = home.root().display().to_string();
-        let daemon_fingerprint = current_daemon_fingerprint(&home).await;
-        let other_work_root = temp_dir.path().join("other-work-root");
-        let other_project_scope = runtime_project_partition_key(Some(other_work_root.as_path()));
-        let _server = spawn_probe_server(
-            Router::new().route(
-                "/v0/daemon/info",
-                get({
-                    let bind_addr = bind_addr.clone();
-                    let home_id = home_id.clone();
-                    let home_root = home_root.clone();
-                    let project_scope = other_project_scope.clone();
-                    move || async move {
-                        Json(DaemonInfoResponse {
-                            daemon: "lionclawd".to_string(),
-                            status: "ok".to_string(),
-                            home_id: home_id.clone(),
-                            home_root: home_root.clone(),
-                            bind_addr: bind_addr.clone(),
-                            project_scope: project_scope.clone(),
-                            daemon_fingerprint: daemon_fingerprint.clone(),
-                        })
-                    }
-                }),
-            ),
-            &bind_addr,
-        )
-        .await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let state = load_operator_state(&home)
-            .await
-            .expect("load operator state");
-        let runtime_context =
-            resolve_runtime_execution_context(&home, &config, config.defaults.runtime.as_deref())
-                .await
-                .expect("resolve runtime context");
-        let expected_daemon_fingerprint = compute_daemon_fingerprint(
-            &runtime_context.daemon_config_fingerprint,
-            &state.applied_state,
-        );
-        assert!(matches!(
-            classify_daemon(
-                &bind_addr,
-                &home_id,
-                &current_project_scope(),
-                &expected_daemon_fingerprint,
-            )
-            .await
-            .expect("classify daemon"),
-            DaemonClassification::SameHomeDifferentProject
-        ));
-
-        let stack = status_for_work_root(&home, &manager, &current_work_root())
-            .await
-            .expect("status");
-
-        assert_eq!(
-            stack.daemon_status,
-            "loaded/active/running (different work root)"
-        );
-    }
-
-    #[tokio::test]
-    async fn status_surfaces_stale_background_channel_units() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = test_project_home(temp_dir.path());
-        let mut config = load_test_config_with_managed_bind(&home).await;
-        let runtime_stub = temp_dir.path().join("codex-stub.sh");
-        fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
-        make_executable(&runtime_stub);
-        config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
-            .into_iter()
-            .collect();
-        config
-            .set_default_runtime("codex")
-            .expect("set default runtime");
-        config.save(&home).await.expect("save config");
-
-        let identity = test_unit_identity(&home);
-        let daemon_unit = daemon_unit_name(&identity);
-        let stale_unit = channel_unit_name(&identity, "telegram");
-
-        tokio::fs::create_dir_all(home.units_systemd_dir())
-            .await
-            .expect("create units dir");
-        tokio::fs::write(
-            home.units_systemd_dir().join(&stale_unit),
-            format!(
-                "[Unit]\nDescription=stale\nX-LionClaw-UnitGroupId={}\nX-LionClaw-HomeRoot={}\n",
-                identity.unit_group_id,
-                identity.home_root.display()
-            ),
-        )
-        .await
-        .expect("write stale unit");
-
-        let manager = FakeUnitManager::default();
-        manager
-            .set_unit_status(&daemon_unit, "loaded/active/running")
-            .expect("set daemon status");
-        manager
-            .set_unit_status(&stale_unit, "loaded/active/running")
-            .expect("set stale channel status");
-
-        let home_id = home.ensure_home_id().await.expect("home id");
-        let bind_addr = config.daemon.bind.clone();
-        let home_root = home.root().display().to_string();
-        let _server = spawn_probe_server(
-            Router::new().route(
-                "/v0/daemon/info",
-                get({
-                    let bind_addr = bind_addr.clone();
-                    let home_id = home_id.clone();
-                    let home_root = home_root.clone();
-                    let project_scope = current_project_scope();
-                    move || async move {
-                        Json(DaemonInfoResponse {
-                            daemon: "lionclawd".to_string(),
-                            status: "ok".to_string(),
-                            home_id: home_id.clone(),
-                            home_root: home_root.clone(),
-                            bind_addr: bind_addr.clone(),
-                            project_scope: project_scope.clone(),
-                            daemon_fingerprint: "daemon-stale-state".to_string(),
-                        })
-                    }
-                }),
-            ),
-            &bind_addr,
-        )
-        .await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let stack = status_for_work_root(&home, &manager, &current_work_root())
-            .await
-            .expect("status");
-
-        assert_eq!(
-            stack.daemon_status,
-            "loaded/active/running (restart required)"
-        );
-        assert_eq!(stack.channels.len(), 1);
-        let channel = &stack.channels[0];
-        assert_eq!(channel.id, "telegram");
-        assert_eq!(channel.skill, "-");
-        assert_eq!(channel.launch_mode, "background");
-        assert_eq!(channel.unit_status, "loaded/active/running (stale)");
-        assert_eq!(channel.pending_peers, 0);
-        assert_eq!(channel.approved_peers, 0);
-        assert_eq!(channel.blocked_peers, 0);
-        assert!(channel.latest_inbound_at.is_none());
-        assert!(channel.latest_outbound_at.is_none());
     }
 }
