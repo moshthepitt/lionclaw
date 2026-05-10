@@ -38,84 +38,17 @@ impl AppliedState {
     }
 
     pub fn from_home(home: &LionClawHome, config: &OperatorConfig) -> Result<Self> {
-        let skills_root = canonical_skills_root(home)?;
-        let mut skills = Vec::new();
-        let mut channels = Vec::with_capacity(config.channels.len());
-        let mut skill_aliases = BTreeSet::new();
-        let mut skill_ids = BTreeSet::new();
-        let mut channel_ids = BTreeSet::new();
-        let mut entries = fs::read_dir(&skills_root)
-            .with_context(|| format!("failed to read directory {}", skills_root.display()))?
-            .collect::<std::io::Result<Vec<_>>>()
-            .with_context(|| format!("failed to iterate directory {}", skills_root.display()))?;
-        entries.sort_by_key(|entry| entry.file_name());
+        let inputs = read_applied_state_inputs(home, config)?;
+        let skills = materialize_applied_skills(&inputs.skills_root, inputs.skills)?;
+        Ok(Self::from_parts(skills, inputs.channels))
+    }
 
-        for entry in entries {
-            let alias = entry
-                .file_name()
-                .to_str()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "invalid installed skill name under {}",
-                        skills_root.display()
-                    )
-                })?
-                .to_string();
-            if alias.starts_with('.') {
-                continue;
-            }
-            validate_skill_alias(&alias)?;
-            if !skill_aliases.insert(alias.clone()) {
-                return Err(anyhow!(
-                    "installed skill alias '{alias}' appears more than once"
-                ));
-            }
-
-            let metadata = fs::symlink_metadata(entry.path())
-                .with_context(|| format!("failed to stat {}", entry.path().display()))?;
-            if metadata.file_type().is_symlink() {
-                return Err(anyhow!(
-                    "installed skill '{}' must not be a symlink",
-                    entry.path().display()
-                ));
-            }
-            if !metadata.is_dir() {
-                return Err(anyhow!(
-                    "installed skill '{}' is not a directory",
-                    entry.path().display()
-                ));
-            }
-            let skill = AppliedSkill::from_installed(&skills_root, entry.path())?;
-            if !skill_ids.insert(skill.skill_id.clone()) {
-                return Err(anyhow!(
-                    "installed skill alias '{}' collides with another installed skill on skill id '{}'",
-                    skill.alias,
-                    skill.skill_id
-                ));
-            }
-            skills.push(skill);
-        }
-
-        for channel in &config.channels {
-            if !channel_ids.insert(channel.id.clone()) {
-                return Err(anyhow!(
-                    "operator config contains duplicate channel id '{}'",
-                    channel.id
-                ));
-            }
-            validate_skill_alias(&channel.skill)?;
-            if !skill_aliases.contains(channel.skill.as_str()) {
-                return Err(anyhow!(
-                    "configured channel '{}' references missing installed skill alias '{}'",
-                    channel.id,
-                    channel.skill
-                ));
-            }
-            channels.push(AppliedChannel::from_config(channel));
-        }
-
-        let skills = materialize_applied_skills(&skills_root, skills)?;
-        Ok(Self::from_parts(skills, channels))
+    pub(crate) fn from_home_read_only(
+        home: &LionClawHome,
+        config: &OperatorConfig,
+    ) -> Result<Self> {
+        let inputs = read_applied_state_inputs(home, config)?;
+        Ok(Self::from_parts(inputs.skills, inputs.channels))
     }
 
     pub fn skills(&self) -> &[AppliedSkill] {
@@ -180,6 +113,99 @@ impl AppliedState {
             channels_by_id,
         }
     }
+}
+
+struct AppliedStateInputs {
+    skills_root: PathBuf,
+    skills: Vec<AppliedSkill>,
+    channels: Vec<AppliedChannel>,
+}
+
+fn read_applied_state_inputs(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+) -> Result<AppliedStateInputs> {
+    let skills_root = canonical_skills_root(home)?;
+    let mut skills = Vec::new();
+    let mut channels = Vec::with_capacity(config.channels.len());
+    let mut skill_aliases = BTreeSet::new();
+    let mut skill_ids = BTreeSet::new();
+    let mut channel_ids = BTreeSet::new();
+    let mut entries = fs::read_dir(&skills_root)
+        .with_context(|| format!("failed to read directory {}", skills_root.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("failed to iterate directory {}", skills_root.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let alias = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| {
+                anyhow!(
+                    "invalid installed skill name under {}",
+                    skills_root.display()
+                )
+            })?
+            .to_string();
+        if alias.starts_with('.') {
+            continue;
+        }
+        validate_skill_alias(&alias)?;
+        if !skill_aliases.insert(alias.clone()) {
+            return Err(anyhow!(
+                "installed skill alias '{alias}' appears more than once"
+            ));
+        }
+
+        let metadata = fs::symlink_metadata(entry.path())
+            .with_context(|| format!("failed to stat {}", entry.path().display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(anyhow!(
+                "installed skill '{}' must not be a symlink",
+                entry.path().display()
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(anyhow!(
+                "installed skill '{}' is not a directory",
+                entry.path().display()
+            ));
+        }
+        let skill = AppliedSkill::from_installed(&skills_root, entry.path())?;
+        if !skill_ids.insert(skill.skill_id.clone()) {
+            return Err(anyhow!(
+                "installed skill alias '{}' collides with another installed skill on skill id '{}'",
+                skill.alias,
+                skill.skill_id
+            ));
+        }
+        skills.push(skill);
+    }
+
+    for channel in &config.channels {
+        if !channel_ids.insert(channel.id.clone()) {
+            return Err(anyhow!(
+                "operator config contains duplicate channel id '{}'",
+                channel.id
+            ));
+        }
+        validate_skill_alias(&channel.skill)?;
+        if !skill_aliases.contains(channel.skill.as_str()) {
+            return Err(anyhow!(
+                "configured channel '{}' references missing installed skill alias '{}'",
+                channel.id,
+                channel.skill
+            ));
+        }
+        channels.push(AppliedChannel::from_config(channel));
+    }
+
+    Ok(AppliedStateInputs {
+        skills_root,
+        skills,
+        channels,
+    })
 }
 
 fn applied_skills_fingerprint(skills: &[AppliedSkill]) -> String {

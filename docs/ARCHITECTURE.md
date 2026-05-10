@@ -467,5 +467,5 @@ home.
 5. Only touch `kernel/runtime/builtins.rs` if the adapter is intentionally
    builtin test/kernel scaffolding.
 6. Add unit tests in the adapter module plus one kernel-level integration case.
-7. Update `docs/RUNTIME_MODEL.md`, this architecture doc, and manual QA notes
-   if the runtime introduces new auth, state, or confinement behavior.
+7. Update this architecture doc and `docs/MANUAL_QA.md` if the runtime
+   introduces new auth, state, or confinement behavior.
