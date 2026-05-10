@@ -31,7 +31,7 @@ async fn add_channel_requires_installed_alias() {
         env.home(),
         "local-cli".to_string(),
         "missing-skill".to_string(),
-        ChannelLaunchMode::Service,
+        ChannelLaunchMode::Background,
         Vec::new(),
     )
     .await
@@ -49,7 +49,7 @@ async fn add_channel_rejects_invalid_alias() {
         env.home(),
         "local-cli".to_string(),
         "../not-valid".to_string(),
-        ChannelLaunchMode::Service,
+        ChannelLaunchMode::Background,
         Vec::new(),
     )
     .await
@@ -833,7 +833,7 @@ async fn install_and_bind_channel(env: &TestHome, channel_id: &str, skill_name: 
         true,
     );
     env.install_skill(skill_name, &skill_source).await;
-    env.add_channel(channel_id, skill_name, ChannelLaunchMode::Service)
+    env.add_channel(channel_id, skill_name, ChannelLaunchMode::Background)
         .await;
 }
 

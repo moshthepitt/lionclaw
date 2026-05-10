@@ -20,8 +20,8 @@ Run this before merging behavior-changing work that touches:
 - runtime execution or Podman confinement
 - Codex auth/config staging
 - runtime image identity or selected-runtime resolution
-- daemon compatibility, service reuse, or project scoping
-- `lionclaw run`, `service up`, `channel attach`, terminal channels, or jobs
+- daemon compatibility, daemon reuse, or project scoping
+- `lionclaw run`, `lionclaw up`, `channel attach`, terminal channels, or jobs
 - runtime secrets, drafts, continuity, or session recovery
 
 ## What This Pass Proves
@@ -81,7 +81,7 @@ Default full pass:
 - direct Codex run
 - draft create/promote/discard
 - `/retry`, `/reset`, and `--continue-last-session`
-- managed daemon `service up/status/logs`
+- managed daemon `up/status/logs`
 - selected runtime image identity checks
 - terminal channel pair/approve/send/reattach/retry
 - scheduler job run and channel delivery
@@ -155,7 +155,7 @@ Configure LionClaw from project A:
 
 ```bash
 cd "$PROJ_A"
-"$LIONCLAW_BIN" onboard --bind auto
+"$LIONCLAW_BIN" project init
 "$LIONCLAW_BIN" runtime add codex --kind codex --bin codex --image lionclaw-runtime:v1
 "$LIONCLAW_BIN" runtime set-default codex
 "$LIONCLAW_BIN" skill add "$REPO_ROOT/skills/channel-terminal" --alias terminal
@@ -267,9 +267,9 @@ With the optional broken runtime still configured:
 
 ```bash
 cd "$PROJ_A"
-"$LIONCLAW_BIN" service up --runtime codex
-"$LIONCLAW_BIN" service status
-"$LIONCLAW_BIN" service logs
+"$LIONCLAW_BIN" up
+"$LIONCLAW_BIN" status
+"$LIONCLAW_BIN" logs
 
 bind=$(sed -n 's/^bind = "\(.*\)"$/\1/p' "$LIONCLAW_HOME/config/lionclaw.toml" | head -n1)
 daemon_info=""
@@ -285,8 +285,8 @@ test -n "$daemon_info"
 
 Expected:
 
-- service starts or reconciles cleanly
-- the broken unselected runtime does not block `service up --runtime codex`
+- background units start or reconcile cleanly
+- the broken unselected runtime does not block `lionclaw up` when the default runtime is `codex`
 - daemon info reports stable `home_id`, `project_scope`, and
   `daemon_fingerprint`
 
@@ -314,7 +314,7 @@ printf '%s\n' "$before_info"
   --kind codex \
   --bin codex \
   --image lionclaw-runtime:v1
-"$LIONCLAW_BIN" service up --runtime codex
+"$LIONCLAW_BIN" up
 
 after_info=""
 for _ in $(seq 1 30); do
@@ -325,13 +325,16 @@ for _ in $(seq 1 30); do
 done
 printf '%s\n' "$after_info"
 test -n "$after_info"
+daemon_env=$(find "$LIONCLAW_HOME/units/env" -maxdepth 1 \
+  -name 'lionclaw-*.env' ! -name 'lionclaw-channel-*' -print -quit)
+test -n "$daemon_env"
 grep -E '^(CODEX_HOME|LIONCLAW_DAEMON_FINGERPRINT)=' \
-  "$LIONCLAW_HOME/services/env/lionclawd.env" || true
+  "$daemon_env"
 ```
 
 Expected:
 
-- daemon remains reachable after `service up`
+- daemon remains reachable after `lionclaw up`
 - `daemon_fingerprint` changes after the config update
 - same `home_id` and `project_scope` are preserved
 - if `CODEX_HOME` was exported at the start of the pass, the generated daemon
@@ -460,7 +463,7 @@ mount-runtime-secrets = true
 
 This phase assumes the host can create rootless Podman private networking for
 `network-mode = "on"`. If the host `pasta` or `/dev/net/tun` path is broken,
-LionClaw now fails during `service up` instead of waiting for the first turn.
+LionClaw now fails during `lionclaw up` instead of waiting for the first turn.
 On Arch Linux, the common fix is to load the `tun` module first:
 
 ```bash
@@ -471,7 +474,7 @@ ls /sys/module/tun
 Reconcile the daemon and record the new fingerprint:
 
 ```bash
-"$LIONCLAW_BIN" service up --runtime codex
+"$LIONCLAW_BIN" up
 daemon_info=""
 for _ in $(seq 1 30); do
   if daemon_info=$(curl -fsS "http://$bind/v0/daemon/info" 2>/dev/null); then
@@ -547,7 +550,7 @@ Keep the project-A daemon running and switch to project B:
 
 ```bash
 cd "$PROJ_B"
-"$LIONCLAW_BIN" service up --runtime codex
+"$LIONCLAW_BIN" up
 "$LIONCLAW_BIN" channel attach terminal --runtime codex --peer qa-terminal
 ```
 
@@ -582,8 +585,8 @@ From project A:
 
 ```bash
 cd "$PROJ_A"
-"$LIONCLAW_BIN" service down
-"$LIONCLAW_BIN" service status
+"$LIONCLAW_BIN" down
+"$LIONCLAW_BIN" status
 ```
 
 Expected:
@@ -619,7 +622,7 @@ commit:
 rustc/clippy version:
 podman version:
 runtime id:
-command path: run | attach | service | job | secrets
+command path: run | attach | up | job | secrets
 LIONCLAW_HOME:
 project root:
 bind addr:
@@ -636,8 +639,8 @@ can reproduce on another runtime? yes/no
 Attach:
 
 ```bash
-"$LIONCLAW_BIN" service status
-"$LIONCLAW_BIN" service logs
+"$LIONCLAW_BIN" status
+"$LIONCLAW_BIN" logs
 curl -sS "http://$bind/v0/daemon/info"
 find "$LIONCLAW_HOME/runtime" -maxdepth 8 -print | sort
 find "$LIONCLAW_HOME/workspaces" -maxdepth 8 -print | sort

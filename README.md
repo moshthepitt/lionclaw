@@ -15,9 +15,9 @@ credentials, and long-running workflows while keeping them inside an
 environment you define.
 
 Note: LionClaw's direct `lionclaw run` path currently supports Unix-like
-systems (Linux/macOS). Managed daemon paths, including `service up` and channel
-auto-start, currently require Linux with systemd user services. Windows is out
-of scope.
+systems (Linux/macOS). Managed background paths, including `lionclaw up` and
+channel auto-start, currently require Linux with the systemd user manager.
+Windows is out of scope.
 
 ## Why LionClaw
 
@@ -116,12 +116,33 @@ and its immediate parent. It does not walk arbitrarily up the filesystem.
 Use `--home PATH` only when you need to target one exact instance home and
 bypass project discovery.
 
+Everyday operations stay at the top level:
+
+```bash
+./target/release/lionclaw status
+./target/release/lionclaw project status
+./target/release/lionclaw up
+./target/release/lionclaw logs --tail 200
+./target/release/lionclaw logs -f --worker telegram
+./target/release/lionclaw doctor
+```
+
+Project-wide forms are explicit and never scan arbitrary LionClaw homes:
+
+```bash
+./target/release/lionclaw up --all
+./target/release/lionclaw down --all
+./target/release/lionclaw logs --all --tail 200
+./target/release/lionclaw doctor --all
+```
+
 Installed non-channel skills are mounted read-only under `/lionclaw/skills/<alias>`
 and projected into each runtime's native skill directory inside `/runtime/home`.
-`lionclaw skill install` copies a skill into that canonical skills directory, and
-`lionclaw skill rm` removes it physically. `lionclaw connect <channel>` binds
-channel skills as host workers; every other installed alias is runtime-visible
-by default.
+`lionclaw skill install` copies a skill into that canonical skills directory,
+`lionclaw skill list` shows installed aliases, and `lionclaw skill remove`
+removes one physically when no configured channel still uses it.
+`lionclaw connect <channel>` binds channel skills as host workers; every other
+installed alias is runtime-visible by default.
 
 Runtime-specific provider settings stay with the runtime. For example, if a
 Codex profile leaves `model` unset, LionClaw reuses the current host Codex
@@ -281,10 +302,11 @@ shape works for the default instance, a named instance, or an exact home:
 ./target/release/lionclaw --instance reviewer connect telegram --from-env TELEGRAM_BOT_TOKEN
 ```
 
-Interactive channels run in the current terminal. Service channels use systemd
-user services on Linux and store required channel env in the selected instance
-home, not in accidental shell state. Missing env in a non-interactive connect
-prints the exact variable names and scriptable repair commands.
+Interactive channels run in the current terminal. Background channels are
+managed through the platform backend, currently systemd user units on Linux,
+and store required channel env in the selected instance home, not in accidental
+shell state. Missing env in a non-interactive connect prints the exact variable
+names and scriptable repair commands.
 
 Inspect or remove channels on the selected instance:
 
@@ -298,7 +320,7 @@ Pairing and logs remain explicit:
 
 ```bash
 ./target/release/lionclaw channel pairing list --channel-id telegram
-./target/release/lionclaw service logs
+./target/release/lionclaw logs --worker telegram
 ```
 
 ## State Layout
@@ -319,7 +341,7 @@ Each instance home contains:
 - `skills/<alias>/`
 - `workspaces/main/`
 - `runtime/`
-- `services/`
+- `units/`
 
 Use `--home PATH` when you need to target one instance home directly and bypass
 project discovery.
@@ -342,7 +364,7 @@ private network namespace, not host networking. LionClaw does not expose a
 fake allowlist mode before a real egress-control plane exists. On rootless
 hosts this also depends on Podman being able to create that private network
 namespace, commonly through a working `pasta` and `/dev/net/tun` path. LionClaw
-preflights that requirement before interactive or managed-service startup when
+preflights that requirement before interactive or managed-background startup when
 the effective preset uses `network-mode = "on"`.
 
 On Arch Linux, a common failure is `pasta failed ... /dev/net/tun: No such

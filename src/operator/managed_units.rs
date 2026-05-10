@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -16,12 +16,13 @@ use crate::{
     },
 };
 
-pub const DAEMON_UNIT_NAME: &str = "lionclawd.service";
+const UNIT_GROUP_ID_METADATA: &str = "X-LionClaw-UnitGroupId";
+const HOME_ROOT_METADATA: &str = "X-LionClaw-HomeRoot";
+const CHANNEL_METADATA: &str = "X-LionClaw-Channel";
 
 #[derive(Debug, Clone)]
-pub struct ManagedServiceUnit {
+pub struct ManagedUnit {
     pub name: String,
-    pub unit_path: PathBuf,
     pub unit_content: String,
     pub env_path: PathBuf,
     pub env_content: String,
@@ -29,14 +30,53 @@ pub struct ManagedServiceUnit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServiceIdentity {
-    pub service_id: String,
+pub struct UnitIdentity {
+    pub unit_group_id: String,
     pub home_id: String,
     pub home_root: PathBuf,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnitFileMetadata {
+    pub unit_group_id: Option<String>,
+    pub home_root: Option<PathBuf>,
+    pub channel_id: Option<String>,
+}
+
+impl UnitFileMetadata {
+    pub fn belongs_to_identity(&self, identity: &UnitIdentity) -> bool {
+        self.unit_group_id.as_deref() == Some(identity.unit_group_id.as_str())
+            && self.home_root.as_deref() == Some(identity.home_root.as_path())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnedManagedUnits {
+    names: BTreeSet<String>,
+    daemon: Option<String>,
+    channels: BTreeMap<String, String>,
+}
+
+impl OwnedManagedUnits {
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.names.iter().cloned().collect()
+    }
+
+    pub fn daemon(&self) -> Option<&str> {
+        self.daemon.as_deref()
+    }
+
+    pub fn channel(&self, channel_id: &str) -> Option<&str> {
+        self.channels.get(channel_id).map(String::as_str)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
-pub struct DaemonServiceSpec<'a> {
+pub struct DaemonUnitSpec<'a> {
     pub bind_addr: &'a str,
     pub runtime_id: &'a str,
     pub workspace: &'a str,
@@ -46,25 +86,25 @@ pub struct DaemonServiceSpec<'a> {
 }
 
 #[derive(Debug, Clone)]
-pub struct ChannelServiceSpec {
+pub struct ChannelUnitSpec {
     pub channel_id: String,
     pub worker_path: PathBuf,
     pub env: Vec<(String, String)>,
     pub channel_env_path: Option<PathBuf>,
 }
 
-pub fn daemon_unit_name(identity: &ServiceIdentity) -> String {
-    format!("lionclaw-{}.service", identity.service_id)
+pub fn daemon_unit_name(identity: &UnitIdentity) -> String {
+    format!("lionclaw-{}.service", identity.unit_group_id)
 }
 
-pub fn daemon_env_path(home: &LionClawHome, identity: &ServiceIdentity) -> PathBuf {
-    service_env_path(home, &daemon_unit_name(identity))
+pub fn daemon_env_path(home: &LionClawHome, identity: &UnitIdentity) -> PathBuf {
+    unit_env_path(home, &daemon_unit_name(identity))
 }
 
-pub fn channel_unit_name(identity: &ServiceIdentity, channel_id: &str) -> String {
+pub fn channel_unit_name(identity: &UnitIdentity, channel_id: &str) -> String {
     format!(
         "lionclaw-channel-{}-{channel_id}.service",
-        identity.service_id
+        identity.unit_group_id
     )
 }
 
@@ -72,13 +112,13 @@ pub fn unit_status_is_active(status: &str) -> bool {
     status.split('/').nth(1) == Some("active")
 }
 
-pub fn ensure_service_identity(home: &LionClawHome) -> Result<ServiceIdentity> {
-    let identity = read_or_create_service_identity(home)?;
+pub fn ensure_unit_identity(home: &LionClawHome) -> Result<UnitIdentity> {
+    let identity = read_or_create_unit_identity(home)?;
     ensure_identity_not_colliding(home, identity)
 }
 
-pub fn existing_service_identity(home: &LionClawHome) -> Result<Option<ServiceIdentity>> {
-    let Some(service_id) = read_service_id(home)? else {
+pub fn existing_unit_identity(home: &LionClawHome) -> Result<Option<UnitIdentity>> {
+    let Some(unit_group_id) = read_unit_group_id(home)? else {
         return Ok(None);
     };
     let home_id = match futures_home_id(home)? {
@@ -86,31 +126,109 @@ pub fn existing_service_identity(home: &LionClawHome) -> Result<Option<ServiceId
         None => return Ok(None),
     };
     let home_root = canonical_home_root(home)?;
-    Ok(Some(ServiceIdentity {
-        service_id,
+    Ok(Some(UnitIdentity {
+        unit_group_id,
         home_id,
         home_root,
     }))
 }
 
-fn read_or_create_service_identity(home: &LionClawHome) -> Result<ServiceIdentity> {
-    let service_id = match read_service_id(home)? {
-        Some(service_id) => service_id,
+fn discover_systemd_owned_units(home: &LionClawHome) -> Result<OwnedManagedUnits> {
+    discover_owned_units_in_dir(home, &systemd_user_unit_dir()?)
+}
+
+fn discover_owned_units_in_dir(
+    home: &LionClawHome,
+    systemd_dir: &Path,
+) -> Result<OwnedManagedUnits> {
+    let Some(identity) = existing_unit_identity(home)? else {
+        return Ok(OwnedManagedUnits::default());
+    };
+    let daemon_name = daemon_unit_name(&identity);
+    let channel_prefix = format!("lionclaw-channel-{}-", identity.unit_group_id);
+    let mut units = OwnedManagedUnits::default();
+    scan_owned_units(
+        systemd_dir,
+        &identity,
+        &daemon_name,
+        &channel_prefix,
+        &mut units,
+    )?;
+    Ok(units)
+}
+
+fn scan_owned_units(
+    systemd_dir: &Path,
+    identity: &UnitIdentity,
+    daemon_name: &str,
+    channel_prefix: &str,
+    units: &mut OwnedManagedUnits,
+) -> Result<()> {
+    if !systemd_dir.exists() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(systemd_dir)
+        .with_context(|| format!("failed to read directory {}", systemd_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to iterate {}", systemd_dir.display()))?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("lionclaw") || !name.ends_with(".service") {
+            continue;
+        }
+        let Some(content) = read_regular_unit_file(&path)? else {
+            continue;
+        };
+        if unit_content_belongs_to_identity(&content, identity) {
+            record_owned_unit(name, &content, daemon_name, channel_prefix, units);
+        }
+    }
+
+    Ok(())
+}
+
+fn record_owned_unit(
+    name: &str,
+    content: &str,
+    daemon_name: &str,
+    channel_prefix: &str,
+    units: &mut OwnedManagedUnits,
+) {
+    let name = name.to_string();
+    units.names.insert(name.clone());
+    if name == daemon_name {
+        units.daemon.get_or_insert(name);
+        return;
+    }
+    if name.starts_with(channel_prefix) {
+        if let Some(channel_id) = unit_content_metadata(content).channel_id {
+            units.channels.entry(channel_id).or_insert(name);
+        }
+    }
+}
+
+fn read_or_create_unit_identity(home: &LionClawHome) -> Result<UnitIdentity> {
+    let unit_group_id = match read_unit_group_id(home)? {
+        Some(unit_group_id) => unit_group_id,
         None => {
-            let service_id = Uuid::new_v4().to_string();
-            write_service_id(home, &service_id)?;
-            service_id
+            let unit_group_id = Uuid::new_v4().to_string();
+            write_unit_group_id(home, &unit_group_id)?;
+            unit_group_id
         }
     };
     let home_id = futures_home_id(home)?.ok_or_else(|| {
         anyhow!(
-            "home id is not configured for {}; run lionclaw project init or onboard first",
+            "home id is not configured for {}; create a LionClaw project instance first",
             home.root().display()
         )
     })?;
     let home_root = canonical_home_root(home)?;
-    Ok(ServiceIdentity {
-        service_id,
+    Ok(UnitIdentity {
+        unit_group_id,
         home_id,
         home_root,
     })
@@ -118,31 +236,31 @@ fn read_or_create_service_identity(home: &LionClawHome) -> Result<ServiceIdentit
 
 fn ensure_identity_not_colliding(
     home: &LionClawHome,
-    identity: ServiceIdentity,
-) -> Result<ServiceIdentity> {
+    identity: UnitIdentity,
+) -> Result<UnitIdentity> {
     ensure_identity_not_colliding_in_dir(home, identity, &systemd_user_unit_dir()?)
 }
 
 fn ensure_identity_not_colliding_in_dir(
     home: &LionClawHome,
-    identity: ServiceIdentity,
+    identity: UnitIdentity,
     systemd_dir: &Path,
-) -> Result<ServiceIdentity> {
-    if find_existing_service_id_collision(&identity, systemd_dir)?.is_none() {
+) -> Result<UnitIdentity> {
+    if find_existing_unit_group_id_collision(&identity, systemd_dir)?.is_none() {
         return Ok(identity);
     }
 
-    let service_id = Uuid::new_v4().to_string();
-    write_service_id(home, &service_id)?;
-    Ok(ServiceIdentity {
-        service_id,
+    let unit_group_id = Uuid::new_v4().to_string();
+    write_unit_group_id(home, &unit_group_id)?;
+    Ok(UnitIdentity {
+        unit_group_id,
         home_id: identity.home_id,
         home_root: identity.home_root,
     })
 }
 
-fn find_existing_service_id_collision(
-    identity: &ServiceIdentity,
+fn find_existing_unit_group_id_collision(
+    identity: &UnitIdentity,
     systemd_dir: &Path,
 ) -> Result<Option<PathBuf>> {
     if !systemd_dir.exists() {
@@ -155,44 +273,37 @@ fn find_existing_service_id_collision(
         let entry =
             entry.with_context(|| format!("failed to iterate {}", systemd_dir.display()))?;
         let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path)
-            .with_context(|| format!("failed to inspect {}", path.display()))?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
+        let Some(content) = read_regular_unit_file(&path)? else {
             continue;
-        }
-
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        if unit_metadata_value(&content, "X-LionClaw-ServiceId").as_deref()
-            != Some(identity.service_id.as_str())
+        };
+        if unit_metadata_value(&content, UNIT_GROUP_ID_METADATA).as_deref()
+            != Some(identity.unit_group_id.as_str())
         {
             continue;
         }
-        let Some(recorded_home) =
-            unit_metadata_value(&content, "X-LionClaw-HomeRoot").map(PathBuf::from)
-        else {
-            continue;
-        };
-        if recorded_home != identity.home_root && recorded_home.exists() {
-            return Ok(Some(recorded_home));
+        if !unit_content_belongs_to_identity(&content, identity) {
+            return Ok(Some(path));
         }
     }
 
     Ok(None)
 }
 
-fn read_service_id(home: &LionClawHome) -> Result<Option<String>> {
-    let path = home.service_id_path();
+fn read_unit_group_id(home: &LionClawHome) -> Result<Option<String>> {
+    let path = home.unit_group_id_path();
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err).with_context(|| format!("failed to stat {}", path.display())),
     };
     if metadata.file_type().is_symlink() {
-        bail!("service id file {} must not be a symlink", path.display());
+        bail!(
+            "unit group id file {} must not be a symlink",
+            path.display()
+        );
     }
     if !metadata.is_file() {
-        bail!("service id path {} is not a file", path.display());
+        bail!("unit group id path {} is not a file", path.display());
     }
     let value = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -200,15 +311,16 @@ fn read_service_id(home: &LionClawHome) -> Result<Option<String>> {
     if value.is_empty() {
         return Ok(None);
     }
-    Uuid::parse_str(value).with_context(|| format!("invalid service id in {}", path.display()))?;
+    Uuid::parse_str(value)
+        .with_context(|| format!("invalid unit group id in {}", path.display()))?;
     Ok(Some(value.to_string()))
 }
 
-fn write_service_id(home: &LionClawHome, service_id: &str) -> Result<()> {
-    Uuid::parse_str(service_id).context("service id must be a UUID")?;
-    let path = home.service_id_path();
-    ensure_private_file_write_target(home, &path, "service id file")?;
-    std::fs::write(&path, format!("{service_id}\n"))
+fn write_unit_group_id(home: &LionClawHome, unit_group_id: &str) -> Result<()> {
+    Uuid::parse_str(unit_group_id).context("unit group id must be a UUID")?;
+    let path = home.unit_group_id_path();
+    ensure_private_file_write_target(home, &path, "unit group id file")?;
+    std::fs::write(&path, format!("{unit_group_id}\n"))
         .with_context(|| format!("failed to write {}", path.display()))?;
     #[cfg(unix)]
     {
@@ -241,42 +353,26 @@ fn canonical_home_root(home: &LionClawHome) -> Result<PathBuf> {
         .with_context(|| format!("failed to resolve {}", home.root().display()))
 }
 
-fn unit_home_root(path: &Path) -> Result<Option<PathBuf>> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
-    };
-    Ok(unit_metadata_value(&content, "X-LionClaw-HomeRoot").map(PathBuf::from))
+pub fn unit_file_metadata(path: &Path) -> Result<Option<UnitFileMetadata>> {
+    Ok(read_regular_unit_file(path)?.map(|content| unit_content_metadata(&content)))
 }
 
-pub fn unit_channel_id(path: &Path) -> Result<Option<String>> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
-    };
-    Ok(unit_metadata_value(&content, "X-LionClaw-Channel"))
+pub fn unit_belongs_to_identity(path: &Path, identity: &UnitIdentity) -> Result<bool> {
+    Ok(unit_file_metadata(path)?
+        .as_ref()
+        .is_some_and(|metadata| metadata.belongs_to_identity(identity)))
 }
 
-pub fn unit_belongs_to_identity(path: &Path, identity: &ServiceIdentity) -> Result<bool> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to inspect {}", path.display()))
-        }
-    };
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Ok(false);
+fn unit_content_belongs_to_identity(content: &str, identity: &UnitIdentity) -> bool {
+    unit_content_metadata(content).belongs_to_identity(identity)
+}
+
+fn unit_content_metadata(content: &str) -> UnitFileMetadata {
+    UnitFileMetadata {
+        unit_group_id: unit_metadata_value(content, UNIT_GROUP_ID_METADATA),
+        home_root: unit_metadata_value(content, HOME_ROOT_METADATA).map(PathBuf::from),
+        channel_id: unit_metadata_value(content, CHANNEL_METADATA),
     }
-
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let service_id = unit_metadata_value(&content, "X-LionClaw-ServiceId");
-    let home_root = unit_metadata_value(&content, "X-LionClaw-HomeRoot");
-    Ok(service_id.as_deref() == Some(identity.service_id.as_str())
-        && home_root.as_deref() == Some(identity.home_root.to_string_lossy().as_ref()))
 }
 
 fn unit_metadata_value(content: &str, key: &str) -> Option<String> {
@@ -290,13 +386,12 @@ fn unit_metadata_value(content: &str, key: &str) -> Option<String> {
 
 pub fn render_daemon_unit(
     home: &LionClawHome,
-    identity: &ServiceIdentity,
+    identity: &UnitIdentity,
     daemon_bin: &Path,
-    spec: DaemonServiceSpec<'_>,
-) -> ManagedServiceUnit {
+    spec: DaemonUnitSpec<'_>,
+) -> ManagedUnit {
     let name = daemon_unit_name(identity);
     let env_path = daemon_env_path(home, identity);
-    let unit_path = home.services_systemd_dir().join(&name);
 
     let (host, port) = parse_bind_addr(spec.bind_addr);
     let mut env_lines = vec![
@@ -332,17 +427,16 @@ pub fn render_daemon_unit(
         .map(|(key, value)| format!("{key}={}\n", escape_env_value(value)))
         .collect::<String>();
     let unit_content = format!(
-        "[Unit]\nDescription=LionClaw daemon\nAfter=default.target\nX-LionClaw-ServiceId={service_id}\nX-LionClaw-HomeId={home_id}\nX-LionClaw-HomeRoot={home_root}\n\n[Service]\nType=simple\nEnvironmentFile={env}\nExecStart={exec}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
-        service_id = identity.service_id,
+        "[Unit]\nDescription=LionClaw daemon\nAfter=default.target\nX-LionClaw-UnitGroupId={unit_group_id}\nX-LionClaw-HomeId={home_id}\nX-LionClaw-HomeRoot={home_root}\n\n[Service]\nType=simple\nEnvironmentFile={env}\nExecStart={exec}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
+        unit_group_id = identity.unit_group_id,
         home_id = identity.home_id,
         home_root = identity.home_root.display(),
         env = env_path.display(),
         exec = daemon_bin.display(),
     );
 
-    ManagedServiceUnit {
+    ManagedUnit {
         name,
-        unit_path,
         unit_content,
         env_path,
         env_content,
@@ -352,13 +446,12 @@ pub fn render_daemon_unit(
 
 pub fn render_channel_unit(
     home: &LionClawHome,
-    identity: &ServiceIdentity,
-    spec: &ChannelServiceSpec,
-) -> ManagedServiceUnit {
+    identity: &UnitIdentity,
+    spec: &ChannelUnitSpec,
+) -> ManagedUnit {
     let daemon_name = daemon_unit_name(identity);
     let name = channel_unit_name(identity, &spec.channel_id);
-    let env_path = service_env_path(home, &name);
-    let unit_path = home.services_systemd_dir().join(&name);
+    let env_path = unit_env_path(home, &name);
     let env_content = spec
         .env
         .iter()
@@ -369,19 +462,18 @@ pub fn render_channel_unit(
         environment_files.push_str(&format!("EnvironmentFile={}\n", channel_env_path.display()));
     }
     let unit_content = format!(
-        "[Unit]\nDescription=LionClaw channel worker ({channel})\nAfter={daemon}\nRequires={daemon}\nPartOf={daemon}\nX-LionClaw-ServiceId={service_id}\nX-LionClaw-HomeId={home_id}\nX-LionClaw-HomeRoot={home_root}\nX-LionClaw-Channel={channel}\n\n[Service]\nType=simple\n{environment_files}ExecStart={exec}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=LionClaw channel worker ({channel})\nAfter={daemon}\nRequires={daemon}\nPartOf={daemon}\nX-LionClaw-UnitGroupId={unit_group_id}\nX-LionClaw-HomeId={home_id}\nX-LionClaw-HomeRoot={home_root}\nX-LionClaw-Channel={channel}\n\n[Service]\nType=simple\n{environment_files}ExecStart={exec}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
         channel = spec.channel_id,
         daemon = daemon_name,
-        service_id = identity.service_id,
+        unit_group_id = identity.unit_group_id,
         home_id = identity.home_id,
         home_root = identity.home_root.display(),
         environment_files = environment_files,
         exec = spec.worker_path.display(),
     );
 
-    ManagedServiceUnit {
+    ManagedUnit {
         name,
-        unit_path,
         unit_content,
         env_path,
         env_content,
@@ -389,18 +481,15 @@ pub fn render_channel_unit(
     }
 }
 
-fn service_env_path(home: &LionClawHome, unit_name: &str) -> PathBuf {
-    home.services_env_dir()
+fn unit_env_path(home: &LionClawHome, unit_name: &str) -> PathBuf {
+    home.units_env_dir()
         .join(format!("{}.env", unit_name.trim_end_matches(".service")))
 }
 
 #[async_trait]
-pub trait ServiceManager: Send + Sync {
-    async fn apply_units(
-        &self,
-        home: &LionClawHome,
-        units: &[ManagedServiceUnit],
-    ) -> Result<Vec<String>>;
+pub trait UnitManager: Send + Sync {
+    fn owned_units(&self, home: &LionClawHome) -> Result<OwnedManagedUnits>;
+    async fn apply_units(&self, home: &LionClawHome, units: &[ManagedUnit]) -> Result<Vec<String>>;
     async fn up_units(&self, units: &[String]) -> Result<()>;
     async fn restart_units(&self, units: &[String]) -> Result<()>;
     async fn down_units(&self, units: &[String]) -> Result<()>;
@@ -408,26 +497,30 @@ pub trait ServiceManager: Send + Sync {
     async fn logs(&self, units: &[String], lines: usize) -> Result<String>;
 }
 
-pub struct SystemdUserServiceManager;
+pub struct SystemdUserUnitManager;
 
 #[async_trait]
-impl ServiceManager for SystemdUserServiceManager {
-    async fn apply_units(
-        &self,
-        home: &LionClawHome,
-        units: &[ManagedServiceUnit],
-    ) -> Result<Vec<String>> {
+impl UnitManager for SystemdUserUnitManager {
+    fn owned_units(&self, home: &LionClawHome) -> Result<OwnedManagedUnits> {
+        discover_systemd_owned_units(home)
+    }
+
+    async fn apply_units(&self, home: &LionClawHome, units: &[ManagedUnit]) -> Result<Vec<String>> {
         let user_unit_dir = systemd_user_unit_dir()?;
         tokio::fs::create_dir_all(&user_unit_dir)
             .await
             .with_context(|| format!("failed to create {}", user_unit_dir.display()))?;
-        ensure_private_service_paths(home, units)?;
-        prune_stale_generated_files(home, &user_unit_dir, units)?;
+        ensure_private_unit_paths(home, units)?;
+        let identity = require_existing_unit_identity(home)?;
+        ensure_desired_units_belong_to_identity(&identity, units)?;
+
+        ensure_unit_paths_owned_or_absent(&identity, &user_unit_dir, units)?;
+        prune_stale_generated_files(home, &user_unit_dir, &identity, units)?;
 
         let mut changed_units = Vec::new();
+        ensure_unit_paths_owned_or_absent(&identity, &user_unit_dir, units)?;
         for unit in units {
             let unit_path = user_unit_dir.join(&unit.name);
-            ensure_owned_or_absent(home, &unit_path)?;
             let unit_changed = file_content_differs(&unit_path, &unit.unit_content)
                 .with_context(|| format!("failed to compare {}", unit_path.display()))?;
             let env_changed = file_content_differs(&unit.env_path, &unit.env_content)
@@ -468,10 +561,19 @@ impl ServiceManager for SystemdUserServiceManager {
     }
 
     async fn down_units(&self, units: &[String]) -> Result<()> {
+        let mut failures = Vec::new();
         for unit in units {
             if let Err(err) = run_systemctl(["--user", "disable", "--now", unit]).await {
                 warn!(?err, unit, "failed to stop systemd user unit");
+                failures.push(format!("{unit}: {err:#}"));
             }
+        }
+        if !failures.is_empty() {
+            bail!(
+                "failed to stop {} managed unit(s): {}",
+                failures.len(),
+                failures.join("; ")
+            );
         }
         Ok(())
     }
@@ -520,15 +622,10 @@ impl ServiceManager for SystemdUserServiceManager {
     }
 }
 
-fn ensure_private_service_paths(home: &LionClawHome, units: &[ManagedServiceUnit]) -> Result<()> {
-    create_private_dir_all(
-        home,
-        &home.services_systemd_dir(),
-        "managed service directory",
-    )?;
-    create_private_dir_all(home, &home.services_env_dir(), "service env directory")?;
+fn ensure_private_unit_paths(home: &LionClawHome, units: &[ManagedUnit]) -> Result<()> {
+    create_private_dir_all(home, &home.units_env_dir(), "unit env directory")?;
     for unit in units {
-        ensure_private_file_write_target(home, &unit.env_path, "service env file")?;
+        ensure_private_file_write_target(home, &unit.env_path, "unit env file")?;
         for extra_env_file in &unit.extra_env_files {
             ensure_private_file_readable(home, extra_env_file, "channel env file")?;
         }
@@ -536,17 +633,42 @@ fn ensure_private_service_paths(home: &LionClawHome, units: &[ManagedServiceUnit
     Ok(())
 }
 
+fn require_existing_unit_identity(home: &LionClawHome) -> Result<UnitIdentity> {
+    existing_unit_identity(home)?.ok_or_else(|| {
+        anyhow!(
+            "home {} does not have a complete LionClaw unit identity",
+            home.root().display()
+        )
+    })
+}
+
+fn ensure_desired_units_belong_to_identity(
+    identity: &UnitIdentity,
+    units: &[ManagedUnit],
+) -> Result<()> {
+    for unit in units {
+        if !unit_content_belongs_to_identity(&unit.unit_content, identity) {
+            bail!(
+                "rendered unit {} does not carry the selected LionClaw ownership metadata",
+                unit.name
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
-pub struct FakeServiceManager {
+pub struct FakeUnitManager {
     states: Mutex<HashMap<String, String>>,
-    units: Mutex<HashMap<String, ManagedServiceUnit>>,
+    units: Mutex<HashMap<String, ManagedUnit>>,
     restarted: Mutex<Vec<String>>,
     log_output: Mutex<Option<String>>,
     log_error: Mutex<Option<String>>,
     fail_up_after_started: Mutex<Option<usize>>,
+    fail_down_units: Mutex<Vec<String>>,
 }
 
-impl FakeServiceManager {
+impl FakeUnitManager {
     pub fn set_unit_status(
         &self,
         unit: impl Into<String>,
@@ -568,7 +690,7 @@ impl FakeServiceManager {
             .any(|value| value == unit))
     }
 
-    pub fn managed_unit(&self, unit: &str) -> Result<Option<ManagedServiceUnit>> {
+    pub fn managed_unit(&self, unit: &str) -> Result<Option<ManagedUnit>> {
         Ok(self
             .units
             .lock()
@@ -600,20 +722,66 @@ impl FakeServiceManager {
             .map_err(|_| anyhow!("fail up lock poisoned"))? = Some(started_units);
         Ok(())
     }
+
+    pub fn fail_down_unit(&self, unit: impl Into<String>) -> Result<()> {
+        self.fail_down_units
+            .lock()
+            .map_err(|_| anyhow!("fail down lock poisoned"))?
+            .push(unit.into());
+        Ok(())
+    }
 }
 
 #[async_trait]
-impl ServiceManager for FakeServiceManager {
-    async fn apply_units(
-        &self,
-        _home: &LionClawHome,
-        units: &[ManagedServiceUnit],
-    ) -> Result<Vec<String>> {
+impl UnitManager for FakeUnitManager {
+    fn owned_units(&self, home: &LionClawHome) -> Result<OwnedManagedUnits> {
+        let Some(identity) = existing_unit_identity(home)? else {
+            return Ok(OwnedManagedUnits::default());
+        };
+        let daemon_name = daemon_unit_name(&identity);
+        let channel_prefix = format!("lionclaw-channel-{}-", identity.unit_group_id);
+        let stored = self
+            .units
+            .lock()
+            .map_err(|_| anyhow!("units lock poisoned"))?;
+        let mut owned = OwnedManagedUnits::default();
+        for unit in stored.values() {
+            if unit_content_belongs_to_identity(&unit.unit_content, &identity) {
+                record_owned_unit(
+                    &unit.name,
+                    &unit.unit_content,
+                    &daemon_name,
+                    &channel_prefix,
+                    &mut owned,
+                );
+            }
+        }
+        drop(stored);
+        Ok(owned)
+    }
+
+    async fn apply_units(&self, home: &LionClawHome, units: &[ManagedUnit]) -> Result<Vec<String>> {
+        ensure_private_unit_paths(home, units)?;
+        let identity = require_existing_unit_identity(home)?;
+        ensure_desired_units_belong_to_identity(&identity, units)?;
+        let desired_names = units
+            .iter()
+            .map(|unit| unit.name.as_str())
+            .collect::<BTreeSet<_>>();
         let changed = {
             let mut stored = self
                 .units
                 .lock()
                 .map_err(|_| anyhow!("units lock poisoned"))?;
+            for unit in units {
+                if let Some(existing) = stored.get(&unit.name) {
+                    ensure_unit_content_owned(&identity, &unit.name, &existing.unit_content)?;
+                }
+            }
+            stored.retain(|name, unit| {
+                desired_names.contains(name.as_str())
+                    || !unit_content_belongs_to_identity(&unit.unit_content, &identity)
+            });
             let mut changed = Vec::new();
             for unit in units {
                 let was_changed = stored
@@ -624,6 +792,8 @@ impl ServiceManager for FakeServiceManager {
                     })
                     .unwrap_or(true);
                 stored.insert(unit.name.clone(), unit.clone());
+                std::fs::write(&unit.env_path, &unit.env_content)
+                    .with_context(|| format!("failed to write {}", unit.env_path.display()))?;
                 if was_changed {
                     changed.push(unit.name.clone());
                 }
@@ -647,7 +817,7 @@ impl ServiceManager for FakeServiceManager {
             for (started, unit) in units.iter().enumerate() {
                 if fail_after_started == Some(started) {
                     return Err(anyhow!(
-                        "configured service start failure after {started} unit(s)"
+                        "configured unit start failure after {started} unit(s)"
                     ));
                 }
                 states.insert(unit.clone(), "loaded/active/running".to_string());
@@ -677,14 +847,31 @@ impl ServiceManager for FakeServiceManager {
     }
 
     async fn down_units(&self, units: &[String]) -> Result<()> {
+        let fail_units = self
+            .fail_down_units
+            .lock()
+            .map_err(|_| anyhow!("fail down lock poisoned"))?
+            .clone();
+        let mut failures = Vec::new();
         {
             let mut states = self
                 .states
                 .lock()
                 .map_err(|_| anyhow!("states lock poisoned"))?;
             for unit in units {
+                if fail_units.iter().any(|value| value == unit) {
+                    failures.push(format!("{unit}: configured unit stop failure"));
+                    continue;
+                }
                 states.insert(unit.clone(), "loaded/inactive/dead".to_string());
             }
+        }
+        if !failures.is_empty() {
+            bail!(
+                "failed to stop {} managed unit(s): {}",
+                failures.len(),
+                failures.join("; ")
+            );
         }
         Ok(())
     }
@@ -751,19 +938,30 @@ fn escape_env_value(value: &str) -> String {
 fn prune_stale_generated_files(
     home: &LionClawHome,
     user_unit_dir: &Path,
-    units: &[ManagedServiceUnit],
+    identity: &UnitIdentity,
+    units: &[ManagedUnit],
 ) -> Result<()> {
     let desired_names = units
         .iter()
         .map(|unit| unit.name.as_str())
         .collect::<Vec<_>>();
-    prune_unit_dir(&home.services_systemd_dir(), &desired_names)?;
-    prune_env_dir(&home.services_env_dir(), units)?;
-    prune_user_unit_dir(home, user_unit_dir, &desired_names)?;
+    prune_env_dir(&home.units_env_dir(), units)?;
+    prune_user_unit_dir(identity, user_unit_dir, &desired_names)?;
     Ok(())
 }
 
-fn ensure_owned_or_absent(home: &LionClawHome, path: &Path) -> Result<()> {
+fn ensure_unit_paths_owned_or_absent(
+    identity: &UnitIdentity,
+    user_unit_dir: &Path,
+    units: &[ManagedUnit],
+) -> Result<()> {
+    for unit in units {
+        ensure_owned_or_absent(identity, &user_unit_dir.join(&unit.name))?;
+    }
+    Ok(())
+}
+
+fn ensure_owned_or_absent(identity: &UnitIdentity, path: &Path) -> Result<()> {
     if !path_entry_exists(path)? {
         return Ok(());
     }
@@ -775,48 +973,33 @@ fn ensure_owned_or_absent(home: &LionClawHome, path: &Path) -> Result<()> {
             path.display()
         );
     }
-    let recorded_home = unit_home_root(path)?;
-    let home_root = canonical_home_root(home)?;
-    match recorded_home {
-        Some(recorded) if recorded == home_root || !recorded.exists() => Ok(()),
-        Some(recorded) => bail!(
-            "managed unit {} belongs to {}; refusing to overwrite it for {}",
-            path.display(),
-            recorded.display(),
-            home_root.display()
-        ),
-        None => bail!(
-            "managed unit {} exists without LionClaw ownership metadata; refusing to overwrite it",
+    if !metadata.is_file() {
+        bail!(
+            "managed unit {} is not a regular file; refusing to overwrite it",
             path.display()
-        ),
+        );
     }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    ensure_unit_content_owned(identity, &path.display().to_string(), &content)
 }
 
-fn prune_unit_dir(dir: &Path, desired_names: &[&str]) -> Result<()> {
-    if !dir.exists() {
+fn ensure_unit_content_owned(
+    identity: &UnitIdentity,
+    unit_label: &str,
+    content: &str,
+) -> Result<()> {
+    if unit_content_belongs_to_identity(content, identity) {
         return Ok(());
     }
-
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("failed to read directory {}", dir.display()))?
-    {
-        let entry = entry.with_context(|| format!("failed to iterate {}", dir.display()))?;
-        let path = entry.path();
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy();
-        if !file_name.starts_with("lionclaw") || !file_name.ends_with(".service") {
-            continue;
-        }
-        if desired_names.iter().any(|name| *name == file_name) {
-            continue;
-        }
-        remove_path_if_exists(&path)?;
-    }
-
-    Ok(())
+    bail!(
+        "managed unit {unit_label} is not owned by unit group {} at {}; refusing to overwrite it",
+        identity.unit_group_id,
+        identity.home_root.display()
+    )
 }
 
-fn prune_env_dir(dir: &Path, units: &[ManagedServiceUnit]) -> Result<()> {
+fn prune_env_dir(dir: &Path, units: &[ManagedUnit]) -> Result<()> {
     if !dir.exists() {
         return Ok(());
     }
@@ -838,13 +1021,11 @@ fn prune_env_dir(dir: &Path, units: &[ManagedServiceUnit]) -> Result<()> {
     Ok(())
 }
 
-fn prune_user_unit_dir(home: &LionClawHome, dir: &Path, desired_names: &[&str]) -> Result<()> {
+fn prune_user_unit_dir(identity: &UnitIdentity, dir: &Path, desired_names: &[&str]) -> Result<()> {
     if !dir.exists() {
         return Ok(());
     }
 
-    let home_root = canonical_home_root(home)?;
-    let managed_dir = normalize_lexical_path(&home.services_systemd_dir());
     for entry in std::fs::read_dir(dir)
         .with_context(|| format!("failed to read directory {}", dir.display()))?
     {
@@ -859,50 +1040,12 @@ fn prune_user_unit_dir(home: &LionClawHome, dir: &Path, desired_names: &[&str]) 
             continue;
         }
 
-        let metadata = std::fs::symlink_metadata(&path)
-            .with_context(|| format!("failed to inspect {}", path.display()))?;
-        if metadata.file_type().is_symlink() {
-            if symlink_points_inside(&path, dir, &managed_dir)? {
-                remove_path_if_exists(&path)?;
-            }
-            continue;
-        }
-        if !metadata.is_file() {
-            continue;
-        }
-        if unit_home_root(&path)?.as_deref() == Some(home_root.as_path()) {
+        if unit_belongs_to_identity(&path, identity)? {
             remove_path_if_exists(&path)?;
         }
     }
 
     Ok(())
-}
-
-fn symlink_points_inside(path: &Path, dir: &Path, managed_dir: &Path) -> Result<bool> {
-    let target = std::fs::read_link(path)
-        .with_context(|| format!("failed to read link {}", path.display()))?;
-    let resolved = if target.is_absolute() {
-        target
-    } else {
-        path.parent().unwrap_or(dir).join(target)
-    };
-    Ok(normalize_lexical_path(&resolved).starts_with(managed_dir))
-}
-
-fn normalize_lexical_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {
-                normalized.push(component.as_os_str());
-            }
-        }
-    }
-    normalized
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<()> {
@@ -928,6 +1071,22 @@ fn path_entry_exists(path: &Path) -> Result<bool> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err).with_context(|| format!("failed to inspect {}", path.display())),
     }
+}
+
+fn read_regular_unit_file(path: &Path) -> Result<Option<String>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", path.display()))
+        }
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))
+        .map(Some)
 }
 
 fn file_content_differs(path: &Path, expected: &str) -> Result<bool> {
@@ -971,11 +1130,11 @@ mod tests {
     use std::{fs, os::unix::fs::symlink, path::Path};
 
     use super::{
-        channel_unit_name, daemon_unit_name, ensure_identity_not_colliding_in_dir,
-        ensure_private_service_paths, path_entry_exists, prune_user_unit_dir,
-        read_or_create_service_identity, render_channel_unit, render_daemon_unit,
-        unit_belongs_to_identity, write_service_id, ChannelServiceSpec, DaemonServiceSpec,
-        ManagedServiceUnit, ServiceIdentity,
+        channel_unit_name, daemon_unit_name, discover_owned_units_in_dir,
+        ensure_identity_not_colliding_in_dir, ensure_owned_or_absent, ensure_private_unit_paths,
+        path_entry_exists, prune_user_unit_dir, read_or_create_unit_identity, render_channel_unit,
+        render_daemon_unit, unit_belongs_to_identity, write_unit_group_id, ChannelUnitSpec,
+        DaemonUnitSpec, ManagedUnit, UnitIdentity,
     };
 
     fn seed_home(root: &Path) -> crate::home::LionClawHome {
@@ -985,14 +1144,14 @@ mod tests {
         home
     }
 
-    fn write_unit(path: &Path, service_id: &str, home_root: &Path, channel_id: Option<&str>) {
+    fn write_unit(path: &Path, unit_group_id: &str, home_root: &Path, channel_id: Option<&str>) {
         let channel = channel_id
             .map(|value| format!("X-LionClaw-Channel={value}\n"))
             .unwrap_or_default();
         fs::write(
             path,
             format!(
-                "[Unit]\nX-LionClaw-ServiceId={service_id}\nX-LionClaw-HomeRoot={}\n{channel}",
+                "[Unit]\nX-LionClaw-UnitGroupId={unit_group_id}\nX-LionClaw-HomeRoot={}\n{channel}",
                 home_root.display()
             ),
         )
@@ -1001,8 +1160,8 @@ mod tests {
 
     #[test]
     fn renders_expected_unit_names() {
-        let identity = ServiceIdentity {
-            service_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        let identity = UnitIdentity {
+            unit_group_id: "11111111-1111-4111-8111-111111111111".to_string(),
             home_id: "home".to_string(),
             home_root: "/tmp/lionclaw-home".into(),
         };
@@ -1019,8 +1178,8 @@ mod tests {
     #[test]
     fn renders_units_with_expected_execs() {
         let home = crate::home::LionClawHome::new("/tmp/lionclaw-home".into());
-        let identity = ServiceIdentity {
-            service_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        let identity = UnitIdentity {
+            unit_group_id: "11111111-1111-4111-8111-111111111111".to_string(),
             home_id: "home".to_string(),
             home_root: "/tmp/lionclaw-home".into(),
         };
@@ -1028,7 +1187,7 @@ mod tests {
             &home,
             &identity,
             Path::new("/tmp/bin/lionclawd"),
-            DaemonServiceSpec {
+            DaemonUnitSpec {
                 bind_addr: "127.0.0.1:8979",
                 runtime_id: "codex",
                 workspace: "main",
@@ -1055,7 +1214,7 @@ mod tests {
         let channel = render_channel_unit(
             &home,
             &identity,
-            &ChannelServiceSpec {
+            &ChannelUnitSpec {
                 channel_id: "telegram".to_string(),
                 worker_path: "/tmp/skills/telegram/scripts/worker".into(),
                 env: vec![("TELEGRAM_BOT_TOKEN".to_string(), "secret".to_string())],
@@ -1067,37 +1226,36 @@ mod tests {
     }
 
     #[test]
-    fn service_identity_is_generated_once_and_preserved() {
+    fn unit_identity_is_generated_once_and_preserved() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = seed_home(&temp_dir.path().join(".lionclaw"));
 
-        let first = read_or_create_service_identity(&home).expect("first service identity");
-        let second = read_or_create_service_identity(&home).expect("second service identity");
+        let first = read_or_create_unit_identity(&home).expect("first unit group identity");
+        let second = read_or_create_unit_identity(&home).expect("second unit group identity");
 
         assert_eq!(first, second);
         assert_eq!(
-            fs::read_to_string(home.service_id_path())
-                .expect("service id")
+            fs::read_to_string(home.unit_group_id_path())
+                .expect("unit group id")
                 .trim(),
-            first.service_id
+            first.unit_group_id
         );
     }
 
     #[test]
-    fn copied_home_collision_rotates_selected_service_id() {
+    fn copied_home_collision_rotates_selected_unit_group_id() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let selected = seed_home(&temp_dir.path().join("selected"));
         let original = seed_home(&temp_dir.path().join("original"));
         let systemd_dir = temp_dir.path().join("systemd-user");
         fs::create_dir_all(&systemd_dir).expect("systemd dir");
 
-        let colliding_service_id = uuid::Uuid::new_v4().to_string();
-        write_service_id(&selected, &colliding_service_id).expect("selected service id");
-        let selected_identity =
-            read_or_create_service_identity(&selected).expect("selected identity");
+        let colliding_unit_group_id = uuid::Uuid::new_v4().to_string();
+        write_unit_group_id(&selected, &colliding_unit_group_id).expect("selected unit group id");
+        let selected_identity = read_or_create_unit_identity(&selected).expect("selected identity");
         write_unit(
             &systemd_dir.join(daemon_unit_name(&selected_identity)),
-            &colliding_service_id,
+            &colliding_unit_group_id,
             &std::fs::canonicalize(original.root()).expect("original root"),
             None,
         );
@@ -1106,123 +1264,208 @@ mod tests {
             ensure_identity_not_colliding_in_dir(&selected, selected_identity, &systemd_dir)
                 .expect("rotate identity");
 
-        assert_ne!(rotated.service_id, colliding_service_id);
+        assert_ne!(rotated.unit_group_id, colliding_unit_group_id);
         assert_eq!(
-            fs::read_to_string(selected.service_id_path())
-                .expect("rotated service id")
+            fs::read_to_string(selected.unit_group_id_path())
+                .expect("rotated unit group id")
                 .trim(),
-            rotated.service_id
+            rotated.unit_group_id
         );
     }
 
     #[test]
-    fn moved_home_reclaims_missing_recorded_home_root() {
+    fn same_unit_group_with_different_home_root_rotates_even_when_recorded_home_is_missing() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let selected = seed_home(&temp_dir.path().join("selected"));
         let systemd_dir = temp_dir.path().join("systemd-user");
         fs::create_dir_all(&systemd_dir).expect("systemd dir");
 
-        let service_id = uuid::Uuid::new_v4().to_string();
-        write_service_id(&selected, &service_id).expect("selected service id");
-        let identity = read_or_create_service_identity(&selected).expect("selected identity");
+        let unit_group_id = uuid::Uuid::new_v4().to_string();
+        write_unit_group_id(&selected, &unit_group_id).expect("selected unit group id");
+        let identity = read_or_create_unit_identity(&selected).expect("selected identity");
         write_unit(
             &systemd_dir.join(daemon_unit_name(&identity)),
-            &service_id,
+            &unit_group_id,
             &temp_dir.path().join("missing-home"),
             None,
         );
 
-        let reclaimed = ensure_identity_not_colliding_in_dir(&selected, identity, &systemd_dir)
-            .expect("reclaim identity");
+        let rotated = ensure_identity_not_colliding_in_dir(&selected, identity, &systemd_dir)
+            .expect("rotate identity");
 
-        assert_eq!(reclaimed.service_id, service_id);
+        assert_ne!(rotated.unit_group_id, unit_group_id);
     }
 
     #[test]
-    fn unit_ownership_requires_matching_service_id_and_home_root() {
+    fn unit_ownership_requires_matching_unit_group_id_and_home_root() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = seed_home(&temp_dir.path().join(".lionclaw"));
-        let identity = read_or_create_service_identity(&home).expect("identity");
+        let identity = read_or_create_unit_identity(&home).expect("identity");
         let unit_path = temp_dir
             .path()
             .join(channel_unit_name(&identity, "telegram"));
         write_unit(
             &unit_path,
-            &identity.service_id,
+            &identity.unit_group_id,
             &identity.home_root,
             Some("telegram"),
         );
 
         assert!(
             unit_belongs_to_identity(&unit_path, &identity).expect("owned unit"),
-            "unit with matching service id and home root should be owned"
+            "unit with matching unit group id and home root should be owned"
         );
 
-        let other = ServiceIdentity {
-            service_id: uuid::Uuid::new_v4().to_string(),
+        let other = UnitIdentity {
+            unit_group_id: uuid::Uuid::new_v4().to_string(),
             home_id: identity.home_id.clone(),
             home_root: identity.home_root.clone(),
         };
         assert!(
             !unit_belongs_to_identity(&unit_path, &other).expect("foreign unit"),
-            "different service id should not be owned"
+            "different unit group id should not be owned"
         );
+    }
+
+    #[test]
+    fn discovers_only_metadata_owned_systemd_units() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = seed_home(&temp_dir.path().join(".lionclaw"));
+        let identity = read_or_create_unit_identity(&home).expect("identity");
+        let systemd_dir = temp_dir.path().join("systemd-user");
+        fs::create_dir_all(&systemd_dir).expect("systemd dir");
+        let daemon = daemon_unit_name(&identity);
+        let worker = channel_unit_name(&identity, "telegram");
+        write_unit(
+            &systemd_dir.join(&daemon),
+            &identity.unit_group_id,
+            &identity.home_root,
+            None,
+        );
+        write_unit(
+            &systemd_dir.join(&worker),
+            &identity.unit_group_id,
+            &identity.home_root,
+            Some("telegram"),
+        );
+        write_unit(
+            &systemd_dir.join(channel_unit_name(&identity, "foreign")),
+            &uuid::Uuid::new_v4().to_string(),
+            &identity.home_root,
+            Some("foreign"),
+        );
+
+        let owned = discover_owned_units_in_dir(&home, &systemd_dir).expect("owned units");
+
+        assert_eq!(owned.daemon(), Some(daemon.as_str()));
+        assert_eq!(owned.channel("telegram"), Some(worker.as_str()));
+        assert_eq!(owned.channel("foreign"), None);
+        let names = owned.names();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&daemon));
+        assert!(names.contains(&worker));
+    }
+
+    #[test]
+    fn discovers_channel_association_from_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = seed_home(&temp_dir.path().join(".lionclaw"));
+        let identity = read_or_create_unit_identity(&home).expect("identity");
+        let systemd_dir = temp_dir.path().join("systemd-user");
+        fs::create_dir_all(&systemd_dir).expect("systemd dir");
+        let mismatched_worker = channel_unit_name(&identity, "telegram");
+        write_unit(
+            &systemd_dir.join(&mismatched_worker),
+            &identity.unit_group_id,
+            &identity.home_root,
+            Some("slack"),
+        );
+
+        let owned = discover_owned_units_in_dir(&home, &systemd_dir).expect("owned units");
+
+        assert_eq!(owned.channel("slack"), Some(mismatched_worker.as_str()));
+        assert_eq!(owned.channel("telegram"), None);
     }
 
     #[test]
     fn prunes_only_owned_user_unit_files() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        std::fs::create_dir_all(home.services_systemd_dir()).expect("managed dir");
+        let home = seed_home(&temp_dir.path().join(".lionclaw"));
+        let identity = read_or_create_unit_identity(&home).expect("identity");
         let user_dir = temp_dir.path().join("systemd-user");
         std::fs::create_dir_all(&user_dir).expect("user dir");
-        let home_root = std::fs::canonicalize(home.root()).expect("home root");
 
-        let managed_unit = user_dir.join("lionclaw-channel-old.service");
+        let stale_owned = user_dir.join("lionclaw-channel-old.service");
+        write_unit(
+            &stale_owned,
+            &identity.unit_group_id,
+            &identity.home_root,
+            None,
+        );
+
+        let desired = user_dir.join("lionclaw-current.service");
+        write_unit(&desired, &identity.unit_group_id, &identity.home_root, None);
+
+        let home_root_only = user_dir.join("lionclaw-home-root-only.service");
         fs::write(
-            &managed_unit,
+            &home_root_only,
             format!(
-                "[Unit]\nDescription=old\nX-LionClaw-HomeRoot={}\n",
-                home_root.display()
+                "[Unit]\nDescription=incomplete\nX-LionClaw-HomeRoot={}\n",
+                identity.home_root.display()
             ),
         )
-        .expect("managed unit");
+        .expect("home-root-only unit");
 
-        let managed_link_target = home.services_systemd_dir().join("lionclawd.service");
-        fs::write(&managed_link_target, "[Unit]\n").expect("legacy managed target");
-        let managed_link = user_dir.join("lionclawd.service");
-        symlink(&managed_link_target, &managed_link).expect("legacy managed link");
-
-        let unrelated_target = temp_dir.path().join("custom.service");
-        fs::write(&unrelated_target, "[Unit]\n").expect("custom unit");
-        let unrelated_link = user_dir.join("lionclaw-custom.service");
-        symlink(&unrelated_target, &unrelated_link).expect("custom link");
-
-        let escaping_target = home.services_systemd_dir().join("../outside.service");
-        let escaping_link = user_dir.join("lionclaw-escape.service");
-        symlink(&escaping_target, &escaping_link).expect("escaping link");
-
-        prune_user_unit_dir(&home, &user_dir, &[]).expect("prune");
-
-        assert!(
-            !managed_unit.exists(),
-            "managed unit file should be removed"
+        let foreign = user_dir.join("lionclaw-foreign.service");
+        write_unit(
+            &foreign,
+            &uuid::Uuid::new_v4().to_string(),
+            &identity.home_root,
+            None,
         );
+
+        let symlink_target = temp_dir.path().join("custom.service");
+        fs::write(&symlink_target, "[Unit]\n").expect("custom unit");
+        let symlink_unit = user_dir.join("lionclaw-link.service");
+        symlink(&symlink_target, &symlink_unit).expect("unit symlink");
+
+        prune_user_unit_dir(&identity, &user_dir, &["lionclaw-current.service"]).expect("prune");
+
         assert!(
-            !path_entry_exists(&managed_link).expect("managed link exists"),
-            "legacy managed symlink should be removed"
+            !stale_owned.exists(),
+            "stale owned unit file should be removed"
         );
+        assert!(desired.exists(), "desired owned unit should be preserved");
         assert!(
-            managed_link_target.exists(),
-            "managed symlink target should be preserved"
+            home_root_only.exists(),
+            "home-root-only unit should not be treated as owned"
         );
+        assert!(foreign.exists(), "foreign unit should be preserved");
+        assert!(path_entry_exists(&symlink_unit).expect("symlink unit exists"));
+    }
+
+    #[test]
+    fn overwrite_requires_complete_ownership_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = seed_home(&temp_dir.path().join(".lionclaw"));
+        let identity = read_or_create_unit_identity(&home).expect("identity");
+        let unit_path = temp_dir.path().join(daemon_unit_name(&identity));
+        fs::write(
+            &unit_path,
+            format!(
+                "[Unit]\nDescription=incomplete\nX-LionClaw-HomeRoot={}\n",
+                identity.home_root.display()
+            ),
+        )
+        .expect("home-root-only unit");
+
+        let err =
+            ensure_owned_or_absent(&identity, &unit_path).expect_err("incomplete unit is foreign");
+
+        assert!(err.to_string().contains("is not owned"));
         assert!(
-            unrelated_link.exists(),
-            "unrelated symlink should be preserved"
-        );
-        assert!(
-            path_entry_exists(&escaping_link).expect("escaping link exists"),
-            "escaping symlink should be preserved"
+            unit_path.exists(),
+            "foreign-looking unit should be left untouched"
         );
     }
 
@@ -1240,24 +1483,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn private_service_paths_reject_symlinked_env_directory() {
+    fn private_unit_paths_reject_symlinked_env_directory() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        fs::create_dir_all(home.services_dir()).expect("services dir");
+        fs::create_dir_all(home.units_dir()).expect("units dir");
         let outside_env = temp_dir.path().join("outside-env");
         fs::create_dir_all(&outside_env).expect("outside env");
-        symlink(&outside_env, home.services_env_dir()).expect("symlink env dir");
-        let unit = ManagedServiceUnit {
+        symlink(&outside_env, home.units_env_dir()).expect("symlink env dir");
+        let unit = ManagedUnit {
             name: "lionclaw-test.service".to_string(),
-            unit_path: home.services_systemd_dir().join("lionclaw-test.service"),
             unit_content: "[Unit]\n".to_string(),
-            env_path: home.services_env_dir().join("lionclaw-test.env"),
+            env_path: home.units_env_dir().join("lionclaw-test.env"),
             env_content: "TOKEN=\"secret\"\n".to_string(),
             extra_env_files: Vec::new(),
         };
 
-        let err = ensure_private_service_paths(&home, &[unit])
-            .expect_err("symlinked service env directory should fail");
+        let err = ensure_private_unit_paths(&home, &[unit])
+            .expect_err("symlinked unit env directory should fail");
 
         assert!(err.to_string().contains("must not be a symlink"));
         assert!(!outside_env.join("lionclaw-test.env").exists());

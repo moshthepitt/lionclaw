@@ -124,6 +124,35 @@ pub fn resolve_existing_project_root(selection: &TargetSelection) -> Result<Path
     resolve_project_root_from_cwd(selection.project.as_deref(), &cwd)
 }
 
+pub fn discover_project_root(selection: &TargetSelection) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    if selection.home.is_some() || selection.instance.is_some() {
+        bail!("project-wide commands cannot be combined with --home or --instance");
+    }
+    discover_project_root_from_cwd(selection.project.as_deref(), &cwd)
+}
+
+pub fn discover_diagnostic_project_root(selection: &TargetSelection) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    if selection.home.is_some() || selection.instance.is_some() {
+        bail!("project-wide commands cannot be combined with --home or --instance");
+    }
+    discover_diagnostic_project_root_from_cwd(selection.project.as_deref(), &cwd)
+}
+
+pub fn validate_home_target_exclusive(selection: &TargetSelection) -> Result<()> {
+    if selection.home.is_some() && (selection.project.is_some() || selection.instance.is_some()) {
+        bail!("--home cannot be combined with --project or --instance");
+    }
+    Ok(())
+}
+
+pub(crate) fn normalize_project_default_instance(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 pub fn init_project(project_root: &Path) -> Result<ProjectInitResult> {
     let project_root = canonical_existing_dir(project_root, "project root")?;
     let project_dir = project_dir(&project_root);
@@ -251,6 +280,8 @@ pub fn adopt_project_instance(
             )
         })?;
     }
+    let lionclaw_home = LionClawHome::new(target_home.clone());
+    ensure_instance_base_dirs(&lionclaw_home)?;
     save_instance_config(target_home.as_path(), &work_root)?;
 
     Ok(InstanceRecord {
@@ -358,9 +389,7 @@ fn resolve_target_from_cwd(
     cwd: &Path,
 ) -> Result<TargetContext> {
     if let Some(home) = selection.home.as_deref() {
-        if selection.project.is_some() || selection.instance.is_some() {
-            bail!("--home cannot be combined with --project or --instance");
-        }
+        validate_home_target_exclusive(selection)?;
         let home = absolutize_from(cwd, home);
         let work_root = match work_root {
             WorkRootRequirement::Optional => None,
@@ -429,6 +458,59 @@ fn resolve_project_root_from_cwd(project: Option<&Path>, cwd: &Path) -> Result<P
         "no LionClaw project found from {}; run from the project root, pass --project PATH, or pass --home PATH",
         cwd.display()
     )
+}
+
+fn discover_project_root_from_cwd(project: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
+    discover_project_root_from_cwd_with_marker(project, cwd, ProjectRootMarker::ProjectFile)
+}
+
+fn discover_diagnostic_project_root_from_cwd(
+    project: Option<&Path>,
+    cwd: &Path,
+) -> Result<PathBuf> {
+    discover_project_root_from_cwd_with_marker(project, cwd, ProjectRootMarker::MetadataDirectory)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectRootMarker {
+    ProjectFile,
+    MetadataDirectory,
+}
+
+fn discover_project_root_from_cwd_with_marker(
+    project: Option<&Path>,
+    cwd: &Path,
+    marker: ProjectRootMarker,
+) -> Result<PathBuf> {
+    if let Some(project) = project {
+        return canonical_existing_dir(&absolutize_from(cwd, project), "project root");
+    }
+
+    let cwd = canonical_existing_dir(cwd, "current directory")?;
+    if let Some(_instance_home) = containing_project_instance_home(&cwd) {
+        bail!(
+            "This looks like a LionClaw instance home, not a project root.\nRun from the project root, or use --project <path>."
+        );
+    }
+
+    for candidate in [Some(cwd.as_path()), cwd.parent()].into_iter().flatten() {
+        if project_root_marker_exists(candidate, marker) {
+            return canonical_existing_dir(candidate, "project root");
+        }
+    }
+
+    bail!(
+        "no LionClaw project found from {}; run from the project root or pass --project PATH",
+        cwd.display()
+    )
+}
+
+fn project_root_marker_exists(project_root: &Path, marker: ProjectRootMarker) -> bool {
+    if project_file(project_root).exists() {
+        return true;
+    }
+    marker == ProjectRootMarker::MetadataDirectory
+        && fs::symlink_metadata(project_dir(project_root)).is_ok()
 }
 
 fn resolve_instance_name(
@@ -575,10 +657,7 @@ fn load_project_config(project_root: &Path) -> Result<ProjectConfig> {
             path.display()
         );
     }
-    let default_instance = parsed
-        .default_instance
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let default_instance = normalize_project_default_instance(parsed.default_instance);
     Ok(ProjectConfig { default_instance })
 }
 
@@ -859,7 +938,7 @@ fn ensure_file_write_target_not_symlink(path: &Path, label: &str) -> Result<()> 
     }
 }
 
-fn validate_instance_name(name: &str) -> Result<()> {
+pub fn validate_instance_name(name: &str) -> Result<()> {
     let trimmed = name.trim();
     if name != trimmed {
         bail!("instance name '{name}' has surrounding whitespace");
@@ -911,6 +990,22 @@ fn instance_home(project_root: &Path, name: &str) -> PathBuf {
     instances_dir(project_root).join(name)
 }
 
+pub fn project_dir_path(project_root: &Path) -> PathBuf {
+    project_dir(project_root)
+}
+
+pub fn project_file_path(project_root: &Path) -> PathBuf {
+    project_file(project_root)
+}
+
+pub fn instances_dir_path(project_root: &Path) -> PathBuf {
+    instances_dir(project_root)
+}
+
+pub fn instance_home_path(project_root: &Path, name: &str) -> PathBuf {
+    instance_home(project_root, name)
+}
+
 fn instance_config_path(home: &Path) -> PathBuf {
     home.join("config").join(INSTANCE_CONFIG_FILE)
 }
@@ -932,12 +1027,12 @@ fn ensure_instance_base_dirs(home: &LionClawHome) -> Result<()> {
         home.root(),
         home.db_dir(),
         home.config_dir(),
+        home.channel_env_dir(),
         home.skills_dir(),
         home.runtime_dir(),
         home.logs_dir(),
-        home.services_dir(),
-        home.services_env_dir(),
-        home.services_systemd_dir(),
+        home.units_dir(),
+        home.units_env_dir(),
         home.workspace_dir(crate::home::DEFAULT_WORKSPACE),
     ] {
         fs::create_dir_all(&path)
@@ -964,7 +1059,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        adopt_project_instance, create_project_instance, init_project, list_project_instances,
+        adopt_project_instance, create_project_instance, discover_diagnostic_project_root_from_cwd,
+        init_project, list_project_instances, normalize_project_default_instance,
         resolve_project_setup_root_from_cwd, resolve_target_from_cwd, TargetSelection,
         WorkRootRequirement, DEFAULT_INSTANCE, PROJECT_DIR,
     };
@@ -985,6 +1081,19 @@ mod tests {
             .join(".lionclaw/instances/main/config/instance.toml")
             .exists());
         assert_eq!(result.instance.work_root, result.project_root);
+    }
+
+    #[test]
+    fn project_default_instance_normalization_trims_and_drops_empty_values() {
+        assert_eq!(
+            normalize_project_default_instance(Some(" reviewer ".to_string())).as_deref(),
+            Some("reviewer")
+        );
+        assert_eq!(
+            normalize_project_default_instance(Some(" \t ".to_string())),
+            None
+        );
+        assert_eq!(normalize_project_default_instance(None), None);
     }
 
     #[test]
@@ -1017,6 +1126,27 @@ mod tests {
         assert_eq!(from_root.project_root, from_child.project_root);
         assert_eq!(from_child.work_root, from_root.work_root);
         assert!(err.to_string().contains("no LionClaw project found"));
+    }
+
+    #[test]
+    fn diagnostic_resolver_discovers_project_metadata_without_project_file() {
+        let temp_dir = tempdir().expect("temp dir");
+        fs::create_dir(temp_dir.path().join(PROJECT_DIR)).expect("metadata dir");
+
+        let project_root = discover_diagnostic_project_root_from_cwd(None, temp_dir.path())
+            .expect("diagnostic project root");
+        let target_err = resolve_target_from_cwd(
+            &TargetSelection::default(),
+            WorkRootRequirement::Optional,
+            temp_dir.path(),
+        )
+        .expect_err("operational target still requires project config");
+
+        assert_eq!(
+            project_root,
+            temp_dir.path().canonicalize().expect("canonical")
+        );
+        assert!(target_err.to_string().contains("no LionClaw project found"));
     }
 
     #[test]

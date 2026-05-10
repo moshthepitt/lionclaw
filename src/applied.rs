@@ -634,16 +634,20 @@ fn read_installed_skill_metadata(snapshot_root: &Path) -> Result<Option<Installe
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::Path};
 
     use super::{publish_materialized_snapshot_root, AppliedState};
-    use crate::{home::LionClawHome, operator::reconcile::onboard};
+    use crate::{home::LionClawHome, operator::target::init_project};
+
+    fn test_home(project_root: &Path) -> LionClawHome {
+        let project = init_project(project_root).expect("init project");
+        LionClawHome::new(project.instance.home)
+    }
 
     #[tokio::test]
     async fn load_ignores_hidden_staging_directories() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_home(temp_dir.path());
 
         let visible = home.skills_dir().join("visible");
         fs::create_dir_all(&visible).expect("visible dir");
@@ -675,8 +679,7 @@ mod tests {
     #[tokio::test]
     async fn load_rejects_symlinked_installed_aliases() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_home(temp_dir.path());
 
         let target = home.skills_dir().join("target");
         fs::create_dir_all(&target).expect("target dir");
@@ -701,8 +704,7 @@ mod tests {
     #[tokio::test]
     async fn channel_only_changes_reuse_materialized_skill_snapshot() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_home(temp_dir.path());
 
         let visible = home.skills_dir().join("visible");
         fs::create_dir_all(&visible).expect("visible dir");
@@ -725,7 +727,7 @@ mod tests {
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
             id: "terminal".to_string(),
             skill: "visible".to_string(),
-            launch_mode: crate::operator::config::ChannelLaunchMode::Service,
+            launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: Vec::new(),
         });
@@ -746,8 +748,7 @@ mod tests {
     #[tokio::test]
     async fn channel_required_env_changes_applied_state_fingerprint() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_home(temp_dir.path());
 
         let visible = home.skills_dir().join("visible");
         fs::create_dir_all(&visible).expect("visible dir");
@@ -763,7 +764,7 @@ mod tests {
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
             id: "terminal".to_string(),
             skill: "visible".to_string(),
-            launch_mode: crate::operator::config::ChannelLaunchMode::Service,
+            launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: vec!["FIRST_KEY".to_string()],
         });
@@ -774,7 +775,7 @@ mod tests {
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
             id: "terminal".to_string(),
             skill: "visible".to_string(),
-            launch_mode: crate::operator::config::ChannelLaunchMode::Service,
+            launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: vec!["SECOND_KEY".to_string()],
         });
@@ -788,8 +789,7 @@ mod tests {
     #[tokio::test]
     async fn load_rejects_materialized_snapshot_mismatch() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_home(temp_dir.path());
 
         let visible = home.skills_dir().join("visible");
         fs::create_dir_all(&visible).expect("visible dir");
@@ -820,8 +820,7 @@ mod tests {
     #[tokio::test]
     async fn publish_materialized_snapshot_root_reuses_existing_valid_target() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_home(temp_dir.path());
 
         let visible = home.skills_dir().join("visible");
         fs::create_dir_all(&visible).expect("visible dir");

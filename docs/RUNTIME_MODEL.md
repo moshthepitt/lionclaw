@@ -68,7 +68,7 @@ the trusted Rust core.
 1. LionClaw is runtime-agnostic, but not runtime-flattening. Different agents
    may expose different strengths.
 2. `lionclaw run [runtime]` is the canonical interactive product path.
-3. Runtime selection happens at invocation or service startup, not when a
+3. Runtime selection happens at invocation or background startup, not when a
    channel is installed.
 4. Identity and continuity are runtime-independent and come from assistant-home
    files plus durable LionClaw session state.
@@ -93,7 +93,7 @@ project layout that is `.lionclaw/instances/<name>/`:
 - `skills/<alias>/`
 - `runtime/`
 - `logs/`
-- `services/`
+- `units/`
 
 No normal runtime flow should depend on repository-relative paths.
 
@@ -108,7 +108,7 @@ In the project UX, instance homes live under
 `.lionclaw/instances/<name>/`.
 
 It owns the database, operator config, installed skill snapshots, runtime
-cache artifacts, logs, generated service files, and machine-owned
+cache artifacts, logs, generated unit files, and machine-owned
 `config/home-id`.
 
 This is infrastructure state. It is not the assistant's personality, memory,
@@ -298,7 +298,7 @@ Current runtime-visible secrets are explicit mounts. The longer-term hardening
 direction is a tighter secret broker/proxy for credentials that should be used
 without handing raw long-lived values to the runtime.
 
-## CLI And Service Model
+## CLI And Background Model
 
 Operator-facing paths:
 
@@ -308,41 +308,61 @@ Operator-facing paths:
 - `lionclaw configure --runtime codex`
 - `lionclaw status`
 - `lionclaw status --all`
+- `lionclaw project status`
+- `lionclaw doctor`
+- `lionclaw doctor --all`
+- `lionclaw project doctor`
 - `lionclaw runtime add ...`
 - `lionclaw run [runtime]`
 - `lionclaw run --continue-last-session [runtime]`
 - `lionclaw run --timeout 4h [runtime]`
 - `lionclaw skill install ...`
+- `lionclaw skill list`
+- `lionclaw skill remove <alias>`
 - `lionclaw connect <channel-or-path>`
 - `lionclaw channel list`
 - `lionclaw channel remove <channel>`
 - `lionclaw job add|ls|show|run|pause|resume|rm`
-- `lionclaw service up --runtime [runtime]`
-- `lionclaw service down`
-- `lionclaw service status`
-- `lionclaw service logs`
+- `lionclaw up`
+- `lionclaw up --all`
+- `lionclaw down`
+- `lionclaw down --all`
+- `lionclaw logs [--daemon|--workers|--worker <channel>] [--tail N] [--since TIME] [-f]`
+- `lionclaw logs --all [--daemon|--workers|--worker <channel>]`
 
 `lionclaw skill install` copies a skill into the selected instance home's
-`skills/<alias>` directory. `lionclaw skill rm` deletes that installed alias
-from disk. `lionclaw connect <channel-or-path>` reads channel skill metadata,
-installs or binds the channel skill, records the selected instance's channel
-config, persists required channel env under `config/channels/`, and starts the
-interactive or service worker. Channel-bound skills stay host-only; every
+`skills/<alias>` directory. `lionclaw skill list` reports installed aliases
+without following symlinks. `lionclaw skill remove <alias>` deletes that
+installed alias from disk only when no configured channel still uses it.
+`lionclaw connect <channel-or-path>` reads channel skill metadata, installs or
+binds the channel skill, records the selected instance's channel config,
+persists required channel env under `config/channels/`, and starts the
+interactive or background worker. Channel-bound skills stay host-only; every
 other installed alias is runtime-visible by default.
 
 Background operation is explicit. If you want long-running channels,
 auto-restart, or channel attach to start the daemon for you, LionClaw uses the
-platform service manager for that job. The current managed-service
-implementation uses systemd user services.
+platform backend for that job. The current managed-background implementation
+uses systemd user units.
 
 Direct `lionclaw run` reads the current installed skill and channel state each
 time it launches a runtime. Managed daemons bake an immutable applied skill and
 channel snapshot at startup, so skill or channel changes take effect after the
 daemon is restarted or reconciled through `lionclaw connect`,
-`lionclaw service up`, or low-level channel attach. `lionclaw service status`
-marks the daemon as `restart required` when the current filesystem/config state
-no longer matches that running snapshot, and it keeps stale managed channel
-units visible until the daemon is reconciled or stopped.
+`lionclaw up`, or low-level channel attach. `lionclaw status` reports the
+selected instance configuration and current backend-owned systemd unit state.
+`lionclaw doctor` diagnoses drift, and `lionclaw up` reconciles the selected
+instance by applying the current desired units and stopping stale owned units.
+LionClaw treats a user systemd unit as owned only when both its
+`X-LionClaw-UnitGroupId` and `X-LionClaw-HomeRoot` metadata match the selected
+instance.
+
+`lionclaw doctor` is read-only. It diagnoses target resolution, project and
+instance metadata, runtime configuration, managed unit state, channel skill
+metadata, and channel environment contracts. Errors exit with code 1, warnings
+alone exit with code 0, and an internal doctor failure exits with code 2.
+Project-wide operations use the current project or `--project PATH` only; they
+do not search global state or arbitrary instance homes.
 
 Raw HTTP is for workers, tests, and debugging. It is not the normal operator
 experience.
@@ -365,7 +385,7 @@ automatically.
 
 ## Implementation Checklist Anchor
 
-- [x] Add `lionclaw` onboarding and declarative state reconciliation.
+- [x] Add `lionclaw` project setup and declarative state reconciliation.
 - [x] Move skill installs to canonical snapshot store under the selected instance home.
 - [x] Remove repo-path assumptions from worker resolution.
 - [x] Add assistant home workspace identity bootstrap templates.
@@ -374,6 +394,6 @@ automatically.
 - [x] Add program-backed OpenCode runtime path.
 - [x] Add rootless Podman execution backend.
 - [x] Add runtime-private `/workspace`, `/runtime`, and `/drafts` layout.
-- [x] Add supervisor/service generation with restart policies.
+- [x] Add supervisor unit generation with restart policies.
 - [x] Add pairing and channel health workflows.
 - [x] Add marker-based skill injection cache as non-authoritative derived output.

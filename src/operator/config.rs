@@ -303,14 +303,14 @@ pub struct ManagedChannelConfig {
 #[serde(rename_all = "lowercase")]
 pub enum ChannelLaunchMode {
     #[default]
-    Service,
+    Background,
     Interactive,
 }
 
 impl ChannelLaunchMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Service => "service",
+            Self::Background => "background",
             Self::Interactive => "interactive",
         }
     }
@@ -321,10 +321,10 @@ impl std::str::FromStr for ChannelLaunchMode {
 
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         match value.trim() {
-            "service" => Ok(Self::Service),
+            "background" => Ok(Self::Background),
             "interactive" => Ok(Self::Interactive),
             other => Err(format!(
-                "invalid channel launch mode '{other}'; expected 'service' or 'interactive'"
+                "invalid channel launch mode '{other}'; expected 'background' or 'interactive'"
             )),
         }
     }
@@ -627,18 +627,19 @@ pub fn validate_host_executable(source: &str) -> Result<()> {
         return Err(anyhow!("host executable command or path cannot be empty"));
     }
 
-    if !looks_like_path(raw) {
+    let path = Path::new(raw);
+    if !path.is_absolute() {
         return Err(anyhow!(
-            "host executable '{source}' must be stored as an absolute or explicit path"
+            "host executable '{source}' must be stored as an absolute path"
         ));
     }
-    validate_executable_path(&normalize_executable_path(raw)?)
+    validate_executable_path(path)
 }
 
 pub fn validate_podman_executable(source: &str) -> Result<()> {
     let raw = source.trim();
     validate_host_executable(raw)?;
-    ensure_podman_executable(&normalize_executable_path(raw)?)
+    ensure_podman_executable(Path::new(raw))
 }
 
 fn looks_like_path(raw: &str) -> bool {
@@ -706,7 +707,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn channel_launch_mode_defaults_to_service() {
+    async fn channel_launch_mode_defaults_to_background() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let mut config = OperatorConfig::default();
@@ -721,7 +722,10 @@ mod tests {
 
         let loaded = OperatorConfig::load(&home).await.expect("load config");
         assert_eq!(loaded.channels.len(), 1);
-        assert_eq!(loaded.channels[0].launch_mode, ChannelLaunchMode::Service);
+        assert_eq!(
+            loaded.channels[0].launch_mode,
+            ChannelLaunchMode::Background
+        );
     }
 
     #[tokio::test]
@@ -758,7 +762,16 @@ mod tests {
 
         assert!(err
             .to_string()
-            .contains("must be stored as an absolute or explicit path"));
+            .contains("must be stored as an absolute path"));
+    }
+
+    #[test]
+    fn relative_podman_engine_is_rejected_for_stored_profiles() {
+        let err = validate_podman_executable("./podman").expect_err("relative podman engine");
+
+        assert!(err
+            .to_string()
+            .contains("must be stored as an absolute path"));
     }
 
     #[test]
@@ -1031,7 +1044,7 @@ mod tests {
         let err = validate_host_executable("sh").expect_err("bare command should fail");
         assert!(err
             .to_string()
-            .contains("must be stored as an absolute or explicit path"));
+            .contains("must be stored as an absolute path"));
     }
 
     #[test]

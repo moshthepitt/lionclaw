@@ -8,9 +8,9 @@ contract around that work: sessions, channels, scheduled jobs, continuity,
 runtime configuration, confinement, policy, and audit.
 
 LionClaw currently targets Unix-like systems only. The direct `lionclaw run`
-path is designed for Linux/macOS-style Unix environments. Managed daemon paths,
-including service mode and channel auto-start, currently use systemd user
-services; launchd support is a future portability item.
+path is designed for Linux/macOS-style Unix environments. Managed background
+paths, including `lionclaw up` and channel auto-start, currently use the
+systemd user manager; launchd support is a future portability item.
 
 ## System Shape
 
@@ -209,7 +209,7 @@ Current runtime network policy is intentionally coarse:
 LionClaw does not expose a fake allowlist mode before a real egress-control
 plane exists. On rootless hosts, `on` also requires the container engine to be
 able to stand up its private network namespace. LionClaw preflights that host
-capability before interactive or managed-service startup.
+capability before interactive or managed-background startup.
 
 Runtime secrets are loaded from the selected instance home's
 `config/runtime-secrets.env`.
@@ -227,8 +227,8 @@ session-local copies of `auth.json` and `config.toml` under
 into the runtime container.
 
 `lionclaw run` inherits an interactive shell's `CODEX_HOME` when set, and
-`lionclaw service up` persists that same override into the managed daemon
-environment for background jobs and channels.
+`lionclaw up` persists that same override into the managed daemon environment
+for background jobs and channels.
 
 ## API Contracts
 
@@ -400,21 +400,22 @@ manually by the operator.
 - Channel skills declare `lionclaw.toml` metadata: channel id, launch mode,
   worker entrypoint, and required env names. The v1 metadata contract is small
   by design and does not claim permissions LionClaw does not enforce.
-- `launch=service`: the channel worker is supervised through the platform
-  service manager. The current implementation uses systemd user services.
+- `launch=background`: the channel worker is supervised through the platform
+  backend. The current implementation uses systemd user units.
 - `launch=interactive`: the channel worker is foreground-only and normally
   started by `lionclaw connect <channel>` in the current terminal. The low-level
   attach path remains available for debugging.
 - Required channel env is selected-instance state under `config/channels/`.
-  Service env may reference that private file, but generated service env is not
-  the source of truth.
+  Generated unit env may reference that private file, but generated unit env is
+  not the source of truth.
 
 Worker entrypoint resolution uses the metadata `worker` path and rejects
 symlink escapes outside the skill directory.
 
-`LIONCLAW_HOME` gets stable machine-owned `config/home-id` and service identity
-state. Attach and service flows only reuse a daemon when `/v0/daemon/info`
-reports the same home id, current project scope, and daemon-compat fingerprint.
+`LIONCLAW_HOME` gets stable machine-owned `config/home-id` and managed-unit
+identity state. Attach and background flows only reuse a daemon when
+`/v0/daemon/info` reports the same home id, current project scope, and
+daemon-compat fingerprint.
 Managed systemd units are instance-scoped and carry `X-LionClaw-*` ownership
 metadata so cleanup and stop operations only touch units owned by the selected
 home.

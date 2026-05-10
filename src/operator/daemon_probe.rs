@@ -29,7 +29,7 @@ pub(crate) enum DaemonClassification {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct HealthResponse {
-    service: String,
+    daemon: String,
 }
 
 #[derive(Debug)]
@@ -66,7 +66,7 @@ pub(crate) async fn classify_daemon(
         }
         ProbeJsonResult::Status | ProbeJsonResult::InvalidBody | ProbeJsonResult::Transport => {
             match get_json::<HealthResponse>(bind_addr, "/health").await? {
-                ProbeJsonResult::Ok(health) if health.service == "lionclawd" => {
+                ProbeJsonResult::Ok(health) if health.daemon == "lionclawd" => {
                     Ok(DaemonClassification::IncompatibleLionClaw)
                 }
                 ProbeJsonResult::Ok(_)

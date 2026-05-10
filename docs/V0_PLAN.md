@@ -60,9 +60,9 @@ It does not:
 
 ## v0 Deliverables
 
-1. Operator CLI for onboarding, runtime registration, local runs, service
+1. Operator CLI for project setup, runtime registration, local runs, background
    control, channels, jobs, and continuity.
-2. SQLite-backed kernel services for sessions, turns, skills, policy, audit,
+2. SQLite-backed kernel subsystems for sessions, turns, skills, policy, audit,
    channels, jobs, and continuity metadata.
 3. Program-backed runtime path for Codex.
 4. Program-backed runtime path for OpenCode.
@@ -76,7 +76,7 @@ It does not:
 10. Scheduler for time-based jobs with fresh synthetic sessions and optional
     channel delivery.
 11. Visible assistant continuity under the assistant home workspace.
-12. Manual QA pass covering real Codex, real Podman confinement, service reuse,
+12. Manual QA pass covering real Codex, real Podman confinement, daemon reuse,
     terminal channel flow, scheduler flow, runtime secrets, and project
     isolation.
 
@@ -123,7 +123,7 @@ for tests and future narrow adapters, but it is not the main product path.
 1. Production-grade secret broker for all credentials.
 2. Full egress-control plane.
 3. Remote skill registry and signature enforcement.
-4. Multi-user hosted service.
+4. Multi-user hosted deployment.
 5. Windows support.
 6. Built-in external channels.
 7. Replacing the selected agent's native capabilities with a LionClaw tool

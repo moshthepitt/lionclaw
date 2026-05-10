@@ -6,6 +6,7 @@ use crate::home::LionClawHome;
 
 use super::{
     config::{ManagedChannelConfig, OperatorConfig},
+    managed_units::{SystemdUserUnitManager, UnitManager},
     runtime_integration::{runtime_auth_guidance, runtime_profile_facts},
     target::{
         inspect_target_work_root, list_project_instance_statuses, TargetContext, TargetSelection,
@@ -13,8 +14,16 @@ use super::{
 };
 
 pub async fn render_target_status(target: &TargetContext) -> Result<String> {
+    render_target_status_with_manager(target, &SystemdUserUnitManager).await
+}
+
+pub async fn render_target_status_with_manager<M: UnitManager>(
+    target: &TargetContext,
+    manager: &M,
+) -> Result<String> {
     let work_root = inspect_target_work_root(target);
     let config = OperatorConfig::load(&target.instance_home).await?;
+    let managed_units = load_managed_unit_snapshot(&target.instance_home, &config, manager).await?;
     let name = target
         .instance_name
         .clone()
@@ -37,12 +46,20 @@ pub async fn render_target_status(target: &TargetContext) -> Result<String> {
         work_root_finding: work_root.finding,
         shared_work_root_count: shared_count,
         config,
+        managed_units,
         include_project_header: true,
         selected: true,
     }))
 }
 
 pub async fn render_project_status_all(project_root: &Path) -> Result<String> {
+    render_project_status_all_with_manager(project_root, &SystemdUserUnitManager).await
+}
+
+pub async fn render_project_status_all_with_manager<M: UnitManager>(
+    project_root: &Path,
+    manager: &M,
+) -> Result<String> {
     let entries = list_project_instance_statuses(project_root)?;
     let project_root = project_root.canonicalize()?;
     let mut output = format!("project: {}\n", project_root.display());
@@ -54,6 +71,9 @@ pub async fn render_project_status_all(project_root: &Path) -> Result<String> {
 
     for entry in entries {
         let config = OperatorConfig::load(&LionClawHome::new(entry.home.clone())).await?;
+        let managed_units =
+            load_managed_unit_snapshot(&LionClawHome::new(entry.home.clone()), &config, manager)
+                .await?;
         output.push('\n');
         output.push_str(&render_instance_status(InstanceRenderInput {
             project_root: Some(project_root.clone()),
@@ -64,6 +84,7 @@ pub async fn render_project_status_all(project_root: &Path) -> Result<String> {
             work_root_finding: entry.work_root_finding,
             shared_work_root_count: entry.shared_work_root_count,
             config,
+            managed_units,
             include_project_header: false,
             selected: false,
         }));
@@ -91,8 +112,21 @@ struct InstanceRenderInput {
     work_root_finding: Option<String>,
     shared_work_root_count: usize,
     config: OperatorConfig,
+    managed_units: ManagedUnitSnapshot,
     include_project_header: bool,
     selected: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedUnitSnapshot {
+    daemon: String,
+    workers: Vec<ManagedWorkerStatus>,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedWorkerStatus {
+    channel_id: String,
+    status: String,
 }
 
 fn render_instance_status(input: InstanceRenderInput) -> String {
@@ -128,6 +162,7 @@ fn render_instance_status(input: InstanceRenderInput) -> String {
     ));
     push_runtime_status(&mut output, &input.config);
     push_channel_status(&mut output, &input.config.channels);
+    push_managed_unit_status(&mut output, &input.managed_units);
     push_readiness(&mut output, &input);
 
     if input.selected {
@@ -135,6 +170,34 @@ fn render_instance_status(input: InstanceRenderInput) -> String {
     }
 
     output
+}
+
+async fn load_managed_unit_snapshot<M: UnitManager>(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+    manager: &M,
+) -> Result<ManagedUnitSnapshot> {
+    let owned_units = manager.owned_units(home)?;
+    let daemon = match owned_units.daemon() {
+        Some(unit) => manager.unit_status(unit).await?,
+        None => "not-installed".to_string(),
+    };
+    let mut workers = Vec::new();
+    for channel in config
+        .channels
+        .iter()
+        .filter(|channel| channel.launch_mode == super::config::ChannelLaunchMode::Background)
+    {
+        let status = match owned_units.channel(&channel.id) {
+            Some(unit) => manager.unit_status(unit).await?,
+            None => "not-installed".to_string(),
+        };
+        workers.push(ManagedWorkerStatus {
+            channel_id: channel.id.clone(),
+            status,
+        });
+    }
+    Ok(ManagedUnitSnapshot { daemon, workers })
 }
 
 fn push_runtime_status(output: &mut String, config: &OperatorConfig) {
@@ -175,6 +238,18 @@ fn push_channel_status(output: &mut String, channels: &[ManagedChannelConfig]) {
             channel.skill,
             channel.launch_mode.as_str()
         ));
+    }
+}
+
+fn push_managed_unit_status(output: &mut String, units: &ManagedUnitSnapshot) {
+    output.push_str(&format!("  managed daemon: {}\n", units.daemon));
+    if units.workers.is_empty() {
+        output.push_str("  managed workers: none\n");
+        return;
+    }
+    output.push_str("  managed workers:\n");
+    for worker in &units.workers {
+        output.push_str(&format!("    {}: {}\n", worker.channel_id, worker.status));
     }
 }
 
@@ -235,15 +310,25 @@ pub fn missing_target_for_status() -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
     use super::*;
     use crate::operator::{
+        managed_units::{daemon_unit_name, ensure_unit_identity, FakeUnitManager},
         runtime_integration::configure_runtime_profile_with_engine_resolver,
         target::{create_project_instance, init_project},
     };
 
-    fn configure_test_codex(config: &mut OperatorConfig) {
+    fn fake_podman(root: &std::path::Path) -> std::path::PathBuf {
+        let path = root.join("podman");
+        fs::write(&path, "#!/usr/bin/env bash\nexit 0\n").expect("write fake podman");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod fake podman");
+        path
+    }
+
+    fn configure_test_codex(config: &mut OperatorConfig, engine: &std::path::Path) {
         configure_runtime_profile_with_engine_resolver(config, "codex", |_| {
-            Ok("/usr/bin/podman".to_string())
+            Ok(engine.to_string_lossy().to_string())
         })
         .expect("configure codex");
     }
@@ -254,7 +339,7 @@ mod tests {
         let project = init_project(temp_dir.path()).expect("init project");
         let home = LionClawHome::new(project.instance.home.clone());
         let mut config = OperatorConfig::load(&home).await.expect("load config");
-        configure_test_codex(&mut config);
+        configure_test_codex(&mut config, &fake_podman(temp_dir.path()));
         config.save(&home).await.expect("save config");
         let target = TargetContext {
             project_root: Some(project.project_root.clone()),
@@ -296,13 +381,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_does_not_report_unowned_derived_unit_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        let home = LionClawHome::new(project.instance.home.clone());
+        let identity = ensure_unit_identity(&home).expect("unit identity");
+        let manager = FakeUnitManager::default();
+        manager
+            .set_unit_status(daemon_unit_name(&identity), "loaded/active/running")
+            .expect("set daemon status");
+        let target = TargetContext {
+            project_root: Some(project.project_root.clone()),
+            instance_name: Some("main".to_string()),
+            instance_home: home,
+            work_root: None,
+        };
+
+        let output = render_target_status_with_manager(&target, &manager)
+            .await
+            .expect("status");
+
+        assert!(output.contains("managed daemon: not-installed"));
+        assert!(!output.contains("managed daemon: loaded/active/running"));
+    }
+
+    #[tokio::test]
     async fn status_all_reports_project_instances_and_shared_work_roots() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let project = init_project(temp_dir.path()).expect("init project");
         create_project_instance(&project.project_root, "reviewer", None, false).expect("reviewer");
         let home = LionClawHome::new(project.instance.home.clone());
         let mut config = OperatorConfig::load(&home).await.expect("load config");
-        configure_test_codex(&mut config);
+        configure_test_codex(&mut config, &fake_podman(temp_dir.path()));
         config.save(&home).await.expect("save config");
 
         let output = render_project_status_all(&project.project_root)

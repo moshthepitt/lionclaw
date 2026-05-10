@@ -249,7 +249,7 @@ async fn channel_send_capability_uses_session_channel_defaults() {
     env.add_channel(
         "local-cli",
         "channel-local-cli",
-        lionclaw::operator::config::ChannelLaunchMode::Service,
+        lionclaw::operator::config::ChannelLaunchMode::Background,
     )
     .await;
     let kernel = env.kernel().await;

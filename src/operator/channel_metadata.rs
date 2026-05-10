@@ -420,7 +420,7 @@ mod tests {
         fs::write(
             skill.join("lionclaw.toml"),
             format!(
-                "version = 1\n\n[channel]\nid = \"{id}\"\nlaunch = \"service\"\nworker = \"scripts/worker\"\nenv = [\"TELEGRAM_BOT_TOKEN\"]\n"
+                "version = 1\n\n[channel]\nid = \"{id}\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\nenv = [\"TELEGRAM_BOT_TOKEN\"]\n"
             ),
         )
         .expect("metadata");
@@ -447,7 +447,7 @@ mod tests {
         let skill = write_channel_skill(temp_dir.path(), "channel-telegram", "telegram");
         fs::write(
             skill.join("lionclaw.toml"),
-            "version = 1\nextra = true\n\n[channel]\nid = \"telegram\"\nlaunch = \"service\"\nworker = \"scripts/worker\"\n",
+            "version = 1\nextra = true\n\n[channel]\nid = \"telegram\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\n",
         )
         .expect("metadata");
 
@@ -476,7 +476,7 @@ mod tests {
         let skill = write_channel_skill(temp_dir.path(), "channel-telegram", "telegram");
         fs::write(
             skill.join("lionclaw.toml"),
-            "version = 1\n\n[channel]\nid = \"telegram\"\nlaunch = \"service\"\nworker = \"scripts/worker\"\nenv = [\"LIONCLAW_HOME\"]\n",
+            "version = 1\n\n[channel]\nid = \"telegram\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\nenv = [\"LIONCLAW_HOME\"]\n",
         )
         .expect("metadata");
 
