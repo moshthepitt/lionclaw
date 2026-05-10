@@ -178,7 +178,8 @@ target: instance main configured bind 127.0.0.1:8787
 expected: no listener, or the owned managed daemon for this instance
 observed: 127.0.0.1:8787 is used by a non-LionClaw process
 inspect: ss -ltnp '( sport = :8787 )'
-repair: stop the process shown by inspect, then run: lionclaw up
+note: stop the process shown by inspect
+repair: lionclaw up
 ```
 
 Warnings alone exit 0, errors exit 1, and internal doctor failures exit 2.

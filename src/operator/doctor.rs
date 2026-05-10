@@ -32,6 +32,9 @@ use crate::{
     },
 };
 
+const UNRESOLVED_WORK_ROOT_NOTE: &str =
+    "choose the intended work root; doctor cannot infer a safe path";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindingSeverity {
     Error,
@@ -156,6 +159,23 @@ impl FindingKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorRunbook {
+    pub inspect: Box<str>,
+    pub note: Option<Box<str>>,
+    pub repair: Option<Box<str>>,
+}
+
+impl DoctorRunbook {
+    fn new(inspect: Box<str>) -> Self {
+        Self {
+            inspect,
+            note: None,
+            repair: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DoctorFinding {
     pub id: &'static str,
     pub severity: FindingSeverity,
@@ -163,8 +183,7 @@ pub struct DoctorFinding {
     pub target: Box<str>,
     pub expected: Box<str>,
     pub observed: Box<str>,
-    pub inspect: Box<str>,
-    pub repair: Option<Box<str>>,
+    pub runbook: Box<DoctorRunbook>,
 }
 
 impl DoctorFinding {
@@ -201,18 +220,22 @@ impl DoctorFinding {
             target: target.clone().into_boxed_str(),
             expected: kind.expected().into(),
             observed: into_boxed_str(observed),
-            inspect: default_inspect_command(&target),
-            repair: None,
+            runbook: Box::new(DoctorRunbook::new(default_inspect_command(&target))),
         }
     }
 
     fn with_inspect(mut self, command: impl Into<String>) -> Self {
-        self.inspect = command.into().into_boxed_str();
+        self.runbook.inspect = command.into().into_boxed_str();
+        self
+    }
+
+    fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.runbook.note = Some(note.into().into_boxed_str());
         self
     }
 
     fn with_repair(mut self, command: impl Into<String>) -> Self {
-        self.repair = Some(command.into().into_boxed_str());
+        self.runbook.repair = Some(command.into().into_boxed_str());
         self
     }
 }
@@ -261,8 +284,11 @@ impl DoctorReport {
             output.push_str(&format!("target: {}\n", finding.target));
             output.push_str(&format!("expected: {}\n", finding.expected));
             output.push_str(&format!("observed: {}\n", finding.observed));
-            output.push_str(&format!("inspect: {}\n", finding.inspect));
-            if let Some(repair) = finding.repair.as_deref() {
+            output.push_str(&format!("inspect: {}\n", finding.runbook.inspect));
+            if let Some(note) = finding.runbook.note.as_deref() {
+                output.push_str(&format!("note: {note}\n"));
+            }
+            if let Some(repair) = finding.runbook.repair.as_deref() {
                 output.push_str(&format!("repair: {repair}\n"));
             }
             output.push('\n');
@@ -315,7 +341,6 @@ struct DoctorCommands {
     selected_prefix: String,
     project_prefix: Option<String>,
     instance: String,
-    home: PathBuf,
 }
 
 impl DoctorCommands {
@@ -334,7 +359,6 @@ impl DoctorCommands {
             selected_prefix,
             project_prefix,
             instance: instance.to_string(),
-            home: home.to_path_buf(),
         }
     }
 
@@ -351,14 +375,8 @@ impl DoctorCommands {
         })
     }
 
-    fn adopt_work_root_repair(&self) -> Option<String> {
-        let home = shell_quote_arg(&self.home.display().to_string());
-        self.project_prefix.as_deref().map(|prefix| {
-            format!(
-                "{prefix} instance adopt {} {home} --work-root PATH",
-                shell_quote_arg(&self.instance)
-            )
-        })
+    fn unresolved_work_root_note(&self) -> &'static str {
+        UNRESOLVED_WORK_ROOT_NOTE
     }
 }
 
@@ -519,8 +537,8 @@ fn inspect_default_instance<'a>(
                 format!("{}: {err}", project_file_path(project_root).display()),
             )
             .with_inspect(project_command(project_root, "instance list"))
-            .with_repair(format!(
-                "edit {}",
+            .with_note(format!(
+                "edit {} so default_instance is a valid instance name",
                 project_file_path(project_root).display()
             )),
         );
@@ -561,8 +579,8 @@ fn selected_project_instance_names(
                     ),
                 )
                 .with_inspect(project_command(project_root, "instance list"))
-                .with_repair(format!(
-                    "edit {}",
+                .with_note(format!(
+                    "choose a default_instance in {} or rerun doctor with --instance NAME",
                     project_file_path(project_root).display()
                 )),
             );
@@ -725,11 +743,9 @@ fn inspect_instance_work_root(
                 format!("instance \"{name}\" does not record a work root"),
                 instance_config.display().to_string(),
                 format!("{} is missing", instance_config.display()),
-            );
-            findings.push(with_optional_repair(
-                finding,
-                commands.adopt_work_root_repair(),
-            ));
+            )
+            .with_note(commands.unresolved_work_root_note());
+            findings.push(finding);
             return None;
         }
         Err(finding) => {
@@ -759,11 +775,9 @@ fn inspect_instance_work_root(
                 instance_config.display(),
                 parsed.work_root.display()
             ),
-        );
-        findings.push(with_optional_repair(
-            finding,
-            commands.adopt_work_root_repair(),
-        ));
+        )
+        .with_note(commands.unresolved_work_root_note());
+        findings.push(finding);
         return None;
     };
 
@@ -775,11 +789,9 @@ fn inspect_instance_work_root(
                 format!("instance \"{name}\" work root is missing"),
                 work_root.display().to_string(),
                 format!("{}: {err}", work_root.display()),
-            );
-            findings.push(with_optional_repair(
-                finding,
-                commands.adopt_work_root_repair(),
-            ));
+            )
+            .with_note(commands.unresolved_work_root_note());
+            findings.push(finding);
             return None;
         }
     };
@@ -1171,10 +1183,8 @@ async fn inspect_configured_bind<M: UnitManager>(
                     format!("{bind} is served by this LionClaw home for a different project/work-root scope"),
                 )
                 .with_inspect(inspect_listener_command(bind))
-                .with_repair(format!(
-                    "stop the daemon shown by inspect, then run: {}",
-                    commands.selected("up")
-                )),
+                .with_note("stop the daemon shown by inspect")
+                .with_repair(commands.selected("up")),
             );
         }
         DaemonClassification::ForeignHome(info) => {
@@ -1199,10 +1209,8 @@ async fn inspect_configured_bind<M: UnitManager>(
                     format!("{bind} responded like LionClaw but not with the current daemon info contract"),
                 )
                 .with_inspect(inspect_listener_command(bind))
-                .with_repair(format!(
-                    "stop the older LionClaw daemon shown by inspect, then run: {}",
-                    commands.selected("up")
-                )),
+                .with_note("stop the older LionClaw daemon shown by inspect")
+                .with_repair(commands.selected("up")),
             );
         }
         DaemonClassification::UnknownListener => {
@@ -1214,10 +1222,8 @@ async fn inspect_configured_bind<M: UnitManager>(
                     format!("{bind} is used by a non-LionClaw process"),
                 )
                 .with_inspect(inspect_listener_command(bind))
-                .with_repair(format!(
-                    "stop the process shown by inspect, then run: {}",
-                    commands.selected("up")
-                )),
+                .with_note("stop the process shown by inspect")
+                .with_repair(commands.selected("up")),
             );
         }
     }
@@ -1244,10 +1250,8 @@ fn foreground_daemon_finding(name: &str, bind: &str, commands: &DoctorCommands) 
         format!("{bind} is served by this LionClaw home, but not by the owned managed unit"),
     )
     .with_inspect(inspect_listener_command(bind))
-    .with_repair(format!(
-        "stop the foreground daemon, then run: {}",
-        commands.selected("up")
-    ))
+    .with_note("stop the foreground daemon shown by inspect")
+    .with_repair(commands.selected("up"))
 }
 
 fn inspect_listener_command(bind: &str) -> String {
@@ -1958,8 +1962,8 @@ mod tests {
             "lionclaw --project /repo --instance reviewer up"
         );
         assert_eq!(
-            commands.adopt_work_root_repair().as_deref(),
-            Some("lionclaw --project /repo instance adopt reviewer /repo/.lionclaw/instances/reviewer --work-root PATH")
+            commands.unresolved_work_root_note(),
+            UNRESOLVED_WORK_ROOT_NOTE
         );
         assert_eq!(
             commands.create_instance_repair().as_deref(),
@@ -1977,7 +1981,10 @@ mod tests {
             "lionclaw --home /tmp/lionclaw-home status"
         );
         assert!(commands.create_instance_repair().is_none());
-        assert!(commands.adopt_work_root_repair().is_none());
+        assert_eq!(
+            commands.unresolved_work_root_note(),
+            UNRESOLVED_WORK_ROOT_NOTE
+        );
     }
 
     #[test]
@@ -2051,7 +2058,7 @@ mod tests {
             "selected instance work root is not valid enough to compute daemon project scope"
         );
         let expected_inspect = commands.selected("status");
-        assert_eq!(finding.inspect.as_ref(), expected_inspect.as_str());
+        assert_eq!(finding.runbook.inspect.as_ref(), expected_inspect.as_str());
     }
 
     #[tokio::test]
@@ -2119,7 +2126,7 @@ mod tests {
         assert!(finding
             .observed
             .contains("configured daemon bind 'not a bind' cannot be resolved"));
-        assert_eq!(finding.inspect.as_ref(), "ss -ltnp");
+        assert_eq!(finding.runbook.inspect.as_ref(), "ss -ltnp");
     }
 
     #[tokio::test]
@@ -2175,7 +2182,15 @@ mod tests {
             format!("{bind} is used by a non-LionClaw process")
         );
         let expected_inspect = inspect_listener_command(&bind);
-        assert_eq!(finding.inspect.as_ref(), expected_inspect.as_str());
+        assert_eq!(finding.runbook.inspect.as_ref(), expected_inspect.as_str());
+        assert_eq!(
+            finding.runbook.note.as_deref(),
+            Some("stop the process shown by inspect")
+        );
+        assert_eq!(
+            finding.runbook.repair.as_deref(),
+            Some(commands.selected("up").as_str())
+        );
     }
 
     #[tokio::test]
@@ -2212,11 +2227,11 @@ mod tests {
         assert_eq!(home_id, home.read_home_id().await.unwrap().unwrap());
         assert_eq!(finding.id, "LC-D002");
         assert_eq!(
-            finding.inspect.as_ref(),
+            finding.runbook.inspect.as_ref(),
             "lionclaw --home /tmp/other-home status"
         );
         assert_eq!(
-            finding.repair.as_deref(),
+            finding.runbook.repair.as_deref(),
             Some("lionclaw --home /tmp/other-home down")
         );
     }
@@ -2256,8 +2271,16 @@ mod tests {
             "configured bind is served by this home for a different project"
         );
         assert_eq!(
-            finding.inspect.as_ref(),
+            finding.runbook.inspect.as_ref(),
             inspect_listener_command(&bind).as_str()
+        );
+        assert_eq!(
+            finding.runbook.note.as_deref(),
+            Some("stop the daemon shown by inspect")
+        );
+        assert_eq!(
+            finding.runbook.repair.as_deref(),
+            Some(commands.selected("up").as_str())
         );
     }
 
@@ -2295,6 +2318,14 @@ mod tests {
         assert_eq!(
             finding.subject.as_ref(),
             "configured bind is served by an unmanaged foreground daemon"
+        );
+        assert_eq!(
+            finding.runbook.note.as_deref(),
+            Some("stop the foreground daemon shown by inspect")
+        );
+        assert_eq!(
+            finding.runbook.repair.as_deref(),
+            Some(commands.selected("up").as_str())
         );
     }
 
@@ -2336,11 +2367,11 @@ mod tests {
             "managed daemon is running stale configuration"
         );
         assert_eq!(
-            finding.inspect.as_ref(),
+            finding.runbook.inspect.as_ref(),
             commands.selected("status").as_str()
         );
         assert_eq!(
-            finding.repair.as_deref(),
+            finding.runbook.repair.as_deref(),
             Some(commands.selected("up").as_str())
         );
     }
@@ -2371,8 +2402,16 @@ mod tests {
             "configured bind is served by an older LionClaw daemon"
         );
         assert_eq!(
-            finding.inspect.as_ref(),
+            finding.runbook.inspect.as_ref(),
             inspect_listener_command(&bind).as_str()
+        );
+        assert_eq!(
+            finding.runbook.note.as_deref(),
+            Some("stop the older LionClaw daemon shown by inspect")
+        );
+        assert_eq!(
+            finding.runbook.repair.as_deref(),
+            Some(commands.selected("up").as_str())
         );
     }
 
@@ -2387,7 +2426,7 @@ mod tests {
 
         let finding = finding(&report, "project file is missing or unreadable");
         assert_eq!(
-            finding.repair.as_deref(),
+            finding.runbook.repair.as_deref(),
             Some(project_command(temp_dir.path(), "project init").as_str())
         );
     }
@@ -2405,7 +2444,7 @@ mod tests {
             "project metadata directory is missing or unreadable",
         );
         assert_eq!(
-            finding.repair.as_deref(),
+            finding.runbook.repair.as_deref(),
             Some(project_command(temp_dir.path(), "project init").as_str())
         );
     }
@@ -2422,7 +2461,7 @@ mod tests {
 
         let finding = finding(&report, "instances directory is missing or unreadable");
         assert_eq!(
-            finding.repair.as_deref(),
+            finding.runbook.repair.as_deref(),
             Some(project_create_instance_command(temp_dir.path(), "main").as_str())
         );
     }
@@ -2443,7 +2482,7 @@ mod tests {
 
         let finding = finding(&report, "instances directory is missing or unreadable");
         assert_eq!(
-            finding.repair.as_deref(),
+            finding.runbook.repair.as_deref(),
             Some(project_create_instance_command(temp_dir.path(), "reviewer").as_str())
         );
     }
@@ -2464,7 +2503,7 @@ mod tests {
 
         let finding = finding(&report, "instances directory is missing or unreadable");
         assert_eq!(
-            finding.repair.as_deref(),
+            finding.runbook.repair.as_deref(),
             Some(project_create_instance_command(temp_dir.path(), "reviewer").as_str())
         );
         assert!(!report.findings.iter().any(
@@ -2488,7 +2527,7 @@ mod tests {
 
         let finding = finding(&report, "instances directory is missing or unreadable");
         assert_eq!(
-            finding.repair.as_deref(),
+            finding.runbook.repair.as_deref(),
             Some(project_create_instance_command(temp_dir.path(), "main").as_str())
         );
         assert!(!report
@@ -2510,7 +2549,7 @@ mod tests {
         assert!(report.has_errors());
         let finding = finding(&report, "project has no instances");
         assert_eq!(
-            finding.repair.as_deref(),
+            finding.runbook.repair.as_deref(),
             Some(project_create_instance_command(temp_dir.path(), "main").as_str())
         );
     }
@@ -2531,7 +2570,7 @@ mod tests {
 
         let finding = finding(&report, "project has no instances");
         assert_eq!(
-            finding.repair.as_deref(),
+            finding.runbook.repair.as_deref(),
             Some(project_create_instance_command(temp_dir.path(), "reviewer").as_str())
         );
     }
@@ -2594,9 +2633,43 @@ mod tests {
             .expect("doctor report");
 
         assert!(report.has_errors());
-        assert!(report.findings.iter().any(|finding| {
-            finding.subject.as_ref() == "default instance \"../../some-home\" is invalid"
-        }));
+        let finding = finding(&report, "default instance \"../../some-home\" is invalid");
+        assert!(finding.runbook.repair.is_none());
+        let expected_note = format!(
+            "edit {} so default_instance is a valid instance name",
+            project_file_path(temp_dir.path()).display()
+        );
+        assert_eq!(
+            finding.runbook.note.as_deref(),
+            Some(expected_note.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_multiple_instances_without_default_as_manual_selection() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let instances_dir = instances_dir_path(temp_dir.path());
+        fs::create_dir_all(instances_dir.join("main")).expect("main instance");
+        fs::create_dir_all(instances_dir.join("reviewer")).expect("reviewer instance");
+        fs::write(project_file_path(temp_dir.path()), "version = 1\n").expect("project file");
+
+        let report = inspect_project(temp_dir.path(), None, false, &FakeUnitManager::default())
+            .await
+            .expect("doctor report");
+
+        let finding = finding(
+            &report,
+            "project has multiple instances and no default_instance",
+        );
+        assert!(finding.runbook.repair.is_none());
+        let expected_note = format!(
+            "choose a default_instance in {} or rerun doctor with --instance NAME",
+            project_file_path(temp_dir.path()).display()
+        );
+        assert_eq!(
+            finding.runbook.note.as_deref(),
+            Some(expected_note.as_str())
+        );
     }
 
     #[tokio::test]
@@ -2621,11 +2694,12 @@ mod tests {
         assert!(report.findings.iter().any(
             |finding| finding.subject.as_ref() == "instance entry \".hidden\" has invalid name"
         ));
-        assert!(report
-            .findings
-            .iter()
-            .any(|finding| finding.subject.as_ref()
-                == "instance \"main\" does not record a work root"));
+        let work_root_finding = finding(&report, "instance \"main\" does not record a work root");
+        assert!(work_root_finding.runbook.repair.is_none());
+        assert_eq!(
+            work_root_finding.runbook.note.as_deref(),
+            Some(UNRESOLVED_WORK_ROOT_NOTE)
+        );
         assert!(!report
             .findings
             .iter()

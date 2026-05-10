@@ -297,8 +297,14 @@ doctor. Use the actual configured port from
 cd "$PROJ_A"
 PORT=$(sed -n 's/^bind = "127\.0\.0\.1:\([0-9][0-9]*\)"/\1/p' \
   .lionclaw/instances/main/config/lionclaw.toml | head -n 1)
-python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$PROJ_A"
+test -n "$PORT"
+python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$PROJ_A" \
+  >/tmp/lionclaw-bind-conflict.log 2>&1 &
+BIND_QA_PID=$!
+trap 'kill "$BIND_QA_PID" 2>/dev/null || true' EXIT
 "$LIONCLAW_BIN" doctor
+kill "$BIND_QA_PID" 2>/dev/null || true
+trap - EXIT
 ```
 
 Expected:
@@ -306,9 +312,9 @@ Expected:
 - `doctor` exits 1
 - the bind finding is `LC-D001`
 - `inspect` uses `ss -ltnp '( sport = :PORT )'`
+- `note` says to stop the process shown by inspect
+- `repair` is an exact `lionclaw ... up` command
 - no raw HTTP command is printed
-
-Stop the temporary server after recording evidence.
 
 ### Stale Or Ghost Units
 
