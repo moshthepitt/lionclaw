@@ -331,28 +331,30 @@ impl DoctorCommands {
         format!("{} {command}", self.selected_prefix)
     }
 
-    fn create_instance(&self) -> String {
-        match self.project_prefix.as_deref() {
-            Some(prefix) => format!(
+    fn create_instance_repair(&self) -> Option<String> {
+        self.project_prefix.as_deref().map(|prefix| {
+            format!(
                 "{prefix} instance create {}",
                 shell_quote_arg(&self.instance)
-            ),
-            None => "lionclaw project init".to_string(),
-        }
+            )
+        })
     }
 
-    fn adopt_work_root(&self) -> String {
+    fn adopt_work_root_repair(&self) -> Option<String> {
         let home = shell_quote_arg(&self.home.display().to_string());
-        match self.project_prefix.as_deref() {
-            Some(prefix) => format!(
+        self.project_prefix.as_deref().map(|prefix| {
+            format!(
                 "{prefix} instance adopt {} {home} --work-root PATH",
                 shell_quote_arg(&self.instance)
-            ),
-            None => format!(
-                "lionclaw instance adopt {} {home} --work-root PATH",
-                shell_quote_arg(&self.instance)
-            ),
-        }
+            )
+        })
+    }
+}
+
+fn with_optional_repair(finding: DoctorFinding, repair: Option<String>) -> DoctorFinding {
+    match repair {
+        Some(command) => finding.with_repair(command),
+        None => finding,
     }
 }
 
@@ -637,15 +639,16 @@ fn inspect_home_path(
     let metadata = match fs::symlink_metadata(home) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            findings.push(
-                DoctorFinding::error(
-                    FindingKind::InstanceHome,
-                    format!("instance \"{name}\" home is missing"),
-                    home.display().to_string(),
-                    format!("{} does not exist", home.display()),
-                )
-                .with_repair(commands.create_instance()),
+            let finding = DoctorFinding::error(
+                FindingKind::InstanceHome,
+                format!("instance \"{name}\" home is missing"),
+                home.display().to_string(),
+                format!("{} does not exist", home.display()),
             );
+            findings.push(with_optional_repair(
+                finding,
+                commands.create_instance_repair(),
+            ));
             return None;
         }
         Err(err) => {
@@ -701,15 +704,16 @@ fn inspect_instance_work_root(
     let parsed = match read_instance_file(&instance_config) {
         Ok(Some(config)) => config,
         Ok(None) => {
-            findings.push(
-                DoctorFinding::error(
-                    FindingKind::InstanceWorkRoot,
-                    format!("instance \"{name}\" does not record a work root"),
-                    instance_config.display().to_string(),
-                    format!("{} is missing", instance_config.display()),
-                )
-                .with_repair(commands.adopt_work_root()),
+            let finding = DoctorFinding::error(
+                FindingKind::InstanceWorkRoot,
+                format!("instance \"{name}\" does not record a work root"),
+                instance_config.display().to_string(),
+                format!("{} is missing", instance_config.display()),
             );
+            findings.push(with_optional_repair(
+                finding,
+                commands.adopt_work_root_repair(),
+            ));
             return None;
         }
         Err(finding) => {
@@ -730,34 +734,36 @@ fn inspect_instance_work_root(
     let work_root = if parsed.work_root.is_absolute() {
         parsed.work_root
     } else {
-        findings.push(
-            DoctorFinding::error(
-                FindingKind::InstanceWorkRoot,
-                format!("instance \"{name}\" work root is not canonical"),
-                instance_config.display().to_string(),
-                format!(
-                    "{} records {}",
-                    instance_config.display(),
-                    parsed.work_root.display()
-                ),
-            )
-            .with_repair(commands.adopt_work_root()),
+        let finding = DoctorFinding::error(
+            FindingKind::InstanceWorkRoot,
+            format!("instance \"{name}\" work root is not canonical"),
+            instance_config.display().to_string(),
+            format!(
+                "{} records {}",
+                instance_config.display(),
+                parsed.work_root.display()
+            ),
         );
+        findings.push(with_optional_repair(
+            finding,
+            commands.adopt_work_root_repair(),
+        ));
         return None;
     };
 
     let metadata = match fs::metadata(&work_root) {
         Ok(metadata) => metadata,
         Err(err) => {
-            findings.push(
-                DoctorFinding::error(
-                    FindingKind::InstanceWorkRoot,
-                    format!("instance \"{name}\" work root is missing"),
-                    work_root.display().to_string(),
-                    format!("{}: {err}", work_root.display()),
-                )
-                .with_repair(commands.adopt_work_root()),
+            let finding = DoctorFinding::error(
+                FindingKind::InstanceWorkRoot,
+                format!("instance \"{name}\" work root is missing"),
+                work_root.display().to_string(),
+                format!("{}: {err}", work_root.display()),
             );
+            findings.push(with_optional_repair(
+                finding,
+                commands.adopt_work_root_repair(),
+            ));
             return None;
         }
     };
@@ -1783,9 +1789,26 @@ mod tests {
             "lionclaw --project /repo --instance reviewer up"
         );
         assert_eq!(
-            commands.adopt_work_root(),
-            "lionclaw --project /repo instance adopt reviewer /repo/.lionclaw/instances/reviewer --work-root PATH"
+            commands.adopt_work_root_repair().as_deref(),
+            Some("lionclaw --project /repo instance adopt reviewer /repo/.lionclaw/instances/reviewer --work-root PATH")
         );
+        assert_eq!(
+            commands.create_instance_repair().as_deref(),
+            Some("lionclaw --project /repo instance create reviewer")
+        );
+    }
+
+    #[test]
+    fn doctor_commands_omit_project_repairs_for_direct_home_targets() {
+        let commands =
+            DoctorCommands::for_target(None, "direct-home", Path::new("/tmp/lionclaw-home"));
+
+        assert_eq!(
+            commands.selected("status"),
+            "lionclaw --home /tmp/lionclaw-home status"
+        );
+        assert!(commands.create_instance_repair().is_none());
+        assert!(commands.adopt_work_root_repair().is_none());
     }
 
     #[test]
