@@ -46,7 +46,7 @@ pub(crate) async fn classify_daemon(
     expected_project_scope: &str,
     expected_daemon_fingerprint: &str,
 ) -> Result<DaemonClassification> {
-    if !listener_is_present(bind_addr).await {
+    if !listener_is_present(bind_addr).await? {
         return Ok(DaemonClassification::Absent);
     }
 
@@ -104,22 +104,22 @@ pub(crate) async fn wait_for_same_home_daemon(
     }
 }
 
-async fn listener_is_present(bind_addr: &str) -> bool {
-    let addrs = match lookup_host(bind_addr).await {
-        Ok(values) => values.collect::<Vec<_>>(),
-        Err(_) => return false,
-    };
+async fn listener_is_present(bind_addr: &str) -> Result<bool> {
+    let addrs = lookup_host(bind_addr)
+        .await
+        .with_context(|| format!("configured daemon bind '{bind_addr}' cannot be resolved"))?
+        .collect::<Vec<_>>();
 
     for addr in addrs {
         if matches!(
             tokio::time::timeout(Duration::from_millis(250), TcpStream::connect(addr)).await,
             Ok(Ok(_))
         ) {
-            return true;
+            return Ok(true);
         }
     }
 
-    false
+    Ok(false)
 }
 
 async fn get_json<T: DeserializeOwned>(bind_addr: &str, path: &str) -> Result<ProbeJsonResult<T>> {
@@ -148,5 +148,21 @@ async fn get_json<T: DeserializeOwned>(bind_addr: &str, path: &str) -> Result<Pr
     match serde_json::from_slice::<T>(&body) {
         Ok(value) => Ok(ProbeJsonResult::Ok(value)),
         Err(_) => Ok(ProbeJsonResult::InvalidBody),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn classify_daemon_rejects_invalid_bind_address() {
+        let err = classify_daemon("not a bind", "home", "project", "fingerprint")
+            .await
+            .expect_err("invalid bind should not be classified as absent");
+
+        assert!(err
+            .to_string()
+            .contains("configured daemon bind 'not a bind' cannot be resolved"));
     }
 }

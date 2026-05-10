@@ -1,60 +1,52 @@
 # Scripts
 
-This directory contains the sharp tools.
+These scripts are developer and CI smoke helpers. They are not the normal
+LionClaw setup path.
 
-## Why this exists
-Most users should stay on the main `lionclaw` path: register a real agent
-runtime, run it through LionClaw, and add channels or jobs through the CLI.
+Use the product CLI for everyday work:
 
-These scripts are here for local CI and manual terminal-channel smoke testing.
-Manual setup. Debugging. Tight feedback loops.
+```bash
+lionclaw project init
+lionclaw configure --runtime codex
+lionclaw run
+```
 
-Use them when you mean it.
+## Available Scripts
 
-## Available scripts
-- `ci.sh`: runs the local CI gate, mirrors the GitHub Actions `ci` workflow, and is the preferred pre-push verification entrypoint.
-- `bootstrap-terminal-test.sh`: bootstraps or refreshes a manual terminal-channel
-  test home, gives a fresh home its own loopback bind, configures the runtime
-  image and terminal channel, then attaches it in the current TTY.
-- `attach-terminal-test.sh`: rebuilds LionClaw, stops the managed daemon for a specific `LIONCLAW_HOME`, and attaches the interactive terminal channel in the current TTY.
+- `ci.sh`: local CI gate that mirrors the GitHub Actions `ci` workflow.
+- `bootstrap-terminal-test.sh`: creates or refreshes a manual terminal-channel
+  smoke home, configures a runtime image and terminal channel, then attaches in
+  the current TTY.
+- `attach-terminal-test.sh`: rebuilds LionClaw, restarts the managed daemon for
+  a specific smoke-test home, and attaches the interactive terminal channel in
+  the current TTY.
 
 ## Usage
+
 Run the same checks as GitHub CI:
+
 ```bash
 ./scripts/ci.sh
 ```
 
-Fresh terminal-channel test home in one command on Linux with the systemd user
-manager:
+Create a fresh terminal-channel smoke home on Linux with a systemd user manager:
+
 ```bash
 ./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e
 ```
 
-That command initializes a fresh project instance and lets `lionclaw up`
-allocate the managed bind, so manual test projects do not collide with another
-LionClaw daemon already using the default bind. It configures the runtime with
-`lionclaw-runtime:v1` and builds that shared local image first when it is
-missing. The attach step uses
-LionClaw's managed daemon path, which currently needs the systemd user manager.
+The bootstrap script is for local development feedback. It creates disposable
+state, builds the shared local runtime image when missing, and lets
+`lionclaw up` allocate a managed bind for the smoke home.
 
 Override the runtime id, command, or channel:
+
 ```bash
 ./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e work codex terminal
 ```
 
-Override the runtime image or kind with environment variables:
-```bash
-LIONCLAW_RUNTIME_IMAGE=lionclaw-runtime:v2 \
-LIONCLAW_RUNTIME_KIND=opencode \
-  ./scripts/bootstrap-terminal-test.sh /tmp/lionclaw-terminal-e2e opencode opencode terminal
-```
+Rebuild, restart, and attach the terminal smoke channel:
 
-Rebuild + restart + attach the terminal test channel:
 ```bash
 ./scripts/attach-terminal-test.sh /tmp/lionclaw-terminal-e2e
-```
-
-Override the runtime or channel:
-```bash
-./scripts/attach-terminal-test.sh /tmp/lionclaw-terminal-e2e codex terminal
 ```

@@ -204,8 +204,6 @@ struct ProductLogsArgs {
 #[derive(Debug, Subcommand)]
 enum ProjectCommand {
     Init,
-    Status,
-    Doctor,
 }
 
 #[derive(Debug, Subcommand)]
@@ -560,18 +558,6 @@ pub async fn run() -> Result<ExitCode> {
                     result.instance.home.display(),
                     result.instance.work_root.display()
                 );
-            }
-            ProjectCommand::Status => {
-                validate_project_wide_target("project status", &target_selection)?;
-                let project_root = discover_project_root(&target_selection)?;
-                let manager = SystemdUserUnitManager;
-                let status =
-                    render_project_status_all_with_manager(&project_root, &manager).await?;
-                print!("{status}");
-            }
-            ProjectCommand::Doctor => {
-                validate_project_wide_target("project doctor", &target_selection)?;
-                return run_doctor_command(&target_selection, true).await;
             }
         },
         Command::Instance { command } => match command {
@@ -2071,6 +2057,13 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn project_namespace_exposes_only_project_setup() {
+        assert!(Cli::try_parse_from(["lionclaw", "project", "init"]).is_ok());
+        assert!(Cli::try_parse_from(["lionclaw", "project", "status"]).is_err());
+        assert!(Cli::try_parse_from(["lionclaw", "project", "doctor"]).is_err());
     }
 
     #[test]
