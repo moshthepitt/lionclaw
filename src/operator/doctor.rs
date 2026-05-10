@@ -1165,7 +1165,7 @@ async fn inspect_configured_bind<M: UnitManager>(
         DaemonClassification::Absent => {}
         DaemonClassification::SameHome => {
             if !owned_managed_daemon_is_active(home, manager).await {
-                findings.push(foreground_daemon_finding(name, bind, commands));
+                findings.push(foreground_daemon_finding(name, bind));
             }
         }
         DaemonClassification::SameHomeDifferentConfig => {
@@ -1183,7 +1183,7 @@ async fn inspect_configured_bind<M: UnitManager>(
                     .with_repair(commands.selected("up")),
                 );
             } else {
-                findings.push(foreground_daemon_finding(name, bind, commands));
+                findings.push(foreground_daemon_finding(name, bind));
             }
         }
         DaemonClassification::SameHomeDifferentProject => {
@@ -1195,8 +1195,7 @@ async fn inspect_configured_bind<M: UnitManager>(
                     format!("{bind} is served by this LionClaw home for a different project/work-root scope"),
                 )
                 .with_inspect(inspect_listener_command(bind))
-                .with_note("stop the daemon shown by inspect")
-                .with_repair(commands.selected("up")),
+                .with_note("stop the daemon shown by inspect"),
             );
         }
         DaemonClassification::ForeignHome(info) => {
@@ -1221,8 +1220,7 @@ async fn inspect_configured_bind<M: UnitManager>(
                     format!("{bind} responded like LionClaw but not with the current daemon info contract"),
                 )
                 .with_inspect(inspect_listener_command(bind))
-                .with_note("stop the older LionClaw daemon shown by inspect")
-                .with_repair(commands.selected("up")),
+                .with_note("stop the older LionClaw daemon shown by inspect"),
             );
         }
         DaemonClassification::UnknownListener => {
@@ -1234,8 +1232,7 @@ async fn inspect_configured_bind<M: UnitManager>(
                     format!("{bind} is used by a non-LionClaw process"),
                 )
                 .with_inspect(inspect_listener_command(bind))
-                .with_note("stop the process shown by inspect")
-                .with_repair(commands.selected("up")),
+                .with_note("stop the process shown by inspect"),
             );
         }
     }
@@ -1267,7 +1264,7 @@ async fn owned_managed_daemon_is_active<M: UnitManager>(home: &LionClawHome, man
         .is_ok_and(|status| unit_status_is_active(&status))
 }
 
-fn foreground_daemon_finding(name: &str, bind: &str, commands: &DoctorCommands) -> DoctorFinding {
+fn foreground_daemon_finding(name: &str, bind: &str) -> DoctorFinding {
     DoctorFinding::error(
         FindingKind::ConfiguredBindOwnerMismatch,
         "configured bind is served by an unmanaged foreground daemon",
@@ -1276,7 +1273,6 @@ fn foreground_daemon_finding(name: &str, bind: &str, commands: &DoctorCommands) 
     )
     .with_inspect(inspect_listener_command(bind))
     .with_note("stop the foreground daemon shown by inspect")
-    .with_repair(commands.selected("up"))
 }
 
 fn inspect_listener_command(bind: &str) -> String {
@@ -2220,10 +2216,7 @@ mod tests {
             finding.runbook.note.as_deref(),
             Some("stop the process shown by inspect")
         );
-        assert_eq!(
-            finding.runbook.repair.as_deref(),
-            Some(commands.selected("up").as_str())
-        );
+        assert_eq!(finding.runbook.repair.as_deref(), None);
     }
 
     #[tokio::test]
@@ -2311,10 +2304,7 @@ mod tests {
             finding.runbook.note.as_deref(),
             Some("stop the daemon shown by inspect")
         );
-        assert_eq!(
-            finding.runbook.repair.as_deref(),
-            Some(commands.selected("up").as_str())
-        );
+        assert_eq!(finding.runbook.repair.as_deref(), None);
     }
 
     #[tokio::test]
@@ -2356,10 +2346,7 @@ mod tests {
             finding.runbook.note.as_deref(),
             Some("stop the foreground daemon shown by inspect")
         );
-        assert_eq!(
-            finding.runbook.repair.as_deref(),
-            Some(commands.selected("up").as_str())
-        );
+        assert_eq!(finding.runbook.repair.as_deref(), None);
     }
 
     #[tokio::test]
@@ -2489,10 +2476,7 @@ mod tests {
             finding.runbook.note.as_deref(),
             Some("stop the older LionClaw daemon shown by inspect")
         );
-        assert_eq!(
-            finding.runbook.repair.as_deref(),
-            Some(commands.selected("up").as_str())
-        );
+        assert_eq!(finding.runbook.repair.as_deref(), None);
     }
 
     #[tokio::test]
