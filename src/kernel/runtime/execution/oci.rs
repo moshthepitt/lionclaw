@@ -1,4 +1,5 @@
 use std::{
+    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -31,6 +32,9 @@ const OCI_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 // mounts like /runtime.
 const READ_ONLY_BIND_MOUNT_OPTIONS: &str = "ro,Z";
 const READ_WRITE_BIND_MOUNT_OPTIONS: &str = "rw,Z";
+const WORKSPACE_MOUNT_TARGET: &str = "/workspace";
+const LIONCLAW_METADATA_DIR: &str = ".lionclaw";
+const WORKSPACE_LIONCLAW_METADATA_TMPFS: &str = "/workspace/.lionclaw:size=1m,mode=700";
 
 #[derive(Debug, Clone)]
 struct PreparedOciProcessLaunch {
@@ -222,6 +226,11 @@ fn prepare_oci_process_launch(
     for mount in &request.plan.mounts {
         args.push("--volume".to_string());
         args.push(format_volume_spec(mount)?);
+    }
+
+    if workspace_lionclaw_metadata_mask_needed(&request.plan.mounts, &config.tmpfs) {
+        args.push("--tmpfs".to_string());
+        args.push(WORKSPACE_LIONCLAW_METADATA_TMPFS.to_string());
     }
 
     for tmpfs in &config.tmpfs {
@@ -667,6 +676,27 @@ fn format_volume_spec(mount: &MountSpec) -> Result<String> {
     Ok(format!("{source}:{}:{access}", mount.target))
 }
 
+fn workspace_lionclaw_metadata_mask_needed(
+    mounts: &[MountSpec],
+    configured_tmpfs: &[String],
+) -> bool {
+    mounts.iter().any(|mount| {
+        mount.target == WORKSPACE_MOUNT_TARGET
+            && fs::symlink_metadata(mount.source.join(LIONCLAW_METADATA_DIR)).is_ok()
+    }) && !configured_tmpfs
+        .iter()
+        .any(|entry| tmpfs_target(entry) == WORKSPACE_LIONCLAW_METADATA_TMPFS_TARGET)
+}
+
+const WORKSPACE_LIONCLAW_METADATA_TMPFS_TARGET: &str = "/workspace/.lionclaw";
+
+fn tmpfs_target(entry: &str) -> &str {
+    entry
+        .trim()
+        .split_once(':')
+        .map_or(entry.trim(), |(target, _)| target.trim())
+}
+
 fn merged_environment(
     plan_environment: &[(String, String)],
     program_environment: &[(String, String)],
@@ -712,21 +742,57 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[test]
+    fn oci_backend_masks_lionclaw_metadata_under_workspace_mount() {
+        let project = tempdir().expect("project");
+        fs::create_dir(project.path().join(".lionclaw")).expect("metadata dir");
+        let mut request = sample_execution_request();
+        request.plan.mounts[0].source = project.path().to_path_buf();
+        request.plan.working_dir = None;
+
+        let prepared = prepare_oci_process_launch(&request, None).expect("prepare");
+
+        assert!(prepared.args.windows(2).any(|pair| {
+            pair == [
+                "--tmpfs".to_string(),
+                super::WORKSPACE_LIONCLAW_METADATA_TMPFS.to_string(),
+            ]
+        }));
+    }
+
+    #[test]
+    fn oci_backend_does_not_duplicate_configured_lionclaw_metadata_mask() {
+        let project = tempdir().expect("project");
+        fs::create_dir(project.path().join(".lionclaw")).expect("metadata dir");
+        let mut request = sample_execution_request();
+        request.plan.mounts[0].source = project.path().to_path_buf();
+        request.plan.working_dir = None;
+        match &mut request.plan.confinement {
+            ConfinementConfig::Oci(config) => {
+                config
+                    .tmpfs
+                    .push(super::WORKSPACE_LIONCLAW_METADATA_TMPFS.to_string());
+            }
+        }
+
+        let prepared = prepare_oci_process_launch(&request, None).expect("prepare");
+
+        let mask_count = prepared
+            .args
+            .windows(2)
+            .filter(|pair| {
+                *pair
+                    == [
+                        "--tmpfs".to_string(),
+                        super::WORKSPACE_LIONCLAW_METADATA_TMPFS.to_string(),
+                    ]
+            })
+            .count();
+        assert_eq!(mask_count, 1);
+    }
+
+    #[test]
     fn oci_backend_builds_podman_run_invocation() {
-        let request = ExecutionRequest {
-            plan: sample_plan(),
-            program: RuntimeProgramSpec {
-                executable: "/usr/local/bin/codex".to_string(),
-                args: vec!["exec".to_string(), "--json".to_string()],
-                environment: vec![("MODEL".to_string(), "gpt-5-codex".to_string())],
-                stdin: "hello".to_string(),
-                auth: None,
-            },
-            runtime_secrets_mount: Some(RuntimeSecretsMount {
-                source: "/home/mosh/.lionclaw/config/runtime-secrets.env".into(),
-            }),
-            codex_home_override: None,
-        };
+        let request = sample_execution_request_with_runtime_secrets();
 
         let secret_name = request
             .runtime_secrets_mount
@@ -1209,6 +1275,30 @@ esac
                 cpu_limit: Some("2".to_string()),
                 pids_limit: Some(256),
             },
+        }
+    }
+
+    fn sample_execution_request() -> ExecutionRequest {
+        ExecutionRequest {
+            plan: sample_plan(),
+            program: RuntimeProgramSpec {
+                executable: "/usr/local/bin/codex".to_string(),
+                args: vec!["exec".to_string(), "--json".to_string()],
+                environment: vec![("MODEL".to_string(), "gpt-5-codex".to_string())],
+                stdin: "hello".to_string(),
+                auth: None,
+            },
+            runtime_secrets_mount: None,
+            codex_home_override: None,
+        }
+    }
+
+    fn sample_execution_request_with_runtime_secrets() -> ExecutionRequest {
+        ExecutionRequest {
+            runtime_secrets_mount: Some(RuntimeSecretsMount {
+                source: "/home/mosh/.lionclaw/config/runtime-secrets.env".into(),
+            }),
+            ..sample_execution_request()
         }
     }
 }

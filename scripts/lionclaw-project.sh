@@ -244,6 +244,17 @@ config_path() {
   printf '%s/config/lionclaw.toml\n' "$LIONCLAW_HOME"
 }
 
+instance_config_path() {
+  printf '%s/config/instance.toml\n' "$LIONCLAW_HOME"
+}
+
+toml_escape_basic_string() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '%s\n' "$value"
+}
+
 ensure_podman() {
   [[ -n "$PODMAN_BIN" && -x "$PODMAN_BIN" ]] || die "podman is required; set LIONCLAW_PODMAN_BIN if it is not on PATH"
 }
@@ -422,12 +433,12 @@ ensure_runtime_image() {
 }
 
 run_lionclaw() {
-  (cd "$WORKSPACE_ROOT" && env LIONCLAW_HOME="$LIONCLAW_HOME" "$LIONCLAW_BIN" "$@")
+  (cd "$WORKSPACE_ROOT" && env LIONCLAW_HOME="$LIONCLAW_HOME" "$LIONCLAW_BIN" --home "$LIONCLAW_HOME" "$@")
 }
 
 run_lionclaw_action() {
   if is_dry_run; then
-    printf '[dry-run] (%s) LIONCLAW_HOME=%q %q' "$WORKSPACE_ROOT" "$LIONCLAW_HOME" "$LIONCLAW_BIN"
+    printf '[dry-run] (%s) LIONCLAW_HOME=%q %q --home %q' "$WORKSPACE_ROOT" "$LIONCLAW_HOME" "$LIONCLAW_BIN" "$LIONCLAW_HOME"
     for arg in "$@"; do
       printf ' %q' "$arg"
     done
@@ -462,6 +473,42 @@ ensure_home_onboarded() {
   if [[ ! -f "$(config_path)" ]]; then
     run_lionclaw_action onboard --bind auto
   fi
+
+  ensure_home_work_root_recorded
+}
+
+ensure_home_work_root_recorded() {
+  local config_dir config_file escaped_work_root
+  config_dir="$LIONCLAW_HOME/config"
+  config_file="$(instance_config_path)"
+  escaped_work_root="$(toml_escape_basic_string "$WORKSPACE_ROOT")"
+
+  if [[ -L "$config_dir" ]]; then
+    die "refusing to write instance config through symlinked directory: $config_dir"
+  fi
+  if [[ -L "$config_file" ]]; then
+    die "refusing to write symlinked instance config: $config_file"
+  fi
+  if [[ -f "$config_file" ]]; then
+    if grep -Fxq "work_root = \"$escaped_work_root\"" "$config_file"; then
+      return
+    fi
+    if [[ "${LIONCLAW_ALLOW_REWRITE:-0}" != "1" ]]; then
+      die "instance config $config_file does not target work root $WORKSPACE_ROOT; set LIONCLAW_ALLOW_REWRITE=1 to rewrite it"
+    fi
+    warn "rewriting instance config $config_file to target work root $WORKSPACE_ROOT"
+  fi
+
+  if is_dry_run; then
+    printf '[dry-run] would write %q with work_root=%q\n' "$config_file" "$WORKSPACE_ROOT"
+    return
+  fi
+
+  mkdir -p "$config_dir"
+  {
+    printf 'version = 1\n'
+    printf 'work_root = "%s"\n' "$escaped_work_root"
+  } >"$config_file"
 }
 
 project_skill_specs_for_validator() {
@@ -742,7 +789,7 @@ case "$cmd" in
       exit 0
     fi
     cd "$WORKSPACE_ROOT"
-    exec env LIONCLAW_HOME="$LIONCLAW_HOME" "$LIONCLAW_BIN" run "$@" "$RUNTIME_ID"
+    exec env LIONCLAW_HOME="$LIONCLAW_HOME" "$LIONCLAW_BIN" --home "$LIONCLAW_HOME" run "$@" "$RUNTIME_ID"
     ;;
   attach)
     print_context
@@ -753,7 +800,7 @@ case "$cmd" in
       exit 0
     fi
     cd "$WORKSPACE_ROOT"
-    exec env LIONCLAW_HOME="$LIONCLAW_HOME" "$LIONCLAW_BIN" channel attach "$CHANNEL_ID" "$@" --runtime "$RUNTIME_ID"
+    exec env LIONCLAW_HOME="$LIONCLAW_HOME" "$LIONCLAW_BIN" --home "$LIONCLAW_HOME" channel attach "$CHANNEL_ID" "$@" --runtime "$RUNTIME_ID"
     ;;
   up)
     ensure_systemd_user
@@ -780,6 +827,7 @@ case "$cmd" in
       printf 'Project home is not onboarded yet.\n'
       exit 0
     fi
+    ensure_home_work_root_recorded
     printf 'Bind:              %s\n' "$(configured_bind || true)"
     run_lionclaw service status
     ;;

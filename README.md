@@ -4,7 +4,7 @@ LionClaw is a personal AI assistant that runs locally on your machine.
 
 It gives standard agent CLIs a durable home. You still use the real agent, but
 LionClaw adds memory, scheduled jobs, local project context, explicit
-credentials, and a controlled workspace around it.
+credentials, and a controlled work root around it.
 
 The agent does the heavy lifting. LionClaw provides the security boundary,
 session state, runtime launch path, and audit log for the decisions it owns.
@@ -36,7 +36,7 @@ Here is the bet LionClaw makes:
   workflows.
 - Keep the core small. The trusted Rust core focuses on policy, state,
   auditing, runtime launch, sessions, and jobs.
-- Control the blast radius. A run sees only the workspace, network mode,
+- Control the blast radius. A run sees only the work root, network mode,
   runtime state, and secrets LionClaw explicitly grants.
 - Keep context alive. Sessions, scheduled jobs, and channels survive beyond one
   terminal prompt.
@@ -60,8 +60,9 @@ what session is active, and which boundary decisions are recorded.
 
 ## Quick Start
 
-LionClaw is built in Rust. Clone it, build it, create the shared runtime image,
-register one runtime, and start a confined session.
+LionClaw is built in Rust. Clone it, build it, initialize the project, create
+the shared runtime image, register one runtime on the default instance, and
+start a confined session.
 
 ```bash
 # 1. Build the core binaries
@@ -69,16 +70,16 @@ git clone https://github.com/moshthepitt/lionclaw.git
 cd lionclaw
 cargo build --release
 
-# 2. Build the shared runtime image with a stable local tag
-podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .
+# 2. Initialize this checkout as a LionClaw project
+./target/release/lionclaw project init
 
-# 3. Initialize your local environment
-./target/release/lionclaw onboard
+# 3. Build the shared runtime image with a stable local tag
+podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .
 
 # 4. Example runtime: sign in to Codex once on the host
 codex login
 
-# 5. Register that runtime and start using it
+# 5. Register that runtime on the selected instance and start using it
 ./target/release/lionclaw runtime add codex --kind codex --bin codex --image lionclaw-runtime:v1
 ./target/release/lionclaw run codex
 ```
@@ -91,12 +92,31 @@ runtime mechanism:
 ./target/release/lionclaw run opencode
 ```
 
-`lionclaw run ...` uses your current directory as the project root by default.
-The confined runtime sees that project at `/workspace`. LionClaw keeps its own
-state, continuity, runtime cache, services, and config under `LIONCLAW_HOME`.
+`lionclaw project init` creates `.lionclaw/project.toml` and a default
+`main` instance at `.lionclaw/instances/main`. A project is the local
+management boundary. An instance home stores one LionClaw instance's config,
+database, logs, installed skills, runtime cache, and assistant-home continuity.
+
+Each project instance records a default work root. `project init` points
+`main` at the project root, and `instance create <name>` does the same unless
+you pass `--work-root PATH`. The confined runtime sees the selected instance's
+work root at `/workspace`.
+
+Targeting is explicit and deterministic:
+
+```bash
+./target/release/lionclaw run
+./target/release/lionclaw --instance reviewer run
+./target/release/lionclaw --project /path/to/project --instance reviewer run
+./target/release/lionclaw --home /path/to/instance-home run
+```
+
+Without `--home` or `--project`, LionClaw discovers only the current directory
+and its immediate parent. It does not walk arbitrarily up the filesystem.
+
 Installed non-channel skills are mounted read-only under `/lionclaw/skills/<alias>`
 and projected into each runtime's native skill directory inside `/runtime/home`.
-`lionclaw skill add` copies a skill into that canonical skills directory, and
+`lionclaw skill install` copies a skill into that canonical skills directory, and
 `lionclaw skill rm` removes it physically. `lionclaw channel add --skill <alias>`
 makes that alias host-only; every other installed alias is runtime-visible by
 default.
@@ -180,7 +200,7 @@ Terminal A:
 export LIONCLAW_RUNTIME=codex
 export LIONCLAW_PEER="${USER:-local}"
 
-./target/release/lionclaw skill add skills/channel-terminal --alias terminal
+./target/release/lionclaw skill install skills/channel-terminal --alias terminal
 ./target/release/lionclaw channel add terminal --launch interactive
 ./target/release/lionclaw channel attach terminal \
   --runtime "$LIONCLAW_RUNTIME" \
@@ -197,7 +217,7 @@ export LIONCLAW_PEER="${USER:-local}"
 ./target/release/lionclaw job add daily-brief \
   --runtime "$LIONCLAW_RUNTIME" \
   --schedule "every 1d" \
-  --prompt "Inspect the current workspace and send me a short engineering brief with risks, drift, and next steps." \
+  --prompt "Inspect the current work root and send me a short engineering brief with risks, drift, and next steps." \
   --deliver-channel terminal \
   --deliver-peer "$LIONCLAW_PEER"
 ```
@@ -251,7 +271,7 @@ LionClaw and the selected runtime keep separate continuity layers:
 - LionClaw owns the durable session transcript, audit trail, assistant home,
   drafts, scheduled artifacts, and channel delivery history.
 - The runtime owns its private resumable state under the confined `/runtime`
-  mount, partitioned by session, project root, and execution security shape.
+  mount, partitioned by session, work root, and execution security shape.
 
 ## Channels And Background Mode
 
@@ -273,7 +293,7 @@ For an existing LionClaw home with a configured runtime, the manual channel
 steps are:
 
 ```bash
-./target/release/lionclaw skill add skills/channel-terminal --alias terminal
+./target/release/lionclaw skill install skills/channel-terminal --alias terminal
 ./target/release/lionclaw channel add terminal --launch interactive
 ./target/release/lionclaw channel attach terminal --runtime <runtime>
 ```
@@ -283,9 +303,9 @@ LionClaw for you through the managed daemon path, which currently uses systemd
 user services. It restores the latest interactive terminal session for that
 peer, resumes any still-running answer stream from the last durable checkpoint,
 and prints the pairing code and approval command on first contact. It only
-reuses a daemon when that daemon belongs to the same `LIONCLAW_HOME`, current
-project, and compatible daemon config, including runtime, preset, and workspace
-settings. If installed skills or channel config changed since that daemon
+reuses a daemon when that daemon belongs to the same instance home, current
+project target, and compatible daemon config, including runtime, preset, and
+work-root settings. If installed skills or channel config changed since that daemon
 started, `channel attach` reconciles and restarts it before attaching.
 `lionclaw service status` marks that case as `restart required` and keeps stale
 managed channel units visible until the daemon is reconciled or stopped.
@@ -301,7 +321,7 @@ channels and attach each one in its own terminal:
 For Telegram:
 
 ```bash
-./target/release/lionclaw skill add skills/channel-telegram --alias telegram
+./target/release/lionclaw skill install skills/channel-telegram --alias telegram
 ./target/release/lionclaw channel add telegram
 ```
 
@@ -322,26 +342,34 @@ Then inspect or manage it with:
 
 ## State Layout
 
-LionClaw defaults to `~/.lionclaw`:
+Project-local LionClaw state lives under `.lionclaw/`:
+
+- `project.toml`
+- `instances/main/`
+- `instances/<name>/`
+
+Each instance home contains:
 
 - `db/lionclaw.db`
 - `config/lionclaw.toml`
+- `config/instance.toml`
 - `config/runtime-secrets.env`
 - `skills/<alias>/`
 - `workspaces/main/`
 - `runtime/`
 - `services/`
 
-Override the root with `LIONCLAW_HOME`.
+Use `--home PATH` when you need to target one instance home directly and bypass
+project discovery.
 
 ## Runtime And Security Model
 
-Runtime profiles, execution presets, and confinement settings live in
-`~/.lionclaw/config/lionclaw.toml`.
+Runtime profiles, execution presets, and confinement settings live in the
+selected instance home's `config/lionclaw.toml`.
 
 The everyday confined runtime layout is:
 
-- `/workspace`: the project root, mounted read-only or read-write by preset
+- `/workspace`: the selected work root, mounted read-only or read-write by preset
 - `/runtime`: runtime-private writable state
 - `/drafts`: runtime-private draft/output area
 - `/lionclaw/skills/<alias>`: installed non-channel skill snapshot assets, mounted read-only
@@ -374,9 +402,9 @@ To keep it loaded across reboots:
 printf 'tun\n' | sudo tee /etc/modules-load.d/tun.conf
 ```
 
-Runtime secrets for confined runtimes live separately in
-`~/.lionclaw/config/runtime-secrets.env`. Presets either mount that whole file
-or mount no runtime secrets at all with `mount-runtime-secrets = true|false`.
+Runtime secrets for confined runtimes live separately in the selected instance
+home's `config/runtime-secrets.env`. Presets either mount that whole file or
+mount no runtime secrets at all with `mount-runtime-secrets = true|false`.
 When mounted, Podman places it under `/run/secrets/` with a LionClaw-managed
 name that starts with `lionclaw-runtime-secrets-`. LionClaw hardens the source
 file to owner-only permissions on Unix before handing it to Podman.

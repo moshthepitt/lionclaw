@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::process::Command;
@@ -6,7 +11,6 @@ use uuid::Uuid;
 
 use crate::{
     applied::compute_daemon_fingerprint,
-    config::resolve_project_workspace_root,
     home::runtime_project_partition_key,
     home::LionClawHome,
     operator::{
@@ -14,7 +18,7 @@ use crate::{
         daemon_probe::{classify_daemon, wait_for_same_home_daemon, DaemonClassification},
         reconcile::{
             base_url_from_bind, load_operator_state, resolve_applied_skill_worker_entrypoint,
-            resolve_required_channel_env, up, StackBinaryPaths,
+            resolve_required_channel_env, up_for_work_root, StackBinaryPaths,
         },
         runtime::{
             resolve_runtime_execution_context, resolve_runtime_id,
@@ -36,20 +40,21 @@ pub(crate) struct ChannelAttachSpec {
 pub async fn attach_channel<M: ServiceManager>(
     home: &LionClawHome,
     manager: &M,
+    work_root: &Path,
     channel_id: String,
     requested_peer_id: Option<String>,
     requested_runtime_id: Option<String>,
 ) -> Result<()> {
     let binaries = crate::operator::reconcile::resolve_stack_binaries()?;
     let home_id = home.ensure_home_id().await?;
-    let project_scope = current_project_scope()?;
+    let project_scope = project_scope_for_work_root(work_root);
     let spec = prepare_channel_attach(
         home,
         manager,
+        work_root,
         channel_id,
         requested_peer_id,
         requested_runtime_id,
-        &project_scope,
         &binaries,
     )
     .await?;
@@ -111,12 +116,13 @@ pub async fn attach_channel<M: ServiceManager>(
 pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
     home: &LionClawHome,
     manager: &M,
+    work_root: &Path,
     channel_id: String,
     requested_peer_id: Option<String>,
     requested_runtime_id: Option<String>,
-    expected_project_scope: &str,
     binaries: &StackBinaryPaths,
 ) -> Result<ChannelAttachSpec> {
+    let expected_project_scope = project_scope_for_work_root(work_root);
     let local_state = load_operator_state(home).await?;
     let initial_config = local_state.config.clone();
     let requested_runtime_id = requested_runtime_id
@@ -139,19 +145,19 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
     let applied = match classify_daemon(
         &initial_config.daemon.bind,
         &home_id,
-        expected_project_scope,
+        &expected_project_scope,
         &expected_daemon_fingerprint,
     )
     .await?
     {
         DaemonClassification::Absent => {
             started_services = true;
-            up(home, manager, &initial_runtime_id, binaries).await?
+            up_for_work_root(home, manager, &initial_runtime_id, binaries, work_root).await?
         }
         DaemonClassification::SameHome => local_state,
         DaemonClassification::SameHomeDifferentConfig => {
             started_services = true;
-            up(home, manager, &initial_runtime_id, binaries).await?
+            up_for_work_root(home, manager, &initial_runtime_id, binaries, work_root).await?
         }
         DaemonClassification::SameHomeDifferentProject => {
             return Err(anyhow!(
@@ -283,10 +289,8 @@ fn default_local_peer_id() -> String {
         .unwrap_or_else(|| "local-user".to_string())
 }
 
-fn current_project_scope() -> Result<String> {
-    let project_root =
-        resolve_project_workspace_root().context("failed to resolve project workspace root")?;
-    Ok(runtime_project_partition_key(Some(project_root.as_path())))
+fn project_scope_for_work_root(work_root: &Path) -> String {
+    runtime_project_partition_key(Some(work_root))
 }
 
 #[cfg(test)]
@@ -319,9 +323,12 @@ mod tests {
         }
     }
 
+    fn current_work_root() -> std::path::PathBuf {
+        resolve_project_workspace_root().expect("resolve project workspace root")
+    }
+
     fn current_project_scope() -> String {
-        let project_root =
-            resolve_project_workspace_root().expect("resolve project workspace root");
+        let project_root = current_work_root();
         runtime_project_partition_key(Some(project_root.as_path()))
     }
 
@@ -547,10 +554,10 @@ mod tests {
         let err = prepare_channel_attach(
             &home,
             &manager,
+            &current_work_root(),
             "terminal".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
-            &current_project_scope(),
             &binaries(),
         )
         .await
@@ -571,10 +578,10 @@ mod tests {
         let err = prepare_channel_attach(
             &home,
             &manager,
+            &current_work_root(),
             "terminal".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
-            &current_project_scope(),
             &binaries(),
         )
         .await
@@ -593,10 +600,10 @@ mod tests {
         let spec = prepare_channel_attach(
             &home,
             &manager,
+            &current_work_root(),
             "terminal".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
-            &current_project_scope(),
             &binaries(),
         )
         .await
@@ -654,10 +661,10 @@ mod tests {
         let spec = prepare_channel_attach(
             &home,
             &manager,
+            &current_work_root(),
             "terminal".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
-            &current_project_scope(),
             &binaries(),
         )
         .await
@@ -681,10 +688,10 @@ mod tests {
         let err = prepare_channel_attach(
             &home,
             &manager,
+            &current_work_root(),
             "terminal".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
-            &current_project_scope(),
             &binaries(),
         )
         .await
@@ -705,10 +712,10 @@ mod tests {
         let spec = prepare_channel_attach(
             &home,
             &manager,
+            &current_work_root(),
             "terminal".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
-            &current_project_scope(),
             &binaries(),
         )
         .await
@@ -767,10 +774,10 @@ mod tests {
         let spec = prepare_channel_attach(
             &home,
             &manager,
+            &current_work_root(),
             "terminal".to_string(),
             None,
             Some("codex".to_string()),
-            &current_project_scope(),
             &binaries(),
         )
         .await
@@ -817,10 +824,10 @@ mod tests {
         let spec = prepare_channel_attach(
             &home,
             &manager,
+            &current_work_root(),
             "terminal".to_string(),
             None,
             Some("codex".to_string()),
-            &current_project_scope(),
             &binaries(),
         )
         .await
@@ -877,10 +884,10 @@ mod tests {
         let spec = prepare_channel_attach(
             &home,
             &manager,
+            &current_work_root(),
             "terminal".to_string(),
             None,
             Some("codex".to_string()),
-            &current_project_scope(),
             &binaries(),
         )
         .await
@@ -934,10 +941,10 @@ mod tests {
         let err = prepare_channel_attach(
             &home,
             &manager,
+            &current_work_root(),
             "terminal".to_string(),
             None,
             Some("missing".to_string()),
-            &current_project_scope(),
             &binaries(),
         )
         .await
@@ -981,10 +988,10 @@ mod tests {
         let err = prepare_channel_attach(
             &home,
             &manager,
+            &current_work_root(),
             "terminal".to_string(),
             None,
             Some("codex".to_string()),
-            &current_project_scope(),
             &binaries(),
         )
         .await
@@ -1010,10 +1017,10 @@ mod tests {
         let err = prepare_channel_attach(
             &home,
             &manager,
+            &current_work_root(),
             "terminal".to_string(),
             None,
             Some("codex".to_string()),
-            &current_project_scope(),
             &binaries(),
         )
         .await
@@ -1059,10 +1066,10 @@ mod tests {
         let err = prepare_channel_attach(
             &home,
             &manager,
+            &current_work_root(),
             "terminal".to_string(),
             None,
             Some("codex".to_string()),
-            &current_project_scope(),
             &binaries(),
         )
         .await
