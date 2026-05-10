@@ -144,6 +144,15 @@ enum DiagnosticDefaultInstance<'a> {
     Valid(&'a str),
 }
 
+impl<'a> DiagnosticDefaultInstance<'a> {
+    fn valid_name(self) -> Option<&'a str> {
+        match self {
+            Self::Valid(name) => Some(name),
+            Self::Missing | Self::Invalid => None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct DiagnosticInstanceFile {
     #[serde(default)]
@@ -266,8 +275,14 @@ async fn inspect_project<M: UnitManager>(
         None
     };
 
+    let default_instance = project_config
+        .as_ref()
+        .map(|config| inspect_default_instance(project_root, config, &mut report))
+        .unwrap_or(DiagnosticDefaultInstance::Missing);
+    let instance_repair_target = default_instance.valid_name().unwrap_or("main");
+
     let (instances, instances_loaded) = if metadata_dir_ok {
-        match discover_project_instance_homes(project_root) {
+        match discover_project_instance_homes(project_root, instance_repair_target) {
             Ok(discovery) => {
                 report.extend(discovery.findings);
                 (discovery.homes, true)
@@ -280,16 +295,15 @@ async fn inspect_project<M: UnitManager>(
     } else {
         (BTreeMap::new(), false)
     };
-    let default_instance = project_config
-        .as_ref()
-        .map(|config| inspect_default_instance(project_root, config, &mut report))
-        .unwrap_or(DiagnosticDefaultInstance::Missing);
 
     let selected_names = if !instances_loaded {
         Vec::new()
     } else if all {
         if instances.is_empty() && project_config.is_some() {
-            report.push(project_has_no_instances_finding(project_root));
+            report.push(project_has_no_instances_finding(
+                project_root,
+                instance_repair_target,
+            ));
         }
         instances.keys().cloned().collect::<Vec<_>>()
     } else if let Some(name) = selected_instance {
@@ -310,9 +324,9 @@ async fn inspect_project<M: UnitManager>(
                         instances_dir_path(project_root).display()
                     ),
                 )
-                .with_repair(project_command(
+                .with_repair(project_create_instance_command(
                     project_root,
-                    &format!("instance create {}", shell_quote_arg(default_instance)),
+                    default_instance,
                 )),
             );
         }
@@ -374,7 +388,7 @@ fn selected_project_instance_names(
     match instances.keys().cloned().collect::<Vec<_>>().as_slice() {
         [only] => vec![only.clone()],
         [] => {
-            report.push(project_has_no_instances_finding(project_root));
+            report.push(project_has_no_instances_finding(project_root, "main"));
             Vec::new()
         }
         _ => {
@@ -396,7 +410,7 @@ fn selected_project_instance_names(
     }
 }
 
-fn project_has_no_instances_finding(project_root: &Path) -> DoctorFinding {
+fn project_has_no_instances_finding(project_root: &Path, repair_instance: &str) -> DoctorFinding {
     DoctorFinding::error(
         "project has no instances",
         format!(
@@ -404,7 +418,10 @@ fn project_has_no_instances_finding(project_root: &Path) -> DoctorFinding {
             instances_dir_path(project_root).display()
         ),
     )
-    .with_repair(project_command(project_root, "instance create main"))
+    .with_repair(project_create_instance_command(
+        project_root,
+        repair_instance,
+    ))
 }
 
 async fn inspect_direct_home<M: UnitManager>(home: &Path, manager: &M) -> Result<DoctorReport> {
@@ -1142,6 +1159,7 @@ struct InstanceHomeDiscovery {
 
 fn discover_project_instance_homes(
     project_root: &Path,
+    repair_instance: &str,
 ) -> std::result::Result<InstanceHomeDiscovery, DoctorFinding> {
     let instances_dir = instances_dir_path(project_root);
     let metadata = fs::symlink_metadata(&instances_dir).map_err(|err| {
@@ -1149,7 +1167,10 @@ fn discover_project_instance_homes(
             "instances directory is missing or unreadable",
             format!("{}: {err}", instances_dir.display()),
         )
-        .with_repair(project_command(project_root, "instance create main"))
+        .with_repair(project_create_instance_command(
+            project_root,
+            repair_instance,
+        ))
     })?;
     if metadata.file_type().is_symlink() {
         return Err(DoctorFinding::error(
@@ -1202,6 +1223,13 @@ fn project_command(project_root: &Path, command: &str) -> String {
     format!(
         "lionclaw --project {} {command}",
         shell_quote_arg(&project_root.display().to_string())
+    )
+}
+
+fn project_create_instance_command(project_root: &Path, instance: &str) -> String {
+    project_command(
+        project_root,
+        &format!("instance create {}", shell_quote_arg(instance)),
     )
 }
 
@@ -1318,7 +1346,28 @@ mod tests {
         let finding = finding(&report, "instances directory is missing or unreadable");
         assert_eq!(
             finding.repair.as_deref(),
-            Some(project_command(temp_dir.path(), "instance create main").as_str())
+            Some(project_create_instance_command(temp_dir.path(), "main").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_missing_instances_repair_uses_valid_default_instance() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir_all(project_dir_path(temp_dir.path())).expect("metadata dir");
+        fs::write(
+            project_file_path(temp_dir.path()),
+            "version = 1\ndefault_instance = \"reviewer\"\n",
+        )
+        .expect("project file");
+
+        let report = inspect_project(temp_dir.path(), None, false, &FakeUnitManager::default())
+            .await
+            .expect("doctor report");
+
+        let finding = finding(&report, "instances directory is missing or unreadable");
+        assert_eq!(
+            finding.repair.as_deref(),
+            Some(project_create_instance_command(temp_dir.path(), "reviewer").as_str())
         );
     }
 
@@ -1333,10 +1382,32 @@ mod tests {
             .expect("doctor report");
 
         assert!(report.has_errors());
-        assert!(report
-            .findings
-            .iter()
-            .any(|finding| finding.subject == "project has no instances"));
+        let finding = finding(&report, "project has no instances");
+        assert_eq!(
+            finding.repair.as_deref(),
+            Some(project_create_instance_command(temp_dir.path(), "main").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_all_empty_instances_repair_uses_valid_default_instance() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir_all(instances_dir_path(temp_dir.path())).expect("instances dir");
+        fs::write(
+            project_file_path(temp_dir.path()),
+            "version = 1\ndefault_instance = \"reviewer\"\n",
+        )
+        .expect("project file");
+
+        let report = inspect_project(temp_dir.path(), None, true, &FakeUnitManager::default())
+            .await
+            .expect("doctor report");
+
+        let finding = finding(&report, "project has no instances");
+        assert_eq!(
+            finding.repair.as_deref(),
+            Some(project_create_instance_command(temp_dir.path(), "reviewer").as_str())
+        );
     }
 
     #[tokio::test]
