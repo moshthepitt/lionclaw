@@ -1,0 +1,14 @@
+{
+  "files.watcherExclude": {
+    "**/.worktrees/**": true
+  },
+  "rust-analyzer.files.exclude": [
+    ".worktrees"
+  ],
+  "rust-analyzer.linkedProjects": [
+    "./Cargo.toml"
+  ],
+  "search.exclude": {
+    "**/.worktrees/**": true
+  }
+}
