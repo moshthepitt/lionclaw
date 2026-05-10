@@ -267,8 +267,11 @@ async fn inspect_project<M: UnitManager>(
     };
 
     let (instances, instances_loaded) = if metadata_dir_ok {
-        match read_instance_homes(project_root) {
-            Ok(instances) => (instances, true),
+        match discover_project_instance_homes(project_root) {
+            Ok(discovery) => {
+                report.extend(discovery.findings);
+                (discovery.homes, true)
+            }
             Err(finding) => {
                 report.push(finding);
                 (BTreeMap::new(), false)
@@ -1131,9 +1134,15 @@ fn read_instance_file(
     })
 }
 
-fn read_instance_homes(
+#[derive(Debug, Default)]
+struct InstanceHomeDiscovery {
+    homes: BTreeMap<String, PathBuf>,
+    findings: Vec<DoctorFinding>,
+}
+
+fn discover_project_instance_homes(
     project_root: &Path,
-) -> std::result::Result<BTreeMap<String, PathBuf>, DoctorFinding> {
+) -> std::result::Result<InstanceHomeDiscovery, DoctorFinding> {
     let instances_dir = instances_dir_path(project_root);
     let metadata = fs::symlink_metadata(&instances_dir).map_err(|err| {
         DoctorFinding::error(
@@ -1155,7 +1164,7 @@ fn read_instance_homes(
         ));
     }
 
-    let mut homes = BTreeMap::new();
+    let mut discovery = InstanceHomeDiscovery::default();
     for entry in fs::read_dir(&instances_dir)
         .with_context(|| format!("failed to read {}", instances_dir.display()))
         .map_err(|err| {
@@ -1165,15 +1174,28 @@ fn read_instance_homes(
         let entry = entry.map_err(|err| {
             DoctorFinding::error("instances directory cannot be read", err.to_string())
         })?;
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            discovery.findings.push(DoctorFinding::error(
+                "instance entry name is not UTF-8",
+                format!(
+                    "{} cannot be addressed as a LionClaw instance",
+                    path.display()
+                ),
+            ));
             continue;
         };
-        if name.starts_with('.') {
+        if let Err(err) = validate_instance_name(name) {
+            discovery.findings.push(DoctorFinding::error(
+                format!("instance entry \"{name}\" has invalid name"),
+                format!("{}: {err}", path.display()),
+            ));
             continue;
         }
-        homes.insert(name, entry.path());
+        discovery.homes.insert(name.to_string(), path);
     }
-    Ok(homes)
+    Ok(discovery)
 }
 
 fn project_command(project_root: &Path, command: &str) -> String {
@@ -1342,6 +1364,64 @@ mod tests {
         assert!(report.findings.iter().any(|finding| {
             finding.subject == "default instance \"../../some-home\" is invalid"
         }));
+    }
+
+    #[tokio::test]
+    async fn doctor_all_reports_invalid_instance_entries_without_inspecting_them() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let instances_dir = instances_dir_path(temp_dir.path());
+        fs::create_dir_all(instances_dir.join("main")).expect("valid instance");
+        fs::create_dir_all(instances_dir.join("bad name")).expect("invalid instance");
+        fs::create_dir_all(instances_dir.join(".hidden")).expect("hidden instance");
+        fs::write(project_file_path(temp_dir.path()), "version = 1\n").expect("project file");
+
+        let report = inspect_project(temp_dir.path(), None, true, &FakeUnitManager::default())
+            .await
+            .expect("doctor report");
+
+        assert!(report.has_errors());
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.subject == "instance entry \"bad name\" has invalid name"));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.subject == "instance entry \".hidden\" has invalid name"));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.subject == "instance \"main\" does not record a work root"));
+        assert!(!report
+            .findings
+            .iter()
+            .any(|finding| finding.subject.starts_with("instance \"bad name\"")));
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_no_usable_instances_when_only_invalid_entries_exist() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let instances_dir = instances_dir_path(temp_dir.path());
+        fs::create_dir_all(instances_dir.join("bad name")).expect("invalid instance");
+        fs::write(project_file_path(temp_dir.path()), "version = 1\n").expect("project file");
+
+        let report = inspect_project(temp_dir.path(), None, false, &FakeUnitManager::default())
+            .await
+            .expect("doctor report");
+
+        assert!(report.has_errors());
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.subject == "instance entry \"bad name\" has invalid name"));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.subject == "project has no instances"));
+        assert!(!report
+            .findings
+            .iter()
+            .any(|finding| finding.subject.starts_with("instance \"bad name\"")));
     }
 
     #[tokio::test]
