@@ -1109,7 +1109,13 @@ fn read_project_file(
             format!("{} must use version = 1", path.display()),
         ));
     }
-    Ok(config)
+    Ok(DiagnosticProjectFile {
+        version: config.version,
+        default_instance: config
+            .default_instance
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    })
 }
 
 fn read_instance_file(
@@ -1369,6 +1375,56 @@ mod tests {
             finding.repair.as_deref(),
             Some(project_create_instance_command(temp_dir.path(), "reviewer").as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn doctor_normalizes_default_instance_before_repair_selection() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir_all(project_dir_path(temp_dir.path())).expect("metadata dir");
+        fs::write(
+            project_file_path(temp_dir.path()),
+            "version = 1\ndefault_instance = \" reviewer \"\n",
+        )
+        .expect("project file");
+
+        let report = inspect_project(temp_dir.path(), None, false, &FakeUnitManager::default())
+            .await
+            .expect("doctor report");
+
+        let finding = finding(&report, "instances directory is missing or unreadable");
+        assert_eq!(
+            finding.repair.as_deref(),
+            Some(project_create_instance_command(temp_dir.path(), "reviewer").as_str())
+        );
+        assert!(!report
+            .findings
+            .iter()
+            .any(|finding| finding.subject == "default instance \" reviewer \" is invalid"));
+    }
+
+    #[tokio::test]
+    async fn doctor_treats_blank_default_instance_as_missing() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir_all(project_dir_path(temp_dir.path())).expect("metadata dir");
+        fs::write(
+            project_file_path(temp_dir.path()),
+            "version = 1\ndefault_instance = \"   \"\n",
+        )
+        .expect("project file");
+
+        let report = inspect_project(temp_dir.path(), None, false, &FakeUnitManager::default())
+            .await
+            .expect("doctor report");
+
+        let finding = finding(&report, "instances directory is missing or unreadable");
+        assert_eq!(
+            finding.repair.as_deref(),
+            Some(project_create_instance_command(temp_dir.path(), "main").as_str())
+        );
+        assert!(!report
+            .findings
+            .iter()
+            .any(|finding| finding.subject == "default instance \"   \" is invalid"));
     }
 
     #[tokio::test]
