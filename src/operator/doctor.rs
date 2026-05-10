@@ -22,8 +22,8 @@ use crate::{
         runtime_integration::runtime_auth_guidance,
         target::{
             discover_diagnostic_project_root, instance_home_path, instances_dir_path,
-            project_dir_path, project_file_path, validate_home_target_exclusive,
-            validate_instance_name, TargetSelection,
+            normalize_project_default_instance, project_dir_path, project_file_path,
+            validate_home_target_exclusive, validate_instance_name, TargetSelection,
         },
     },
 };
@@ -1111,10 +1111,7 @@ fn read_project_file(
     }
     Ok(DiagnosticProjectFile {
         version: config.version,
-        default_instance: config
-            .default_instance
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
+        default_instance: normalize_project_default_instance(config.default_instance),
     })
 }
 

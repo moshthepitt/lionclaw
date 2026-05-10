@@ -147,6 +147,12 @@ pub fn validate_home_target_exclusive(selection: &TargetSelection) -> Result<()>
     Ok(())
 }
 
+pub(crate) fn normalize_project_default_instance(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 pub fn init_project(project_root: &Path) -> Result<ProjectInitResult> {
     let project_root = canonical_existing_dir(project_root, "project root")?;
     let project_dir = project_dir(&project_root);
@@ -651,10 +657,7 @@ fn load_project_config(project_root: &Path) -> Result<ProjectConfig> {
             path.display()
         );
     }
-    let default_instance = parsed
-        .default_instance
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let default_instance = normalize_project_default_instance(parsed.default_instance);
     Ok(ProjectConfig { default_instance })
 }
 
@@ -1057,9 +1060,9 @@ mod tests {
 
     use super::{
         adopt_project_instance, create_project_instance, discover_diagnostic_project_root_from_cwd,
-        init_project, list_project_instances, resolve_project_setup_root_from_cwd,
-        resolve_target_from_cwd, TargetSelection, WorkRootRequirement, DEFAULT_INSTANCE,
-        PROJECT_DIR,
+        init_project, list_project_instances, normalize_project_default_instance,
+        resolve_project_setup_root_from_cwd, resolve_target_from_cwd, TargetSelection,
+        WorkRootRequirement, DEFAULT_INSTANCE, PROJECT_DIR,
     };
 
     #[test]
@@ -1078,6 +1081,19 @@ mod tests {
             .join(".lionclaw/instances/main/config/instance.toml")
             .exists());
         assert_eq!(result.instance.work_root, result.project_root);
+    }
+
+    #[test]
+    fn project_default_instance_normalization_trims_and_drops_empty_values() {
+        assert_eq!(
+            normalize_project_default_instance(Some(" reviewer ".to_string())).as_deref(),
+            Some("reviewer")
+        );
+        assert_eq!(
+            normalize_project_default_instance(Some(" \t ".to_string())),
+            None
+        );
+        assert_eq!(normalize_project_default_instance(None), None);
     }
 
     #[test]
