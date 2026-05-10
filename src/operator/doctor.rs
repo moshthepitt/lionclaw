@@ -163,7 +163,7 @@ pub struct DoctorFinding {
     pub target: Box<str>,
     pub expected: Box<str>,
     pub observed: Box<str>,
-    pub inspect: Option<Box<str>>,
+    pub inspect: Box<str>,
     pub repair: Option<Box<str>>,
 }
 
@@ -193,20 +193,21 @@ impl DoctorFinding {
         target: impl Into<String>,
         observed: impl Into<String>,
     ) -> Self {
+        let target = target.into();
         Self {
             subject: into_boxed_str(subject),
             id: kind.id(),
             severity,
-            target: into_boxed_str(target),
+            target: target.clone().into_boxed_str(),
             expected: kind.expected().into(),
             observed: into_boxed_str(observed),
-            inspect: None,
+            inspect: default_inspect_command(&target),
             repair: None,
         }
     }
 
     fn with_inspect(mut self, command: impl Into<String>) -> Self {
-        self.inspect = Some(command.into().into_boxed_str());
+        self.inspect = command.into().into_boxed_str();
         self
     }
 
@@ -218,6 +219,18 @@ impl DoctorFinding {
 
 fn into_boxed_str(value: impl Into<String>) -> Box<str> {
     value.into().into_boxed_str()
+}
+
+fn default_inspect_command(target: &str) -> Box<str> {
+    if target_looks_like_path(target) {
+        format!("ls -ld {}", shell_quote_arg(target)).into_boxed_str()
+    } else {
+        "lionclaw status".into()
+    }
+}
+
+fn target_looks_like_path(target: &str) -> bool {
+    target.starts_with('/') || target.starts_with('.') || target.contains('/')
 }
 
 #[derive(Debug, Clone, Default)]
@@ -248,9 +261,7 @@ impl DoctorReport {
             output.push_str(&format!("target: {}\n", finding.target));
             output.push_str(&format!("expected: {}\n", finding.expected));
             output.push_str(&format!("observed: {}\n", finding.observed));
-            if let Some(inspect) = finding.inspect.as_deref() {
-                output.push_str(&format!("inspect: {inspect}\n"));
-            }
+            output.push_str(&format!("inspect: {}\n", finding.inspect));
             if let Some(repair) = finding.repair.as_deref() {
                 output.push_str(&format!("repair: {repair}\n"));
             }
@@ -467,6 +478,7 @@ async fn inspect_project<M: UnitManager>(
                         instances_dir_path(project_root).display()
                     ),
                 )
+                .with_inspect(project_command(project_root, "instance list"))
                 .with_repair(project_create_instance_command(
                     project_root,
                     default_instance,
@@ -506,6 +518,7 @@ fn inspect_default_instance<'a>(
                 project_file_path(project_root).display().to_string(),
                 format!("{}: {err}", project_file_path(project_root).display()),
             )
+            .with_inspect(project_command(project_root, "instance list"))
             .with_repair(format!(
                 "edit {}",
                 project_file_path(project_root).display()
@@ -547,6 +560,7 @@ fn selected_project_instance_names(
                         project_file_path(project_root).display()
                     ),
                 )
+                .with_inspect(project_command(project_root, "instance list"))
                 .with_repair(format!(
                     "edit {}",
                     project_file_path(project_root).display()
@@ -567,6 +581,7 @@ fn project_has_no_instances_finding(project_root: &Path, repair_instance: &str) 
             instances_dir_path(project_root).display()
         ),
     )
+    .with_inspect(project_command(project_root, "instance list"))
     .with_repair(project_create_instance_command(
         project_root,
         repair_instance,
@@ -607,6 +622,7 @@ async fn inspect_instance<M: UnitManager>(
                     lion_home.config_path().display().to_string(),
                     err.to_string(),
                 )
+                .with_inspect(commands.selected("status"))
                 .with_repair(commands.selected("configure --runtime codex")),
             );
             return findings;
@@ -837,6 +853,7 @@ fn inspect_runtime_config(
                 format!("instance {name} runtime defaults"),
                 "runtime setup is required before run/up/connect can launch workers",
             )
+            .with_inspect(commands.selected("status"))
             .with_repair(commands.selected("configure --runtime codex")),
         );
         return;
@@ -850,6 +867,7 @@ fn inspect_runtime_config(
                 format!("instance {name} runtime profile {runtime_id}"),
                 "defaults.runtime points at a profile that is not configured",
             )
+            .with_inspect(commands.selected("status"))
             .with_repair(commands.selected("configure --runtime codex")),
         );
         return;
@@ -863,17 +881,21 @@ fn inspect_runtime_config(
                 format!("instance {name} runtime profile {runtime_id}"),
                 err.to_string(),
             )
+            .with_inspect(commands.selected("status"))
             .with_repair(commands.selected("configure --runtime codex")),
         );
     }
 
     if let Some(guidance) = runtime_auth_guidance(profile) {
-        findings.push(DoctorFinding::warning(
-            FindingKind::RuntimeAuth,
-            format!("runtime auth for \"{runtime_id}\" is not refreshed by doctor"),
-            format!("instance {name} runtime auth {runtime_id}"),
-            guidance,
-        ));
+        findings.push(
+            DoctorFinding::warning(
+                FindingKind::RuntimeAuth,
+                format!("runtime auth for \"{runtime_id}\" is not refreshed by doctor"),
+                format!("instance {name} runtime auth {runtime_id}"),
+                guidance,
+            )
+            .with_inspect(commands.selected("status")),
+        );
     }
 }
 
@@ -1017,6 +1039,7 @@ fn inspect_channel_metadata_match(
                     metadata.env
                 ),
             )
+            .with_inspect(commands.selected("channel list"))
             .with_repair(commands.selected(&format!("connect {}", shell_quote_arg(&channel.id)))),
         );
     }
@@ -1250,12 +1273,15 @@ async fn inspect_expected_units<M: UnitManager>(
     let owned_units = match manager.owned_units(home) {
         Ok(units) => units,
         Err(err) => {
-            findings.push(DoctorFinding::error(
-                FindingKind::ManagedUnit,
-                format!("managed unit ownership is invalid for instance \"{name}\""),
-                home.root().display().to_string(),
-                err.to_string(),
-            ));
+            findings.push(
+                DoctorFinding::error(
+                    FindingKind::ManagedUnit,
+                    format!("managed unit ownership is invalid for instance \"{name}\""),
+                    home.root().display().to_string(),
+                    err.to_string(),
+                )
+                .with_inspect(commands.selected("status")),
+            );
             return;
         }
     };
@@ -1273,6 +1299,7 @@ async fn inspect_expected_units<M: UnitManager>(
                 format!("instance {name} managed daemon unit"),
                 "no owned systemd unit metadata was found for the selected home",
             )
+            .with_inspect(commands.selected("status"))
             .with_repair(commands.selected("up")),
         );
     }
@@ -1289,6 +1316,7 @@ async fn inspect_expected_units<M: UnitManager>(
                     format!("instance {name} {subject} unit"),
                     "no owned systemd unit metadata was found for the selected home",
                 )
+                .with_inspect(commands.selected("status"))
                 .with_repair(commands.selected("up")),
             );
         }
@@ -1383,6 +1411,7 @@ async fn inspect_owned_stale_units<M: UnitManager>(
                 unit_name.to_string(),
                 format!("{unit_name}: {status}"),
             )
+            .with_inspect(format!("systemctl --user show {unit_name}"))
             .with_repair(commands.selected("up")),
         );
     }
@@ -1416,30 +1445,36 @@ fn inspect_project_units(
         let metadata = match unit_file_metadata(&unit_path)? {
             Some(metadata) => metadata,
             None => {
-                findings.push(DoctorFinding::warning(
-                    FindingKind::ProjectUnit,
-                    "unowned LionClaw-looking unit",
-                    unit_path.display().to_string(),
-                    format!(
-                        "{} is not a regular unit file with readable LionClaw metadata",
-                        unit_path.display()
-                    ),
-                ));
+                findings.push(
+                    DoctorFinding::warning(
+                        FindingKind::ProjectUnit,
+                        "unowned LionClaw-looking unit",
+                        unit_path.display().to_string(),
+                        format!(
+                            "{} is not a regular unit file with readable LionClaw metadata",
+                            unit_path.display()
+                        ),
+                    )
+                    .with_inspect(format!("systemctl --user show {unit_name}")),
+                );
                 continue;
             }
         };
         let recorded_home = match metadata.home_root.as_ref() {
             Some(home) => home,
             None => {
-                findings.push(DoctorFinding::warning(
-                    FindingKind::ProjectUnit,
-                    "unowned LionClaw-looking unit",
-                    unit_path.display().to_string(),
-                    format!(
-                        "{} has no X-LionClaw-HomeRoot metadata",
-                        unit_path.display()
-                    ),
-                ));
+                findings.push(
+                    DoctorFinding::warning(
+                        FindingKind::ProjectUnit,
+                        "unowned LionClaw-looking unit",
+                        unit_path.display().to_string(),
+                        format!(
+                            "{} has no X-LionClaw-HomeRoot metadata",
+                            unit_path.display()
+                        ),
+                    )
+                    .with_inspect(format!("systemctl --user show {unit_name}")),
+                );
                 continue;
             }
         };
@@ -1447,57 +1482,69 @@ fn inspect_project_units(
             continue;
         }
         if metadata.unit_group_id.is_none() {
-            findings.push(DoctorFinding::warning(
-                FindingKind::ProjectUnit,
-                "incomplete LionClaw unit metadata",
-                unit_path.display().to_string(),
-                format!(
-                    "{} records {} but has no X-LionClaw-UnitGroupId metadata",
-                    unit_path.display(),
-                    recorded_home.display()
-                ),
-            ));
+            findings.push(
+                DoctorFinding::warning(
+                    FindingKind::ProjectUnit,
+                    "incomplete LionClaw unit metadata",
+                    unit_path.display().to_string(),
+                    format!(
+                        "{} records {} but has no X-LionClaw-UnitGroupId metadata",
+                        unit_path.display(),
+                        recorded_home.display()
+                    ),
+                )
+                .with_inspect(format!("systemctl --user show {unit_name}")),
+            );
             continue;
         }
         if let Some(identity) = known_identities.get(recorded_home) {
             if metadata.belongs_to_identity(identity) {
                 continue;
             }
-            findings.push(DoctorFinding::warning(
-                FindingKind::ProjectUnit,
-                "LionClaw unit metadata does not match instance identity",
-                unit_path.display().to_string(),
-                format!(
-                    "{} records {} but is not owned by that instance's unit group",
-                    unit_path.display(),
-                    recorded_home.display()
-                ),
-            ));
+            findings.push(
+                DoctorFinding::warning(
+                    FindingKind::ProjectUnit,
+                    "LionClaw unit metadata does not match instance identity",
+                    unit_path.display().to_string(),
+                    format!(
+                        "{} records {} but is not owned by that instance's unit group",
+                        unit_path.display(),
+                        recorded_home.display()
+                    ),
+                )
+                .with_inspect(format!("systemctl --user show {unit_name}")),
+            );
             continue;
         }
         if known_homes.contains(recorded_home) {
-            findings.push(DoctorFinding::warning(
+            findings.push(
+                DoctorFinding::warning(
+                    FindingKind::ProjectUnit,
+                    "LionClaw unit points at instance without unit identity",
+                    unit_path.display().to_string(),
+                    format!(
+                        "{} records {} but the instance has no unit group id",
+                        unit_path.display(),
+                        recorded_home.display()
+                    ),
+                )
+                .with_inspect(format!("systemctl --user show {unit_name}")),
+            );
+            continue;
+        }
+        findings.push(
+            DoctorFinding::warning(
                 FindingKind::ProjectUnit,
-                "LionClaw unit points at instance without unit identity",
+                "ghost LionClaw unit points into this project",
                 unit_path.display().to_string(),
                 format!(
-                    "{} records {} but the instance has no unit group id",
+                    "{} records missing or unregistered home {}",
                     unit_path.display(),
                     recorded_home.display()
                 ),
-            ));
-            continue;
-        }
-        findings.push(DoctorFinding::warning(
-            FindingKind::ProjectUnit,
-            "ghost LionClaw unit points into this project",
-            unit_path.display().to_string(),
-            format!(
-                "{} records missing or unregistered home {}",
-                unit_path.display(),
-                recorded_home.display()
-            ),
-        ));
+            )
+            .with_inspect(format!("systemctl --user show {unit_name}")),
+        );
     }
     Ok(findings)
 }
@@ -1769,12 +1816,134 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
 mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
 
+    use axum::{http::StatusCode, routing::get, Json, Router};
+
     use super::*;
+    use crate::contracts::DaemonInfoResponse;
     use crate::kernel::runtime::{ConfinementConfig, OciConfinementConfig};
     use crate::operator::config::RuntimeProfileConfig;
     use crate::operator::managed_units::{
-        channel_unit_name, ensure_unit_identity, FakeUnitManager,
+        channel_unit_name, daemon_unit_name, ensure_unit_identity, render_daemon_unit,
+        DaemonUnitSpec, FakeUnitManager, UnitManager,
     };
+
+    async fn configured_bind_fixture() -> (
+        tempfile::TempDir,
+        LionClawHome,
+        PathBuf,
+        DoctorCommands,
+        OperatorConfig,
+    ) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let work_root = temp_dir.path().join("work");
+        fs::create_dir(&work_root).expect("work root");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        home.ensure_home_id().await.expect("home id");
+        let home_root = home.root();
+        let commands = DoctorCommands::for_target(None, "direct-home", &home_root);
+        let mut config = OperatorConfig::default();
+        config.daemon.bind_configured = true;
+        (temp_dir, home, work_root, commands, config)
+    }
+
+    fn current_daemon_fingerprint(home: &LionClawHome, config: &OperatorConfig) -> String {
+        let applied_state =
+            AppliedState::from_home_read_only(home, config).expect("read applied state");
+        compute_daemon_fingerprint(&daemon_compat_fingerprint(config), &applied_state)
+    }
+
+    fn daemon_info(
+        home: &LionClawHome,
+        bind: &str,
+        home_id: String,
+        project_scope: String,
+        daemon_fingerprint: String,
+    ) -> DaemonInfoResponse {
+        DaemonInfoResponse {
+            daemon: "lionclawd".to_string(),
+            status: "ok".to_string(),
+            home_id,
+            home_root: home.root().display().to_string(),
+            bind_addr: bind.to_string(),
+            project_scope,
+            daemon_fingerprint,
+        }
+    }
+
+    async fn spawn_daemon_info_server(
+        info: DaemonInfoResponse,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind daemon info server");
+        let bind = listener.local_addr().expect("daemon info addr").to_string();
+        let app = Router::new().route(
+            "/v0/daemon/info",
+            get({
+                let info = info.clone();
+                move || {
+                    let info = info.clone();
+                    async move { Json(info) }
+                }
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve daemon info app");
+        });
+        (bind, handle)
+    }
+
+    async fn spawn_incompatible_lionclaw_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind incompatible daemon server");
+        let bind = listener.local_addr().expect("daemon addr").to_string();
+        let app = Router::new()
+            .route("/v0/daemon/info", get(|| async { StatusCode::NOT_FOUND }))
+            .route(
+                "/health",
+                get(|| async { Json(serde_json::json!({ "daemon": "lionclawd" })) }),
+            );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve incompatible daemon app");
+        });
+        (bind, handle)
+    }
+
+    async fn mark_owned_daemon_active(
+        home: &LionClawHome,
+        manager: &FakeUnitManager,
+        bind: &str,
+        work_root: &Path,
+        daemon_fingerprint: &str,
+    ) {
+        let identity = ensure_unit_identity(home).expect("unit identity");
+        let daemon = render_daemon_unit(
+            home,
+            &identity,
+            Path::new("/tmp/lionclawd"),
+            DaemonUnitSpec {
+                bind_addr: bind,
+                runtime_id: "codex",
+                workspace: crate::home::DEFAULT_WORKSPACE,
+                project_workspace_root: work_root,
+                daemon_fingerprint,
+                codex_home_override: None,
+            },
+        );
+        manager
+            .apply_units(home, &[daemon])
+            .await
+            .expect("apply daemon unit");
+        manager
+            .set_unit_status(daemon_unit_name(&identity), "loaded/active/running")
+            .expect("set daemon status");
+    }
 
     #[test]
     fn doctor_commands_keep_project_repairs_project_scoped() {
@@ -1839,6 +2008,7 @@ mod tests {
             rendered.contains("expected: selected instance has a valid configured runtime profile")
         );
         assert!(rendered.contains("observed: configure first"));
+        assert!(rendered.contains("inspect: lionclaw status"));
     }
 
     #[tokio::test]
@@ -1881,7 +2051,7 @@ mod tests {
             "selected instance work root is not valid enough to compute daemon project scope"
         );
         let expected_inspect = commands.selected("status");
-        assert_eq!(finding.inspect.as_deref(), Some(expected_inspect.as_str()));
+        assert_eq!(finding.inspect.as_ref(), expected_inspect.as_str());
     }
 
     #[tokio::test]
@@ -1920,6 +2090,36 @@ mod tests {
 
         assert!(findings.is_empty());
         assert!(!home.skills_dir().join(".applied").exists());
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_invalid_configured_bind_as_unclassifiable() {
+        let (_temp_dir, home, work_root, commands, mut config) = configured_bind_fixture().await;
+        config.daemon.bind = "not a bind".to_string();
+        let manager = FakeUnitManager::default();
+        let mut findings = Vec::new();
+
+        inspect_configured_bind(
+            &home,
+            "direct-home",
+            &commands,
+            &config,
+            Some(&work_root),
+            &manager,
+            &mut findings,
+        )
+        .await;
+
+        let finding = findings.first().expect("configured bind finding");
+        assert_eq!(finding.id, "LC-D009");
+        assert_eq!(
+            finding.subject.as_ref(),
+            "configured bind cannot be classified"
+        );
+        assert!(finding
+            .observed
+            .contains("configured daemon bind 'not a bind' cannot be resolved"));
+        assert_eq!(finding.inspect.as_ref(), "ss -ltnp");
     }
 
     #[tokio::test]
@@ -1975,7 +2175,205 @@ mod tests {
             format!("{bind} is used by a non-LionClaw process")
         );
         let expected_inspect = inspect_listener_command(&bind);
-        assert_eq!(finding.inspect.as_deref(), Some(expected_inspect.as_str()));
+        assert_eq!(finding.inspect.as_ref(), expected_inspect.as_str());
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_foreign_home_on_configured_bind() {
+        let (_temp_dir, home, work_root, commands, mut config) = configured_bind_fixture().await;
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let project_scope = runtime_project_partition_key(Some(&work_root));
+        let daemon_fingerprint = current_daemon_fingerprint(&home, &config);
+        let mut info = daemon_info(
+            &home,
+            "127.0.0.1:0",
+            "foreign-home-id".to_string(),
+            project_scope,
+            daemon_fingerprint,
+        );
+        info.home_root = "/tmp/other-home".to_string();
+        let (bind, server) = spawn_daemon_info_server(info).await;
+        config.daemon.bind = bind.clone();
+        let mut findings = Vec::new();
+
+        inspect_configured_bind(
+            &home,
+            "direct-home",
+            &commands,
+            &config,
+            Some(&work_root),
+            &FakeUnitManager::default(),
+            &mut findings,
+        )
+        .await;
+        server.abort();
+
+        let finding = findings.first().expect("configured bind finding");
+        assert_eq!(home_id, home.read_home_id().await.unwrap().unwrap());
+        assert_eq!(finding.id, "LC-D002");
+        assert_eq!(
+            finding.inspect.as_ref(),
+            "lionclaw --home /tmp/other-home status"
+        );
+        assert_eq!(
+            finding.repair.as_deref(),
+            Some("lionclaw --home /tmp/other-home down")
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_same_home_different_project_on_configured_bind() {
+        let (_temp_dir, home, work_root, commands, mut config) = configured_bind_fixture().await;
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let daemon_fingerprint = current_daemon_fingerprint(&home, &config);
+        let info = daemon_info(
+            &home,
+            "127.0.0.1:0",
+            home_id,
+            "different-project-scope".to_string(),
+            daemon_fingerprint,
+        );
+        let (bind, server) = spawn_daemon_info_server(info).await;
+        config.daemon.bind = bind.clone();
+        let mut findings = Vec::new();
+
+        inspect_configured_bind(
+            &home,
+            "direct-home",
+            &commands,
+            &config,
+            Some(&work_root),
+            &FakeUnitManager::default(),
+            &mut findings,
+        )
+        .await;
+        server.abort();
+
+        let finding = findings.first().expect("configured bind finding");
+        assert_eq!(finding.id, "LC-D003");
+        assert_eq!(
+            finding.subject.as_ref(),
+            "configured bind is served by this home for a different project"
+        );
+        assert_eq!(
+            finding.inspect.as_ref(),
+            inspect_listener_command(&bind).as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_same_home_foreground_daemon_on_configured_bind() {
+        let (_temp_dir, home, work_root, commands, mut config) = configured_bind_fixture().await;
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let project_scope = runtime_project_partition_key(Some(&work_root));
+        let daemon_fingerprint = current_daemon_fingerprint(&home, &config);
+        let info = daemon_info(
+            &home,
+            "127.0.0.1:0",
+            home_id,
+            project_scope,
+            daemon_fingerprint,
+        );
+        let (bind, server) = spawn_daemon_info_server(info).await;
+        config.daemon.bind = bind.clone();
+        let mut findings = Vec::new();
+
+        inspect_configured_bind(
+            &home,
+            "direct-home",
+            &commands,
+            &config,
+            Some(&work_root),
+            &FakeUnitManager::default(),
+            &mut findings,
+        )
+        .await;
+        server.abort();
+
+        let finding = findings.first().expect("configured bind finding");
+        assert_eq!(finding.id, "LC-D003");
+        assert_eq!(
+            finding.subject.as_ref(),
+            "configured bind is served by an unmanaged foreground daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_stale_managed_daemon_on_configured_bind() {
+        let (_temp_dir, home, work_root, commands, mut config) = configured_bind_fixture().await;
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let project_scope = runtime_project_partition_key(Some(&work_root));
+        let current_fingerprint = current_daemon_fingerprint(&home, &config);
+        let info = daemon_info(
+            &home,
+            "127.0.0.1:0",
+            home_id,
+            project_scope,
+            "stale-daemon-fingerprint".to_string(),
+        );
+        let (bind, server) = spawn_daemon_info_server(info).await;
+        config.daemon.bind = bind.clone();
+        let manager = FakeUnitManager::default();
+        mark_owned_daemon_active(&home, &manager, &bind, &work_root, &current_fingerprint).await;
+        let mut findings = Vec::new();
+
+        inspect_configured_bind(
+            &home,
+            "direct-home",
+            &commands,
+            &config,
+            Some(&work_root),
+            &manager,
+            &mut findings,
+        )
+        .await;
+        server.abort();
+
+        let finding = findings.first().expect("configured bind finding");
+        assert_eq!(finding.id, "LC-D008");
+        assert_eq!(
+            finding.subject.as_ref(),
+            "managed daemon is running stale configuration"
+        );
+        assert_eq!(
+            finding.inspect.as_ref(),
+            commands.selected("status").as_str()
+        );
+        assert_eq!(
+            finding.repair.as_deref(),
+            Some(commands.selected("up").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_incompatible_lionclaw_on_configured_bind() {
+        let (_temp_dir, home, work_root, commands, mut config) = configured_bind_fixture().await;
+        let (bind, server) = spawn_incompatible_lionclaw_server().await;
+        config.daemon.bind = bind.clone();
+        let mut findings = Vec::new();
+
+        inspect_configured_bind(
+            &home,
+            "direct-home",
+            &commands,
+            &config,
+            Some(&work_root),
+            &FakeUnitManager::default(),
+            &mut findings,
+        )
+        .await;
+        server.abort();
+
+        let finding = findings.first().expect("configured bind finding");
+        assert_eq!(finding.id, "LC-D004");
+        assert_eq!(
+            finding.subject.as_ref(),
+            "configured bind is served by an older LionClaw daemon"
+        );
+        assert_eq!(
+            finding.inspect.as_ref(),
+            inspect_listener_command(&bind).as_str()
+        );
     }
 
     #[tokio::test]

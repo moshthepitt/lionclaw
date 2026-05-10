@@ -104,7 +104,32 @@ Expected:
 - `/reset` starts a fresh interactive session
 - generated drafts stay outside the project checkout
 
-## Phase 3: Project Isolation
+## Phase 3: Instances And Work Roots
+
+Create two more instances in project A:
+
+```bash
+cd "$PROJ_A"
+mkdir -p shared-work reviewer-work
+"$LIONCLAW_BIN" instance create reviewer --work-root "$PROJ_A/reviewer-work"
+"$LIONCLAW_BIN" instance create shared --work-root "$PROJ_A/shared-work"
+"$LIONCLAW_BIN" instance create shared-two --work-root "$PROJ_A/shared-work"
+"$LIONCLAW_BIN" instance list
+"$LIONCLAW_BIN" --instance reviewer status
+"$LIONCLAW_BIN" --instance shared status
+"$LIONCLAW_BIN" status --all
+"$LIONCLAW_BIN" doctor --all
+```
+
+Expected:
+
+- `instance list` marks the default instance and shows both shared instances
+  pointing at the same work root
+- `--instance reviewer` targets only the reviewer instance
+- `status --all` and `doctor --all` enumerate project instances explicitly
+- shared work roots are reported as shared, not treated as corruption
+
+## Phase 4: Project Isolation
 
 Configure project B separately:
 
@@ -126,7 +151,7 @@ Expected:
 - the answer is `project-b`
 - project B does not reuse project A work-root state
 
-## Phase 4: Channels
+## Phase 5: Channels
 
 From project A, attach the terminal channel:
 
@@ -144,7 +169,26 @@ Expected:
 - the channel response comes from the configured runtime
 - `lionclaw logs -f` can inspect the selected instance without raw HTTP
 
-## Phase 5: Background Operation
+Telegram is credential-gated manual QA. Run it only when a real bot token and
+chat flow are available; do not fake Telegram with local shims in this
+checklist.
+
+```bash
+cd "$PROJ_A"
+printf 'TELEGRAM_BOT_TOKEN=...\n' > telegram.env
+"$LIONCLAW_BIN" connect telegram --env-file ./telegram.env
+```
+
+Expected when credentials are available:
+
+- the token is stored in selected-instance private channel env
+- `doctor` does not print the token
+- Telegram delivery works through the configured runtime after peer approval
+
+If credentials are not available, record this subphase as skipped with
+`missing Telegram bot token`.
+
+## Phase 6: Background Operation
 
 On Linux with a systemd user manager:
 
@@ -153,7 +197,9 @@ cd "$PROJ_A"
 "$LIONCLAW_BIN" up
 "$LIONCLAW_BIN" status
 "$LIONCLAW_BIN" logs --tail 200
+"$LIONCLAW_BIN" logs -f
 "$LIONCLAW_BIN" doctor
+"$LIONCLAW_BIN" down
 ```
 
 Expected:
@@ -162,6 +208,7 @@ Expected:
 - configured background workers are active
 - `doctor` reports stable `[LC-D...]` findings when there is drift
 - `doctor` does not repair, start, stop, allocate, or rewrite state
+- `down` stops only units owned by the selected instance
 
 For platform evidence only:
 
@@ -170,7 +217,7 @@ systemctl --user status lionclaw*.service
 journalctl --user -u 'lionclaw*.service' -n 100 --no-pager
 ```
 
-## Phase 6: Jobs
+## Phase 7: Jobs
 
 With the terminal channel available:
 
@@ -194,9 +241,102 @@ Expected:
 - delivery reaches the approved channel peer
 - job history is visible through the CLI
 
-## Phase 7: Doctor Drift
+## Phase 8: Doctor Diagnostics
 
-Create only the drift relevant to the change under test, then run:
+Every diagnostic finding must include `[LC-D...]`, severity, `target`,
+`expected`, `observed`, and read-only `inspect`. `repair` appears only when the
+command is concrete and safe.
+
+### Missing Default Instance
+
+Use a scratch copy or restore the file after the check:
+
+```bash
+cd "$PROJ_A"
+cp .lionclaw/project.toml .lionclaw/project.toml.qa-bak
+printf 'version = 1\ndefault_instance = "missing"\n' > .lionclaw/project.toml
+"$LIONCLAW_BIN" doctor
+mv .lionclaw/project.toml.qa-bak .lionclaw/project.toml
+```
+
+Expected:
+
+- `doctor` exits 1
+- the finding reports the missing configured default instance
+- the repair is an explicit `lionclaw --project ... instance create missing`
+
+### Missing Channel Env
+
+Only run this after configuring a channel with required env, such as Telegram:
+
+```bash
+cd "$PROJ_A"
+mv .lionclaw/instances/main/config/channels/telegram.env \
+  .lionclaw/instances/main/config/channels/telegram.env.qa-bak
+"$LIONCLAW_BIN" doctor
+mv .lionclaw/instances/main/config/channels/telegram.env.qa-bak \
+  .lionclaw/instances/main/config/channels/telegram.env
+```
+
+Expected:
+
+- `doctor` exits 1
+- the finding names the channel env problem without printing secret values
+- `inspect` is read-only and `repair` points at `lionclaw connect telegram`
+
+Skip with `no credential-backed background channel configured` when this
+precondition is not available.
+
+### Bind Conflict
+
+Reserve the selected configured bind with a non-LionClaw process, then run
+doctor. Use the actual configured port from
+`.lionclaw/instances/main/config/lionclaw.toml`.
+
+```bash
+cd "$PROJ_A"
+PORT=$(sed -n 's/^bind = "127\.0\.0\.1:\([0-9][0-9]*\)"/\1/p' \
+  .lionclaw/instances/main/config/lionclaw.toml | head -n 1)
+python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$PROJ_A"
+"$LIONCLAW_BIN" doctor
+```
+
+Expected:
+
+- `doctor` exits 1
+- the bind finding is `LC-D001`
+- `inspect` uses `ss -ltnp '( sport = :PORT )'`
+- no raw HTTP command is printed
+
+Stop the temporary server after recording evidence.
+
+### Stale Or Ghost Units
+
+Create only one unit drift at a time. Examples:
+
+```bash
+cd "$PROJ_A"
+"$LIONCLAW_BIN" up
+systemctl --user stop 'lionclaw*.service'
+"$LIONCLAW_BIN" doctor
+```
+
+For ghost-unit coverage, preserve a copy of an owned LionClaw unit file, run
+`down`, restore the copied unit file under `~/.config/systemd/user/`, then run:
+
+```bash
+"$LIONCLAW_BIN" doctor --all
+```
+
+Expected:
+
+- stopped owned units are errors with explicit `lionclaw up` repair
+- ghost or unowned LionClaw-looking units are warnings
+- warnings never mutate or remove units
+
+### Final Doctor Sweep
+
+After restoring drift:
 
 ```bash
 "$LIONCLAW_BIN" doctor
@@ -206,7 +346,7 @@ Create only the drift relevant to the change under test, then run:
 Expected:
 
 - every finding has `[LC-D...]`, severity, target, expected, and observed
-- optional `inspect` commands are read-only
+- every finding has a read-only `inspect` command
 - optional `repair` commands are explicit LionClaw or platform commands
 - warnings alone exit 0
 - errors exit 1
