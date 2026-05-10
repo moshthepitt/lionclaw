@@ -61,8 +61,8 @@ what session is active, and which boundary decisions are recorded.
 ## Quick Start
 
 LionClaw is built in Rust. Clone it, build it, initialize the project, create
-the shared runtime image, register one runtime on the default instance, and
-start a confined session.
+the shared runtime image, configure Codex on the default instance, and start a
+confined session.
 
 ```bash
 # 1. Build the core binaries
@@ -79,13 +79,14 @@ podman build -t lionclaw-runtime:v1 -f containers/runtime/Containerfile .
 # 4. Example runtime: sign in to Codex once on the host
 codex login
 
-# 5. Register that runtime on the selected instance and start using it
-./target/release/lionclaw runtime add codex --kind codex --bin codex --image lionclaw-runtime:v1
-./target/release/lionclaw run codex
+# 5. Configure Codex on the selected instance and start using it
+./target/release/lionclaw configure --runtime codex
+./target/release/lionclaw status
+./target/release/lionclaw run
 ```
 
-If you prefer OpenCode and have it configured, register it through the same
-runtime mechanism:
+OpenCode can still be registered through the lower-level runtime mechanism, but
+it is not part of the configure happy path yet:
 
 ```bash
 ./target/release/lionclaw runtime add opencode --kind opencode --bin opencode --image lionclaw-runtime:v1
@@ -108,11 +109,12 @@ Targeting is explicit and deterministic:
 ./target/release/lionclaw run
 ./target/release/lionclaw --instance reviewer run
 ./target/release/lionclaw --project /path/to/project --instance reviewer run
-./target/release/lionclaw --home /path/to/instance-home run
 ```
 
 Without `--home` or `--project`, LionClaw discovers only the current directory
 and its immediate parent. It does not walk arbitrarily up the filesystem.
+Use `--home PATH` only when you need to target one exact instance home and
+bypass project discovery.
 
 Installed non-channel skills are mounted read-only under `/lionclaw/skills/<alias>`
 and projected into each runtime's native skill directory inside `/runtime/home`.

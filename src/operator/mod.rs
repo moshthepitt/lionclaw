@@ -5,6 +5,8 @@ pub mod daemon_probe;
 pub mod reconcile;
 pub mod run;
 pub mod runtime;
+pub mod runtime_integration;
 pub mod services;
 pub mod snapshot;
+pub mod status;
 pub mod target;

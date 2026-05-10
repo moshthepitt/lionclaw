@@ -67,6 +67,22 @@ pub struct InstanceListEntry {
     pub shared_work_root_count: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkRootInspection {
+    pub work_root: Option<PathBuf>,
+    pub finding: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InstanceStatusEntry {
+    pub name: String,
+    pub is_default: bool,
+    pub home: PathBuf,
+    pub work_root: Option<PathBuf>,
+    pub work_root_finding: Option<String>,
+    pub shared_work_root_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProjectFileConfig {
     #[serde(default)]
@@ -282,6 +298,60 @@ pub fn list_project_instances(project_root: &Path) -> Result<Vec<InstanceListEnt
         .collect())
 }
 
+pub fn list_project_instance_statuses(project_root: &Path) -> Result<Vec<InstanceStatusEntry>> {
+    let project_root = canonical_project_root(project_root)?;
+    let config = load_project_config(&project_root)?;
+    let names = list_instance_names(&project_root)?;
+    let mut inspections_by_name = BTreeMap::new();
+    let mut counts = BTreeMap::<PathBuf, usize>::new();
+
+    for name in &names {
+        let home = instance_home(&project_root, name);
+        let inspection = inspect_project_instance_work_root(&project_root, &home);
+        if let Some(work_root) = &inspection.work_root {
+            *counts.entry(work_root.clone()).or_insert(0) += 1;
+        }
+        inspections_by_name.insert(name.clone(), inspection);
+    }
+
+    Ok(names
+        .into_iter()
+        .map(|name| {
+            let home = instance_home(&project_root, &name);
+            let inspection =
+                inspections_by_name
+                    .remove(&name)
+                    .unwrap_or_else(|| WorkRootInspection {
+                        work_root: None,
+                        finding: Some("work root was not inspected".to_string()),
+                    });
+            let shared_work_root_count = inspection
+                .work_root
+                .as_ref()
+                .and_then(|path| counts.get(path))
+                .copied()
+                .unwrap_or(0);
+            InstanceStatusEntry {
+                is_default: config.default_instance.as_deref() == Some(name.as_str()),
+                name,
+                home,
+                work_root: inspection.work_root,
+                work_root_finding: inspection.finding,
+                shared_work_root_count,
+            }
+        })
+        .collect())
+}
+
+pub fn inspect_target_work_root(target: &TargetContext) -> WorkRootInspection {
+    match (&target.project_root, &target.instance_name) {
+        (Some(project_root), Some(_)) => {
+            inspect_project_instance_work_root(project_root, &target.instance_home.root())
+        }
+        _ => inspect_home_work_root(&target.instance_home.root()),
+    }
+}
+
 fn resolve_target_from_cwd(
     selection: &TargetSelection,
     work_root: WorkRootRequirement,
@@ -373,7 +443,7 @@ fn resolve_instance_name(
 
     if let Some(name) = config.default_instance.as_deref() {
         validate_instance_name(name)?;
-        ensure_instances_dir(project_root)?;
+        require_instances_dir(project_root)?;
         if !instance_home(project_root, name).exists() {
             bail!(
                 "default instance '{name}' is configured but missing; repair with 'lionclaw instance create {name}' or update {}",
@@ -397,7 +467,7 @@ fn resolve_instance_name(
 }
 
 fn resolve_project_instance_home(project_root: &Path, instance_name: &str) -> Result<PathBuf> {
-    ensure_instances_dir(project_root)?;
+    require_instances_dir(project_root)?;
     let home = instance_home(project_root, instance_name);
     if !home.exists() {
         bail!(
@@ -447,6 +517,47 @@ fn resolve_home_work_root(home: &Path) -> Result<PathBuf> {
     }
     fs::canonicalize(&config.work_root)
         .with_context(|| format!("failed to resolve work root {}", config.work_root.display()))
+}
+
+fn inspect_project_instance_work_root(project_root: &Path, home: &Path) -> WorkRootInspection {
+    match load_instance_config(home) {
+        Ok(Some(config)) => {
+            match validate_recorded_project_work_root(project_root, &config.work_root) {
+                Ok(work_root) => WorkRootInspection {
+                    work_root: Some(work_root),
+                    finding: None,
+                },
+                Err(err) => WorkRootInspection {
+                    work_root: None,
+                    finding: Some(err.to_string()),
+                },
+            }
+        }
+        Ok(None) => WorkRootInspection {
+            work_root: None,
+            finding: Some(format!(
+                "instance home {} does not record a work root",
+                home.display()
+            )),
+        },
+        Err(err) => WorkRootInspection {
+            work_root: None,
+            finding: Some(err.to_string()),
+        },
+    }
+}
+
+fn inspect_home_work_root(home: &Path) -> WorkRootInspection {
+    match resolve_home_work_root(home) {
+        Ok(work_root) => WorkRootInspection {
+            work_root: Some(work_root),
+            finding: None,
+        },
+        Err(err) => WorkRootInspection {
+            work_root: None,
+            finding: Some(err.to_string()),
+        },
+    }
 }
 
 fn load_project_config(project_root: &Path) -> Result<ProjectConfig> {
@@ -686,6 +797,26 @@ fn ensure_instances_dir(project_root: &Path) -> Result<()> {
         Err(err) => Err(err)
             .with_context(|| format!("failed to stat instances directory {}", instances.display())),
     }
+}
+
+fn require_instances_dir(project_root: &Path) -> Result<()> {
+    validate_project_metadata_dir(project_root)?;
+    let instances = instances_dir(project_root);
+    let metadata = fs::symlink_metadata(&instances)
+        .with_context(|| format!("failed to stat instances directory {}", instances.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "instances directory {} must not be a symlink",
+            instances.display()
+        );
+    }
+    if !metadata.is_dir() {
+        bail!(
+            "instances directory {} is not a directory",
+            instances.display()
+        );
+    }
+    Ok(())
 }
 
 fn ensure_directory_not_symlink(path: &Path, label: &str) -> Result<()> {

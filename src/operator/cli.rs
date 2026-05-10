@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    io::{BufRead, BufReader, IsTerminal, Write},
     path::{Path, PathBuf},
     process::ExitCode,
     str::FromStr,
@@ -36,8 +37,16 @@ use crate::{
         },
         run::run_local,
         runtime::{resolve_runtime_id, validate_runtime_availability},
+        runtime_integration::{
+            configure_runtime_profile_with_engine_resolver, configure_runtime_required_message,
+            ConfigureRuntimeOutcome,
+        },
         services::SystemdUserServiceManager,
         snapshot::SKILL_INSTALL_METADATA_FILE,
+        status::{
+            missing_target_for_status, render_project_status_all, render_target_status,
+            validate_status_all_target,
+        },
         target::{
             adopt_project_instance, create_project_instance, init_project, list_project_instances,
             resolve_existing_project_root, resolve_project_setup_root, resolve_target,
@@ -89,7 +98,9 @@ enum Command {
         #[command(subcommand)]
         command: InstanceCommand,
     },
+    Configure(ConfigureArgs),
     Run(RunArgs),
+    Status(StatusArgs),
     #[command(hide = true)]
     ProjectValidate(ProjectValidateArgs),
     Runtime {
@@ -129,6 +140,18 @@ struct RunArgs {
     )]
     timeout: Option<Duration>,
     runtime: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ConfigureArgs {
+    #[arg(long)]
+    runtime: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct StatusArgs {
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -579,6 +602,25 @@ pub async fn run() -> Result<ExitCode> {
                 );
             }
         },
+        Command::Configure(args) => {
+            let target = resolved_target
+                .as_ref()
+                .ok_or_else(|| anyhow!("configure requires a resolved LionClaw target"))?;
+            let stdin = std::io::stdin();
+            let interactive = stdin.is_terminal();
+            let mut input = BufReader::new(stdin);
+            let stdout = std::io::stdout();
+            let mut output = stdout;
+            let outcome = configure_runtime_with_io(
+                &target.instance_home,
+                args.runtime,
+                interactive,
+                &mut input,
+                &mut output,
+            )
+            .await?;
+            print_configure_outcome(&target.instance_home, &outcome);
+        }
         Command::Run(args) => {
             let target = resolved_target
                 .as_ref()
@@ -587,11 +629,31 @@ pub async fn run() -> Result<ExitCode> {
             run_local(
                 &target.instance_home,
                 target.require_work_root()?,
+                target.instance_name.as_deref(),
                 args.runtime,
                 args.continue_last_session,
                 timeout_override,
             )
             .await?;
+        }
+        Command::Status(args) => {
+            if args.all {
+                validate_status_all_target(&target_selection)?;
+                let project_root =
+                    resolve_existing_project_root(&target_selection).map_err(|_| {
+                        anyhow!(
+                            "status --all requires a LionClaw project; run from the project root or pass --project PATH"
+                        )
+                    })?;
+                let status = render_project_status_all(&project_root).await?;
+                print!("{status}");
+            } else {
+                let target = resolved_target
+                    .as_ref()
+                    .ok_or_else(missing_target_for_status)?;
+                let status = render_target_status(target).await?;
+                print!("{status}");
+            }
         }
         Command::ProjectValidate(args) => {
             let issues = validate_project_managed_config(&home, &args).await?;
@@ -1145,7 +1207,15 @@ fn resolve_command_target(
     command: &Command,
 ) -> Result<Option<crate::operator::target::TargetContext>> {
     let requirement = match command {
+        Command::Configure(_) => Some(WorkRootRequirement::Optional),
         Command::Run(_) => Some(WorkRootRequirement::Required),
+        Command::Status(args) => {
+            if args.all {
+                None
+            } else {
+                Some(WorkRootRequirement::Optional)
+            }
+        }
         Command::Service { command } => match command {
             ServiceCommand::Up(_) | ServiceCommand::Status => Some(WorkRootRequirement::Required),
             ServiceCommand::Down | ServiceCommand::Logs(_) => Some(WorkRootRequirement::Optional),
@@ -1198,6 +1268,80 @@ fn required_command_work_root<'a>(
         .as_ref()
         .ok_or_else(|| anyhow!("{command} requires a resolved LionClaw target"))?;
     target.require_work_root()
+}
+
+async fn configure_runtime_with_io<R: BufRead, W: Write>(
+    home: &LionClawHome,
+    requested_runtime: Option<String>,
+    interactive: bool,
+    input: &mut R,
+    output: &mut W,
+) -> Result<ConfigureRuntimeOutcome> {
+    configure_runtime_with_io_and_engine_resolver(
+        home,
+        requested_runtime,
+        interactive,
+        input,
+        output,
+        normalize_podman_executable,
+    )
+    .await
+}
+
+async fn configure_runtime_with_io_and_engine_resolver<R: BufRead, W: Write, F>(
+    home: &LionClawHome,
+    requested_runtime: Option<String>,
+    interactive: bool,
+    input: &mut R,
+    output: &mut W,
+    resolve_engine: F,
+) -> Result<ConfigureRuntimeOutcome>
+where
+    F: FnMut(&str) -> Result<String>,
+{
+    let runtime_id = match requested_runtime
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(runtime_id) => runtime_id.to_string(),
+        None if interactive => prompt_configure_runtime(input, output)?,
+        None => return Err(anyhow!(configure_runtime_required_message())),
+    };
+
+    let mut config = OperatorConfig::load(home).await?;
+    let outcome =
+        configure_runtime_profile_with_engine_resolver(&mut config, &runtime_id, resolve_engine)?;
+    config.save(home).await?;
+    Ok(outcome)
+}
+
+fn prompt_configure_runtime<R: BufRead, W: Write>(input: &mut R, output: &mut W) -> Result<String> {
+    writeln!(output, "Supported runtimes: codex")?;
+    write!(output, "Runtime to configure: ")?;
+    output.flush()?;
+
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    let runtime_id = line.trim();
+    if runtime_id.is_empty() {
+        return Err(anyhow!(configure_runtime_required_message()));
+    }
+    Ok(runtime_id.to_string())
+}
+
+fn print_configure_outcome(home: &LionClawHome, outcome: &ConfigureRuntimeOutcome) {
+    let profile_state = if outcome.created_profile {
+        "created"
+    } else {
+        "preserved"
+    };
+    println!(
+        "configured runtime {} for {} ({profile_state} profile)",
+        outcome.runtime_id,
+        home.root().display()
+    );
+    println!("default runtime set to {}", outcome.runtime_id);
 }
 
 fn print_runtime_state_change_note() {
@@ -1539,6 +1683,7 @@ mod tests {
     use super::*;
     use crate::kernel::runtime::ConfinementConfig;
     use chrono::Duration as ChronoDuration;
+    use std::io::Cursor;
     use tempfile::{NamedTempFile, TempDir};
 
     #[cfg(unix)]
@@ -1618,6 +1763,40 @@ mod tests {
     }
 
     #[test]
+    fn configure_command_does_not_require_resolved_work_root() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        let work_root = project.project_root.join("review-work");
+        std::fs::create_dir_all(&work_root).expect("work root");
+        let reviewer = create_project_instance(
+            &project.project_root,
+            "reviewer",
+            Some(work_root.as_path()),
+            false,
+        )
+        .expect("create reviewer instance");
+        std::fs::remove_dir_all(&work_root).expect("break work root");
+        let selection = TargetSelection {
+            home: None,
+            project: Some(project.project_root.clone()),
+            instance: Some("reviewer".to_string()),
+        };
+
+        let target = resolve_command_target(
+            &selection,
+            &Command::Configure(ConfigureArgs {
+                runtime: Some("codex".to_string()),
+            }),
+        )
+        .expect("configure target should resolve without a work root")
+        .expect("configure should resolve target");
+
+        assert_eq!(target.instance_name.as_deref(), Some("reviewer"));
+        assert_eq!(target.instance_home.root(), reviewer.home.as_path());
+        assert!(target.work_root.is_none());
+    }
+
+    #[test]
     fn runtime_opening_commands_require_recorded_home_work_root() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = temp_dir.path().join("home");
@@ -1629,6 +1808,14 @@ mod tests {
         };
 
         let commands = vec![
+            (
+                "run",
+                Command::Run(RunArgs {
+                    continue_last_session: false,
+                    timeout: None,
+                    runtime: None,
+                }),
+            ),
             (
                 "service up",
                 Command::Service {
@@ -1702,6 +1889,45 @@ mod tests {
     }
 
     #[test]
+    fn run_command_targets_named_project_instance_and_work_root() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        let reviewer = create_project_instance(
+            &project.project_root,
+            "reviewer",
+            Some(project.project_root.as_path()),
+            false,
+        )
+        .expect("create reviewer instance");
+        let selection = TargetSelection {
+            home: None,
+            project: Some(project.project_root.clone()),
+            instance: Some("reviewer".to_string()),
+        };
+        let command = Command::Run(RunArgs {
+            continue_last_session: false,
+            timeout: None,
+            runtime: None,
+        });
+
+        let target = resolve_command_target(&selection, &command)
+            .expect("run target should resolve")
+            .expect("run target should be selected");
+
+        assert_eq!(
+            target.project_root.as_deref(),
+            Some(project.project_root.as_path())
+        );
+        assert_eq!(target.instance_name.as_deref(), Some("reviewer"));
+        assert_eq!(target.instance_home.root(), reviewer.home.as_path());
+        assert_ne!(target.instance_home.root(), project.instance.home.as_path());
+        assert_eq!(
+            target.require_work_root().expect("run requires work root"),
+            reviewer.work_root.as_path()
+        );
+    }
+
+    #[test]
     fn onboard_honors_explicit_home_target() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = temp_dir.path().join("home");
@@ -1744,6 +1970,51 @@ mod tests {
                 .expect_err("onboard should reject project and instance selectors");
             assert!(err.to_string().contains("onboard cannot be combined"));
         }
+    }
+
+    #[tokio::test]
+    async fn noninteractive_configure_without_runtime_fails_with_scriptable_form() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let err = configure_runtime_with_io(&home, None, false, &mut input, &mut output)
+            .await
+            .expect_err("runtime should be required");
+
+        assert!(err
+            .to_string()
+            .contains("lionclaw configure --runtime codex"));
+        assert!(
+            !home.config_path().exists(),
+            "configure should not create config when runtime is missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_configure_requires_runtime_input() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut input = Cursor::new(b"codex\n".to_vec());
+        let mut output = Vec::new();
+
+        let outcome = configure_runtime_with_io_and_engine_resolver(
+            &home,
+            None,
+            true,
+            &mut input,
+            &mut output,
+            |_| Ok("/usr/bin/podman".to_string()),
+        )
+        .await
+        .expect("configure runtime");
+
+        assert_eq!(outcome.runtime_id, "codex");
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        assert_eq!(config.defaults.runtime.as_deref(), Some("codex"));
+        let prompt = String::from_utf8(output).expect("utf8 prompt");
+        assert!(prompt.contains("Runtime to configure:"));
     }
 
     #[tokio::test]
