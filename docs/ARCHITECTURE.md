@@ -397,21 +397,27 @@ manually by the operator.
 
 ## Operator Launch Model
 
-- `launch_mode=service`: channel worker is supervised by `lionclaw service up`
-  through the platform service manager. The current implementation uses systemd
-  user services.
-- `launch_mode=interactive`: channel worker is foreground-only and started
-  with `lionclaw channel attach <id>`. If no compatible daemon is already
-  running, the attach path starts the daemon through the same systemd-backed
-  manager.
-- If a channel declares `required_env`, both launch paths require those host
-  environment variables and pass them through to the worker.
+- Channel skills declare `lionclaw.toml` metadata: channel id, launch mode,
+  worker entrypoint, and required env names. The v1 metadata contract is small
+  by design and does not claim permissions LionClaw does not enforce.
+- `launch=service`: the channel worker is supervised through the platform
+  service manager. The current implementation uses systemd user services.
+- `launch=interactive`: the channel worker is foreground-only and normally
+  started by `lionclaw connect <channel>` in the current terminal. The low-level
+  attach path remains available for debugging.
+- Required channel env is selected-instance state under `config/channels/`.
+  Service env may reference that private file, but generated service env is not
+  the source of truth.
 
-Worker entrypoint resolution requires `scripts/worker`.
+Worker entrypoint resolution uses the metadata `worker` path and rejects
+symlink escapes outside the skill directory.
 
-`LIONCLAW_HOME` gets a stable machine-owned `config/home-id`. Attach and
-service flows only reuse a daemon when `/v0/daemon/info` reports the same
-home id, current project scope, and daemon-compat fingerprint.
+`LIONCLAW_HOME` gets stable machine-owned `config/home-id` and service identity
+state. Attach and service flows only reuse a daemon when `/v0/daemon/info`
+reports the same home id, current project scope, and daemon-compat fingerprint.
+Managed systemd units are instance-scoped and carry `X-LionClaw-*` ownership
+metadata so cleanup and stop operations only touch units owned by the selected
+home.
 
 ## Security Posture In v0
 

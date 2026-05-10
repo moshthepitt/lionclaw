@@ -211,6 +211,8 @@ fn applied_state_fingerprint(skills: &[AppliedSkill], channels: &[AppliedChannel
         hasher.update(b"\0");
         hasher.update(channel.skill_alias.as_bytes());
         hasher.update(b"\0");
+        hasher.update(channel.worker.as_bytes());
+        hasher.update(b"\0");
         hasher.update(channel.launch_mode.as_str().as_bytes());
         hasher.update(b"\0");
         for key in &channel.required_env {
@@ -563,6 +565,7 @@ impl AppliedSkill {
 pub struct AppliedChannel {
     pub id: String,
     pub skill_alias: String,
+    pub worker: String,
     pub launch_mode: ChannelLaunchMode,
     pub required_env: Vec<String>,
 }
@@ -572,6 +575,7 @@ impl AppliedChannel {
         Self {
             id: config.id.clone(),
             skill_alias: config.skill.clone(),
+            worker: config.worker.clone(),
             launch_mode: config.launch_mode,
             required_env: config.required_env.clone(),
         }
@@ -722,6 +726,7 @@ mod tests {
             id: "terminal".to_string(),
             skill: "visible".to_string(),
             launch_mode: crate::operator::config::ChannelLaunchMode::Service,
+            worker: crate::operator::config::default_channel_worker(),
             required_env: Vec::new(),
         });
         config.save(&home).await.expect("save config");
@@ -759,6 +764,7 @@ mod tests {
             id: "terminal".to_string(),
             skill: "visible".to_string(),
             launch_mode: crate::operator::config::ChannelLaunchMode::Service,
+            worker: crate::operator::config::default_channel_worker(),
             required_env: vec!["FIRST_KEY".to_string()],
         });
         config.save(&home).await.expect("save first config");
@@ -769,6 +775,7 @@ mod tests {
             id: "terminal".to_string(),
             skill: "visible".to_string(),
             launch_mode: crate::operator::config::ChannelLaunchMode::Service,
+            worker: crate::operator::config::default_channel_worker(),
             required_env: vec!["SECOND_KEY".to_string()],
         });
         config.save(&home).await.expect("save second config");

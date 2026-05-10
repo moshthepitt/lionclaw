@@ -204,6 +204,12 @@ impl OperatorConfig {
             .collect();
         self.channels.sort_by_key(|channel| channel.id.clone());
         for channel in &mut self.channels {
+            channel.id = channel.id.trim().to_string();
+            channel.skill = channel.skill.trim().to_string();
+            channel.worker = channel.worker.trim().to_string();
+            if channel.worker.is_empty() {
+                channel.worker = default_channel_worker();
+            }
             channel.required_env.sort();
             channel.required_env.dedup();
         }
@@ -265,6 +271,8 @@ pub struct OperatorDefaults {
 pub struct DaemonConfig {
     #[serde(default = "default_bind")]
     pub bind: String,
+    #[serde(default)]
+    pub bind_configured: bool,
     #[serde(default = "default_workspace")]
     pub workspace: String,
 }
@@ -273,6 +281,7 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             bind: default_bind(),
+            bind_configured: false,
             workspace: default_workspace(),
         }
     }
@@ -284,6 +293,8 @@ pub struct ManagedChannelConfig {
     pub skill: String,
     #[serde(default)]
     pub launch_mode: ChannelLaunchMode,
+    #[serde(default = "default_channel_worker")]
+    pub worker: String,
     #[serde(default)]
     pub required_env: Vec<String>,
 }
@@ -325,6 +336,10 @@ pub fn default_bind() -> String {
 
 pub fn default_workspace() -> String {
     DEFAULT_WORKSPACE.to_string()
+}
+
+pub fn default_channel_worker() -> String {
+    crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -662,9 +677,10 @@ mod tests {
 
     use super::{
         daemon_compat_fingerprint, daemon_compat_fingerprint_with_runtime_context,
-        derive_skill_alias, normalize_host_executable, normalize_local_source,
-        normalize_runtime_command, validate_host_executable, validate_podman_executable,
-        ChannelLaunchMode, ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig,
+        default_channel_worker, derive_skill_alias, normalize_host_executable,
+        normalize_local_source, normalize_runtime_command, validate_host_executable,
+        validate_podman_executable, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig,
+        RuntimeProfileConfig,
     };
     use crate::kernel::runtime::{
         ConfinementConfig, ExecutionPreset, NetworkMode, OciConfinementConfig, WorkspaceAccess,
@@ -698,6 +714,7 @@ mod tests {
             id: "terminal".to_string(),
             skill: "terminal".to_string(),
             launch_mode: ChannelLaunchMode::default(),
+            worker: default_channel_worker(),
             required_env: Vec::new(),
         });
         config.save(&home).await.expect("save config");
@@ -716,6 +733,7 @@ mod tests {
             id: "terminal".to_string(),
             skill: "terminal".to_string(),
             launch_mode: ChannelLaunchMode::Interactive,
+            worker: default_channel_worker(),
             required_env: Vec::new(),
         });
         config.save(&home).await.expect("save config");

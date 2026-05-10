@@ -636,6 +636,40 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn codex_launch_prereqs_do_not_hide_runtime_image_probe_errors_with_exit_one() {
+        let script = "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"exists\" ]; then\n  echo 'failed to read storage state' >&2\n  exit 1\nfi\nexit 0\n";
+        let (_podman_dir, engine) = fake_podman_with_body(script);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        write_test_codex_auth(
+            &home,
+            json!({
+                "OPENAI_API_KEY": null,
+                "last_refresh": Utc::now().to_rfc3339(),
+                "tokens": {
+                    "access_token": format!("a.{}.c", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                        serde_json::to_vec(&json!({ "exp": (Utc::now() + ChronoDuration::hours(1)).timestamp() }))
+                            .expect("jwt payload")
+                    )),
+                    "refresh_token": "refresh-test"
+                }
+            }),
+        )
+        .await;
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine));
+
+        let err = validate_runtime_launch_prerequisites(&home, &config, "codex")
+            .await
+            .expect_err("probe stderr should surface as an engine error");
+        assert!(err.to_string().contains(
+            "failed to inspect OCI image 'ghcr.io/lionclaw/codex-runtime:latest': failed to read storage state"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn codex_launch_prereqs_surface_runtime_image_probe_errors_honestly() {
         let script = "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"exists\" ]; then\n  echo 'storage denied' >&2\n  exit 125\nfi\nexit 0\n";
         let (_podman_dir, engine) = fake_podman_with_body(script);

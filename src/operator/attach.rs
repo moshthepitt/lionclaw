@@ -46,6 +46,27 @@ pub async fn attach_channel<M: ServiceManager>(
     requested_runtime_id: Option<String>,
 ) -> Result<()> {
     let binaries = crate::operator::reconcile::resolve_stack_binaries()?;
+    attach_channel_with_binaries(
+        home,
+        manager,
+        work_root,
+        channel_id,
+        requested_peer_id,
+        requested_runtime_id,
+        &binaries,
+    )
+    .await
+}
+
+pub(crate) async fn attach_channel_with_binaries<M: ServiceManager>(
+    home: &LionClawHome,
+    manager: &M,
+    work_root: &Path,
+    channel_id: String,
+    requested_peer_id: Option<String>,
+    requested_runtime_id: Option<String>,
+    binaries: &StackBinaryPaths,
+) -> Result<()> {
     let home_id = home.ensure_home_id().await?;
     let project_scope = project_scope_for_work_root(work_root);
     let spec = prepare_channel_attach(
@@ -55,7 +76,7 @@ pub async fn attach_channel<M: ServiceManager>(
         channel_id,
         requested_peer_id,
         requested_runtime_id,
-        &binaries,
+        binaries,
     )
     .await?;
 
@@ -198,9 +219,12 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
         ));
     }
 
-    let worker_path =
-        resolve_applied_skill_worker_entrypoint(&applied.applied_state, &channel.skill_alias)
-            .with_context(|| format!("channel '{}' worker resolution failed", channel.id))?;
+    let worker_path = resolve_applied_skill_worker_entrypoint(
+        &applied.applied_state,
+        &channel.skill_alias,
+        Some(&channel.worker),
+    )
+    .with_context(|| format!("channel '{}' worker resolution failed", channel.id))?;
     let effective_runtime_id = match requested_runtime_id.as_deref() {
         Some(runtime_id) => Some(applied.config.resolve_runtime_id(Some(runtime_id))?),
         None => None,
@@ -236,7 +260,7 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
             env.insert("PATH".to_string(), path);
         }
     }
-    for (key, value) in resolve_required_channel_env(&channel.id, &channel.required_env)? {
+    for (key, value) in resolve_required_channel_env(home, &channel.id, &channel.required_env)? {
         env.insert(key, value);
     }
     if let Some(runtime_id) = effective_runtime_id {
@@ -255,6 +279,7 @@ pub(crate) async fn prepare_channel_attach<M: ServiceManager>(
 async fn launch_channel_attach(spec: ChannelAttachSpec) -> Result<()> {
     let mut command = Command::new(&spec.worker_path);
     command
+        .env_clear()
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -302,7 +327,7 @@ mod tests {
     use axum::{routing::get, Json, Router};
     use serde_json::json;
 
-    use super::prepare_channel_attach;
+    use super::{launch_channel_attach, prepare_channel_attach, ChannelAttachSpec};
     use crate::{
         applied::{compute_daemon_fingerprint, AppliedState},
         config::resolve_project_workspace_root,
@@ -310,10 +335,13 @@ mod tests {
         home::{runtime_project_partition_key, LionClawHome},
         kernel::runtime::{ConfinementConfig, OciConfinementConfig},
         operator::{
+            channel_env::{merge_channel_env, ChannelEnv},
             config::{ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig},
             reconcile::{add_channel, add_skill},
             runtime::resolve_runtime_execution_context,
-            services::{FakeServiceManager, ServiceManager},
+            services::{
+                daemon_unit_name, ensure_service_identity, FakeServiceManager, ServiceManager,
+            },
         },
     };
 
@@ -330,6 +358,11 @@ mod tests {
     fn current_project_scope() -> String {
         let project_root = current_work_root();
         runtime_project_partition_key(Some(project_root.as_path()))
+    }
+
+    fn test_daemon_unit_name(home: &LionClawHome) -> String {
+        let identity = ensure_service_identity(home).expect("service identity");
+        daemon_unit_name(&identity)
     }
 
     async fn current_daemon_fingerprint(
@@ -636,7 +669,7 @@ mod tests {
             .is_some_and(|value| value.starts_with("interactive:terminal:mosh:")));
         assert_eq!(
             manager
-                .unit_status(crate::operator::services::DAEMON_UNIT_NAME)
+                .unit_status(&test_daemon_unit_name(&home))
                 .await
                 .expect("unit status"),
             "loaded/active/running"
@@ -657,6 +690,9 @@ mod tests {
         )
         .await
         .expect("update channel required env");
+        let mut channel_env = ChannelEnv::new();
+        channel_env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+        merge_channel_env(&home, "terminal", &channel_env).expect("persist channel env");
 
         let spec = prepare_channel_attach(
             &home,
@@ -673,7 +709,7 @@ mod tests {
         assert!(spec
             .env
             .iter()
-            .any(|(key, value)| key == "PATH" && !value.is_empty()));
+            .any(|(key, value)| key == "PATH" && value == "/usr/bin:/bin"));
 
         add_channel(
             &home,
@@ -700,6 +736,40 @@ mod tests {
         assert!(err
             .to_string()
             .contains("LIONCLAW_TEST_MISSING_REQUIRED_ENV"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_channel_attach_clears_inherited_environment() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let worker = temp_dir.path().join("worker.sh");
+        let output = temp_dir.path().join("env.txt");
+        write_executable(
+            &worker,
+            &format!(
+                "#!/bin/sh\n/usr/bin/env | /usr/bin/sort > '{}'\n",
+                output.display()
+            ),
+        );
+
+        launch_channel_attach(ChannelAttachSpec {
+            worker_path: worker,
+            bind_addr: "127.0.0.1:0".to_string(),
+            env: vec![("LIONCLAW_CHANNEL_ID".to_string(), "terminal".to_string())],
+            started_services: false,
+            expected_daemon_fingerprint: String::new(),
+        })
+        .await
+        .expect("launch worker");
+
+        let env_output = fs::read_to_string(output).expect("env output");
+        assert!(env_output.contains("LIONCLAW_CHANNEL_ID=terminal\n"));
+        if std::env::var_os("HOME").is_some() {
+            assert!(
+                !env_output.lines().any(|line| line.starts_with("HOME=")),
+                "worker should not inherit operator HOME"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -874,11 +944,9 @@ mod tests {
             listener,
         )
         .await;
+        let daemon_unit = test_daemon_unit_name(&home);
         manager
-            .set_unit_status(
-                crate::operator::services::DAEMON_UNIT_NAME,
-                "loaded/active/running",
-            )
+            .set_unit_status(&daemon_unit, "loaded/active/running")
             .expect("set unit status");
 
         let spec = prepare_channel_attach(
@@ -896,7 +964,7 @@ mod tests {
         assert!(spec.started_services, "stale daemon should be reconciled");
         assert!(
             manager
-                .was_restarted(crate::operator::services::DAEMON_UNIT_NAME)
+                .was_restarted(&daemon_unit)
                 .expect("read restart state"),
             "managed daemon should be restarted when config fingerprint changes"
         );
