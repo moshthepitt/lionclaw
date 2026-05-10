@@ -313,7 +313,7 @@ Expected:
 - the bind finding is `LC-D001`
 - `inspect` uses `ss -ltnp '( sport = :PORT )'`
 - `note` says to stop the process shown by inspect
-- `repair` is an exact `lionclaw ... up` command
+- no `repair` is printed because stopping the occupying process is a manual decision
 - no raw HTTP command is printed
 
 ### Stale Or Ghost Units
