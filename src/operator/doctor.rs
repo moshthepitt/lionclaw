@@ -283,8 +283,10 @@ async fn inspect_project<M: UnitManager>(
         .map(|config| inspect_default_instance(project_root, config, &mut report))
         .unwrap_or(DiagnosticDefaultInstance::Missing);
 
-    let selected_names = if all {
-        if instances_loaded && instances.is_empty() && project_config.is_some() {
+    let selected_names = if !instances_loaded {
+        Vec::new()
+    } else if all {
+        if instances.is_empty() && project_config.is_some() {
             report.push(project_has_no_instances_finding(project_root));
         }
         instances.keys().cloned().collect::<Vec<_>>()
@@ -292,13 +294,7 @@ async fn inspect_project<M: UnitManager>(
         validate_instance_name(name)?;
         vec![name.to_string()]
     } else {
-        selected_project_instance_names(
-            project_root,
-            default_instance,
-            &instances,
-            instances_loaded,
-            &mut report,
-        )
+        selected_project_instance_names(project_root, default_instance, &instances, &mut report)
     };
 
     if let DiagnosticDefaultInstance::Valid(default_instance) = default_instance {
@@ -363,7 +359,6 @@ fn selected_project_instance_names(
     project_root: &Path,
     default_instance: DiagnosticDefaultInstance<'_>,
     instances: &BTreeMap<String, PathBuf>,
-    instances_loaded: bool,
     report: &mut DoctorReport,
 ) -> Vec<String> {
     match default_instance {
@@ -376,11 +371,10 @@ fn selected_project_instance_names(
 
     match instances.keys().cloned().collect::<Vec<_>>().as_slice() {
         [only] => vec![only.clone()],
-        [] if instances_loaded => {
+        [] => {
             report.push(project_has_no_instances_finding(project_root));
             Vec::new()
         }
-        [] => Vec::new(),
         _ => {
             report.push(
                 DoctorFinding::error(
@@ -1382,6 +1376,64 @@ mod tests {
         assert!(report.findings.iter().any(|finding| {
             finding.subject == "default instance \"../../some-home\" is invalid"
         }));
+    }
+
+    #[tokio::test]
+    async fn doctor_does_not_inspect_selected_instance_when_instances_dir_is_invalid() {
+        let temp_dir = project_with_symlinked_instances(None);
+
+        let report = inspect_project(
+            temp_dir.path(),
+            Some("main"),
+            false,
+            &FakeUnitManager::default(),
+        )
+        .await
+        .expect("doctor report");
+
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.subject == "instances directory is a symlink"));
+        assert!(!report
+            .findings
+            .iter()
+            .any(|finding| finding.subject.contains("instance \"main\"")));
+    }
+
+    #[tokio::test]
+    async fn doctor_does_not_inspect_default_instance_when_instances_dir_is_invalid() {
+        let temp_dir = project_with_symlinked_instances(Some("main"));
+
+        let report = inspect_project(temp_dir.path(), None, false, &FakeUnitManager::default())
+            .await
+            .expect("doctor report");
+
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.subject == "instances directory is a symlink"));
+        assert!(!report
+            .findings
+            .iter()
+            .any(|finding| finding.subject.contains("instance \"main\"")));
+    }
+
+    fn project_with_symlinked_instances(default_instance: Option<&str>) -> tempfile::TempDir {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = project_dir_path(temp_dir.path());
+        let outside_instances = temp_dir.path().join("outside-instances");
+        fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        fs::create_dir_all(outside_instances.join("main")).expect("outside instance dir");
+        symlink(&outside_instances, instances_dir_path(temp_dir.path()))
+            .expect("symlink instances dir");
+
+        let mut project_file = "version = 1\n".to_string();
+        if let Some(default_instance) = default_instance {
+            project_file.push_str(&format!("default_instance = \"{default_instance}\"\n"));
+        }
+        fs::write(project_file_path(temp_dir.path()), project_file).expect("project file");
+        temp_dir
     }
 
     #[test]
