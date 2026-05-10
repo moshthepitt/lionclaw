@@ -15,14 +15,13 @@ use crate::{
         channel_env::validate_channel_env_contract,
         channel_metadata::{load_channel_metadata, validate_channel_id},
         command_display::{lionclaw_home_command_prefix, shell_quote_arg},
-        config::{
-            daemon_compat_fingerprint, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig,
-        },
+        config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
         daemon_probe::{classify_daemon, DaemonClassification},
         managed_units::{
             daemon_unit_name, existing_unit_identity, unit_file_metadata, unit_status_is_active,
             UnitManager,
         },
+        runtime::resolve_runtime_execution_context,
         runtime_integration::runtime_auth_guidance,
         target::{
             discover_diagnostic_project_root, instance_home_path, instances_dir_path,
@@ -1129,9 +1128,22 @@ async fn inspect_configured_bind<M: UnitManager>(
         }
     };
 
+    let daemon_fingerprint = match expected_daemon_fingerprint(home, config, &applied_state).await {
+        Ok(daemon_fingerprint) => daemon_fingerprint,
+        Err(err) => {
+            findings.push(
+                DoctorFinding::error(
+                    FindingKind::ConfiguredBindUnclassifiable,
+                    "configured bind cannot be classified",
+                    target.clone(),
+                    err.to_string(),
+                )
+                .with_inspect(commands.selected("status")),
+            );
+            return;
+        }
+    };
     let project_scope = runtime_project_partition_key(Some(work_root));
-    let daemon_fingerprint =
-        compute_daemon_fingerprint(&daemon_compat_fingerprint(config), &applied_state);
     let classification =
         match classify_daemon(bind, &home_id, &project_scope, &daemon_fingerprint).await {
             Ok(classification) => classification,
@@ -1227,6 +1239,19 @@ async fn inspect_configured_bind<M: UnitManager>(
             );
         }
     }
+}
+
+async fn expected_daemon_fingerprint(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+    applied_state: &AppliedState,
+) -> Result<String> {
+    let runtime_context =
+        resolve_runtime_execution_context(home, config, config.defaults.runtime.as_deref()).await?;
+    Ok(compute_daemon_fingerprint(
+        &runtime_context.daemon_config_fingerprint,
+        applied_state,
+    ))
 }
 
 async fn owned_managed_daemon_is_active<M: UnitManager>(home: &LionClawHome, manager: &M) -> bool {
@@ -1825,7 +1850,7 @@ mod tests {
     use super::*;
     use crate::contracts::DaemonInfoResponse;
     use crate::kernel::runtime::{ConfinementConfig, OciConfinementConfig};
-    use crate::operator::config::RuntimeProfileConfig;
+    use crate::operator::config::{daemon_compat_fingerprint, RuntimeProfileConfig};
     use crate::operator::managed_units::{
         channel_unit_name, daemon_unit_name, ensure_unit_identity, render_daemon_unit,
         DaemonUnitSpec, FakeUnitManager, UnitManager,
@@ -1851,10 +1876,18 @@ mod tests {
         (temp_dir, home, work_root, commands, config)
     }
 
-    fn current_daemon_fingerprint(home: &LionClawHome, config: &OperatorConfig) -> String {
+    fn raw_daemon_fingerprint(home: &LionClawHome, config: &OperatorConfig) -> String {
         let applied_state =
             AppliedState::from_home_read_only(home, config).expect("read applied state");
         compute_daemon_fingerprint(&daemon_compat_fingerprint(config), &applied_state)
+    }
+
+    async fn current_daemon_fingerprint(home: &LionClawHome, config: &OperatorConfig) -> String {
+        let applied_state =
+            AppliedState::from_home_read_only(home, config).expect("read applied state");
+        expected_daemon_fingerprint(home, config, &applied_state)
+            .await
+            .expect("daemon fingerprint")
     }
 
     fn daemon_info(
@@ -2198,7 +2231,7 @@ mod tests {
         let (_temp_dir, home, work_root, commands, mut config) = configured_bind_fixture().await;
         let home_id = home.ensure_home_id().await.expect("home id");
         let project_scope = runtime_project_partition_key(Some(&work_root));
-        let daemon_fingerprint = current_daemon_fingerprint(&home, &config);
+        let daemon_fingerprint = current_daemon_fingerprint(&home, &config).await;
         let mut info = daemon_info(
             &home,
             "127.0.0.1:0",
@@ -2240,7 +2273,7 @@ mod tests {
     async fn doctor_reports_same_home_different_project_on_configured_bind() {
         let (_temp_dir, home, work_root, commands, mut config) = configured_bind_fixture().await;
         let home_id = home.ensure_home_id().await.expect("home id");
-        let daemon_fingerprint = current_daemon_fingerprint(&home, &config);
+        let daemon_fingerprint = current_daemon_fingerprint(&home, &config).await;
         let info = daemon_info(
             &home,
             "127.0.0.1:0",
@@ -2289,7 +2322,7 @@ mod tests {
         let (_temp_dir, home, work_root, commands, mut config) = configured_bind_fixture().await;
         let home_id = home.ensure_home_id().await.expect("home id");
         let project_scope = runtime_project_partition_key(Some(&work_root));
-        let daemon_fingerprint = current_daemon_fingerprint(&home, &config);
+        let daemon_fingerprint = current_daemon_fingerprint(&home, &config).await;
         let info = daemon_info(
             &home,
             "127.0.0.1:0",
@@ -2330,11 +2363,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn doctor_matches_contextual_daemon_fingerprint_on_configured_bind() {
+        let (_temp_dir, home, work_root, commands, mut config) = configured_bind_fixture().await;
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "codex".to_string(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    image: None,
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+        let home_id = home.ensure_home_id().await.expect("home id");
+        let project_scope = runtime_project_partition_key(Some(&work_root));
+        let raw_fingerprint = raw_daemon_fingerprint(&home, &config);
+        let contextual_fingerprint = current_daemon_fingerprint(&home, &config).await;
+        assert_ne!(raw_fingerprint, contextual_fingerprint);
+        let info = daemon_info(
+            &home,
+            "127.0.0.1:0",
+            home_id,
+            project_scope,
+            contextual_fingerprint.clone(),
+        );
+        let (bind, server) = spawn_daemon_info_server(info).await;
+        config.daemon.bind = bind.clone();
+        let manager = FakeUnitManager::default();
+        mark_owned_daemon_active(&home, &manager, &bind, &work_root, &contextual_fingerprint).await;
+        let mut findings = Vec::new();
+
+        inspect_configured_bind(
+            &home,
+            "direct-home",
+            &commands,
+            &config,
+            Some(&work_root),
+            &manager,
+            &mut findings,
+        )
+        .await;
+        server.abort();
+
+        assert!(findings.is_empty(), "{findings:#?}");
+    }
+
+    #[tokio::test]
     async fn doctor_reports_stale_managed_daemon_on_configured_bind() {
         let (_temp_dir, home, work_root, commands, mut config) = configured_bind_fixture().await;
         let home_id = home.ensure_home_id().await.expect("home id");
         let project_scope = runtime_project_partition_key(Some(&work_root));
-        let current_fingerprint = current_daemon_fingerprint(&home, &config);
+        let current_fingerprint = current_daemon_fingerprint(&home, &config).await;
         let info = daemon_info(
             &home,
             "127.0.0.1:0",
