@@ -1034,7 +1034,7 @@ fn inspect_project_metadata_dir(project_root: &Path) -> std::result::Result<(), 
             "project metadata directory is missing or unreadable",
             format!("{}: {err}", path.display()),
         )
-        .with_repair("lionclaw project init")
+        .with_repair(project_command(project_root, "project init"))
     })?;
     if metadata.file_type().is_symlink() {
         return Err(DoctorFinding::error(
@@ -1060,7 +1060,7 @@ fn read_project_file(
             "project file is missing or unreadable",
             format!("{}: {err}", path.display()),
         )
-        .with_repair("lionclaw project init")
+        .with_repair(project_command(project_root, "project init"))
     })?;
     if metadata.file_type().is_symlink() {
         return Err(DoctorFinding::error(
@@ -1149,7 +1149,7 @@ fn discover_project_instance_homes(
             "instances directory is missing or unreadable",
             format!("{}: {err}", instances_dir.display()),
         )
-        .with_repair("lionclaw instance create main")
+        .with_repair(project_command(project_root, "instance create main"))
     })?;
     if metadata.file_type().is_symlink() {
         return Err(DoctorFinding::error(
@@ -1280,10 +1280,46 @@ mod tests {
             .await
             .expect("doctor report");
 
-        assert!(report
-            .findings
-            .iter()
-            .any(|finding| finding.subject == "project file is missing or unreadable"));
+        let finding = finding(&report, "project file is missing or unreadable");
+        assert_eq!(
+            finding.repair.as_deref(),
+            Some(project_command(temp_dir.path(), "project init").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_scopes_missing_project_metadata_repair_to_project() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+
+        let report = inspect_project(temp_dir.path(), None, false, &FakeUnitManager::default())
+            .await
+            .expect("doctor report");
+
+        let finding = finding(
+            &report,
+            "project metadata directory is missing or unreadable",
+        );
+        assert_eq!(
+            finding.repair.as_deref(),
+            Some(project_command(temp_dir.path(), "project init").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_scopes_missing_instances_repair_to_project() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir_all(project_dir_path(temp_dir.path())).expect("metadata dir");
+        fs::write(project_file_path(temp_dir.path()), "version = 1\n").expect("project file");
+
+        let report = inspect_project(temp_dir.path(), None, false, &FakeUnitManager::default())
+            .await
+            .expect("doctor report");
+
+        let finding = finding(&report, "instances directory is missing or unreadable");
+        assert_eq!(
+            finding.repair.as_deref(),
+            Some(project_command(temp_dir.path(), "instance create main").as_str())
+        );
     }
 
     #[tokio::test]
@@ -1593,5 +1629,13 @@ mod tests {
             == "managed daemon unit is missing for instance \"direct-home\""));
         assert!(findings.iter().any(|finding| finding.subject
             == "worker \"telegram\" is not running for instance \"direct-home\""));
+    }
+
+    fn finding<'a>(report: &'a DoctorReport, subject: &str) -> &'a DoctorFinding {
+        report
+            .findings
+            .iter()
+            .find(|finding| finding.subject == subject)
+            .expect("doctor finding")
     }
 }
