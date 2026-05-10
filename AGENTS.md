@@ -7,10 +7,10 @@ Contributors (human or AI) should follow the workflow and quality gates below.
 
 ## Source of Truth
 - Project overview: `README.md`
-- v0 scope and constraints: `docs/V0_PLAN.md`
 - architecture and contracts: `docs/ARCHITECTURE.md`
-- runtime model: `docs/RUNTIME_MODEL.md`
-- milestone plan: `docs/ROADMAP.md`
+- manual acceptance: `docs/MANUAL_QA.md`
+- release process: `docs/RELEASE.md`
+- developer/CI smoke helpers: `scripts/README.md`
 
 ## Working Rules
 - Prefer TDD when practical: RED -> GREEN -> REFACTOR.

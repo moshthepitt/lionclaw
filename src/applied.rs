@@ -38,84 +38,17 @@ impl AppliedState {
     }
 
     pub fn from_home(home: &LionClawHome, config: &OperatorConfig) -> Result<Self> {
-        let skills_root = canonical_skills_root(home)?;
-        let mut skills = Vec::new();
-        let mut channels = Vec::with_capacity(config.channels.len());
-        let mut skill_aliases = BTreeSet::new();
-        let mut skill_ids = BTreeSet::new();
-        let mut channel_ids = BTreeSet::new();
-        let mut entries = fs::read_dir(&skills_root)
-            .with_context(|| format!("failed to read directory {}", skills_root.display()))?
-            .collect::<std::io::Result<Vec<_>>>()
-            .with_context(|| format!("failed to iterate directory {}", skills_root.display()))?;
-        entries.sort_by_key(|entry| entry.file_name());
+        let inputs = read_applied_state_inputs(home, config)?;
+        let skills = materialize_applied_skills(&inputs.skills_root, inputs.skills)?;
+        Ok(Self::from_parts(skills, inputs.channels))
+    }
 
-        for entry in entries {
-            let alias = entry
-                .file_name()
-                .to_str()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "invalid installed skill name under {}",
-                        skills_root.display()
-                    )
-                })?
-                .to_string();
-            if alias.starts_with('.') {
-                continue;
-            }
-            validate_skill_alias(&alias)?;
-            if !skill_aliases.insert(alias.clone()) {
-                return Err(anyhow!(
-                    "installed skill alias '{alias}' appears more than once"
-                ));
-            }
-
-            let metadata = fs::symlink_metadata(entry.path())
-                .with_context(|| format!("failed to stat {}", entry.path().display()))?;
-            if metadata.file_type().is_symlink() {
-                return Err(anyhow!(
-                    "installed skill '{}' must not be a symlink",
-                    entry.path().display()
-                ));
-            }
-            if !metadata.is_dir() {
-                return Err(anyhow!(
-                    "installed skill '{}' is not a directory",
-                    entry.path().display()
-                ));
-            }
-            let skill = AppliedSkill::from_installed(&skills_root, entry.path())?;
-            if !skill_ids.insert(skill.skill_id.clone()) {
-                return Err(anyhow!(
-                    "installed skill alias '{}' collides with another installed skill on skill id '{}'",
-                    skill.alias,
-                    skill.skill_id
-                ));
-            }
-            skills.push(skill);
-        }
-
-        for channel in &config.channels {
-            if !channel_ids.insert(channel.id.clone()) {
-                return Err(anyhow!(
-                    "operator config contains duplicate channel id '{}'",
-                    channel.id
-                ));
-            }
-            validate_skill_alias(&channel.skill)?;
-            if !skill_aliases.contains(channel.skill.as_str()) {
-                return Err(anyhow!(
-                    "configured channel '{}' references missing installed skill alias '{}'",
-                    channel.id,
-                    channel.skill
-                ));
-            }
-            channels.push(AppliedChannel::from_config(channel));
-        }
-
-        let skills = materialize_applied_skills(&skills_root, skills)?;
-        Ok(Self::from_parts(skills, channels))
+    pub(crate) fn from_home_read_only(
+        home: &LionClawHome,
+        config: &OperatorConfig,
+    ) -> Result<Self> {
+        let inputs = read_applied_state_inputs(home, config)?;
+        Ok(Self::from_parts(inputs.skills, inputs.channels))
     }
 
     pub fn skills(&self) -> &[AppliedSkill] {
@@ -182,6 +115,99 @@ impl AppliedState {
     }
 }
 
+struct AppliedStateInputs {
+    skills_root: PathBuf,
+    skills: Vec<AppliedSkill>,
+    channels: Vec<AppliedChannel>,
+}
+
+fn read_applied_state_inputs(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+) -> Result<AppliedStateInputs> {
+    let skills_root = canonical_skills_root(home)?;
+    let mut skills = Vec::new();
+    let mut channels = Vec::with_capacity(config.channels.len());
+    let mut skill_aliases = BTreeSet::new();
+    let mut skill_ids = BTreeSet::new();
+    let mut channel_ids = BTreeSet::new();
+    let mut entries = fs::read_dir(&skills_root)
+        .with_context(|| format!("failed to read directory {}", skills_root.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("failed to iterate directory {}", skills_root.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let alias = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| {
+                anyhow!(
+                    "invalid installed skill name under {}",
+                    skills_root.display()
+                )
+            })?
+            .to_string();
+        if alias.starts_with('.') {
+            continue;
+        }
+        validate_skill_alias(&alias)?;
+        if !skill_aliases.insert(alias.clone()) {
+            return Err(anyhow!(
+                "installed skill alias '{alias}' appears more than once"
+            ));
+        }
+
+        let metadata = fs::symlink_metadata(entry.path())
+            .with_context(|| format!("failed to stat {}", entry.path().display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(anyhow!(
+                "installed skill '{}' must not be a symlink",
+                entry.path().display()
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(anyhow!(
+                "installed skill '{}' is not a directory",
+                entry.path().display()
+            ));
+        }
+        let skill = AppliedSkill::from_installed(&skills_root, entry.path())?;
+        if !skill_ids.insert(skill.skill_id.clone()) {
+            return Err(anyhow!(
+                "installed skill alias '{}' collides with another installed skill on skill id '{}'",
+                skill.alias,
+                skill.skill_id
+            ));
+        }
+        skills.push(skill);
+    }
+
+    for channel in &config.channels {
+        if !channel_ids.insert(channel.id.clone()) {
+            return Err(anyhow!(
+                "operator config contains duplicate channel id '{}'",
+                channel.id
+            ));
+        }
+        validate_skill_alias(&channel.skill)?;
+        if !skill_aliases.contains(channel.skill.as_str()) {
+            return Err(anyhow!(
+                "configured channel '{}' references missing installed skill alias '{}'",
+                channel.id,
+                channel.skill
+            ));
+        }
+        channels.push(AppliedChannel::from_config(channel));
+    }
+
+    Ok(AppliedStateInputs {
+        skills_root,
+        skills,
+        channels,
+    })
+}
+
 fn applied_skills_fingerprint(skills: &[AppliedSkill]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"lionclaw-applied-skills-v1\0");
@@ -210,6 +236,8 @@ fn applied_state_fingerprint(skills: &[AppliedSkill], channels: &[AppliedChannel
         hasher.update(channel.id.as_bytes());
         hasher.update(b"\0");
         hasher.update(channel.skill_alias.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(channel.worker.as_bytes());
         hasher.update(b"\0");
         hasher.update(channel.launch_mode.as_str().as_bytes());
         hasher.update(b"\0");
@@ -563,6 +591,7 @@ impl AppliedSkill {
 pub struct AppliedChannel {
     pub id: String,
     pub skill_alias: String,
+    pub worker: String,
     pub launch_mode: ChannelLaunchMode,
     pub required_env: Vec<String>,
 }
@@ -572,6 +601,7 @@ impl AppliedChannel {
         Self {
             id: config.id.clone(),
             skill_alias: config.skill.clone(),
+            worker: config.worker.clone(),
             launch_mode: config.launch_mode,
             required_env: config.required_env.clone(),
         }
@@ -630,16 +660,20 @@ fn read_installed_skill_metadata(snapshot_root: &Path) -> Result<Option<Installe
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::Path};
 
     use super::{publish_materialized_snapshot_root, AppliedState};
-    use crate::{home::LionClawHome, operator::reconcile::onboard};
+    use crate::{home::LionClawHome, operator::target::init_project};
+
+    fn test_home(project_root: &Path) -> LionClawHome {
+        let project = init_project(project_root).expect("init project");
+        LionClawHome::new(project.instance.home)
+    }
 
     #[tokio::test]
     async fn load_ignores_hidden_staging_directories() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_home(temp_dir.path());
 
         let visible = home.skills_dir().join("visible");
         fs::create_dir_all(&visible).expect("visible dir");
@@ -671,8 +705,7 @@ mod tests {
     #[tokio::test]
     async fn load_rejects_symlinked_installed_aliases() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_home(temp_dir.path());
 
         let target = home.skills_dir().join("target");
         fs::create_dir_all(&target).expect("target dir");
@@ -697,8 +730,7 @@ mod tests {
     #[tokio::test]
     async fn channel_only_changes_reuse_materialized_skill_snapshot() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_home(temp_dir.path());
 
         let visible = home.skills_dir().join("visible");
         fs::create_dir_all(&visible).expect("visible dir");
@@ -721,7 +753,8 @@ mod tests {
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
             id: "terminal".to_string(),
             skill: "visible".to_string(),
-            launch_mode: crate::operator::config::ChannelLaunchMode::Service,
+            launch_mode: crate::operator::config::ChannelLaunchMode::Background,
+            worker: crate::operator::config::default_channel_worker(),
             required_env: Vec::new(),
         });
         config.save(&home).await.expect("save config");
@@ -741,8 +774,7 @@ mod tests {
     #[tokio::test]
     async fn channel_required_env_changes_applied_state_fingerprint() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_home(temp_dir.path());
 
         let visible = home.skills_dir().join("visible");
         fs::create_dir_all(&visible).expect("visible dir");
@@ -758,7 +790,8 @@ mod tests {
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
             id: "terminal".to_string(),
             skill: "visible".to_string(),
-            launch_mode: crate::operator::config::ChannelLaunchMode::Service,
+            launch_mode: crate::operator::config::ChannelLaunchMode::Background,
+            worker: crate::operator::config::default_channel_worker(),
             required_env: vec!["FIRST_KEY".to_string()],
         });
         config.save(&home).await.expect("save first config");
@@ -768,7 +801,8 @@ mod tests {
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
             id: "terminal".to_string(),
             skill: "visible".to_string(),
-            launch_mode: crate::operator::config::ChannelLaunchMode::Service,
+            launch_mode: crate::operator::config::ChannelLaunchMode::Background,
+            worker: crate::operator::config::default_channel_worker(),
             required_env: vec!["SECOND_KEY".to_string()],
         });
         config.save(&home).await.expect("save second config");
@@ -781,8 +815,7 @@ mod tests {
     #[tokio::test]
     async fn load_rejects_materialized_snapshot_mismatch() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_home(temp_dir.path());
 
         let visible = home.skills_dir().join("visible");
         fs::create_dir_all(&visible).expect("visible dir");
@@ -813,8 +846,7 @@ mod tests {
     #[tokio::test]
     async fn publish_materialized_snapshot_root_reuses_existing_valid_target() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
-        onboard(&home, None).await.expect("onboard");
+        let home = test_home(temp_dir.path());
 
         let visible = home.skills_dir().join("visible");
         fs::create_dir_all(&visible).expect("visible dir");

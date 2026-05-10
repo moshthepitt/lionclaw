@@ -8,9 +8,9 @@ contract around that work: sessions, channels, scheduled jobs, continuity,
 runtime configuration, confinement, policy, and audit.
 
 LionClaw currently targets Unix-like systems only. The direct `lionclaw run`
-path is designed for Linux/macOS-style Unix environments. Managed daemon paths,
-including service mode and channel auto-start, currently use systemd user
-services; launchd support is a future portability item.
+path is designed for Linux/macOS-style Unix environments. Managed background
+paths, including `lionclaw up` and channel auto-start, currently use the
+systemd user manager; launchd support is a future portability item.
 
 ## System Shape
 
@@ -59,7 +59,7 @@ mediate every private step inside those harnesses.
 
 Instead, LionClaw constrains the runtime launch:
 
-- project root mounted at `/workspace`
+- selected work root mounted at `/workspace`
 - runtime-private state mounted at `/runtime`
 - draft/output area mounted at `/drafts`
 - applied non-channel skill snapshots mounted read-only at `/lionclaw/skills/<alias>`
@@ -125,7 +125,7 @@ For `lionclaw run <runtime>`, channel turns, or scheduled jobs:
 2. The kernel opens or reuses a durable session.
 3. The kernel renders the prompt envelope from identity, continuity, skills,
    history, and current input.
-4. The execution planner resolves the runtime profile, preset, project root,
+4. The execution planner resolves the runtime profile, preset, work root,
    runtime state root, drafts root, network mode, secret mount decision, image,
    timeouts, and compatibility key.
 5. The kernel audits `runtime.plan.allow` or `runtime.plan.deny`.
@@ -168,14 +168,15 @@ narrow non-runtime surfaces, and tests.
 
 The everyday runtime layout is mount-first:
 
-- `/workspace`: project/task root with preset-controlled read-only or read-write access
+- `/workspace`: selected work root with preset-controlled read-only or read-write access
 - `/runtime`: runtime-private writable state root
 - `/drafts`: runtime-private draft/output area
 - `/lionclaw/skills/<alias>`: installed non-channel skill snapshot assets mounted read-only
 
-For local `lionclaw run`, the project root defaults to the current working
-directory and is mounted at `/workspace`. `LIONCLAW_HOME` remains LionClaw's
-state root and is not the project tree.
+For local `lionclaw run`, target resolution selects one project instance and
+uses that instance's recorded work root. The work root is mounted at
+`/workspace`. The instance home remains LionClaw's state root and is not the
+project tree or work root.
 
 The planner injects runtime-private environment defaults such as
 `HOME=/runtime/home`, `LIONCLAW_DRAFTS_DIR=/drafts`, and
@@ -184,7 +185,7 @@ assets, so engine-specific caches and config stay out of assistant continuity.
 
 Interactive program-backed turns launch a fresh confined process for each
 request, but the mounted `/runtime` state root is scoped to the LionClaw
-session, project root, and execution security shape. That lets the harness
+session, work root, and execution security shape. That lets the harness
 resume its own conversation state across turns without sharing private runtime
 state across different projects or secret/network shapes.
 
@@ -208,9 +209,10 @@ Current runtime network policy is intentionally coarse:
 LionClaw does not expose a fake allowlist mode before a real egress-control
 plane exists. On rootless hosts, `on` also requires the container engine to be
 able to stand up its private network namespace. LionClaw preflights that host
-capability before interactive or managed-service startup.
+capability before interactive or managed-background startup.
 
-Runtime secrets are loaded from `~/.lionclaw/config/runtime-secrets.env`.
+Runtime secrets are loaded from the selected instance home's
+`config/runtime-secrets.env`.
 Presets either mount that whole file or mount no runtime secrets at all with
 `mount-runtime-secrets = true|false`. The Podman backend mounts it read-only
 under `/run/secrets/` with a LionClaw-managed name that starts with
@@ -225,8 +227,8 @@ session-local copies of `auth.json` and `config.toml` under
 into the runtime container.
 
 `lionclaw run` inherits an interactive shell's `CODEX_HOME` when set, and
-`lionclaw service up` persists that same override into the managed daemon
-environment for background jobs and channels.
+`lionclaw up` persists that same override into the managed daemon environment
+for background jobs and channels.
 
 ## API Contracts
 
@@ -353,8 +355,8 @@ Kernel bootstrap converts stale `running` session turns into durable
 
 ## Assistant Continuity
 
-Continuity lives under the assistant home workspace inside
-`LIONCLAW_HOME/workspaces/<daemon.workspace>/`.
+Continuity lives under the assistant home workspace inside the selected
+instance home at `workspaces/<daemon.workspace>/`.
 
 The assistant home workspace contains:
 
@@ -395,21 +397,28 @@ manually by the operator.
 
 ## Operator Launch Model
 
-- `launch_mode=service`: channel worker is supervised by `lionclaw service up`
-  through the platform service manager. The current implementation uses systemd
-  user services.
-- `launch_mode=interactive`: channel worker is foreground-only and started
-  with `lionclaw channel attach <id>`. If no compatible daemon is already
-  running, the attach path starts the daemon through the same systemd-backed
-  manager.
-- If a channel declares `required_env`, both launch paths require those host
-  environment variables and pass them through to the worker.
+- Channel skills declare `lionclaw.toml` metadata: channel id, launch mode,
+  worker entrypoint, and required env names. The v1 metadata contract is small
+  by design and does not claim permissions LionClaw does not enforce.
+- `launch=background`: the channel worker is supervised through the platform
+  backend. The current implementation uses systemd user units.
+- `launch=interactive`: the channel worker is foreground-only and normally
+  started by `lionclaw connect <channel>` in the current terminal. The low-level
+  attach path remains available for debugging.
+- Required channel env is selected-instance state under `config/channels/`.
+  Generated unit env may reference that private file, but generated unit env is
+  not the source of truth.
 
-Worker entrypoint resolution requires `scripts/worker`.
+Worker entrypoint resolution uses the metadata `worker` path and rejects
+symlink escapes outside the skill directory.
 
-`LIONCLAW_HOME` gets a stable machine-owned `config/home-id`. Attach and
-service flows only reuse a daemon when `/v0/daemon/info` reports the same
-home id, current project scope, and daemon-compat fingerprint.
+`LIONCLAW_HOME` gets stable machine-owned `config/home-id` and managed-unit
+identity state. Attach and background flows only reuse a daemon when
+`/v0/daemon/info` reports the same home id, current project scope, and
+daemon-compat fingerprint.
+Managed systemd units are instance-scoped and carry `X-LionClaw-*` ownership
+metadata so cleanup and stop operations only touch units owned by the selected
+home.
 
 ## Security Posture In v0
 
@@ -427,8 +436,8 @@ home id, current project scope, and daemon-compat fingerprint.
    override, and constrained env passthrough. Configured kernel defaults are
    trusted directly; policy timeout bounds apply to explicit per-turn override
    requests.
-7. Ordinary confined runtime file work stays inside mounted
-   workspace/runtime/drafts paths.
+7. Ordinary confined runtime file work stays inside mounted work-root, runtime,
+   and drafts paths.
 8. Kernel brokers are reserved for explicit side effects and direct-runtime
    requests. `channel.send` records outbound transcript entries and appends
    typed stream events. `net.egress`, `secret.request`, and `scheduler.run`
@@ -458,5 +467,5 @@ home id, current project scope, and daemon-compat fingerprint.
 5. Only touch `kernel/runtime/builtins.rs` if the adapter is intentionally
    builtin test/kernel scaffolding.
 6. Add unit tests in the adapter module plus one kernel-level integration case.
-7. Update `docs/RUNTIME_MODEL.md`, this architecture doc, and manual QA notes
-   if the runtime introduces new auth, state, or confinement behavior.
+7. Update this architecture doc and `docs/MANUAL_QA.md` if the runtime
+   introduces new auth, state, or confinement behavior.

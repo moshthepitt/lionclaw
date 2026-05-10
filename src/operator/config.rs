@@ -204,6 +204,12 @@ impl OperatorConfig {
             .collect();
         self.channels.sort_by_key(|channel| channel.id.clone());
         for channel in &mut self.channels {
+            channel.id = channel.id.trim().to_string();
+            channel.skill = channel.skill.trim().to_string();
+            channel.worker = channel.worker.trim().to_string();
+            if channel.worker.is_empty() {
+                channel.worker = default_channel_worker();
+            }
             channel.required_env.sort();
             channel.required_env.dedup();
         }
@@ -265,6 +271,8 @@ pub struct OperatorDefaults {
 pub struct DaemonConfig {
     #[serde(default = "default_bind")]
     pub bind: String,
+    #[serde(default)]
+    pub bind_configured: bool,
     #[serde(default = "default_workspace")]
     pub workspace: String,
 }
@@ -273,6 +281,7 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             bind: default_bind(),
+            bind_configured: false,
             workspace: default_workspace(),
         }
     }
@@ -284,6 +293,8 @@ pub struct ManagedChannelConfig {
     pub skill: String,
     #[serde(default)]
     pub launch_mode: ChannelLaunchMode,
+    #[serde(default = "default_channel_worker")]
+    pub worker: String,
     #[serde(default)]
     pub required_env: Vec<String>,
 }
@@ -292,14 +303,14 @@ pub struct ManagedChannelConfig {
 #[serde(rename_all = "lowercase")]
 pub enum ChannelLaunchMode {
     #[default]
-    Service,
+    Background,
     Interactive,
 }
 
 impl ChannelLaunchMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Service => "service",
+            Self::Background => "background",
             Self::Interactive => "interactive",
         }
     }
@@ -310,10 +321,10 @@ impl std::str::FromStr for ChannelLaunchMode {
 
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         match value.trim() {
-            "service" => Ok(Self::Service),
+            "background" => Ok(Self::Background),
             "interactive" => Ok(Self::Interactive),
             other => Err(format!(
-                "invalid channel launch mode '{other}'; expected 'service' or 'interactive'"
+                "invalid channel launch mode '{other}'; expected 'background' or 'interactive'"
             )),
         }
     }
@@ -325,6 +336,10 @@ pub fn default_bind() -> String {
 
 pub fn default_workspace() -> String {
     DEFAULT_WORKSPACE.to_string()
+}
+
+pub fn default_channel_worker() -> String {
+    crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -612,17 +627,19 @@ pub fn validate_host_executable(source: &str) -> Result<()> {
         return Err(anyhow!("host executable command or path cannot be empty"));
     }
 
-    if !looks_like_path(raw) {
+    let path = Path::new(raw);
+    if !path.is_absolute() {
         return Err(anyhow!(
-            "host executable '{source}' must be stored as an absolute or explicit path"
+            "host executable '{source}' must be stored as an absolute path"
         ));
     }
-    validate_executable_path(&normalize_executable_path(raw)?)
+    validate_executable_path(path)
 }
 
 pub fn validate_podman_executable(source: &str) -> Result<()> {
-    validate_host_executable(source)?;
-    ensure_podman_executable(&normalize_executable_path(source.trim())?)
+    let raw = source.trim();
+    validate_host_executable(raw)?;
+    ensure_podman_executable(Path::new(raw))
 }
 
 fn looks_like_path(raw: &str) -> bool {
@@ -661,9 +678,10 @@ mod tests {
 
     use super::{
         daemon_compat_fingerprint, daemon_compat_fingerprint_with_runtime_context,
-        derive_skill_alias, normalize_host_executable, normalize_local_source,
-        normalize_runtime_command, validate_host_executable, ChannelLaunchMode,
-        ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig,
+        default_channel_worker, derive_skill_alias, normalize_host_executable,
+        normalize_local_source, normalize_runtime_command, validate_host_executable,
+        validate_podman_executable, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig,
+        RuntimeProfileConfig,
     };
     use crate::kernel::runtime::{
         ConfinementConfig, ExecutionPreset, NetworkMode, OciConfinementConfig, WorkspaceAccess,
@@ -689,7 +707,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn channel_launch_mode_defaults_to_service() {
+    async fn channel_launch_mode_defaults_to_background() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let mut config = OperatorConfig::default();
@@ -697,13 +715,17 @@ mod tests {
             id: "terminal".to_string(),
             skill: "terminal".to_string(),
             launch_mode: ChannelLaunchMode::default(),
+            worker: default_channel_worker(),
             required_env: Vec::new(),
         });
         config.save(&home).await.expect("save config");
 
         let loaded = OperatorConfig::load(&home).await.expect("load config");
         assert_eq!(loaded.channels.len(), 1);
-        assert_eq!(loaded.channels[0].launch_mode, ChannelLaunchMode::Service);
+        assert_eq!(
+            loaded.channels[0].launch_mode,
+            ChannelLaunchMode::Background
+        );
     }
 
     #[tokio::test]
@@ -715,6 +737,7 @@ mod tests {
             id: "terminal".to_string(),
             skill: "terminal".to_string(),
             launch_mode: ChannelLaunchMode::Interactive,
+            worker: default_channel_worker(),
             required_env: Vec::new(),
         });
         config.save(&home).await.expect("save config");
@@ -731,6 +754,24 @@ mod tests {
     fn normalizes_local_source_uri() {
         let absolute = normalize_local_source(".").expect("normalize");
         assert!(absolute.starts_with("local:/"));
+    }
+
+    #[test]
+    fn bare_podman_engine_is_rejected_for_stored_profiles() {
+        let err = validate_podman_executable("podman").expect_err("bare podman engine");
+
+        assert!(err
+            .to_string()
+            .contains("must be stored as an absolute path"));
+    }
+
+    #[test]
+    fn relative_podman_engine_is_rejected_for_stored_profiles() {
+        let err = validate_podman_executable("./podman").expect_err("relative podman engine");
+
+        assert!(err
+            .to_string()
+            .contains("must be stored as an absolute path"));
     }
 
     #[test]
@@ -1003,7 +1044,7 @@ mod tests {
         let err = validate_host_executable("sh").expect_err("bare command should fail");
         assert!(err
             .to_string()
-            .contains("must be stored as an absolute or explicit path"));
+            .contains("must be stored as an absolute path"));
     }
 
     #[test]

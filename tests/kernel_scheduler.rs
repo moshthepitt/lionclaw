@@ -30,7 +30,8 @@ use lionclaw::{
     },
     operator::{
         config::ChannelLaunchMode,
-        reconcile::{add_channel, add_skill, onboard, remove_skill},
+        reconcile::{add_channel, add_skill, remove_skill},
+        target::init_project,
     },
     workspace::bootstrap_workspace,
 };
@@ -1408,7 +1409,6 @@ impl RuntimeAdapter for BlockingRuntimeAdapter {
 }
 
 async fn install_skill(env: &TestEnv, skill_name: &str) -> String {
-    onboard(&env.home, None).await.expect("onboard");
     let skill_source = env.temp_dir.path().join("skill-sources").join(skill_name);
     std::fs::create_dir_all(&skill_source).expect("skill source dir");
     std::fs::write(
@@ -1435,7 +1435,6 @@ async fn install_skill(env: &TestEnv, skill_name: &str) -> String {
 }
 
 async fn install_and_bind_channel(env: &TestEnv, channel_id: &str, skill_name: &str) {
-    onboard(&env.home, None).await.expect("onboard");
     let skill_source = env.temp_dir.path().join("skill-sources").join(skill_name);
     let worker = skill_source.join("scripts/worker");
     std::fs::create_dir_all(worker.parent().expect("worker parent")).expect("scripts dir");
@@ -1459,7 +1458,7 @@ async fn install_and_bind_channel(env: &TestEnv, channel_id: &str, skill_name: &
         &env.home,
         channel_id.to_string(),
         skill_name.to_string(),
-        ChannelLaunchMode::Service,
+        ChannelLaunchMode::Background,
         Vec::new(),
     )
     .await
@@ -1523,7 +1522,8 @@ async fn write_test_codex_auth(home: &LionClawHome) {
 impl TestEnv {
     fn new() -> Self {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let project = init_project(temp_dir.path()).expect("init project");
+        let home = LionClawHome::new(project.instance.home);
         Self { temp_dir, home }
     }
 
@@ -1544,7 +1544,6 @@ impl TestEnv {
     }
 
     async fn kernel_with_options(&self, mut options: KernelOptions) -> Kernel {
-        onboard(&self.home, None).await.expect("onboard");
         options.applied_state = AppliedState::load(&self.home)
             .await
             .expect("load applied state");

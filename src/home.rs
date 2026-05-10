@@ -62,8 +62,20 @@ impl LionClawHome {
         resolve_private_env_file(&self.runtime_secrets_env_path(), "runtime secrets").await
     }
 
+    pub fn channel_env_dir(&self) -> PathBuf {
+        self.config_dir().join("channels")
+    }
+
+    pub fn channel_env_path(&self, channel_id: &str) -> PathBuf {
+        self.channel_env_dir().join(format!("{channel_id}.env"))
+    }
+
     pub fn home_id_path(&self) -> PathBuf {
         self.config_dir().join("home-id")
+    }
+
+    pub fn unit_group_id_path(&self) -> PathBuf {
+        self.config_dir().join("unit-group-id")
     }
 
     pub fn skills_dir(&self) -> PathBuf {
@@ -144,16 +156,12 @@ impl LionClawHome {
         self.root.join("logs")
     }
 
-    pub fn services_dir(&self) -> PathBuf {
-        self.root.join("services")
+    pub fn units_dir(&self) -> PathBuf {
+        self.root.join("units")
     }
 
-    pub fn services_env_dir(&self) -> PathBuf {
-        self.services_dir().join("env")
-    }
-
-    pub fn services_systemd_dir(&self) -> PathBuf {
-        self.services_dir().join("systemd")
+    pub fn units_env_dir(&self) -> PathBuf {
+        self.units_dir().join("env")
     }
 
     pub fn workspace_dir(&self, workspace: &str) -> PathBuf {
@@ -165,12 +173,12 @@ impl LionClawHome {
             self.root(),
             self.db_dir(),
             self.config_dir(),
+            self.channel_env_dir(),
             self.skills_dir(),
             self.runtime_dir(),
             self.logs_dir(),
-            self.services_dir(),
-            self.services_env_dir(),
-            self.services_systemd_dir(),
+            self.units_dir(),
+            self.units_env_dir(),
             self.workspace_dir(DEFAULT_WORKSPACE),
         ] {
             tokio::fs::create_dir_all(&path)

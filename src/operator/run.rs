@@ -8,7 +8,6 @@ use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
 use crate::{
-    config::resolve_project_workspace_root,
     contracts::{
         SessionActionKind, SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest,
         SessionOpenRequest, SessionTurnRequest, SessionTurnStatus, SessionTurnView, StreamEventDto,
@@ -17,9 +16,8 @@ use crate::{
     home::{runtime_project_partition_key, LionClawHome},
     kernel::Kernel,
     operator::{
-        reconcile::{
-            load_operator_state, onboard, open_runtime_kernel_with_timeouts, render_runtime_cache,
-        },
+        config::OperatorConfig,
+        reconcile::{open_runtime_kernel_for_work_root, render_runtime_cache_for_work_root},
         runtime::{resolve_runtime_id, validate_runtime_launch_prerequisites},
     },
     runtime_timeouts::RuntimeTurnTimeouts,
@@ -27,6 +25,8 @@ use crate::{
 
 pub async fn run_local(
     home: &LionClawHome,
+    work_root: &Path,
+    instance_name: Option<&str>,
     requested_runtime: Option<String>,
     continue_last_session: bool,
     timeout_override: Option<RuntimeTurnTimeouts>,
@@ -36,10 +36,14 @@ pub async fn run_local(
     let mut input = BufReader::new(stdin);
     let mut output = stdout;
     run_local_with_io_and_timeouts(
-        home,
-        requested_runtime,
-        continue_last_session,
-        timeout_override,
+        RunLocalInvocation {
+            home,
+            work_root,
+            instance_name,
+            requested_runtime,
+            continue_last_session,
+            timeout_override,
+        },
         &mut input,
         &mut output,
     )
@@ -54,43 +58,65 @@ pub(crate) async fn run_local_with_io<R: BufRead + Send, W: Write + Send>(
     input: &mut R,
     output: &mut W,
 ) -> Result<()> {
+    let work_root = crate::config::resolve_project_workspace_root()
+        .map_err(|err| anyhow!("failed to resolve project workspace root: {err}"))?;
     run_local_with_io_and_timeouts(
-        home,
-        requested_runtime,
-        continue_last_session,
-        None,
+        RunLocalInvocation {
+            home,
+            work_root: &work_root,
+            instance_name: Some("main"),
+            requested_runtime,
+            continue_last_session,
+            timeout_override: None,
+        },
         input,
         output,
     )
     .await
 }
 
-pub(crate) async fn run_local_with_io_and_timeouts<R: BufRead + Send, W: Write + Send>(
-    home: &LionClawHome,
+struct RunLocalInvocation<'a> {
+    home: &'a LionClawHome,
+    work_root: &'a Path,
+    instance_name: Option<&'a str>,
     requested_runtime: Option<String>,
     continue_last_session: bool,
     timeout_override: Option<RuntimeTurnTimeouts>,
+}
+
+async fn run_local_with_io_and_timeouts<R: BufRead + Send, W: Write + Send>(
+    invocation: RunLocalInvocation<'_>,
     input: &mut R,
     output: &mut W,
 ) -> Result<()> {
-    onboard(home, None).await?;
-    let state = load_operator_state(home).await?;
-    let runtime_id = resolve_runtime_id(&state.config, requested_runtime.as_deref())?;
-    validate_runtime_launch_prerequisites(home, &state.config, &runtime_id).await?;
-    render_runtime_cache(home, &state.config, &runtime_id).await?;
+    let RunLocalInvocation {
+        home,
+        work_root,
+        instance_name,
+        requested_runtime,
+        continue_last_session,
+        timeout_override,
+    } = invocation;
+    let config = OperatorConfig::load(home).await?;
+    let runtime_id = resolve_run_runtime_id(
+        &config,
+        requested_runtime.as_deref(),
+        instance_name.unwrap_or("selected home"),
+    )?;
+    validate_runtime_launch_prerequisites(home, &config, &runtime_id).await?;
+    render_runtime_cache_for_work_root(home, &config, &runtime_id, work_root).await?;
 
     let effective_timeouts = timeout_override.unwrap_or_else(RuntimeTurnTimeouts::interactive);
-    let kernel = open_runtime_kernel_with_timeouts(
+    let kernel = open_runtime_kernel_for_work_root(
         home,
-        &state.config,
+        &config,
         Some(runtime_id.clone()),
+        work_root,
         Some(effective_timeouts),
     )
     .await?;
-    let project_workspace_root = resolve_project_workspace_root()
-        .map_err(|err| anyhow!("failed to resolve project workspace root: {err}"))?;
-    let peer_id = local_peer_id_for_project(&project_workspace_root);
-    let project_workspace_root = project_workspace_root.display().to_string();
+    let peer_id = local_peer_id_for_project(work_root);
+    let project_workspace_root = work_root.display().to_string();
     run_repl(
         &kernel,
         ReplContext {
@@ -104,6 +130,26 @@ pub(crate) async fn run_local_with_io_and_timeouts<R: BufRead + Send, W: Write +
         output,
     )
     .await
+}
+
+fn resolve_run_runtime_id(
+    config: &crate::operator::config::OperatorConfig,
+    requested_runtime: Option<&str>,
+    instance_name: &str,
+) -> Result<String> {
+    if requested_runtime
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        return resolve_runtime_id(config, requested_runtime);
+    }
+
+    config.defaults.runtime.clone().ok_or_else(|| {
+        anyhow!(
+            "no default runtime configured for instance \"{instance_name}\"\nRun:\n  lionclaw configure --runtime codex"
+        )
+    })
 }
 
 struct ReplContext<'a> {
@@ -127,7 +173,7 @@ async fn run_repl<R: BufRead + Send, W: Write + Send>(
 
     writeln!(
         output,
-        "LionClaw interactive mode\nruntime: {}\nproject: {}\ntimeout: idle {}, hard {}\nType /continue, /retry, /reset, or /exit.\n",
+        "LionClaw interactive mode\nruntime: {}\nwork root: {}\ntimeout: idle {}, hard {}\nType /continue, /retry, /reset, or /exit.\n",
         context.runtime_id,
         context.project_workspace_root,
         crate::runtime_timeouts::format_duration(context.timeouts.idle),
@@ -533,7 +579,7 @@ mod tests {
 
     use super::{
         local_peer_id_for_project, render_turn_stream, resolve_repl_session, run_local_with_io,
-        run_local_with_io_and_timeouts,
+        run_local_with_io_and_timeouts, RunLocalInvocation,
     };
     use crate::{
         config::resolve_project_workspace_root,
@@ -550,7 +596,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn run_local_auto_onboards_and_executes_turns() {
+    async fn run_local_uses_existing_setup_and_executes_turns() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let stub = temp_dir.path().join("codex-stub.sh");
@@ -564,7 +610,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
 
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
-        config.save(&home).await.expect("save config");
+        save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
@@ -607,18 +653,23 @@ sleep 1
 
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
-        config.save(&home).await.expect("save config");
+        save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
         let mut output = Vec::new();
+        let work_root = std::env::current_dir().expect("current dir");
         run_local_with_io_and_timeouts(
-            &home,
-            None,
-            false,
-            Some(RuntimeTurnTimeouts::with_hard_timeout(
-                std::time::Duration::from_millis(60),
-            )),
+            RunLocalInvocation {
+                home: &home,
+                work_root: &work_root,
+                instance_name: Some("main"),
+                requested_runtime: None,
+                continue_last_session: false,
+                timeout_override: Some(RuntimeTurnTimeouts::with_hard_timeout(
+                    std::time::Duration::from_millis(60),
+                )),
+            },
             &mut input,
             &mut output,
         )
@@ -653,7 +704,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
 
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
-        config.save(&home).await.expect("save config");
+        save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
 
         let mut first_input = Cursor::new(b"hello\n/exit\n".to_vec());
@@ -699,7 +750,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
 
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
-        config.save(&home).await.expect("save config");
+        save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
 
         let mut first_input = Cursor::new(b"hello\n/exit\n".to_vec());
@@ -779,7 +830,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
 
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
-        config.save(&home).await.expect("save config");
+        save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
         let pool = Db::connect_file(&home.db_path())
             .await
@@ -874,7 +925,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
 
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
-        config.save(&home).await.expect("save config");
+        save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
 
         let mut input = Cursor::new(b"/reset\n/exit\n".to_vec());
@@ -911,7 +962,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
 
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
-        config.save(&home).await.expect("save config");
+        save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
 
         let mut input = Cursor::new(b"/exit\n".to_vec());
@@ -934,9 +985,13 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
             .await
             .expect_err("missing runtime should error");
 
-        assert!(err
-            .to_string()
-            .contains("runtime is required when no default runtime is configured"));
+        let message = err.to_string();
+        assert!(message.contains("no default runtime configured for instance \"main\""));
+        assert!(message.contains("lionclaw configure --runtime codex"));
+        assert!(
+            !home.config_path().exists(),
+            "run should not create runtime config implicitly"
+        );
     }
 
     #[tokio::test]
@@ -961,7 +1016,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
                 }),
             },
         );
-        config.save(&home).await.expect("save config");
+        save_prepared_config(&home, &config).await;
 
         let mut input = Cursor::new(Vec::<u8>::new());
         let mut output = Vec::new();
@@ -987,7 +1042,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
 
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
-        config.save(&home).await.expect("save config");
+        save_prepared_config(&home, &config).await;
 
         let mut input = Cursor::new(Vec::<u8>::new());
         let mut output = Vec::new();
@@ -1031,7 +1086,7 @@ exit 0
 
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
-        config.save(&home).await.expect("save config");
+        save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
 
         let mut input = Cursor::new(Vec::<u8>::new());
@@ -1064,7 +1119,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
 
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
-        config.save(&home).await.expect("save config");
+        save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
@@ -1094,7 +1149,7 @@ echo '{"type":"response.output_text.delta","text":"hello from opencode"}'
 
         let mut config = OperatorConfig::default();
         config.upsert_runtime("opencode".to_string(), stubbed_opencode_runtime(&stub));
-        config.save(&home).await.expect("save config");
+        save_prepared_config(&home, &config).await;
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
         let mut output = Vec::new();
@@ -1155,7 +1210,7 @@ exit 0
         config
             .set_default_runtime("opencode")
             .expect("set default runtime");
-        config.save(&home).await.expect("save config");
+        save_prepared_config(&home, &config).await;
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
         let mut output = Vec::new();
@@ -1185,7 +1240,7 @@ echo '{"type":"text","text":"hello from opencode"}'
 
         let mut config = OperatorConfig::default();
         config.upsert_runtime("opencode".to_string(), stubbed_opencode_runtime(&stub));
-        config.save(&home).await.expect("save config");
+        save_prepared_config(&home, &config).await;
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
         let mut output = Vec::new();
@@ -1217,7 +1272,7 @@ exit 7
 
         let mut config = OperatorConfig::default();
         config.upsert_runtime("opencode".to_string(), stubbed_opencode_runtime(&stub));
-        config.save(&home).await.expect("save config");
+        save_prepared_config(&home, &config).await;
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
         let mut output = Vec::new();
@@ -1250,7 +1305,7 @@ exit 7
 
         let mut config = OperatorConfig::default();
         config.upsert_runtime("codex".to_string(), stubbed_codex_runtime(&stub));
-        config.save(&home).await.expect("save config");
+        save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
 
         let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
@@ -1313,6 +1368,14 @@ exit 7
         assert!(output.contains("lionclaw> hello"));
         assert!(output.contains("lionclaw> world"));
         assert!(output.contains("[error] something failed"));
+    }
+
+    async fn save_prepared_config(home: &LionClawHome, config: &OperatorConfig) {
+        home.ensure_base_dirs().await.expect("prepare home dirs");
+        crate::workspace::bootstrap_workspace(&config.workspace_root(home))
+            .await
+            .expect("bootstrap workspace");
+        config.save(home).await.expect("save config");
     }
 
     #[cfg(unix)]

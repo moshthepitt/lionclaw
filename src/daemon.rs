@@ -83,7 +83,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let app = build_router(
         kernel,
         DaemonInfoResponse {
-            service: "lionclawd".to_string(),
+            daemon: "lionclawd".to_string(),
             status: "ok".to_string(),
             home_id,
             home_root: config.home.root().display().to_string(),

@@ -1,6 +1,13 @@
-use std::{collections::BTreeMap, process::ExitCode, str::FromStr, time::Duration};
+use std::{
+    collections::BTreeMap,
+    io::{BufRead, BufReader, IsTerminal, Write},
+    path::{Path, PathBuf},
+    process::ExitCode,
+    str::FromStr,
+    time::Duration,
+};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use cron::Schedule;
@@ -18,20 +25,41 @@ use crate::{
     },
     operator::{
         attach::attach_channel,
+        command_display::{lionclaw_home_command_prefix, shell_quote_arg},
         config::{
             derive_skill_alias, normalize_podman_executable, normalize_runtime_command,
             ChannelLaunchMode, OperatorConfig, RuntimeProfileConfig,
         },
+        connect::{connect_channel, ConnectChannelRequest, ConnectEnvInputs, ConnectOutcome},
+        doctor::run_doctor,
+        managed_units::{SystemdUserUnitManager, UnitManager},
+        operations::{
+            down_instance, no_managed_units_message, operate_project_instances,
+            project_log_components, selected_log_components, up_instance, write_journal_logs,
+            LogFilter, LogOptions, StackOperation,
+        },
         reconcile::{
-            add_channel, add_skill, down, logs, onboard, open_kernel, open_runtime_kernel,
+            add_channel, add_skill, open_kernel, open_runtime_kernel_for_work_root,
             pairing_approve, pairing_block, pairing_list, remove_channel, remove_skill,
-            resolve_installed_skill_worker_entrypoint, resolve_stack_binaries, status, up,
-            OnboardBindSelection,
+            resolve_installed_skill_worker_entrypoint,
         },
         run::run_local,
         runtime::{resolve_runtime_id, validate_runtime_availability},
-        services::SystemdUserServiceManager,
+        runtime_integration::{
+            configure_runtime_profile_with_engine_resolver, configure_runtime_required_message,
+            ConfigureRuntimeOutcome,
+        },
+        skills::{list_installed_skills, InstalledSkill},
         snapshot::SKILL_INSTALL_METADATA_FILE,
+        status::{
+            missing_target_for_status, render_project_status_all_with_manager,
+            render_target_status_with_manager, validate_status_all_target,
+        },
+        target::{
+            adopt_project_instance, create_project_instance, discover_project_root, init_project,
+            list_project_instance_statuses, list_project_instances, resolve_existing_project_root,
+            resolve_project_setup_root, resolve_target, TargetSelection, WorkRootRequirement,
+        },
     },
     runtime_timeouts::{parse_duration, RuntimeTurnTimeouts},
 };
@@ -42,23 +70,54 @@ const PROJECT_VALIDATE_MISMATCH_EXIT: u8 = 20;
 #[command(name = "lionclaw")]
 #[command(about = "LionClaw operator CLI")]
 pub struct Cli {
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "Target an exact LionClaw instance home"
+    )]
+    home: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "Target a LionClaw project root"
+    )]
+    project: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        value_name = "NAME",
+        help = "Target a project instance"
+    )]
+    instance: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Onboard(OnboardArgs),
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
+    Instance {
+        #[command(subcommand)]
+        command: InstanceCommand,
+    },
+    Configure(ConfigureArgs),
+    Connect(ConnectArgs),
     Run(RunArgs),
+    Up(AllArgs),
+    Down(AllArgs),
+    Logs(ProductLogsArgs),
+    Status(StatusArgs),
+    Doctor(DoctorArgs),
     #[command(hide = true)]
     ProjectValidate(ProjectValidateArgs),
     Runtime {
         #[command(subcommand)]
         command: Box<RuntimeCommand>,
-    },
-    Service {
-        #[command(subcommand)]
-        command: ServiceCommand,
     },
     Skill {
         #[command(subcommand)]
@@ -92,12 +151,94 @@ struct RunArgs {
 }
 
 #[derive(Debug, Args)]
-struct OnboardArgs {
+struct ConfigureArgs {
+    #[arg(long)]
+    runtime: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ConnectArgs {
+    channel_or_path: String,
+    #[arg(long = "env-file", value_name = "PATH")]
+    env_file: Option<PathBuf>,
+    #[arg(long = "from-env", value_name = "NAME")]
+    from_env: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct StatusArgs {
+    #[arg(long)]
+    all: bool,
+}
+
+#[derive(Debug, Args)]
+struct AllArgs {
+    #[arg(long)]
+    all: bool,
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    #[arg(long)]
+    all: bool,
+}
+
+#[derive(Debug, Args)]
+struct ProductLogsArgs {
+    #[arg(short = 'f', long)]
+    follow: bool,
+    #[arg(long, default_value_t = 200)]
+    tail: usize,
+    #[arg(long)]
+    since: Option<String>,
+    #[arg(long)]
+    daemon: bool,
+    #[arg(long)]
+    workers: bool,
+    #[arg(long, value_name = "CHANNEL")]
+    worker: Option<String>,
+    #[arg(long)]
+    all: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectCommand {
+    Init,
+}
+
+#[derive(Debug, Subcommand)]
+enum InstanceCommand {
+    Create(InstanceCreateArgs),
+    List,
+    Adopt(InstanceAdoptArgs),
+}
+
+#[derive(Debug, Args)]
+struct InstanceCreateArgs {
+    name: String,
     #[arg(
-        long,
-        help = "Daemon bind address or 'auto' for an isolated loopback port"
+        long = "work-root",
+        value_name = "PATH",
+        help = "Default host directory this instance operates on, resolved from the project root"
     )]
-    bind: Option<String>,
+    work_root: Option<PathBuf>,
+    #[arg(long = "create-work-root", help = "Create the work root during setup")]
+    create_work_root: bool,
+}
+
+#[derive(Debug, Args)]
+struct InstanceAdoptArgs {
+    name: String,
+    #[arg(value_name = "HOME")]
+    source_home: PathBuf,
+    #[arg(
+        long = "work-root",
+        value_name = "PATH",
+        help = "Default host directory this instance operates on, resolved from the project root"
+    )]
+    work_root: Option<PathBuf>,
+    #[arg(long = "create-work-root", help = "Create the work root during setup")]
+    create_work_root: bool,
 }
 
 #[derive(Debug, Args)]
@@ -122,26 +263,6 @@ struct ProjectValidateArgs {
     launch_mode: String,
     #[arg(long = "project-skill")]
     project_skills: Vec<String>,
-}
-
-#[derive(Debug, Subcommand)]
-enum ServiceCommand {
-    Up(ServiceUpArgs),
-    Down,
-    Status,
-    Logs(LogsArgs),
-}
-
-#[derive(Debug, Args)]
-struct ServiceUpArgs {
-    #[arg(long)]
-    runtime: Option<String>,
-}
-
-#[derive(Debug, Args)]
-struct LogsArgs {
-    #[arg(long, default_value_t = 200)]
-    lines: usize,
 }
 
 #[derive(Debug, Subcommand)]
@@ -194,7 +315,11 @@ struct RuntimeSetDefaultArgs {
 
 #[derive(Debug, Subcommand)]
 enum SkillCommand {
+    Install(SkillAddArgs),
     Add(SkillAddArgs),
+    List,
+    Remove(SkillRmArgs),
+    #[command(hide = true)]
     Rm(SkillRmArgs),
     #[command(hide = true)]
     WorkerPath(SkillWorkerPathArgs),
@@ -222,6 +347,8 @@ struct SkillWorkerPathArgs {
 #[derive(Debug, Subcommand)]
 enum ChannelCommand {
     Add(ChannelAddArgs),
+    List(ChannelListArgs),
+    Remove(ChannelRmArgs),
     Rm(ChannelRmArgs),
     Attach(ChannelAttachArgs),
     Pairing {
@@ -235,7 +362,7 @@ struct ChannelAddArgs {
     id: String,
     #[arg(long)]
     skill: Option<String>,
-    #[arg(long, default_value = "service")]
+    #[arg(long, default_value = "background")]
     launch: String,
     #[arg(long = "required-env")]
     required_env: Vec<String>,
@@ -244,6 +371,12 @@ struct ChannelAddArgs {
 #[derive(Debug, Args)]
 struct ChannelRmArgs {
     id: String,
+}
+
+#[derive(Debug, Args)]
+struct ChannelListArgs {
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Debug, Args)]
@@ -397,28 +530,258 @@ struct ContinuityPathArgs {
 
 pub async fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
-    let home = LionClawHome::from_env();
+    let target_selection = TargetSelection {
+        home: cli.home,
+        project: cli.project,
+        instance: cli.instance,
+    };
+    let command = cli.command;
+    let env_home = LionClawHome::from_env();
+    let resolved_target = resolve_command_target(&target_selection, &command)?;
+    let home = resolved_target
+        .as_ref()
+        .map(|target| target.instance_home.clone())
+        .unwrap_or(env_home);
 
-    match cli.command {
-        Command::Onboard(args) => {
-            let bind_selection = args.bind.as_deref().map(parse_onboard_bind).transpose()?;
-            let config = onboard(&home, bind_selection).await?;
-            println!(
-                "onboarded {} with workspace {} on {}",
-                home.root().display(),
-                config.daemon.workspace,
-                config.daemon.bind
-            );
+    match command {
+        Command::Project { command } => match command {
+            ProjectCommand::Init => {
+                let project_root = resolve_project_setup_root(&target_selection)?;
+                let result = init_project(&project_root)?;
+                println!(
+                    "initialized LionClaw project {}",
+                    result.project_root.display()
+                );
+                println!(
+                    "* {} home={} work-root={}",
+                    result.instance.name,
+                    result.instance.home.display(),
+                    result.instance.work_root.display()
+                );
+            }
+        },
+        Command::Instance { command } => match command {
+            InstanceCommand::Create(args) => {
+                let project_root = resolve_existing_project_root(&target_selection)?;
+                let instance = create_project_instance(
+                    &project_root,
+                    &args.name,
+                    args.work_root.as_deref(),
+                    args.create_work_root,
+                )?;
+                println!(
+                    "created instance {} home={} work-root={}",
+                    instance.name,
+                    instance.home.display(),
+                    instance.work_root.display()
+                );
+            }
+            InstanceCommand::List => {
+                let project_root = resolve_existing_project_root(&target_selection)?;
+                let entries = list_project_instances(&project_root)?;
+                if entries.is_empty() {
+                    println!("no instances found");
+                } else {
+                    for entry in entries {
+                        let marker = if entry.is_default { "*" } else { " " };
+                        let work_root = entry
+                            .work_root
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "-".to_string());
+                        let shared = if entry.shared_work_root_count > 1 {
+                            entry.shared_work_root_count.to_string()
+                        } else {
+                            "-".to_string()
+                        };
+                        println!(
+                            "{} {} home={} work-root={} shared={}",
+                            marker,
+                            entry.name,
+                            entry.home.display(),
+                            work_root,
+                            shared
+                        );
+                    }
+                }
+            }
+            InstanceCommand::Adopt(args) => {
+                let project_root = resolve_existing_project_root(&target_selection)?;
+                let instance = adopt_project_instance(
+                    &project_root,
+                    &args.name,
+                    &args.source_home,
+                    args.work_root.as_deref(),
+                    args.create_work_root,
+                )?;
+                println!(
+                    "adopted instance {} home={} work-root={}",
+                    instance.name,
+                    instance.home.display(),
+                    instance.work_root.display()
+                );
+            }
+        },
+        Command::Configure(args) => {
+            let target = resolved_target
+                .as_ref()
+                .ok_or_else(|| anyhow!("configure requires a resolved LionClaw target"))?;
+            let stdin = std::io::stdin();
+            let interactive = stdin.is_terminal();
+            let mut input = BufReader::new(stdin);
+            let stdout = std::io::stdout();
+            let mut output = stdout;
+            let outcome = configure_runtime_with_io(
+                &target.instance_home,
+                args.runtime,
+                interactive,
+                &mut input,
+                &mut output,
+            )
+            .await?;
+            print_configure_outcome(&target.instance_home, &outcome);
+        }
+        Command::Connect(args) => {
+            let target = resolved_target
+                .as_ref()
+                .ok_or_else(|| anyhow!("connect requires a resolved LionClaw target"))?;
+            let stdin = std::io::stdin();
+            let interactive = stdin.is_terminal();
+            let mut input = BufReader::new(stdin);
+            let stdout = std::io::stdout();
+            let mut output = stdout;
+            let manager = SystemdUserUnitManager;
+            let outcome = connect_channel(
+                ConnectChannelRequest {
+                    home: &target.instance_home,
+                    manager: &manager,
+                    work_root: target.require_work_root()?,
+                    channel_or_path: &args.channel_or_path,
+                    env_inputs: ConnectEnvInputs {
+                        env_file: args.env_file,
+                        from_env: args.from_env,
+                    },
+                    interactive,
+                    hide_prompt_input: interactive,
+                },
+                &mut input,
+                &mut output,
+            )
+            .await?;
+            print_connect_outcome(&target.instance_home, &outcome);
         }
         Command::Run(args) => {
+            let target = resolved_target
+                .as_ref()
+                .ok_or_else(|| anyhow!("run requires a resolved LionClaw target"))?;
             let timeout_override = args.timeout.map(RuntimeTurnTimeouts::with_hard_timeout);
             run_local(
-                &home,
+                &target.instance_home,
+                target.require_work_root()?,
+                target.instance_name.as_deref(),
                 args.runtime,
                 args.continue_last_session,
                 timeout_override,
             )
             .await?;
+        }
+        Command::Up(args) => {
+            let manager = SystemdUserUnitManager;
+            if args.all {
+                validate_project_wide_target("up --all", &target_selection)?;
+                let project_root = discover_project_root(&target_selection)?;
+                let report =
+                    operate_project_instances(&project_root, &manager, StackOperation::Up).await;
+                print!("{}", report.render());
+                if report.has_failures() {
+                    return Ok(ExitCode::from(1));
+                }
+            } else {
+                let target = resolved_target
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("up requires a resolved LionClaw target"))?;
+                let message =
+                    up_instance(&target.instance_home, &manager, target.require_work_root()?)
+                        .await?;
+                println!("{message}");
+            }
+        }
+        Command::Down(args) => {
+            let manager = SystemdUserUnitManager;
+            if args.all {
+                validate_project_wide_target("down --all", &target_selection)?;
+                let project_root = discover_project_root(&target_selection)?;
+                let report =
+                    operate_project_instances(&project_root, &manager, StackOperation::Down).await;
+                print!("{}", report.render());
+                if report.has_failures() {
+                    return Ok(ExitCode::from(1));
+                }
+            } else {
+                let target = resolved_target
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("down requires a resolved LionClaw target"))?;
+                let message = down_instance(&target.instance_home, &manager).await?;
+                println!("{message}");
+            }
+        }
+        Command::Logs(args) => {
+            let filter = parse_log_filter(&args)?;
+            let options = LogOptions {
+                follow: args.follow,
+                tail: args.tail,
+                since: args.since,
+            };
+            if args.all {
+                validate_project_wide_target("logs --all", &target_selection)?;
+                let project_root = discover_project_root(&target_selection)?;
+                let components = project_log_components(&project_root, &filter).await?;
+                if components.is_empty() {
+                    println!("{}", no_managed_units_message(true));
+                } else {
+                    let mut stdout = std::io::stdout();
+                    write_journal_logs(&components, &options, true, &mut stdout).await?;
+                }
+            } else {
+                let target = resolved_target
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("logs requires a resolved LionClaw target"))?;
+                let components = selected_log_components(
+                    &target.instance_home,
+                    target.instance_name.as_deref(),
+                    &filter,
+                )
+                .await?;
+                if components.is_empty() {
+                    println!("{}", no_managed_units_message(false));
+                } else {
+                    let mut stdout = std::io::stdout();
+                    write_journal_logs(&components, &options, false, &mut stdout).await?;
+                }
+            }
+        }
+        Command::Status(args) => {
+            if args.all {
+                validate_status_all_target(&target_selection)?;
+                let project_root = discover_project_root(&target_selection)?;
+                let manager = SystemdUserUnitManager;
+                let status =
+                    render_project_status_all_with_manager(&project_root, &manager).await?;
+                print!("{status}");
+            } else {
+                let target = resolved_target
+                    .as_ref()
+                    .ok_or_else(missing_target_for_status)?;
+                let manager = SystemdUserUnitManager;
+                let status = render_target_status_with_manager(target, &manager).await?;
+                print!("{status}");
+            }
+        }
+        Command::Doctor(args) => {
+            if args.all {
+                validate_project_wide_target("doctor --all", &target_selection)?;
+            }
+            return run_doctor_command(&target_selection, args.all).await;
         }
         Command::ProjectValidate(args) => {
             let issues = validate_project_managed_config(&home, &args).await?;
@@ -480,54 +843,8 @@ pub async fn run() -> Result<ExitCode> {
                 println!("default runtime set to {}", args.id);
             }
         },
-        Command::Service { command } => {
-            let manager = SystemdUserServiceManager;
-            match command {
-                ServiceCommand::Up(args) => {
-                    let config = OperatorConfig::load(&home).await?;
-                    let runtime_id = resolve_runtime_id(&config, args.runtime.as_deref())?;
-                    let binaries = resolve_stack_binaries()?;
-                    let applied = up(&home, &manager, &runtime_id, &binaries).await?;
-                    let managed_channels = applied
-                        .config
-                        .channels
-                        .iter()
-                        .filter(|channel| channel.launch_mode == ChannelLaunchMode::Service)
-                        .count();
-                    println!(
-                        "started LionClaw services with runtime {runtime_id} ({managed_channels} channels)"
-                    );
-                }
-                ServiceCommand::Down => {
-                    down(&home, &manager).await?;
-                    println!("stopped managed LionClaw services");
-                }
-                ServiceCommand::Status => {
-                    let stack = status(&home, &manager).await?;
-                    println!("daemon: {}", stack.daemon_status);
-                    for channel in stack.channels {
-                        println!(
-                            "channel={} skill={} launch={} unit={} peers(pending={},approved={},blocked={}) inbound={} outbound={}",
-                            channel.id,
-                            channel.skill,
-                            channel.launch_mode,
-                            channel.unit_status,
-                            channel.pending_peers,
-                            channel.approved_peers,
-                            channel.blocked_peers,
-                            channel.latest_inbound_at.as_deref().unwrap_or("-"),
-                            channel.latest_outbound_at.as_deref().unwrap_or("-"),
-                        );
-                    }
-                }
-                ServiceCommand::Logs(args) => {
-                    let output = logs(&home, &manager, args.lines).await?;
-                    print!("{output}");
-                }
-            }
-        }
         Command::Skill { command } => match command {
-            SkillCommand::Add(args) => {
+            SkillCommand::Add(args) | SkillCommand::Install(args) => {
                 let alias = args
                     .alias
                     .unwrap_or_else(|| derive_skill_alias(&args.source));
@@ -535,7 +852,11 @@ pub async fn run() -> Result<ExitCode> {
                 println!("installed skill {alias}");
                 print_runtime_state_change_note();
             }
-            SkillCommand::Rm(args) => {
+            SkillCommand::List => {
+                let skills = list_installed_skills(&home).await?;
+                print_installed_skills(&skills);
+            }
+            SkillCommand::Remove(args) | SkillCommand::Rm(args) => {
                 let removed = remove_skill(&home, &args.alias).await?;
                 println!(
                     "{} {}",
@@ -547,7 +868,8 @@ pub async fn run() -> Result<ExitCode> {
                 }
             }
             SkillCommand::WorkerPath(args) => {
-                let worker = resolve_installed_skill_worker_entrypoint(&home, &args.alias).await?;
+                let worker =
+                    resolve_installed_skill_worker_entrypoint(&home, &args.alias, None).await?;
                 println!("{}", worker.display());
             }
         },
@@ -572,7 +894,39 @@ pub async fn run() -> Result<ExitCode> {
                 );
                 print_runtime_state_change_note();
             }
-            ChannelCommand::Rm(args) => {
+            ChannelCommand::List(args) => {
+                if args.all {
+                    validate_channel_list_all_target(&target_selection)?;
+                    let project_root =
+                        resolve_existing_project_root(&target_selection).map_err(|_| {
+                            anyhow!(
+                                "channel list --all requires a LionClaw project; run from the project root or pass --project PATH"
+                            )
+                        })?;
+                    let manager = SystemdUserUnitManager;
+                    print!(
+                        "{}",
+                        render_project_channel_list(&project_root, &manager).await?
+                    );
+                } else {
+                    let target = resolved_target.as_ref().ok_or_else(|| {
+                        anyhow!("channel list requires a resolved LionClaw target")
+                    })?;
+                    let manager = SystemdUserUnitManager;
+                    print!(
+                        "{}",
+                        render_instance_channel_list(
+                            target.instance_name.as_deref().unwrap_or("direct-home"),
+                            &target.instance_home,
+                            &manager,
+                        )
+                        .await?
+                    );
+                }
+            }
+            ChannelCommand::Remove(args) | ChannelCommand::Rm(args) => {
+                let manager = SystemdUserUnitManager;
+                stop_owned_channel_unit(&home, &manager, &args.id).await?;
                 let removed = remove_channel(&home, &args.id).await?;
                 println!(
                     "{} {}",
@@ -584,8 +938,10 @@ pub async fn run() -> Result<ExitCode> {
                 }
             }
             ChannelCommand::Attach(args) => {
-                let manager = SystemdUserServiceManager;
-                attach_channel(&home, &manager, args.id, args.peer, args.runtime).await?;
+                let manager = SystemdUserUnitManager;
+                let work_root = required_command_work_root(&resolved_target, "channel attach")?;
+                attach_channel(&home, &manager, work_root, args.id, args.peer, args.runtime)
+                    .await?;
             }
             ChannelCommand::Pairing { command } => match command {
                 ChannelPairingCommand::List(args) => {
@@ -628,7 +984,11 @@ pub async fn run() -> Result<ExitCode> {
             let config = OperatorConfig::load(&home).await?;
             match command {
                 ContinuityCommand::Drafts { command } => {
-                    let kernel = open_runtime_kernel(&home, &config, None).await?;
+                    let work_root =
+                        required_command_work_root(&resolved_target, "continuity drafts")?;
+                    let kernel =
+                        open_runtime_kernel_for_work_root(&home, &config, None, work_root, None)
+                            .await?;
                     match command {
                         ContinuityDraftCommand::Ls(args) => {
                             let response = kernel
@@ -787,7 +1147,10 @@ pub async fn run() -> Result<ExitCode> {
             let config = OperatorConfig::load(&home).await?;
             match command {
                 JobCommand::Run(args) => {
-                    let kernel = open_runtime_kernel(&home, &config, None).await?;
+                    let work_root = required_command_work_root(&resolved_target, "job run")?;
+                    let kernel =
+                        open_runtime_kernel_for_work_root(&home, &config, None, work_root, None)
+                            .await?;
                     let job_id = parse_job_id(&args.job_id)?;
                     let response = kernel.run_job_now(JobRefRequest { job_id }).await?;
                     println!(
@@ -796,7 +1159,10 @@ pub async fn run() -> Result<ExitCode> {
                     );
                 }
                 JobCommand::Tick => {
-                    let kernel = open_runtime_kernel(&home, &config, None).await?;
+                    let work_root = required_command_work_root(&resolved_target, "job tick")?;
+                    let kernel =
+                        open_runtime_kernel_for_work_root(&home, &config, None, work_root, None)
+                            .await?;
                     let response = kernel.scheduler_tick().await?;
                     println!("claimed {} scheduled runs", response.claimed_runs);
                 }
@@ -951,9 +1317,336 @@ pub async fn run() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn resolve_command_target(
+    selection: &TargetSelection,
+    command: &Command,
+) -> Result<Option<crate::operator::target::TargetContext>> {
+    let requirement = match command {
+        Command::Configure(_) => Some(WorkRootRequirement::Optional),
+        Command::Connect(_) => Some(WorkRootRequirement::Required),
+        Command::Run(_) => Some(WorkRootRequirement::Required),
+        Command::Up(args) => {
+            if args.all {
+                None
+            } else {
+                Some(WorkRootRequirement::Required)
+            }
+        }
+        Command::Down(args) => {
+            if args.all {
+                None
+            } else {
+                Some(WorkRootRequirement::Optional)
+            }
+        }
+        Command::Logs(args) => {
+            if args.all {
+                None
+            } else {
+                Some(WorkRootRequirement::Optional)
+            }
+        }
+        Command::Status(args) => {
+            if args.all {
+                None
+            } else {
+                Some(WorkRootRequirement::Optional)
+            }
+        }
+        Command::Doctor(_) => None,
+        Command::Channel { command } => match command {
+            ChannelCommand::Attach(_) => Some(WorkRootRequirement::Required),
+            ChannelCommand::List(args) if args.all => None,
+            ChannelCommand::Add(_)
+            | ChannelCommand::List(_)
+            | ChannelCommand::Remove(_)
+            | ChannelCommand::Rm(_)
+            | ChannelCommand::Pairing { .. } => Some(WorkRootRequirement::Optional),
+        },
+        Command::Continuity { command } => match command {
+            ContinuityCommand::Drafts { .. } => Some(WorkRootRequirement::Required),
+            ContinuityCommand::Status
+            | ContinuityCommand::Search(_)
+            | ContinuityCommand::Get(_)
+            | ContinuityCommand::Loops { .. }
+            | ContinuityCommand::Proposals { .. } => Some(WorkRootRequirement::Optional),
+        },
+        Command::Job { command } => match command {
+            JobCommand::Run(_) | JobCommand::Tick => Some(WorkRootRequirement::Required),
+            JobCommand::Add(_)
+            | JobCommand::Ls
+            | JobCommand::Show(_)
+            | JobCommand::Pause(_)
+            | JobCommand::Resume(_)
+            | JobCommand::Rm(_)
+            | JobCommand::Runs(_) => Some(WorkRootRequirement::Optional),
+        },
+        Command::Runtime { .. } | Command::Skill { .. } => Some(WorkRootRequirement::Optional),
+        Command::Project { .. } | Command::Instance { .. } | Command::ProjectValidate(_) => None,
+    };
+
+    requirement
+        .map(|requirement| resolve_target(selection, requirement))
+        .transpose()
+}
+
+fn required_command_work_root<'a>(
+    resolved_target: &'a Option<crate::operator::target::TargetContext>,
+    command: &str,
+) -> Result<&'a Path> {
+    let target = resolved_target
+        .as_ref()
+        .ok_or_else(|| anyhow!("{command} requires a resolved LionClaw target"))?;
+    target.require_work_root()
+}
+
+fn validate_project_wide_target(command: &str, selection: &TargetSelection) -> Result<()> {
+    if selection.home.is_some() {
+        bail!("{command} requires a project context and cannot be combined with --home");
+    }
+    if selection.instance.is_some() {
+        bail!("{command} is project-wide and cannot be combined with --instance");
+    }
+    Ok(())
+}
+
+fn parse_log_filter(args: &ProductLogsArgs) -> Result<LogFilter> {
+    let selected =
+        usize::from(args.daemon) + usize::from(args.workers) + usize::from(args.worker.is_some());
+    if selected > 1 {
+        bail!("logs accepts only one of --daemon, --workers, or --worker");
+    }
+    if args.daemon {
+        Ok(LogFilter::Daemon)
+    } else if args.workers {
+        Ok(LogFilter::Workers)
+    } else if let Some(worker) = args.worker.as_deref() {
+        Ok(LogFilter::Worker(worker.to_string()))
+    } else {
+        Ok(LogFilter::Default)
+    }
+}
+
+async fn run_doctor_command(selection: &TargetSelection, all: bool) -> Result<ExitCode> {
+    let manager = SystemdUserUnitManager;
+    match run_doctor(selection, all, &manager).await {
+        Ok(report) => {
+            print!("{}", report.render());
+            if report.has_errors() {
+                Ok(ExitCode::from(1))
+            } else {
+                Ok(ExitCode::SUCCESS)
+            }
+        }
+        Err(err) => {
+            eprintln!("doctor: {err:#}");
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
+fn print_installed_skills(skills: &[InstalledSkill]) {
+    if skills.is_empty() {
+        println!("no skills installed");
+        return;
+    }
+    println!("skill       source                         reference  status");
+    for skill in skills {
+        println!(
+            "{:<11} {:<30} {:<10} {}",
+            skill.alias,
+            skill.source.as_deref().unwrap_or("-"),
+            skill.reference.as_deref().unwrap_or("-"),
+            skill.status.as_str()
+        );
+    }
+}
+
+async fn configure_runtime_with_io<R: BufRead, W: Write>(
+    home: &LionClawHome,
+    requested_runtime: Option<String>,
+    interactive: bool,
+    input: &mut R,
+    output: &mut W,
+) -> Result<ConfigureRuntimeOutcome> {
+    configure_runtime_with_io_and_engine_resolver(
+        home,
+        requested_runtime,
+        interactive,
+        input,
+        output,
+        normalize_podman_executable,
+    )
+    .await
+}
+
+async fn configure_runtime_with_io_and_engine_resolver<R: BufRead, W: Write, F>(
+    home: &LionClawHome,
+    requested_runtime: Option<String>,
+    interactive: bool,
+    input: &mut R,
+    output: &mut W,
+    resolve_engine: F,
+) -> Result<ConfigureRuntimeOutcome>
+where
+    F: FnMut(&str) -> Result<String>,
+{
+    let runtime_id = match requested_runtime
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(runtime_id) => runtime_id.to_string(),
+        None if interactive => prompt_configure_runtime(input, output)?,
+        None => return Err(anyhow!(configure_runtime_required_message())),
+    };
+
+    let mut config = OperatorConfig::load(home).await?;
+    let outcome =
+        configure_runtime_profile_with_engine_resolver(&mut config, &runtime_id, resolve_engine)?;
+    config.save(home).await?;
+    Ok(outcome)
+}
+
+fn prompt_configure_runtime<R: BufRead, W: Write>(input: &mut R, output: &mut W) -> Result<String> {
+    writeln!(output, "Supported runtimes: codex")?;
+    write!(output, "Runtime to configure: ")?;
+    output.flush()?;
+
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    let runtime_id = line.trim();
+    if runtime_id.is_empty() {
+        return Err(anyhow!(configure_runtime_required_message()));
+    }
+    Ok(runtime_id.to_string())
+}
+
+fn print_configure_outcome(home: &LionClawHome, outcome: &ConfigureRuntimeOutcome) {
+    let profile_state = if outcome.created_profile {
+        "created"
+    } else {
+        "preserved"
+    };
+    println!(
+        "configured runtime {} for {} ({profile_state} profile)",
+        outcome.runtime_id,
+        home.root().display()
+    );
+    println!("default runtime set to {}", outcome.runtime_id);
+}
+
+fn print_connect_outcome(home: &LionClawHome, outcome: &ConnectOutcome) {
+    println!(
+        "connected channel {} using skill {} ({})",
+        outcome.channel_id,
+        outcome.skill_alias,
+        outcome.launch.as_str()
+    );
+    match outcome.launch {
+        ChannelLaunchMode::Interactive => {
+            println!("interactive channel worker exited");
+        }
+        ChannelLaunchMode::Background => {
+            println!("background channel worker is running");
+            println!("pair or approve peers with:");
+            println!(
+                "  {}",
+                channel_pairing_list_command(home, &outcome.channel_id)
+            );
+        }
+    }
+}
+
+fn channel_pairing_list_command(home: &LionClawHome, channel_id: &str) -> String {
+    format!(
+        "{} channel pairing list --channel-id {}",
+        lionclaw_home_command_prefix(home),
+        shell_quote_arg(channel_id)
+    )
+}
+
+fn validate_channel_list_all_target(selection: &TargetSelection) -> Result<()> {
+    if selection.home.is_some() {
+        return Err(anyhow!(
+            "channel list --all requires a project context; run from the project root or pass --project PATH"
+        ));
+    }
+    if selection.instance.is_some() {
+        return Err(anyhow!(
+            "channel list --all is project-wide and cannot be combined with --instance"
+        ));
+    }
+    Ok(())
+}
+
+async fn render_project_channel_list<M: UnitManager>(
+    project_root: &Path,
+    manager: &M,
+) -> Result<String> {
+    let mut output = String::new();
+    output.push_str(&format!("project: {}\n", project_root.display()));
+    for entry in list_project_instance_statuses(project_root)? {
+        output.push('\n');
+        output.push_str(
+            &render_instance_channel_list(&entry.name, &LionClawHome::new(entry.home), manager)
+                .await?,
+        );
+    }
+    Ok(output)
+}
+
+async fn render_instance_channel_list<M: UnitManager>(
+    instance_name: &str,
+    home: &LionClawHome,
+    manager: &M,
+) -> Result<String> {
+    let config = OperatorConfig::load(home).await?;
+    let mut output = String::new();
+    output.push_str(&format!("instance: {instance_name}\n"));
+    output.push_str("channel   launch       skill      unit\n");
+    if config.channels.is_empty() {
+        output.push_str("(none)\n");
+        return Ok(output);
+    }
+    let owned_units = manager.owned_units(home)?;
+    for channel in config.channels {
+        let unit = match channel.launch_mode {
+            ChannelLaunchMode::Interactive => "n/a".to_string(),
+            ChannelLaunchMode::Background => match owned_units.channel(&channel.id) {
+                Some(unit) => manager.unit_status(unit).await?,
+                None => "not-installed".to_string(),
+            },
+        };
+        output.push_str(&format!(
+            "{:<9} {:<12} {:<10} {}\n",
+            channel.id,
+            channel.launch_mode.as_str(),
+            channel.skill,
+            unit
+        ));
+    }
+    Ok(output)
+}
+
+async fn stop_owned_channel_unit<M: UnitManager>(
+    home: &LionClawHome,
+    manager: &M,
+    channel_id: &str,
+) -> Result<()> {
+    let Some(unit) = manager
+        .owned_units(home)?
+        .channel(channel_id)
+        .map(str::to_string)
+    else {
+        return Ok(());
+    };
+    manager.down_units(&[unit]).await
+}
+
 fn print_runtime_state_change_note() {
     println!(
-        "direct runs pick this up on the next launch; rerun 'lionclaw service up' or 'lionclaw channel attach' if a managed daemon is already running"
+        "direct runs pick this up on the next launch; rerun 'lionclaw connect <channel>' or 'lionclaw up' if a managed daemon is already running"
     );
 }
 
@@ -1097,17 +1790,6 @@ async fn installed_skill_source(home: &LionClawHome, alias: &str) -> Result<Opti
     let metadata: ProjectSkillInstallMetadata = toml::from_str(&content)
         .with_context(|| format!("failed to parse {}", metadata_path.display()))?;
     Ok(Some(metadata.source))
-}
-
-fn parse_onboard_bind(raw: &str) -> Result<OnboardBindSelection> {
-    let bind = raw.trim();
-    if bind.is_empty() {
-        return Err(anyhow!("--bind requires a value"));
-    }
-    if bind == "auto" {
-        return Ok(OnboardBindSelection::Auto);
-    }
-    Ok(OnboardBindSelection::Explicit(bind.to_string()))
 }
 
 fn parse_runtime_timeout(raw: &str) -> std::result::Result<Duration, String> {
@@ -1289,7 +1971,11 @@ fn validate_codex_profile_args(args: &RuntimeAddArgs) -> Result<()> {
 mod tests {
     use super::*;
     use crate::kernel::runtime::ConfinementConfig;
+    use crate::operator::managed_units::{
+        channel_unit_name, ensure_unit_identity, render_channel_unit, ChannelUnitSpec,
+    };
     use chrono::Duration as ChronoDuration;
+    use std::io::Cursor;
     use tempfile::{NamedTempFile, TempDir};
 
     #[cfg(unix)]
@@ -1319,6 +2005,88 @@ mod tests {
                 pids_limit: None,
             },
         )
+    }
+
+    fn default_logs_args() -> ProductLogsArgs {
+        ProductLogsArgs {
+            follow: false,
+            tail: 200,
+            since: None,
+            daemon: false,
+            workers: false,
+            worker: None,
+            all: false,
+        }
+    }
+
+    #[test]
+    fn parses_product_log_filter_exclusively() {
+        let mut args = default_logs_args();
+        args.worker = Some("telegram".to_string());
+        assert_eq!(
+            parse_log_filter(&args).expect("worker filter"),
+            LogFilter::Worker("telegram".to_string())
+        );
+
+        args.daemon = true;
+        let err = parse_log_filter(&args).expect_err("conflicting filters should fail");
+        assert!(err.to_string().contains("only one"));
+    }
+
+    #[test]
+    fn instance_adopt_positional_home_does_not_set_global_home() {
+        let cli = Cli::try_parse_from([
+            "lionclaw",
+            "instance",
+            "adopt",
+            "shared",
+            "/tmp/lionclaw-home",
+            "--work-root",
+            ".",
+        ])
+        .expect("parse instance adopt");
+
+        assert!(cli.home.is_none());
+        match cli.command {
+            Command::Instance {
+                command: InstanceCommand::Adopt(args),
+            } => {
+                assert_eq!(args.name, "shared");
+                assert_eq!(args.source_home, PathBuf::from("/tmp/lionclaw-home"));
+                assert_eq!(args.work_root, Some(PathBuf::from(".")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_namespace_exposes_only_project_setup() {
+        assert!(Cli::try_parse_from(["lionclaw", "project", "init"]).is_ok());
+        assert!(Cli::try_parse_from(["lionclaw", "project", "status"]).is_err());
+        assert!(Cli::try_parse_from(["lionclaw", "project", "doctor"]).is_err());
+    }
+
+    #[test]
+    fn project_wide_commands_reject_home_and_instance_selectors() {
+        let with_home = TargetSelection {
+            home: Some(PathBuf::from("/tmp/lionclaw-home")),
+            project: None,
+            instance: None,
+        };
+        let err =
+            validate_project_wide_target("logs --all", &with_home).expect_err("--home should fail");
+        assert!(err.to_string().contains("cannot be combined with --home"));
+
+        let with_instance = TargetSelection {
+            home: None,
+            project: None,
+            instance: Some("reviewer".to_string()),
+        };
+        let err = validate_project_wide_target("logs --all", &with_instance)
+            .expect_err("--instance should fail");
+        assert!(err
+            .to_string()
+            .contains("cannot be combined with --instance"));
     }
 
     #[test]
@@ -1366,6 +2134,356 @@ mod tests {
     #[test]
     fn rejects_invalid_schedule() {
         assert!(parse_job_schedule_spec("not-a-schedule", None).is_err());
+    }
+
+    #[test]
+    fn configure_command_does_not_require_resolved_work_root() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        let work_root = project.project_root.join("review-work");
+        std::fs::create_dir_all(&work_root).expect("work root");
+        let reviewer = create_project_instance(
+            &project.project_root,
+            "reviewer",
+            Some(work_root.as_path()),
+            false,
+        )
+        .expect("create reviewer instance");
+        std::fs::remove_dir_all(&work_root).expect("break work root");
+        let selection = TargetSelection {
+            home: None,
+            project: Some(project.project_root.clone()),
+            instance: Some("reviewer".to_string()),
+        };
+
+        let target = resolve_command_target(
+            &selection,
+            &Command::Configure(ConfigureArgs {
+                runtime: Some("codex".to_string()),
+            }),
+        )
+        .expect("configure target should resolve without a work root")
+        .expect("configure should resolve target");
+
+        assert_eq!(target.instance_name.as_deref(), Some("reviewer"));
+        assert_eq!(target.instance_home.root(), reviewer.home.as_path());
+        assert!(target.work_root.is_none());
+    }
+
+    #[test]
+    fn runtime_opening_commands_require_recorded_home_work_root() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = temp_dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let selection = TargetSelection {
+            home: Some(home.clone()),
+            project: None,
+            instance: None,
+        };
+
+        let commands = vec![
+            (
+                "run",
+                Command::Run(RunArgs {
+                    continue_last_session: false,
+                    timeout: None,
+                    runtime: None,
+                }),
+            ),
+            ("up", Command::Up(AllArgs { all: false })),
+            (
+                "channel attach",
+                Command::Channel {
+                    command: ChannelCommand::Attach(ChannelAttachArgs {
+                        id: "terminal".to_string(),
+                        peer: None,
+                        runtime: None,
+                    }),
+                },
+            ),
+            (
+                "continuity drafts",
+                Command::Continuity {
+                    command: ContinuityCommand::Drafts {
+                        command: ContinuityDraftCommand::Ls(ContinuityDraftListArgs {
+                            runtime: None,
+                        }),
+                    },
+                },
+            ),
+            (
+                "job run",
+                Command::Job {
+                    command: JobCommand::Run(JobRefArgs {
+                        job_id: "1".to_string(),
+                    }),
+                },
+            ),
+            (
+                "job tick",
+                Command::Job {
+                    command: JobCommand::Tick,
+                },
+            ),
+        ];
+
+        for (label, command) in commands {
+            let err = match resolve_command_target(&selection, &command) {
+                Ok(_) => panic!("{label} should require a work root"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string()
+                    .contains("does not contain a recorded work root"),
+                "{label} returned unexpected error: {err}"
+            );
+        }
+
+        let runtime_list = resolve_command_target(
+            &selection,
+            &Command::Runtime {
+                command: Box::new(RuntimeCommand::Ls),
+            },
+        )
+        .expect("runtime ls should target home without work root")
+        .expect("runtime ls should resolve target");
+        assert_eq!(runtime_list.instance_home.root(), home.as_path());
+        assert!(runtime_list.work_root.is_none());
+    }
+
+    #[test]
+    fn run_command_targets_named_project_instance_and_work_root() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        let reviewer = create_project_instance(
+            &project.project_root,
+            "reviewer",
+            Some(project.project_root.as_path()),
+            false,
+        )
+        .expect("create reviewer instance");
+        let selection = TargetSelection {
+            home: None,
+            project: Some(project.project_root.clone()),
+            instance: Some("reviewer".to_string()),
+        };
+        let command = Command::Run(RunArgs {
+            continue_last_session: false,
+            timeout: None,
+            runtime: None,
+        });
+
+        let target = resolve_command_target(&selection, &command)
+            .expect("run target should resolve")
+            .expect("run target should be selected");
+
+        assert_eq!(
+            target.project_root.as_deref(),
+            Some(project.project_root.as_path())
+        );
+        assert_eq!(target.instance_name.as_deref(), Some("reviewer"));
+        assert_eq!(target.instance_home.root(), reviewer.home.as_path());
+        assert_ne!(target.instance_home.root(), project.instance.home.as_path());
+        assert_eq!(
+            target.require_work_root().expect("run requires work root"),
+            reviewer.work_root.as_path()
+        );
+    }
+
+    #[test]
+    fn connect_pairing_command_targets_selected_home() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("reviewer home"));
+
+        let command = channel_pairing_list_command(&home, "telegram");
+
+        assert!(command.starts_with("lionclaw --home "));
+        assert!(command.contains(&home.root().display().to_string()));
+        assert!(command.contains("channel pairing list --channel-id telegram"));
+        assert!(!command.starts_with("lionclaw channel pairing"));
+    }
+
+    #[tokio::test]
+    async fn noninteractive_configure_without_runtime_fails_with_scriptable_form() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let err = configure_runtime_with_io(&home, None, false, &mut input, &mut output)
+            .await
+            .expect_err("runtime should be required");
+
+        assert!(err
+            .to_string()
+            .contains("lionclaw configure --runtime codex"));
+        assert!(
+            !home.config_path().exists(),
+            "configure should not create config when runtime is missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_configure_requires_runtime_input() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut input = Cursor::new(b"codex\n".to_vec());
+        let mut output = Vec::new();
+
+        let outcome = configure_runtime_with_io_and_engine_resolver(
+            &home,
+            None,
+            true,
+            &mut input,
+            &mut output,
+            |_| Ok("/usr/bin/podman".to_string()),
+        )
+        .await
+        .expect("configure runtime");
+
+        assert_eq!(outcome.runtime_id, "codex");
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        assert_eq!(config.defaults.runtime.as_deref(), Some("codex"));
+        let prompt = String::from_utf8(output).expect("utf8 prompt");
+        assert!(prompt.contains("Runtime to configure:"));
+    }
+
+    #[tokio::test]
+    async fn channel_list_renders_instance_channels() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        let mut config = OperatorConfig::default();
+        config.upsert_channel(crate::operator::config::ManagedChannelConfig {
+            id: "terminal".to_string(),
+            skill: "terminal".to_string(),
+            launch_mode: ChannelLaunchMode::Interactive,
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env: Vec::new(),
+        });
+        config.upsert_channel(crate::operator::config::ManagedChannelConfig {
+            id: "telegram".to_string(),
+            skill: "telegram".to_string(),
+            launch_mode: ChannelLaunchMode::Background,
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+        });
+        config.save(&home).await.expect("save config");
+        let manager = crate::operator::managed_units::FakeUnitManager::default();
+
+        let rendered = render_instance_channel_list("main", &home, &manager)
+            .await
+            .expect("channel list");
+
+        assert!(rendered.contains("instance: main"));
+        assert!(rendered.contains("terminal"));
+        assert!(rendered.contains("interactive"));
+        assert!(rendered.contains("telegram"));
+        assert!(rendered.contains("background"));
+        assert!(rendered.contains("unit"));
+        assert!(rendered.contains("not-installed"));
+    }
+
+    #[tokio::test]
+    async fn channel_list_requires_owned_unit_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        home.ensure_home_id().await.expect("home id");
+        let identity = ensure_unit_identity(&home).expect("unit identity");
+        let unit = channel_unit_name(&identity, "telegram");
+        let mut config = OperatorConfig::default();
+        config.upsert_channel(crate::operator::config::ManagedChannelConfig {
+            id: "telegram".to_string(),
+            skill: "telegram".to_string(),
+            launch_mode: ChannelLaunchMode::Background,
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+        });
+        config.save(&home).await.expect("save config");
+        let manager = crate::operator::managed_units::FakeUnitManager::default();
+        manager
+            .set_unit_status(&unit, "loaded/active/running")
+            .expect("unit status");
+
+        let rendered = render_instance_channel_list("main", &home, &manager)
+            .await
+            .expect("channel list");
+
+        assert!(rendered.contains("not-installed"));
+        assert!(!rendered.contains("loaded/active/running"));
+    }
+
+    #[tokio::test]
+    async fn channel_remove_deletes_configured_channel() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        let mut config = OperatorConfig::default();
+        config.upsert_channel(crate::operator::config::ManagedChannelConfig {
+            id: "telegram".to_string(),
+            skill: "telegram".to_string(),
+            launch_mode: ChannelLaunchMode::Background,
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+        });
+        config.save(&home).await.expect("save config");
+        let identity = ensure_unit_identity(&home).expect("unit identity");
+        let unit = channel_unit_name(&identity, "telegram");
+        let foreign_unit = channel_unit_name(&identity, "foreign");
+        let mut env = crate::operator::channel_env::ChannelEnv::new();
+        env.insert("TELEGRAM_BOT_TOKEN".to_string(), "secret-token".to_string());
+        crate::operator::channel_env::save_channel_env(&home, "telegram", &env).expect("save env");
+        let manager = crate::operator::managed_units::FakeUnitManager::default();
+        let channel_unit = render_channel_unit(
+            &home,
+            &identity,
+            &ChannelUnitSpec {
+                channel_id: "telegram".to_string(),
+                worker_path: temp_dir.path().join("worker"),
+                env: Vec::new(),
+                channel_env_path: None,
+            },
+        );
+        manager
+            .apply_units(&home, &[channel_unit])
+            .await
+            .expect("apply channel unit");
+        manager
+            .set_unit_status(&unit, "loaded/active/running")
+            .expect("owned status");
+        manager
+            .set_unit_status(&foreign_unit, "loaded/active/running")
+            .expect("foreign status");
+
+        stop_owned_channel_unit(&home, &manager, "telegram")
+            .await
+            .expect("stop owned unit");
+        stop_owned_channel_unit(&home, &manager, "foreign")
+            .await
+            .expect("skip foreign unit");
+        assert!(remove_channel(&home, "telegram")
+            .await
+            .expect("remove channel"));
+        let config = OperatorConfig::load(&home).await.expect("load config");
+        assert!(config.channels.is_empty());
+        assert_eq!(
+            manager.unit_status(&unit).await.expect("owned status"),
+            "loaded/inactive/dead"
+        );
+        assert_eq!(
+            manager
+                .unit_status(&foreign_unit)
+                .await
+                .expect("foreign status"),
+            "loaded/active/running"
+        );
+        assert_eq!(
+            crate::operator::channel_env::load_channel_env(&home, "telegram")
+                .expect("load env")
+                .get("TELEGRAM_BOT_TOKEN")
+                .map(String::as_str),
+            Some("secret-token")
+        );
     }
 
     #[tokio::test]

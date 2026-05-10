@@ -43,7 +43,7 @@ pub struct SessionOpenRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonInfoResponse {
-    pub service: String,
+    pub daemon: String,
     pub status: String,
     pub home_id: String,
     pub home_root: String,

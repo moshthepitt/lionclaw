@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: ./scripts/attach-terminal-test.sh <lionclaw-home> [runtime-id] [channel-id]
 
-Rebuild LionClaw, stop any managed background services for the given home,
+Rebuild LionClaw, stop any managed background daemon for the given home,
 and attach the interactive terminal channel in the current TTY.
 
 Arguments:
@@ -31,7 +31,7 @@ resolve_home() {
 
 resolve_default_runtime() {
   local runtime_id
-  runtime_id="$("./target/debug/lionclaw" runtime ls \
+  runtime_id="$("./target/debug/lionclaw" --home "$LIONCLAW_HOME" runtime ls \
     | sed -n 's/^\* \([^ ]\+\) .*/\1/p' \
     | head -n1)"
 
@@ -56,7 +56,7 @@ cd "$repo_root"
 export LIONCLAW_HOME="$lionclaw_home"
 
 [[ -d "$LIONCLAW_HOME" ]] || die "LionClaw home does not exist: $LIONCLAW_HOME"
-[[ -f "$LIONCLAW_HOME/config/lionclaw.toml" ]] || die "missing config at $LIONCLAW_HOME/config/lionclaw.toml; run lionclaw onboard first"
+[[ -f "$LIONCLAW_HOME/config/lionclaw.toml" ]] || die "missing config at $LIONCLAW_HOME/config/lionclaw.toml; configure the project instance first"
 
 runtime_id="${2:-$(resolve_default_runtime)}"
 bind_addr="$(configured_bind)"
@@ -68,5 +68,5 @@ printf 'Using runtime=%s channel=%s\n' "$runtime_id" "$channel_id"
 if [[ "${LIONCLAW_SKIP_BUILD:-0}" != "1" ]]; then
   cargo build --bins
 fi
-"./target/debug/lionclaw" service down
-exec "./target/debug/lionclaw" channel attach "$channel_id" --runtime "$runtime_id"
+"./target/debug/lionclaw" --home "$LIONCLAW_HOME" down
+exec "./target/debug/lionclaw" --home "$LIONCLAW_HOME" channel attach "$channel_id" --runtime "$runtime_id"
