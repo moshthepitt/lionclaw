@@ -39,10 +39,6 @@ resolve_project_root() {
   fi
 }
 
-configured_bind() {
-  sed -n 's/^bind = "\(.*\)"$/\1/p' "$LIONCLAW_HOME/config/lionclaw.toml" | head -n1
-}
-
 runtime_kind_for() {
   local runtime_id="$1"
   local explicit="${LIONCLAW_RUNTIME_KIND:-}"
@@ -113,11 +109,9 @@ fi
 
 lionclaw_home="$project_root/.lionclaw/instances/main"
 export LIONCLAW_HOME="$lionclaw_home"
-bind_addr="$(configured_bind)"
 
 printf 'Using project root=%s\n' "$project_root"
 printf 'Using LIONCLAW_HOME=%s\n' "$LIONCLAW_HOME"
-printf 'Using bind=%s\n' "${bind_addr:-unknown}"
 printf 'Ensuring runtime=%s kind=%s command=%s image=%s channel=%s\n' \
   "$runtime_id" "$runtime_kind" "$runtime_command" "$runtime_image" "$channel_id"
 

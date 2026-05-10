@@ -14,7 +14,7 @@ use crate::{home::LionClawHome, runtime_timeouts::parse_duration};
 
 use super::{
     config::{ChannelLaunchMode, OperatorConfig},
-    managed_units::{SystemdUserUnitManager, UnitManager},
+    managed_units::{OwnedManagedUnits, SystemdUserUnitManager, UnitManager},
     reconcile::{down, resolve_stack_binaries, up_for_work_root},
     redaction::SecretRedactor,
     runtime::resolve_runtime_id,
@@ -175,9 +175,31 @@ pub async fn selected_log_components(
     instance: Option<&str>,
     filter: &LogFilter,
 ) -> Result<Vec<LogComponent>> {
-    let owned_units = SystemdUserUnitManager.owned_units(home)?;
+    selected_log_components_with_manager(home, instance, filter, &SystemdUserUnitManager).await
+}
+
+async fn selected_log_components_with_manager<M: UnitManager>(
+    home: &LionClawHome,
+    instance: Option<&str>,
+    filter: &LogFilter,
+    manager: &M,
+) -> Result<Vec<LogComponent>> {
+    let owned_units = manager.owned_units(home)?;
     let config = OperatorConfig::load(home).await?;
     let instance = instance.map(str::to_string);
+    if let LogFilter::Worker(channel_id) = filter {
+        return match worker_log_component(home, instance, &config, &owned_units, channel_id) {
+            WorkerLogComponent::Found(component) => Ok(vec![component]),
+            WorkerLogComponent::MissingUnit => Ok(Vec::new()),
+            WorkerLogComponent::MissingChannel => Err(anyhow!(
+                "channel '{channel_id}' is not configured for the selected instance"
+            )),
+            WorkerLogComponent::NotBackground(mode) => Err(anyhow!(
+                "channel '{channel_id}' is configured as {}; logs --worker targets background channel workers only",
+                mode.as_str()
+            )),
+        };
+    }
     let daemon = owned_units.daemon().map(|unit| LogComponent {
         home: home.clone(),
         instance: instance.clone(),
@@ -207,44 +229,79 @@ pub async fn selected_log_components(
         }
         LogFilter::Daemon => Ok(daemon.into_iter().collect()),
         LogFilter::Workers => Ok(worker_components),
-        LogFilter::Worker(channel_id) => {
-            let Some(channel) = config
-                .channels
-                .iter()
-                .find(|channel| &channel.id == channel_id)
-            else {
-                return Err(anyhow!(
-                    "channel '{channel_id}' is not configured for the selected instance"
-                ));
-            };
-            if channel.launch_mode != ChannelLaunchMode::Background {
-                return Err(anyhow!(
-                    "channel '{channel_id}' is configured as {}; logs --worker targets background channel workers only",
-                    channel.launch_mode.as_str()
-                ));
-            }
-            Ok(owned_units
-                .channel(&channel.id)
-                .map(|unit| LogComponent {
-                    home: home.clone(),
-                    instance,
-                    component: channel.id.clone(),
-                    unit: unit.to_string(),
-                })
-                .into_iter()
-                .collect())
-        }
+        LogFilter::Worker(_) => unreachable!("worker filter returned above"),
     }
+}
+
+enum WorkerLogComponent {
+    Found(LogComponent),
+    MissingChannel,
+    NotBackground(ChannelLaunchMode),
+    MissingUnit,
+}
+
+fn worker_log_component(
+    home: &LionClawHome,
+    instance: Option<String>,
+    config: &OperatorConfig,
+    owned_units: &OwnedManagedUnits,
+    channel_id: &str,
+) -> WorkerLogComponent {
+    let Some(channel) = config
+        .channels
+        .iter()
+        .find(|channel| channel.id == channel_id)
+    else {
+        return WorkerLogComponent::MissingChannel;
+    };
+    if channel.launch_mode != ChannelLaunchMode::Background {
+        return WorkerLogComponent::NotBackground(channel.launch_mode);
+    }
+    owned_units
+        .channel(&channel.id)
+        .map(|unit| {
+            WorkerLogComponent::Found(LogComponent {
+                home: home.clone(),
+                instance,
+                component: channel.id.clone(),
+                unit: unit.to_string(),
+            })
+        })
+        .unwrap_or(WorkerLogComponent::MissingUnit)
 }
 
 pub async fn project_log_components(
     project_root: &Path,
     filter: &LogFilter,
 ) -> Result<Vec<LogComponent>> {
+    project_log_components_with_manager(project_root, filter, &SystemdUserUnitManager).await
+}
+
+async fn project_log_components_with_manager<M: UnitManager>(
+    project_root: &Path,
+    filter: &LogFilter,
+    manager: &M,
+) -> Result<Vec<LogComponent>> {
     let mut components = Vec::new();
     for entry in list_project_instance_statuses(project_root)? {
         let home = LionClawHome::new(entry.home);
-        components.extend(selected_log_components(&home, Some(&entry.name), filter).await?);
+        match filter {
+            LogFilter::Worker(channel_id) => {
+                let owned_units = manager.owned_units(&home)?;
+                let config = OperatorConfig::load(&home).await?;
+                if let WorkerLogComponent::Found(component) =
+                    worker_log_component(&home, Some(entry.name), &config, &owned_units, channel_id)
+                {
+                    components.push(component);
+                }
+            }
+            _ => {
+                components.extend(
+                    selected_log_components_with_manager(&home, Some(&entry.name), filter, manager)
+                        .await?,
+                );
+            }
+        }
     }
     Ok(components)
 }
@@ -471,8 +528,45 @@ mod tests {
     use crate::operator::{
         channel_env::{save_channel_env, ChannelEnv},
         config::ManagedChannelConfig,
-        managed_units::ensure_unit_identity,
+        managed_units::{
+            ensure_unit_identity, render_channel_unit, ChannelUnitSpec, FakeUnitManager,
+        },
+        target::{create_project_instance, init_project},
     };
+
+    async fn configure_channel(
+        home: &LionClawHome,
+        channel_id: &str,
+        launch_mode: ChannelLaunchMode,
+    ) {
+        let mut config = OperatorConfig::load(home).await.expect("load config");
+        config.upsert_channel(ManagedChannelConfig {
+            id: channel_id.to_string(),
+            skill: channel_id.to_string(),
+            launch_mode,
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env: Vec::new(),
+        });
+        config.save(home).await.expect("save config");
+    }
+
+    async fn apply_channel_unit(home: &LionClawHome, manager: &FakeUnitManager, channel_id: &str) {
+        let identity = ensure_unit_identity(home).expect("unit identity");
+        let unit = render_channel_unit(
+            home,
+            &identity,
+            &ChannelUnitSpec {
+                channel_id: channel_id.to_string(),
+                worker_path: home.root().join("worker"),
+                env: Vec::new(),
+                channel_env_path: None,
+            },
+        );
+        manager
+            .apply_units(home, &[unit])
+            .await
+            .expect("apply channel unit");
+    }
 
     #[test]
     fn renders_prefixed_redacted_journal_json() {
@@ -545,6 +639,59 @@ mod tests {
             .expect("components");
 
         assert!(components.is_empty());
+    }
+
+    #[tokio::test]
+    async fn selected_worker_logs_require_channel_configuration() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        let manager = FakeUnitManager::default();
+
+        let err = selected_log_components_with_manager(
+            &home,
+            Some("main"),
+            &LogFilter::Worker("telegram".to_string()),
+            &manager,
+        )
+        .await
+        .expect_err("missing selected worker should fail");
+
+        assert!(err
+            .to_string()
+            .contains("channel 'telegram' is not configured"));
+    }
+
+    #[tokio::test]
+    async fn project_worker_logs_skip_instances_without_requested_worker() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        let reviewer = create_project_instance(&project.project_root, "reviewer", None, false)
+            .expect("reviewer");
+        let terminal = create_project_instance(&project.project_root, "terminal", None, false)
+            .expect("terminal");
+        let main_home = LionClawHome::new(project.instance.home);
+        let reviewer_home = LionClawHome::new(reviewer.home);
+        let terminal_home = LionClawHome::new(terminal.home);
+        let manager = FakeUnitManager::default();
+
+        configure_channel(&main_home, "telegram", ChannelLaunchMode::Background).await;
+        apply_channel_unit(&main_home, &manager, "telegram").await;
+        configure_channel(&terminal_home, "telegram", ChannelLaunchMode::Interactive).await;
+        configure_channel(&reviewer_home, "slack", ChannelLaunchMode::Background).await;
+        apply_channel_unit(&reviewer_home, &manager, "slack").await;
+
+        let components = project_log_components_with_manager(
+            &project.project_root,
+            &LogFilter::Worker("telegram".to_string()),
+            &manager,
+        )
+        .await
+        .expect("project worker logs");
+
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0].instance.as_deref(), Some("main"));
+        assert_eq!(components[0].component, "telegram");
     }
 
     #[test]
