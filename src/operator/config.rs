@@ -627,18 +627,19 @@ pub fn validate_host_executable(source: &str) -> Result<()> {
         return Err(anyhow!("host executable command or path cannot be empty"));
     }
 
-    if !looks_like_path(raw) {
+    let path = Path::new(raw);
+    if !path.is_absolute() {
         return Err(anyhow!(
-            "host executable '{source}' must be stored as an absolute or explicit path"
+            "host executable '{source}' must be stored as an absolute path"
         ));
     }
-    validate_executable_path(&normalize_executable_path(raw)?)
+    validate_executable_path(path)
 }
 
 pub fn validate_podman_executable(source: &str) -> Result<()> {
     let raw = source.trim();
     validate_host_executable(raw)?;
-    ensure_podman_executable(&normalize_executable_path(raw)?)
+    ensure_podman_executable(Path::new(raw))
 }
 
 fn looks_like_path(raw: &str) -> bool {
@@ -761,7 +762,16 @@ mod tests {
 
         assert!(err
             .to_string()
-            .contains("must be stored as an absolute or explicit path"));
+            .contains("must be stored as an absolute path"));
+    }
+
+    #[test]
+    fn relative_podman_engine_is_rejected_for_stored_profiles() {
+        let err = validate_podman_executable("./podman").expect_err("relative podman engine");
+
+        assert!(err
+            .to_string()
+            .contains("must be stored as an absolute path"));
     }
 
     #[test]
@@ -1034,7 +1044,7 @@ mod tests {
         let err = validate_host_executable("sh").expect_err("bare command should fail");
         assert!(err
             .to_string()
-            .contains("must be stored as an absolute or explicit path"));
+            .contains("must be stored as an absolute path"));
     }
 
     #[test]

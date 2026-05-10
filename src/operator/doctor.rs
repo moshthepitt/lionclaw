@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -10,12 +9,12 @@ use serde::Deserialize;
 
 use crate::{
     home::LionClawHome,
-    kernel::{runtime::ConfinementConfig, skills::validate_skill_alias},
+    kernel::skills::validate_skill_alias,
     operator::{
         channel_env::validate_channel_env_contract,
         channel_metadata::{load_channel_metadata, validate_channel_id},
         command_display::{lionclaw_home_command_prefix, shell_quote_arg},
-        config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig, RuntimeProfileConfig},
+        config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
         managed_units::{
             daemon_unit_name, existing_unit_identity, unit_file_metadata, unit_status_is_active,
             UnitManager,
@@ -652,41 +651,6 @@ fn inspect_runtime_config(
             guidance,
         ));
     }
-
-    inspect_oci_image_readiness(runtime_id, profile, findings);
-}
-
-fn inspect_oci_image_readiness(
-    runtime_id: &str,
-    profile: &RuntimeProfileConfig,
-    findings: &mut Vec<DoctorFinding>,
-) {
-    let ConfinementConfig::Oci(oci) = profile.confinement();
-    let Some(image) = oci.image.as_deref() else {
-        return;
-    };
-    if profile.validate().is_err() {
-        return;
-    }
-    let output = Command::new(&oci.engine)
-        .args(["image", "exists", image])
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {}
-        Ok(_) => findings.push(
-            DoctorFinding::error(
-                format!("runtime image for \"{runtime_id}\" is not available locally"),
-                format!("OCI image {image} was not found by {}", oci.engine),
-            )
-            .with_repair(format!(
-                "podman build -t {image} -f containers/runtime/Containerfile ."
-            )),
-        ),
-        Err(err) => findings.push(DoctorFinding::warning(
-            format!("runtime image for \"{runtime_id}\" could not be checked"),
-            format!("{} image exists {image}: {err}", oci.engine),
-        )),
-    }
 }
 
 fn inspect_channels(
@@ -1244,9 +1208,11 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{symlink, PermissionsExt};
 
     use super::*;
+    use crate::kernel::runtime::{ConfinementConfig, OciConfinementConfig};
+    use crate::operator::config::RuntimeProfileConfig;
     use crate::operator::managed_units::{
         channel_unit_name, ensure_unit_identity, FakeUnitManager,
     };
@@ -1434,6 +1400,45 @@ mod tests {
         }
         fs::write(project_file_path(temp_dir.path()), project_file).expect("project file");
         temp_dir
+    }
+
+    #[test]
+    fn doctor_does_not_execute_configured_oci_engine() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let engine = temp_dir.path().join("podman");
+        let marker = temp_dir.path().join("podman-was-run");
+        fs::write(
+            &engine,
+            format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\ntouch '{}'\n",
+                marker.display()
+            ),
+        )
+        .expect("write fake podman");
+        fs::set_permissions(&engine, fs::Permissions::from_mode(0o755)).expect("chmod podman");
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "codex".to_string(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: engine.to_string_lossy().to_string(),
+                    image: Some("lionclaw-runtime:v1".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+        let commands = DoctorCommands::for_target(None, "main", temp_dir.path());
+        let mut findings = Vec::new();
+
+        inspect_runtime_config("main", &commands, &config, &mut findings);
+
+        assert!(!marker.exists());
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.subject.contains("runtime image")));
     }
 
     #[test]
