@@ -468,7 +468,24 @@ fn discover_diagnostic_project_root_from_cwd(
     project: Option<&Path>,
     cwd: &Path,
 ) -> Result<PathBuf> {
-    discover_project_root_from_cwd_with_marker(project, cwd, ProjectRootMarker::MetadataDirectory)
+    if let Some(project) = project {
+        return canonical_existing_dir(&absolutize_from(cwd, project), "project root");
+    }
+
+    let cwd = canonical_existing_dir(cwd, "current directory")?;
+    if let Some(_instance_home) = containing_project_instance_home(&cwd) {
+        bail!(
+            "This looks like a LionClaw instance home, not a project root.\nRun from the project root, or use --project <path>."
+        );
+    }
+
+    for candidate in [Some(cwd.as_path()), cwd.parent()].into_iter().flatten() {
+        if project_root_marker_exists(candidate, ProjectRootMarker::MetadataDirectory) {
+            return canonical_existing_dir(candidate, "project root");
+        }
+    }
+
+    Ok(cwd)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1132,6 +1149,26 @@ mod tests {
     fn diagnostic_resolver_discovers_project_metadata_without_project_file() {
         let temp_dir = tempdir().expect("temp dir");
         fs::create_dir(temp_dir.path().join(PROJECT_DIR)).expect("metadata dir");
+
+        let project_root = discover_diagnostic_project_root_from_cwd(None, temp_dir.path())
+            .expect("diagnostic project root");
+        let target_err = resolve_target_from_cwd(
+            &TargetSelection::default(),
+            WorkRootRequirement::Optional,
+            temp_dir.path(),
+        )
+        .expect_err("operational target still requires project config");
+
+        assert_eq!(
+            project_root,
+            temp_dir.path().canonicalize().expect("canonical")
+        );
+        assert!(target_err.to_string().contains("no LionClaw project found"));
+    }
+
+    #[test]
+    fn diagnostic_resolver_falls_back_to_current_directory_without_project_metadata() {
+        let temp_dir = tempdir().expect("temp dir");
 
         let project_root = discover_diagnostic_project_root_from_cwd(None, temp_dir.path())
             .expect("diagnostic project root");
