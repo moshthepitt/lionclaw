@@ -182,16 +182,87 @@ class TerminalApiTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(response.outcome, "queued")
             await api.send_inbound("hello again")
+            self.assertEqual(seen_event_ids[0], seen_event_ids[1])
+            self.assertNotEqual(seen_event_ids[1], seen_event_ids[2])
+            self.assertEqual(_event_sequence(seen_event_ids[0]), "0")
+            self.assertEqual(_event_sequence(seen_event_ids[2]), "1")
             self.assertEqual(
-                seen_event_ids,
-                [
-                    "terminal-inbound:interactive:test:0",
-                    "terminal-inbound:interactive:test:0",
-                    "terminal-inbound:interactive:test:1",
-                ],
+                _event_prefix(seen_event_ids[0]),
+                _event_prefix(seen_event_ids[2]),
             )
         finally:
             await api.close()
+
+    async def test_send_inbound_event_id_is_unique_across_client_restarts(self):
+        seen_event_ids: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            data = json.loads(request.content.decode())
+            seen_event_ids.append(data["event_id"])
+            return httpx.Response(
+                200,
+                json={
+                    "outcome": "queued",
+                    "turn_id": f"turn-{len(seen_event_ids)}",
+                    "session_id": "session-1",
+                },
+            )
+
+        transport = httpx.MockTransport(handler)
+        first = LionClawApi(
+            base_url="http://lionclaw.test",
+            channel_id="terminal",
+            peer_id="mosh",
+            consumer_id="interactive:test",
+            start_mode="tail",
+            stream_limit=50,
+            stream_wait_ms=0,
+        )
+        second = LionClawApi(
+            base_url="http://lionclaw.test",
+            channel_id="terminal",
+            peer_id="mosh",
+            consumer_id="interactive:test",
+            start_mode="tail",
+            stream_limit=50,
+            stream_wait_ms=0,
+        )
+        await first._client.aclose()
+        await second._client.aclose()
+        first._client = httpx.AsyncClient(
+            base_url=first.base_url,
+            transport=transport,
+        )
+        second._client = httpx.AsyncClient(
+            base_url=second.base_url,
+            transport=transport,
+        )
+
+        try:
+            await first.send_inbound("before restart")
+            await second.send_inbound("after restart")
+
+            self.assertEqual(len(seen_event_ids), 2)
+            self.assertEqual(_event_sequence(seen_event_ids[0]), "0")
+            self.assertEqual(_event_sequence(seen_event_ids[1]), "0")
+            self.assertNotEqual(seen_event_ids[0], seen_event_ids[1])
+            self.assertNotEqual(
+                _event_prefix(seen_event_ids[0]),
+                _event_prefix(seen_event_ids[1]),
+            )
+        finally:
+            await first.close()
+            await second.close()
+
+
+def _event_prefix(event_id: str) -> str:
+    prefix, _sequence = event_id.rsplit(":", 1)
+    return prefix
+
+
+def _event_sequence(event_id: str) -> str:
+    _prefix, sequence = event_id.rsplit(":", 1)
+    return sequence
 
 
 if __name__ == "__main__":

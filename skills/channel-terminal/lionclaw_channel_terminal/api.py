@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, cast
+from uuid import uuid4
 
 import httpx
 
@@ -78,6 +79,7 @@ class LionClawApi:
         self.stream_limit = stream_limit
         self.stream_wait_ms = stream_wait_ms
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout_seconds)
+        self._inbound_nonce = uuid4().hex
         self._inbound_sequence = 0
 
     @property
@@ -191,7 +193,10 @@ class LionClawApi:
         )
 
     async def send_inbound(self, text: str, session_id: str | None = None) -> InboundResponse:
-        event_id = f"terminal-inbound:{self.consumer_id}:{self._inbound_sequence}"
+        event_id = (
+            f"terminal-inbound:{self.consumer_id}:"
+            f"{self._inbound_nonce}:{self._inbound_sequence}"
+        )
         payload: dict[str, Any] = {
             "channel_id": self.channel_id,
             "event_id": event_id,
