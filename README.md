@@ -12,10 +12,10 @@ Use the agent harness you want. Keep the boundary around your project yours.
 git clone https://github.com/moshthepitt/lionclaw.git
 cd lionclaw
 cargo build --release
-LIONCLAW_BIN="$PWD/target/release/lionclaw"
+export PATH="$PWD/target/release:$PATH"
 
 cd /path/to/your/project
-"$LIONCLAW_BIN" doctor
+lionclaw doctor
 ```
 
 `doctor` points at the next setup problem. Fix, rerun, repeat.
@@ -83,21 +83,21 @@ Run `doctor` from the project you want LionClaw to own:
 
 ```bash
 cd /path/to/your/project
-"$LIONCLAW_BIN" doctor
+lionclaw doctor
 ```
 
 Follow the repair commands until `doctor` is clean. Then run the configured
 runtime:
 
 ```bash
-"$LIONCLAW_BIN" run
+lionclaw run
 ```
 
 For Codex, use a logged-in Codex CLI. If `run` reports a missing runtime image,
 build or provide the image named in the error. The bundled image definition
 lives at `containers/runtime/Containerfile`.
 
-`doctor` checks setup. `run` checks launch. Use `"$LIONCLAW_BIN" --help` and
+`doctor` checks setup. `run` checks launch. Use `lionclaw --help` and
 subcommand `--help` for current syntax.
 
 Runtime auth stays runtime-specific. LionClaw stages only the runtime-local auth
