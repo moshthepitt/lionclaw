@@ -13,9 +13,9 @@ use chrono::{Duration as ChronoDuration, Utc};
 use lionclaw::{
     applied::AppliedState,
     contracts::{
-        ChannelPeerApproveRequest, ContinuityPathRequest, ContinuitySearchRequest,
-        JobCreateRequest, PolicyGrantRequest, SessionHistoryPolicy, SessionOpenRequest,
-        SessionTurnRequest, TrustTier,
+        ChannelPairingApproveRequest, ChannelPairingStatus, ContinuityPathRequest,
+        ContinuitySearchRequest, JobCreateRequest, PolicyGrantRequest, SessionHistoryPolicy,
+        SessionOpenRequest, SessionTurnRequest, TrustTier,
     },
     home::LionClawHome,
     kernel::{
@@ -379,16 +379,16 @@ async fn continuity_refresh_indexes_exist() {
         .iter()
         .any(|name| name == "idx_session_turns_recent_failures"));
 
-    let channel_peer_indexes = sqlx::query("PRAGMA index_list('channel_peers')")
+    let channel_pairing_indexes = sqlx::query("PRAGMA index_list('channel_pairing_requests')")
         .fetch_all(&pool)
         .await
-        .expect("channel_peers index list")
+        .expect("channel_pairing_requests index list")
         .into_iter()
         .map(|row| row.get::<String, _>("name"))
         .collect::<Vec<_>>();
-    assert!(channel_peer_indexes
+    assert!(channel_pairing_indexes
         .iter()
-        .any(|name| name == "idx_channel_peers_pending_recent"));
+        .any(|name| name == "idx_channel_pairing_requests_status"));
 
     let scheduler_job_indexes = sqlx::query("PRAGMA index_list('scheduler_jobs')")
         .fetch_all(&pool)
@@ -483,17 +483,17 @@ async fn active_continuity_global_slices_are_bounded_to_recent_items() {
 
     for index in 0..7 {
         sqlx::query(
-            "INSERT INTO channel_peers \
-             (channel_id, peer_id, status, trust_tier, pairing_code, first_seen_ms, updated_at_ms) \
-             VALUES (?1, ?2, 'pending', 'untrusted', ?3, ?4, ?4)",
+            "INSERT INTO channel_pairing_requests \
+             (pairing_id, channel_id, code_hash, claim_policy, sender_ref, conversation_ref, thread_ref, requested_profile, status, label, max_claims, claim_count, created_at_ms, expires_at_ms, claimed_at_ms, updated_at_ms) \
+             VALUES (?1, 'terminal', ?2, 'operator_approval', ?3, NULL, NULL, 'direct', 'pending', NULL, 1, 0, ?4, NULL, NULL, ?4)",
         )
-        .bind("terminal")
+        .bind(Uuid::new_v4().to_string())
+        .bind(format!("hash-{index:02}"))
         .bind(format!("peer-{index:02}"))
-        .bind(format!("code-{index:02}"))
         .bind(i64::from(index + 1) * 1000)
         .execute(&pool)
         .await
-        .expect("seed pending peer ordering");
+        .expect("seed pending pairing ordering");
     }
 
     kernel
@@ -577,7 +577,7 @@ async fn create_job_rolls_back_when_audit_append_fails() {
 }
 
 #[tokio::test]
-async fn approve_channel_peer_rolls_back_when_audit_append_fails() {
+async fn approve_channel_pairing_rolls_back_when_audit_append_fails() {
     let env = TestEnv::new();
     bootstrap_workspace(&env.workspace_root())
         .await
@@ -602,26 +602,31 @@ async fn approve_channel_peer_rolls_back_when_audit_append_fails() {
         .expect("drop audit_events");
 
     let err = kernel
-        .approve_channel_peer(ChannelPeerApproveRequest {
+        .approve_channel_pairing(ChannelPairingApproveRequest {
             channel_id: "terminal".to_string(),
-            peer_id: "alice".to_string(),
-            pairing_code,
+            pairing_id: None,
+            pairing_code: Some(pairing_code),
+            label: None,
+            routing_profile: None,
             trust_tier: Some(TrustTier::Main),
         })
         .await
         .expect_err("approve should fail when audit append fails");
     assert!(err.to_string().contains("failed to append audit event"));
 
-    let peers = kernel
-        .list_channel_peers(Some("terminal".to_string()))
+    let pairings = kernel
+        .list_channel_pairings(
+            Some("terminal".to_string()),
+            Some(ChannelPairingStatus::Pending),
+        )
         .await
-        .expect("list peers after rollback");
-    let alice = peers
-        .peers
+        .expect("list pairings after rollback");
+    let alice = pairings
+        .pairings
         .iter()
-        .find(|peer| peer.peer_id == "alice")
-        .expect("alice peer");
-    assert_eq!(alice.status, "pending");
+        .find(|pairing| pairing.sender_ref.as_deref() == Some("alice"))
+        .expect("alice pairing");
+    assert_eq!(alice.status, ChannelPairingStatus::Pending);
 }
 
 #[tokio::test]
@@ -723,7 +728,7 @@ async fn create_job_succeeds_when_active_continuity_refresh_fails() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn approve_channel_peer_succeeds_when_active_continuity_refresh_fails() {
+async fn approve_channel_pairing_succeeds_when_active_continuity_refresh_fails() {
     let env = TestEnv::new();
     bootstrap_workspace(&env.workspace_root())
         .await
@@ -741,17 +746,19 @@ async fn approve_channel_peer_succeeds_when_active_continuity_refresh_fails() {
     break_active_continuity_refresh(&env);
 
     let response = kernel
-        .approve_channel_peer(ChannelPeerApproveRequest {
+        .approve_channel_pairing(ChannelPairingApproveRequest {
             channel_id: "terminal".to_string(),
-            peer_id: "alice".to_string(),
-            pairing_code,
+            pairing_id: None,
+            pairing_code: Some(pairing_code),
+            label: None,
+            routing_profile: None,
             trust_tier: Some(TrustTier::Main),
         })
         .await
         .expect("approve should still succeed");
-    assert_eq!(response.peer.status, "approved");
+    assert_eq!(response.grant.status, "approved");
 
-    assert_refresh_failure_event(&kernel, "channel.peer.approved", "api").await;
+    assert_refresh_failure_event(&kernel, "channel.grant.approved", "api").await;
 }
 
 #[cfg(unix)]
@@ -785,21 +792,24 @@ async fn pairing_pending_continuity_succeeds_when_active_refresh_fails() {
         .await
         .expect("pending peer should still be recorded");
 
-    let peers = kernel
-        .list_channel_peers(Some("terminal".to_string()))
+    let pairings = kernel
+        .list_channel_pairings(
+            Some("terminal".to_string()),
+            Some(ChannelPairingStatus::Pending),
+        )
         .await
-        .expect("list channel peers");
-    let alice = peers
-        .peers
+        .expect("list channel pairings");
+    let alice = pairings
+        .pairings
         .iter()
-        .find(|peer| peer.peer_id == "alice")
-        .expect("alice peer");
-    assert_eq!(alice.status, "pending");
+        .find(|pairing| pairing.sender_ref.as_deref() == Some("alice"))
+        .expect("alice pairing");
+    assert_eq!(alice.status, ChannelPairingStatus::Pending);
 
     let daily = read_all_markdown(env.workspace_root().join("continuity/daily"));
     assert!(daily.contains("Pairing required for terminal/alice"));
 
-    assert_refresh_failure_event(&kernel, "channel.peer.pairing_pending", "kernel").await;
+    assert_refresh_failure_event(&kernel, "channel.inbound.pending", "kernel").await;
 }
 
 #[tokio::test]
@@ -2131,8 +2141,8 @@ impl TestEnv {
     }
 }
 
-async fn enqueue_pending_peer(kernel: &Kernel, channel_id: &str, peer_id: &str) {
-    kernel
+async fn enqueue_pending_peer(kernel: &Kernel, channel_id: &str, peer_id: &str) -> String {
+    let response = kernel
         .process_inbound_channel_text(InboundChannelText {
             channel_id: channel_id.to_string(),
             peer_id: peer_id.to_string(),
@@ -2144,20 +2154,11 @@ async fn enqueue_pending_peer(kernel: &Kernel, channel_id: &str, peer_id: &str) 
         })
         .await
         .expect("seed pending peer");
+    response.pairing_code.expect("pairing code")
 }
 
 async fn seed_pending_peer(kernel: &Kernel, channel_id: &str, peer_id: &str) -> String {
-    enqueue_pending_peer(kernel, channel_id, peer_id).await;
-    let peers = kernel
-        .list_channel_peers(Some(channel_id.to_string()))
-        .await
-        .expect("list channel peers");
-    peers
-        .peers
-        .iter()
-        .find(|peer| peer.peer_id == peer_id)
-        .and_then(|peer| peer.pairing_code.clone())
-        .expect("pairing code")
+    enqueue_pending_peer(kernel, channel_id, peer_id).await
 }
 
 async fn assert_refresh_failure_event(kernel: &Kernel, source_action: &str, actor: &str) {

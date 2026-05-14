@@ -14,9 +14,10 @@ use chrono::{Duration as ChronoDuration, Utc};
 use lionclaw::{
     applied::AppliedState,
     contracts::{
-        ChannelStreamPullRequest, ChannelStreamStartMode, JobCreateRequest, JobRefRequest,
-        JobRunsRequest, SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery,
-        SessionOpenRequest, SessionTurnRequest, StreamEventKindDto, TrustTier,
+        ChannelPairingApproveRequest, ChannelStreamPullRequest, ChannelStreamStartMode,
+        JobCreateRequest, JobRefRequest, JobRunsRequest, SessionHistoryPolicy,
+        SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest, SessionTurnRequest,
+        StreamEventKindDto, TrustTier,
     },
     home::LionClawHome,
     kernel::{
@@ -777,11 +778,12 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
         })
         .await;
     approve_channel_peer(&kernel, "terminal", "alice").await;
+    let terminal_session_key = "channel:terminal:direct:alice".to_string();
 
     let seed_session = kernel
         .open_session(SessionOpenRequest {
             channel_id: "terminal".to_string(),
-            peer_id: "alice".to_string(),
+            peer_id: terminal_session_key.clone(),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -836,7 +838,7 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
     let latest_terminal = kernel
         .latest_session_snapshot(SessionLatestQuery {
             channel_id: "terminal".to_string(),
-            peer_id: "alice".to_string(),
+            peer_id: terminal_session_key,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
         .await
@@ -1466,7 +1468,7 @@ async fn install_and_bind_channel(env: &TestEnv, channel_id: &str, skill_name: &
 }
 
 async fn approve_channel_peer(kernel: &Kernel, channel_id: &str, peer_id: &str) {
-    let _ = kernel
+    let response = kernel
         .process_inbound_channel_text(InboundChannelText {
             channel_id: channel_id.to_string(),
             peer_id: peer_id.to_string(),
@@ -1478,25 +1480,18 @@ async fn approve_channel_peer(kernel: &Kernel, channel_id: &str, peer_id: &str) 
         })
         .await
         .expect("seed pending peer");
-    let peers = kernel
-        .list_channel_peers(Some(channel_id.to_string()))
-        .await
-        .expect("list channel peers");
-    let pairing_code = peers
-        .peers
-        .iter()
-        .find(|peer| peer.peer_id == peer_id)
-        .and_then(|peer| peer.pairing_code.clone())
-        .expect("pairing code");
+    let pairing_code = response.pairing_code.expect("pairing code");
     kernel
-        .approve_channel_peer(lionclaw::contracts::ChannelPeerApproveRequest {
+        .approve_channel_pairing(ChannelPairingApproveRequest {
             channel_id: channel_id.to_string(),
-            peer_id: peer_id.to_string(),
-            pairing_code,
+            pairing_id: None,
+            pairing_code: Some(pairing_code),
+            label: None,
+            routing_profile: None,
             trust_tier: Some(TrustTier::Main),
         })
         .await
-        .expect("approve channel peer");
+        .expect("approve channel pairing");
 }
 
 struct TestEnv {

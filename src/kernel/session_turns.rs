@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
+use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -64,6 +64,58 @@ impl SessionTurnStore {
     pub async fn begin_turn(&self, turn: NewSessionTurn) -> Result<SessionTurnRecord> {
         let started_at_ms = now_ms();
 
+        self.begin_turn_with_started_at(turn, started_at_ms).await
+    }
+
+    pub async fn begin_turn_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        turn: NewSessionTurn,
+    ) -> Result<SessionTurnRecord> {
+        self.begin_turn_with_status_in_tx(tx, turn, SessionTurnStatus::Running)
+            .await
+    }
+
+    pub async fn begin_turn_with_status_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        turn: NewSessionTurn,
+        status: SessionTurnStatus,
+    ) -> Result<SessionTurnRecord> {
+        let started_at_ms = now_ms();
+
+        sqlx::query(
+            "INSERT INTO session_turns \
+             (turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, runtime_id, started_at_ms, finished_at_ms) \
+             VALUES (?1, ?2, (SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM session_turns WHERE session_id = ?2), ?3, ?4, ?5, ?6, '', NULL, NULL, ?7, ?8, NULL)",
+        )
+        .bind(turn.turn_id.to_string())
+        .bind(turn.session_id.to_string())
+        .bind(turn.kind.as_str())
+        .bind(status.as_str())
+        .bind(&turn.display_user_text)
+        .bind(&turn.prompt_user_text)
+        .bind(&turn.runtime_id)
+        .bind(started_at_ms)
+        .execute(&mut **tx)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to insert session turn {} for session {}",
+                turn.turn_id, turn.session_id
+            )
+        })?;
+
+        self.get_in_tx(tx, turn.turn_id).await?.ok_or_else(|| {
+            anyhow!("session turn disappeared immediately after transactional insert")
+        })
+    }
+
+    async fn begin_turn_with_started_at(
+        &self,
+        turn: NewSessionTurn,
+        started_at_ms: i64,
+    ) -> Result<SessionTurnRecord> {
         sqlx::query(
             "INSERT INTO session_turns \
              (turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, runtime_id, started_at_ms, finished_at_ms) \
@@ -210,6 +262,24 @@ impl SessionTurnStore {
         .fetch_optional(&self.pool)
         .await
         .context("failed to query session turn")?;
+
+        row.map(map_session_turn_row).transpose()
+    }
+
+    async fn get_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        turn_id: Uuid,
+    ) -> Result<Option<SessionTurnRecord>> {
+        let row = sqlx::query(
+            "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, runtime_id, started_at_ms, finished_at_ms \
+             FROM session_turns \
+             WHERE turn_id = ?1",
+        )
+        .bind(turn_id.to_string())
+        .fetch_optional(&mut **tx)
+        .await
+        .context("failed to query session turn in transaction")?;
 
         row.map(map_session_turn_row).transpose()
     }
