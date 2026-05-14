@@ -448,7 +448,7 @@ fn resolve_project_root_from_cwd(project: Option<&Path>, cwd: &Path) -> Result<P
         );
     }
 
-    for candidate in [Some(cwd.as_path()), cwd.parent()].into_iter().flatten() {
+    for candidate in project_root_candidates(&cwd) {
         if project_file(candidate).exists() {
             return canonical_project_root(candidate);
         }
@@ -461,31 +461,24 @@ fn resolve_project_root_from_cwd(project: Option<&Path>, cwd: &Path) -> Result<P
 }
 
 fn discover_project_root_from_cwd(project: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
-    discover_project_root_from_cwd_with_marker(project, cwd, ProjectRootMarker::ProjectFile)
+    discover_project_root_from_cwd_with_policy(
+        project,
+        cwd,
+        ProjectRootMarker::ProjectFile,
+        MissingProjectRoot::Error,
+    )
 }
 
 fn discover_diagnostic_project_root_from_cwd(
     project: Option<&Path>,
     cwd: &Path,
 ) -> Result<PathBuf> {
-    if let Some(project) = project {
-        return canonical_existing_dir(&absolutize_from(cwd, project), "project root");
-    }
-
-    let cwd = canonical_existing_dir(cwd, "current directory")?;
-    if let Some(_instance_home) = containing_project_instance_home(&cwd) {
-        bail!(
-            "This looks like a LionClaw instance home, not a project root.\nRun from the project root, or use --project <path>."
-        );
-    }
-
-    for candidate in [Some(cwd.as_path()), cwd.parent()].into_iter().flatten() {
-        if project_root_marker_exists(candidate, ProjectRootMarker::MetadataDirectory) {
-            return canonical_existing_dir(candidate, "project root");
-        }
-    }
-
-    Ok(cwd)
+    discover_project_root_from_cwd_with_policy(
+        project,
+        cwd,
+        ProjectRootMarker::MetadataDirectory,
+        MissingProjectRoot::UseCurrentDirectory,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -494,32 +487,42 @@ enum ProjectRootMarker {
     MetadataDirectory,
 }
 
-fn discover_project_root_from_cwd_with_marker(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingProjectRoot {
+    Error,
+    UseCurrentDirectory,
+}
+
+fn discover_project_root_from_cwd_with_policy(
     project: Option<&Path>,
     cwd: &Path,
     marker: ProjectRootMarker,
+    missing: MissingProjectRoot,
 ) -> Result<PathBuf> {
     if let Some(project) = project {
         return canonical_existing_dir(&absolutize_from(cwd, project), "project root");
     }
 
     let cwd = canonical_existing_dir(cwd, "current directory")?;
-    if let Some(_instance_home) = containing_project_instance_home(&cwd) {
+    if containing_project_instance_home(&cwd).is_some() {
         bail!(
             "This looks like a LionClaw instance home, not a project root.\nRun from the project root, or use --project <path>."
         );
     }
 
-    for candidate in [Some(cwd.as_path()), cwd.parent()].into_iter().flatten() {
+    for candidate in project_root_candidates(&cwd) {
         if project_root_marker_exists(candidate, marker) {
             return canonical_existing_dir(candidate, "project root");
         }
     }
 
-    bail!(
-        "no LionClaw project found from {}; run from the project root or pass --project PATH",
-        cwd.display()
-    )
+    match missing {
+        MissingProjectRoot::Error => bail!(
+            "no LionClaw project found from {}; run from the project root or pass --project PATH",
+            cwd.display()
+        ),
+        MissingProjectRoot::UseCurrentDirectory => Ok(cwd),
+    }
 }
 
 fn project_root_marker_exists(project_root: &Path, marker: ProjectRootMarker) -> bool {
@@ -528,6 +531,10 @@ fn project_root_marker_exists(project_root: &Path, marker: ProjectRootMarker) ->
     }
     marker == ProjectRootMarker::MetadataDirectory
         && fs::symlink_metadata(project_dir(project_root)).is_ok()
+}
+
+fn project_root_candidates(cwd: &Path) -> impl Iterator<Item = &Path> + '_ {
+    [Some(cwd), cwd.parent()].into_iter().flatten()
 }
 
 fn resolve_instance_name(
