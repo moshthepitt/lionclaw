@@ -210,10 +210,7 @@ INSERT OR IGNORE INTO channel_inbound_events (
     created_at_ms
 )
 SELECT
-    COALESCE(external_message_id, CASE
-        WHEN update_id IS NOT NULL THEN 'v1-update:' || update_id
-        ELSE 'v1-message:' || message_id
-    END),
+    'v1-message:' || message_id,
     channel_id,
     peer_id,
     peer_id,
@@ -388,10 +385,7 @@ SELECT
     channel_turns.channel_id,
     'channel:' || channel_turns.channel_id || ':direct:' || replace(replace(channel_turns.peer_id, '%', '%25'), ':', '%3A'),
     channel_turns.session_id,
-    COALESCE(channel_messages.external_message_id, CASE
-        WHEN channel_messages.update_id IS NOT NULL THEN 'v1-update:' || channel_messages.update_id
-        ELSE 'v1-message:' || channel_messages.message_id
-    END),
+    'v1-message:' || channel_messages.message_id,
     channel_turns.runtime_id,
     channel_turns.status,
     channel_turns.last_error,
