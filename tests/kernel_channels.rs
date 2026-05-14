@@ -230,15 +230,19 @@ async fn channel_stream_pull_and_ack_round_trip() {
         .await
         .expect("process approved inbound");
     assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
+    let queued_turn_id = queued.turn_id.expect("queued turn id");
 
     let stream = wait_for_stream_events(&kernel, "telegram", "telegram-worker", |events| {
-        events
-            .iter()
-            .filter_map(|event| event.code.as_deref())
-            .any(|code| code == "queue.completed")
+        events.iter().any(|event| {
+            event.turn_id == Some(queued_turn_id)
+                && event.code.as_deref() == Some("queue.completed")
+        }) && events.iter().any(|event| {
+            event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::Done
+        })
     })
     .await;
     assert!(!stream.events.is_empty());
+    assert_turn_completed_before_done(&stream.events, queued_turn_id, "acked channel turn");
     let last_sequence = stream.events.last().expect("last event").sequence;
     assert!(stream
         .events
