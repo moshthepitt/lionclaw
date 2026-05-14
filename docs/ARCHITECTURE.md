@@ -352,7 +352,9 @@ stream contract. Kernel-generated lifecycle codes include:
 Stream events produced by actual runtime turns include `session_id` and
 `turn_id`. The stream `peer_id` remains the provider-facing conversation ref for
 delivery compatibility; internal session identity is carried by `session_key`
-and the session row.
+and the session row. Channel session keys are grant scoped: direct sessions
+include the sender, conversation sessions include the conversation and sender,
+and thread sessions include the conversation, thread, and sender.
 
 ## Session Continuity
 

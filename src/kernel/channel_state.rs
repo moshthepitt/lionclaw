@@ -587,35 +587,6 @@ impl ChannelStateStore {
         row.map(map_grant_row).transpose()
     }
 
-    pub async fn find_thread_session_grant(
-        &self,
-        channel_id: &str,
-        conversation_ref: &str,
-        thread_ref: &str,
-        status: ChannelGrantStatus,
-    ) -> Result<Option<ChannelGrantRecord>> {
-        let row = sqlx::query(
-            "SELECT grant_id, channel_id, sender_ref, conversation_ref, thread_ref, routing_profile, trust_tier, status, label, created_at_ms, updated_at_ms, revoked_at_ms \
-             FROM channel_grants \
-             WHERE channel_id = ?1 \
-               AND conversation_ref = ?2 \
-               AND thread_ref = ?3 \
-               AND routing_profile = 'thread' \
-               AND status = ?4 \
-             ORDER BY updated_at_ms DESC \
-             LIMIT 1",
-        )
-        .bind(channel_id)
-        .bind(conversation_ref)
-        .bind(thread_ref)
-        .bind(status.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .context("failed to query channel thread grant")?;
-
-        row.map(map_grant_row).transpose()
-    }
-
     pub async fn list_pairing_requests(
         &self,
         channel_id: Option<&str>,

@@ -788,14 +788,17 @@ impl Kernel {
                     .await
             }
             SessionKeyScope::Thread {
+                sender_ref,
                 conversation_ref,
                 thread_ref,
             } => {
                 self.channel_state
-                    .find_thread_session_grant(
+                    .get_grant_by_scope(
                         channel_id,
-                        conversation_ref,
-                        thread_ref,
+                        Some(sender_ref),
+                        Some(conversation_ref),
+                        Some(thread_ref),
+                        ChannelRoutingProfile::Thread,
                         ChannelGrantStatus::Blocked,
                     )
                     .await
@@ -837,14 +840,17 @@ impl Kernel {
                     .await
             }
             SessionKeyScope::Thread {
+                sender_ref,
                 conversation_ref,
                 thread_ref,
             } => {
                 self.channel_state
-                    .find_thread_session_grant(
+                    .get_grant_by_scope(
                         channel_id,
-                        conversation_ref,
-                        thread_ref,
+                        Some(sender_ref),
+                        Some(conversation_ref),
+                        Some(thread_ref),
+                        ChannelRoutingProfile::Thread,
                         ChannelGrantStatus::Approved,
                     )
                     .await
@@ -4888,6 +4894,9 @@ fn session_key_for_grant(grant: &ChannelGrantRecord) -> Result<String, KernelErr
             ))
         }
         ChannelRoutingProfile::Thread => {
+            let sender_ref = grant.sender_ref.as_deref().ok_or_else(|| {
+                KernelError::Internal("thread grant missing sender_ref".to_string())
+            })?;
             let conversation_ref = grant.conversation_ref.as_deref().ok_or_else(|| {
                 KernelError::Internal("thread grant missing conversation_ref".to_string())
             })?;
@@ -4895,10 +4904,11 @@ fn session_key_for_grant(grant: &ChannelGrantRecord) -> Result<String, KernelErr
                 KernelError::Internal("thread grant missing thread_ref".to_string())
             })?;
             Ok(format!(
-                "channel:{}:thread:{}:{}",
+                "channel:{}:thread:{}:{}:sender:{}",
                 grant.channel_id,
                 encode_session_key_part(conversation_ref),
-                encode_session_key_part(thread_ref)
+                encode_session_key_part(thread_ref),
+                encode_session_key_part(sender_ref)
             ))
         }
         ChannelRoutingProfile::Outbound => Err(KernelError::BadRequest(
@@ -4970,7 +4980,10 @@ fn stream_peer_ref_for_session_peer(channel_id: &str, session_peer_id: &str) -> 
 
     let thread_prefix = format!("channel:{channel_id}:thread:");
     if let Some(rest) = session_peer_id.strip_prefix(&thread_prefix) {
-        if let Some((conversation_ref, _thread_ref)) = rest.split_once(':') {
+        if let Some((thread_scope, _sender_ref)) = rest.split_once(":sender:") {
+            let Some((conversation_ref, _thread_ref)) = thread_scope.split_once(':') else {
+                return session_peer_id.to_string();
+            };
             return decode_session_key_part(conversation_ref);
         }
     }
@@ -4997,8 +5010,10 @@ fn parse_session_key_scope(channel_id: &str, session_peer_id: &str) -> Option<Se
 
     let thread_prefix = format!("channel:{channel_id}:thread:");
     if let Some(rest) = session_peer_id.strip_prefix(&thread_prefix) {
-        let (conversation_ref, thread_ref) = rest.split_once(':')?;
+        let (thread_scope, sender_ref) = rest.split_once(":sender:")?;
+        let (conversation_ref, thread_ref) = thread_scope.split_once(':')?;
         return Some(SessionKeyScope::Thread {
+            sender_ref: decode_session_key_part(sender_ref),
             conversation_ref: decode_session_key_part(conversation_ref),
             thread_ref: decode_session_key_part(thread_ref),
         });
@@ -5287,6 +5302,7 @@ enum SessionKeyScope {
         conversation_ref: String,
     },
     Thread {
+        sender_ref: String,
         conversation_ref: String,
         thread_ref: String,
     },
