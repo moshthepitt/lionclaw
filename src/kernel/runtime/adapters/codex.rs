@@ -71,9 +71,10 @@ impl CodexRuntimeAdapter {
             runtime_secrets_mount,
             codex_home_override,
         } = execution;
+        let network_mode = plan.network_mode;
         let thread_state = self.thread_state_for(&input.runtime_session_id);
         let transport = self
-            .start_app_server_transport(plan.clone(), runtime_secrets_mount, codex_home_override)
+            .start_app_server_transport(plan, runtime_secrets_mount, codex_home_override)
             .await?;
         let mut client = CodexAppServerClient::new(transport);
 
@@ -94,7 +95,7 @@ impl CodexRuntimeAdapter {
                         &thread_id,
                         &input.prompt,
                         self.config.model.as_deref(),
-                        plan.network_mode,
+                        network_mode,
                     ),
                     &events,
                     &thread_state,

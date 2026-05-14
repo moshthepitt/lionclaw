@@ -5166,33 +5166,6 @@ impl Kernel {
             }
         };
 
-        let close_result = self
-            .close_runtime_session(
-                Arc::clone(&adapter),
-                &runtime_id,
-                session.session_id,
-                &handle,
-                RuntimeSessionCloseContext::Control,
-            )
-            .await;
-        if let Err(err) = close_result {
-            self.clear_runtime_session_ready(&execution_plan).await;
-            let message = err.to_string();
-            self.persist_failed_session_turn(
-                session,
-                &persisted_turn,
-                FailedSessionTurnCompletion {
-                    assistant_text: runtime_control.outcome.message().to_string(),
-                    error_code: "runtime.error".to_string(),
-                    error_text: message.clone(),
-                    stream_error_emitted: false,
-                },
-                channel_stream_finalizer,
-            )
-            .await?;
-            return Err(KernelError::Runtime(message));
-        }
-
         let outcome_event = runtime_control_outcome_event(&runtime_control.outcome);
         let mut runtime_events = runtime_control.events;
         let mut checkpoints = AssistantCheckpointState::default();
@@ -5208,6 +5181,18 @@ impl Kernel {
             .await
         {
             self.clear_runtime_session_ready(&execution_plan).await;
+            if let Err(err) = self
+                .close_runtime_session(
+                    Arc::clone(&adapter),
+                    &runtime_id,
+                    session.session_id,
+                    &handle,
+                    RuntimeSessionCloseContext::Control,
+                )
+                .await
+            {
+                warn!(?err, runtime_id, session_id = %session.session_id, "failed to close runtime session after runtime-control event error");
+            }
             self.persist_failed_session_turn(
                 session,
                 &persisted_turn,
@@ -5239,6 +5224,50 @@ impl Kernel {
         let error_text = (status == SessionTurnStatus::Failed).then(|| assistant_text.clone());
         if status == SessionTurnStatus::Failed {
             self.clear_runtime_session_ready(&execution_plan).await;
+        }
+        let failed_control_error = error_code.clone().zip(error_text.clone());
+
+        let close_result = self
+            .close_runtime_session(
+                Arc::clone(&adapter),
+                &runtime_id,
+                session.session_id,
+                &handle,
+                RuntimeSessionCloseContext::Control,
+            )
+            .await;
+        if let Err(err) = close_result {
+            self.clear_runtime_session_ready(&execution_plan).await;
+            if let Some((error_code, error_text)) = failed_control_error {
+                self.persist_failed_session_turn(
+                    session,
+                    &persisted_turn,
+                    FailedSessionTurnCompletion {
+                        assistant_text,
+                        error_code,
+                        error_text: error_text.clone(),
+                        stream_error_emitted: runtime_events_include_error(&runtime_events),
+                    },
+                    channel_stream_finalizer,
+                )
+                .await?;
+                return Err(KernelError::Runtime(error_text));
+            }
+
+            let message = err.to_string();
+            self.persist_failed_session_turn(
+                session,
+                &persisted_turn,
+                FailedSessionTurnCompletion {
+                    assistant_text,
+                    error_code: "runtime.error".to_string(),
+                    error_text: message.clone(),
+                    stream_error_emitted: false,
+                },
+                channel_stream_finalizer,
+            )
+            .await?;
+            return Err(KernelError::Runtime(message));
         }
 
         self.session_turns

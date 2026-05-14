@@ -446,6 +446,79 @@ async fn failed_runtime_control_persists_failed_turn_with_runtime_error_code() {
 }
 
 #[tokio::test]
+async fn failed_runtime_control_close_failure_preserves_control_error() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    kernel
+        .register_runtime_adapter(
+            "control-close-fail",
+            Arc::new(RuntimeControlCloseFailureAdapter {
+                control_error_code: "runtime.control.failed_before_close".to_string(),
+                control_error_text: "control failed before close".to_string(),
+                close_error_text: "control close failed".to_string(),
+            }),
+        )
+        .await;
+    let session = open_session(
+        &kernel,
+        "runtime-control-close-failure-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    let err = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "/failed".to_string(),
+            runtime_id: Some("control-close-fail".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect_err("runtime control should fail");
+
+    assert!(
+        matches!(err, KernelError::Runtime(message) if message == "control failed before close")
+    );
+
+    let history = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: session.session_id,
+            limit: Some(4),
+        })
+        .await
+        .expect("history");
+    let turn = history.turns.last().expect("failed runtime control turn");
+    assert_eq!(turn.kind, SessionTurnKind::RuntimeControl);
+    assert_eq!(turn.status, SessionTurnStatus::Failed);
+    assert_eq!(turn.assistant_text, "control failed before close");
+    assert_eq!(
+        turn.error_code.as_deref(),
+        Some("runtime.control.failed_before_close")
+    );
+    assert_eq!(
+        turn.error_text.as_deref(),
+        Some("control failed before close")
+    );
+
+    let close_errors = kernel
+        .query_audit(
+            Some(session.session_id),
+            Some("runtime.control.close_error".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query close error audit");
+    assert_eq!(close_errors.events.len(), 1);
+    assert_eq!(
+        close_errors.events[0].details["error"].as_str(),
+        Some("control close failed")
+    );
+}
+
+#[tokio::test]
 async fn failed_runtime_control_clears_runtime_session_resumability_for_next_turn() {
     let env = TestEnv::new();
     let workspace_root = env.path().join("workspace");
@@ -1416,6 +1489,12 @@ struct RuntimeControlFailureClearingAdapter {
     resumed_flags: Arc<Mutex<Vec<bool>>>,
 }
 
+struct RuntimeControlCloseFailureAdapter {
+    control_error_code: String,
+    control_error_text: String,
+    close_error_text: String,
+}
+
 struct BlockingAnswerAdapter {
     answer: String,
     sleep_for: Duration,
@@ -1823,6 +1902,53 @@ impl RuntimeAdapter for RuntimeControlFailureClearingAdapter {
 
     async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
         Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for RuntimeControlCloseFailureAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "control-close-fail".to_string(),
+            version: "0.1".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("control-close-fail-{}", input.session_id),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn runtime_control(
+        &self,
+        _execution: RuntimeControlExecution,
+        _events: RuntimeEventSender,
+    ) -> Result<RuntimeControlOutcome> {
+        Ok(RuntimeControlOutcome::Failed {
+            code: Some(self.control_error_code.clone()),
+            message: self.control_error_text.clone(),
+        })
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        events: RuntimeEventSender,
+    ) -> Result<()> {
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
+    }
+
+    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
+        anyhow::bail!(self.close_error_text.clone())
     }
 }
 
