@@ -793,6 +793,8 @@ pub struct ChannelPairingView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelPairingListResponse {
     pub pairings: Vec<ChannelPairingView>,
+    #[serde(default)]
+    pub grants: Vec<ChannelGrantView>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

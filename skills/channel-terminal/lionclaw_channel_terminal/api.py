@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -94,13 +94,29 @@ class LionClawApi:
         )
         _raise_for_status(response)
         payload = response.json()
-        for pairing in payload.get("pairings", []):
-            if pairing.get("sender_ref") != self.peer_id:
-                continue
-            if pairing.get("requested_profile") != "direct":
-                continue
+        grant = _find_direct_peer_record(
+            payload.get("grants", []),
+            self.peer_id,
+            profile_field="routing_profile",
+        )
+        if grant is not None:
+            status = grant.get("status")
+            if status == "approved":
+                return PeerState(status="approved", trust_tier=grant.get("trust_tier"))
+            if status == "blocked":
+                return PeerState(status="blocked")
+
+        pairing = _find_direct_peer_record(
+            payload.get("pairings", []),
+            self.peer_id,
+            profile_field="requested_profile",
+        )
+        if pairing is not None:
+            status = pairing.get("status", "unknown")
+            if status == "approved":
+                status = "unknown"
             return PeerState(
-                status=pairing.get("status", "unknown"),
+                status=_peer_status(status),
                 pairing_id=pairing.get("pairing_id"),
             )
         return PeerState(status="unknown")
@@ -242,6 +258,27 @@ class LionClawApi:
             },
         )
         _raise_for_status(response)
+
+
+def _find_direct_peer_record(
+    records: list[dict[str, Any]],
+    peer_id: str,
+    *,
+    profile_field: str,
+) -> dict[str, Any] | None:
+    for record in records:
+        if record.get("sender_ref") != peer_id:
+            continue
+        if record.get(profile_field) != "direct":
+            continue
+        return record
+    return None
+
+
+def _peer_status(value: Any) -> PeerStatus:
+    if value in ("pending", "approved", "blocked"):
+        return cast(PeerStatus, value)
+    return "unknown"
 
 
 def _parse_session_open_result(payload: dict[str, Any] | None) -> SessionOpenResult | None:

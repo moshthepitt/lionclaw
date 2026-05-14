@@ -637,6 +637,21 @@ impl ChannelStateStore {
         rows.into_iter().map(map_pairing_row).collect()
     }
 
+    pub async fn list_grants(&self, channel_id: Option<&str>) -> Result<Vec<ChannelGrantRecord>> {
+        let rows = sqlx::query(
+            "SELECT grant_id, channel_id, sender_ref, conversation_ref, thread_ref, routing_profile, trust_tier, status, label, created_at_ms, updated_at_ms, revoked_at_ms \
+             FROM channel_grants \
+             WHERE (?1 IS NULL OR channel_id = ?1) \
+             ORDER BY updated_at_ms DESC",
+        )
+        .bind(channel_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list channel grants")?;
+
+        rows.into_iter().map(map_grant_row).collect()
+    }
+
     pub async fn create_or_refresh_operator_pairing(
         &self,
         channel_id: &str,
