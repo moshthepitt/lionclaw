@@ -47,7 +47,7 @@ class AiogramTelegramTransport:
 
 def extract_text_update(update: Update) -> TelegramTextUpdate | None:
     message = _first_supported_message(update)
-    if message is None or message.text is None:
+    if message is None or message.text is None or message.chat.type != "private":
         return None
     return TelegramTextUpdate(
         update_id=update.update_id,
@@ -57,7 +57,7 @@ def extract_text_update(update: Update) -> TelegramTextUpdate | None:
 
 
 def _first_supported_message(update: Update) -> Message | None:
-    for candidate in (update.message, update.edited_message, update.channel_post):
+    for candidate in (update.message, update.edited_message):
         if candidate is not None:
             return candidate
     return None

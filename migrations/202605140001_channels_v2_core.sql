@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS channel_inbound_events (
     conversation_ref TEXT NOT NULL,
     thread_ref TEXT,
     message_ref TEXT,
+    text TEXT,
     trigger TEXT NOT NULL CHECK (trigger IN ('dm', 'mention', 'reply_to_bot', 'thread_continuation', 'none')),
     attachments_json TEXT NOT NULL DEFAULT '[]',
     reply_to_ref TEXT,
@@ -200,6 +201,7 @@ INSERT OR IGNORE INTO channel_inbound_events (
     conversation_ref,
     thread_ref,
     message_ref,
+    text,
     trigger,
     attachments_json,
     reply_to_ref,
@@ -217,6 +219,7 @@ SELECT
     peer_id,
     NULL,
     external_message_id,
+    content,
     'dm',
     '[]',
     NULL,
@@ -421,6 +424,8 @@ WHERE EXISTS (
       AND channel_peers.peer_id = sessions.peer_id
       AND channel_peers.status = 'approved'
 );
+
+DROP TABLE channel_peers;
 
 CREATE TABLE channel_messages_new (
     message_id TEXT PRIMARY KEY NOT NULL,

@@ -8,8 +8,8 @@ use chrono::{Duration as ChronoDuration, Utc};
 use common::{write_skill_source, TestHome};
 use lionclaw::{
     contracts::{
-        ChannelPairingApproveRequest, JobCreateRequest, PolicyGrantRequest, SessionOpenRequest,
-        SessionTurnRequest, StreamEventKindDto, TrustTier,
+        ChannelInboundRequest, ChannelPairingApproveRequest, ChannelTrigger, JobCreateRequest,
+        PolicyGrantRequest, SessionOpenRequest, SessionTurnRequest, StreamEventKindDto, TrustTier,
     },
     kernel::{
         policy::Capability,
@@ -18,7 +18,7 @@ use lionclaw::{
             RuntimeEvent, RuntimeEventSender, RuntimeSessionHandle, RuntimeSessionStartInput,
             RuntimeTurnInput, RuntimeTurnResult,
         },
-        InboundChannelText, Kernel,
+        Kernel,
     },
 };
 use serde_json::{json, Value};
@@ -265,15 +265,12 @@ async fn channel_send_capability_uses_session_channel_defaults() {
 
     let peer_id = "peer-cap-broker-channel";
     let _ = kernel
-        .process_inbound_channel_text(InboundChannelText {
-            channel_id: "local-cli".to_string(),
-            peer_id: peer_id.to_string(),
-            text: "seed pairing".to_string(),
-            session_id: None,
-            runtime_id: Some("single-capability".to_string()),
-            update_id: Some(9101),
-            external_message_id: Some("cap-broker-9101".to_string()),
-        })
+        .ingest_channel_inbound(v2_text_request(
+            "local-cli",
+            "cap-broker-9101",
+            peer_id,
+            "seed pairing",
+        ))
         .await
         .expect("seed pairing state");
     let pairings = kernel
@@ -478,6 +475,28 @@ async fn grant_capability(kernel: &Kernel, skill_alias: &str, capability: &str) 
         })
         .await
         .expect("grant capability");
+}
+
+fn v2_text_request(
+    channel_id: &str,
+    event_id: &str,
+    sender_ref: &str,
+    text: &str,
+) -> ChannelInboundRequest {
+    ChannelInboundRequest {
+        channel_id: channel_id.to_string(),
+        event_id: event_id.to_string(),
+        sender_ref: sender_ref.to_string(),
+        conversation_ref: sender_ref.to_string(),
+        thread_ref: None,
+        message_ref: Some(event_id.to_string()),
+        text: Some(text.to_string()),
+        attachments: Vec::new(),
+        reply_to_ref: None,
+        trigger: ChannelTrigger::Dm,
+        received_at: None,
+        provider_metadata: serde_json::json!({}),
+    }
 }
 
 async fn latest_capability_result(kernel: &Kernel, session_id: Uuid) -> Value {

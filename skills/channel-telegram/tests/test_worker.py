@@ -15,11 +15,16 @@ from lionclaw_channel_telegram.worker import OffsetStore, TelegramWorker
 
 
 class ExtractTextUpdateTests(unittest.TestCase):
-    def test_supported_text_sources_map_to_peer_and_text(self) -> None:
+    def test_private_text_sources_map_to_peer_and_text(self) -> None:
         cases = {
             "message": {
                 "update_id": 11,
-                "message": {"message_id": 1, "date": 0, "chat": {"id": 42, "type": "private"}, "text": "hello"},
+                "message": {
+                    "message_id": 1,
+                    "date": 0,
+                    "chat": {"id": 42, "type": "private"},
+                    "text": "hello",
+                },
             },
             "edited_message": {
                 "update_id": 12,
@@ -30,10 +35,33 @@ class ExtractTextUpdateTests(unittest.TestCase):
                     "text": "edited",
                 },
             },
-            "channel_post": {
+        }
+
+        for name, payload in cases.items():
+            with self.subTest(source=name):
+                update = Update.model_validate(payload)
+                mapped = extract_text_update(update)
+                self.assertIsNotNone(mapped)
+                assert mapped is not None
+                message = next(value for key, value in payload.items() if key != "update_id")
+                self.assertEqual(mapped.update_id, payload["update_id"])
+                self.assertEqual(mapped.peer_id, str(message["chat"]["id"]))
+
+    def test_non_private_text_updates_are_ignored(self) -> None:
+        cases = {
+            "group_message": {
                 "update_id": 13,
-                "channel_post": {
+                "message": {
                     "message_id": 3,
+                    "date": 0,
+                    "chat": {"id": -44, "type": "group"},
+                    "text": "group",
+                },
+            },
+            "channel_post": {
+                "update_id": 14,
+                "channel_post": {
+                    "message_id": 4,
                     "date": 0,
                     "chat": {"id": -10044, "type": "channel"},
                     "text": "broadcast",
@@ -43,12 +71,7 @@ class ExtractTextUpdateTests(unittest.TestCase):
 
         for name, payload in cases.items():
             with self.subTest(source=name):
-                update = Update.model_validate(payload)
-                mapped = extract_text_update(update)
-                self.assertIsNotNone(mapped)
-                assert mapped is not None
-                self.assertEqual(mapped.update_id, payload["update_id"])
-                self.assertEqual(mapped.peer_id, str(next(value for key, value in payload.items() if key != "update_id")["chat"]["id"]))
+                self.assertIsNone(extract_text_update(Update.model_validate(payload)))
 
     def test_non_text_updates_are_ignored(self) -> None:
         update = Update.model_validate(
@@ -188,7 +211,6 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 worker.lionclaw_api.sent_inbound,
                 [
                     TelegramTextUpdate(update_id=7, peer_id="77", text="hi"),
-                    TelegramTextUpdate(update_id=8, peer_id="-1009", text="news"),
                 ],
             )
 

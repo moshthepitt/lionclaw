@@ -54,7 +54,7 @@ LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
 ## Notes
 
 - LionClaw enforces scoped pairing (`pending_approval` -> approved grant through `lionclaw channel pairing approve ...` or `/v0/channels/pairing/approve`).
-- `sender_ref` and `conversation_ref` are Telegram `chat.id` serialized as string for the current DM-oriented worker.
+- The worker currently accepts private chats only. `sender_ref` and `conversation_ref` are Telegram `chat.id` serialized as string for private DM updates.
 - The worker defaults `consumer_id` to `telegram:<channel_id>` and `start_mode=resume`, so undelivered stream events are replayed after worker restart.
 - Telegram delivery is message-oriented by default: typing while a turn is active, final answer on `done`, no reasoning lane delivery.
 - Runtime selection comes from the selected instance's default runtime; workers do not send `runtime_id` in inbound requests.

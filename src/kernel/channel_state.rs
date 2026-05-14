@@ -15,36 +15,6 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChannelPeerStatus {
-    Pending,
-    Approved,
-    Blocked,
-}
-
-impl ChannelPeerStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Approved => "approved",
-            Self::Blocked => "blocked",
-        }
-    }
-}
-
-impl FromStr for ChannelPeerStatus {
-    type Err = String;
-
-    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-        match value {
-            "pending" => Ok(Self::Pending),
-            "approved" => Ok(Self::Approved),
-            "blocked" => Ok(Self::Blocked),
-            other => Err(format!("invalid channel peer status '{other}'")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelGrantStatus {
     Approved,
     Blocked,
@@ -79,17 +49,6 @@ pub struct ChannelBindingRecord {
     pub channel_id: String,
     pub skill_alias: String,
     pub launch_mode: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct ChannelPeerRecord {
-    pub channel_id: String,
-    pub peer_id: String,
-    pub status: ChannelPeerStatus,
-    pub trust_tier: TrustTier,
-    pub pairing_code: String,
-    pub first_seen: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +95,7 @@ pub struct ChannelInboundEventRecord {
     pub conversation_ref: String,
     pub thread_ref: Option<String>,
     pub message_ref: Option<String>,
+    pub text: Option<String>,
     pub trigger: ChannelTrigger,
     pub attachments: Vec<ChannelAttachmentDescriptor>,
     pub reply_to_ref: Option<String>,
@@ -152,11 +112,32 @@ pub(crate) struct NewChannelInboundEvent<'a> {
     pub conversation_ref: &'a str,
     pub thread_ref: Option<&'a str>,
     pub message_ref: Option<&'a str>,
+    pub text: Option<&'a str>,
     pub trigger: ChannelTrigger,
     pub attachments: &'a [ChannelAttachmentDescriptor],
     pub reply_to_ref: Option<&'a str>,
     pub provider_metadata: &'a Value,
     pub received_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OperatorPairingUpsert<'a> {
+    pub channel_id: &'a str,
+    pub sender_ref: Option<&'a str>,
+    pub conversation_ref: Option<&'a str>,
+    pub thread_ref: Option<&'a str>,
+    pub requested_profile: ChannelRoutingProfile,
+    pub code_hash: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChannelGrantScopeLookup<'a> {
+    channel_id: &'a str,
+    sender_ref: Option<&'a str>,
+    conversation_ref: Option<&'a str>,
+    thread_ref: Option<&'a str>,
+    routing_profile: ChannelRoutingProfile,
+    status: ChannelGrantStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -274,9 +255,9 @@ impl FromStr for StreamMessageLane {
 #[derive(Debug, Clone)]
 pub struct ChannelHealthRecord {
     pub channel_id: String,
-    pub pending_peer_count: u64,
-    pub approved_peer_count: u64,
-    pub blocked_peer_count: u64,
+    pub pending_pairing_count: u64,
+    pub approved_grant_count: u64,
+    pub blocked_grant_count: u64,
     pub latest_inbound_at: Option<DateTime<Utc>>,
     pub latest_outbound_at: Option<DateTime<Utc>>,
 }
@@ -347,12 +328,12 @@ impl ChannelStateStore {
         &self.pool
     }
 
-    pub(crate) async fn insert_inbound_event(
+    pub(crate) async fn insert_inbound_event_in_tx(
         &self,
+        tx: &mut Transaction<'_, Sqlite>,
         event: NewChannelInboundEvent<'_>,
     ) -> Result<Option<ChannelInboundEventRecord>> {
-        let stored_attachments = attachment_descriptors_without_message_content(event.attachments);
-        let attachments_json = serde_json::to_string(&stored_attachments)
+        let attachments_json = serde_json::to_string(event.attachments)
             .context("failed to encode attachment descriptors")?;
         let provider_metadata_json = serde_json::to_string(event.provider_metadata)
             .context("failed to encode provider metadata")?;
@@ -361,8 +342,8 @@ impl ChannelStateStore {
 
         let result = sqlx::query(
             "INSERT INTO channel_inbound_events \
-             (event_id, channel_id, sender_ref, conversation_ref, thread_ref, message_ref, trigger, attachments_json, reply_to_ref, provider_metadata_json, received_at_ms, created_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             (event_id, channel_id, sender_ref, conversation_ref, thread_ref, message_ref, text, trigger, attachments_json, reply_to_ref, provider_metadata_json, received_at_ms, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )
         .bind(event.event_id)
         .bind(event.channel_id)
@@ -370,13 +351,14 @@ impl ChannelStateStore {
         .bind(event.conversation_ref)
         .bind(event.thread_ref)
         .bind(event.message_ref)
+        .bind(event.text)
         .bind(event.trigger.as_str())
         .bind(attachments_json)
         .bind(event.reply_to_ref)
         .bind(provider_metadata_json)
         .bind(received_at_ms)
         .bind(created_at_ms)
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await;
 
         match result {
@@ -384,7 +366,7 @@ impl ChannelStateStore {
                 if done.rows_affected() == 0 {
                     return Ok(None);
                 }
-                self.get_inbound_event(event.channel_id, event.event_id)
+                self.get_inbound_event_in_tx(tx, event.channel_id, event.event_id)
                     .await
             }
             Err(err) => {
@@ -398,26 +380,28 @@ impl ChannelStateStore {
         }
     }
 
-    pub async fn get_inbound_event(
+    pub(crate) async fn get_inbound_event_in_tx(
         &self,
+        tx: &mut Transaction<'_, Sqlite>,
         channel_id: &str,
         event_id: &str,
     ) -> Result<Option<ChannelInboundEventRecord>> {
         let row = sqlx::query(
-            "SELECT event_id, channel_id, sender_ref, conversation_ref, thread_ref, message_ref, trigger, attachments_json, reply_to_ref, provider_metadata_json, received_at_ms, created_at_ms \
+            "SELECT event_id, channel_id, sender_ref, conversation_ref, thread_ref, message_ref, text, trigger, attachments_json, reply_to_ref, provider_metadata_json, received_at_ms, created_at_ms \
              FROM channel_inbound_events WHERE channel_id = ?1 AND event_id = ?2",
         )
         .bind(channel_id)
         .bind(event_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut **tx)
         .await
         .context("failed to query channel inbound event")?;
 
         row.map(map_inbound_event_row).transpose()
     }
 
-    pub async fn find_blocking_grant(
+    pub(crate) async fn find_blocking_grant_in_tx(
         &self,
+        tx: &mut Transaction<'_, Sqlite>,
         channel_id: &str,
         sender_ref: &str,
         conversation_ref: &str,
@@ -425,13 +409,16 @@ impl ChannelStateStore {
     ) -> Result<Option<ChannelGrantRecord>> {
         if let Some(thread_ref) = thread_ref {
             if let Some(grant) = self
-                .get_grant_by_scope(
-                    channel_id,
-                    Some(sender_ref),
-                    Some(conversation_ref),
-                    Some(thread_ref),
-                    ChannelRoutingProfile::Thread,
-                    ChannelGrantStatus::Blocked,
+                .get_grant_by_scope_with_status_in_tx(
+                    tx,
+                    ChannelGrantScopeLookup {
+                        channel_id,
+                        sender_ref: Some(sender_ref),
+                        conversation_ref: Some(conversation_ref),
+                        thread_ref: Some(thread_ref),
+                        routing_profile: ChannelRoutingProfile::Thread,
+                        status: ChannelGrantStatus::Blocked,
+                    },
                 )
                 .await?
             {
@@ -440,32 +427,39 @@ impl ChannelStateStore {
         }
 
         if let Some(grant) = self
-            .get_grant_by_scope(
-                channel_id,
-                Some(sender_ref),
-                Some(conversation_ref),
-                None,
-                ChannelRoutingProfile::Conversation,
-                ChannelGrantStatus::Blocked,
+            .get_grant_by_scope_with_status_in_tx(
+                tx,
+                ChannelGrantScopeLookup {
+                    channel_id,
+                    sender_ref: Some(sender_ref),
+                    conversation_ref: Some(conversation_ref),
+                    thread_ref: None,
+                    routing_profile: ChannelRoutingProfile::Conversation,
+                    status: ChannelGrantStatus::Blocked,
+                },
             )
             .await?
         {
             return Ok(Some(grant));
         }
 
-        self.get_grant_by_scope(
-            channel_id,
-            Some(sender_ref),
-            None,
-            None,
-            ChannelRoutingProfile::Direct,
-            ChannelGrantStatus::Blocked,
+        self.get_grant_by_scope_with_status_in_tx(
+            tx,
+            ChannelGrantScopeLookup {
+                channel_id,
+                sender_ref: Some(sender_ref),
+                conversation_ref: None,
+                thread_ref: None,
+                routing_profile: ChannelRoutingProfile::Direct,
+                status: ChannelGrantStatus::Blocked,
+            },
         )
         .await
     }
 
-    pub async fn find_approved_grant(
+    pub(crate) async fn find_approved_grant_in_tx(
         &self,
+        tx: &mut Transaction<'_, Sqlite>,
         channel_id: &str,
         sender_ref: &str,
         conversation_ref: &str,
@@ -474,13 +468,16 @@ impl ChannelStateStore {
     ) -> Result<Option<ChannelGrantRecord>> {
         if let Some(thread_ref) = thread_ref {
             if let Some(grant) = self
-                .get_grant_by_scope(
-                    channel_id,
-                    Some(sender_ref),
-                    Some(conversation_ref),
-                    Some(thread_ref),
-                    ChannelRoutingProfile::Thread,
-                    ChannelGrantStatus::Approved,
+                .get_grant_by_scope_with_status_in_tx(
+                    tx,
+                    ChannelGrantScopeLookup {
+                        channel_id,
+                        sender_ref: Some(sender_ref),
+                        conversation_ref: Some(conversation_ref),
+                        thread_ref: Some(thread_ref),
+                        routing_profile: ChannelRoutingProfile::Thread,
+                        status: ChannelGrantStatus::Approved,
+                    },
                 )
                 .await?
             {
@@ -489,13 +486,16 @@ impl ChannelStateStore {
         }
 
         if let Some(grant) = self
-            .get_grant_by_scope(
-                channel_id,
-                Some(sender_ref),
-                Some(conversation_ref),
-                None,
-                ChannelRoutingProfile::Conversation,
-                ChannelGrantStatus::Approved,
+            .get_grant_by_scope_with_status_in_tx(
+                tx,
+                ChannelGrantScopeLookup {
+                    channel_id,
+                    sender_ref: Some(sender_ref),
+                    conversation_ref: Some(conversation_ref),
+                    thread_ref: None,
+                    routing_profile: ChannelRoutingProfile::Conversation,
+                    status: ChannelGrantStatus::Approved,
+                },
             )
             .await?
         {
@@ -504,13 +504,16 @@ impl ChannelStateStore {
 
         if trigger == ChannelTrigger::Dm {
             return self
-                .get_grant_by_scope(
-                    channel_id,
-                    Some(sender_ref),
-                    None,
-                    None,
-                    ChannelRoutingProfile::Direct,
-                    ChannelGrantStatus::Approved,
+                .get_grant_by_scope_with_status_in_tx(
+                    tx,
+                    ChannelGrantScopeLookup {
+                        channel_id,
+                        sender_ref: Some(sender_ref),
+                        conversation_ref: None,
+                        thread_ref: None,
+                        routing_profile: ChannelRoutingProfile::Direct,
+                        status: ChannelGrantStatus::Approved,
+                    },
                 )
                 .await;
         }
@@ -544,6 +547,34 @@ impl ChannelStateStore {
         .bind(routing_profile.as_str())
         .bind(status.as_str())
         .fetch_optional(&self.pool)
+        .await
+        .context("failed to query channel grant by scope")?;
+
+        row.map(map_grant_row).transpose()
+    }
+
+    async fn get_grant_by_scope_with_status_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        lookup: ChannelGrantScopeLookup<'_>,
+    ) -> Result<Option<ChannelGrantRecord>> {
+        let row = sqlx::query(
+            "SELECT grant_id, channel_id, sender_ref, conversation_ref, thread_ref, routing_profile, trust_tier, status, label, created_at_ms, updated_at_ms, revoked_at_ms \
+             FROM channel_grants \
+             WHERE channel_id = ?1 \
+               AND COALESCE(sender_ref, '') = COALESCE(?2, '') \
+               AND COALESCE(conversation_ref, '') = COALESCE(?3, '') \
+               AND COALESCE(thread_ref, '') = COALESCE(?4, '') \
+               AND routing_profile = ?5 \
+               AND status = ?6",
+        )
+        .bind(lookup.channel_id)
+        .bind(lookup.sender_ref)
+        .bind(lookup.conversation_ref)
+        .bind(lookup.thread_ref)
+        .bind(lookup.routing_profile.as_str())
+        .bind(lookup.status.as_str())
+        .fetch_optional(&mut **tx)
         .await
         .context("failed to query channel grant by scope")?;
 
@@ -614,14 +645,38 @@ impl ChannelStateStore {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .context("failed to start pairing request transaction")?;
+        let pairing = self
+            .create_or_refresh_operator_pairing_in_tx(
+                &mut tx,
+                OperatorPairingUpsert {
+                    channel_id,
+                    sender_ref,
+                    conversation_ref,
+                    thread_ref,
+                    requested_profile,
+                    code_hash,
+                },
+            )
+            .await?;
+        tx.commit()
+            .await
+            .context("failed to commit pairing request transaction")?;
+        Ok(pairing)
+    }
+
+    pub(crate) async fn create_or_refresh_operator_pairing_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        pairing: OperatorPairingUpsert<'_>,
+    ) -> Result<(ChannelPairingRequestRecord, bool)> {
         let existing = self
             .find_pending_operator_pairing_in_tx(
-                &mut tx,
-                channel_id,
-                sender_ref,
-                conversation_ref,
-                thread_ref,
-                requested_profile,
+                tx,
+                pairing.channel_id,
+                pairing.sender_ref,
+                pairing.conversation_ref,
+                pairing.thread_ref,
+                pairing.requested_profile,
             )
             .await?;
         if let Some(existing) = existing {
@@ -633,16 +688,13 @@ impl ChannelStateStore {
             )
             .bind(existing.pairing_id.to_string())
             .bind(now)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .context("failed to refresh channel pairing request")?;
             let refreshed = self
-                .get_pairing_request_by_id_in_tx(&mut tx, existing.pairing_id)
+                .get_pairing_request_by_id_in_tx(tx, existing.pairing_id)
                 .await?
                 .ok_or_else(|| anyhow!("channel pairing disappeared after refresh"))?;
-            tx.commit()
-                .await
-                .context("failed to commit pairing refresh")?;
             return Ok((refreshed, false));
         }
 
@@ -654,24 +706,21 @@ impl ChannelStateStore {
              VALUES (?1, ?2, ?3, 'operator_approval', ?4, ?5, ?6, ?7, 'pending', NULL, 1, 0, ?8, NULL, NULL, ?8)",
         )
         .bind(pairing_id.to_string())
-        .bind(channel_id)
-        .bind(code_hash)
-        .bind(sender_ref)
-        .bind(conversation_ref)
-        .bind(thread_ref)
-        .bind(requested_profile.as_str())
+        .bind(pairing.channel_id)
+        .bind(pairing.code_hash)
+        .bind(pairing.sender_ref)
+        .bind(pairing.conversation_ref)
+        .bind(pairing.thread_ref)
+        .bind(pairing.requested_profile.as_str())
         .bind(now)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .context("failed to create channel pairing request")?;
 
         let created = self
-            .get_pairing_request_by_id_in_tx(&mut tx, pairing_id)
+            .get_pairing_request_by_id_in_tx(tx, pairing_id)
             .await?
             .ok_or_else(|| anyhow!("channel pairing disappeared after insert"))?;
-        tx.commit()
-            .await
-            .context("failed to commit pairing insert")?;
         Ok((created, true))
     }
 
@@ -954,201 +1003,6 @@ impl ChannelStateStore {
         .context("failed to query pending operator pairing")?;
 
         row.map(map_pairing_row).transpose()
-    }
-
-    pub async fn get_peer(
-        &self,
-        channel_id: &str,
-        peer_id: &str,
-    ) -> Result<Option<ChannelPeerRecord>> {
-        let row = sqlx::query(
-            "SELECT channel_id, peer_id, status, trust_tier, pairing_code, first_seen_ms, updated_at_ms \
-             FROM channel_peers WHERE channel_id = ?1 AND peer_id = ?2",
-        )
-        .bind(channel_id)
-        .bind(peer_id)
-        .fetch_optional(&self.pool)
-        .await
-        .context("failed to query channel peer")?;
-
-        row.map(map_peer_row).transpose()
-    }
-
-    pub async fn upsert_pending_peer(
-        &self,
-        channel_id: &str,
-        peer_id: &str,
-        pairing_code: &str,
-    ) -> Result<ChannelPeerRecord> {
-        let now = now_ms();
-
-        sqlx::query(
-            "INSERT INTO channel_peers \
-             (channel_id, peer_id, status, trust_tier, pairing_code, first_seen_ms, updated_at_ms) \
-             VALUES (?1, ?2, 'pending', 'untrusted', ?3, ?4, ?4) \
-             ON CONFLICT(channel_id, peer_id) DO UPDATE SET \
-                 status = CASE \
-                    WHEN channel_peers.status = 'approved' THEN channel_peers.status \
-                    ELSE 'pending' \
-                 END, \
-                 pairing_code = CASE \
-                    WHEN channel_peers.status = 'approved' THEN channel_peers.pairing_code \
-                    ELSE excluded.pairing_code \
-                 END, \
-                 updated_at_ms = excluded.updated_at_ms",
-        )
-        .bind(channel_id)
-        .bind(peer_id)
-        .bind(pairing_code)
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .context("failed to upsert pending channel peer")?;
-
-        self.get_peer(channel_id, peer_id)
-            .await?
-            .ok_or_else(|| anyhow!("channel peer disappeared after pending upsert"))
-    }
-
-    pub async fn approve_peer(
-        &self,
-        channel_id: &str,
-        peer_id: &str,
-        trust_tier: TrustTier,
-    ) -> Result<Option<ChannelPeerRecord>> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .context("failed to start approve channel peer transaction")?;
-        let approved = self
-            .approve_peer_in_tx(&mut tx, channel_id, peer_id, trust_tier)
-            .await?;
-        tx.commit()
-            .await
-            .context("failed to commit approve channel peer transaction")?;
-        Ok(approved)
-    }
-
-    pub(crate) async fn approve_peer_in_tx(
-        &self,
-        tx: &mut Transaction<'_, Sqlite>,
-        channel_id: &str,
-        peer_id: &str,
-        trust_tier: TrustTier,
-    ) -> Result<Option<ChannelPeerRecord>> {
-        let now = now_ms();
-        let changed = sqlx::query(
-            "UPDATE channel_peers \
-             SET status = 'approved', trust_tier = ?3, updated_at_ms = ?4 \
-             WHERE channel_id = ?1 AND peer_id = ?2",
-        )
-        .bind(channel_id)
-        .bind(peer_id)
-        .bind(trust_tier.as_str())
-        .bind(now)
-        .execute(&mut **tx)
-        .await
-        .context("failed to approve channel peer")?;
-
-        if changed.rows_affected() == 0 {
-            return Ok(None);
-        }
-
-        self.get_peer_in_tx(tx, channel_id, peer_id).await
-    }
-
-    pub async fn block_peer(
-        &self,
-        channel_id: &str,
-        peer_id: &str,
-    ) -> Result<Option<ChannelPeerRecord>> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .context("failed to start block channel peer transaction")?;
-        let blocked = self.block_peer_in_tx(&mut tx, channel_id, peer_id).await?;
-        tx.commit()
-            .await
-            .context("failed to commit block channel peer transaction")?;
-        Ok(blocked)
-    }
-
-    pub(crate) async fn block_peer_in_tx(
-        &self,
-        tx: &mut Transaction<'_, Sqlite>,
-        channel_id: &str,
-        peer_id: &str,
-    ) -> Result<Option<ChannelPeerRecord>> {
-        let now = now_ms();
-        let changed = sqlx::query(
-            "UPDATE channel_peers \
-             SET status = 'blocked', updated_at_ms = ?3 \
-             WHERE channel_id = ?1 AND peer_id = ?2",
-        )
-        .bind(channel_id)
-        .bind(peer_id)
-        .bind(now)
-        .execute(&mut **tx)
-        .await
-        .context("failed to block channel peer")?;
-
-        if changed.rows_affected() == 0 {
-            return Ok(None);
-        }
-
-        self.get_peer_in_tx(tx, channel_id, peer_id).await
-    }
-
-    pub async fn list_peers(&self, channel_id: Option<&str>) -> Result<Vec<ChannelPeerRecord>> {
-        let rows = sqlx::query(
-            "SELECT channel_id, peer_id, status, trust_tier, pairing_code, first_seen_ms, updated_at_ms \
-             FROM channel_peers \
-             WHERE (?1 IS NULL OR channel_id = ?1) \
-             ORDER BY updated_at_ms DESC",
-        )
-        .bind(channel_id)
-        .fetch_all(&self.pool)
-        .await
-        .context("failed to list channel peers")?;
-
-        rows.into_iter().map(map_peer_row).collect()
-    }
-
-    pub async fn list_pending_peers(&self, limit: usize) -> Result<Vec<ChannelPeerRecord>> {
-        let rows = sqlx::query(
-            "SELECT channel_id, peer_id, status, trust_tier, pairing_code, first_seen_ms, updated_at_ms \
-             FROM channel_peers \
-             WHERE status = 'pending' \
-             ORDER BY updated_at_ms DESC, channel_id ASC, peer_id ASC \
-             LIMIT ?1",
-        )
-        .bind(i64::try_from(limit).context("pending peer limit is too large")?)
-        .fetch_all(&self.pool)
-        .await
-        .context("failed to list pending channel peers")?;
-
-        rows.into_iter().map(map_peer_row).collect()
-    }
-
-    pub(crate) async fn get_peer_in_tx(
-        &self,
-        tx: &mut Transaction<'_, Sqlite>,
-        channel_id: &str,
-        peer_id: &str,
-    ) -> Result<Option<ChannelPeerRecord>> {
-        let row = sqlx::query(
-            "SELECT channel_id, peer_id, status, trust_tier, pairing_code, first_seen_ms, updated_at_ms \
-             FROM channel_peers WHERE channel_id = ?1 AND peer_id = ?2",
-        )
-        .bind(channel_id)
-        .bind(peer_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .context("failed to query channel peer")?;
-
-        row.map(map_peer_row).transpose()
     }
 
     pub async fn get_offset(&self, channel_id: &str) -> Result<i64> {
@@ -1591,9 +1445,9 @@ impl ChannelStateStore {
         .await
         .context("failed to query channel outbound activity")?;
 
-        let mut pending_peer_count = 0_u64;
-        let mut approved_peer_count = 0_u64;
-        let mut blocked_peer_count = 0_u64;
+        let mut pending_pairing_count = 0_u64;
+        let mut approved_grant_count = 0_u64;
+        let mut blocked_grant_count = 0_u64;
 
         for row in pairing_counts {
             let status: String = row.get("status");
@@ -1601,7 +1455,7 @@ impl ChannelStateStore {
             let count = u64::try_from(count_raw)
                 .with_context(|| format!("invalid channel pairing count '{count_raw}'"))?;
             if status.as_str() == "pending" {
-                pending_peer_count = count;
+                pending_pairing_count = count;
             }
         }
 
@@ -1611,8 +1465,8 @@ impl ChannelStateStore {
             let count = u64::try_from(count_raw)
                 .with_context(|| format!("invalid channel grant count '{count_raw}'"))?;
             match status.as_str() {
-                "approved" => approved_peer_count = count,
-                "blocked" => blocked_peer_count = blocked_peer_count.saturating_add(count),
+                "approved" => approved_grant_count = count,
+                "blocked" => blocked_grant_count = blocked_grant_count.saturating_add(count),
                 _ => {}
             }
         }
@@ -1634,39 +1488,13 @@ impl ChannelStateStore {
 
         Ok(ChannelHealthRecord {
             channel_id: channel_id.to_string(),
-            pending_peer_count,
-            approved_peer_count,
-            blocked_peer_count,
+            pending_pairing_count,
+            approved_grant_count,
+            blocked_grant_count,
             latest_inbound_at,
             latest_outbound_at,
         })
     }
-}
-
-fn map_peer_row(row: SqliteRow) -> Result<ChannelPeerRecord> {
-    let status_raw: String = row.get("status");
-    let trust_tier_raw: String = row.get("trust_tier");
-    let first_seen_ms: i64 = row.get("first_seen_ms");
-    let updated_at_ms: i64 = row.get("updated_at_ms");
-
-    let status = ChannelPeerStatus::from_str(&status_raw)
-        .map_err(|err| anyhow!("invalid channel peer status: {err}"))?;
-    let trust_tier =
-        TrustTier::from_str(&trust_tier_raw).map_err(|err| anyhow!("invalid trust tier: {err}"))?;
-    let first_seen = ms_to_datetime(first_seen_ms)
-        .ok_or_else(|| anyhow!("invalid first_seen_ms '{first_seen_ms}'"))?;
-    let updated_at = ms_to_datetime(updated_at_ms)
-        .ok_or_else(|| anyhow!("invalid updated_at_ms '{updated_at_ms}'"))?;
-
-    Ok(ChannelPeerRecord {
-        channel_id: row.get("channel_id"),
-        peer_id: row.get("peer_id"),
-        status,
-        trust_tier,
-        pairing_code: row.get("pairing_code"),
-        first_seen,
-        updated_at,
-    })
 }
 
 fn map_pairing_row(row: SqliteRow) -> Result<ChannelPairingRequestRecord> {
@@ -1745,19 +1573,6 @@ fn map_grant_row(row: SqliteRow) -> Result<ChannelGrantRecord> {
     })
 }
 
-fn attachment_descriptors_without_message_content(
-    attachments: &[ChannelAttachmentDescriptor],
-) -> Vec<ChannelAttachmentDescriptor> {
-    attachments
-        .iter()
-        .cloned()
-        .map(|mut attachment| {
-            attachment.caption = None;
-            attachment
-        })
-        .collect()
-}
-
 fn map_inbound_event_row(row: SqliteRow) -> Result<ChannelInboundEventRecord> {
     let trigger_raw: String = row.get("trigger");
     let attachments_raw: String = row.get("attachments_json");
@@ -1782,6 +1597,7 @@ fn map_inbound_event_row(row: SqliteRow) -> Result<ChannelInboundEventRecord> {
         conversation_ref: row.get("conversation_ref"),
         thread_ref: row.get("thread_ref"),
         message_ref: row.get("message_ref"),
+        text: row.get("text"),
         trigger,
         attachments,
         reply_to_ref: row.get("reply_to_ref"),
@@ -1875,60 +1691,4 @@ fn map_turn_row(row: SqliteRow) -> Result<ChannelTurnRecord> {
         started_at,
         finished_at,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::kernel::db::Db;
-
-    async fn new_store() -> ChannelStateStore {
-        let db = Db::connect_memory().await.expect("connect memory db");
-        ChannelStateStore::new(db.pool())
-    }
-
-    #[tokio::test]
-    async fn list_pending_peers_returns_newest_pending_only() {
-        let store = new_store().await;
-        store
-            .upsert_pending_peer("terminal", "alice", "code-a")
-            .await
-            .expect("seed alice");
-        store
-            .upsert_pending_peer("terminal", "bob", "code-b")
-            .await
-            .expect("seed bob");
-        store
-            .upsert_pending_peer("matrix", "carol", "code-c")
-            .await
-            .expect("seed carol");
-        store
-            .approve_peer("terminal", "alice", TrustTier::Main)
-            .await
-            .expect("approve alice");
-
-        sqlx::query(
-            "UPDATE channel_peers \
-             SET updated_at_ms = CASE peer_id \
-                WHEN 'alice' THEN 1000 \
-                WHEN 'bob' THEN 3000 \
-                WHEN 'carol' THEN 2000 \
-                ELSE updated_at_ms \
-             END",
-        )
-        .execute(store.pool())
-        .await
-        .expect("set peer timestamps");
-
-        let peers = store
-            .list_pending_peers(2)
-            .await
-            .expect("list pending peers");
-        assert_eq!(peers.len(), 2);
-        assert_eq!(peers[0].peer_id, "bob");
-        assert_eq!(peers[1].peer_id, "carol");
-        assert!(peers
-            .iter()
-            .all(|peer| peer.status == ChannelPeerStatus::Pending));
-    }
 }
