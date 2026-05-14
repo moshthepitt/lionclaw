@@ -10,8 +10,8 @@ use crate::{
     applied::{compute_daemon_fingerprint, AppliedState},
     contracts::{
         ChannelGrantResponse, ChannelGrantRevokeRequest, ChannelGrantRevokeResponse,
-        ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingStatus,
-        ChannelPairingView, ChannelRoutingProfile, TrustTier,
+        ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingListResponse,
+        ChannelPairingStatus, ChannelRoutingProfile, TrustTier,
     },
     home::{runtime_project_partition_key, LionClawHome},
     kernel::{skills::validate_skill_alias, Kernel, KernelOptions, RuntimeExecutionPolicy},
@@ -360,14 +360,13 @@ pub async fn pairing_list(
     home: &LionClawHome,
     channel_id: Option<String>,
     status: Option<ChannelPairingStatus>,
-) -> Result<Vec<ChannelPairingView>> {
+) -> Result<ChannelPairingListResponse> {
     let config = OperatorConfig::load(home).await?;
     let kernel = open_kernel(home, &config, None).await?;
-    let pairings = kernel
+    kernel
         .list_channel_pairings(channel_id, status)
         .await
-        .map_err(to_anyhow)?;
-    Ok(pairings.pairings)
+        .map_err(to_anyhow)
 }
 
 pub async fn pairing_approve(
@@ -380,7 +379,7 @@ pub async fn pairing_approve(
 ) -> Result<ChannelGrantResponse> {
     let config = OperatorConfig::load(home).await?;
     let kernel = open_kernel(home, &config, None).await?;
-    let (pairing_id, pairing_code) = uuid_or_ref(pairing);
+    let (pairing_id, pairing_code) = pairing_approve_lookup(pairing);
     kernel
         .approve_channel_pairing(ChannelPairingApproveRequest {
             channel_id,
@@ -397,19 +396,19 @@ pub async fn pairing_approve(
 pub async fn pairing_block(
     home: &LionClawHome,
     channel_id: String,
-    target: String,
+    sender_ref: Option<String>,
+    pairing_id: Option<Uuid>,
     conversation_ref: Option<String>,
     thread_ref: Option<String>,
     reason: Option<String>,
 ) -> Result<ChannelGrantResponse> {
     let config = OperatorConfig::load(home).await?;
     let kernel = open_kernel(home, &config, None).await?;
-    let (pairing_id, sender_ref) = uuid_or_ref(target);
     kernel
         .block_channel_pairing(ChannelPairingBlockRequest {
             channel_id,
             pairing_id,
-            sender_ref,
+            sender_ref: non_empty_trimmed(sender_ref),
             conversation_ref,
             thread_ref,
             reason,
@@ -436,12 +435,17 @@ pub async fn pairing_revoke(
         .map_err(to_anyhow)
 }
 
-fn uuid_or_ref(raw: String) -> (Option<Uuid>, Option<String>) {
+fn pairing_approve_lookup(raw: String) -> (Option<Uuid>, Option<String>) {
     let trimmed = raw.trim();
     match Uuid::parse_str(trimmed) {
         Ok(pairing_id) => (Some(pairing_id), None),
         Err(_) => (None, Some(trimmed.to_string())),
     }
+}
+
+fn non_empty_trimmed(raw: Option<String>) -> Option<String> {
+    raw.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn to_anyhow(err: crate::kernel::KernelError) -> anyhow::Error {
