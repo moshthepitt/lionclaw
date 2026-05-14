@@ -336,6 +336,7 @@ External channel skills integrate over HTTP:
 5. `POST /v0/channels/stream/ack` records that a worker durably handled events
    through a sequence.
 6. Pairing approve/block and grant revoke endpoints manage channel trust.
+   Blocking a scope also closes matching pending pairing requests.
 
 Queued channel turns emit machine-stable status/error codes through the same
 stream contract. Kernel-generated lifecycle codes include:

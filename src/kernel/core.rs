@@ -1246,12 +1246,25 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
-        if let Some(pairing_id) = pairing_id {
+        let blocked_pairing_ids = if let Some(pairing_id) = pairing_id {
             self.channel_state
                 .mark_pairing_status_in_tx(&mut tx, pairing_id, ChannelPairingStatus::Blocked, None)
                 .await
                 .map_err(internal)?;
-        }
+            vec![pairing_id]
+        } else {
+            self.channel_state
+                .mark_matching_pending_pairings_blocked_in_tx(
+                    &mut tx,
+                    &channel_id,
+                    grant_scope.sender_ref.as_deref(),
+                    grant_scope.conversation_ref.as_deref(),
+                    grant_scope.thread_ref.as_deref(),
+                    routing_profile,
+                )
+                .await
+                .map_err(internal)?
+        };
         self.audit
             .append_in_tx(
                 &mut tx,
@@ -1267,6 +1280,7 @@ impl Kernel {
                     "reason_code": req.reason.unwrap_or_else(|| "operator_blocked".to_string()),
                     "grant_id": grant.grant_id,
                     "pairing_id": pairing_id,
+                    "pairing_ids": blocked_pairing_ids.clone(),
                     "routing_profile": grant.routing_profile.as_str(),
                 }),
             )
@@ -1281,6 +1295,7 @@ impl Kernel {
                 "channel_id": channel_id,
                 "grant_id": grant.grant_id,
                 "pairing_id": pairing_id,
+                "pairing_ids": blocked_pairing_ids,
             }),
         )
         .await;
