@@ -200,7 +200,7 @@ impl RuntimeControlOutcome {
 
     pub fn failed_error_code(&self) -> Option<&str> {
         match self {
-            Self::Failed { code, .. } => code.as_deref().or(Some("runtime.control.failed")),
+            Self::Failed { code, .. } => Some(code.as_deref().unwrap_or("runtime.control.failed")),
             Self::Handled { .. } | Self::Unsupported { .. } | Self::InteractiveOnly { .. } => None,
         }
     }

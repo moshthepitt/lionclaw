@@ -4499,6 +4499,7 @@ struct RuntimeCapabilityEvaluation<'a> {
 struct RuntimeTurnAbortExecution<'a> {
     adapter: &'a dyn RuntimeAdapter,
     handle: &'a RuntimeSessionHandle,
+    turn_id: Uuid,
     session_id: Uuid,
     runtime_id: &'a str,
     turn_task: &'a mut tokio::task::JoinHandle<Result<RuntimeTurnResult, anyhow::Error>>,
@@ -4513,6 +4514,7 @@ struct RuntimeTurnAbortExecution<'a> {
 struct RuntimeControlAbortExecution<'a> {
     adapter: &'a dyn RuntimeAdapter,
     handle: &'a RuntimeSessionHandle,
+    turn_id: Uuid,
     session_id: Uuid,
     runtime_id: &'a str,
     control_task: &'a mut tokio::task::JoinHandle<Result<RuntimeControlOutcome, anyhow::Error>>,
@@ -6740,21 +6742,18 @@ impl Kernel {
                                     error_code: "runtime.error".to_string(),
                                     error_text: audit_err.to_string(),
                                 })?;
-                            self.emit_runtime_event(
+                            self.record_runtime_event(
+                                turn_id,
                                 &stream_context,
                                 &event_sink,
                                 RuntimeEvent::Error {
                                     code: Some("runtime.error".to_string()),
                                     text: message.clone(),
                                 },
+                                &mut events,
+                                &mut checkpoints,
                             )
-                            .await
-                            .map_err(|emit_err| FailedRuntimeTurn {
-                                events: events.clone(),
-                                status: SessionTurnStatus::Failed,
-                                error_code: "runtime.error".to_string(),
-                                error_text: emit_err.to_string(),
-                            })?;
+                            .await?;
                             Err(FailedRuntimeTurn {
                                 events,
                                 status: SessionTurnStatus::Failed,
@@ -6782,21 +6781,18 @@ impl Kernel {
                                     error_code: "runtime.error".to_string(),
                                     error_text: audit_err.to_string(),
                                 })?;
-                            self.emit_runtime_event(
+                            self.record_runtime_event(
+                                turn_id,
                                 &stream_context,
                                 &event_sink,
                                 RuntimeEvent::Error {
                                     code: Some("runtime.error".to_string()),
                                     text: message.clone(),
                                 },
+                                &mut events,
+                                &mut checkpoints,
                             )
-                            .await
-                            .map_err(|emit_err| FailedRuntimeTurn {
-                                events: events.clone(),
-                                status: SessionTurnStatus::Failed,
-                                error_code: "runtime.error".to_string(),
-                                error_text: emit_err.to_string(),
-                            })?;
+                            .await?;
                             Err(FailedRuntimeTurn {
                                 events,
                                 status: SessionTurnStatus::Failed,
@@ -6815,6 +6811,7 @@ impl Kernel {
                         .abort_runtime_turn(RuntimeTurnAbortExecution {
                             adapter: adapter.as_ref(),
                             handle,
+                            turn_id,
                             session_id,
                             runtime_id,
                             turn_task: &mut turn_task,
@@ -6836,6 +6833,7 @@ impl Kernel {
                         .abort_runtime_turn(RuntimeTurnAbortExecution {
                             adapter: adapter.as_ref(),
                             handle,
+                            turn_id,
                             session_id,
                             runtime_id,
                             turn_task: &mut turn_task,
@@ -7003,21 +7001,19 @@ impl Kernel {
                                     error_code: "runtime.error".to_string(),
                                     error_text: audit_err.to_string(),
                                 })?;
-                            self.emit_runtime_event(
+                            self.record_runtime_event(
+                                turn_id,
                                 &stream_context,
                                 &event_sink,
                                 RuntimeEvent::Error {
                                     code: Some("runtime.error".to_string()),
                                     text: message.clone(),
                                 },
+                                &mut events,
+                                &mut checkpoints,
                             )
                             .await
-                            .map_err(|emit_err| FailedRuntimeTurn {
-                                events: events.clone(),
-                                status: SessionTurnStatus::Failed,
-                                error_code: "runtime.error".to_string(),
-                                error_text: emit_err.to_string(),
-                            })?;
+                            ?;
                             Err(FailedRuntimeTurn {
                                 events,
                                 status: SessionTurnStatus::Failed,
@@ -7045,21 +7041,19 @@ impl Kernel {
                                     error_code: "runtime.error".to_string(),
                                     error_text: audit_err.to_string(),
                                 })?;
-                            self.emit_runtime_event(
+                            self.record_runtime_event(
+                                turn_id,
                                 &stream_context,
                                 &event_sink,
                                 RuntimeEvent::Error {
                                     code: Some("runtime.error".to_string()),
                                     text: message.clone(),
                                 },
+                                &mut events,
+                                &mut checkpoints,
                             )
                             .await
-                            .map_err(|emit_err| FailedRuntimeTurn {
-                                events: events.clone(),
-                                status: SessionTurnStatus::Failed,
-                                error_code: "runtime.error".to_string(),
-                                error_text: emit_err.to_string(),
-                            })?;
+                            ?;
                             Err(FailedRuntimeTurn {
                                 events,
                                 status: SessionTurnStatus::Failed,
@@ -7078,6 +7072,7 @@ impl Kernel {
                         .abort_runtime_control(RuntimeControlAbortExecution {
                             adapter: adapter.as_ref(),
                             handle,
+                            turn_id,
                             session_id,
                             runtime_id,
                             control_task: &mut control_task,
@@ -7099,6 +7094,7 @@ impl Kernel {
                         .abort_runtime_control(RuntimeControlAbortExecution {
                             adapter: adapter.as_ref(),
                             handle,
+                            turn_id,
                             session_id,
                             runtime_id,
                             control_task: &mut control_task,
@@ -7122,12 +7118,13 @@ impl Kernel {
         let RuntimeControlAbortExecution {
             adapter,
             handle,
+            turn_id,
             session_id,
             runtime_id,
             control_task,
             stream_context,
             event_sink,
-            events,
+            mut events,
             timeout_ms,
             reason,
             timeout_kind,
@@ -7175,21 +7172,19 @@ impl Kernel {
                 error_code: "runtime.timeout".to_string(),
                 error_text: err.to_string(),
             })?;
-        self.emit_runtime_event(
+        let mut checkpoints = AssistantCheckpointState::default();
+        self.record_runtime_event(
+            turn_id,
             stream_context,
             event_sink,
             RuntimeEvent::Error {
                 code: Some("runtime.timeout".to_string()),
                 text: reason.clone(),
             },
+            &mut events,
+            &mut checkpoints,
         )
-        .await
-        .map_err(|err| FailedRuntimeTurn {
-            events: events.clone(),
-            status: SessionTurnStatus::TimedOut,
-            error_code: "runtime.timeout".to_string(),
-            error_text: err.to_string(),
-        })?;
+        .await?;
 
         Err(FailedRuntimeTurn {
             events,
@@ -7206,12 +7201,13 @@ impl Kernel {
         let RuntimeTurnAbortExecution {
             adapter,
             handle,
+            turn_id,
             session_id,
             runtime_id,
             turn_task,
             stream_context,
             event_sink,
-            events,
+            mut events,
             timeout_ms,
             reason,
             timeout_kind,
@@ -7259,21 +7255,19 @@ impl Kernel {
                 error_code: "runtime.timeout".to_string(),
                 error_text: err.to_string(),
             })?;
-        self.emit_runtime_event(
+        let mut checkpoints = AssistantCheckpointState::default();
+        self.record_runtime_event(
+            turn_id,
             stream_context,
             event_sink,
             RuntimeEvent::Error {
                 code: Some("runtime.timeout".to_string()),
                 text: reason.clone(),
             },
+            &mut events,
+            &mut checkpoints,
         )
-        .await
-        .map_err(|err| FailedRuntimeTurn {
-            events: events.clone(),
-            status: SessionTurnStatus::TimedOut,
-            error_code: "runtime.timeout".to_string(),
-            error_text: err.to_string(),
-        })?;
+        .await?;
 
         Err(FailedRuntimeTurn {
             events,

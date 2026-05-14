@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::kernel::runtime::{
@@ -76,34 +77,38 @@ impl CodexRuntimeAdapter {
             .await?;
         let mut client = CodexAppServerClient::new(transport);
 
-        client.initialize(&events, &thread_state).await?;
-        let thread_id = self
-            .ensure_app_server_thread(
-                &mut client,
-                &input.runtime_session_id,
-                &events,
-                &thread_state,
-            )
-            .await?;
-        let response = client
-            .request(
-                "turn/start",
-                turn_start_params(
-                    &thread_id,
-                    &input.prompt,
-                    self.config.model.as_deref(),
-                    plan.network_mode,
-                ),
-                &events,
-                &thread_state,
-            )
-            .await?;
-        let turn_id = extract_app_server_turn_id(&response);
-        client
-            .wait_for_turn_completed(turn_id.as_deref(), &events, &thread_state)
-            .await?;
-        ensure_app_server_exit_success(client.shutdown().await?)?;
-        Ok(RuntimeTurnResult::default())
+        let result = async {
+            client.initialize(&events, &thread_state).await?;
+            let thread_id = self
+                .ensure_app_server_thread(
+                    &mut client,
+                    &input.runtime_session_id,
+                    &events,
+                    &thread_state,
+                )
+                .await?;
+            let response = client
+                .request(
+                    "turn/start",
+                    turn_start_params(
+                        &thread_id,
+                        &input.prompt,
+                        self.config.model.as_deref(),
+                        plan.network_mode,
+                    ),
+                    &events,
+                    &thread_state,
+                )
+                .await?;
+            let turn_id = extract_app_server_turn_id(&response);
+            client
+                .wait_for_turn_completed(turn_id.as_deref(), &events, &thread_state)
+                .await?;
+            Ok(RuntimeTurnResult::default())
+        }
+        .await;
+
+        finish_app_server_session(client, result).await
     }
 
     async fn run_app_server_control(
@@ -144,22 +149,26 @@ impl CodexRuntimeAdapter {
             .start_app_server_transport(plan, runtime_secrets_mount, codex_home_override)
             .await?;
         let mut client = CodexAppServerClient::new(transport);
-        client.initialize(&events, &thread_state).await?;
-        let response = client
-            .request(
-                "model/list",
-                json!({
-                    "includeHidden": input.arguments.split_whitespace().any(|arg| arg == "--hidden"),
-                }),
-                &events,
-                &thread_state,
-            )
-            .await?;
-        ensure_app_server_exit_success(client.shutdown().await?)?;
+        let result = async {
+            client.initialize(&events, &thread_state).await?;
+            let response = client
+                .request(
+                    "model/list",
+                    json!({
+                        "includeHidden": input.arguments.split_whitespace().any(|arg| arg == "--hidden"),
+                    }),
+                    &events,
+                    &thread_state,
+                )
+                .await?;
 
-        Ok(RuntimeControlOutcome::Handled {
-            message: describe_model_list_response(&response),
-        })
+            Ok(RuntimeControlOutcome::Handled {
+                message: describe_model_list_response(&response),
+            })
+        }
+        .await;
+
+        finish_app_server_session(client, result).await
     }
 
     async fn run_thread_control(
@@ -188,87 +197,92 @@ impl CodexRuntimeAdapter {
             .start_app_server_transport(plan, runtime_secrets_mount, codex_home_override)
             .await?;
         let mut client = CodexAppServerClient::new(transport);
-        client.initialize(&events, &thread_state).await?;
-        let thread_id = self
-            .resume_app_server_thread(&mut client, &saved_thread_id, &events, &thread_state)
-            .await?;
 
-        let outcome = match input.command_name.as_str() {
-            "rename" | "name" => {
-                let name = input.arguments.trim();
-                if name.is_empty() {
-                    RuntimeControlOutcome::Failed {
-                        code: Some("runtime.control.invalid_arguments".to_string()),
-                        message: "Codex rename requires a non-empty name.".to_string(),
+        let result = async {
+            client.initialize(&events, &thread_state).await?;
+            let thread_id = self
+                .resume_app_server_thread(&mut client, &saved_thread_id, &events, &thread_state)
+                .await?;
+
+            let outcome = match input.command_name.as_str() {
+                "rename" | "name" => {
+                    let name = input.arguments.trim();
+                    if name.is_empty() {
+                        RuntimeControlOutcome::Failed {
+                            code: Some("runtime.control.invalid_arguments".to_string()),
+                            message: "Codex rename requires a non-empty name.".to_string(),
+                        }
+                    } else {
+                        client
+                            .request(
+                                "thread/name/set",
+                                json!({
+                                    "threadId": thread_id,
+                                    "name": name,
+                                }),
+                                &events,
+                                &thread_state,
+                            )
+                            .await?;
+                        RuntimeControlOutcome::Handled {
+                            message: format!("Renamed Codex thread to '{name}'."),
+                        }
                     }
-                } else {
+                }
+                "compact" => {
                     client
                         .request(
-                            "thread/name/set",
+                            "thread/compact/start",
                             json!({
                                 "threadId": thread_id,
-                                "name": name,
                             }),
                             &events,
                             &thread_state,
                         )
                         .await?;
+                    client
+                        .wait_for_thread_compacted(Some(&thread_id), &events, &thread_state)
+                        .await?;
                     RuntimeControlOutcome::Handled {
-                        message: format!("Renamed Codex thread to '{name}'."),
+                        message: "Compacted Codex thread.".to_string(),
                     }
                 }
-            }
-            "compact" => {
-                client
-                    .request(
-                        "thread/compact/start",
-                        json!({
-                            "threadId": thread_id,
-                        }),
-                        &events,
-                        &thread_state,
-                    )
-                    .await?;
-                client
-                    .wait_for_thread_compacted(Some(&thread_id), &events, &thread_state)
-                    .await?;
-                RuntimeControlOutcome::Handled {
-                    message: "Compacted Codex thread.".to_string(),
+                "review" => {
+                    let response = client
+                        .request(
+                            "review/start",
+                            json!({
+                                "threadId": thread_id,
+                                "delivery": "inline",
+                                "target": review_target_from_arguments(&input.arguments),
+                            }),
+                            &events,
+                            &thread_state,
+                        )
+                        .await?;
+                    let turn_id = extract_app_server_turn_id(&response);
+                    client
+                        .wait_for_turn_completed(turn_id.as_deref(), &events, &thread_state)
+                        .await?;
+                    let answer = client.answer_text().trim().to_string();
+                    RuntimeControlOutcome::Handled {
+                        message: if answer.is_empty() {
+                            "Codex review completed.".to_string()
+                        } else {
+                            answer
+                        },
+                    }
                 }
-            }
-            "review" => {
-                let response = client
-                    .request(
-                        "review/start",
-                        json!({
-                            "threadId": thread_id,
-                            "delivery": "inline",
-                            "target": review_target_from_arguments(&input.arguments),
-                        }),
-                        &events,
-                        &thread_state,
-                    )
-                    .await?;
-                let turn_id = extract_app_server_turn_id(&response);
-                client
-                    .wait_for_turn_completed(turn_id.as_deref(), &events, &thread_state)
-                    .await?;
-                let answer = client.answer_text().trim().to_string();
-                RuntimeControlOutcome::Handled {
-                    message: if answer.is_empty() {
-                        "Codex review completed.".to_string()
-                    } else {
-                        answer
-                    },
-                }
-            }
-            other => RuntimeControlOutcome::Unsupported {
-                message: format!("Codex does not support native control command '/{other}'"),
-            },
-        };
+                other => RuntimeControlOutcome::Unsupported {
+                    message: format!("Codex does not support native control command '/{other}'"),
+                },
+            };
 
-        ensure_app_server_exit_success(client.shutdown().await?)?;
-        Ok(outcome)
+            Ok(outcome)
+        }
+        .await;
+
+        finish_app_server_session(client, result).await
     }
 
     async fn start_app_server_transport(
@@ -353,12 +367,16 @@ impl CodexRuntimeAdapter {
     }
 
     fn current_thread_id(&self, runtime_session_id: &str) -> Result<Option<String>> {
-        Ok(self
-            .sessions
+        Ok(self.session_state(runtime_session_id)?.thread_id)
+    }
+
+    fn session_state(&self, runtime_session_id: &str) -> Result<CodexSessionState> {
+        self.sessions
             .read()
             .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
             .get(runtime_session_id)
-            .and_then(|session| session.thread_id.clone()))
+            .cloned()
+            .ok_or_else(|| anyhow!("runtime session '{runtime_session_id}' not found"))
     }
 }
 
@@ -817,6 +835,32 @@ fn ensure_app_server_exit_success(output: ExecutionOutput) -> Result<()> {
     bail!("codex app-server exited with code {code}: {stderr}");
 }
 
+async fn finish_app_server_session<T, R>(
+    client: CodexAppServerClient<T>,
+    result: Result<R>,
+) -> Result<R>
+where
+    T: AppServerTransport + Send,
+{
+    let shutdown = client
+        .shutdown()
+        .await
+        .and_then(ensure_app_server_exit_success);
+
+    match (result, shutdown) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(err)) => Err(err),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(shutdown_err)) => {
+            warn!(
+                error = %shutdown_err,
+                "codex app-server shutdown failed after runtime error"
+            );
+            Err(err)
+        }
+    }
+}
+
 fn thread_start_params(model: Option<&str>) -> Value {
     let mut params = json!({
         "approvalPolicy": "never",
@@ -912,7 +956,7 @@ fn extract_app_server_thread_id(value: &Value) -> Option<String> {
         .or_else(|| value.get("thread_id").and_then(Value::as_str))
         .or_else(|| value.get("id").and_then(Value::as_str))
         .filter(|thread_id| !thread_id.trim().is_empty())
-        .map(str::to_string)
+        .map(|thread_id| thread_id.trim().to_string())
 }
 
 fn extract_app_server_turn_id(value: &Value) -> Option<String> {
@@ -923,7 +967,7 @@ fn extract_app_server_turn_id(value: &Value) -> Option<String> {
         .or_else(|| value.get("turn_id").and_then(Value::as_str))
         .or_else(|| value.get("id").and_then(Value::as_str))
         .filter(|turn_id| !turn_id.trim().is_empty())
-        .map(str::to_string)
+        .map(|turn_id| turn_id.trim().to_string())
 }
 
 fn app_server_text(value: &Value, keys: &[&str]) -> Option<String> {
@@ -934,6 +978,8 @@ fn app_server_text(value: &Value, keys: &[&str]) -> Option<String> {
 
 fn app_server_error_text(value: &Value) -> String {
     app_server_text(value, &["message", "text", "details", "error"])
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
         .unwrap_or_else(|| "codex app-server error".to_string())
 }
 
@@ -971,7 +1017,7 @@ fn model_display_name(value: &Value) -> Option<String> {
         .or_else(|| value.get("name").and_then(Value::as_str))
         .or_else(|| value.get("label").and_then(Value::as_str))
         .filter(|name| !name.trim().is_empty())
-        .map(str::to_string)
+        .map(|name| name.trim().to_string())
 }
 
 fn load_saved_thread_id(root: &Path) -> Result<Option<String>> {
@@ -991,10 +1037,10 @@ fn load_saved_thread_id(root: &Path) -> Result<Option<String>> {
         return Ok(None);
     }
 
-    let thread_id = match fs::read_to_string(&path) {
-        Ok(contents) => contents.trim().to_string(),
-        Err(_) => return Ok(None),
-    };
+    let thread_id = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read codex thread state '{}'", path.display()))?
+        .trim()
+        .to_string();
     if thread_id.is_empty() {
         return Ok(None);
     }
@@ -1050,19 +1096,25 @@ impl CodexThreadState {
             .read()
             .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
             .get(&self.runtime_session_id)
-            .and_then(|session| session.runtime_state_root.clone());
+            .ok_or_else(|| anyhow!("runtime session '{}' not found", self.runtime_session_id))?
+            .runtime_state_root
+            .clone();
 
         if let Some(root) = root.as_deref() {
             save_thread_id(root, thread_id)?;
         }
 
-        self.sessions
-            .write()
-            .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
-            .entry(self.runtime_session_id.clone())
-            .and_modify(|session| {
-                session.thread_id = Some(thread_id.to_string());
-            });
+        {
+            let mut sessions = self
+                .sessions
+                .write()
+                .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?;
+            let session = sessions.get_mut(&self.runtime_session_id).ok_or_else(|| {
+                anyhow!("runtime session '{}' not found", self.runtime_session_id)
+            })?;
+            session.thread_id = Some(thread_id.to_string());
+            drop(sessions);
+        }
         Ok(())
     }
 }
@@ -1073,14 +1125,8 @@ fn collect_codex_text(value: &Value, depth: usize) -> Option<String> {
     }
 
     match value {
-        Value::String(text) => {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        }
+        Value::String(text) if text.is_empty() => None,
+        Value::String(text) => Some(text.clone()),
         Value::Array(values) => {
             let parts: Vec<String> = values
                 .iter()
@@ -1119,7 +1165,10 @@ fn collect_codex_text(value: &Value, depth: usize) -> Option<String> {
 mod tests {
     use std::{
         collections::VecDeque,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
     };
 
     use crate::kernel::runtime::{
@@ -1139,6 +1188,7 @@ mod tests {
     struct FakeAppServerTransport {
         incoming: Arc<Mutex<VecDeque<Value>>>,
         sent: Arc<Mutex<Vec<Value>>>,
+        shutdowns: Arc<AtomicUsize>,
         output: ExecutionOutput,
     }
 
@@ -1147,6 +1197,7 @@ mod tests {
             Self {
                 incoming: Arc::new(Mutex::new(incoming.into())),
                 sent: Arc::new(Mutex::new(Vec::new())),
+                shutdowns: Arc::new(AtomicUsize::new(0)),
                 output: ExecutionOutput {
                     exit_code: Some(0),
                     ..ExecutionOutput::default()
@@ -1167,6 +1218,7 @@ mod tests {
         }
 
         async fn shutdown(&mut self) -> Result<ExecutionOutput> {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
             Ok(self.output.clone())
         }
     }
@@ -1191,6 +1243,28 @@ mod tests {
         assert_eq!(
             program.auth,
             Some(crate::kernel::runtime::RuntimeAuthKind::Codex)
+        );
+    }
+
+    #[test]
+    fn app_server_text_preserves_streamed_delta_whitespace() {
+        let params = json!({
+            "delta": {
+                "content": [
+                    {"text": "Hello"},
+                    {"text": " world"},
+                    {"text": "\n"},
+                ],
+            },
+        });
+
+        assert_eq!(
+            super::app_server_text(&params, &["delta"]),
+            Some("Hello world\n".to_string())
+        );
+        assert_eq!(
+            super::app_server_error_text(&json!({"message": "  failed \n"})),
+            "failed"
         );
     }
 
@@ -1338,6 +1412,23 @@ mod tests {
         }));
 
         adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn finish_app_server_session_shuts_down_after_protocol_error() {
+        let transport = FakeAppServerTransport::new(Vec::new());
+        let shutdowns = transport.shutdowns.clone();
+        let client = CodexAppServerClient::new(transport);
+
+        let err = super::finish_app_server_session::<_, ()>(
+            client,
+            Err(anyhow::anyhow!("protocol failed")),
+        )
+        .await
+        .expect_err("protocol error should be returned");
+
+        assert!(err.to_string().contains("protocol failed"));
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
