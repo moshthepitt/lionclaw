@@ -1092,10 +1092,59 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
         .await
         .expect("thread continuation");
     assert_eq!(queued_thread.outcome, ChannelInboundOutcome::Queued);
+    let bob_thread_session_key = thread_session_key("slack", "room-1", "topic-b", "bob");
     assert_eq!(
         queued_thread.session_key.as_deref(),
-        Some("channel:slack:thread:room-1:topic-b")
+        Some(bob_thread_session_key.as_str())
     );
+    let queued_thread_turn_id = queued_thread.turn_id.expect("thread turn id");
+    let queued_thread_session_id = queued_thread.session_id.expect("thread session id");
+    let thread_stream = wait_for_stream_events(&kernel, "slack", "thread-worker", |events| {
+        stream_has_completed_and_done(events, queued_thread_turn_id)
+    })
+    .await;
+    assert_turn_completed_before_done(&thread_stream.events, queued_thread_turn_id, "thread turn");
+
+    kernel
+        .block_channel_pairing(ChannelPairingBlockRequest {
+            channel_id: "slack".to_string(),
+            pairing_id: None,
+            sender_ref: Some("mallory".to_string()),
+            conversation_ref: Some("room-1".to_string()),
+            thread_ref: Some("topic-b".to_string()),
+            reason: Some("test_thread_block".to_string()),
+        })
+        .await
+        .expect("block other thread sender");
+
+    let bob_thread_action = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: queued_thread_session_id,
+            user_text: "authorized bob thread follow up".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("other sender block must not block bob's thread session");
+    assert!(bob_thread_action
+        .assistant_text
+        .contains("authorized bob thread follow up"));
+
+    let blocked_thread_open = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "slack".to_string(),
+            peer_id: thread_session_key("slack", "room-1", "topic-b", "mallory"),
+            trust_tier: TrustTier::Untrusted,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect_err("blocked thread sender should not open a session");
+    assert!(matches!(
+        blocked_thread_open,
+        KernelError::Conflict(message) if message.contains("blocked")
+    ));
 
     let waiting = kernel
         .ingest_channel_inbound(ChannelInboundRequest {
@@ -1219,9 +1268,15 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
         .await
         .expect("queue colon thread");
     assert_eq!(colon_queued.outcome, ChannelInboundOutcome::Queued);
+    let colon_thread_session_key = thread_session_key(
+        "slack",
+        "telegram:chat:-123",
+        "telegram:topic:77",
+        "telegram:user:456",
+    );
     assert_eq!(
         colon_queued.session_key.as_deref(),
-        Some("channel:slack:thread:telegram%3Achat%3A-123:telegram%3Atopic%3A77")
+        Some(colon_thread_session_key.as_str())
     );
     let colon_turn_id = colon_queued.turn_id.expect("colon turn id");
     let colon_stream = wait_for_stream_events(&kernel, "slack", "colon-worker", |events| {
@@ -1448,16 +1503,8 @@ async fn bootstrap_recovers_durable_pending_channel_turns() {
     )
     .await;
 
-    let (session_status, channel_status): (String, String) = sqlx::query_as(
-        "SELECT session_turns.status, channel_turns.status \
-         FROM session_turns \
-         JOIN channel_turns ON channel_turns.turn_id = session_turns.turn_id \
-         WHERE session_turns.turn_id = ?1",
-    )
-    .bind(turn_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .expect("query recovered turn statuses");
+    let (session_status, channel_status) =
+        wait_for_joined_turn_statuses(&pool, turn_id, "completed", "completed").await;
     assert_eq!(session_status, "completed");
     assert_eq!(channel_status, "completed");
 }
@@ -2166,6 +2213,20 @@ fn direct_session_key(channel_id: &str, peer_id: &str) -> String {
     format!("channel:{channel_id}:direct:{}", session_key_part(peer_id))
 }
 
+fn thread_session_key(
+    channel_id: &str,
+    conversation_ref: &str,
+    thread_ref: &str,
+    sender_ref: &str,
+) -> String {
+    format!(
+        "channel:{channel_id}:thread:{}:{}:sender:{}",
+        session_key_part(conversation_ref),
+        session_key_part(thread_ref),
+        session_key_part(sender_ref)
+    )
+}
+
 fn session_key_part(value: &str) -> String {
     value.replace('%', "%25").replace(':', "%3A")
 }
@@ -2282,6 +2343,39 @@ where
         sleep(Duration::from_millis(25)).await;
     }
     panic!("timed out waiting for {label}");
+}
+
+async fn wait_for_joined_turn_statuses(
+    pool: &sqlx::SqlitePool,
+    turn_id: uuid::Uuid,
+    expected_session_status: &str,
+    expected_channel_status: &str,
+) -> (String, String) {
+    for _ in 0..40 {
+        let statuses = query_joined_turn_statuses(pool, turn_id).await;
+        if statuses.0 == expected_session_status && statuses.1 == expected_channel_status {
+            return statuses;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    query_joined_turn_statuses(pool, turn_id).await
+}
+
+async fn query_joined_turn_statuses(
+    pool: &sqlx::SqlitePool,
+    turn_id: uuid::Uuid,
+) -> (String, String) {
+    sqlx::query_as(
+        "SELECT session_turns.status, channel_turns.status \
+         FROM session_turns \
+         JOIN channel_turns ON channel_turns.turn_id = session_turns.turn_id \
+         WHERE session_turns.turn_id = ?1",
+    )
+    .bind(turn_id.to_string())
+    .fetch_one(pool)
+    .await
+    .expect("query joined turn statuses")
 }
 
 async fn wait_for_running_snapshot_without_answer(
