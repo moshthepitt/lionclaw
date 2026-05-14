@@ -145,6 +145,10 @@ impl CodexRuntimeAdapter {
             codex_home_override,
             input,
         } = execution;
+        let include_hidden = match model_list_include_hidden(&input.arguments) {
+            Ok(include_hidden) => include_hidden,
+            Err(outcome) => return Ok(outcome),
+        };
         let thread_state = self.thread_state_for(&input.runtime_session_id);
         let transport = self
             .start_app_server_transport(plan, runtime_secrets_mount, codex_home_override)
@@ -156,7 +160,7 @@ impl CodexRuntimeAdapter {
                 .request(
                     "model/list",
                     json!({
-                        "includeHidden": input.arguments.split_whitespace().any(|arg| arg == "--hidden"),
+                        "includeHidden": include_hidden,
                     }),
                     &events,
                     &thread_state,
@@ -192,6 +196,11 @@ impl CodexRuntimeAdapter {
                 ),
             });
         };
+        if let Some(outcome) =
+            invalid_thread_control_arguments(&input.command_name, &input.arguments)
+        {
+            return Ok(outcome);
+        }
 
         let thread_state = self.thread_state_for(&input.runtime_session_id);
         let transport = self
@@ -208,26 +217,19 @@ impl CodexRuntimeAdapter {
             let outcome = match input.command_name.as_str() {
                 "rename" | "name" => {
                     let name = input.arguments.trim();
-                    if name.is_empty() {
-                        RuntimeControlOutcome::Failed {
-                            code: Some("runtime.control.invalid_arguments".to_string()),
-                            message: "Codex rename requires a non-empty name.".to_string(),
-                        }
-                    } else {
-                        client
-                            .request(
-                                "thread/name/set",
-                                json!({
-                                    "threadId": thread_id,
-                                    "name": name,
-                                }),
-                                &events,
-                                &thread_state,
-                            )
-                            .await?;
-                        RuntimeControlOutcome::Handled {
-                            message: format!("Renamed Codex thread to '{name}'."),
-                        }
+                    client
+                        .request(
+                            "thread/name/set",
+                            json!({
+                                "threadId": thread_id,
+                                "name": name,
+                            }),
+                            &events,
+                            &thread_state,
+                        )
+                        .await?;
+                    RuntimeControlOutcome::Handled {
+                        message: format!("Renamed Codex thread to '{name}'."),
                     }
                 }
                 "compact" => {
@@ -538,6 +540,8 @@ struct CodexAppServerClient<T> {
     next_id: u64,
     completed_turns: HashSet<String>,
     unmatched_turn_completed: bool,
+    failed_turns: HashMap<String, String>,
+    unmatched_turn_failure: Option<String>,
     compacted_threads: HashSet<String>,
     unmatched_thread_compacted: bool,
     answer_text: String,
@@ -553,6 +557,8 @@ where
             next_id: 1,
             completed_turns: HashSet::new(),
             unmatched_turn_completed: false,
+            failed_turns: HashMap::new(),
+            unmatched_turn_failure: None,
             compacted_threads: HashSet::new(),
             unmatched_thread_compacted: false,
             answer_text: String::new(),
@@ -620,6 +626,9 @@ where
                 return parse_app_server_response(message, method);
             }
             self.handle_message(message, events, thread_state).await?;
+            if let Some(message) = self.turn_failure(None) {
+                bail!("{message}");
+            }
         }
     }
 
@@ -629,6 +638,9 @@ where
         events: &RuntimeEventSender,
         thread_state: &CodexThreadState,
     ) -> Result<()> {
+        if let Some(message) = self.turn_failure(turn_id) {
+            bail!("{message}");
+        }
         if self.turn_completed(turn_id) {
             return Ok(());
         }
@@ -638,6 +650,9 @@ where
                 bail!("codex app-server closed before turn completed");
             };
             self.handle_message(message, events, thread_state).await?;
+            if let Some(message) = self.turn_failure(turn_id) {
+                bail!("{message}");
+            }
             if self.turn_completed(turn_id) {
                 return Ok(());
             }
@@ -650,6 +665,9 @@ where
         events: &RuntimeEventSender,
         thread_state: &CodexThreadState,
     ) -> Result<()> {
+        if let Some(message) = self.turn_failure(None) {
+            bail!("{message}");
+        }
         if self.thread_compacted(thread_id) {
             return Ok(());
         }
@@ -659,6 +677,9 @@ where
                 bail!("codex app-server closed before thread compacted");
             };
             self.handle_message(message, events, thread_state).await?;
+            if let Some(message) = self.turn_failure(None) {
+                bail!("{message}");
+            }
             if self.thread_compacted(thread_id) {
                 return Ok(());
             }
@@ -677,14 +698,40 @@ where
 
     fn turn_completed(&self, turn_id: Option<&str>) -> bool {
         match turn_id {
-            Some(turn_id) => self.completed_turns.contains(turn_id),
+            Some(turn_id) => {
+                self.unmatched_turn_completed || self.completed_turns.contains(turn_id)
+            }
             None => self.unmatched_turn_completed || !self.completed_turns.is_empty(),
+        }
+    }
+
+    fn turn_failure(&self, turn_id: Option<&str>) -> Option<&str> {
+        match turn_id {
+            Some(turn_id) => self
+                .failed_turns
+                .get(turn_id)
+                .map(String::as_str)
+                .or(self.unmatched_turn_failure.as_deref()),
+            None => self
+                .unmatched_turn_failure
+                .as_deref()
+                .or_else(|| self.failed_turns.values().next().map(String::as_str)),
+        }
+    }
+
+    fn remember_turn_failure(&mut self, params: &Value, message: String) {
+        if let Some(turn_id) = extract_app_server_turn_id(params) {
+            self.failed_turns.insert(turn_id, message);
+        } else {
+            self.unmatched_turn_failure = Some(message);
         }
     }
 
     fn thread_compacted(&self, thread_id: Option<&str>) -> bool {
         match thread_id {
-            Some(thread_id) => self.compacted_threads.contains(thread_id),
+            Some(thread_id) => {
+                self.unmatched_thread_compacted || self.compacted_threads.contains(thread_id)
+            }
             None => self.unmatched_thread_compacted || !self.compacted_threads.is_empty(),
         }
     }
@@ -738,16 +785,20 @@ where
                 }));
             }
             "turn/completed" => {
-                if let Some(turn_id) = extract_app_server_turn_id(params) {
-                    self.completed_turns.insert(turn_id);
+                if let Some(message) = completed_turn_error_text(params) {
+                    self.remember_turn_failure(params, message);
                 } else {
-                    self.unmatched_turn_completed = true;
+                    if let Some(turn_id) = extract_app_server_turn_id(params) {
+                        self.completed_turns.insert(turn_id);
+                    } else {
+                        self.unmatched_turn_completed = true;
+                    }
+                    drop(events.send(RuntimeEvent::Status {
+                        code: None,
+                        text: "codex turn completed".to_string(),
+                    }));
+                    drop(events.send(RuntimeEvent::Done));
                 }
-                drop(events.send(RuntimeEvent::Status {
-                    code: None,
-                    text: "codex turn completed".to_string(),
-                }));
-                drop(events.send(RuntimeEvent::Done));
             }
             "item/agentMessage/delta" => {
                 if let Some(text) = app_server_text(params, &["delta", "text", "content"]) {
@@ -775,10 +826,15 @@ where
                 }
             }
             "error" => {
-                drop(events.send(RuntimeEvent::Error {
-                    code: Some("runtime.error".to_string()),
-                    text: app_server_error_text(params),
-                }));
+                let message = app_server_error_text(params);
+                if error_notification_will_retry(params) {
+                    drop(events.send(RuntimeEvent::Status {
+                        code: Some("runtime.retrying".to_string()),
+                        text: message,
+                    }));
+                } else {
+                    self.remember_turn_failure(params, message);
+                }
             }
             _ => {}
         }
@@ -949,6 +1005,51 @@ fn review_target_from_arguments(arguments: &str) -> Value {
     })
 }
 
+fn invalid_thread_control_arguments(
+    command_name: &str,
+    arguments: &str,
+) -> Option<RuntimeControlOutcome> {
+    let arguments = arguments.trim();
+    match command_name {
+        "rename" | "name" if arguments.is_empty() => Some(invalid_arguments_outcome(
+            "Codex rename requires a non-empty name.",
+        )),
+        "compact" if !arguments.is_empty() => Some(invalid_arguments_outcome(
+            "Codex compact does not accept arguments.",
+        )),
+        _ => None,
+    }
+}
+
+fn model_list_include_hidden(arguments: &str) -> std::result::Result<bool, RuntimeControlOutcome> {
+    let mut include_hidden = false;
+    for argument in arguments.split_whitespace() {
+        match argument {
+            "--hidden" | "--include-hidden" => include_hidden = true,
+            argument if argument.starts_with('-') => {
+                return Err(invalid_arguments_outcome(
+                    "Codex model listing only accepts --hidden or --include-hidden.",
+                ));
+            }
+            _ => {
+                return Err(RuntimeControlOutcome::InteractiveOnly {
+                    message:
+                        "Codex model selection is interactive; configure the LionClaw runtime model instead."
+                            .to_string(),
+                });
+            }
+        }
+    }
+    Ok(include_hidden)
+}
+
+fn invalid_arguments_outcome(message: &str) -> RuntimeControlOutcome {
+    RuntimeControlOutcome::Failed {
+        code: Some("runtime.control.invalid_arguments".to_string()),
+        message: message.to_string(),
+    }
+}
+
 fn extract_app_server_thread_id(value: &Value) -> Option<String> {
     value
         .pointer("/thread/id")
@@ -984,6 +1085,50 @@ fn app_server_error_text(value: &Value) -> String {
         .unwrap_or_else(|| "codex app-server error".to_string())
 }
 
+fn completed_turn_error_text(params: &Value) -> Option<String> {
+    let turn = params.get("turn").unwrap_or(params);
+    let status = turn
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|status| !status.is_empty());
+    let error = turn
+        .get("error")
+        .or_else(|| params.get("error"))
+        .filter(|error| !error.is_null());
+    if status.is_none_or(|status| status.eq_ignore_ascii_case("completed")) && error.is_none() {
+        return None;
+    }
+
+    let message = error
+        .map(app_server_error_text)
+        .or_else(|| {
+            app_server_text(turn, &["message", "statusMessage", "details", "error"])
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty())
+        })
+        .or_else(|| status.map(turn_status_error_text))
+        .unwrap_or_else(|| "codex turn failed".to_string());
+    Some(message)
+}
+
+fn turn_status_error_text(status: &str) -> String {
+    if status.eq_ignore_ascii_case("failed") {
+        "codex turn failed".to_string()
+    } else if status.eq_ignore_ascii_case("interrupted") {
+        "codex turn interrupted".to_string()
+    } else {
+        format!("codex turn ended with status '{status}'")
+    }
+}
+
+fn error_notification_will_retry(params: &Value) -> bool {
+    params
+        .get("willRetry")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 fn describe_app_server_item(params: &Value) -> Option<String> {
     let item = params.get("item").unwrap_or(params);
     let item_type = item.get("type").and_then(Value::as_str)?;
@@ -1013,8 +1158,10 @@ fn describe_model_list_response(response: &Value) -> String {
 
 fn model_display_name(value: &Value) -> Option<String> {
     value
-        .get("id")
+        .get("displayName")
         .and_then(Value::as_str)
+        .or_else(|| value.get("model").and_then(Value::as_str))
+        .or_else(|| value.get("id").and_then(Value::as_str))
         .or_else(|| value.get("name").and_then(Value::as_str))
         .or_else(|| value.get("label").and_then(Value::as_str))
         .filter(|name| !name.trim().is_empty())
@@ -1166,6 +1313,7 @@ fn collect_codex_text(value: &Value, depth: usize) -> Option<String> {
 mod tests {
     use std::{
         collections::VecDeque,
+        path::PathBuf,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc, Mutex,
@@ -1173,7 +1321,8 @@ mod tests {
     };
 
     use crate::kernel::runtime::{
-        ExecutionOutput, RuntimeAdapter, RuntimeEvent, RuntimeMessageLane, RuntimeSessionStartInput,
+        ExecutionOutput, RuntimeAdapter, RuntimeControlOutcome, RuntimeEvent, RuntimeMessageLane,
+        RuntimeSessionHandle, RuntimeSessionStartInput,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -1205,6 +1354,40 @@ mod tests {
                 },
             }
         }
+    }
+
+    async fn start_codex_test_session(
+        runtime_state_root: Option<PathBuf>,
+    ) -> (
+        CodexRuntimeAdapter,
+        RuntimeSessionHandle,
+        super::CodexThreadState,
+    ) {
+        start_codex_test_session_with_config(CodexRuntimeConfig::default(), runtime_state_root)
+            .await
+    }
+
+    async fn start_codex_test_session_with_config(
+        config: CodexRuntimeConfig,
+        runtime_state_root: Option<PathBuf>,
+    ) -> (
+        CodexRuntimeAdapter,
+        RuntimeSessionHandle,
+        super::CodexThreadState,
+    ) {
+        let adapter = CodexRuntimeAdapter::new(config);
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root,
+            })
+            .await
+            .expect("start");
+        let thread_state = adapter.thread_state_for(&handle.runtime_session_id);
+        (adapter, handle, thread_state)
     }
 
     #[async_trait]
@@ -1269,26 +1452,118 @@ mod tests {
         );
     }
 
+    #[test]
+    fn model_list_control_arguments_only_allow_listing_flags() {
+        assert_eq!(super::model_list_include_hidden(""), Ok(false));
+        assert_eq!(super::model_list_include_hidden("--hidden"), Ok(true));
+        assert_eq!(
+            super::model_list_include_hidden("--include-hidden"),
+            Ok(true)
+        );
+
+        let outcome = super::model_list_include_hidden("gpt-5-codex")
+            .expect_err("model selection should not be faked as a list request");
+        assert!(matches!(
+            outcome,
+            RuntimeControlOutcome::InteractiveOnly { message } if message.contains("model selection is interactive")
+        ));
+
+        let outcome = super::model_list_include_hidden("--unknown")
+            .expect_err("unknown model list flags should be rejected");
+        assert!(matches!(
+            outcome,
+            RuntimeControlOutcome::Failed { code, message }
+                if code.as_deref() == Some("runtime.control.invalid_arguments")
+                    && message.contains("--hidden")
+        ));
+    }
+
+    #[test]
+    fn thread_control_argument_validation_rejects_ambiguous_forms() {
+        assert!(matches!(
+            super::invalid_thread_control_arguments("rename", ""),
+            Some(RuntimeControlOutcome::Failed { code, message })
+                if code.as_deref() == Some("runtime.control.invalid_arguments")
+                    && message.contains("non-empty name")
+        ));
+        assert!(matches!(
+            super::invalid_thread_control_arguments("compact", "now"),
+            Some(RuntimeControlOutcome::Failed { code, message })
+                if code.as_deref() == Some("runtime.control.invalid_arguments")
+                    && message.contains("does not accept arguments")
+        ));
+        assert!(super::invalid_thread_control_arguments("review", "base main").is_none());
+    }
+
+    #[test]
+    fn model_list_description_uses_codex_app_server_display_fields() {
+        let response = json!({
+            "data": [
+                {
+                    "id": "model-id",
+                    "model": "gpt-5-codex",
+                    "displayName": "GPT-5 Codex"
+                },
+                {
+                    "id": "fallback-id",
+                    "model": "fallback-model"
+                }
+            ]
+        });
+
+        assert_eq!(
+            super::describe_model_list_response(&response),
+            "Available Codex models: GPT-5 Codex, fallback-model."
+        );
+    }
+
+    #[test]
+    fn completed_turn_error_text_only_flags_failed_turns() {
+        assert_eq!(
+            super::completed_turn_error_text(&json!({
+                "turn": {
+                    "id": "turn_1",
+                    "status": "completed",
+                    "error": null
+                }
+            })),
+            None
+        );
+        assert_eq!(
+            super::completed_turn_error_text(&json!({
+                "turn": {
+                    "id": "turn_1",
+                    "status": "failed",
+                    "error": {"message": "boom"}
+                }
+            })),
+            Some("boom".to_string())
+        );
+        assert_eq!(
+            super::completed_turn_error_text(&json!({
+                "turn": {
+                    "id": "turn_1",
+                    "status": "interrupted",
+                    "error": null
+                }
+            })),
+            Some("codex turn interrupted".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn codex_app_server_protocol_streams_turn_and_saves_thread_id() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let runtime_state_root = temp_dir.path().join("runtime-state");
         std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
-        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig {
-            executable: "codex".to_string(),
-            model: Some("gpt-5-codex".to_string()),
-        });
-        let handle = adapter
-            .session_start(RuntimeSessionStartInput {
-                session_id: Uuid::new_v4(),
-                working_dir: None,
-                environment: Vec::new(),
-                runtime_skill_ids: Vec::new(),
-                runtime_state_root: Some(runtime_state_root.clone()),
-            })
-            .await
-            .expect("start");
-        let thread_state = adapter.thread_state_for(&handle.runtime_session_id);
+        let (adapter, handle, thread_state) = start_codex_test_session_with_config(
+            CodexRuntimeConfig {
+                executable: "codex".to_string(),
+                model: Some("gpt-5-codex".to_string()),
+            },
+            Some(runtime_state_root.clone()),
+        )
+        .await;
         let transport = FakeAppServerTransport::new(vec![
             json!({"id": 1, "result": {"serverInfo": {"name": "codex", "version": "test"}, "userAgent": "codex/test"}}),
             json!({"method": "thread/started", "params": {"threadId": "thr_1"}}),
@@ -1367,19 +1642,237 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_app_server_protocol_rejects_internal_approval_callbacks() {
-        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
-        let handle = adapter
-            .session_start(RuntimeSessionStartInput {
-                session_id: Uuid::new_v4(),
-                working_dir: None,
-                environment: Vec::new(),
-                runtime_skill_ids: Vec::new(),
-                runtime_state_root: None,
-            })
+    async fn codex_app_server_protocol_resumes_saved_thread_id() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
+        std::fs::write(
+            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
+            "",
+        )
+        .expect("write ready marker");
+        std::fs::write(
+            runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE),
+            "thr_saved\n",
+        )
+        .expect("write thread id");
+
+        let (adapter, handle, thread_state) =
+            start_codex_test_session(Some(runtime_state_root)).await;
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {"thread": {"id": "thr_saved"}}}),
+        ]);
+        let sent = transport.sent.clone();
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let thread_id = adapter
+            .ensure_app_server_thread(
+                &mut client,
+                &handle.runtime_session_id,
+                &event_tx,
+                &thread_state,
+            )
             .await
-            .expect("start");
-        let thread_state = adapter.thread_state_for(&handle.runtime_session_id);
+            .expect("resume thread");
+
+        assert_eq!(thread_id, "thr_saved");
+        let sent = sent.lock().expect("sent lock").clone();
+        assert_eq!(sent[0]["method"], "thread/resume");
+        assert_eq!(sent[0]["params"]["threadId"], "thr_saved");
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_unmatched_terminal_notifications_complete_current_waiter() {
+        let (adapter, handle, thread_state) = start_codex_test_session(None).await;
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {"turn": {"id": "turn_1"}}}),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thr_1",
+                    "turn": {"status": "completed"}
+                }
+            }),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = client
+            .request("turn/start", json!({}), &event_tx, &thread_state)
+            .await
+            .expect("turn start");
+        client
+            .wait_for_turn_completed(
+                super::extract_app_server_turn_id(&response).as_deref(),
+                &event_tx,
+                &thread_state,
+            )
+            .await
+            .expect("id-less completion should complete the active turn");
+
+        let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Done)));
+
+        let transport = FakeAppServerTransport::new(vec![json!({
+            "method": "thread/compacted",
+            "params": {}
+        })]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        client
+            .wait_for_thread_compacted(Some("thr_1"), &event_tx, &thread_state)
+            .await
+            .expect("id-less compaction should complete the active compaction");
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_failed_turn_completion_returns_error() {
+        let (adapter, handle, thread_state) = start_codex_test_session(None).await;
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {"turn": {"id": "turn_1"}}}),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thr_1",
+                    "turn": {
+                        "id": "turn_1",
+                        "status": "failed",
+                        "error": {"message": "boom from model"}
+                    }
+                }
+            }),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = client
+            .request("turn/start", json!({}), &event_tx, &thread_state)
+            .await
+            .expect("turn start");
+        let err = client
+            .wait_for_turn_completed(
+                super::extract_app_server_turn_id(&response).as_deref(),
+                &event_tx,
+                &thread_state,
+            )
+            .await
+            .expect_err("failed turn should be returned as an adapter error");
+
+        assert!(err.to_string().contains("boom from model"));
+        let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Done)));
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_unmatched_terminal_error_returns_error() {
+        let (adapter, handle, thread_state) = start_codex_test_session(None).await;
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {"turn": {"id": "turn_1"}}}),
+            json!({
+                "method": "error",
+                "params": {
+                    "threadId": "thr_1",
+                    "error": {"message": "global app-server failure"},
+                    "willRetry": false
+                }
+            }),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = client
+            .request("turn/start", json!({}), &event_tx, &thread_state)
+            .await
+            .expect("turn start");
+        let err = client
+            .wait_for_turn_completed(
+                super::extract_app_server_turn_id(&response).as_deref(),
+                &event_tx,
+                &thread_state,
+            )
+            .await
+            .expect_err("unmatched terminal errors should fail a specific turn");
+
+        assert!(err.to_string().contains("global app-server failure"));
+        let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Done)));
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_retryable_error_notification_does_not_fail_turn() {
+        let (adapter, handle, thread_state) = start_codex_test_session(None).await;
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {"turn": {"id": "turn_1"}}}),
+            json!({
+                "method": "error",
+                "params": {
+                    "threadId": "thr_1",
+                    "turnId": "turn_1",
+                    "message": "temporary overload",
+                    "willRetry": true
+                }
+            }),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thr_1",
+                    "turn": {
+                        "id": "turn_1",
+                        "status": "completed"
+                    }
+                }
+            }),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = client
+            .request("turn/start", json!({}), &event_tx, &thread_state)
+            .await
+            .expect("turn start");
+        client
+            .wait_for_turn_completed(
+                super::extract_app_server_turn_id(&response).as_deref(),
+                &event_tx,
+                &thread_state,
+            )
+            .await
+            .expect("retryable error should not fail a completed turn");
+
+        let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::Status { code: Some(code), text }
+                if code == "runtime.retrying" && text == "temporary overload"
+        )));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Error { .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Done)));
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_protocol_rejects_internal_approval_callbacks() {
+        let (adapter, handle, thread_state) = start_codex_test_session(None).await;
         let transport = FakeAppServerTransport::new(vec![
             json!({"id": 1, "result": {}}),
             json!({"id": "approval-1", "method": "item/commandExecution/requestApproval", "params": {}}),
@@ -1440,17 +1933,7 @@ mod tests {
         std::fs::write(runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE), "\n")
             .expect("write invalid thread id");
 
-        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
-        let handle = adapter
-            .session_start(RuntimeSessionStartInput {
-                session_id: Uuid::new_v4(),
-                working_dir: None,
-                environment: Vec::new(),
-                runtime_skill_ids: Vec::new(),
-                runtime_state_root: Some(runtime_state_root),
-            })
-            .await
-            .expect("start");
+        let (adapter, handle, _) = start_codex_test_session(Some(runtime_state_root)).await;
         assert!(!handle.resumes_existing_session);
 
         adapter.close(&handle).await.expect("close");
@@ -1467,17 +1950,7 @@ mod tests {
         )
         .expect("write thread id");
 
-        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
-        let handle = adapter
-            .session_start(RuntimeSessionStartInput {
-                session_id: Uuid::new_v4(),
-                working_dir: None,
-                environment: Vec::new(),
-                runtime_skill_ids: Vec::new(),
-                runtime_state_root: Some(runtime_state_root),
-            })
-            .await
-            .expect("start");
+        let (adapter, handle, _) = start_codex_test_session(Some(runtime_state_root)).await;
         assert!(!handle.resumes_existing_session);
 
         adapter.close(&handle).await.expect("close");

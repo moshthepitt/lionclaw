@@ -6677,10 +6677,11 @@ impl Kernel {
         tokio::pin!(hard_sleep);
         let mut events = Vec::new();
         let mut checkpoints = AssistantCheckpointState::default();
+        let mut event_rx_open = true;
 
         loop {
             tokio::select! {
-                maybe_event = event_rx.recv() => {
+                maybe_event = event_rx.recv(), if event_rx_open => {
                     match maybe_event {
                         Some(event) => {
                             self.record_runtime_event(
@@ -6695,9 +6696,7 @@ impl Kernel {
                             idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
                         }
                         None => {
-                            if turn_task.is_finished() {
-                                continue;
-                            }
+                            event_rx_open = false;
                         }
                     }
                 }
@@ -6951,10 +6950,11 @@ impl Kernel {
         tokio::pin!(hard_sleep);
         let mut events = Vec::new();
         let mut checkpoints = AssistantCheckpointState::default();
+        let mut event_rx_open = true;
 
         loop {
             tokio::select! {
-                maybe_event = event_rx.recv() => {
+                maybe_event = event_rx.recv(), if event_rx_open => {
                     match maybe_event {
                         Some(event) => {
                             self.record_runtime_event(
@@ -6969,9 +6969,7 @@ impl Kernel {
                             idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
                         }
                         None => {
-                            if control_task.is_finished() {
-                                continue;
-                            }
+                            event_rx_open = false;
                         }
                     }
                 }
