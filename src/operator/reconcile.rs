@@ -3,6 +3,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 use uuid::Uuid;
 
@@ -10,7 +11,8 @@ use crate::{
     applied::{compute_daemon_fingerprint, AppliedState},
     contracts::{
         ChannelGrantResponse, ChannelGrantRevokeRequest, ChannelGrantRevokeResponse,
-        ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingListResponse,
+        ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
+        ChannelPairingInviteRequest, ChannelPairingInviteResponse, ChannelPairingListResponse,
         ChannelPairingStatus, ChannelRoutingProfile, TrustTier,
     },
     home::{runtime_project_partition_key, LionClawHome},
@@ -314,12 +316,27 @@ pub async fn up_for_work_root<M: UnitManager>(
 }
 
 fn allocate_auto_bind() -> Result<String> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .context("failed to allocate an automatic loopback bind")?;
-    let addr = listener
-        .local_addr()
-        .context("failed to read automatic bind address")?;
-    Ok(format!("127.0.0.1:{}", addr.port()))
+    static ALLOCATED_AUTO_BIND_PORTS: OnceLock<Mutex<BTreeSet<u16>>> = OnceLock::new();
+
+    let allocated_ports = ALLOCATED_AUTO_BIND_PORTS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    for _ in 0..64 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .context("failed to allocate an automatic loopback bind")?;
+        let port = listener
+            .local_addr()
+            .context("failed to read automatic bind address")?
+            .port();
+        let mut allocated_ports = allocated_ports
+            .lock()
+            .map_err(|_| anyhow!("automatic bind port registry lock poisoned"))?;
+        if allocated_ports.insert(port) {
+            return Ok(format!("127.0.0.1:{port}"));
+        }
+    }
+
+    Err(anyhow!(
+        "failed to allocate a unique automatic loopback bind after repeated attempts"
+    ))
 }
 
 async fn ensure_managed_bind_configured(
@@ -393,6 +410,15 @@ pub async fn pairing_approve(
         .map_err(to_anyhow)
 }
 
+pub async fn pairing_invite(
+    home: &LionClawHome,
+    req: ChannelPairingInviteRequest,
+) -> Result<ChannelPairingInviteResponse> {
+    let config = OperatorConfig::load(home).await?;
+    let kernel = open_kernel(home, &config, None).await?;
+    kernel.invite_channel_pairing(req).await.map_err(to_anyhow)
+}
+
 pub async fn pairing_block(
     home: &LionClawHome,
     channel_id: String,
@@ -401,7 +427,7 @@ pub async fn pairing_block(
     conversation_ref: Option<String>,
     thread_ref: Option<String>,
     reason: Option<String>,
-) -> Result<ChannelGrantResponse> {
+) -> Result<ChannelPairingBlockResponse> {
     let config = OperatorConfig::load(home).await?;
     let kernel = open_kernel(home, &config, None).await?;
     kernel
