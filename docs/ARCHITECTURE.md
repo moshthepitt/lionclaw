@@ -273,7 +273,7 @@ with the CLI.
 ### Channel
 
 - `GET /v0/channels/list`
-- `GET /v0/channels/pairing`
+- `GET /v0/channels/pairing` (pairing requests and current grant state)
 - `POST /v0/channels/pairing/approve`
 - `POST /v0/channels/pairing/block`
 - `POST /v0/channels/grants/revoke`

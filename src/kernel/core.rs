@@ -1016,8 +1016,16 @@ impl Kernel {
             .into_iter()
             .map(to_channel_pairing_view)
             .collect();
+        let grants = self
+            .channel_state
+            .list_grants(channel_id.as_deref())
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(to_channel_grant_view)
+            .collect();
 
-        Ok(ChannelPairingListResponse { pairings })
+        Ok(ChannelPairingListResponse { pairings, grants })
     }
 
     pub async fn approve_channel_pairing(

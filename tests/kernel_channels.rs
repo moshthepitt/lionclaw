@@ -535,6 +535,7 @@ async fn channels_v2_pending_pairing_hashes_code_and_rejects_runtime_id() {
         .await
         .expect("list pairings");
     assert_eq!(pairings.pairings.len(), 1);
+    assert!(pairings.grants.is_empty());
     let serialized = serde_json::to_value(&pairings.pairings[0]).expect("serialize pairing");
     assert!(serialized.get("pairing_code").is_none());
 
@@ -593,6 +594,18 @@ async fn channels_v2_pending_pairing_hashes_code_and_rejects_runtime_id() {
         .grant;
     assert_eq!(grant.routing_profile.as_str(), "direct");
     assert_eq!(grant.sender_ref.as_deref(), Some("alice"));
+
+    let access_state = kernel
+        .list_channel_pairings(Some("terminal".to_string()), None)
+        .await
+        .expect("list channel access state");
+    let listed_grant = access_state
+        .grants
+        .iter()
+        .find(|value| value.sender_ref.as_deref() == Some("alice"))
+        .expect("approved grant listed");
+    assert_eq!(listed_grant.status, "approved");
+    assert_eq!(listed_grant.trust_tier.as_str(), "main");
 
     let queued = kernel
         .ingest_channel_inbound(v2_text_request(
@@ -831,6 +844,14 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
         .await
         .expect("block sender");
     assert_eq!(blocked_grant.grant.status, "blocked");
+
+    let access_state = kernel
+        .list_channel_pairings(Some("slack".to_string()), None)
+        .await
+        .expect("list slack channel access state");
+    assert!(access_state.grants.iter().any(|grant| {
+        grant.sender_ref.as_deref() == Some("mallory") && grant.status == "blocked"
+    }));
 
     let blocked = kernel
         .ingest_channel_inbound(v2_text_request(
