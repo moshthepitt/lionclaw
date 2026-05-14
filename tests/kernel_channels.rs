@@ -807,6 +807,74 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
         transcript_row.get::<String, _>("prompt_user_text"),
         "see image"
     );
+
+    let colon_pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "slack",
+            "colon-thread-pending",
+            "telegram:user:456",
+            "telegram:chat:-123",
+            Some("telegram:topic:77"),
+            "thread with provider-shaped refs",
+            ChannelTrigger::ThreadContinuation,
+        ))
+        .await
+        .expect("pending colon thread");
+    let colon_pairing_id = colon_pending.pairing_id.expect("colon pairing id");
+    kernel
+        .approve_channel_pairing(ChannelPairingApproveRequest {
+            channel_id: "slack".to_string(),
+            pairing_id: Some(colon_pairing_id),
+            pairing_code: None,
+            routing_profile: None,
+            trust_tier: Some(TrustTier::Main),
+            label: None,
+        })
+        .await
+        .expect("approve colon thread");
+    let colon_queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "slack",
+            "colon-thread-queued",
+            "telegram:user:456",
+            "telegram:chat:-123",
+            Some("telegram:topic:77"),
+            "thread again with provider-shaped refs",
+            ChannelTrigger::ThreadContinuation,
+        ))
+        .await
+        .expect("queue colon thread");
+    assert_eq!(colon_queued.outcome, ChannelInboundOutcome::Queued);
+    assert_eq!(
+        colon_queued.session_key.as_deref(),
+        Some("channel:slack:thread:telegram%3Achat%3A-123:telegram%3Atopic%3A77")
+    );
+    let colon_turn_id = colon_queued.turn_id.expect("colon turn id");
+    let colon_stream = wait_for_stream_events(&kernel, "slack", "colon-worker", |events| {
+        events.iter().any(|event| {
+            event.turn_id == Some(colon_turn_id) && event.code.as_deref() == Some("queue.completed")
+        })
+    })
+    .await;
+    assert!(colon_stream.events.iter().any(|event| {
+        event.turn_id == Some(colon_turn_id) && event.peer_id == "telegram:chat:-123"
+    }));
+
+    let colon_session_id = colon_queued.session_id.expect("colon session id");
+    let action = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: colon_session_id,
+            user_text: "follow up on escaped thread session".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("mutate escaped thread session");
+    assert!(action
+        .assistant_text
+        .contains("follow up on escaped thread session"));
 }
 
 #[tokio::test]
@@ -1487,7 +1555,11 @@ fn assert_error_before_done(
 }
 
 fn direct_session_key(channel_id: &str, peer_id: &str) -> String {
-    format!("channel:{channel_id}:direct:{peer_id}")
+    format!("channel:{channel_id}:direct:{}", session_key_part(peer_id))
+}
+
+fn session_key_part(value: &str) -> String {
+    value.replace('%', "%25").replace(':', "%3A")
 }
 
 fn v2_text_request(

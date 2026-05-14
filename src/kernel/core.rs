@@ -56,10 +56,10 @@ use super::{
     audit::AuditLog,
     capability_broker::{CapabilityBroker, CapabilityExecutionContext},
     channel_state::{
-        ChannelGrantRecord, ChannelGrantStatus, ChannelPairingRequestRecord, ChannelPeerStatus,
-        ChannelStateStore, ChannelStreamEventInsert, ChannelStreamEventKind,
-        ChannelStreamEventRecord, ChannelTurnRecord, ChannelTurnStatus,
-        StreamMessageLane as ChannelStreamLane,
+        ChannelGrantRecord, ChannelGrantStatus, ChannelGrantUpsert, ChannelPairingRequestRecord,
+        ChannelPeerStatus, ChannelStateStore, ChannelStreamEventInsert, ChannelStreamEventKind,
+        ChannelStreamEventRecord, ChannelTurnRecord, ChannelTurnStatus, NewChannelInboundEvent,
+        NewChannelTurn, StreamMessageLane as ChannelStreamLane,
     },
     continuity::{
         ActiveContinuitySnapshot, ContinuityArtifact, ContinuityEvent, ContinuityLayout,
@@ -1094,8 +1094,7 @@ impl Kernel {
         }
 
         let routing_profile = req.routing_profile.unwrap_or(pairing.requested_profile);
-        let (sender_ref, conversation_ref, thread_ref) =
-            grant_scope_from_pairing(&pairing, routing_profile)?;
+        let grant_scope = grant_scope_from_pairing(&pairing, routing_profile)?;
         let trust_tier = req.trust_tier.unwrap_or(TrustTier::Main);
         let label = req
             .label
@@ -1106,14 +1105,16 @@ impl Kernel {
             .channel_state
             .insert_or_update_grant_in_tx(
                 &mut tx,
-                &channel_id,
-                sender_ref.as_deref(),
-                conversation_ref.as_deref(),
-                thread_ref.as_deref(),
-                routing_profile,
-                trust_tier,
-                ChannelGrantStatus::Approved,
-                label,
+                ChannelGrantUpsert {
+                    channel_id: &channel_id,
+                    sender_ref: grant_scope.sender_ref.as_deref(),
+                    conversation_ref: grant_scope.conversation_ref.as_deref(),
+                    thread_ref: grant_scope.thread_ref.as_deref(),
+                    routing_profile,
+                    trust_tier,
+                    status: ChannelGrantStatus::Approved,
+                    label,
+                },
             )
             .await
             .map_err(internal)?;
@@ -1178,60 +1179,54 @@ impl Kernel {
             .await
             .map_err(|err| internal(err.into()))?;
 
-        let (pairing_id, routing_profile, sender_ref, conversation_ref, thread_ref) =
-            if let Some(pairing_id) = req.pairing_id {
-                let pairing = self
-                    .channel_state
-                    .get_pairing_request_by_id_in_tx(&mut tx, pairing_id)
-                    .await
-                    .map_err(internal)?
-                    .ok_or_else(|| {
-                        KernelError::NotFound("channel pairing request not found".to_string())
-                    })?;
-                if pairing.channel_id != channel_id {
-                    return Err(KernelError::BadRequest(
-                        "pairing request does not belong to channel_id".to_string(),
-                    ));
-                }
-                let (sender_ref, conversation_ref, thread_ref) =
-                    grant_scope_from_pairing(&pairing, pairing.requested_profile)?;
-                (
-                    Some(pairing.pairing_id),
-                    pairing.requested_profile,
-                    sender_ref,
-                    conversation_ref,
-                    thread_ref,
-                )
-            } else {
-                let sender_ref = trim_optional(req.sender_ref);
-                let conversation_ref = trim_optional(req.conversation_ref);
-                let thread_ref = trim_optional(req.thread_ref);
-                let routing_profile = infer_block_profile(
-                    sender_ref.as_deref(),
-                    conversation_ref.as_deref(),
-                    thread_ref.as_deref(),
-                )?;
-                (
-                    None,
-                    routing_profile,
-                    sender_ref,
-                    conversation_ref,
-                    thread_ref,
-                )
+        let (pairing_id, routing_profile, grant_scope) = if let Some(pairing_id) = req.pairing_id {
+            let pairing = self
+                .channel_state
+                .get_pairing_request_by_id_in_tx(&mut tx, pairing_id)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| {
+                    KernelError::NotFound("channel pairing request not found".to_string())
+                })?;
+            if pairing.channel_id != channel_id {
+                return Err(KernelError::BadRequest(
+                    "pairing request does not belong to channel_id".to_string(),
+                ));
+            }
+            let grant_scope = grant_scope_from_pairing(&pairing, pairing.requested_profile)?;
+            (
+                Some(pairing.pairing_id),
+                pairing.requested_profile,
+                grant_scope,
+            )
+        } else {
+            let grant_scope = GrantScope {
+                sender_ref: trim_optional(req.sender_ref),
+                conversation_ref: trim_optional(req.conversation_ref),
+                thread_ref: trim_optional(req.thread_ref),
             };
+            let routing_profile = infer_block_profile(
+                grant_scope.sender_ref.as_deref(),
+                grant_scope.conversation_ref.as_deref(),
+                grant_scope.thread_ref.as_deref(),
+            )?;
+            (None, routing_profile, grant_scope)
+        };
 
         let grant = self
             .channel_state
             .insert_or_update_grant_in_tx(
                 &mut tx,
-                &channel_id,
-                sender_ref.as_deref(),
-                conversation_ref.as_deref(),
-                thread_ref.as_deref(),
-                routing_profile,
-                TrustTier::Untrusted,
-                ChannelGrantStatus::Blocked,
-                None,
+                ChannelGrantUpsert {
+                    channel_id: &channel_id,
+                    sender_ref: grant_scope.sender_ref.as_deref(),
+                    conversation_ref: grant_scope.conversation_ref.as_deref(),
+                    thread_ref: grant_scope.thread_ref.as_deref(),
+                    routing_profile,
+                    trust_tier: TrustTier::Untrusted,
+                    status: ChannelGrantStatus::Blocked,
+                    label: None,
+                },
             )
             .await
             .map_err(internal)?;
@@ -1620,19 +1615,19 @@ impl Kernel {
 
         let inserted = self
             .channel_state
-            .insert_inbound_event(
-                &inbound.event_id,
-                &inbound.channel_id,
-                &inbound.sender_ref,
-                &inbound.conversation_ref,
-                inbound.thread_ref.as_deref(),
-                inbound.message_ref.as_deref(),
-                inbound.trigger,
-                &inbound.attachments,
-                inbound.reply_to_ref.as_deref(),
-                &inbound.provider_metadata,
-                inbound.received_at,
-            )
+            .insert_inbound_event(NewChannelInboundEvent {
+                event_id: &inbound.event_id,
+                channel_id: &inbound.channel_id,
+                sender_ref: &inbound.sender_ref,
+                conversation_ref: &inbound.conversation_ref,
+                thread_ref: inbound.thread_ref.as_deref(),
+                message_ref: inbound.message_ref.as_deref(),
+                trigger: inbound.trigger,
+                attachments: &inbound.attachments,
+                reply_to_ref: inbound.reply_to_ref.as_deref(),
+                provider_metadata: &inbound.provider_metadata,
+                received_at: inbound.received_at,
+            })
             .await
             .map_err(internal)?;
         if inserted.is_none() {
@@ -1700,16 +1695,15 @@ impl Kernel {
         let Some(grant) = grant else {
             let requested_profile =
                 default_pending_profile(inbound.trigger, inbound.thread_ref.as_deref());
-            let (sender_ref, conversation_ref, thread_ref) =
-                pending_scope_for_profile(&inbound, requested_profile)?;
+            let pending_scope = pending_scope_for_profile(&inbound, requested_profile)?;
             let pairing_code = generate_pairing_code();
             let (pairing, created) = self
                 .channel_state
                 .create_or_refresh_operator_pairing(
                     &inbound.channel_id,
-                    sender_ref.as_deref(),
-                    conversation_ref.as_deref(),
-                    thread_ref.as_deref(),
+                    pending_scope.sender_ref.as_deref(),
+                    pending_scope.conversation_ref.as_deref(),
+                    pending_scope.thread_ref.as_deref(),
                     requested_profile,
                     &hash_pairing_code(&pairing_code),
                 )
@@ -1819,13 +1813,15 @@ impl Kernel {
         self.channel_state
             .enqueue_turn_in_tx(
                 &mut tx,
-                turn_id,
-                &inbound.channel_id,
-                &session_key,
-                session.session_id,
-                &inbound.event_id,
-                &runtime_id,
-                turn_status,
+                NewChannelTurn {
+                    turn_id,
+                    channel_id: &inbound.channel_id,
+                    session_key: &session_key,
+                    session_id: session.session_id,
+                    inbound_event_id: &inbound.event_id,
+                    runtime_id: &runtime_id,
+                    status: turn_status,
+                },
             )
             .await
             .map_err(internal)?;
@@ -4624,6 +4620,13 @@ struct ValidatedChannelInbound {
     provider_metadata: serde_json::Value,
 }
 
+#[derive(Debug, Clone)]
+struct GrantScope {
+    sender_ref: Option<String>,
+    conversation_ref: Option<String>,
+    thread_ref: Option<String>,
+}
+
 fn validate_channel_inbound_request(
     req: ChannelInboundRequest,
 ) -> Result<ValidatedChannelInbound, KernelError> {
@@ -4653,8 +4656,7 @@ fn validate_channel_inbound_request(
         .map_err(|err| KernelError::BadRequest(format!("invalid provider_metadata: {err}")))?;
     if metadata_bytes.len() > MAX_PROVIDER_METADATA_BYTES {
         return Err(KernelError::BadRequest(format!(
-            "provider_metadata exceeds {} bytes",
-            MAX_PROVIDER_METADATA_BYTES
+            "provider_metadata exceeds {MAX_PROVIDER_METADATA_BYTES} bytes"
         )));
     }
 
@@ -4750,23 +4752,27 @@ fn default_pending_profile(
 fn pending_scope_for_profile(
     inbound: &ValidatedChannelInbound,
     profile: ChannelRoutingProfile,
-) -> Result<(Option<String>, Option<String>, Option<String>), KernelError> {
+) -> Result<GrantScope, KernelError> {
     match profile {
-        ChannelRoutingProfile::Direct => Ok((Some(inbound.sender_ref.clone()), None, None)),
-        ChannelRoutingProfile::Conversation => Ok((
-            Some(inbound.sender_ref.clone()),
-            Some(inbound.conversation_ref.clone()),
-            None,
-        )),
+        ChannelRoutingProfile::Direct => Ok(GrantScope {
+            sender_ref: Some(inbound.sender_ref.clone()),
+            conversation_ref: None,
+            thread_ref: None,
+        }),
+        ChannelRoutingProfile::Conversation => Ok(GrantScope {
+            sender_ref: Some(inbound.sender_ref.clone()),
+            conversation_ref: Some(inbound.conversation_ref.clone()),
+            thread_ref: None,
+        }),
         ChannelRoutingProfile::Thread => {
             let thread_ref = inbound.thread_ref.clone().ok_or_else(|| {
                 KernelError::BadRequest("thread routing profile requires thread_ref".to_string())
             })?;
-            Ok((
-                Some(inbound.sender_ref.clone()),
-                Some(inbound.conversation_ref.clone()),
-                Some(thread_ref),
-            ))
+            Ok(GrantScope {
+                sender_ref: Some(inbound.sender_ref.clone()),
+                conversation_ref: Some(inbound.conversation_ref.clone()),
+                thread_ref: Some(thread_ref),
+            })
         }
         ChannelRoutingProfile::Outbound => Err(KernelError::BadRequest(
             "outbound routing profile cannot admit inbound events".to_string(),
@@ -4777,13 +4783,17 @@ fn pending_scope_for_profile(
 fn grant_scope_from_pairing(
     pairing: &ChannelPairingRequestRecord,
     profile: ChannelRoutingProfile,
-) -> Result<(Option<String>, Option<String>, Option<String>), KernelError> {
+) -> Result<GrantScope, KernelError> {
     match profile {
         ChannelRoutingProfile::Direct => {
             let sender_ref = pairing.sender_ref.clone().ok_or_else(|| {
                 KernelError::BadRequest("direct grant requires sender_ref".to_string())
             })?;
-            Ok((Some(sender_ref), None, None))
+            Ok(GrantScope {
+                sender_ref: Some(sender_ref),
+                conversation_ref: None,
+                thread_ref: None,
+            })
         }
         ChannelRoutingProfile::Conversation => {
             let sender_ref = pairing.sender_ref.clone().ok_or_else(|| {
@@ -4792,7 +4802,11 @@ fn grant_scope_from_pairing(
             let conversation_ref = pairing.conversation_ref.clone().ok_or_else(|| {
                 KernelError::BadRequest("conversation grant requires conversation_ref".to_string())
             })?;
-            Ok((Some(sender_ref), Some(conversation_ref), None))
+            Ok(GrantScope {
+                sender_ref: Some(sender_ref),
+                conversation_ref: Some(conversation_ref),
+                thread_ref: None,
+            })
         }
         ChannelRoutingProfile::Thread => {
             let sender_ref = pairing.sender_ref.clone().ok_or_else(|| {
@@ -4804,13 +4818,21 @@ fn grant_scope_from_pairing(
             let thread_ref = pairing.thread_ref.clone().ok_or_else(|| {
                 KernelError::BadRequest("thread grant requires thread_ref".to_string())
             })?;
-            Ok((Some(sender_ref), Some(conversation_ref), Some(thread_ref)))
+            Ok(GrantScope {
+                sender_ref: Some(sender_ref),
+                conversation_ref: Some(conversation_ref),
+                thread_ref: Some(thread_ref),
+            })
         }
         ChannelRoutingProfile::Outbound => {
             let conversation_ref = pairing.conversation_ref.clone().ok_or_else(|| {
                 KernelError::BadRequest("outbound grant requires conversation_ref".to_string())
             })?;
-            Ok((None, Some(conversation_ref), None))
+            Ok(GrantScope {
+                sender_ref: None,
+                conversation_ref: Some(conversation_ref),
+                thread_ref: None,
+            })
         }
     }
 }
@@ -4858,7 +4880,8 @@ fn session_key_for_grant(grant: &ChannelGrantRecord) -> Result<String, KernelErr
             })?;
             Ok(format!(
                 "channel:{}:direct:{}",
-                grant.channel_id, sender_ref
+                grant.channel_id,
+                encode_session_key_part(sender_ref)
             ))
         }
         ChannelRoutingProfile::Conversation => {
@@ -4870,7 +4893,9 @@ fn session_key_for_grant(grant: &ChannelGrantRecord) -> Result<String, KernelErr
             })?;
             Ok(format!(
                 "channel:{}:conversation:{}:sender:{}",
-                grant.channel_id, conversation_ref, sender_ref
+                grant.channel_id,
+                encode_session_key_part(conversation_ref),
+                encode_session_key_part(sender_ref)
             ))
         }
         ChannelRoutingProfile::Thread => {
@@ -4882,7 +4907,9 @@ fn session_key_for_grant(grant: &ChannelGrantRecord) -> Result<String, KernelErr
             })?;
             Ok(format!(
                 "channel:{}:thread:{}:{}",
-                grant.channel_id, conversation_ref, thread_ref
+                grant.channel_id,
+                encode_session_key_part(conversation_ref),
+                encode_session_key_part(thread_ref)
             ))
         }
         ChannelRoutingProfile::Outbound => Err(KernelError::BadRequest(
@@ -4891,23 +4918,71 @@ fn session_key_for_grant(grant: &ChannelGrantRecord) -> Result<String, KernelErr
     }
 }
 
+fn encode_session_key_part(raw: &str) -> String {
+    let mut encoded = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            ':' => encoded.push_str("%3A"),
+            '%' => encoded.push_str("%25"),
+            _ => encoded.push(ch),
+        }
+    }
+    encoded
+}
+
+fn decode_session_key_part(raw: &str) -> String {
+    let mut decoded = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            decoded.push(ch);
+            continue;
+        }
+
+        let mut lookahead = chars.clone();
+        let Some(first) = lookahead.next() else {
+            decoded.push('%');
+            continue;
+        };
+        let Some(second) = lookahead.next() else {
+            decoded.push('%');
+            continue;
+        };
+
+        match (first, second) {
+            ('3', 'A') | ('3', 'a') => {
+                chars.next();
+                chars.next();
+                decoded.push(':');
+            }
+            ('2', '5') => {
+                chars.next();
+                chars.next();
+                decoded.push('%');
+            }
+            _ => decoded.push('%'),
+        }
+    }
+    decoded
+}
+
 fn stream_peer_ref_for_session_peer(channel_id: &str, session_peer_id: &str) -> String {
     let direct_prefix = format!("channel:{channel_id}:direct:");
     if let Some(sender_ref) = session_peer_id.strip_prefix(&direct_prefix) {
-        return sender_ref.to_string();
+        return decode_session_key_part(sender_ref);
     }
 
     let conversation_prefix = format!("channel:{channel_id}:conversation:");
     if let Some(rest) = session_peer_id.strip_prefix(&conversation_prefix) {
         if let Some((conversation_ref, _sender_ref)) = rest.split_once(":sender:") {
-            return conversation_ref.to_string();
+            return decode_session_key_part(conversation_ref);
         }
     }
 
     let thread_prefix = format!("channel:{channel_id}:thread:");
     if let Some(rest) = session_peer_id.strip_prefix(&thread_prefix) {
         if let Some((conversation_ref, _thread_ref)) = rest.split_once(':') {
-            return conversation_ref.to_string();
+            return decode_session_key_part(conversation_ref);
         }
     }
 
@@ -4918,7 +4993,7 @@ fn parse_session_key_scope(channel_id: &str, session_peer_id: &str) -> Option<Se
     let direct_prefix = format!("channel:{channel_id}:direct:");
     if let Some(sender_ref) = session_peer_id.strip_prefix(&direct_prefix) {
         return Some(SessionKeyScope::Direct {
-            sender_ref: sender_ref.to_string(),
+            sender_ref: decode_session_key_part(sender_ref),
         });
     }
 
@@ -4926,8 +5001,8 @@ fn parse_session_key_scope(channel_id: &str, session_peer_id: &str) -> Option<Se
     if let Some(rest) = session_peer_id.strip_prefix(&conversation_prefix) {
         let (conversation_ref, sender_ref) = rest.split_once(":sender:")?;
         return Some(SessionKeyScope::Conversation {
-            sender_ref: sender_ref.to_string(),
-            conversation_ref: conversation_ref.to_string(),
+            sender_ref: decode_session_key_part(sender_ref),
+            conversation_ref: decode_session_key_part(conversation_ref),
         });
     }
 
@@ -4935,8 +5010,8 @@ fn parse_session_key_scope(channel_id: &str, session_peer_id: &str) -> Option<Se
     if let Some(rest) = session_peer_id.strip_prefix(&thread_prefix) {
         let (conversation_ref, thread_ref) = rest.split_once(':')?;
         return Some(SessionKeyScope::Thread {
-            conversation_ref: conversation_ref.to_string(),
-            thread_ref: thread_ref.to_string(),
+            conversation_ref: decode_session_key_part(conversation_ref),
+            thread_ref: decode_session_key_part(thread_ref),
         });
     }
 

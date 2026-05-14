@@ -383,7 +383,7 @@ INSERT INTO channel_turns_new (
 SELECT
     channel_turns.turn_id,
     channel_turns.channel_id,
-    'channel:' || channel_turns.channel_id || ':direct:' || channel_turns.peer_id,
+    'channel:' || channel_turns.channel_id || ':direct:' || replace(replace(channel_turns.peer_id, '%', '%25'), ':', '%3A'),
     channel_turns.session_id,
     COALESCE(channel_messages.external_message_id, CASE
         WHEN channel_messages.update_id IS NOT NULL THEN 'v1-update:' || channel_messages.update_id
@@ -413,7 +413,7 @@ CREATE INDEX IF NOT EXISTS idx_channel_turns_status
     ON channel_turns(status, queued_at_ms);
 
 UPDATE sessions
-SET peer_id = 'channel:' || sessions.channel_id || ':direct:' || sessions.peer_id
+SET peer_id = 'channel:' || sessions.channel_id || ':direct:' || replace(replace(sessions.peer_id, '%', '%25'), ':', '%3A')
 WHERE EXISTS (
     SELECT 1
     FROM channel_peers
