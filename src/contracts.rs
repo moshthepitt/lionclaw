@@ -971,6 +971,84 @@ pub struct ChannelAttachmentDescriptor {
     pub caption: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelAttachmentStatus {
+    Staged,
+    Rejected,
+}
+
+impl ChannelAttachmentStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Staged => "staged",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelAttachmentStageResponse {
+    pub channel_id: String,
+    pub event_id: String,
+    pub attachment_id: String,
+    pub status: ChannelAttachmentStatus,
+    pub size_bytes: i64,
+    pub sha256: String,
+    #[serde(default)]
+    pub runtime_path: Option<String>,
+    #[serde(default)]
+    pub reason_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelAttachmentMissingReport {
+    pub attachment_id: String,
+    pub reason_code: String,
+    #[serde(default)]
+    pub reason_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelAttachmentFinalizeRequest {
+    pub channel_id: String,
+    pub event_id: String,
+    pub worker_id: String,
+    #[serde(default)]
+    pub missing: Vec<ChannelAttachmentMissingReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelAttachmentFinalizeOutcome {
+    Queued,
+    AlreadyFinalized,
+    NotReady,
+}
+
+impl ChannelAttachmentFinalizeOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::AlreadyFinalized => "already_finalized",
+            Self::NotReady => "not_ready",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelAttachmentFinalizeResponse {
+    pub channel_id: String,
+    pub event_id: String,
+    pub outcome: ChannelAttachmentFinalizeOutcome,
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+    #[serde(default)]
+    pub turn_id: Option<Uuid>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelInboundRequest {

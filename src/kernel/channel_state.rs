@@ -1500,6 +1500,63 @@ impl ChannelStateStore {
         row.map(map_turn_row).transpose()
     }
 
+    pub async fn get_turn_by_inbound_event(
+        &self,
+        channel_id: &str,
+        event_id: &str,
+    ) -> Result<Option<ChannelTurnRecord>> {
+        let row = sqlx::query(
+            "SELECT turn_id, channel_id, session_key, session_id, inbound_event_id, runtime_id, status, last_error, answer_checkpoint_sequence, queued_at_ms, started_at_ms, finished_at_ms \
+             FROM channel_turns \
+             WHERE channel_id = ?1 AND inbound_event_id = ?2",
+        )
+        .bind(channel_id)
+        .bind(event_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query channel turn by inbound event")?;
+
+        row.map(map_turn_row).transpose()
+    }
+
+    pub(crate) async fn get_turn_by_inbound_event_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        channel_id: &str,
+        event_id: &str,
+    ) -> Result<Option<ChannelTurnRecord>> {
+        let row = sqlx::query(
+            "SELECT turn_id, channel_id, session_key, session_id, inbound_event_id, runtime_id, status, last_error, answer_checkpoint_sequence, queued_at_ms, started_at_ms, finished_at_ms \
+             FROM channel_turns \
+             WHERE channel_id = ?1 AND inbound_event_id = ?2",
+        )
+        .bind(channel_id)
+        .bind(event_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .context("failed to query channel turn by inbound event in transaction")?;
+
+        row.map(map_turn_row).transpose()
+    }
+
+    pub(crate) async fn mark_waiting_turn_pending_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        turn_id: Uuid,
+    ) -> Result<bool> {
+        let changed = sqlx::query(
+            "UPDATE channel_turns \
+             SET status = 'pending', last_error = NULL \
+             WHERE turn_id = ?1 AND status = 'waiting_for_attachments'",
+        )
+        .bind(turn_id.to_string())
+        .execute(&mut **tx)
+        .await
+        .context("failed to mark waiting channel turn pending")?;
+
+        Ok(changed.rows_affected() > 0)
+    }
+
     pub async fn update_answer_checkpoint_sequence(
         &self,
         turn_id: Uuid,
@@ -1531,13 +1588,13 @@ impl ChannelStateStore {
                 .await
                 .context("failed to start pending channel turn claim transaction")?;
             let row = sqlx::query(
-                "SELECT channel_turns.turn_id, session_turns.status AS session_status \
+                "SELECT channel_turns.turn_id, channel_turns.status AS turn_status, session_turns.status AS session_status \
                  FROM channel_turns \
                  LEFT JOIN session_turns ON session_turns.turn_id = channel_turns.turn_id \
                  WHERE channel_turns.channel_id = ?1 \
                    AND channel_turns.session_key = ?2 \
-                   AND channel_turns.status = 'pending' \
-                 ORDER BY channel_turns.queued_at_ms ASC \
+                   AND channel_turns.status IN ('waiting_for_attachments', 'pending', 'running') \
+                 ORDER BY channel_turns.queued_at_ms ASC, COALESCE(session_turns.sequence_no, 0) ASC, channel_turns.turn_id ASC \
                  LIMIT 1",
             )
             .bind(channel_id)
@@ -1554,6 +1611,17 @@ impl ChannelStateStore {
             };
 
             let turn_id_raw: String = row.get("turn_id");
+            let turn_status_raw: String = row.get("turn_status");
+            let turn_status = ChannelTurnStatus::from_str(&turn_status_raw)
+                .map_err(|err| anyhow!(err))
+                .with_context(|| format!("invalid channel turn status '{turn_status_raw}'"))?;
+            if turn_status != ChannelTurnStatus::Pending {
+                tx.commit()
+                    .await
+                    .context("failed to commit blocked channel turn claim transaction")?;
+                return Ok(None);
+            }
+
             let session_status: Option<String> = row.get("session_status");
             if !matches!(
                 session_status.as_deref(),
@@ -1666,10 +1734,19 @@ impl ChannelStateStore {
 
     pub(crate) async fn pending_turn_workers(&self) -> Result<Vec<PendingChannelTurnWorker>> {
         let rows = sqlx::query(
-            "SELECT channel_id, session_key, MIN(queued_at_ms) AS first_queued_at_ms \
-             FROM channel_turns \
-             WHERE status = 'pending' \
-             GROUP BY channel_id, session_key \
+            "WITH next_open_turns AS ( \
+                 SELECT channel_turns.channel_id, channel_turns.session_key, channel_turns.status AS turn_status, channel_turns.queued_at_ms, \
+                        ROW_NUMBER() OVER ( \
+                            PARTITION BY channel_turns.channel_id, channel_turns.session_key \
+                            ORDER BY channel_turns.queued_at_ms ASC, COALESCE(session_turns.sequence_no, 0) ASC, channel_turns.turn_id ASC \
+                        ) AS queue_rank \
+                 FROM channel_turns \
+                 LEFT JOIN session_turns ON session_turns.turn_id = channel_turns.turn_id \
+                 WHERE channel_turns.status IN ('waiting_for_attachments', 'pending', 'running') \
+             ) \
+             SELECT channel_id, session_key, queued_at_ms AS first_queued_at_ms \
+             FROM next_open_turns \
+             WHERE queue_rank = 1 AND turn_status = 'pending' \
              ORDER BY first_queued_at_ms ASC, channel_id ASC, session_key ASC",
         )
         .fetch_all(&self.pool)
@@ -1685,18 +1762,32 @@ impl ChannelStateStore {
             .collect())
     }
 
-    pub async fn has_pending_turns(&self, channel_id: &str, session_key: &str) -> Result<bool> {
+    pub async fn has_claimable_pending_turns(
+        &self,
+        channel_id: &str,
+        session_key: &str,
+    ) -> Result<bool> {
         let row = sqlx::query(
             "SELECT EXISTS( \
-                SELECT 1 FROM channel_turns \
-                WHERE channel_id = ?1 AND session_key = ?2 AND status = 'pending' \
+                SELECT 1 \
+                FROM ( \
+                    SELECT channel_turns.status AS turn_status \
+                    FROM channel_turns \
+                    LEFT JOIN session_turns ON session_turns.turn_id = channel_turns.turn_id \
+                    WHERE channel_turns.channel_id = ?1 \
+                      AND channel_turns.session_key = ?2 \
+                      AND channel_turns.status IN ('waiting_for_attachments', 'pending', 'running') \
+                    ORDER BY channel_turns.queued_at_ms ASC, COALESCE(session_turns.sequence_no, 0) ASC, channel_turns.turn_id ASC \
+                    LIMIT 1 \
+                ) AS next_open_turn \
+                WHERE next_open_turn.turn_status = 'pending' \
              ) AS has_pending",
         )
         .bind(channel_id)
         .bind(session_key)
         .fetch_one(&self.pool)
         .await
-        .context("failed to query pending channel turns")?;
+        .context("failed to query claimable pending channel turns")?;
 
         Ok(row.get::<i64, _>("has_pending") != 0)
     }

@@ -18,6 +18,7 @@ pub const BUILTIN_PRESET_HIDDEN_COMPACTION: &str = "hidden-compaction";
 const WORKSPACE_MOUNT_TARGET: &str = "/workspace";
 const RUNTIME_MOUNT_TARGET: &str = "/runtime";
 const DRAFTS_MOUNT_TARGET: &str = "/drafts";
+const ATTACHMENTS_MOUNT_TARGET: &str = "/attachments";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeExecutionProfile {
@@ -131,6 +132,7 @@ pub struct ExecutionPlanRequest {
     pub working_dir: Option<String>,
     pub env_passthrough_keys: Vec<String>,
     pub skill_mounts: Vec<MountSpec>,
+    pub extra_mounts: Vec<MountSpec>,
     pub timeout_ms: Option<u64>,
 }
 
@@ -153,6 +155,16 @@ pub struct ExecutionPlanner {
     workspace_name: Option<String>,
     default_idle_timeout: Duration,
     default_hard_timeout: Duration,
+}
+
+struct BuildMountsRequest<'a> {
+    session_id: Option<Uuid>,
+    runtime_id: &'a str,
+    preset: &'a ExecutionPreset,
+    runtime_profile: &'a RuntimeExecutionProfile,
+    skill_mounts: &'a [MountSpec],
+    extra_mounts: &'a [MountSpec],
+    purpose: ExecutionPlanPurpose,
 }
 
 impl fmt::Debug for ExecutionPlanner {
@@ -214,14 +226,15 @@ impl ExecutionPlanner {
         )?;
         let (preset_name, preset) =
             self.resolve_preset(request.preset_name.as_deref(), request.purpose)?;
-        let mounts = self.build_mounts(
-            request.session_id,
-            &request.runtime_id,
-            &preset,
-            &runtime_profile,
-            &request.skill_mounts,
-            request.purpose,
-        )?;
+        let mounts = self.build_mounts(BuildMountsRequest {
+            session_id: request.session_id,
+            runtime_id: &request.runtime_id,
+            preset: &preset,
+            runtime_profile: &runtime_profile,
+            skill_mounts: &request.skill_mounts,
+            extra_mounts: &request.extra_mounts,
+            purpose: request.purpose,
+        })?;
         let limits = match &runtime_profile.confinement {
             ConfinementConfig::Oci(config) => config.limits.clone(),
         };
@@ -297,16 +310,8 @@ impl ExecutionPlanner {
         self.runtimes.get(runtime_id)
     }
 
-    fn build_mounts(
-        &self,
-        session_id: Option<Uuid>,
-        runtime_id: &str,
-        preset: &ExecutionPreset,
-        runtime_profile: &RuntimeExecutionProfile,
-        skill_mounts: &[MountSpec],
-        purpose: ExecutionPlanPurpose,
-    ) -> Result<Vec<MountSpec>, String> {
-        if purpose == ExecutionPlanPurpose::HiddenCompaction {
+    fn build_mounts(&self, request: BuildMountsRequest<'_>) -> Result<Vec<MountSpec>, String> {
+        if request.purpose == ExecutionPlanPurpose::HiddenCompaction {
             return Ok(Vec::new());
         }
 
@@ -320,24 +325,24 @@ impl ExecutionPlanner {
             mounts.push(MountSpec {
                 source: workspace_source,
                 target: WORKSPACE_MOUNT_TARGET.to_string(),
-                access: workspace_access_to_mount_access(preset.workspace_access),
+                access: workspace_access_to_mount_access(request.preset.workspace_access),
             });
         }
 
         if let (Some(runtime_root), Some(workspace_name), Some(session_id)) = (
             self.runtime_root.as_ref(),
             self.workspace_name.as_ref(),
-            session_id,
+            request.session_id,
         ) {
             mounts.push(MountSpec {
                 source: runtime_session_state_dir_from_parts(
                     runtime_root,
-                    runtime_id,
+                    request.runtime_id,
                     workspace_name,
                     self.project_workspace_root.as_deref(),
                     session_id,
-                    &runtime_profile.compatibility_key,
-                    &runtime_session_shape_key(preset),
+                    &request.runtime_profile.compatibility_key,
+                    &runtime_session_shape_key(request.preset),
                 ),
                 target: RUNTIME_MOUNT_TARGET.to_string(),
                 access: MountAccess::ReadWrite,
@@ -345,7 +350,7 @@ impl ExecutionPlanner {
             mounts.push(MountSpec {
                 source: runtime_project_drafts_dir_from_parts(
                     runtime_root,
-                    runtime_id,
+                    request.runtime_id,
                     workspace_name,
                     self.project_workspace_root.as_deref(),
                 ),
@@ -354,15 +359,23 @@ impl ExecutionPlanner {
             });
         }
 
-        validate_runtime_skill_mounts(skill_mounts)?;
-        mounts.extend(skill_mounts.iter().cloned());
+        validate_runtime_skill_mounts(request.skill_mounts)?;
+        mounts.extend(request.skill_mounts.iter().cloned());
+        validate_runtime_extra_mounts(request.extra_mounts)?;
+        mounts.extend(request.extra_mounts.iter().cloned());
 
-        match &runtime_profile.confinement {
+        match &request.runtime_profile.confinement {
             ConfinementConfig::Oci(config) => {
                 for mount in &config.additional_mounts {
                     if is_skills_mount_target(&mount.target) {
                         return Err(format!(
                             "runtime additional mount target '{}' is reserved for runtime skill assets",
+                            mount.target
+                        ));
+                    }
+                    if mount_target_is_or_under(&mount.target, ATTACHMENTS_MOUNT_TARGET) {
+                        return Err(format!(
+                            "runtime additional mount target '{}' is reserved for channel attachments",
                             mount.target
                         ));
                     }
@@ -463,6 +476,40 @@ fn validate_runtime_skill_mounts(mounts: &[MountSpec]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn validate_runtime_extra_mounts(mounts: &[MountSpec]) -> Result<(), String> {
+    for mount in mounts {
+        if is_skills_mount_target(&mount.target) {
+            return Err(format!(
+                "runtime extra mount target '{}' is reserved for runtime skill assets",
+                mount.target
+            ));
+        }
+        if ["/workspace", "/runtime", "/drafts"]
+            .iter()
+            .any(|reserved| mount_target_is_or_under(&mount.target, reserved))
+        {
+            return Err(format!(
+                "runtime extra mount target '{}' conflicts with a core runtime mount",
+                mount.target
+            ));
+        }
+        if !mount.target.starts_with('/') {
+            return Err(format!(
+                "runtime extra mount target '{}' must be an absolute path",
+                mount.target
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn mount_target_is_or_under(target: &str, root: &str) -> bool {
+    target == root
+        || target
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn runtime_session_shape_key(preset: &ExecutionPreset) -> String {
@@ -597,6 +644,7 @@ mod tests {
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
                 skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("plan");
@@ -656,6 +704,7 @@ mod tests {
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
                 skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("plan");
@@ -748,6 +797,7 @@ mod tests {
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
                 skill_mounts: vec![skill_mount.clone()],
+                extra_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("plan");
@@ -788,6 +838,7 @@ mod tests {
                     target: "/lionclaw/skills/terminal".to_string(),
                     access: MountAccess::ReadWrite,
                 }],
+                extra_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect_err("runtime skill mounts must be read-only");
@@ -828,6 +879,7 @@ mod tests {
                         target: target.to_string(),
                         access: MountAccess::ReadOnly,
                     }],
+                    extra_mounts: Vec::new(),
                     timeout_ms: None,
                 })
                 .expect_err("runtime skill mount targets must use valid skill aliases");
@@ -882,12 +934,109 @@ mod tests {
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
                 skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect_err("skill namespace is reserved for kernel runtime skill mounts");
 
         assert!(
             err.contains("reserved for runtime skill assets"),
+            "unexpected planner error: {err}"
+        );
+    }
+
+    #[test]
+    fn planner_rejects_extra_mounts_inside_core_mount_targets() {
+        let sandbox = tempdir().expect("temp dir");
+        for target in ["/workspace/input", "/runtime/cache", "/drafts/output"] {
+            let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+                policy: RuntimeExecutionPolicy::default(),
+                default_preset_name: None,
+                presets: BTreeMap::new(),
+                runtimes: BTreeMap::new(),
+                workspace_root: None,
+                project_workspace_root: None,
+                runtime_root: None,
+                workspace_name: None,
+                default_idle_timeout: Duration::from_secs(30),
+                default_hard_timeout: Duration::from_secs(90),
+            });
+
+            let err = planner
+                .plan(ExecutionPlanRequest {
+                    session_id: Some(Uuid::nil()),
+                    runtime_id: "codex".to_string(),
+                    purpose: ExecutionPlanPurpose::Interactive,
+                    preset_name: None,
+                    working_dir: None,
+                    env_passthrough_keys: Vec::new(),
+                    skill_mounts: Vec::new(),
+                    extra_mounts: vec![MountSpec {
+                        source: sandbox.path().join("attachments"),
+                        target: target.to_string(),
+                        access: MountAccess::ReadOnly,
+                    }],
+                    timeout_ms: None,
+                })
+                .expect_err("core runtime mount subtrees are reserved");
+
+            assert!(
+                err.contains("conflicts with a core runtime mount"),
+                "unexpected planner error for {target}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn planner_rejects_runtime_additional_mounts_over_channel_attachments() {
+        let sandbox = tempdir().expect("temp dir");
+        let runtimes = [(
+            "codex".to_string(),
+            RuntimeExecutionProfile::new(
+                ConfinementConfig::Oci(OciConfinementConfig {
+                    additional_mounts: vec![MountSpec {
+                        source: sandbox.path().join("override"),
+                        target: "/attachments/provider".to_string(),
+                        access: MountAccess::ReadWrite,
+                    }],
+                    ..OciConfinementConfig::default()
+                }),
+                "runtime-codex-v1".to_string(),
+                None,
+                None,
+            ),
+        )]
+        .into_iter()
+        .collect();
+        let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: RuntimeExecutionPolicy::default(),
+            default_preset_name: None,
+            presets: BTreeMap::new(),
+            runtimes,
+            workspace_root: None,
+            project_workspace_root: None,
+            runtime_root: None,
+            workspace_name: None,
+            default_idle_timeout: Duration::from_secs(30),
+            default_hard_timeout: Duration::from_secs(90),
+        });
+
+        let err = planner
+            .plan(ExecutionPlanRequest {
+                session_id: Some(Uuid::nil()),
+                runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::Interactive,
+                preset_name: None,
+                working_dir: None,
+                env_passthrough_keys: Vec::new(),
+                skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
+                timeout_ms: None,
+            })
+            .expect_err("channel attachment mount target is kernel-owned");
+
+        assert!(
+            err.contains("reserved for channel attachments"),
             "unexpected planner error: {err}"
         );
     }
@@ -916,6 +1065,7 @@ mod tests {
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
                 skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect_err("plan should fail");
@@ -967,6 +1117,7 @@ mod tests {
                 working_dir: Some(child.to_string_lossy().to_string()),
                 env_passthrough_keys: Vec::new(),
                 skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
                 timeout_ms: Some(45_000),
             })
             .expect("plan");
@@ -1014,6 +1165,7 @@ mod tests {
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
                 skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("plan");
@@ -1049,6 +1201,7 @@ mod tests {
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
                 skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("plan");
@@ -1104,6 +1257,7 @@ mod tests {
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
                 skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("plain plan");
@@ -1116,6 +1270,7 @@ mod tests {
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
                 skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("secreted plan");
@@ -1175,6 +1330,7 @@ mod tests {
                     target: "/lionclaw/skills/terminal".to_string(),
                     access: MountAccess::ReadOnly,
                 }],
+                extra_mounts: Vec::new(),
                 timeout_ms: None,
             })
             .expect("plan");
