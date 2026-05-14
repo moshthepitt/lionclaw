@@ -1165,6 +1165,97 @@ async fn latest_session_snapshot_uses_stream_head_before_first_answer_checkpoint
 }
 
 #[tokio::test]
+async fn bootstrap_recovers_durable_pending_channel_turns() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "recover-pending-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    create_pending_pairing(&kernel, "terminal", "peer-recover", "recover-pairing").await;
+    approve_pairing(&kernel, "terminal", "peer-recover").await;
+    let session_key = direct_session_key("terminal", "peer-recover");
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: session_key.clone(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Conservative),
+        })
+        .await
+        .expect("open channel session");
+
+    let turn_id = uuid::Uuid::new_v4();
+    let inbound_event_id = "recover-pending-event";
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    sqlx::query(
+        "INSERT INTO channel_inbound_events \
+         (event_id, channel_id, sender_ref, conversation_ref, thread_ref, message_ref, text, trigger, attachments_json, reply_to_ref, provider_metadata_json, received_at_ms, created_at_ms) \
+         VALUES (?1, 'terminal', 'peer-recover', 'peer-recover', NULL, ?1, 'recover after restart', 'dm', '[]', NULL, '{}', ?2, ?2)",
+    )
+    .bind(inbound_event_id)
+    .bind(now_ms)
+    .execute(&pool)
+    .await
+    .expect("seed inbound event");
+    sqlx::query(
+        "INSERT INTO session_turns \
+         (turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, runtime_id, started_at_ms, finished_at_ms) \
+         VALUES (?1, ?2, 1, 'normal', 'running', 'recover after restart', 'recover after restart', '', NULL, NULL, 'mock', ?3, NULL)",
+    )
+    .bind(turn_id.to_string())
+    .bind(session.session_id.to_string())
+    .bind(now_ms)
+    .execute(&pool)
+    .await
+    .expect("seed running session turn");
+    sqlx::query(
+        "INSERT INTO channel_turns \
+         (turn_id, channel_id, session_key, session_id, inbound_event_id, runtime_id, status, last_error, answer_checkpoint_sequence, queued_at_ms, started_at_ms, finished_at_ms) \
+         VALUES (?1, 'terminal', ?2, ?3, ?4, 'mock', 'pending', NULL, NULL, ?5, NULL, NULL)",
+    )
+    .bind(turn_id.to_string())
+    .bind(&session_key)
+    .bind(session.session_id.to_string())
+    .bind(inbound_event_id)
+    .bind(now_ms)
+    .execute(&pool)
+    .await
+    .expect("seed pending channel turn");
+
+    let restarted = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+    wait_for_latest_turn(
+        &restarted,
+        session.session_id,
+        |turn| turn.turn_id == turn_id && turn.status == SessionTurnStatus::Completed,
+        "bootstrap recovered pending channel turn",
+    )
+    .await;
+
+    let (session_status, channel_status): (String, String) = sqlx::query_as(
+        "SELECT session_turns.status, channel_turns.status \
+         FROM session_turns \
+         JOIN channel_turns ON channel_turns.turn_id = session_turns.turn_id \
+         WHERE session_turns.turn_id = ?1",
+    )
+    .bind(turn_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query recovered turn statuses");
+    assert_eq!(session_status, "completed");
+    assert_eq!(channel_status, "completed");
+}
+
+#[tokio::test]
 async fn channel_session_actions_return_immediately_and_respect_peer_blocking() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "terminal", "action-skill").await;

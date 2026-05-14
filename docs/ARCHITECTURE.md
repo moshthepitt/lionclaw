@@ -377,8 +377,9 @@ Answer-lane text is checkpointed while a turn is still running so restart
 reconciliation can preserve partial replies already emitted to the user.
 Channel-backed running turns also persist the exact stream sequence through
 which the durable assistant checkpoint is synchronized. Channels v2 stores
-provider facts without message text in `channel_inbound_events`, admits work
-through scoped grants, and derives deterministic session keys such as
+normalized provider facts, including text and attachment descriptors, in
+`channel_inbound_events`, admits work through scoped grants, and derives
+deterministic session keys such as
 `channel:<channel_id>:direct:<sender_ref>`. Worker-supplied runtime selection is
 not part of the inbound channel contract; the kernel resolves runtime execution
 from the instance/default runtime configuration.
@@ -386,7 +387,9 @@ Session-key components escape `:` and `%` so provider refs such as
 `telegram:chat:-123` remain unambiguous.
 
 Kernel bootstrap converts stale `running` session turns into durable
-`interrupted` turns before they can be reused.
+`interrupted` turns before they can be reused. Durable pending channel turns are
+not interrupted on restart; bootstrap re-drives their channel workers so
+accepted inbound work is recoverable after commit.
 
 ## Assistant Continuity
 
