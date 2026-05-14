@@ -363,7 +363,7 @@ prompts:
 
 `session_turns` is the durable source of truth for prompt history. It records:
 
-- `kind = normal | retry | continue`
+- `kind = normal | retry | continue | runtime_control`
 - `status = running | completed | failed | timed_out | cancelled | interrupted`
 - `display_user_text`
 - `prompt_user_text`
