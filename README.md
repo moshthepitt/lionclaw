@@ -1,59 +1,117 @@
 # LionClaw
 
-LionClaw turns real agent CLIs into local assistants. It gives agents such as
-Codex a project home, durable sessions, explicit local state, channels,
-scheduled work, and a small trusted Rust core that owns the boundary around
-each run.
+LionClaw runs real agent CLIs as project assistants.
 
-The everyday path is command-first:
+Codex is still Codex. OpenCode is still OpenCode. LionClaw is the local control
+plane around them: project identity, runtime configuration, durable sessions,
+local state, channels, scheduled work, and an audit trail.
 
-```bash
-lionclaw project init
-lionclaw configure --runtime codex
-lionclaw run
-```
-
-Add channels and background operation when you need the assistant to stay
-reachable beyond the current terminal:
-
-```bash
-lionclaw connect terminal
-lionclaw connect telegram
-lionclaw up
-lionclaw status
-lionclaw logs -f
-lionclaw doctor
-```
-
-Use `./target/release/lionclaw` from a source checkout if the binary is not on
-your `PATH`.
-
-## Install From Source
+Use the agent harness you want. Keep the boundary around your project yours.
 
 ```bash
 git clone https://github.com/moshthepitt/lionclaw.git
 cd lionclaw
 cargo build --release
+export PATH="$PWD/target/release:$PATH"
+
+cd /path/to/your/project
+lionclaw doctor
 ```
 
-`lionclaw run` currently supports Unix-like systems. Managed background paths,
-including `lionclaw up` and background channels, currently require Linux with a
-systemd user manager.
+`doctor` points at the next setup problem. Fix, rerun, repeat.
 
-## What LionClaw Owns
+## Why LionClaw
 
-LionClaw owns the local boundary and the product entrypoint:
+AI is going to matter. Probably a lot.
 
-- project and instance selection
-- runtime configuration and launch
-- work-root, runtime-state, draft, skill, and secret mounts
-- durable sessions and audit records
-- channel bindings and background units
-- scheduler-owned runs
+And if it is going to matter, then we should not sleepwalk into a future where
+a handful of large companies own the agents, the memory, the tools, the
+workflows, the credentials, the logs, and eventually the shape of the work
+itself. We have seen this movie before. It was called Web 2.0, and it ended
+with everyone renting their own lives back from platforms.
 
-The runtime remains the real agent harness. Codex still runs as Codex; LionClaw
-controls where it runs, what local state it sees, which credentials are staged,
-and which LionClaw-owned decisions are recorded.
+LionClaw is a small refusal of that future.
+
+The model may be commercial. That is fine. The agent harness may be Codex,
+OpenCode, Claude Code, Gemini CLI, or something better that appears next month.
+Also fine. But the boundary around the agent should belong to you: the project
+it runs in, the state it sees, the credentials it receives, the channels that
+can reach it, the jobs it runs, and the audit trail it leaves behind.
+
+LionClaw keeps that boundary local, explicit, and swappable.
+
+This matters because the future probably will not have one agent. It will have
+many agent harnesses, each good at different things, each with its own strange
+little strengths and weaknesses. LionClaw gives one project a stable assistant
+home while those runtimes come and go.
+
+It is also intentionally small. Not because small is cute, but because small is
+auditable. Small can be understood. Small can be changed by one person with a
+weekend, a grudge, and a good enough reason.
+
+That is the bet: real agents, local boundaries, user-owned control.
+
+## How LionClaw Works
+
+A LionClaw project is a normal project with a `.lionclaw/` directory.
+
+That directory is the local control plane. It holds the project identity,
+instances, runtime profiles, sessions, audit records, installed skills, channel
+bindings, jobs, and runtime-private state.
+
+When you run:
+
+```bash
+lionclaw run
+```
+
+LionClaw resolves the project, selects an instance, builds the confined runtime
+workspace, stages the local state and credentials that runtime needs, then
+launches the real agent CLI.
+
+The selected runtime still does the agent work. LionClaw owns the boundary
+around it: the project it runs in, the state it sees, the mounts it receives,
+the credentials that are staged, the durable session, and the record of what
+happened.
+
+That is the split: the runtime does the agent work. LionClaw decides where it
+runs, what it can see, and what gets recorded.
+
+## Set Up A Project
+
+Run `doctor` from the project you want LionClaw to own:
+
+```bash
+cd /path/to/your/project
+lionclaw doctor
+```
+
+Follow the repair commands until `doctor` is clean. Then run the configured
+runtime:
+
+```bash
+lionclaw run
+```
+
+For Codex, use a logged-in Codex CLI. If `run` reports a missing runtime image,
+build or provide the image named in the error. The bundled image definition
+lives at `containers/runtime/Containerfile`.
+
+`doctor` checks setup. `run` checks launch. Use `lionclaw --help` and
+subcommand `--help` for current syntax.
+
+Runtime auth stays runtime-specific. LionClaw stages only the runtime-local auth
+files needed for the confined launch.
+
+Confined runtime layout:
+
+- `/workspace`: selected work root
+- `/runtime`: runtime-private writable state
+- `/drafts`: runtime-private draft/output area
+- `/lionclaw/skills/<alias>`: installed non-channel skill assets
+
+Network policy is intentionally coarse today: `on` or `none`. `on` uses the
+Podman network namespace, not host networking.
 
 ## Projects And Instances
 
@@ -67,108 +125,41 @@ at the project root, and `instance create <name>` does the same unless you pass
 `--work-root PATH`. The confined runtime sees the selected work root at
 `/workspace`.
 
-Targeting is explicit:
-
-```bash
-lionclaw run
-lionclaw --instance reviewer run
-lionclaw --project /path/to/project --instance reviewer run
-```
-
 Without `--home` or `--project`, LionClaw discovers only the current directory
 and its immediate parent. Use `--home PATH` when you need to target one exact
-instance home and bypass project discovery.
+instance home and bypass project discovery. Use `lionclaw instance --help` for
+the current instance commands.
 
-## Runtimes
-
-The current happy path configures Codex:
-
-```bash
-lionclaw configure --runtime codex
-lionclaw run
-```
-
-Runtime auth stays runtime-specific. For Codex, sign in with Codex on the host
-first, then let LionClaw stage only the runtime-local auth files needed for the
-confined launch.
-
-Confined runtime layout:
-
-- `/workspace`: selected work root
-- `/runtime`: runtime-private writable state
-- `/drafts`: runtime-private draft/output area
-- `/lionclaw/skills/<alias>`: installed non-channel skill assets
-
-Network policy is intentionally coarse today: `on` or `none`. `on` uses the
-Podman network namespace, not host networking.
-
-## Channels
+## Channels And Background Work
 
 Channels are skills that run outside the Rust core. They connect LionClaw to a
 transport without baking Telegram, terminal UI, Slack, or future integrations
 into the trusted kernel.
 
-```bash
-lionclaw connect terminal
-lionclaw connect telegram --env-file ./telegram.env
-lionclaw channel list
-lionclaw channel remove telegram
-```
-
 Interactive channels run in the current terminal. Background channels are
 managed through the platform backend and store required channel env in the
 selected instance home, not in accidental shell state.
 
-## Background Operation
-
-Use the managed path when you want the selected instance to run background
-workers and scheduled jobs:
-
-```bash
-lionclaw up
-lionclaw status
-lionclaw logs -f
-lionclaw down
-```
-
-Project-wide forms are explicit:
-
-```bash
-lionclaw up --all
-lionclaw down --all
-lionclaw logs --all --tail 200
-lionclaw doctor --all
-```
+Use `lionclaw up` when you want LionClaw to stay reachable after the current
+terminal is gone. Use command help for current channel and background syntax.
 
 ## Jobs
 
 Jobs run time-based prompts in fresh isolated sessions and can deliver the
 final result through a configured channel.
 
-```bash
-lionclaw job add daily-brief \
-  --runtime codex \
-  --schedule "every 1d" \
-  --prompt "Inspect the current work root and send a short engineering brief." \
-  --deliver-channel terminal \
-  --deliver-peer "$USER"
-
-lionclaw job ls
-lionclaw job show <job-id>
-lionclaw job run <job-id>
-lionclaw job pause <job-id>
-lionclaw job resume <job-id>
-lionclaw job rm <job-id>
-```
-
-`job run` works even when a job is paused. Pausing stops automatic firing; it
-does not block operator-triggered test runs.
+They are configured through `lionclaw job`. Use `lionclaw job --help` for the
+current command surface.
 
 ## Doctor
 
 `lionclaw doctor` is read-only. It diagnoses target resolution, project state,
 runtime config, channels, managed units, and configured bind drift without
 allocating ports, starting units, stopping units, or changing files.
+
+If no project exists in the current directory or its immediate parent, `doctor`
+treats the current directory as the diagnostic target and tells you how to
+initialize it.
 
 Findings render as stable runbook entries:
 
@@ -182,6 +173,12 @@ note: stop the process shown by inspect
 ```
 
 Warnings alone exit 0, errors exit 1, and internal doctor failures exit 2.
+
+## Requirements
+
+`lionclaw run` currently supports Unix-like systems. Managed background paths,
+including `lionclaw up` and background channels, currently require Linux with a
+systemd user manager.
 
 ## State Layout
 
