@@ -8,6 +8,7 @@ pub mod core;
 pub mod db;
 pub mod drafts;
 pub mod error;
+pub mod input_routing;
 pub mod jobs;
 pub mod policy;
 pub mod runtime;

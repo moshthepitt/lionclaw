@@ -65,6 +65,30 @@ pub type ExecutionOutput = super::process::ProcessOutput;
 
 pub type ExecutionStdoutSender = mpsc::UnboundedSender<String>;
 
+pub enum ExecutionSession {
+    Oci(super::oci::OciExecutionSession),
+}
+
+impl ExecutionSession {
+    pub async fn write_line(&mut self, line: &str) -> Result<()> {
+        match self {
+            Self::Oci(session) => session.write_line(line).await,
+        }
+    }
+
+    pub async fn read_line(&mut self) -> Result<Option<String>> {
+        match self {
+            Self::Oci(session) => session.read_line().await,
+        }
+    }
+
+    pub async fn shutdown(self) -> Result<ExecutionOutput> {
+        match self {
+            Self::Oci(session) => session.shutdown().await,
+        }
+    }
+}
+
 #[async_trait]
 pub trait ExecutionBackend: Send + Sync {
     fn kind(&self) -> ConfinementBackend;
@@ -74,6 +98,8 @@ pub trait ExecutionBackend: Send + Sync {
         request: ExecutionRequest,
         stdout: ExecutionStdoutSender,
     ) -> Result<ExecutionOutput>;
+
+    async fn spawn_interactive(&self, request: ExecutionRequest) -> Result<ExecutionSession>;
 }
 
 pub async fn execute_streaming(
@@ -82,6 +108,12 @@ pub async fn execute_streaming(
 ) -> Result<ExecutionOutput> {
     match request.plan.confinement.backend() {
         ConfinementBackend::Oci => OciExecutionBackend.execute_streaming(request, stdout).await,
+    }
+}
+
+pub async fn spawn_interactive(request: ExecutionRequest) -> Result<ExecutionSession> {
+    match request.plan.confinement.backend() {
+        ConfinementBackend::Oci => OciExecutionBackend.spawn_interactive(request).await,
     }
 }
 

@@ -63,6 +63,7 @@ use super::{
     db::Db,
     drafts,
     error::KernelError,
+    input_routing::{classify_input, ClassifiedInput, RuntimeControlCommand},
     jobs::{
         compute_initial_next_run, JobDeliveryTarget, JobSchedule, JobStore, NewSchedulerJob,
         SchedulerJobDeliveryStatus, SchedulerJobRecord, SchedulerJobRunRecord,
@@ -70,13 +71,15 @@ use super::{
     },
     policy::{Capability, PolicyStore, Scope},
     runtime::{
-        execute_program_backed_turn, project_runtime_skills, register_builtin_runtime_adapters,
+        project_runtime_skills, register_builtin_runtime_adapters,
         resolve_oci_image_compatibility_identity, skill_mount_target, EffectiveExecutionPlan,
         ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
         ExecutionPreset, HiddenTurnSupport, MountAccess, MountSpec, NetworkMode, RuntimeAdapter,
-        RuntimeCapabilityRequest, RuntimeCapabilityResult, RuntimeEvent, RuntimeExecutionProfile,
-        RuntimeMessageLane, RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle,
-        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
+        RuntimeCapabilityRequest, RuntimeCapabilityResult, RuntimeControlExecution,
+        RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent,
+        RuntimeExecutionProfile, RuntimeMessageLane, RuntimeProgramTurnExecution, RuntimeRegistry,
+        RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
+        RuntimeTurnMode, RuntimeTurnResult,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -797,7 +800,7 @@ impl Kernel {
                 SessionTurnExecution {
                     turn_id: Uuid::new_v4(),
                     kind: SessionTurnKind::Continue,
-                    display_user_text: "/continue".to_string(),
+                    display_user_text: "/lionclaw continue".to_string(),
                     prompt_user_text: "Continue your previous assistant reply from where it stopped. Do not restart from the beginning unless necessary.".to_string(),
                     requested_runtime_id: Some(
                         runtime_id_override
@@ -811,12 +814,13 @@ impl Kernel {
                     sink,
                     emit_channel_stream_done: true,
                     audit_actor: "api".to_string(),
+                    runtime_control_origin: RuntimeControlOrigin::SessionTurn,
                 }
             }
             SessionActionKind::RetryLastTurn => SessionTurnExecution {
                 turn_id: Uuid::new_v4(),
                 kind: SessionTurnKind::Retry,
-                display_user_text: "/retry".to_string(),
+                display_user_text: "/lionclaw retry".to_string(),
                 prompt_user_text: latest_turn.prompt_user_text,
                 requested_runtime_id: Some(
                     runtime_id_override
@@ -830,6 +834,7 @@ impl Kernel {
                 sink,
                 emit_channel_stream_done: true,
                 audit_actor: "api".to_string(),
+                runtime_control_origin: RuntimeControlOrigin::SessionTurn,
             },
             SessionActionKind::ResetSession => {
                 return Err(KernelError::BadRequest(
@@ -2356,15 +2361,17 @@ impl Kernel {
             match adapter.turn_mode() {
                 RuntimeTurnMode::Direct => adapter.turn(turn_input, event_tx).await,
                 RuntimeTurnMode::ProgramBacked => {
-                    execute_program_backed_turn(
-                        adapter.as_ref(),
-                        execution_plan,
-                        runtime_secrets_mount,
-                        self.codex_home_override.clone(),
-                        turn_input,
-                        event_tx,
-                    )
-                    .await
+                    adapter
+                        .program_backed_turn(
+                            RuntimeProgramTurnExecution {
+                                input: turn_input,
+                                plan: execution_plan,
+                                runtime_secrets_mount,
+                                codex_home_override: self.codex_home_override.clone(),
+                            },
+                            event_tx,
+                        )
+                        .await
                 }
             }
         })
@@ -2521,6 +2528,7 @@ impl Kernel {
                 sink: None,
                 emit_channel_stream_done: true,
                 audit_actor: "scheduler".to_string(),
+                runtime_control_origin: RuntimeControlOrigin::SessionTurn,
             },
         )
         .await
@@ -4219,10 +4227,46 @@ fn summarize_runtime_events(events: &[RuntimeEvent]) -> SessionTurnArtifacts {
     }
 }
 
+fn runtime_events_to_views(events: &[RuntimeEvent]) -> Vec<StreamEventDto> {
+    events.iter().cloned().map(to_stream_event_view).collect()
+}
+
 fn runtime_events_include_error(events: &[RuntimeEvent]) -> bool {
     events
         .iter()
         .any(|event| matches!(event, RuntimeEvent::Error { .. }))
+}
+
+fn runtime_control_turn_status(outcome: &RuntimeControlOutcome) -> SessionTurnStatus {
+    match outcome {
+        RuntimeControlOutcome::Failed { .. } => SessionTurnStatus::Failed,
+        RuntimeControlOutcome::Handled { .. }
+        | RuntimeControlOutcome::Unsupported { .. }
+        | RuntimeControlOutcome::InteractiveOnly { .. } => SessionTurnStatus::Completed,
+    }
+}
+
+fn runtime_control_outcome_event(outcome: &RuntimeControlOutcome) -> RuntimeEvent {
+    match outcome {
+        RuntimeControlOutcome::Failed { code, message } => RuntimeEvent::Error {
+            code: code
+                .clone()
+                .or_else(|| Some("runtime.control.failed".to_string())),
+            text: message.clone(),
+        },
+        RuntimeControlOutcome::Handled { message } => RuntimeEvent::Status {
+            code: Some("runtime.control.handled".to_string()),
+            text: message.clone(),
+        },
+        RuntimeControlOutcome::Unsupported { message } => RuntimeEvent::Status {
+            code: Some("runtime.control.unsupported".to_string()),
+            text: message.clone(),
+        },
+        RuntimeControlOutcome::InteractiveOnly { message } => RuntimeEvent::Status {
+            code: Some("runtime.control.interactive_only".to_string()),
+            text: message.clone(),
+        },
+    }
 }
 
 fn last_runtime_error(events: &[RuntimeEvent]) -> Option<(String, String)> {
@@ -4289,6 +4333,41 @@ struct RuntimeTurnExecution<'a> {
     event_sink: Option<RuntimeEventSink>,
 }
 
+struct RuntimeControlTurnExecution<'a> {
+    adapter: Arc<dyn RuntimeAdapter>,
+    turn_id: Uuid,
+    runtime_id: &'a str,
+    session_id: Uuid,
+    handle: &'a RuntimeSessionHandle,
+    execution_plan: EffectiveExecutionPlan,
+    idle_timeout: Duration,
+    hard_timeout: Duration,
+    input: RuntimeControlInput,
+    stream_context: Option<ChannelStreamContext>,
+    event_sink: Option<RuntimeEventSink>,
+}
+
+struct CollectedRuntimeControl {
+    events: Vec<RuntimeEvent>,
+    outcome: RuntimeControlOutcome,
+}
+
+struct RuntimeControlSessionExecution<'a> {
+    session: &'a super::sessions::Session,
+    persisted_turn: SessionTurnRecord,
+    control: RuntimeControlCommand,
+    runtime_control_origin: RuntimeControlOrigin,
+    adapter: Arc<dyn RuntimeAdapter>,
+    runtime_id: String,
+    runtime_skill_ids: Vec<String>,
+    execution_plan: EffectiveExecutionPlan,
+    handle: RuntimeSessionHandle,
+    channel_stream_context: Option<ChannelStreamContext>,
+    emit_channel_stream_done: bool,
+    sink: Option<RuntimeEventSink>,
+    audit_actor: String,
+}
+
 struct SessionTurnExecution {
     turn_id: Uuid,
     kind: SessionTurnKind,
@@ -4302,6 +4381,7 @@ struct SessionTurnExecution {
     sink: Option<RuntimeEventSink>,
     emit_channel_stream_done: bool,
     audit_actor: String,
+    runtime_control_origin: RuntimeControlOrigin,
 }
 
 struct RuntimeExecutionSkills {
@@ -4457,6 +4537,7 @@ impl Kernel {
                 sink,
                 emit_channel_stream_done: true,
                 audit_actor: "api".to_string(),
+                runtime_control_origin: RuntimeControlOrigin::SessionTurn,
             },
         )
         .await
@@ -4490,7 +4571,36 @@ impl Kernel {
             sink,
             emit_channel_stream_done,
             audit_actor,
+            runtime_control_origin,
         } = execution;
+        let mut kind = kind;
+        let mut display_user_text = display_user_text;
+        let mut prompt_user_text = prompt_user_text;
+        let mut runtime_control = None;
+
+        if kind == SessionTurnKind::Normal {
+            match classify_input(&prompt_user_text) {
+                ClassifiedInput::Empty => {
+                    return Err(KernelError::BadRequest("user_text is required".to_string()));
+                }
+                ClassifiedInput::Prompt(prompt) => {
+                    display_user_text = prompt.clone();
+                    prompt_user_text = prompt;
+                }
+                ClassifiedInput::LionClawControl(control) => {
+                    return Err(KernelError::BadRequest(format!(
+                        "LionClaw command '/lionclaw {}' is not available through normal turn routing",
+                        control.command_name
+                    )));
+                }
+                ClassifiedInput::RuntimeControl(control) => {
+                    display_user_text = control.raw.clone();
+                    prompt_user_text.clear();
+                    kind = SessionTurnKind::RuntimeControl;
+                    runtime_control = Some(control);
+                }
+            }
+        }
 
         let channel_stream_context = self
             .channel_stream_context_for_session(
@@ -4582,6 +4692,26 @@ impl Kernel {
                 return Err(KernelError::Runtime(error_text));
             }
         };
+
+        if let Some(control) = runtime_control {
+            return self
+                .execute_session_runtime_control(RuntimeControlSessionExecution {
+                    session,
+                    persisted_turn,
+                    control,
+                    runtime_control_origin,
+                    adapter,
+                    runtime_id,
+                    runtime_skill_ids,
+                    execution_plan,
+                    handle,
+                    channel_stream_context: channel_stream_context.clone(),
+                    emit_channel_stream_done,
+                    sink,
+                    audit_actor,
+                })
+                .await;
+        }
 
         let prompt_envelope = self
             .build_prompt_envelope(
@@ -4899,6 +5029,258 @@ impl Kernel {
             runtime_skill_ids,
             runtime_id,
             stream_events: artifacts.event_views,
+        })
+    }
+
+    async fn execute_session_runtime_control(
+        &self,
+        execution: RuntimeControlSessionExecution<'_>,
+    ) -> Result<SessionTurnResponse, KernelError> {
+        let RuntimeControlSessionExecution {
+            session,
+            persisted_turn,
+            control,
+            runtime_control_origin,
+            adapter,
+            runtime_id,
+            runtime_skill_ids,
+            execution_plan,
+            handle,
+            channel_stream_context,
+            emit_channel_stream_done,
+            sink,
+            audit_actor,
+        } = execution;
+        let channel_stream_finalizer = ChannelStreamFinalizer {
+            stream_context: &channel_stream_context,
+            emit_done: emit_channel_stream_done,
+        };
+        let turn_id = persisted_turn.turn_id;
+
+        self.audit
+            .append(
+                "runtime.control.route",
+                Some(session.session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "turn_id": turn_id,
+                    "runtime_id": runtime_id.clone(),
+                    "origin": runtime_control_origin.as_str(),
+                    "command_name": control.command_name.clone(),
+                }),
+            )
+            .await
+            .map_err(internal)?;
+
+        let control_result = self
+            .execute_runtime_control(RuntimeControlTurnExecution {
+                adapter: Arc::clone(&adapter),
+                turn_id,
+                runtime_id: &runtime_id,
+                session_id: session.session_id,
+                handle: &handle,
+                execution_plan: execution_plan.clone(),
+                idle_timeout: execution_plan.idle_timeout,
+                hard_timeout: execution_plan.hard_timeout,
+                input: RuntimeControlInput {
+                    runtime_session_id: handle.runtime_session_id.clone(),
+                    raw: control.raw.clone(),
+                    command_name: control.command_name.clone(),
+                    arguments: control.arguments.clone(),
+                    origin: runtime_control_origin,
+                    runtime_skill_ids: runtime_skill_ids.clone(),
+                },
+                stream_context: channel_stream_context.clone(),
+                event_sink: sink.clone(),
+            })
+            .await;
+
+        let runtime_control = match control_result {
+            Ok(output) => output,
+            Err(turn_err) => {
+                self.clear_runtime_session_ready(&execution_plan).await;
+                if let Err(err) = self
+                    .close_runtime_session(
+                        Arc::clone(&adapter),
+                        &runtime_id,
+                        session.session_id,
+                        &handle,
+                    )
+                    .await
+                {
+                    warn!(?err, runtime_id, session_id = %session.session_id, "failed to close runtime session after runtime-control error");
+                }
+                let assistant_text = assistant_text_from_events(&turn_err.events);
+                let stream_error_emitted = runtime_events_include_error(&turn_err.events);
+                self.persist_failed_session_turn(
+                    session,
+                    &persisted_turn,
+                    FailedSessionTurnCompletion {
+                        assistant_text,
+                        error_code: turn_err.error_code.clone(),
+                        error_text: turn_err.error_text.clone(),
+                        stream_error_emitted,
+                    },
+                    channel_stream_finalizer,
+                )
+                .await?;
+                return Err(kernel_error_for_turn_status(
+                    turn_err.status,
+                    turn_err.error_text,
+                ));
+            }
+        };
+
+        let close_result = self
+            .close_runtime_session(
+                Arc::clone(&adapter),
+                &runtime_id,
+                session.session_id,
+                &handle,
+            )
+            .await;
+        if let Err(err) = close_result {
+            self.clear_runtime_session_ready(&execution_plan).await;
+            let message = err.to_string();
+            self.persist_failed_session_turn(
+                session,
+                &persisted_turn,
+                FailedSessionTurnCompletion {
+                    assistant_text: runtime_control.outcome.message().to_string(),
+                    error_code: "runtime.error".to_string(),
+                    error_text: message.clone(),
+                    stream_error_emitted: false,
+                },
+                channel_stream_finalizer,
+            )
+            .await?;
+            return Err(KernelError::Runtime(message));
+        }
+
+        let outcome_event = runtime_control_outcome_event(&runtime_control.outcome);
+        let mut runtime_events = runtime_control.events;
+        let mut checkpoints = AssistantCheckpointState::default();
+        if let Err(turn_err) = self
+            .record_runtime_event(
+                turn_id,
+                &channel_stream_context,
+                &sink,
+                outcome_event,
+                &mut runtime_events,
+                &mut checkpoints,
+            )
+            .await
+        {
+            self.clear_runtime_session_ready(&execution_plan).await;
+            self.persist_failed_session_turn(
+                session,
+                &persisted_turn,
+                FailedSessionTurnCompletion {
+                    assistant_text: assistant_text_from_events(&turn_err.events),
+                    error_code: turn_err.error_code.clone(),
+                    error_text: turn_err.error_text.clone(),
+                    stream_error_emitted: runtime_events_include_error(&turn_err.events),
+                },
+                channel_stream_finalizer,
+            )
+            .await?;
+            return Err(kernel_error_for_turn_status(
+                turn_err.status,
+                turn_err.error_text,
+            ));
+        }
+
+        let status = runtime_control_turn_status(&runtime_control.outcome);
+        let assistant_text = runtime_control.outcome.message().to_string();
+        let error_code = if status == SessionTurnStatus::Failed {
+            runtime_control
+                .outcome
+                .error_code()
+                .map(str::to_string)
+                .or_else(|| Some("runtime.control.failed".to_string()))
+        } else {
+            None
+        };
+        let error_text = (status == SessionTurnStatus::Failed).then(|| assistant_text.clone());
+
+        self.session_turns
+            .complete_turn(
+                turn_id,
+                SessionTurnCompletion {
+                    status,
+                    assistant_text: assistant_text.clone(),
+                    error_code: error_code.clone(),
+                    error_text: error_text.clone(),
+                },
+            )
+            .await
+            .map_err(internal)?;
+        if let Some(stream_context) = &channel_stream_context {
+            self.emit_turn_completed_snapshot(stream_context, &assistant_text)
+                .await?;
+        }
+        self.emit_channel_stream_done_if_requested(channel_stream_finalizer)
+            .await?;
+        self.sessions
+            .record_turn(session.session_id)
+            .await
+            .map_err(internal)?;
+        if matches!(
+            &runtime_control.outcome,
+            RuntimeControlOutcome::Handled { .. }
+        ) {
+            self.mark_runtime_session_ready(&execution_plan).await;
+        }
+
+        self.audit
+            .append(
+                "runtime.control.outcome",
+                Some(session.session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "turn_id": turn_id,
+                    "runtime_id": runtime_id.clone(),
+                    "origin": runtime_control_origin.as_str(),
+                    "command_name": control.command_name.clone(),
+                    "outcome": runtime_control.outcome.kind(),
+                    "message_len": assistant_text.len(),
+                    "error_code": error_code,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+        self.audit
+            .append(
+                "session.turn",
+                Some(session.session_id),
+                Some(audit_actor),
+                json!({
+                    "turn_id": turn_id,
+                    "runtime_id": runtime_id.clone(),
+                    "runtime_skill_ids": runtime_skill_ids.clone(),
+                    "prompt_len": 0,
+                    "runtime_input_kind": "runtime_control",
+                    "runtime_preset_name": execution_plan.preset_name,
+                    "runtime_working_dir": execution_plan.working_dir,
+                    "runtime_idle_timeout_ms": execution_plan.idle_timeout.as_millis() as u64,
+                    "runtime_hard_timeout_ms": execution_plan.hard_timeout.as_millis() as u64,
+                    "runtime_env_passthrough_count": execution_plan.environment.len(),
+                }),
+            )
+            .await
+            .map_err(internal)?;
+
+        if status == SessionTurnStatus::Failed {
+            return Err(KernelError::Runtime(assistant_text));
+        }
+
+        Ok(SessionTurnResponse {
+            session_id: session.session_id,
+            turn_id,
+            assistant_text,
+            runtime_skill_ids,
+            runtime_id,
+            stream_events: runtime_events_to_views(&runtime_events),
         })
     }
 
@@ -5803,6 +6185,7 @@ impl Kernel {
                     sink: None,
                     emit_channel_stream_done: false,
                     audit_actor: "kernel".to_string(),
+                    runtime_control_origin: RuntimeControlOrigin::ChannelInbound,
                 },
             )
             .await;
@@ -6207,15 +6590,17 @@ impl Kernel {
             match adapter_for_task.turn_mode() {
                 RuntimeTurnMode::Direct => adapter_for_task.turn(input, event_tx).await,
                 RuntimeTurnMode::ProgramBacked => {
-                    execute_program_backed_turn(
-                        adapter_for_task.as_ref(),
-                        execution_plan,
-                        runtime_secrets_mount,
-                        codex_home_override,
-                        input,
-                        event_tx,
-                    )
-                    .await
+                    adapter_for_task
+                        .program_backed_turn(
+                            RuntimeProgramTurnExecution {
+                                input,
+                                plan: execution_plan,
+                                runtime_secrets_mount,
+                                codex_home_override,
+                            },
+                            event_tx,
+                        )
+                        .await
                 }
             }
         });
@@ -6429,6 +6814,351 @@ impl Kernel {
                 }
             }
         }
+    }
+
+    async fn execute_runtime_control(
+        &self,
+        execution: RuntimeControlTurnExecution<'_>,
+    ) -> Result<CollectedRuntimeControl, FailedRuntimeTurn> {
+        let RuntimeControlTurnExecution {
+            adapter,
+            turn_id,
+            runtime_id,
+            session_id,
+            handle,
+            execution_plan,
+            idle_timeout,
+            hard_timeout,
+            input,
+            stream_context,
+            event_sink,
+        } = execution;
+        let idle_timeout_ms = idle_timeout.as_millis() as u64;
+        let hard_timeout_ms = hard_timeout.as_millis() as u64;
+        self.audit
+            .append(
+                "runtime.control.start",
+                Some(session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "runtime_id": runtime_id,
+                    "runtime_session_id": handle.runtime_session_id,
+                    "origin": input.origin.as_str(),
+                    "command_name": input.command_name.clone(),
+                    "idle_timeout_ms": idle_timeout_ms,
+                    "hard_timeout_ms": hard_timeout_ms,
+                }),
+            )
+            .await
+            .map_err(|err| FailedRuntimeTurn {
+                events: Vec::new(),
+                status: SessionTurnStatus::Failed,
+                error_code: "runtime.error".to_string(),
+                error_text: err.to_string(),
+            })?;
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let adapter_for_task = Arc::clone(&adapter);
+        let runtime_secrets_mount = self
+            .resolve_runtime_secrets_mount(&execution_plan)
+            .await
+            .map_err(|err| FailedRuntimeTurn {
+                events: Vec::new(),
+                status: SessionTurnStatus::Failed,
+                error_code: "runtime.error".to_string(),
+                error_text: err.to_string(),
+            })?;
+        let codex_home_override = self.codex_home_override.clone();
+        let mut control_task = tokio::spawn(async move {
+            adapter_for_task
+                .runtime_control(
+                    RuntimeControlExecution {
+                        input,
+                        plan: execution_plan,
+                        runtime_secrets_mount,
+                        codex_home_override,
+                    },
+                    event_tx,
+                )
+                .await
+        });
+        let idle_sleep = sleep(idle_timeout);
+        tokio::pin!(idle_sleep);
+        let hard_sleep = sleep(hard_timeout);
+        tokio::pin!(hard_sleep);
+        let mut events = Vec::new();
+        let mut checkpoints = AssistantCheckpointState::default();
+
+        loop {
+            tokio::select! {
+                maybe_event = event_rx.recv() => {
+                    match maybe_event {
+                        Some(event) => {
+                            self.record_runtime_event(
+                                turn_id,
+                                &stream_context,
+                                &event_sink,
+                                event,
+                                &mut events,
+                                &mut checkpoints,
+                            )
+                            .await?;
+                            idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
+                        }
+                        None => {
+                            if control_task.is_finished() {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                output = &mut control_task => {
+                    while let Some(event) = event_rx.recv().await {
+                        self.record_runtime_event(
+                            turn_id,
+                            &stream_context,
+                            &event_sink,
+                            event,
+                            &mut events,
+                            &mut checkpoints,
+                        )
+                        .await?;
+                    }
+                    return match output {
+                        Ok(Ok(outcome)) => {
+                            self.audit
+                                .append(
+                                    "runtime.control.finish",
+                                    Some(session_id),
+                                    Some("kernel".to_string()),
+                                    json!({
+                                        "runtime_id": runtime_id,
+                                        "runtime_session_id": handle.runtime_session_id,
+                                        "outcome": outcome.kind(),
+                                        "event_count": events.len(),
+                                    }),
+                                )
+                                .await
+                                .map_err(|err| FailedRuntimeTurn {
+                                    events: events.clone(),
+                                    status: SessionTurnStatus::Failed,
+                                    error_code: "runtime.error".to_string(),
+                                    error_text: err.to_string(),
+                                })?;
+                            Ok(CollectedRuntimeControl { events, outcome })
+                        }
+                        Ok(Err(err)) => {
+                            let message = err.to_string();
+                            self.audit
+                                .append(
+                                    "runtime.control.error",
+                                    Some(session_id),
+                                    Some("kernel".to_string()),
+                                    json!({
+                                        "runtime_id": runtime_id,
+                                        "runtime_session_id": handle.runtime_session_id,
+                                        "error": message,
+                                    }),
+                                )
+                                .await
+                                .map_err(|audit_err| FailedRuntimeTurn {
+                                    events: events.clone(),
+                                    status: SessionTurnStatus::Failed,
+                                    error_code: "runtime.error".to_string(),
+                                    error_text: audit_err.to_string(),
+                                })?;
+                            self.emit_runtime_event(
+                                &stream_context,
+                                &event_sink,
+                                RuntimeEvent::Error {
+                                    code: Some("runtime.error".to_string()),
+                                    text: message.clone(),
+                                },
+                            )
+                            .await
+                            .map_err(|emit_err| FailedRuntimeTurn {
+                                events: events.clone(),
+                                status: SessionTurnStatus::Failed,
+                                error_code: "runtime.error".to_string(),
+                                error_text: emit_err.to_string(),
+                            })?;
+                            Err(FailedRuntimeTurn {
+                                events,
+                                status: SessionTurnStatus::Failed,
+                                error_code: "runtime.error".to_string(),
+                                error_text: message,
+                            })
+                        }
+                        Err(err) => {
+                            let message = format!("runtime control task failed: {err}");
+                            self.audit
+                                .append(
+                                    "runtime.control.error",
+                                    Some(session_id),
+                                    Some("kernel".to_string()),
+                                    json!({
+                                        "runtime_id": runtime_id,
+                                        "runtime_session_id": handle.runtime_session_id,
+                                        "error": message,
+                                    }),
+                                )
+                                .await
+                                .map_err(|audit_err| FailedRuntimeTurn {
+                                    events: events.clone(),
+                                    status: SessionTurnStatus::Failed,
+                                    error_code: "runtime.error".to_string(),
+                                    error_text: audit_err.to_string(),
+                                })?;
+                            self.emit_runtime_event(
+                                &stream_context,
+                                &event_sink,
+                                RuntimeEvent::Error {
+                                    code: Some("runtime.error".to_string()),
+                                    text: message.clone(),
+                                },
+                            )
+                            .await
+                            .map_err(|emit_err| FailedRuntimeTurn {
+                                events: events.clone(),
+                                status: SessionTurnStatus::Failed,
+                                error_code: "runtime.error".to_string(),
+                                error_text: emit_err.to_string(),
+                            })?;
+                            Err(FailedRuntimeTurn {
+                                events,
+                                status: SessionTurnStatus::Failed,
+                                error_code: "runtime.error".to_string(),
+                                error_text: message,
+                            })
+                        }
+                    };
+                }
+                _ = &mut idle_sleep => {
+                    let reason = format!(
+                        "Runtime control idle timed out after {} with no output.",
+                        format_duration(idle_timeout)
+                    );
+                    return self
+                        .abort_runtime_control(
+                            adapter.as_ref(),
+                            handle,
+                            session_id,
+                            runtime_id,
+                            &mut control_task,
+                            &stream_context,
+                            &event_sink,
+                            events.clone(),
+                            idle_timeout_ms,
+                            reason,
+                            "idle",
+                        )
+                        .await;
+                }
+                _ = &mut hard_sleep => {
+                    let reason = format!(
+                        "Runtime control reached the {} safety limit.",
+                        format_duration(hard_timeout)
+                    );
+                    return self
+                        .abort_runtime_control(
+                            adapter.as_ref(),
+                            handle,
+                            session_id,
+                            runtime_id,
+                            &mut control_task,
+                            &stream_context,
+                            &event_sink,
+                            events.clone(),
+                            hard_timeout_ms,
+                            reason,
+                            "hard",
+                        )
+                        .await;
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn abort_runtime_control(
+        &self,
+        adapter: &(dyn RuntimeAdapter + Send + Sync),
+        handle: &RuntimeSessionHandle,
+        session_id: Uuid,
+        runtime_id: &str,
+        control_task: &mut tokio::task::JoinHandle<Result<RuntimeControlOutcome, anyhow::Error>>,
+        stream_context: &Option<ChannelStreamContext>,
+        event_sink: &Option<RuntimeEventSink>,
+        events: Vec<RuntimeEvent>,
+        timeout_ms: u64,
+        reason: String,
+        timeout_kind: &str,
+    ) -> Result<CollectedRuntimeControl, FailedRuntimeTurn> {
+        if let Err(cancel_err) = adapter.cancel(handle, Some(reason.clone())).await {
+            self.audit
+                .append(
+                    "runtime.control.cancel_error",
+                    Some(session_id),
+                    Some("kernel".to_string()),
+                    json!({
+                        "runtime_id": runtime_id,
+                        "runtime_session_id": handle.runtime_session_id,
+                        "error": cancel_err.to_string(),
+                    }),
+                )
+                .await
+                .map_err(|err| FailedRuntimeTurn {
+                    events: events.clone(),
+                    status: SessionTurnStatus::TimedOut,
+                    error_code: "runtime.timeout".to_string(),
+                    error_text: err.to_string(),
+                })?;
+        }
+
+        control_task.abort();
+        drop(control_task.await);
+
+        self.audit
+            .append(
+                "runtime.control.timeout",
+                Some(session_id),
+                Some("kernel".to_string()),
+                json!({
+                    "runtime_id": runtime_id,
+                    "runtime_session_id": handle.runtime_session_id,
+                    "timeout_ms": timeout_ms,
+                    "timeout_kind": timeout_kind,
+                }),
+            )
+            .await
+            .map_err(|err| FailedRuntimeTurn {
+                events: events.clone(),
+                status: SessionTurnStatus::TimedOut,
+                error_code: "runtime.timeout".to_string(),
+                error_text: err.to_string(),
+            })?;
+        self.emit_runtime_event(
+            stream_context,
+            event_sink,
+            RuntimeEvent::Error {
+                code: Some("runtime.timeout".to_string()),
+                text: reason.clone(),
+            },
+        )
+        .await
+        .map_err(|err| FailedRuntimeTurn {
+            events: events.clone(),
+            status: SessionTurnStatus::TimedOut,
+            error_code: "runtime.timeout".to_string(),
+            error_text: err.to_string(),
+        })?;
+
+        Err(FailedRuntimeTurn {
+            events,
+            status: SessionTurnStatus::TimedOut,
+            error_code: "runtime.timeout".to_string(),
+            error_text: reason,
+        })
     }
 
     async fn abort_runtime_turn(

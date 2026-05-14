@@ -1,18 +1,19 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::kernel::runtime::{
-    ExecutionOutput, RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthKind, RuntimeCapabilityResult,
-    RuntimeEvent, RuntimeEventSender, RuntimeMessageLane, RuntimeProgramOutputParser,
-    RuntimeProgramSpec, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
-    RuntimeTurnMode,
+    spawn_interactive, ExecutionOutput, ExecutionRequest, ExecutionSession, NetworkMode,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthKind, RuntimeCapabilityResult,
+    RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender,
+    RuntimeMessageLane, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeSessionHandle,
+    RuntimeSessionStartInput, RuntimeTurnMode, RuntimeTurnResult,
 };
 
 #[derive(Debug, Clone)]
@@ -42,43 +43,12 @@ const CODEX_THREAD_ID_STATE_FILE: &str = ".lionclaw-codex-thread-id";
 struct CodexSessionState {
     runtime_state_root: Option<PathBuf>,
     thread_id: Option<String>,
-    last_launch_resumed_session: bool,
-}
-
-#[derive(Default)]
-struct CodexOutputParser {
-    emitted_answer: bool,
-    pending_unphased_agent_message: Option<String>,
-    thread_state: Option<CodexThreadState>,
-    saw_thread_id: bool,
 }
 
 #[derive(Clone)]
 struct CodexThreadState {
     sessions: Arc<RwLock<HashMap<String, CodexSessionState>>>,
     runtime_session_id: String,
-    expects_new_thread_id: bool,
-}
-
-impl RuntimeProgramOutputParser for CodexOutputParser {
-    fn parse_line(&mut self, line: &str) -> Vec<RuntimeEvent> {
-        parse_codex_output_line(line, self)
-    }
-
-    fn finish(&mut self) -> Vec<RuntimeEvent> {
-        let mut events = Vec::new();
-        flush_pending_agent_message(&mut events, self, RuntimeMessageLane::Answer);
-        if let Some(state) = &self.thread_state {
-            if state.expects_new_thread_id && !self.saw_thread_id {
-                events.push(RuntimeEvent::Status {
-                    code: None,
-                    text: "codex did not report a thread id; future turns will start fresh"
-                        .to_string(),
-                });
-            }
-        }
-        events
-    }
 }
 
 impl CodexRuntimeAdapter {
@@ -87,6 +57,304 @@ impl CodexRuntimeAdapter {
             config,
             sessions: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    async fn run_app_server_turn(
+        &self,
+        execution: RuntimeProgramTurnExecution,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        let RuntimeProgramTurnExecution {
+            input,
+            plan,
+            runtime_secrets_mount,
+            codex_home_override,
+        } = execution;
+        let thread_state = self.thread_state_for(&input.runtime_session_id);
+        let transport = self
+            .start_app_server_transport(plan.clone(), runtime_secrets_mount, codex_home_override)
+            .await?;
+        let mut client = CodexAppServerClient::new(transport);
+
+        client.initialize(&events, &thread_state).await?;
+        let thread_id = self
+            .ensure_app_server_thread(
+                &mut client,
+                &input.runtime_session_id,
+                &events,
+                &thread_state,
+            )
+            .await?;
+        let response = client
+            .request(
+                "turn/start",
+                turn_start_params(
+                    &thread_id,
+                    &input.prompt,
+                    self.config.model.as_deref(),
+                    plan.network_mode,
+                ),
+                &events,
+                &thread_state,
+            )
+            .await?;
+        let turn_id = extract_app_server_turn_id(&response);
+        client
+            .wait_for_turn_completed(turn_id.as_deref(), &events, &thread_state)
+            .await?;
+        ensure_app_server_exit_success(client.shutdown().await?)?;
+        Ok(RuntimeTurnResult::default())
+    }
+
+    async fn run_app_server_control(
+        &self,
+        execution: RuntimeControlExecution,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeControlOutcome> {
+        let command = execution.input.command_name.as_str();
+        match command {
+            "model" | "models" => self.run_model_list_control(execution, events).await,
+            "permissions" | "permission" => Ok(RuntimeControlOutcome::InteractiveOnly {
+                message:
+                    "Codex permission changes must be made through LionClaw runtime policy, not a runtime slash command."
+                        .to_string(),
+            }),
+            "rename" | "name" | "compact" | "review" => {
+                self.run_thread_control(execution, events).await
+            }
+            _ => Ok(RuntimeControlOutcome::Unsupported {
+                message: format!("Codex does not support native control command '/{command}'"),
+            }),
+        }
+    }
+
+    async fn run_model_list_control(
+        &self,
+        execution: RuntimeControlExecution,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeControlOutcome> {
+        let RuntimeControlExecution {
+            plan,
+            runtime_secrets_mount,
+            codex_home_override,
+            input,
+        } = execution;
+        let thread_state = self.thread_state_for(&input.runtime_session_id);
+        let transport = self
+            .start_app_server_transport(plan, runtime_secrets_mount, codex_home_override)
+            .await?;
+        let mut client = CodexAppServerClient::new(transport);
+        client.initialize(&events, &thread_state).await?;
+        let response = client
+            .request(
+                "model/list",
+                json!({
+                    "includeHidden": input.arguments.split_whitespace().any(|arg| arg == "--hidden"),
+                }),
+                &events,
+                &thread_state,
+            )
+            .await?;
+        ensure_app_server_exit_success(client.shutdown().await?)?;
+
+        Ok(RuntimeControlOutcome::Handled {
+            message: describe_model_list_response(&response),
+        })
+    }
+
+    async fn run_thread_control(
+        &self,
+        execution: RuntimeControlExecution,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeControlOutcome> {
+        let RuntimeControlExecution {
+            plan,
+            runtime_secrets_mount,
+            codex_home_override,
+            input,
+        } = execution;
+        let Some(saved_thread_id) = self.current_thread_id(&input.runtime_session_id)? else {
+            return Ok(RuntimeControlOutcome::Failed {
+                code: Some("runtime.control.thread_required".to_string()),
+                message: format!(
+                    "Codex control '/{}' needs an existing Codex thread; send a prompt first.",
+                    input.command_name
+                ),
+            });
+        };
+
+        let thread_state = self.thread_state_for(&input.runtime_session_id);
+        let transport = self
+            .start_app_server_transport(plan, runtime_secrets_mount, codex_home_override)
+            .await?;
+        let mut client = CodexAppServerClient::new(transport);
+        client.initialize(&events, &thread_state).await?;
+        let thread_id = self
+            .resume_app_server_thread(&mut client, &saved_thread_id, &events, &thread_state)
+            .await?;
+
+        let outcome = match input.command_name.as_str() {
+            "rename" | "name" => {
+                let name = input.arguments.trim();
+                if name.is_empty() {
+                    RuntimeControlOutcome::Failed {
+                        code: Some("runtime.control.invalid_arguments".to_string()),
+                        message: "Codex rename requires a non-empty name.".to_string(),
+                    }
+                } else {
+                    client
+                        .request(
+                            "thread/name/set",
+                            json!({
+                                "threadId": thread_id,
+                                "name": name,
+                            }),
+                            &events,
+                            &thread_state,
+                        )
+                        .await?;
+                    RuntimeControlOutcome::Handled {
+                        message: format!("Renamed Codex thread to '{name}'."),
+                    }
+                }
+            }
+            "compact" => {
+                client
+                    .request(
+                        "thread/compact/start",
+                        json!({
+                            "threadId": thread_id,
+                        }),
+                        &events,
+                        &thread_state,
+                    )
+                    .await?;
+                client
+                    .wait_for_thread_compacted(Some(&thread_id), &events, &thread_state)
+                    .await?;
+                RuntimeControlOutcome::Handled {
+                    message: "Compacted Codex thread.".to_string(),
+                }
+            }
+            "review" => {
+                let response = client
+                    .request(
+                        "review/start",
+                        json!({
+                            "threadId": thread_id,
+                            "delivery": "inline",
+                            "target": review_target_from_arguments(&input.arguments),
+                        }),
+                        &events,
+                        &thread_state,
+                    )
+                    .await?;
+                let turn_id = extract_app_server_turn_id(&response);
+                client
+                    .wait_for_turn_completed(turn_id.as_deref(), &events, &thread_state)
+                    .await?;
+                let answer = client.answer_text().trim().to_string();
+                RuntimeControlOutcome::Handled {
+                    message: if answer.is_empty() {
+                        "Codex review completed.".to_string()
+                    } else {
+                        answer
+                    },
+                }
+            }
+            other => RuntimeControlOutcome::Unsupported {
+                message: format!("Codex does not support native control command '/{other}'"),
+            },
+        };
+
+        ensure_app_server_exit_success(client.shutdown().await?)?;
+        Ok(outcome)
+    }
+
+    async fn start_app_server_transport(
+        &self,
+        plan: crate::kernel::runtime::EffectiveExecutionPlan,
+        runtime_secrets_mount: Option<crate::kernel::runtime::RuntimeSecretsMount>,
+        codex_home_override: Option<PathBuf>,
+    ) -> Result<ExecutionSessionTransport> {
+        let session = spawn_interactive(ExecutionRequest {
+            plan,
+            program: build_codex_app_server_program(&self.config),
+            runtime_secrets_mount,
+            codex_home_override,
+        })
+        .await?;
+        Ok(ExecutionSessionTransport::new(session))
+    }
+
+    async fn ensure_app_server_thread<T>(
+        &self,
+        client: &mut CodexAppServerClient<T>,
+        runtime_session_id: &str,
+        events: &RuntimeEventSender,
+        thread_state: &CodexThreadState,
+    ) -> Result<String>
+    where
+        T: AppServerTransport + Send,
+    {
+        if let Some(thread_id) = self.current_thread_id(runtime_session_id)? {
+            return self
+                .resume_app_server_thread(client, &thread_id, events, thread_state)
+                .await;
+        }
+
+        let response = client
+            .request(
+                "thread/start",
+                thread_start_params(self.config.model.as_deref()),
+                events,
+                thread_state,
+            )
+            .await?;
+        let thread_id = extract_app_server_thread_id(&response)
+            .ok_or_else(|| anyhow!("codex app-server thread/start response missing thread id"))?;
+        thread_state.persist_thread_id(&thread_id)?;
+        Ok(thread_id)
+    }
+
+    async fn resume_app_server_thread<T>(
+        &self,
+        client: &mut CodexAppServerClient<T>,
+        thread_id: &str,
+        events: &RuntimeEventSender,
+        thread_state: &CodexThreadState,
+    ) -> Result<String>
+    where
+        T: AppServerTransport + Send,
+    {
+        let response = client
+            .request(
+                "thread/resume",
+                thread_resume_params(thread_id, self.config.model.as_deref()),
+                events,
+                thread_state,
+            )
+            .await?;
+        let resolved_thread_id =
+            extract_app_server_thread_id(&response).unwrap_or_else(|| thread_id.to_string());
+        thread_state.persist_thread_id(&resolved_thread_id)?;
+        Ok(resolved_thread_id)
+    }
+
+    fn thread_state_for(&self, runtime_session_id: &str) -> CodexThreadState {
+        CodexThreadState {
+            sessions: Arc::clone(&self.sessions),
+            runtime_session_id: runtime_session_id.to_string(),
+        }
+    }
+
+    fn current_thread_id(&self, runtime_session_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .sessions
+            .read()
+            .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
+            .get(runtime_session_id)
+            .and_then(|session| session.thread_id.clone()))
     }
 }
 
@@ -119,7 +387,6 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
                 CodexSessionState {
                     runtime_state_root: input.runtime_state_root,
                     thread_id,
-                    last_launch_resumed_session: false,
                 },
             );
 
@@ -129,108 +396,20 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
         })
     }
 
-    fn build_turn_program(&self, input: &RuntimeTurnInput) -> Result<RuntimeProgramSpec> {
-        let thread_id = {
-            let mut sessions = self
-                .sessions
-                .write()
-                .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?;
-            let thread_id = {
-                let session = sessions.get_mut(&input.runtime_session_id).ok_or_else(|| {
-                    anyhow!("runtime session '{}' not found", input.runtime_session_id)
-                })?;
-                session.last_launch_resumed_session = session.thread_id.is_some();
-                session.thread_id.clone()
-            };
-            drop(sessions);
-            thread_id
-        };
-
-        Ok(RuntimeProgramSpec {
-            executable: self.config.executable.clone(),
-            args: build_codex_exec_args(self.config.model.as_deref(), thread_id.as_deref()),
-            environment: Vec::new(),
-            stdin: input.prompt.clone(),
-            auth: Some(RuntimeAuthKind::Codex),
-        })
-    }
-
-    fn program_output_parser(
+    async fn program_backed_turn(
         &self,
-        input: &RuntimeTurnInput,
-    ) -> Option<Box<dyn RuntimeProgramOutputParser>> {
-        let expects_new_thread_id = self
-            .sessions
-            .read()
-            .ok()
-            .and_then(|sessions| sessions.get(&input.runtime_session_id).cloned())
-            .map(|session| session.thread_id.is_none())
-            .unwrap_or(false);
-
-        Some(Box::new(CodexOutputParser {
-            thread_state: Some(CodexThreadState {
-                sessions: Arc::clone(&self.sessions),
-                runtime_session_id: input.runtime_session_id.clone(),
-                expects_new_thread_id,
-            }),
-            ..CodexOutputParser::default()
-        }))
+        execution: RuntimeProgramTurnExecution,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        self.run_app_server_turn(execution, events).await
     }
 
-    fn parse_program_output_line(&self, line: &str) -> Vec<RuntimeEvent> {
-        let mut parser = CodexOutputParser::default();
-        parser.parse_line(line)
-    }
-
-    fn format_program_exit_error(
+    async fn runtime_control(
         &self,
-        output: &ExecutionOutput,
-        _observed_error_text: Option<&str>,
-    ) -> String {
-        let code = output.exit_code.unwrap_or(1);
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.is_empty() {
-            format!("codex exec exited with code {code}")
-        } else {
-            format!("codex exec exited with code {code}: {stderr}")
-        }
-    }
-
-    fn prepare_program_retry_after_failure(
-        &self,
-        input: &RuntimeTurnInput,
-        output: &ExecutionOutput,
-        observed_error_text: Option<&str>,
-        events: &RuntimeEventSender,
-    ) -> Result<bool> {
-        let root_to_clear = {
-            let mut sessions = self
-                .sessions
-                .write()
-                .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?;
-            let Some(session) = sessions.get_mut(&input.runtime_session_id) else {
-                return Ok(false);
-            };
-            if !session.last_launch_resumed_session {
-                return Ok(false);
-            }
-            if !is_stale_codex_resume_failure(output, observed_error_text) {
-                return Ok(false);
-            }
-            session.thread_id = None;
-            session.last_launch_resumed_session = false;
-            let root = session.runtime_state_root.clone();
-            drop(sessions);
-            root
-        };
-        if let Some(root) = root_to_clear.as_deref() {
-            clear_saved_thread_id(root)?;
-        }
-        drop(events.send(RuntimeEvent::Status {
-            code: None,
-            text: "codex continuity restarted with a fresh thread".to_string(),
-        }));
-        Ok(true)
+        execution: RuntimeControlExecution,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeControlOutcome> {
+        self.run_app_server_control(execution, events).await
     }
 
     async fn resolve_capability_requests(
@@ -261,31 +440,532 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
     }
 }
 
-fn build_codex_exec_args(model: Option<&str>, thread_id: Option<&str>) -> Vec<String> {
-    let mut args = vec!["exec".to_string()];
+fn build_codex_app_server_program(config: &CodexRuntimeConfig) -> RuntimeProgramSpec {
+    RuntimeProgramSpec {
+        executable: config.executable.clone(),
+        args: vec![
+            "app-server".to_string(),
+            "--listen".to_string(),
+            "stdio://".to_string(),
+        ],
+        environment: Vec::new(),
+        stdin: String::new(),
+        auth: Some(RuntimeAuthKind::Codex),
+    }
+}
 
-    if thread_id.is_some() {
-        args.push("resume".to_string());
+#[async_trait]
+trait AppServerTransport {
+    async fn send(&mut self, message: &Value) -> Result<()>;
+    async fn recv(&mut self) -> Result<Option<Value>>;
+    async fn shutdown(&mut self) -> Result<ExecutionOutput>;
+}
+
+struct ExecutionSessionTransport {
+    session: Option<ExecutionSession>,
+}
+
+impl ExecutionSessionTransport {
+    fn new(session: ExecutionSession) -> Self {
+        Self {
+            session: Some(session),
+        }
+    }
+}
+
+#[async_trait]
+impl AppServerTransport for ExecutionSessionTransport {
+    async fn send(&mut self, message: &Value) -> Result<()> {
+        let session = self
+            .session
+            .as_mut()
+            .context("codex app-server session is already closed")?;
+        session.write_line(&serde_json::to_string(message)?).await
     }
 
-    // LionClaw already provides the outer confinement boundary via Podman, so
-    // Codex should use its official external-sandbox mode rather than trying
-    // to nest bubblewrap inside the container.
-    args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+    async fn recv(&mut self) -> Result<Option<Value>> {
+        let session = self
+            .session
+            .as_mut()
+            .context("codex app-server session is already closed")?;
+        loop {
+            let Some(line) = session.read_line().await? else {
+                return Ok(None);
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            return serde_json::from_str(trimmed)
+                .with_context(|| format!("invalid codex app-server JSON-RPC line: {trimmed}"))
+                .map(Some);
+        }
+    }
 
-    args.push("--json".to_string());
+    async fn shutdown(&mut self) -> Result<ExecutionOutput> {
+        let Some(session) = self.session.take() else {
+            return Ok(ExecutionOutput::default());
+        };
+        session.shutdown().await
+    }
+}
 
+struct CodexAppServerClient<T> {
+    transport: T,
+    next_id: u64,
+    completed_turns: HashSet<String>,
+    unmatched_turn_completed: bool,
+    compacted_threads: HashSet<String>,
+    unmatched_thread_compacted: bool,
+    answer_text: String,
+}
+
+impl<T> CodexAppServerClient<T>
+where
+    T: AppServerTransport + Send,
+{
+    fn new(transport: T) -> Self {
+        Self {
+            transport,
+            next_id: 1,
+            completed_turns: HashSet::new(),
+            unmatched_turn_completed: false,
+            compacted_threads: HashSet::new(),
+            unmatched_thread_compacted: false,
+            answer_text: String::new(),
+        }
+    }
+
+    fn answer_text(&self) -> &str {
+        &self.answer_text
+    }
+
+    async fn initialize(
+        &mut self,
+        events: &RuntimeEventSender,
+        thread_state: &CodexThreadState,
+    ) -> Result<()> {
+        self.request(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "lionclaw",
+                    "title": "LionClaw",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": {
+                    "experimentalApi": true,
+                },
+            }),
+            events,
+            thread_state,
+        )
+        .await?;
+        self.notify("initialized", json!({})).await
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        self.transport
+            .send(&json!({
+                "method": method,
+                "params": params,
+            }))
+            .await
+    }
+
+    async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        events: &RuntimeEventSender,
+        thread_state: &CodexThreadState,
+    ) -> Result<Value> {
+        let id = self.next_request_id();
+        self.transport
+            .send(&json!({
+                "id": id,
+                "method": method,
+                "params": params,
+            }))
+            .await?;
+
+        loop {
+            let Some(message) = self.transport.recv().await? else {
+                bail!("codex app-server closed before responding to {method}");
+            };
+            if response_id(&message).is_some_and(|response_id| response_id == id) {
+                return parse_app_server_response(message, method);
+            }
+            self.handle_message(message, events, thread_state).await?;
+        }
+    }
+
+    async fn wait_for_turn_completed(
+        &mut self,
+        turn_id: Option<&str>,
+        events: &RuntimeEventSender,
+        thread_state: &CodexThreadState,
+    ) -> Result<()> {
+        if self.turn_completed(turn_id) {
+            return Ok(());
+        }
+
+        loop {
+            let Some(message) = self.transport.recv().await? else {
+                bail!("codex app-server closed before turn completed");
+            };
+            self.handle_message(message, events, thread_state).await?;
+            if self.turn_completed(turn_id) {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn wait_for_thread_compacted(
+        &mut self,
+        thread_id: Option<&str>,
+        events: &RuntimeEventSender,
+        thread_state: &CodexThreadState,
+    ) -> Result<()> {
+        if self.thread_compacted(thread_id) {
+            return Ok(());
+        }
+
+        loop {
+            let Some(message) = self.transport.recv().await? else {
+                bail!("codex app-server closed before thread compacted");
+            };
+            self.handle_message(message, events, thread_state).await?;
+            if self.thread_compacted(thread_id) {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn shutdown(mut self) -> Result<ExecutionOutput> {
+        self.transport.shutdown().await
+    }
+
+    fn next_request_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn turn_completed(&self, turn_id: Option<&str>) -> bool {
+        match turn_id {
+            Some(turn_id) => self.completed_turns.contains(turn_id),
+            None => self.unmatched_turn_completed || !self.completed_turns.is_empty(),
+        }
+    }
+
+    fn thread_compacted(&self, thread_id: Option<&str>) -> bool {
+        match thread_id {
+            Some(thread_id) => self.compacted_threads.contains(thread_id),
+            None => self.unmatched_thread_compacted || !self.compacted_threads.is_empty(),
+        }
+    }
+
+    async fn handle_message(
+        &mut self,
+        message: Value,
+        events: &RuntimeEventSender,
+        thread_state: &CodexThreadState,
+    ) -> Result<()> {
+        if message.get("id").is_some() && message.get("method").is_some() {
+            self.respond_to_server_request(&message).await?;
+            return Ok(());
+        }
+
+        let Some(method) = message.get("method").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let params = message.get("params").unwrap_or(&Value::Null);
+        match method {
+            "thread/started" => {
+                if let Some(thread_id) = extract_app_server_thread_id(params) {
+                    thread_state.persist_thread_id(&thread_id)?;
+                    drop(events.send(RuntimeEvent::Status {
+                        code: None,
+                        text: format!("codex thread started: {thread_id}"),
+                    }));
+                }
+            }
+            "thread/name/updated" => {
+                drop(events.send(RuntimeEvent::Status {
+                    code: None,
+                    text: "codex thread renamed".to_string(),
+                }));
+            }
+            "thread/compacted" => {
+                if let Some(thread_id) = extract_app_server_thread_id(params) {
+                    self.compacted_threads.insert(thread_id);
+                } else {
+                    self.unmatched_thread_compacted = true;
+                }
+                drop(events.send(RuntimeEvent::Status {
+                    code: None,
+                    text: "codex thread compacted".to_string(),
+                }));
+            }
+            "turn/started" => {
+                drop(events.send(RuntimeEvent::Status {
+                    code: None,
+                    text: "codex turn started".to_string(),
+                }));
+            }
+            "turn/completed" => {
+                if let Some(turn_id) = extract_app_server_turn_id(params) {
+                    self.completed_turns.insert(turn_id);
+                } else {
+                    self.unmatched_turn_completed = true;
+                }
+                drop(events.send(RuntimeEvent::Status {
+                    code: None,
+                    text: "codex turn completed".to_string(),
+                }));
+                drop(events.send(RuntimeEvent::Done));
+            }
+            "item/agentMessage/delta" => {
+                if let Some(text) = app_server_text(params, &["delta", "text", "content"]) {
+                    self.answer_text.push_str(&text);
+                    drop(events.send(RuntimeEvent::MessageDelta {
+                        lane: RuntimeMessageLane::Answer,
+                        text,
+                    }));
+                }
+            }
+            "item/agentReasoning/delta" | "item/agentReasoningRawContent/delta" => {
+                if let Some(text) = app_server_text(params, &["delta", "text", "content"]) {
+                    drop(events.send(RuntimeEvent::MessageDelta {
+                        lane: RuntimeMessageLane::Reasoning,
+                        text,
+                    }));
+                }
+            }
+            "item/started" | "item/completed" | "item/updated" => {
+                if let Some(status) = describe_app_server_item(params) {
+                    drop(events.send(RuntimeEvent::Status {
+                        code: None,
+                        text: status,
+                    }));
+                }
+            }
+            "error" => {
+                drop(events.send(RuntimeEvent::Error {
+                    code: Some("runtime.error".to_string()),
+                    text: app_server_error_text(params),
+                }));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn respond_to_server_request(&mut self, message: &Value) -> Result<()> {
+        let id = message
+            .get("id")
+            .cloned()
+            .context("codex app-server request missing id")?;
+        let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+        let response = match method {
+            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+                json!({
+                    "id": id,
+                    "result": {
+                        "decision": "accept",
+                    },
+                })
+            }
+            _ => json!({
+                "id": id,
+                "error": {
+                    "code": -32601,
+                    "message": format!("unsupported LionClaw app-server callback '{method}'"),
+                },
+            }),
+        };
+        self.transport.send(&response).await
+    }
+}
+
+fn response_id(message: &Value) -> Option<u64> {
+    message.get("id").and_then(Value::as_u64)
+}
+
+fn parse_app_server_response(message: Value, method: &str) -> Result<Value> {
+    if let Some(error) = message.get("error") {
+        bail!(
+            "codex app-server {method} failed: {}",
+            app_server_error_text(error)
+        );
+    }
+    Ok(message.get("result").cloned().unwrap_or(Value::Null))
+}
+
+fn ensure_app_server_exit_success(output: ExecutionOutput) -> Result<()> {
+    if output.success() {
+        return Ok(());
+    }
+    let code = output.exit_code.unwrap_or(1);
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        bail!("codex app-server exited with code {code}");
+    }
+    bail!("codex app-server exited with code {code}: {stderr}");
+}
+
+fn thread_start_params(model: Option<&str>) -> Value {
+    let mut params = json!({
+        "approvalPolicy": "never",
+        "threadSource": "user",
+    });
     if let Some(model) = model {
-        args.push("--model".to_string());
-        args.push(model.to_string());
+        params["model"] = json!(model);
+    }
+    params
+}
+
+fn thread_resume_params(thread_id: &str, model: Option<&str>) -> Value {
+    let mut params = json!({
+        "threadId": thread_id,
+        "approvalPolicy": "never",
+    });
+    if let Some(model) = model {
+        params["model"] = json!(model);
+    }
+    params
+}
+
+fn turn_start_params(
+    thread_id: &str,
+    prompt: &str,
+    model: Option<&str>,
+    network_mode: NetworkMode,
+) -> Value {
+    let mut params = json!({
+        "threadId": thread_id,
+        "input": [
+            {
+                "type": "text",
+                "text": prompt,
+            }
+        ],
+        "approvalPolicy": "never",
+        "sandboxPolicy": {
+            "type": "externalSandbox",
+            "networkAccess": match network_mode {
+                NetworkMode::On => "enabled",
+                NetworkMode::None => "restricted",
+            },
+        },
+    });
+    if let Some(model) = model {
+        params["model"] = json!(model);
+    }
+    params
+}
+
+fn review_target_from_arguments(arguments: &str) -> Value {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() || trimmed == "changes" || trimmed == "uncommitted" {
+        return json!({"type": "uncommittedChanges"});
+    }
+    if let Some(branch) = trimmed
+        .strip_prefix("base ")
+        .or_else(|| trimmed.strip_prefix("baseBranch "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return json!({
+            "type": "baseBranch",
+            "branch": branch,
+        });
+    }
+    if let Some(sha) = trimmed
+        .strip_prefix("commit ")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return json!({
+            "type": "commit",
+            "sha": sha,
+        });
+    }
+    json!({
+        "type": "custom",
+        "instructions": trimmed,
+    })
+}
+
+fn extract_app_server_thread_id(value: &Value) -> Option<String> {
+    value
+        .pointer("/thread/id")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("threadId").and_then(Value::as_str))
+        .or_else(|| value.get("thread_id").and_then(Value::as_str))
+        .or_else(|| value.get("id").and_then(Value::as_str))
+        .filter(|thread_id| !thread_id.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn extract_app_server_turn_id(value: &Value) -> Option<String> {
+    value
+        .pointer("/turn/id")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("turnId").and_then(Value::as_str))
+        .or_else(|| value.get("turn_id").and_then(Value::as_str))
+        .or_else(|| value.get("id").and_then(Value::as_str))
+        .filter(|turn_id| !turn_id.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn app_server_text(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| value.get(*key))
+        .find_map(|value| collect_codex_text(value, 0))
+}
+
+fn app_server_error_text(value: &Value) -> String {
+    app_server_text(value, &["message", "text", "details", "error"])
+        .unwrap_or_else(|| "codex app-server error".to_string())
+}
+
+fn describe_app_server_item(params: &Value) -> Option<String> {
+    let item = params.get("item").unwrap_or(params);
+    let item_type = item.get("type").and_then(Value::as_str)?;
+    match item_type {
+        "enteredReviewMode" => Some("codex review started".to_string()),
+        "exitedReviewMode" => Some("codex review completed".to_string()),
+        other => Some(format!("codex item: {other}")),
+    }
+}
+
+fn describe_model_list_response(response: &Value) -> String {
+    let models: Vec<String> = response
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(model_display_name)
+        .take(20)
+        .collect();
+
+    if models.is_empty() {
+        return "Codex returned no available models.".to_string();
     }
 
-    if let Some(thread_id) = thread_id {
-        args.push(thread_id.to_string());
-        args.push("-".to_string());
-    }
+    format!("Available Codex models: {}.", models.join(", "))
+}
 
-    args
+fn model_display_name(value: &Value) -> Option<String> {
+    value
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("name").and_then(Value::as_str))
+        .or_else(|| value.get("label").and_then(Value::as_str))
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_string)
 }
 
 fn load_saved_thread_id(root: &Path) -> Result<Option<String>> {
@@ -351,378 +1031,10 @@ fn save_thread_id(root: &Path, thread_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn clear_saved_thread_id(root: &Path) -> Result<()> {
-    let path = root.join(CODEX_THREAD_ID_STATE_FILE);
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(Into::into(err)),
-    }
-}
-
-fn is_stale_codex_resume_failure(
-    output: &ExecutionOutput,
-    observed_error_text: Option<&str>,
-) -> bool {
-    if let Some(text) = observed_error_text {
-        if is_stale_codex_resume_failure_text(text) {
-            return true;
-        }
-    }
-
-    if output.stderr.is_empty() {
-        return false;
-    }
-
-    is_stale_codex_resume_failure_text(&String::from_utf8_lossy(&output.stderr))
-}
-
-fn is_stale_codex_resume_failure_text(text: &str) -> bool {
-    let normalized = text.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return false;
-    }
-
-    let references_saved_continuity = ["thread", "conversation", "session", "resume", "continuity"]
-        .iter()
-        .any(|needle| normalized.contains(needle));
-    if !references_saved_continuity {
-        return false;
-    }
-
-    [
-        "not found",
-        "no such",
-        "missing",
-        "unknown",
-        "invalid",
-        "expired",
-        "stale",
-        "does not exist",
-        "cannot be found",
-        "can't be found",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
-}
-
 fn runtime_session_is_ready(root: &Path) -> Result<bool> {
     Ok(root
         .join(crate::home::RUNTIME_SESSION_READY_MARKER)
         .is_file())
-}
-
-#[cfg(test)]
-fn parse_codex_stdout(stdout: &[u8]) -> Vec<RuntimeEvent> {
-    let output = String::from_utf8_lossy(stdout);
-    let mut events = Vec::new();
-    let mut parser = CodexOutputParser::default();
-
-    for line in output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        events.extend(parser.parse_line(line));
-    }
-    events.extend(parser.finish());
-
-    events
-}
-
-fn parse_codex_output_line(line: &str, parser: &mut CodexOutputParser) -> Vec<RuntimeEvent> {
-    let line = line.trim();
-    if line.is_empty() {
-        return Vec::new();
-    }
-
-    let mut events = Vec::new();
-    if let Ok(json) = serde_json::from_str::<Value>(line) {
-        parse_codex_json_line(&mut events, &json, parser);
-    } else {
-        push_message_delta(
-            &mut events,
-            parser,
-            RuntimeMessageLane::Answer,
-            line.to_string(),
-        );
-    }
-    events
-}
-
-fn parse_codex_json_line(
-    events: &mut Vec<RuntimeEvent>,
-    json: &Value,
-    parser: &mut CodexOutputParser,
-) {
-    match json.get("type").and_then(Value::as_str) {
-        Some("event_msg") => {
-            if let Some(payload) = json.get("payload") {
-                parse_codex_json_event(events, payload, parser);
-            }
-        }
-        Some("response_item") => {}
-        _ => {
-            if codex_event_type(json).is_some() {
-                parse_codex_json_event(events, json, parser);
-            }
-        }
-    }
-}
-
-fn parse_codex_json_event(
-    events: &mut Vec<RuntimeEvent>,
-    json: &Value,
-    parser: &mut CodexOutputParser,
-) {
-    let payload = codex_event_payload(json);
-    let event_type = codex_event_type(json);
-    match event_type {
-        Some("thread.started") => {
-            if let Some(thread_id) = extract_codex_thread_id(payload) {
-                parser.saw_thread_id = true;
-                if let Some(state) = &parser.thread_state {
-                    if let Err(err) = state.persist_thread_id(thread_id) {
-                        events.push(RuntimeEvent::Status {
-                            code: None,
-                            text: format!("codex thread id could not be saved: {err}"),
-                        });
-                    }
-                }
-                events.push(RuntimeEvent::Status {
-                    code: None,
-                    text: format!("codex thread started: {thread_id}"),
-                });
-            }
-        }
-        Some("turn.started") | Some("turn_started") | Some("task_started") => {
-            events.push(RuntimeEvent::Status {
-                code: None,
-                text: "codex turn started".to_string(),
-            });
-        }
-        Some("turn.completed") | Some("turn_complete") => {
-            flush_pending_agent_message(events, parser, RuntimeMessageLane::Answer);
-            events.push(RuntimeEvent::Status {
-                code: None,
-                text: "codex turn completed".to_string(),
-            });
-        }
-        Some("task_complete") => {
-            if let Some(text) = codex_event_text(payload, &["last_agent_message"]) {
-                parser.pending_unphased_agent_message = None;
-                if !parser.emitted_answer {
-                    push_message_delta(events, parser, RuntimeMessageLane::Answer, text);
-                }
-            } else if !parser.emitted_answer {
-                flush_pending_agent_message(events, parser, RuntimeMessageLane::Answer);
-            } else {
-                parser.pending_unphased_agent_message = None;
-            }
-            events.push(RuntimeEvent::Status {
-                code: None,
-                text: "codex turn completed".to_string(),
-            });
-            events.push(RuntimeEvent::Done);
-        }
-        Some("turn.failed") => {
-            let message = payload
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("codex turn failed");
-            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
-            events.push(RuntimeEvent::Error {
-                code: Some("runtime.error".to_string()),
-                text: format!("codex: {message}"),
-            });
-        }
-        Some("turn_aborted") => {
-            let message = codex_event_text(payload, &["reason"])
-                .unwrap_or_else(|| "codex turn aborted".to_string());
-            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
-            events.push(RuntimeEvent::Error {
-                code: Some("runtime.error".to_string()),
-                text: format!("codex: {message}"),
-            });
-        }
-        Some("error") => {
-            let message = payload
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("codex stream error");
-            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
-            events.push(RuntimeEvent::Error {
-                code: Some("runtime.error".to_string()),
-                text: format!("codex: {message}"),
-            });
-        }
-        Some("stream_error") => {
-            let message = codex_event_text(payload, &["message", "details"])
-                .unwrap_or_else(|| "codex stream error".to_string());
-            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
-            events.push(RuntimeEvent::Error {
-                code: Some("runtime.error".to_string()),
-                text: format!("codex: {message}"),
-            });
-        }
-        Some("agent_message_delta") | Some("agent_message_content_delta") => {
-            if let Some(text) = codex_event_text(payload, &["delta", "text", "content"]) {
-                push_agent_message(events, parser, payload, text);
-            }
-        }
-        Some("agent_message") => {
-            if let Some(text) = codex_event_text(payload, &["message", "text", "content"]) {
-                push_agent_message(events, parser, payload, text);
-            }
-        }
-        Some("agent_reasoning_delta")
-        | Some("agent_reasoning_raw_content_delta")
-        | Some("reasoning_content_delta") => {
-            if let Some(text) = codex_event_text(payload, &["delta", "text", "content"]) {
-                push_message_delta(events, parser, RuntimeMessageLane::Reasoning, text);
-            }
-        }
-        Some("agent_reasoning") | Some("agent_reasoning_raw_content") => {
-            if let Some(text) = codex_event_text(
-                payload,
-                &["text", "content", "reasoning_text", "raw_content"],
-            ) {
-                push_message_delta(events, parser, RuntimeMessageLane::Reasoning, text);
-            }
-        }
-        Some("agent_reasoning_section_break")
-        | Some("session_configured")
-        | Some("token_count") => {}
-        Some("exec_command_begin") => {
-            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
-            let command = codex_event_text(payload, &["parsed_cmd", "command"])
-                .unwrap_or_else(|| "command".to_string());
-            events.push(RuntimeEvent::Status {
-                code: None,
-                text: format!("codex command '{}'", truncate_status_detail(&command)),
-            });
-        }
-        Some("exec_command_end") => {
-            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
-            let exit_code = payload
-                .get("exit_code")
-                .and_then(Value::as_i64)
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            events.push(RuntimeEvent::Status {
-                code: None,
-                text: format!("codex command completed (exit {exit_code})"),
-            });
-        }
-        Some("web_search_begin") => {
-            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
-            events.push(RuntimeEvent::Status {
-                code: None,
-                text: "codex web search".to_string(),
-            });
-        }
-        Some("web_search_end") => {
-            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
-            events.push(RuntimeEvent::Status {
-                code: None,
-                text: describe_codex_web_search(payload),
-            });
-        }
-        Some("patch_apply_begin") => {
-            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
-            events.push(RuntimeEvent::Status {
-                code: None,
-                text: "codex patch apply".to_string(),
-            });
-        }
-        Some("patch_apply_end") => {
-            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
-            let status = payload
-                .get("success")
-                .and_then(Value::as_bool)
-                .map(|value| if value { "succeeded" } else { "failed" })
-                .unwrap_or("completed");
-            events.push(RuntimeEvent::Status {
-                code: None,
-                text: format!("codex patch apply ({status})"),
-            });
-        }
-        Some("item.started")
-        | Some("item.updated")
-        | Some("item.completed")
-        | Some("item_started")
-        | Some("item_updated")
-        | Some("item_completed") => {
-            if let Some(item) = payload.get("item") {
-                parse_codex_item(events, item, parser);
-            }
-        }
-        Some(_) | None => {}
-    }
-}
-
-fn push_agent_message(
-    events: &mut Vec<RuntimeEvent>,
-    parser: &mut CodexOutputParser,
-    payload: &Value,
-    text: String,
-) {
-    match codex_agent_message_lane(payload) {
-        Some(lane) => {
-            parser.discard_pending_duplicate(&text);
-            push_message_delta(events, parser, lane, text);
-        }
-        None => parser.push_pending_unphased_agent_message(text),
-    }
-}
-
-fn push_message_delta(
-    events: &mut Vec<RuntimeEvent>,
-    parser: &mut CodexOutputParser,
-    lane: RuntimeMessageLane,
-    text: String,
-) {
-    if matches!(lane, RuntimeMessageLane::Answer) {
-        parser.emitted_answer = true;
-    }
-    events.push(RuntimeEvent::MessageDelta { lane, text });
-}
-
-fn flush_pending_agent_message(
-    events: &mut Vec<RuntimeEvent>,
-    parser: &mut CodexOutputParser,
-    lane: RuntimeMessageLane,
-) {
-    if let Some(text) = parser.pending_unphased_agent_message.take() {
-        push_message_delta(events, parser, lane, text);
-    }
-}
-
-impl CodexOutputParser {
-    fn push_pending_unphased_agent_message(&mut self, text: String) {
-        let Some(pending) = &mut self.pending_unphased_agent_message else {
-            self.pending_unphased_agent_message = Some(text);
-            return;
-        };
-
-        if text == *pending || pending.ends_with(&text) {
-            return;
-        }
-        if text.starts_with(pending.as_str()) {
-            *pending = text;
-            return;
-        }
-        pending.push_str(&text);
-    }
-
-    fn discard_pending_duplicate(&mut self, text: &str) {
-        let Some(pending) = self.pending_unphased_agent_message.as_deref() else {
-            return;
-        };
-        if pending == text || text.starts_with(pending) || pending.ends_with(text) {
-            self.pending_unphased_agent_message = None;
-        }
-    }
 }
 
 impl CodexThreadState {
@@ -744,44 +1056,9 @@ impl CodexThreadState {
             .entry(self.runtime_session_id.clone())
             .and_modify(|session| {
                 session.thread_id = Some(thread_id.to_string());
-                session.last_launch_resumed_session = false;
             });
         Ok(())
     }
-}
-
-fn codex_event_payload(json: &Value) -> &Value {
-    json.get("msg").unwrap_or(json)
-}
-
-fn codex_event_type(json: &Value) -> Option<&str> {
-    json.get("msg")
-        .and_then(|value| value.get("type"))
-        .and_then(Value::as_str)
-        .or_else(|| json.get("type").and_then(Value::as_str))
-}
-
-fn codex_event_text(payload: &Value, keys: &[&str]) -> Option<String> {
-    for key in keys {
-        if let Some(value) = payload.get(*key) {
-            if let Some(text) = collect_codex_text(value, 0) {
-                return Some(text);
-            }
-        }
-    }
-    None
-}
-
-fn extract_codex_thread_id(payload: &Value) -> Option<&str> {
-    payload
-        .get("thread_id")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            payload
-                .pointer("/payload/thread_id")
-                .and_then(Value::as_str)
-        })
-        .filter(|thread_id| !thread_id.trim().is_empty())
 }
 
 fn collect_codex_text(value: &Value, depth: usize) -> Option<String> {
@@ -832,203 +1109,184 @@ fn collect_codex_text(value: &Value, depth: usize) -> Option<String> {
     }
 }
 
-fn parse_codex_item(events: &mut Vec<RuntimeEvent>, item: &Value, parser: &mut CodexOutputParser) {
-    match item.get("type").and_then(Value::as_str) {
-        Some("agent_message") => {
-            if let Some(text) = item.get("text").and_then(Value::as_str) {
-                push_agent_message(events, parser, item, text.to_string());
-            }
-        }
-        Some("error") => {
-            let message = item
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("codex item error");
-            events.push(RuntimeEvent::Error {
-                code: Some("runtime.error".to_string()),
-                text: format!("codex: {message}"),
-            });
-        }
-        Some("command_execution") => {
-            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
-            let command = item
-                .get("command")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let status = item
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            events.push(RuntimeEvent::Status {
-                code: None,
-                text: format!("codex command '{command}' ({status})"),
-            });
-        }
-        Some("file_change") => {
-            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
-            let status = item
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            events.push(RuntimeEvent::Status {
-                code: None,
-                text: format!("codex file_change ({status})"),
-            });
-        }
-        Some("web_search") => {
-            flush_pending_agent_message(events, parser, RuntimeMessageLane::Reasoning);
-            events.push(RuntimeEvent::Status {
-                code: None,
-                text: describe_codex_web_search(item),
-            });
-        }
-        Some("reasoning") => {
-            if let Some(text) = item.get("text").and_then(Value::as_str) {
-                events.push(RuntimeEvent::MessageDelta {
-                    lane: RuntimeMessageLane::Reasoning,
-                    text: text.to_string(),
-                });
-            } else {
-                events.push(RuntimeEvent::Status {
-                    code: None,
-                    text: "codex reasoning update".to_string(),
-                });
-            }
-        }
-        Some(other) => {
-            events.push(RuntimeEvent::Status {
-                code: None,
-                text: describe_codex_item(other, item),
-            });
-        }
-        None => {
-            events.push(RuntimeEvent::Status {
-                code: None,
-                text: "codex item missing type".to_string(),
-            });
-        }
-    }
-}
-
-// Codex's final answer authority is either an explicit final_answer phase or
-// a completion boundary after the last unphased assistant message.
-fn codex_agent_message_lane(payload: &Value) -> Option<RuntimeMessageLane> {
-    match payload.get("phase").and_then(Value::as_str) {
-        Some("final_answer") => Some(RuntimeMessageLane::Answer),
-        Some("commentary") => Some(RuntimeMessageLane::Reasoning),
-        Some(_) => Some(RuntimeMessageLane::Reasoning),
-        None => None,
-    }
-}
-
-fn describe_codex_web_search(item: &Value) -> String {
-    let query = codex_item_string(item, &["query"])
-        .or_else(|| item.pointer("/input/query").and_then(Value::as_str))
-        .or_else(|| item.pointer("/action/query").and_then(Value::as_str))
-        .or_else(|| codex_item_array_first(item, &["queries"]))
-        .or_else(|| item.pointer("/input/queries/0").and_then(Value::as_str))
-        .or_else(|| item.pointer("/action/queries/0").and_then(Value::as_str));
-    let status = codex_item_string(item, &["status", "state"])
-        .or_else(|| item.pointer("/action/type").and_then(Value::as_str))
-        .map(normalize_web_search_status);
-
-    match (query, status) {
-        (Some(query), Some(status)) => {
-            format!(
-                "codex web search '{}' ({})",
-                truncate_status_detail(query),
-                status
-            )
-        }
-        (Some(query), None) => {
-            format!("codex web search '{}'", truncate_status_detail(query))
-        }
-        (None, Some(status)) => format!("codex web search ({status})"),
-        (None, None) => "codex web search".to_string(),
-    }
-}
-
-fn normalize_web_search_status(raw: &str) -> &str {
-    match raw {
-        "other" => "starting",
-        value => value,
-    }
-}
-
-fn describe_codex_item(item_type: &str, item: &Value) -> String {
-    if let Some(summary) = codex_item_summary(item) {
-        return format!("codex item {item_type} ({summary})");
-    }
-    format!("codex item: {item_type}")
-}
-
-fn codex_item_summary(item: &Value) -> Option<String> {
-    let mut parts = Vec::new();
-
-    if let Some(status) = codex_item_string(item, &["status", "state"]) {
-        parts.push(status.to_string());
-    }
-    if let Some(query) = codex_item_string(item, &["query", "location", "title", "path"]) {
-        parts.push(truncate_status_detail(query));
-    }
-
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(", "))
-    }
-}
-
-fn codex_item_string<'a>(item: &'a Value, keys: &[&str]) -> Option<&'a str> {
-    keys.iter()
-        .filter_map(|key| item.get(*key))
-        .filter_map(Value::as_str)
-        .find(|value| !value.trim().is_empty())
-}
-
-fn codex_item_array_first<'a>(item: &'a Value, keys: &[&str]) -> Option<&'a str> {
-    keys.iter()
-        .filter_map(|key| item.get(*key))
-        .filter_map(Value::as_array)
-        .find_map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .find(|value| !value.trim().is_empty())
-        })
-}
-
-fn truncate_status_detail(text: &str) -> String {
-    const MAX_LEN: usize = 80;
-    let trimmed = text.trim();
-    if trimmed.chars().count() <= MAX_LEN {
-        return trimmed.to_string();
-    }
-    let shortened: String = trimmed.chars().take(MAX_LEN - 1).collect();
-    format!("{shortened}…")
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::kernel::runtime::{
-        ExecutionOutput, RuntimeAdapter, RuntimeEvent, RuntimeMessageLane,
-        RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
     };
 
+    use crate::kernel::runtime::{
+        ExecutionOutput, RuntimeAdapter, RuntimeEvent, RuntimeMessageLane, RuntimeSessionStartInput,
+    };
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+
     use super::{
-        build_codex_exec_args, is_stale_codex_resume_failure_text, parse_codex_stdout,
+        build_codex_app_server_program, AppServerTransport, CodexAppServerClient,
         CodexRuntimeAdapter, CodexRuntimeConfig, CODEX_THREAD_ID_STATE_FILE,
     };
     use uuid::Uuid;
 
+    #[derive(Clone)]
+    struct FakeAppServerTransport {
+        incoming: Arc<Mutex<VecDeque<Value>>>,
+        sent: Arc<Mutex<Vec<Value>>>,
+        output: ExecutionOutput,
+    }
+
+    impl FakeAppServerTransport {
+        fn new(incoming: Vec<Value>) -> Self {
+            Self {
+                incoming: Arc::new(Mutex::new(incoming.into())),
+                sent: Arc::new(Mutex::new(Vec::new())),
+                output: ExecutionOutput {
+                    exit_code: Some(0),
+                    ..ExecutionOutput::default()
+                },
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AppServerTransport for FakeAppServerTransport {
+        async fn send(&mut self, message: &Value) -> Result<()> {
+            self.sent.lock().expect("sent lock").push(message.clone());
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> Result<Option<Value>> {
+            Ok(self.incoming.lock().expect("incoming lock").pop_front())
+        }
+
+        async fn shutdown(&mut self) -> Result<ExecutionOutput> {
+            Ok(self.output.clone())
+        }
+    }
+
+    #[test]
+    fn codex_app_server_program_uses_stdio_listener() {
+        let program = build_codex_app_server_program(&CodexRuntimeConfig {
+            executable: "codex".to_string(),
+            model: Some("gpt-5-codex".to_string()),
+        });
+
+        assert_eq!(program.executable, "codex");
+        assert_eq!(
+            program.args,
+            vec![
+                "app-server".to_string(),
+                "--listen".to_string(),
+                "stdio://".to_string(),
+            ]
+        );
+        assert_eq!(program.stdin, "");
+        assert_eq!(
+            program.auth,
+            Some(crate::kernel::runtime::RuntimeAuthKind::Codex)
+        );
+    }
+
     #[tokio::test]
-    async fn codex_adapter_builds_program_spec_for_registered_session() {
+    async fn codex_app_server_protocol_streams_turn_and_saves_thread_id() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
         let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig {
             executable: "codex".to_string(),
             model: Some("gpt-5-codex".to_string()),
         });
-        assert_eq!(adapter.turn_mode(), RuntimeTurnMode::ProgramBacked);
+        let handle = adapter
+            .session_start(RuntimeSessionStartInput {
+                session_id: Uuid::new_v4(),
+                working_dir: None,
+                environment: Vec::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_state_root: Some(runtime_state_root.clone()),
+            })
+            .await
+            .expect("start");
+        let thread_state = adapter.thread_state_for(&handle.runtime_session_id);
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {"serverInfo": {"name": "codex", "version": "test"}, "userAgent": "codex/test"}}),
+            json!({"id": 2, "result": {"thread": {"id": "thr_1"}}}),
+            json!({"id": 3, "result": {"turn": {"id": "turn_1"}}}),
+            json!({"method": "item/agentMessage/delta", "params": {"threadId": "thr_1", "turnId": "turn_1", "delta": "Hello"}}),
+            json!({"method": "turn/completed", "params": {"threadId": "thr_1", "turnId": "turn_1"}}),
+        ]);
+        let sent = transport.sent.clone();
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
 
+        client
+            .initialize(&event_tx, &thread_state)
+            .await
+            .expect("initialize");
+        let thread_id = adapter
+            .ensure_app_server_thread(
+                &mut client,
+                &handle.runtime_session_id,
+                &event_tx,
+                &thread_state,
+            )
+            .await
+            .expect("thread");
+        assert_eq!(thread_id, "thr_1");
+        let response = client
+            .request(
+                "turn/start",
+                super::turn_start_params(
+                    &thread_id,
+                    "hello",
+                    Some("gpt-5-codex"),
+                    crate::kernel::runtime::NetworkMode::None,
+                ),
+                &event_tx,
+                &thread_state,
+            )
+            .await
+            .expect("turn start");
+        client
+            .wait_for_turn_completed(
+                super::extract_app_server_turn_id(&response).as_deref(),
+                &event_tx,
+                &thread_state,
+            )
+            .await
+            .expect("turn completed");
+
+        let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text } if text == "Hello"
+        )));
+        assert_eq!(
+            std::fs::read_to_string(runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE))
+                .expect("thread state"),
+            "thr_1\n"
+        );
+
+        let sent = sent.lock().expect("sent lock").clone();
+        assert_eq!(sent[0]["method"], "initialize");
+        assert_eq!(sent[1]["method"], "initialized");
+        assert_eq!(sent[2]["method"], "thread/start");
+        assert_eq!(sent[3]["method"], "turn/start");
+        assert_eq!(
+            sent[3]["params"]["sandboxPolicy"]["type"],
+            "externalSandbox"
+        );
+        assert_eq!(
+            sent[3]["params"]["sandboxPolicy"]["networkAccess"],
+            "restricted"
+        );
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_protocol_accepts_internal_approval_callbacks() {
+        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
                 session_id: Uuid::new_v4(),
@@ -1039,347 +1297,34 @@ mod tests {
             })
             .await
             .expect("start");
+        let thread_state = adapter.thread_state_for(&handle.runtime_session_id);
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {}}),
+            json!({"id": "approval-1", "method": "item/commandExecution/requestApproval", "params": {}}),
+            json!({"method": "turn/completed", "params": {"turnId": "turn_1"}}),
+        ]);
+        let sent = transport.sent.clone();
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let program = adapter
-            .build_turn_program(&RuntimeTurnInput {
-                runtime_session_id: handle.runtime_session_id.clone(),
-                prompt: "hello".to_string(),
-                fresh_prompt: None,
-                runtime_skill_ids: Vec::new(),
-            })
-            .expect("program");
-
-        assert_eq!(program.executable, "codex");
-        assert_eq!(
-            program.args,
-            vec![
-                "exec".to_string(),
-                "--dangerously-bypass-approvals-and-sandbox".to_string(),
-                "--json".to_string(),
-                "--model".to_string(),
-                "gpt-5-codex".to_string(),
-            ]
-        );
-        assert!(program.environment.is_empty());
-        assert_eq!(program.stdin, "hello");
-        assert_eq!(
-            program.auth,
-            Some(crate::kernel::runtime::RuntimeAuthKind::Codex)
-        );
-
-        adapter.close(&handle).await.expect("close");
-    }
-
-    #[test]
-    fn codex_adapter_formats_nonzero_exit_from_stderr() {
-        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig {
-            executable: "codex".to_string(),
-            ..CodexRuntimeConfig::default()
-        });
-        let message = adapter.format_program_exit_error(
-            &ExecutionOutput {
-                stderr: b"stub failure\n".to_vec(),
-                exit_code: Some(7),
-                ..ExecutionOutput::default()
-            },
-            None,
-        );
-
-        assert!(
-            message.contains("exited with code 7"),
-            "exit code should be included in error"
-        );
-        assert!(
-            message.contains("stub failure"),
-            "stderr output should be surfaced in error"
-        );
-    }
-
-    #[test]
-    fn codex_exec_args_only_include_protocol_fields() {
-        let args = build_codex_exec_args(Some("gpt-5-codex"), None);
-
-        assert_eq!(
-            args,
-            vec![
-                "exec".to_string(),
-                "--dangerously-bypass-approvals-and-sandbox".to_string(),
-                "--json".to_string(),
-                "--model".to_string(),
-                "gpt-5-codex".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn codex_resume_args_use_saved_thread_id_and_read_prompt_from_stdin() {
-        let args = build_codex_exec_args(Some("gpt-5-codex"), Some("thread-123"));
-
-        assert_eq!(
-            args,
-            vec![
-                "exec".to_string(),
-                "resume".to_string(),
-                "--dangerously-bypass-approvals-and-sandbox".to_string(),
-                "--json".to_string(),
-                "--model".to_string(),
-                "gpt-5-codex".to_string(),
-                "thread-123".to_string(),
-                "-".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn codex_args_omit_model_when_runtime_model_is_unset() {
-        assert_eq!(
-            build_codex_exec_args(None, None),
-            vec![
-                "exec".to_string(),
-                "--dangerously-bypass-approvals-and-sandbox".to_string(),
-                "--json".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn codex_stdout_falls_back_to_plain_text_when_json_is_invalid() {
-        let events = parse_codex_stdout(b"plain line\n");
-        assert_eq!(events.len(), 1, "expected one parsed event");
-        assert!(matches!(
-            &events[0],
-            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text } if text == "plain line"
-        ));
-    }
-
-    #[test]
-    fn codex_web_search_status_includes_query_when_available() {
-        let events = parse_codex_stdout(
-            br#"{"type":"item.completed","item":{"type":"web_search","query":"weather in Sajiloni","status":"completed"}}"#,
-        );
-        assert_eq!(events.len(), 1, "expected one parsed event");
-        assert!(matches!(
-            &events[0],
-            RuntimeEvent::Status { code: None, text }
-                if text == "codex web search 'weather in Sajiloni' (completed)"
-        ));
-    }
-
-    #[test]
-    fn codex_web_search_started_and_completed_shapes_are_both_described() {
-        let events = parse_codex_stdout(
-            br#"{"type":"item.started","item":{"id":"item_2","type":"web_search","query":"","action":{"type":"other"}}}
-{"type":"item.completed","item":{"id":"item_2","type":"web_search","query":"weather: Nairobi, Kenya","action":{"type":"search","query":"weather: Nairobi, Kenya","queries":["weather: Nairobi, Kenya"]}}}"#,
-        );
-        assert_eq!(events.len(), 2, "expected two parsed events");
-        assert!(matches!(
-            &events[0],
-            RuntimeEvent::Status { code: None, text }
-                if text == "codex web search (starting)"
-        ));
-        assert!(matches!(
-            &events[1],
-            RuntimeEvent::Status { code: None, text }
-                if text == "codex web search 'weather: Nairobi, Kenya' (search)"
-        ));
-    }
-
-    #[test]
-    fn codex_stdout_parses_nested_msg_events_and_final_answer() {
-        let events = parse_codex_stdout(
-            br#"{"cwd":"/workspace","model":"gpt-5"}
-{"id":"0","msg":{"type":"task_started"}}
-{"id":"1","msg":{"type":"agent_reasoning_delta","delta":"Thinking..."}}
-{"id":"2","msg":{"type":"task_complete","last_agent_message":"Done."}}"#,
-        );
-
-        assert_eq!(
-            events.len(),
-            5,
-            "expected started, reasoning, answer, status, done"
-        );
-        assert!(matches!(
-            &events[0],
-            RuntimeEvent::Status { code: None, text } if text == "codex turn started"
-        ));
-        assert!(matches!(
-            &events[1],
-            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Reasoning, text } if text == "Thinking..."
-        ));
-        assert!(matches!(
-            &events[2],
-            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text } if text == "Done."
-        ));
-        assert!(matches!(
-            &events[3],
-            RuntimeEvent::Status { code: None, text } if text == "codex turn completed"
-        ));
-        assert!(matches!(&events[4], RuntimeEvent::Done));
-    }
-
-    #[test]
-    fn codex_stdout_routes_unphased_messages_by_turn_boundary() {
-        let events = parse_codex_stdout(
-            br##"{"type":"event_msg","payload":{"type":"turn.started"}}
-{"type":"event_msg","payload":{"type":"item.completed","item":{"type":"agent_message","text":"I am checking the files."}}}
-{"type":"event_msg","payload":{"type":"exec_command_begin","parsed_cmd":"sed -n '1,80p' AGENTS.md"}}
-{"type":"event_msg","payload":{"type":"exec_command_end","exit_code":0}}
-{"type":"event_msg","payload":{"type":"item.completed","item":{"type":"agent_message","text":"# Result\n\n- Read `AGENTS.md`."}}}
-{"type":"event_msg","payload":{"type":"turn.completed"}}"##,
-        );
-
-        assert!(matches!(
-            &events[1],
-            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Reasoning, text }
-                if text == "I am checking the files."
-        ));
-        assert!(matches!(
-            &events[4],
-            RuntimeEvent::MessageDelta { lane: RuntimeMessageLane::Answer, text }
-                if text == "# Result\n\n- Read `AGENTS.md`."
-        ));
-    }
-
-    #[test]
-    fn codex_stdout_ignores_non_event_json_objects() {
-        let events = parse_codex_stdout(br#"{"cwd":"/workspace","model":"gpt-5"}"#);
-        assert!(
-            events.is_empty(),
-            "non-event JSON should not surface as status spam"
-        );
-    }
-
-    #[test]
-    fn stale_resume_retry_matcher_is_narrow() {
-        assert!(is_stale_codex_resume_failure_text(
-            "codex: thread not found for resume"
-        ));
-        assert!(is_stale_codex_resume_failure_text(
-            "conversation does not exist"
-        ));
-        assert!(!is_stale_codex_resume_failure_text(
-            "network request failed"
-        ));
-        assert!(!is_stale_codex_resume_failure_text(
-            "authentication failed for this thread"
-        ));
-    }
-
-    #[tokio::test]
-    async fn first_successful_turn_saves_codex_thread_id() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let runtime_state_root = temp_dir.path().join("runtime-state");
-        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
-        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
-        let handle = adapter
-            .session_start(RuntimeSessionStartInput {
-                session_id: Uuid::new_v4(),
-                working_dir: None,
-                environment: Vec::new(),
-                runtime_skill_ids: Vec::new(),
-                runtime_state_root: Some(runtime_state_root.clone()),
-            })
+        let response = client
+            .request("turn/start", json!({}), &event_tx, &thread_state)
             .await
-            .expect("start");
-        assert!(!handle.resumes_existing_session);
-
-        let turn_input = RuntimeTurnInput {
-            runtime_session_id: handle.runtime_session_id.clone(),
-            prompt: "hello".to_string(),
-            fresh_prompt: None,
-            runtime_skill_ids: Vec::new(),
-        };
-        let mut parser = adapter
-            .program_output_parser(&turn_input)
-            .expect("program output parser");
-        let events = parser.parse_line(r#"{"type":"thread.started","thread_id":"thread-new"}"#);
-        assert!(matches!(
-            &events[0],
-            RuntimeEvent::Status { code: None, text } if text == "codex thread started: thread-new"
-        ));
-        assert_eq!(
-            std::fs::read_to_string(runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE))
-                .expect("read saved thread id"),
-            "thread-new\n"
-        );
-
-        let program = adapter.build_turn_program(&turn_input).expect("program");
-        assert_eq!(
-            program.args,
-            vec![
-                "exec".to_string(),
-                "resume".to_string(),
-                "--dangerously-bypass-approvals-and-sandbox".to_string(),
-                "--json".to_string(),
-                "thread-new".to_string(),
-                "-".to_string(),
-            ]
-        );
-
-        adapter.close(&handle).await.expect("close");
-    }
-
-    #[tokio::test]
-    async fn non_stale_resume_failure_keeps_saved_thread_id() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let runtime_state_root = temp_dir.path().join("runtime-state");
-        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
-        std::fs::write(
-            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
-            "",
-        )
-        .expect("write ready marker");
-        std::fs::write(
-            runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE),
-            "thread-old\n",
-        )
-        .expect("write thread id");
-
-        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
-        let handle = adapter
-            .session_start(RuntimeSessionStartInput {
-                session_id: Uuid::new_v4(),
-                working_dir: None,
-                environment: Vec::new(),
-                runtime_skill_ids: Vec::new(),
-                runtime_state_root: Some(runtime_state_root.clone()),
-            })
-            .await
-            .expect("start");
-        assert!(handle.resumes_existing_session);
-
-        let turn_input = RuntimeTurnInput {
-            runtime_session_id: handle.runtime_session_id.clone(),
-            prompt: "hello".to_string(),
-            fresh_prompt: Some("fresh prompt".to_string()),
-            runtime_skill_ids: Vec::new(),
-        };
-        adapter.build_turn_program(&turn_input).expect("program");
-
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let should_retry = adapter
-            .prepare_program_retry_after_failure(
-                &turn_input,
-                &ExecutionOutput {
-                    stderr: b"network request failed\n".to_vec(),
-                    exit_code: Some(1),
-                    ..ExecutionOutput::default()
-                },
-                Some("codex: network request failed"),
+            .expect("turn start");
+        client
+            .wait_for_turn_completed(
+                super::extract_app_server_turn_id(&response).as_deref(),
                 &event_tx,
+                &thread_state,
             )
-            .expect("retry decision");
+            .await
+            .expect("turn completed");
 
-        assert!(!should_retry);
-        assert!(
-            event_rx.try_recv().is_err(),
-            "non-stale failures should not emit retry status"
-        );
-        assert_eq!(
-            std::fs::read_to_string(runtime_state_root.join(CODEX_THREAD_ID_STATE_FILE))
-                .expect("read saved thread id"),
-            "thread-old\n"
-        );
+        let sent = sent.lock().expect("sent lock").clone();
+        assert!(sent.iter().any(|message| {
+            message.get("id").and_then(Value::as_str) == Some("approval-1")
+                && message.pointer("/result/decision").and_then(Value::as_str) == Some("accept")
+        }));
 
         adapter.close(&handle).await.expect("close");
     }
@@ -1404,23 +1349,6 @@ mod tests {
             .await
             .expect("start");
         assert!(!handle.resumes_existing_session);
-
-        let program = adapter
-            .build_turn_program(&RuntimeTurnInput {
-                runtime_session_id: handle.runtime_session_id.clone(),
-                prompt: "hello".to_string(),
-                fresh_prompt: None,
-                runtime_skill_ids: Vec::new(),
-            })
-            .expect("program");
-        assert_eq!(
-            program.args,
-            vec![
-                "exec".to_string(),
-                "--dangerously-bypass-approvals-and-sandbox".to_string(),
-                "--json".to_string(),
-            ]
-        );
 
         adapter.close(&handle).await.expect("close");
     }
@@ -1527,27 +1455,18 @@ mod tests {
             .await
             .expect("start b");
 
-        let program_a = adapter
-            .build_turn_program(&RuntimeTurnInput {
-                runtime_session_id: handle_a.runtime_session_id.clone(),
-                prompt: "hello".to_string(),
-                fresh_prompt: None,
-                runtime_skill_ids: Vec::new(),
-            })
-            .expect("program a");
-        let program_b = adapter
-            .build_turn_program(&RuntimeTurnInput {
-                runtime_session_id: handle_b.runtime_session_id.clone(),
-                prompt: "hello".to_string(),
-                fresh_prompt: None,
-                runtime_skill_ids: Vec::new(),
-            })
-            .expect("program b");
-
-        assert!(program_a.args.contains(&"thread-a".to_string()));
-        assert!(program_b.args.contains(&"thread-b".to_string()));
-        assert!(!program_a.args.contains(&"thread-b".to_string()));
-        assert!(!program_b.args.contains(&"thread-a".to_string()));
+        assert_eq!(
+            adapter
+                .current_thread_id(&handle_a.runtime_session_id)
+                .expect("thread a"),
+            Some("thread-a".to_string())
+        );
+        assert_eq!(
+            adapter
+                .current_thread_id(&handle_b.runtime_session_id)
+                .expect("thread b"),
+            Some("thread-b".to_string())
+        );
 
         adapter.close(&handle_a).await.expect("close a");
         adapter.close(&handle_b).await.expect("close b");

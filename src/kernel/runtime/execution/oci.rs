@@ -12,9 +12,12 @@ use tokio::{runtime::Handle, time::timeout};
 use tracing::warn;
 
 use super::{
-    backend::{ExecutionBackend, ExecutionOutput, ExecutionRequest, ExecutionStdoutSender},
+    backend::{
+        ExecutionBackend, ExecutionOutput, ExecutionRequest, ExecutionSession,
+        ExecutionStdoutSender,
+    },
     plan::{ConfinementBackend, MountAccess, MountSpec, NetworkMode, RuntimeAuthKind},
-    process::{run_process_streaming, ProcessInvocation},
+    process::{run_process_streaming, spawn_process_session, ProcessInvocation, ProcessSession},
     runtime_auth::prepare_runtime_auth,
     OciConfinementConfig,
 };
@@ -22,6 +25,45 @@ use crate::kernel::runtime::RuntimeSecretsMount;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OciExecutionBackend;
+
+pub struct OciExecutionSession {
+    process: ProcessSession,
+    runtime_secrets: Option<OciRuntimeSecretsSession>,
+}
+
+impl OciExecutionSession {
+    pub async fn write_line(&mut self, line: &str) -> Result<()> {
+        self.process.write_line(line).await
+    }
+
+    pub async fn read_line(&mut self) -> Result<Option<String>> {
+        self.process.read_line().await
+    }
+
+    pub async fn shutdown(self) -> Result<ExecutionOutput> {
+        let Self {
+            process,
+            runtime_secrets,
+        } = self;
+        let result = process.wait().await;
+        let runtime_secrets_cleanup_result = match runtime_secrets {
+            Some(cleanup) => cleanup.shutdown().await,
+            None => Ok(()),
+        };
+
+        match (result, runtime_secrets_cleanup_result) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Ok(output), Err(err)) => {
+                warn!(
+                    error = %err,
+                    "runtime secret cleanup failed after successful interactive OCI runtime turn"
+                );
+                Ok(output)
+            }
+            (Err(err), _) => Err(err),
+        }
+    }
+}
 
 const OCI_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -89,6 +131,23 @@ impl ExecutionBackend for OciExecutionBackend {
             }
             (Err(err), _) => Err(err),
         }
+    }
+
+    async fn spawn_interactive(&self, request: ExecutionRequest) -> Result<ExecutionSession> {
+        let runtime_secrets = ensure_runtime_secrets_registered(&request).await?;
+        let runtime_auth_environment = prepare_runtime_auth(&request).await?;
+        let prepared = prepare_oci_process_launch(
+            &request,
+            runtime_secrets
+                .as_ref()
+                .map(|secrets| secrets.secret_name.as_str()),
+        )?;
+        let invocation = build_oci_process_invocation(prepared, &runtime_auth_environment);
+        let process = spawn_process_session(&invocation).await?;
+        Ok(ExecutionSession::Oci(OciExecutionSession {
+            process,
+            runtime_secrets,
+        }))
     }
 }
 

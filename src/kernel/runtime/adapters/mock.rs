@@ -7,8 +7,9 @@ use crate::kernel::{
     policy::Capability,
     runtime::{
         HiddenTurnSupport, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityRequest,
-        RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender, RuntimeMessageLane,
-        RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
+        RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent,
+        RuntimeEventSender, RuntimeMessageLane, RuntimeSessionHandle, RuntimeSessionStartInput,
+        RuntimeTurnInput, RuntimeTurnResult,
     },
 };
 
@@ -113,6 +114,35 @@ impl RuntimeAdapter for MockRuntimeAdapter {
         }
         drop(events.send(RuntimeEvent::Done));
         Ok(())
+    }
+
+    async fn runtime_control(
+        &self,
+        execution: RuntimeControlExecution,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeControlOutcome> {
+        let command = execution.input.command_name.as_str();
+        match command {
+            "handled" => {
+                drop(events.send(RuntimeEvent::Status {
+                    code: Some("mock.control".to_string()),
+                    text: "mock runtime saw handled control".to_string(),
+                }));
+                Ok(RuntimeControlOutcome::Handled {
+                    message: "mock runtime handled control".to_string(),
+                })
+            }
+            "failed" => Ok(RuntimeControlOutcome::Failed {
+                code: Some("mock.control_failed".to_string()),
+                message: "mock runtime control failed".to_string(),
+            }),
+            "interactive" => Ok(RuntimeControlOutcome::InteractiveOnly {
+                message: "mock runtime control is interactive-only".to_string(),
+            }),
+            _ => Ok(RuntimeControlOutcome::Unsupported {
+                message: format!("mock runtime does not support '/{command}'"),
+            }),
+        }
     }
 
     async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {

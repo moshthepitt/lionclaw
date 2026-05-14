@@ -317,9 +317,131 @@ async fn continue_and_retry_actions_create_durable_turns() {
         .expect("history");
     assert_eq!(history.turns.len(), 3);
     assert_eq!(history.turns[1].kind, SessionTurnKind::Continue);
-    assert_eq!(history.turns[1].display_user_text, "/continue");
+    assert_eq!(history.turns[1].display_user_text, "/lionclaw continue");
     assert_eq!(history.turns[2].kind, SessionTurnKind::Retry);
-    assert_eq!(history.turns[2].display_user_text, "/retry");
+    assert_eq!(history.turns[2].display_user_text, "/lionclaw retry");
+}
+
+#[tokio::test]
+async fn first_column_runtime_control_is_persisted_as_runtime_control_turn() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let session = open_session(
+        &kernel,
+        "runtime-control-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    let response = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "/handled now".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("runtime control turn");
+
+    assert_eq!(response.assistant_text, "mock runtime handled control");
+
+    let history = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: session.session_id,
+            limit: Some(4),
+        })
+        .await
+        .expect("history");
+    let turn = history.turns.last().expect("runtime control turn");
+    assert_eq!(turn.kind, SessionTurnKind::RuntimeControl);
+    assert_eq!(turn.status, SessionTurnStatus::Completed);
+    assert_eq!(turn.display_user_text, "/handled now");
+    assert_eq!(turn.prompt_user_text, "");
+    assert_eq!(turn.assistant_text, "mock runtime handled control");
+}
+
+#[tokio::test]
+async fn slash_input_with_leading_space_remains_a_normal_prompt() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let session = open_session(
+        &kernel,
+        "runtime-control-prompt-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    let response = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: " /handled as prompt".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("normal prompt turn");
+
+    assert!(response.assistant_text.contains("/handled as prompt"));
+    assert_ne!(response.assistant_text, "mock runtime handled control");
+
+    let history = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: session.session_id,
+            limit: Some(4),
+        })
+        .await
+        .expect("history");
+    let turn = history.turns.last().expect("normal prompt turn");
+    assert_eq!(turn.kind, SessionTurnKind::Normal);
+    assert_eq!(turn.display_user_text, " /handled as prompt");
+    assert_eq!(turn.prompt_user_text, " /handled as prompt");
+}
+
+#[tokio::test]
+async fn failed_runtime_control_persists_failed_turn_with_runtime_error_code() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let session = open_session(
+        &kernel,
+        "runtime-control-failure-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    let err = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "/failed".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect_err("runtime control should fail");
+
+    assert!(
+        matches!(err, KernelError::Runtime(message) if message == "mock runtime control failed")
+    );
+
+    let history = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: session.session_id,
+            limit: Some(4),
+        })
+        .await
+        .expect("history");
+    let turn = history.turns.last().expect("failed runtime control turn");
+    assert_eq!(turn.kind, SessionTurnKind::RuntimeControl);
+    assert_eq!(turn.status, SessionTurnStatus::Failed);
+    assert_eq!(turn.display_user_text, "/failed");
+    assert_eq!(turn.prompt_user_text, "");
+    assert_eq!(turn.assistant_text, "mock runtime control failed");
+    assert_eq!(turn.error_code.as_deref(), Some("mock.control_failed"));
 }
 
 #[tokio::test]

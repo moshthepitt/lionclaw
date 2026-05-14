@@ -110,6 +110,7 @@ pub enum SessionTurnKind {
     Normal,
     Retry,
     Continue,
+    RuntimeControl,
 }
 
 impl SessionTurnKind {
@@ -118,6 +119,7 @@ impl SessionTurnKind {
             Self::Normal => "normal",
             Self::Retry => "retry",
             Self::Continue => "continue",
+            Self::RuntimeControl => "runtime_control",
         }
     }
 }
@@ -130,6 +132,7 @@ impl FromStr for SessionTurnKind {
             "normal" => Ok(Self::Normal),
             "retry" => Ok(Self::Retry),
             "continue" => Ok(Self::Continue),
+            "runtime_control" => Ok(Self::RuntimeControl),
             other => Err(format!("invalid session turn kind '{other}'")),
         }
     }

@@ -88,20 +88,25 @@ Use these prompts:
 
 ```text
 Reply with exactly RUN_OK_A_1 and nothing else.
+/model
+/rename LionClaw QA
 Read project-marker.txt from the current workspace and reply with exactly its contents.
 Write a draft file named keep.txt under LIONCLAW_DRAFTS_DIR containing exactly KEEP_OK, and reply only with keep.txt. Do not explain.
-/retry
-/reset
+/compact
+/lionclaw retry
+/lionclaw reset
 Reply with exactly RESET_OK and nothing else.
-/exit
+/lionclaw exit
 ```
 
 Expected:
 
 - the first answer is `RUN_OK_A_1`
+- `/model`, `/rename`, and `/compact` are handled as native runtime controls,
+  not sent as ordinary prompt text
 - the marker read returns `project-a`
-- `/retry` reruns the previous prompt through LionClaw history
-- `/reset` starts a fresh interactive session
+- `/lionclaw retry` reruns the previous prompt through LionClaw history
+- `/lionclaw reset` starts a fresh interactive session
 - generated drafts stay outside the project checkout
 
 ## Phase 3: Instances And Work Roots
