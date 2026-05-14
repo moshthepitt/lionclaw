@@ -772,47 +772,6 @@ pub struct ChannelListResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelPeerView {
-    pub channel_id: String,
-    pub peer_id: String,
-    pub status: String,
-    pub trust_tier: TrustTier,
-    pub pairing_code: Option<String>,
-    pub first_seen: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelPeerListResponse {
-    pub peers: Vec<ChannelPeerView>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelPeerApproveRequest {
-    pub channel_id: String,
-    pub peer_id: String,
-    pub pairing_code: String,
-    #[serde(default)]
-    pub trust_tier: Option<TrustTier>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelPeerBlockRequest {
-    pub channel_id: String,
-    pub peer_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelPeerResponse {
-    pub peer: ChannelPeerView,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ChannelPeerListParams {
-    pub channel_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelPairingView {
     pub pairing_id: Uuid,
     pub channel_id: String,

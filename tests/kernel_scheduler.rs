@@ -14,10 +14,10 @@ use chrono::{Duration as ChronoDuration, Utc};
 use lionclaw::{
     applied::AppliedState,
     contracts::{
-        ChannelPairingApproveRequest, ChannelStreamPullRequest, ChannelStreamStartMode,
-        JobCreateRequest, JobRefRequest, JobRunsRequest, SessionHistoryPolicy,
-        SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest, SessionTurnRequest,
-        StreamEventKindDto, TrustTier,
+        ChannelInboundRequest, ChannelPairingApproveRequest, ChannelStreamPullRequest,
+        ChannelStreamStartMode, ChannelTrigger, JobCreateRequest, JobRefRequest, JobRunsRequest,
+        SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest,
+        SessionTurnRequest, StreamEventKindDto, TrustTier,
     },
     home::LionClawHome,
     kernel::{
@@ -27,7 +27,7 @@ use lionclaw::{
             RuntimeExecutionProfile, RuntimeMessageLane, RuntimeSessionHandle,
             RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult, WorkspaceAccess,
         },
-        InboundChannelText, Kernel, KernelError, KernelOptions,
+        Kernel, KernelError, KernelOptions,
     },
     operator::{
         config::ChannelLaunchMode,
@@ -777,7 +777,7 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
             ..KernelOptions::default()
         })
         .await;
-    approve_channel_peer(&kernel, "terminal", "alice").await;
+    approve_channel_grant(&kernel, "terminal", "alice").await;
     let terminal_session_key = "channel:terminal:direct:alice".to_string();
 
     let seed_session = kernel
@@ -1467,19 +1467,24 @@ async fn install_and_bind_channel(env: &TestEnv, channel_id: &str, skill_name: &
     .expect("bind channel");
 }
 
-async fn approve_channel_peer(kernel: &Kernel, channel_id: &str, peer_id: &str) {
+async fn approve_channel_grant(kernel: &Kernel, channel_id: &str, peer_id: &str) {
     let response = kernel
-        .process_inbound_channel_text(InboundChannelText {
+        .ingest_channel_inbound(ChannelInboundRequest {
             channel_id: channel_id.to_string(),
-            peer_id: peer_id.to_string(),
-            text: "seed approval".to_string(),
-            session_id: None,
-            runtime_id: Some("mock".to_string()),
-            update_id: Some(1),
-            external_message_id: Some(format!("seed-{channel_id}-{peer_id}")),
+            event_id: format!("seed-{channel_id}-{peer_id}"),
+            sender_ref: peer_id.to_string(),
+            conversation_ref: peer_id.to_string(),
+            thread_ref: None,
+            message_ref: Some(format!("seed-{channel_id}-{peer_id}")),
+            text: Some("seed approval".to_string()),
+            attachments: Vec::new(),
+            reply_to_ref: None,
+            trigger: ChannelTrigger::Dm,
+            received_at: None,
+            provider_metadata: serde_json::json!({}),
         })
         .await
-        .expect("seed pending peer");
+        .expect("seed pending pairing");
     let pairing_code = response.pairing_code.expect("pairing code");
     kernel
         .approve_channel_pairing(ChannelPairingApproveRequest {
