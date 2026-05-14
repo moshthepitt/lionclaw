@@ -564,10 +564,7 @@ where
 
     async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
         self.transport
-            .send(&json!({
-                "method": method,
-                "params": params,
-            }))
+            .send(&app_server_notification_message(method, params))
             .await
     }
 
@@ -580,11 +577,7 @@ where
     ) -> Result<Value> {
         let id = self.next_request_id();
         self.transport
-            .send(&json!({
-                "id": id,
-                "method": method,
-                "params": params,
-            }))
+            .send(&app_server_request_message(id, method, params))
             .await?;
 
         loop {
@@ -823,15 +816,37 @@ where
             }
             _ => format!("unsupported LionClaw app-server callback '{method}'"),
         };
-        let response = json!({
-            "id": id,
-            "error": {
-                "code": -32601,
-                "message": message,
-            },
-        });
+        let response = app_server_error_response(id, -32601, message);
         self.transport.send(&response).await
     }
+}
+
+fn app_server_request_message(id: u64, method: &str, params: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    })
+}
+
+fn app_server_notification_message(method: &str, params: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+    })
+}
+
+fn app_server_error_response(id: Value, code: i64, message: String) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    })
 }
 
 fn response_id(message: &Value) -> Option<u64> {
@@ -1329,6 +1344,10 @@ mod tests {
         (adapter, handle, thread_state)
     }
 
+    fn is_jsonrpc_message(message: &Value) -> bool {
+        message.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+    }
+
     #[async_trait]
     impl AppServerTransport for FakeAppServerTransport {
         async fn send(&mut self, message: &Value) -> Result<()> {
@@ -1595,6 +1614,7 @@ mod tests {
         );
 
         let sent = sent.lock().expect("sent lock").clone();
+        assert!(sent.iter().all(is_jsonrpc_message));
         assert_eq!(sent[0]["method"], "initialize");
         assert_eq!(sent[1]["method"], "initialized");
         assert_eq!(sent[2]["method"], "thread/start");
@@ -1868,6 +1888,7 @@ mod tests {
         let sent = sent.lock().expect("sent lock").clone();
         assert!(sent.iter().any(|message| {
             message.get("id").and_then(Value::as_str) == Some("approval-1")
+                && is_jsonrpc_message(message)
                 && message.pointer("/error/code").and_then(Value::as_i64) == Some(-32601)
                 && message
                     .pointer("/error/message")

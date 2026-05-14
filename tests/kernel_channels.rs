@@ -763,6 +763,86 @@ async fn channel_runtime_error_event_persists_failed_turn_and_supports_continue(
     .await;
 }
 
+#[tokio::test]
+async fn channel_inbound_first_column_slash_input_uses_runtime_control_route() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "runtime-control-skill").await;
+    let kernel = env.kernel().await;
+
+    create_pending_peer(
+        &kernel,
+        "terminal",
+        "peer-runtime-control",
+        "mock",
+        7451,
+        "runtime-control-7451",
+    )
+    .await;
+    approve_peer(&kernel, "terminal", "peer-runtime-control").await;
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-runtime-control".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open interactive runtime-control session");
+
+    let queued = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-runtime-control".to_string(),
+            text: "/handled now".to_string(),
+            session_id: Some(session.session_id),
+            update_id: Some(7452),
+            external_message_id: Some("runtime-control-7452".to_string()),
+            runtime_id: Some("mock".to_string()),
+        })
+        .await
+        .expect("queue runtime control");
+    assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
+    let queued_turn_id = queued.turn_id.expect("queued turn id");
+
+    wait_for_latest_turn(
+        &kernel,
+        session.session_id,
+        |turn| {
+            turn.turn_id == queued_turn_id
+                && turn.kind == SessionTurnKind::RuntimeControl
+                && turn.status == SessionTurnStatus::Completed
+                && turn.display_user_text == "/handled now"
+                && turn.prompt_user_text.is_empty()
+                && turn.assistant_text == "mock runtime handled control"
+        },
+        "completed channel runtime-control turn",
+    )
+    .await;
+
+    let stream =
+        wait_for_stream_events(&kernel, "terminal", "terminal-runtime-control", |events| {
+            let codes = events
+                .iter()
+                .filter_map(|event| event.code.as_deref())
+                .collect::<Vec<_>>();
+            codes.contains(&"queue.completed")
+                && events.iter().any(|event| {
+                    event.turn_id == Some(queued_turn_id)
+                        && event.kind == StreamEventKindDto::TurnCompleted
+                })
+        })
+        .await;
+    assert_turn_completed_before_done(&stream.events, queued_turn_id, "channel runtime control");
+
+    let audit = wait_for_audit_event_count(&kernel, "runtime.control.route", 1).await;
+    let queued_turn_id_text = queued_turn_id.to_string();
+    assert!(audit.events.iter().any(|event| {
+        event.details["turn_id"].as_str() == Some(queued_turn_id_text.as_str())
+            && event.details["origin"].as_str() == Some("channel_inbound")
+            && event.details["command_name"].as_str() == Some("handled")
+    }));
+}
+
 async fn wait_for_audit_event_count(
     kernel: &Kernel,
     kind: &str,
