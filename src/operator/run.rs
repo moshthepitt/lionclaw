@@ -446,6 +446,7 @@ where
     let mut answer_output_seen = false;
     let mut error_seen = false;
     let mut turn_error: Option<crate::kernel::KernelError> = None;
+    let mut event_stream_open = true;
 
     loop {
         tokio::select! {
@@ -456,21 +457,25 @@ where
                 }
                 break;
             }
-            maybe_event = rx.recv() => {
-                let Some(event) = maybe_event else {
-                    continue;
-                };
-                if is_visible_message_delta(&event) {
-                    visible_output_seen = true;
+            maybe_event = rx.recv(), if event_stream_open => {
+                match maybe_event {
+                    Some(event) => {
+                        if is_visible_message_delta(&event) {
+                            visible_output_seen = true;
+                        }
+                        if is_answer_message_delta(&event) {
+                            answer_output_seen = true;
+                        }
+                        if matches!(event.kind, StreamEventKindDto::Error) {
+                            error_seen = true;
+                        }
+                        render_turn_event(&event, output)?;
+                        output.flush()?;
+                    }
+                    None => {
+                        event_stream_open = false;
+                    }
                 }
-                if is_answer_message_delta(&event) {
-                    answer_output_seen = true;
-                }
-                if matches!(event.kind, StreamEventKindDto::Error) {
-                    error_seen = true;
-                }
-                render_turn_event(&event, output)?;
-                output.flush()?;
             }
         }
     }
@@ -617,12 +622,13 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        local_peer_id_for_project, render_turn_stream, resolve_repl_session, run_local_with_io,
-        run_local_with_io_and_timeouts, RunLocalInvocation,
+        local_peer_id_for_project, render_streaming_future, render_turn_stream,
+        resolve_repl_session, run_local_with_io, run_local_with_io_and_timeouts,
+        RunLocalInvocation,
     };
     use crate::{
         config::resolve_project_workspace_root,
-        contracts::{StreamEventDto, StreamEventKindDto, StreamLaneDto},
+        contracts::{SessionTurnResponse, StreamEventDto, StreamEventKindDto, StreamLaneDto},
         home::{runtime_project_partition_key, LionClawHome},
         kernel::{
             db::Db,
@@ -632,6 +638,34 @@ mod tests {
         operator::config::{OperatorConfig, RuntimeProfileConfig},
         runtime_timeouts::RuntimeTurnTimeouts,
     };
+
+    #[tokio::test]
+    async fn render_streaming_future_waits_after_event_stream_closes() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEventDto>();
+        drop(tx);
+        let session_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let mut turn_future = Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            Ok(SessionTurnResponse {
+                session_id,
+                turn_id,
+                assistant_text: String::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_id: "mock".to_string(),
+                stream_events: Vec::new(),
+            })
+        });
+        let mut output = Vec::new();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            render_streaming_future(&mut turn_future, &mut rx, &mut output),
+        )
+        .await
+        .expect("renderer should wait for the turn future after stream close")
+        .expect("rendering should succeed");
+    }
 
     #[cfg(unix)]
     #[tokio::test]

@@ -13,7 +13,8 @@ use async_trait::async_trait;
 use lionclaw::{
     contracts::{
         SessionActionKind, SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery,
-        SessionOpenRequest, SessionTurnKind, SessionTurnRequest, SessionTurnStatus, TrustTier,
+        SessionOpenRequest, SessionTurnKind, SessionTurnRequest, SessionTurnResponse,
+        SessionTurnStatus, TrustTier,
     },
     home::RUNTIME_SESSION_READY_MARKER,
     kernel::{
@@ -361,6 +362,92 @@ async fn first_column_runtime_control_is_persisted_as_runtime_control_turn() {
     assert_eq!(turn.display_user_text, "/handled now");
     assert_eq!(turn.prompt_user_text, "");
     assert_eq!(turn.assistant_text, "mock runtime handled control");
+}
+
+#[tokio::test]
+async fn prompt_history_does_not_replay_runtime_control_turns() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let recorded_prompts = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "capture",
+            Arc::new(CapturePromptAdapter {
+                prompts: recorded_prompts.clone(),
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+    let session = open_session(
+        &kernel,
+        "runtime-control-history-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    turn_session(&kernel, session.session_id, "capture", "real prompt")
+        .await
+        .expect("initial prompt");
+    turn_session(&kernel, session.session_id, "mock", "/handled now")
+        .await
+        .expect("runtime control");
+    turn_session(&kernel, session.session_id, "capture", "follow up")
+        .await
+        .expect("follow-up prompt");
+
+    let prompts = recorded_prompts.lock().expect("prompt lock").clone();
+    assert_eq!(prompts.len(), 2);
+    let follow_up_prompt = &prompts[1];
+    assert!(follow_up_prompt.contains("real prompt"));
+    assert!(follow_up_prompt.contains("follow up"));
+    assert!(!follow_up_prompt.contains("/handled now"));
+    assert!(!follow_up_prompt.contains("mock runtime handled control"));
+}
+
+#[tokio::test]
+async fn retry_ignores_latest_runtime_control_turn() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let recorded_prompts = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "capture",
+            Arc::new(CapturePromptAdapter {
+                prompts: recorded_prompts.clone(),
+                reply: "retried".to_string(),
+            }),
+        )
+        .await;
+    let session = open_session(
+        &kernel,
+        "runtime-control-retry-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    turn_session(&kernel, session.session_id, "capture", "original prompt")
+        .await
+        .expect("initial prompt");
+    turn_session(&kernel, session.session_id, "mock", "/handled now")
+        .await
+        .expect("runtime control");
+
+    let response = kernel
+        .run_session_action(
+            session.session_id,
+            SessionActionKind::RetryLastTurn,
+            Some("capture".to_string()),
+        )
+        .await
+        .expect("retry action");
+    assert_eq!(response.assistant_text, "retried");
+
+    let prompts = recorded_prompts.lock().expect("prompt lock").clone();
+    assert_eq!(prompts.len(), 2);
+    let retry_prompt = &prompts[1];
+    assert!(retry_prompt.contains("original prompt"));
+    assert!(!retry_prompt.contains("/handled now"));
+    assert!(!retry_prompt.contains("mock runtime handled control"));
 }
 
 #[tokio::test]
@@ -1454,6 +1541,24 @@ async fn open_session(
         })
         .await
         .expect("open session")
+}
+
+async fn turn_session(
+    kernel: &Kernel,
+    session_id: Uuid,
+    runtime_id: &str,
+    user_text: &str,
+) -> Result<SessionTurnResponse, KernelError> {
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id,
+            user_text: user_text.to_string(),
+            runtime_id: Some(runtime_id.to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
 }
 
 struct PartialTimeoutAdapter {

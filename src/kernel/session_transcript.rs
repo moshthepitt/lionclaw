@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::contracts::{SessionHistoryPolicy, SessionTurnStatus, SessionTurnView};
+use crate::contracts::{SessionHistoryPolicy, SessionTurnKind, SessionTurnStatus, SessionTurnView};
 
 use super::continuity::{normalized_title_key, title_file_name};
 use super::session_turns::{SessionTurnRecord, SessionTurnStore};
@@ -98,19 +98,49 @@ pub async fn load_repaired_turns_before_sequence(
         .saturating_mul(HISTORY_OVERFETCH_MULTIPLIER)
         .min(HISTORY_OVERFETCH_CAP)
         .max(limit);
-    let turns = if let Some(before_sequence_no) = before_sequence_no {
-        store
-            .list_recent_before_sequence(session_id, before_sequence_no, fetch_limit)
-            .await?
-    } else {
-        store.list_recent(session_id, fetch_limit).await?
-    };
+    let mut cursor = before_sequence_no;
+    let mut turns = Vec::new();
+
+    loop {
+        let mut page = if let Some(before_sequence_no) = cursor {
+            store
+                .list_recent_before_sequence(session_id, before_sequence_no, fetch_limit)
+                .await?
+        } else {
+            store.list_recent(session_id, fetch_limit).await?
+        };
+        if page.is_empty() {
+            break;
+        }
+
+        let page_len = page.len();
+        let oldest_sequence_no = page.first().map(|turn| turn.sequence_no);
+        page.extend(turns);
+        turns = page;
+
+        let repaired = repair_turns_to_limit(turns.clone(), limit, mode);
+        if repaired.len() >= limit || turns.len() >= HISTORY_OVERFETCH_CAP || page_len < fetch_limit
+        {
+            return Ok(repaired);
+        }
+
+        cursor = oldest_sequence_no;
+    }
+
+    Ok(repair_turns_to_limit(turns, limit, mode))
+}
+
+fn repair_turns_to_limit(
+    turns: Vec<SessionTurnRecord>,
+    limit: usize,
+    mode: TranscriptMode,
+) -> Vec<SessionTurnRecord> {
     let mut repaired = repair_turns(turns, mode);
     if repaired.len() > limit {
         let keep_from = repaired.len() - limit;
         repaired.drain(0..keep_from);
     }
-    Ok(repaired)
+    repaired
 }
 
 pub fn repair_turns(
@@ -119,7 +149,7 @@ pub fn repair_turns(
 ) -> Vec<SessionTurnRecord> {
     turns.sort_by_key(|turn| (turn.sequence_no, turn.started_at, turn.turn_id));
 
-    let map_running_to_interrupted = matches!(mode, TranscriptMode::Prompt(_));
+    let prompt_mode = matches!(mode, TranscriptMode::Prompt(_));
     let mut seen_turn_ids = HashSet::new();
     let mut seen_sequence_nos = HashSet::new();
     let mut repaired = Vec::with_capacity(turns.len());
@@ -128,7 +158,10 @@ pub fn repair_turns(
         if !seen_turn_ids.insert(turn.turn_id) || !seen_sequence_nos.insert(turn.sequence_no) {
             continue;
         }
-        if map_running_to_interrupted && turn.status == SessionTurnStatus::Running {
+        if prompt_mode && turn.kind == SessionTurnKind::RuntimeControl {
+            continue;
+        }
+        if prompt_mode && turn.status == SessionTurnStatus::Running {
             turn.status = SessionTurnStatus::Interrupted;
             if turn.error_code.is_none() {
                 turn.error_code = Some(INTERRUPTED_ERROR_CODE.to_string());
@@ -1055,6 +1088,41 @@ mod tests {
             repaired[0].error_text.as_deref(),
             Some("turn interrupted by kernel restart")
         );
+    }
+
+    #[test]
+    fn prompt_repair_drops_runtime_control_turns() {
+        let mut runtime_control = turn(
+            1,
+            Uuid::parse_str("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee").expect("uuid"),
+            SessionTurnStatus::Completed,
+            "/compact",
+            "Compacted Codex thread.",
+            None,
+        );
+        runtime_control.kind = SessionTurnKind::RuntimeControl;
+        let prompt = turn(
+            2,
+            Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").expect("uuid"),
+            SessionTurnStatus::Completed,
+            "follow up",
+            "answer",
+            None,
+        );
+
+        let prompt_repaired = repair_turns(
+            vec![runtime_control.clone(), prompt.clone()],
+            TranscriptMode::Prompt(SessionHistoryPolicy::Interactive),
+        );
+        let history_repaired = repair_turns(
+            vec![runtime_control.clone(), prompt],
+            TranscriptMode::History,
+        );
+
+        assert_eq!(prompt_repaired.len(), 1);
+        assert_eq!(prompt_repaired[0].kind, SessionTurnKind::Normal);
+        assert_eq!(history_repaired.len(), 2);
+        assert_eq!(history_repaired[0].kind, SessionTurnKind::RuntimeControl);
     }
 
     #[test]
