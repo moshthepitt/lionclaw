@@ -157,9 +157,11 @@ fallback path.
 
 ## Runtime Control Commands
 
-The first column is command space. `lionclaw run` reserves `/lionclaw ...` for
-LionClaw-owned REPL controls such as `/lionclaw retry`, `/lionclaw reset`, and
-`/lionclaw exit`.
+The first column is command space. `lionclaw run` and channel inbound routing
+reserve `/lionclaw ...` for LionClaw-owned controls such as
+`/lionclaw retry`, `/lionclaw reset`, and `/lionclaw exit`. Local-only controls
+such as `/lionclaw exit` are acknowledged by channel routing but do not exit a
+channel worker.
 
 Other first-column slash commands are classified as runtime controls and are
 persisted as `runtime_control` turns. The kernel records

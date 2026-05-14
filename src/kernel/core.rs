@@ -63,7 +63,7 @@ use super::{
     db::Db,
     drafts,
     error::KernelError,
-    input_routing::{classify_input, ClassifiedInput, RuntimeControlCommand},
+    input_routing::{classify_input, ClassifiedInput, LionClawControlInput, RuntimeControlCommand},
     jobs::{
         compute_initial_next_run, JobDeliveryTarget, JobSchedule, JobStore, NewSchedulerJob,
         SchedulerJobDeliveryStatus, SchedulerJobRecord, SchedulerJobRunRecord,
@@ -652,7 +652,11 @@ impl Kernel {
                 let session_lock = self.session_lock(req.session_id).await;
                 let guard = Arc::clone(&session_lock).lock_owned().await;
                 let (session, execution) = self
-                    .prepare_session_action_execution(req.session_id, req.action, None, None)
+                    .prepare_session_action_execution(
+                        req.session_id,
+                        req.action,
+                        SessionActionExecutionOptions::api(None, None),
+                    )
                     .await?;
                 let response_session_id = session.session_id;
                 let turn_id = execution.turn_id;
@@ -752,10 +756,24 @@ impl Kernel {
         runtime_id_override: Option<String>,
         sink: Option<RuntimeEventSink>,
     ) -> Result<SessionTurnResponse, KernelError> {
+        self.run_session_action_with_options(
+            session_id,
+            action,
+            SessionActionExecutionOptions::api(runtime_id_override, sink),
+        )
+        .await
+    }
+
+    async fn run_session_action_with_options(
+        &self,
+        session_id: Uuid,
+        action: SessionActionKind,
+        options: SessionActionExecutionOptions,
+    ) -> Result<SessionTurnResponse, KernelError> {
         let session_lock = self.session_lock(session_id).await;
         let _guard = session_lock.lock().await;
         let (session, execution) = self
-            .prepare_session_action_execution(session_id, action, runtime_id_override, sink)
+            .prepare_session_action_execution(session_id, action, options)
             .await?;
 
         self.execute_session_turn(&session, execution).await
@@ -765,9 +783,15 @@ impl Kernel {
         &self,
         session_id: Uuid,
         action: SessionActionKind,
-        runtime_id_override: Option<String>,
-        sink: Option<RuntimeEventSink>,
+        options: SessionActionExecutionOptions,
     ) -> Result<(super::sessions::Session, SessionTurnExecution), KernelError> {
+        let SessionActionExecutionOptions {
+            turn_id,
+            runtime_id_override,
+            sink,
+            emit_channel_stream_done,
+            audit_actor,
+        } = options;
         let session = self.get_scoped_session(session_id).await?;
         self.require_session_mutation_access(&session).await?;
 
@@ -798,13 +822,12 @@ impl Kernel {
                 }
 
                 SessionTurnExecution {
-                    turn_id: Uuid::new_v4(),
+                    turn_id,
                     kind: SessionTurnKind::Continue,
                     display_user_text: "/lionclaw continue".to_string(),
                     prompt_user_text: "Continue your previous assistant reply from where it stopped. Do not restart from the beginning unless necessary.".to_string(),
                     requested_runtime_id: Some(
                         runtime_id_override
-                            .clone()
                             .unwrap_or_else(|| latest_turn.runtime_id.clone()),
                     ),
                     runtime_working_dir: None,
@@ -812,28 +835,26 @@ impl Kernel {
                     runtime_env_passthrough: None,
                     default_policy_scope: Scope::Session(session_id),
                     sink,
-                    emit_channel_stream_done: true,
-                    audit_actor: "api".to_string(),
+                    emit_channel_stream_done,
+                    audit_actor,
                     runtime_control_origin: RuntimeControlOrigin::SessionTurn,
                 }
             }
             SessionActionKind::RetryLastTurn => SessionTurnExecution {
-                turn_id: Uuid::new_v4(),
+                turn_id,
                 kind: SessionTurnKind::Retry,
                 display_user_text: "/lionclaw retry".to_string(),
                 prompt_user_text: latest_turn.prompt_user_text,
                 requested_runtime_id: Some(
-                    runtime_id_override
-                        .clone()
-                        .unwrap_or_else(|| latest_turn.runtime_id.clone()),
+                    runtime_id_override.unwrap_or_else(|| latest_turn.runtime_id.clone()),
                 ),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
                 runtime_env_passthrough: None,
                 default_policy_scope: Scope::Session(session_id),
                 sink,
-                emit_channel_stream_done: true,
-                audit_actor: "api".to_string(),
+                emit_channel_stream_done,
+                audit_actor,
                 runtime_control_origin: RuntimeControlOrigin::SessionTurn,
             },
             SessionActionKind::ResetSession => {
@@ -4288,6 +4309,14 @@ fn kernel_error_for_turn_status(status: SessionTurnStatus, message: String) -> K
     }
 }
 
+fn queued_turn_failure_code(err: &KernelError) -> &'static str {
+    match err {
+        KernelError::RuntimeTimeout(_) => "runtime.timeout",
+        KernelError::Runtime(_) => "runtime.error",
+        _ => "queue.failed",
+    }
+}
+
 fn session_turn_status_for_error_code(error_code: &str) -> SessionTurnStatus {
     match error_code {
         "runtime.timeout" => SessionTurnStatus::TimedOut,
@@ -4383,6 +4412,36 @@ struct SessionTurnExecution {
     emit_channel_stream_done: bool,
     audit_actor: String,
     runtime_control_origin: RuntimeControlOrigin,
+}
+
+struct SessionActionExecutionOptions {
+    turn_id: Uuid,
+    runtime_id_override: Option<String>,
+    sink: Option<RuntimeEventSink>,
+    emit_channel_stream_done: bool,
+    audit_actor: String,
+}
+
+impl SessionActionExecutionOptions {
+    fn api(runtime_id_override: Option<String>, sink: Option<RuntimeEventSink>) -> Self {
+        Self {
+            turn_id: Uuid::new_v4(),
+            runtime_id_override,
+            sink,
+            emit_channel_stream_done: true,
+            audit_actor: "api".to_string(),
+        }
+    }
+
+    fn queued_channel(turn: &ChannelTurnRecord) -> Self {
+        Self {
+            turn_id: turn.turn_id,
+            runtime_id_override: Some(turn.runtime_id.clone()),
+            sink: None,
+            emit_channel_stream_done: false,
+            audit_actor: "kernel".to_string(),
+        }
+    }
 }
 
 struct RuntimeExecutionSkills {
@@ -6236,6 +6295,23 @@ impl Kernel {
             }
         };
 
+        if let ClassifiedInput::LionClawControl(control) = classify_input(&inbound_message.content)
+        {
+            if let Err(err) = self
+                .process_queued_lionclaw_control(&turn, &session, control, stream_context.clone())
+                .await
+            {
+                let code = queued_turn_failure_code(&err);
+                if let Err(fail_err) = self
+                    .fail_queued_turn(&turn, code, &err.to_string(), stream_context)
+                    .await
+                {
+                    warn!(?fail_err, turn_id = %turn.turn_id, "failed to mark queued LionClaw control failed");
+                }
+            }
+            return;
+        }
+
         let result = self
             .execute_session_turn_serialized(
                 session,
@@ -6259,60 +6335,16 @@ impl Kernel {
 
         match result {
             Ok(response) => {
-                if let Err(err) = self.channel_state.complete_turn(turn.turn_id).await {
-                    warn!(?err, turn_id = %turn.turn_id, "failed to mark queued channel turn complete");
-                }
-                if let Some(stream_context) = self
-                    .channel_stream_context_for_session(
-                        turn.session_id,
-                        &turn.channel_id,
-                        &turn.peer_id,
-                        turn.turn_id,
-                    )
-                    .await
-                    .ok()
-                    .flatten()
-                {
-                    if let Err(err) = self
-                        .emit_runtime_event(
-                            &Some(stream_context.clone()),
-                            &None,
-                            RuntimeEvent::Status {
-                                code: Some("queue.completed".to_string()),
-                                text: "turn completed".to_string(),
-                            },
-                        )
-                        .await
-                    {
-                        warn!(?err, turn_id = %turn.turn_id, "failed to emit queued turn completion status");
-                    }
-                    if let Err(err) = self
-                        .emit_runtime_event(&Some(stream_context), &None, RuntimeEvent::Done)
-                        .await
-                    {
-                        warn!(?err, turn_id = %turn.turn_id, "failed to emit queued turn completion event");
-                    }
-                }
-                self.append_audit_event_best_effort(
-                    "channel.turn.completed",
-                    Some(turn.session_id),
-                    "kernel",
-                    json!({
-                        "turn_id": turn.turn_id,
-                        "channel_id": turn.channel_id,
-                        "peer_id": turn.peer_id,
-                        "runtime_id": response.runtime_id,
-                        "assistant_text_len": response.assistant_text.len(),
-                    }),
+                self.complete_queued_turn(
+                    &turn,
+                    &response.runtime_id,
+                    response.assistant_text.len(),
+                    stream_context,
                 )
                 .await;
             }
             Err(err) => {
-                let code = match err {
-                    KernelError::RuntimeTimeout(_) => "runtime.timeout",
-                    KernelError::Runtime(_) => "runtime.error",
-                    _ => "queue.failed",
-                };
+                let code = queued_turn_failure_code(&err);
                 if let Err(fail_err) = self
                     .fail_queued_turn(&turn, code, &err.to_string(), stream_context)
                     .await
@@ -6321,6 +6353,162 @@ impl Kernel {
                 }
             }
         }
+    }
+
+    async fn process_queued_lionclaw_control(
+        &self,
+        turn: &ChannelTurnRecord,
+        session: &super::sessions::Session,
+        control: LionClawControlInput,
+        stream_context: Option<ChannelStreamContext>,
+    ) -> Result<(), KernelError> {
+        self.append_audit_event_best_effort(
+            "channel.lionclaw_control",
+            Some(session.session_id),
+            "kernel",
+            json!({
+                "turn_id": turn.turn_id,
+                "channel_id": turn.channel_id,
+                "peer_id": turn.peer_id,
+                "command_name": control.command_name.clone(),
+            }),
+        )
+        .await;
+
+        match control.command_name.as_str() {
+            "continue" => {
+                self.run_queued_session_action(
+                    turn,
+                    SessionActionKind::ContinueLastPartial,
+                    stream_context,
+                )
+                .await?;
+            }
+            "retry" => {
+                self.run_queued_session_action(
+                    turn,
+                    SessionActionKind::RetryLastTurn,
+                    stream_context,
+                )
+                .await?;
+            }
+            "reset" => {
+                let response = self
+                    .session_action(SessionActionRequest {
+                        session_id: session.session_id,
+                        action: SessionActionKind::ResetSession,
+                    })
+                    .await?;
+                let message = format!("opened a fresh session: {}", response.session_id);
+                self.emit_runtime_event(
+                    &stream_context,
+                    &None,
+                    RuntimeEvent::Status {
+                        code: Some("lionclaw.reset".to_string()),
+                        text: message.clone(),
+                    },
+                )
+                .await?;
+                self.complete_queued_turn(turn, &turn.runtime_id, message.len(), stream_context)
+                    .await;
+            }
+            "exit" | "quit" => {
+                let message = "LionClaw exit is only available in local interactive mode.";
+                self.emit_runtime_event(
+                    &stream_context,
+                    &None,
+                    RuntimeEvent::Status {
+                        code: Some("lionclaw.exit_unavailable".to_string()),
+                        text: message.to_string(),
+                    },
+                )
+                .await?;
+                self.complete_queued_turn(turn, &turn.runtime_id, message.len(), stream_context)
+                    .await;
+            }
+            "" => {
+                return Err(KernelError::BadRequest(
+                    "missing LionClaw command".to_string(),
+                ));
+            }
+            other => {
+                return Err(KernelError::BadRequest(format!(
+                    "unknown LionClaw command: {other}"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn run_queued_session_action(
+        &self,
+        turn: &ChannelTurnRecord,
+        action: SessionActionKind,
+        stream_context: Option<ChannelStreamContext>,
+    ) -> Result<(), KernelError> {
+        let response = self
+            .run_session_action_with_options(
+                turn.session_id,
+                action,
+                SessionActionExecutionOptions::queued_channel(turn),
+            )
+            .await?;
+
+        self.complete_queued_turn(
+            turn,
+            &response.runtime_id,
+            response.assistant_text.len(),
+            stream_context,
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn complete_queued_turn(
+        &self,
+        turn: &ChannelTurnRecord,
+        runtime_id: &str,
+        assistant_text_len: usize,
+        stream_context: Option<ChannelStreamContext>,
+    ) {
+        if let Err(err) = self.channel_state.complete_turn(turn.turn_id).await {
+            warn!(?err, turn_id = %turn.turn_id, "failed to mark queued channel turn complete");
+        }
+        if let Some(stream_context) = stream_context {
+            if let Err(err) = self
+                .emit_runtime_event(
+                    &Some(stream_context.clone()),
+                    &None,
+                    RuntimeEvent::Status {
+                        code: Some("queue.completed".to_string()),
+                        text: "turn completed".to_string(),
+                    },
+                )
+                .await
+            {
+                warn!(?err, turn_id = %turn.turn_id, "failed to emit queued turn completion status");
+            }
+            if let Err(err) = self
+                .emit_runtime_event(&Some(stream_context), &None, RuntimeEvent::Done)
+                .await
+            {
+                warn!(?err, turn_id = %turn.turn_id, "failed to emit queued turn completion event");
+            }
+        }
+        self.append_audit_event_best_effort(
+            "channel.turn.completed",
+            Some(turn.session_id),
+            "kernel",
+            json!({
+                "turn_id": turn.turn_id,
+                "channel_id": turn.channel_id,
+                "peer_id": turn.peer_id,
+                "runtime_id": runtime_id,
+                "assistant_text_len": assistant_text_len,
+            }),
+        )
+        .await;
     }
 
     async fn fail_queued_turn(

@@ -843,6 +843,149 @@ async fn channel_inbound_first_column_slash_input_uses_runtime_control_route() {
     }));
 }
 
+#[tokio::test]
+async fn channel_inbound_lionclaw_retry_uses_lionclaw_action_route() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "lionclaw-action-skill").await;
+    let kernel = env.kernel().await;
+
+    create_pending_peer(
+        &kernel,
+        "terminal",
+        "peer-lionclaw-action",
+        "mock",
+        7501,
+        "lionclaw-action-7501",
+    )
+    .await;
+    approve_peer(&kernel, "terminal", "peer-lionclaw-action").await;
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-lionclaw-action".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open interactive action session");
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "seed retry source".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("seed retry source");
+
+    let queued = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-lionclaw-action".to_string(),
+            text: "/lionclaw retry".to_string(),
+            session_id: Some(session.session_id),
+            update_id: Some(7502),
+            external_message_id: Some("lionclaw-action-7502".to_string()),
+            runtime_id: Some("mock".to_string()),
+        })
+        .await
+        .expect("queue LionClaw retry");
+    assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
+    let queued_turn_id = queued.turn_id.expect("queued turn id");
+
+    wait_for_latest_turn(
+        &kernel,
+        session.session_id,
+        |turn| {
+            turn.turn_id == queued_turn_id
+                && turn.kind == SessionTurnKind::Retry
+                && turn.status == SessionTurnStatus::Completed
+                && turn.display_user_text == "/lionclaw retry"
+                && turn.prompt_user_text == "seed retry source"
+                && turn.assistant_text.contains("seed retry source")
+        },
+        "completed channel LionClaw retry",
+    )
+    .await;
+
+    let stream =
+        wait_for_stream_events(&kernel, "terminal", "terminal-lionclaw-action", |events| {
+            events.iter().any(|event| {
+                event.turn_id == Some(queued_turn_id)
+                    && event.kind == StreamEventKindDto::TurnCompleted
+            })
+        })
+        .await;
+    assert_turn_completed_before_done(&stream.events, queued_turn_id, "channel LionClaw retry");
+
+    let audit = wait_for_audit_event_count(&kernel, "channel.lionclaw_control", 1).await;
+    let queued_turn_id_text = queued_turn_id.to_string();
+    assert!(audit.events.iter().any(|event| {
+        event.details["turn_id"].as_str() == Some(queued_turn_id_text.as_str())
+            && event.details["command_name"].as_str() == Some("retry")
+    }));
+}
+
+#[tokio::test]
+async fn channel_inbound_bare_retry_stays_runtime_owned() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "bare-runtime-skill").await;
+    let kernel = env.kernel().await;
+
+    create_pending_peer(
+        &kernel,
+        "terminal",
+        "peer-bare-runtime",
+        "mock",
+        7551,
+        "bare-runtime-7551",
+    )
+    .await;
+    approve_peer(&kernel, "terminal", "peer-bare-runtime").await;
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-bare-runtime".to_string(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open interactive runtime-owned session");
+
+    let queued = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: "peer-bare-runtime".to_string(),
+            text: "/retry".to_string(),
+            session_id: Some(session.session_id),
+            update_id: Some(7552),
+            external_message_id: Some("bare-runtime-7552".to_string()),
+            runtime_id: Some("mock".to_string()),
+        })
+        .await
+        .expect("queue bare runtime control");
+    assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
+    let queued_turn_id = queued.turn_id.expect("queued turn id");
+
+    wait_for_latest_turn(
+        &kernel,
+        session.session_id,
+        |turn| {
+            turn.turn_id == queued_turn_id
+                && turn.kind == SessionTurnKind::RuntimeControl
+                && turn.status == SessionTurnStatus::Completed
+                && turn.display_user_text == "/retry"
+                && turn.prompt_user_text.is_empty()
+                && turn.assistant_text == "mock runtime does not support '/retry'"
+        },
+        "completed bare runtime-owned slash command",
+    )
+    .await;
+}
+
 async fn wait_for_audit_event_count(
     kernel: &Kernel,
     kind: &str,

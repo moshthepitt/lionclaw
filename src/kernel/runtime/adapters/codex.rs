@@ -443,11 +443,7 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
 fn build_codex_app_server_program(config: &CodexRuntimeConfig) -> RuntimeProgramSpec {
     RuntimeProgramSpec {
         executable: config.executable.clone(),
-        args: vec![
-            "app-server".to_string(),
-            "--listen".to_string(),
-            "stdio://".to_string(),
-        ],
+        args: vec!["app-server".to_string()],
         environment: Vec::new(),
         stdin: String::new(),
         auth: Some(RuntimeAuthKind::Codex),
@@ -1366,21 +1362,14 @@ mod tests {
     }
 
     #[test]
-    fn codex_app_server_program_uses_stdio_listener() {
+    fn codex_app_server_program_uses_default_stdio_transport() {
         let program = build_codex_app_server_program(&CodexRuntimeConfig {
             executable: "codex".to_string(),
             model: Some("gpt-5-codex".to_string()),
         });
 
         assert_eq!(program.executable, "codex");
-        assert_eq!(
-            program.args,
-            vec![
-                "app-server".to_string(),
-                "--listen".to_string(),
-                "stdio://".to_string(),
-            ]
-        );
+        assert_eq!(program.args, vec!["app-server".to_string()]);
         assert_eq!(program.stdin, "");
         assert_eq!(
             program.auth,
