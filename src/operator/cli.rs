@@ -11,12 +11,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use cron::Schedule;
+use uuid::Uuid;
 
 use crate::{
     contracts::{
-        ContinuityDraftActionRequest, ContinuityDraftListRequest, ContinuityPathRequest,
-        ContinuitySearchRequest, JobCreateRequest, JobRefRequest, JobRunsRequest, JobScheduleDto,
-        TrustTier,
+        ChannelPairingStatus, ChannelRoutingProfile, ContinuityDraftActionRequest,
+        ContinuityDraftListRequest, ContinuityPathRequest, ContinuitySearchRequest,
+        JobCreateRequest, JobRefRequest, JobRunsRequest, JobScheduleDto, TrustTier,
     },
     home::LionClawHome,
     kernel::{
@@ -40,8 +41,8 @@ use crate::{
         },
         reconcile::{
             add_channel, add_skill, open_kernel, open_runtime_kernel_for_work_root,
-            pairing_approve, pairing_block, pairing_list, remove_channel, remove_skill,
-            resolve_installed_skill_worker_entrypoint,
+            pairing_approve, pairing_block, pairing_list, pairing_revoke, remove_channel,
+            remove_skill, resolve_installed_skill_worker_entrypoint,
         },
         run::run_local,
         runtime::{resolve_runtime_id, validate_runtime_availability},
@@ -393,6 +394,7 @@ enum ChannelPairingCommand {
     List(PairingListArgs),
     Approve(PairingApproveArgs),
     Block(PairingBlockArgs),
+    Revoke(PairingRevokeArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -451,13 +453,18 @@ enum ContinuityProposalCommand {
 struct PairingListArgs {
     #[arg(long)]
     channel_id: Option<String>,
+    #[arg(long)]
+    status: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct PairingApproveArgs {
     channel_id: String,
-    peer_id: String,
-    pairing_code: String,
+    pairing: String,
+    #[arg(long)]
+    label: Option<String>,
+    #[arg(long = "routing-profile")]
+    routing_profile: Option<String>,
     #[arg(long, default_value = "main")]
     trust_tier: String,
 }
@@ -478,7 +485,21 @@ struct ContinuityDraftPathArgs {
 #[derive(Debug, Args)]
 struct PairingBlockArgs {
     channel_id: String,
-    peer_id: String,
+    target: String,
+    #[arg(long = "conversation-ref")]
+    conversation_ref: Option<String>,
+    #[arg(long = "thread-ref")]
+    thread_ref: Option<String>,
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct PairingRevokeArgs {
+    channel_id: String,
+    grant_id: Uuid,
+    #[arg(long)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -945,38 +966,76 @@ pub async fn run() -> Result<ExitCode> {
             }
             ChannelCommand::Pairing { command } => match command {
                 ChannelPairingCommand::List(args) => {
-                    for peer in pairing_list(&home, args.channel_id).await? {
+                    let status = args
+                        .status
+                        .as_deref()
+                        .map(ChannelPairingStatus::from_str)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?;
+                    for pairing in pairing_list(&home, args.channel_id, status).await? {
                         println!(
-                            "channel={} peer={} status={} trust={} code={}",
-                            peer.channel_id,
-                            peer.peer_id,
-                            peer.status,
-                            peer.trust_tier.as_str(),
-                            peer.pairing_code.as_deref().unwrap_or("-"),
+                            "channel={} pairing={} status={} profile={} sender={} conversation={} thread={} label={}",
+                            pairing.channel_id,
+                            pairing.pairing_id,
+                            pairing.status.as_str(),
+                            pairing.requested_profile.as_str(),
+                            pairing.sender_ref.as_deref().unwrap_or("-"),
+                            pairing.conversation_ref.as_deref().unwrap_or("-"),
+                            pairing.thread_ref.as_deref().unwrap_or("-"),
+                            pairing.label.as_deref().unwrap_or("-"),
                         );
                     }
                 }
                 ChannelPairingCommand::Approve(args) => {
                     let trust_tier =
                         TrustTier::from_str(&args.trust_tier).map_err(anyhow::Error::msg)?;
-                    let peer = pairing_approve(
+                    let routing_profile = args
+                        .routing_profile
+                        .as_deref()
+                        .map(ChannelRoutingProfile::from_str)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?;
+                    let grant = pairing_approve(
                         &home,
                         args.channel_id,
-                        args.peer_id,
-                        args.pairing_code,
+                        args.pairing,
+                        routing_profile,
                         trust_tier,
+                        args.label,
                     )
                     .await?;
                     println!(
-                        "approved {}:{} ({})",
-                        peer.peer.channel_id,
-                        peer.peer.peer_id,
-                        peer.peer.trust_tier.as_str()
+                        "approved channel={} grant={} profile={} trust={}",
+                        grant.grant.channel_id,
+                        grant.grant.grant_id,
+                        grant.grant.routing_profile.as_str(),
+                        grant.grant.trust_tier.as_str()
                     );
                 }
                 ChannelPairingCommand::Block(args) => {
-                    let peer = pairing_block(&home, args.channel_id, args.peer_id).await?;
-                    println!("blocked {}:{}", peer.peer.channel_id, peer.peer.peer_id);
+                    let grant = pairing_block(
+                        &home,
+                        args.channel_id,
+                        args.target,
+                        args.conversation_ref,
+                        args.thread_ref,
+                        args.reason,
+                    )
+                    .await?;
+                    println!(
+                        "blocked channel={} grant={} profile={}",
+                        grant.grant.channel_id,
+                        grant.grant.grant_id,
+                        grant.grant.routing_profile.as_str()
+                    );
+                }
+                ChannelPairingCommand::Revoke(args) => {
+                    let revoked =
+                        pairing_revoke(&home, args.channel_id, args.grant_id, args.reason).await?;
+                    println!(
+                        "revoked grant={} revoked={}",
+                        revoked.grant_id, revoked.revoked
+                    );
                 }
             },
         },

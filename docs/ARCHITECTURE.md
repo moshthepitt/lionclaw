@@ -89,7 +89,7 @@ Skill text can influence prompt context. It cannot grant permissions.
 - `kernel.runtime`: runtime adapter contract and registry.
 - `kernel.runtime.execution`: execution presets, plan compilation, OCI backend, and process execution.
 - `kernel.scheduler`: due-job claiming, lease coordination, retry, and dispatch.
-- `kernel.channel_state`: channel peer trust state, inbound logs, queued turns, outbound stream state, and transcript history.
+- `kernel.channel_state`: channel pairing requests, scoped grants, normalized inbound event admission, queued turns, outbound stream state, and transcript history.
 - `kernel.continuity`: assistant-home continuity files, `ACTIVE.md` projection, daily notes, artifacts, open loops, proposals, and retrieval helpers.
 - `kernel.continuity_fs`: descriptor-rooted Unix filesystem helper for assistant-home continuity.
 - `kernel.session_compactions`: persisted transcript compaction summaries and ranges.
@@ -273,9 +273,10 @@ with the CLI.
 ### Channel
 
 - `GET /v0/channels/list`
-- `GET /v0/channels/peers`
-- `POST /v0/channels/peers/approve`
-- `POST /v0/channels/peers/block`
+- `GET /v0/channels/pairing`
+- `POST /v0/channels/pairing/approve`
+- `POST /v0/channels/pairing/block`
+- `POST /v0/channels/grants/revoke`
 - `POST /v0/channels/inbound`
 - `POST /v0/channels/stream/pull`
 - `POST /v0/channels/stream/ack`
@@ -325,16 +326,16 @@ metadata endpoint used to classify a listener before reusing it.
 External channel skills integrate over HTTP:
 
 1. `GET /v0/sessions/latest` restores the latest durable session snapshot for
-   `(channel_id, peer_id)`.
-2. `POST /v0/channels/inbound` submits normalized inbound messages. Approved
-   peers queue a channel turn and receive an explicit outcome.
+   a deterministic `(channel_id, session_key)`.
+2. `POST /v0/channels/inbound` submits normalized inbound facts. Approved
+   grants queue a channel turn and receive an explicit outcome.
 3. `POST /v0/sessions/action` starts `continue_last_partial`,
    `retry_last_turn`, or `reset_session` for a channel-backed session.
 4. `POST /v0/channels/stream/pull` fetches typed outbound stream events for a
    consumer cursor.
 5. `POST /v0/channels/stream/ack` records that a worker durably handled events
    through a sequence.
-6. Peer list, approve, and block endpoints manage pairing trust.
+6. Pairing approve/block and grant revoke endpoints manage channel trust.
 
 Queued channel turns emit machine-stable status/error codes through the same
 stream contract. Kernel-generated lifecycle codes include:
@@ -349,9 +350,9 @@ stream contract. Kernel-generated lifecycle codes include:
 - `runtime.timeout`
 
 Stream events produced by actual runtime turns include `session_id` and
-`turn_id`. Channel-scoped messages, such as pairing notices or scheduler
-delivery summaries, may omit both fields and must not be treated as active
-session state by channel skills.
+`turn_id`. The stream `peer_id` remains the provider-facing conversation ref for
+delivery compatibility; internal session identity is carried by `session_key`
+and the session row.
 
 ## Session Continuity
 
@@ -364,7 +365,7 @@ prompts:
 `session_turns` is the durable source of truth for prompt history. It records:
 
 - `kind = normal | retry | continue | runtime_control`
-- `status = running | completed | failed | timed_out | cancelled | interrupted`
+- `status = running | waiting_for_attachments | completed | failed | timed_out | cancelled | interrupted`
 - `display_user_text`
 - `prompt_user_text`
 - `assistant_text`
@@ -375,7 +376,12 @@ prompts:
 Answer-lane text is checkpointed while a turn is still running so restart
 reconciliation can preserve partial replies already emitted to the user.
 Channel-backed running turns also persist the exact stream sequence through
-which the durable assistant checkpoint is synchronized.
+which the durable assistant checkpoint is synchronized. Channels v2 stores
+provider facts without message text in `channel_inbound_events`, admits work
+through scoped grants, and derives deterministic session keys such as
+`channel:<channel_id>:direct:<sender_ref>`. Worker-supplied runtime selection is
+not part of the inbound channel contract; the kernel resolves runtime execution
+from the instance/default runtime configuration.
 
 Kernel bootstrap converts stale `running` session turns into durable
 `interrupted` turns before they can be reused.
@@ -466,7 +472,7 @@ home.
 7. Ordinary confined runtime file work stays inside mounted work-root, runtime,
    and drafts paths.
 8. Kernel brokers are reserved for explicit side effects and direct-runtime
-   requests. `channel.send` records outbound transcript entries and appends
+   requests. `channel.send` records metadata-only outbound entries and appends
    typed stream events. `net.egress`, `secret.request`, and `scheduler.run`
    remain broker-gated and denied until configured.
 9. Audit covers API mutations, runtime plan allow/deny, runtime

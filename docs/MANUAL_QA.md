@@ -243,7 +243,7 @@ cd "$PROJ_A"
 Expected:
 
 - manual job run succeeds
-- delivery reaches the approved channel peer
+- delivery reaches the approved channel grant/session
 - job history is visible through the CLI
 
 ## Phase 8: Doctor Diagnostics

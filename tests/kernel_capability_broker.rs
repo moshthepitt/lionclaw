@@ -8,8 +8,8 @@ use chrono::{Duration as ChronoDuration, Utc};
 use common::{write_skill_source, TestHome};
 use lionclaw::{
     contracts::{
-        JobCreateRequest, PolicyGrantRequest, SessionOpenRequest, SessionTurnRequest,
-        StreamEventKindDto, TrustTier,
+        ChannelPairingApproveRequest, JobCreateRequest, PolicyGrantRequest, SessionOpenRequest,
+        SessionTurnRequest, StreamEventKindDto, TrustTier,
     },
     kernel::{
         policy::Capability,
@@ -276,25 +276,27 @@ async fn channel_send_capability_uses_session_channel_defaults() {
         })
         .await
         .expect("seed pairing state");
-    let peers = kernel
-        .list_channel_peers(Some("local-cli".to_string()))
+    let pairings = kernel
+        .list_channel_pairings(Some("local-cli".to_string()), None)
         .await
-        .expect("list peers");
-    let pairing_code = peers
-        .peers
+        .expect("list pairings");
+    let pairing_id = pairings
+        .pairings
         .iter()
-        .find(|peer| peer.peer_id == peer_id)
-        .and_then(|peer| peer.pairing_code.clone())
-        .expect("pending peer pairing code");
+        .find(|pairing| pairing.sender_ref.as_deref() == Some(peer_id))
+        .map(|pairing| pairing.pairing_id)
+        .expect("pending pairing id");
     kernel
-        .approve_channel_peer(lionclaw::contracts::ChannelPeerApproveRequest {
+        .approve_channel_pairing(ChannelPairingApproveRequest {
             channel_id: "local-cli".to_string(),
-            peer_id: peer_id.to_string(),
-            pairing_code,
+            pairing_id: Some(pairing_id),
+            pairing_code: None,
+            routing_profile: None,
             trust_tier: Some(TrustTier::Main),
+            label: None,
         })
         .await
-        .expect("approve peer");
+        .expect("approve pairing");
     let (session_id, _runtime_skill_id) =
         prepare_session_with_skill(env.home(), &kernel, peer_id, "broker-channel-send").await;
     grant_capability(&kernel, "broker-channel-send", "channel.send").await;
@@ -450,7 +452,7 @@ async fn prepare_session_with_skill(
     let session = kernel
         .open_session(SessionOpenRequest {
             channel_id: "local-cli".to_string(),
-            peer_id: peer_id.to_string(),
+            peer_id: format!("channel:local-cli:direct:{peer_id}"),
             trust_tier: TrustTier::Main,
             history_policy: None,
         })

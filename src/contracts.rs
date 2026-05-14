@@ -142,6 +142,7 @@ impl FromStr for SessionTurnKind {
 #[serde(rename_all = "snake_case")]
 pub enum SessionTurnStatus {
     Running,
+    WaitingForAttachments,
     Completed,
     Failed,
     TimedOut,
@@ -153,6 +154,7 @@ impl SessionTurnStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::WaitingForAttachments => "waiting_for_attachments",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::TimedOut => "timed_out",
@@ -168,6 +170,7 @@ impl FromStr for SessionTurnStatus {
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         match raw {
             "running" => Ok(Self::Running),
+            "waiting_for_attachments" => Ok(Self::WaitingForAttachments),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
             "timed_out" => Ok(Self::TimedOut),
@@ -651,6 +654,111 @@ pub struct ContinuityOpenLoopActionResponse {
     pub archived_path: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelRoutingProfile {
+    Direct,
+    Conversation,
+    Thread,
+    Outbound,
+}
+
+impl ChannelRoutingProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Conversation => "conversation",
+            Self::Thread => "thread",
+            Self::Outbound => "outbound",
+        }
+    }
+}
+
+impl FromStr for ChannelRoutingProfile {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "direct" => Ok(Self::Direct),
+            "conversation" => Ok(Self::Conversation),
+            "thread" => Ok(Self::Thread),
+            "outbound" => Ok(Self::Outbound),
+            other => Err(format!("invalid channel routing profile '{other}'")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelTrigger {
+    Dm,
+    Mention,
+    ReplyToBot,
+    ThreadContinuation,
+    None,
+}
+
+impl ChannelTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dm => "dm",
+            Self::Mention => "mention",
+            Self::ReplyToBot => "reply_to_bot",
+            Self::ThreadContinuation => "thread_continuation",
+            Self::None => "none",
+        }
+    }
+}
+
+impl FromStr for ChannelTrigger {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "dm" => Ok(Self::Dm),
+            "mention" => Ok(Self::Mention),
+            "reply_to_bot" => Ok(Self::ReplyToBot),
+            "thread_continuation" => Ok(Self::ThreadContinuation),
+            "none" => Ok(Self::None),
+            other => Err(format!("invalid channel trigger '{other}'")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelPairingStatus {
+    Pending,
+    Approved,
+    Blocked,
+    Expired,
+}
+
+impl ChannelPairingStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Blocked => "blocked",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+impl FromStr for ChannelPairingStatus {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "pending" => Ok(Self::Pending),
+            "approved" => Ok(Self::Approved),
+            "blocked" => Ok(Self::Blocked),
+            "expired" => Ok(Self::Expired),
+            other => Err(format!("invalid channel pairing status '{other}'")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelBindingView {
     pub channel_id: String,
@@ -705,45 +813,186 @@ pub struct ChannelPeerListParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPairingView {
+    pub pairing_id: Uuid,
+    pub channel_id: String,
+    #[serde(default)]
+    pub sender_ref: Option<String>,
+    #[serde(default)]
+    pub conversation_ref: Option<String>,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
+    pub requested_profile: ChannelRoutingProfile,
+    pub status: ChannelPairingStatus,
+    #[serde(default)]
+    pub label: Option<String>,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPairingListResponse {
+    pub pairings: Vec<ChannelPairingView>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChannelPairingListParams {
+    pub channel_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<ChannelPairingStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelPairingApproveRequest {
+    pub channel_id: String,
+    #[serde(default)]
+    pub pairing_id: Option<Uuid>,
+    #[serde(default)]
+    pub pairing_code: Option<String>,
+    #[serde(default)]
+    pub routing_profile: Option<ChannelRoutingProfile>,
+    #[serde(default)]
+    pub trust_tier: Option<TrustTier>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelPairingBlockRequest {
+    pub channel_id: String,
+    #[serde(default)]
+    pub pairing_id: Option<Uuid>,
+    #[serde(default)]
+    pub sender_ref: Option<String>,
+    #[serde(default)]
+    pub conversation_ref: Option<String>,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelGrantRevokeRequest {
+    pub channel_id: String,
+    pub grant_id: Uuid,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelGrantView {
+    pub grant_id: Uuid,
+    pub channel_id: String,
+    #[serde(default)]
+    pub sender_ref: Option<String>,
+    #[serde(default)]
+    pub conversation_ref: Option<String>,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
+    pub routing_profile: ChannelRoutingProfile,
+    pub trust_tier: TrustTier,
+    pub status: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelGrantResponse {
+    pub grant: ChannelGrantView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelGrantRevokeResponse {
+    pub grant_id: Uuid,
+    pub revoked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelAttachmentDescriptor {
+    pub attachment_id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub size_bytes: Option<i64>,
+    pub provider_file_ref: String,
+    #[serde(default)]
+    pub caption: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelInboundRequest {
     pub channel_id: String,
-    pub peer_id: String,
-    pub text: String,
+    pub event_id: String,
+    pub sender_ref: String,
+    pub conversation_ref: String,
     #[serde(default)]
-    pub session_id: Option<Uuid>,
+    pub thread_ref: Option<String>,
     #[serde(default)]
-    pub update_id: Option<i64>,
+    pub message_ref: Option<String>,
     #[serde(default)]
-    pub external_message_id: Option<String>,
+    pub text: Option<String>,
     #[serde(default)]
-    pub runtime_id: Option<String>,
+    pub attachments: Vec<ChannelAttachmentDescriptor>,
+    #[serde(default)]
+    pub reply_to_ref: Option<String>,
+    pub trigger: ChannelTrigger,
+    #[serde(default)]
+    pub received_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub provider_metadata: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelInboundResponse {
     pub outcome: ChannelInboundOutcome,
     #[serde(default)]
+    pub reason_code: Option<String>,
+    #[serde(default)]
+    pub pairing_id: Option<Uuid>,
+    #[serde(default)]
+    pub pairing_code: Option<String>,
+    #[serde(default)]
     pub turn_id: Option<Uuid>,
     #[serde(default)]
     pub session_id: Option<Uuid>,
+    #[serde(default)]
+    pub session_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelInboundOutcome {
     Queued,
+    WaitingForAttachments,
     Duplicate,
-    PairingPending,
-    PeerBlocked,
+    PendingApproval,
+    Blocked,
+    TriggerIgnored,
 }
 
 impl ChannelInboundOutcome {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Queued => "queued",
+            Self::WaitingForAttachments => "waiting_for_attachments",
             Self::Duplicate => "duplicate",
-            Self::PairingPending => "pairing_pending",
-            Self::PeerBlocked => "peer_blocked",
+            Self::PendingApproval => "pending_approval",
+            Self::Blocked => "blocked",
+            Self::TriggerIgnored => "trigger_ignored",
         }
     }
 }

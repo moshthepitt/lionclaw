@@ -4,10 +4,15 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+use uuid::Uuid;
 
 use crate::{
     applied::{compute_daemon_fingerprint, AppliedState},
-    contracts::{ChannelPeerApproveRequest, ChannelPeerResponse, TrustTier},
+    contracts::{
+        ChannelGrantResponse, ChannelGrantRevokeRequest, ChannelGrantRevokeResponse,
+        ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingStatus,
+        ChannelPairingView, ChannelRoutingProfile, TrustTier,
+    },
     home::{runtime_project_partition_key, LionClawHome},
     kernel::{skills::validate_skill_alias, Kernel, KernelOptions, RuntimeExecutionPolicy},
     operator::{
@@ -354,31 +359,36 @@ pub async fn logs<M: UnitManager>(
 pub async fn pairing_list(
     home: &LionClawHome,
     channel_id: Option<String>,
-) -> Result<Vec<crate::contracts::ChannelPeerView>> {
+    status: Option<ChannelPairingStatus>,
+) -> Result<Vec<ChannelPairingView>> {
     let config = OperatorConfig::load(home).await?;
     let kernel = open_kernel(home, &config, None).await?;
-    let peers = kernel
-        .list_channel_peers(channel_id)
+    let pairings = kernel
+        .list_channel_pairings(channel_id, status)
         .await
         .map_err(to_anyhow)?;
-    Ok(peers.peers)
+    Ok(pairings.pairings)
 }
 
 pub async fn pairing_approve(
     home: &LionClawHome,
     channel_id: String,
-    peer_id: String,
-    pairing_code: String,
+    pairing: String,
+    routing_profile: Option<ChannelRoutingProfile>,
     trust_tier: TrustTier,
-) -> Result<ChannelPeerResponse> {
+    label: Option<String>,
+) -> Result<ChannelGrantResponse> {
     let config = OperatorConfig::load(home).await?;
     let kernel = open_kernel(home, &config, None).await?;
+    let (pairing_id, pairing_code) = pairing_ref(pairing);
     kernel
-        .approve_channel_peer(ChannelPeerApproveRequest {
+        .approve_channel_pairing(ChannelPairingApproveRequest {
             channel_id,
-            peer_id,
+            pairing_id,
             pairing_code,
+            routing_profile,
             trust_tier: Some(trust_tier),
+            label,
         })
         .await
         .map_err(to_anyhow)
@@ -387,17 +397,59 @@ pub async fn pairing_approve(
 pub async fn pairing_block(
     home: &LionClawHome,
     channel_id: String,
-    peer_id: String,
-) -> Result<ChannelPeerResponse> {
+    target: String,
+    conversation_ref: Option<String>,
+    thread_ref: Option<String>,
+    reason: Option<String>,
+) -> Result<ChannelGrantResponse> {
     let config = OperatorConfig::load(home).await?;
     let kernel = open_kernel(home, &config, None).await?;
+    let (pairing_id, sender_ref) = pairing_id_or_sender_ref(target);
     kernel
-        .block_channel_peer(crate::contracts::ChannelPeerBlockRequest {
+        .block_channel_pairing(ChannelPairingBlockRequest {
             channel_id,
-            peer_id,
+            pairing_id,
+            sender_ref,
+            conversation_ref,
+            thread_ref,
+            reason,
         })
         .await
         .map_err(to_anyhow)
+}
+
+pub async fn pairing_revoke(
+    home: &LionClawHome,
+    channel_id: String,
+    grant_id: Uuid,
+    reason: Option<String>,
+) -> Result<ChannelGrantRevokeResponse> {
+    let config = OperatorConfig::load(home).await?;
+    let kernel = open_kernel(home, &config, None).await?;
+    kernel
+        .revoke_channel_grant(ChannelGrantRevokeRequest {
+            channel_id,
+            grant_id,
+            reason,
+        })
+        .await
+        .map_err(to_anyhow)
+}
+
+fn pairing_ref(raw: String) -> (Option<Uuid>, Option<String>) {
+    let trimmed = raw.trim();
+    match Uuid::parse_str(trimmed) {
+        Ok(pairing_id) => (Some(pairing_id), None),
+        Err(_) => (None, Some(trimmed.to_string())),
+    }
+}
+
+fn pairing_id_or_sender_ref(raw: String) -> (Option<Uuid>, Option<String>) {
+    let trimmed = raw.trim();
+    match Uuid::parse_str(trimmed) {
+        Ok(pairing_id) => (Some(pairing_id), None),
+        Err(_) => (None, Some(trimmed.to_string())),
+    }
 }
 
 fn to_anyhow(err: crate::kernel::KernelError) -> anyhow::Error {

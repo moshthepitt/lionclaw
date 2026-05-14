@@ -9,6 +9,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::{
     sync::{Mutex, Notify, RwLock},
     time::{sleep, timeout, Instant},
@@ -17,19 +18,22 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::contracts::{
-    AuditEventView, AuditQueryResponse, ChannelBindingView, ChannelInboundOutcome,
-    ChannelInboundRequest, ChannelInboundResponse, ChannelListResponse, ChannelPeerApproveRequest,
-    ChannelPeerBlockRequest, ChannelPeerListResponse, ChannelPeerResponse, ChannelPeerView,
+    AuditEventView, AuditQueryResponse, ChannelAttachmentDescriptor, ChannelBindingView,
+    ChannelGrantResponse, ChannelGrantRevokeRequest, ChannelGrantRevokeResponse, ChannelGrantView,
+    ChannelInboundOutcome, ChannelInboundRequest, ChannelInboundResponse, ChannelListResponse,
+    ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingListResponse,
+    ChannelPairingStatus, ChannelPairingView, ChannelPeerApproveRequest, ChannelPeerBlockRequest,
+    ChannelPeerListResponse, ChannelPeerResponse, ChannelPeerView, ChannelRoutingProfile,
     ChannelStreamAckRequest, ChannelStreamAckResponse, ChannelStreamEventView,
-    ChannelStreamPullRequest, ChannelStreamPullResponse, ContinuityDraftActionRequest,
-    ContinuityDraftDiscardResponse, ContinuityDraftListRequest, ContinuityDraftListResponse,
-    ContinuityDraftPromoteResponse, ContinuityDraftView, ContinuityGetResponse,
-    ContinuityMemoryProposalView, ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse,
-    ContinuityOpenLoopView, ContinuityPathRequest, ContinuityProposalActionResponse,
-    ContinuityProposalListResponse, ContinuitySearchMatchView, ContinuitySearchRequest,
-    ContinuitySearchResponse, ContinuityStatusResponse, JobCreateRequest, JobCreateResponse,
-    JobDeliveryTargetDto, JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest,
-    JobRemoveResponse, JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto,
+    ChannelStreamPullRequest, ChannelStreamPullResponse, ChannelTrigger,
+    ContinuityDraftActionRequest, ContinuityDraftDiscardResponse, ContinuityDraftListRequest,
+    ContinuityDraftListResponse, ContinuityDraftPromoteResponse, ContinuityDraftView,
+    ContinuityGetResponse, ContinuityMemoryProposalView, ContinuityOpenLoopActionResponse,
+    ContinuityOpenLoopListResponse, ContinuityOpenLoopView, ContinuityPathRequest,
+    ContinuityProposalActionResponse, ContinuityProposalListResponse, ContinuitySearchMatchView,
+    ContinuitySearchRequest, ContinuitySearchResponse, ContinuityStatusResponse, JobCreateRequest,
+    JobCreateResponse, JobDeliveryTargetDto, JobGetResponse, JobListResponse, JobManualRunResponse,
+    JobRefRequest, JobRemoveResponse, JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto,
     JobTickResponse, JobToggleResponse, JobView, PolicyGrantRequest, PolicyGrantResponse,
     PolicyRevokeResponse, SchedulerJobDeliveryStatusDto, SchedulerJobRunStatusDto,
     SchedulerJobTriggerKindDto, SessionActionKind, SessionActionRequest, SessionActionResponse,
@@ -52,8 +56,10 @@ use super::{
     audit::AuditLog,
     capability_broker::{CapabilityBroker, CapabilityExecutionContext},
     channel_state::{
-        ChannelPeerStatus, ChannelStateStore, ChannelStreamEventInsert, ChannelStreamEventKind,
-        ChannelStreamEventRecord, ChannelTurnRecord, StreamMessageLane as ChannelStreamLane,
+        ChannelGrantRecord, ChannelGrantStatus, ChannelPairingRequestRecord, ChannelPeerStatus,
+        ChannelStateStore, ChannelStreamEventInsert, ChannelStreamEventKind,
+        ChannelStreamEventRecord, ChannelTurnRecord, ChannelTurnStatus,
+        StreamMessageLane as ChannelStreamLane,
     },
     continuity::{
         ActiveContinuitySnapshot, ContinuityArtifact, ContinuityEvent, ContinuityLayout,
@@ -579,13 +585,24 @@ impl Kernel {
                         .map_err(internal)?
                     {
                         Some(sequence.saturating_sub(1))
-                    } else {
+                    } else if self
+                        .channel_state
+                        .first_stream_sequence_for_turn(
+                            &channel_turn.channel_id,
+                            channel_turn.turn_id,
+                        )
+                        .await
+                        .map_err(internal)?
+                        .is_some()
+                    {
                         Some(
                             self.channel_state
                                 .current_stream_head(&channel_turn.channel_id)
                                 .await
                                 .map_err(internal)?,
                         )
+                    } else {
+                        None
                     }
                 }
                 _ => None,
@@ -703,13 +720,13 @@ impl Kernel {
     async fn resolve_session_open_trust_tier(
         &self,
         channel_id: &str,
-        peer_id: &str,
+        session_peer_id: &str,
         fallback: TrustTier,
     ) -> Result<TrustTier, KernelError> {
         if self.applied_channel(channel_id).is_none() {
             return Ok(fallback);
         }
-        self.require_channel_peer_approved(channel_id, peer_id)
+        self.require_channel_session_peer_approved(channel_id, session_peer_id)
             .await
     }
 
@@ -721,20 +738,26 @@ impl Kernel {
             return Ok(());
         }
 
-        self.require_channel_peer_approved(&session.channel_id, &session.peer_id)
+        self.require_channel_session_peer_approved(&session.channel_id, &session.peer_id)
             .await?;
         Ok(())
     }
 
-    async fn require_channel_peer_approved(
+    async fn require_channel_session_peer_approved(
         &self,
         channel_id: &str,
-        peer_id: &str,
+        session_peer_id: &str,
     ) -> Result<TrustTier, KernelError> {
         self.require_active_channel_binding(channel_id).await?;
+        if let Some(scope) = parse_session_key_scope(channel_id, session_peer_id) {
+            return self
+                .require_channel_grant_scope_approved(channel_id, scope)
+                .await;
+        }
+
         let peer = self
             .channel_state
-            .get_peer(channel_id, peer_id)
+            .get_peer(channel_id, session_peer_id)
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::BadRequest("channel peer is not approved".to_string()))?;
@@ -747,6 +770,108 @@ impl Kernel {
                 Err(KernelError::Conflict("channel peer is blocked".to_string()))
             }
         }
+    }
+
+    async fn require_channel_grant_scope_approved(
+        &self,
+        channel_id: &str,
+        scope: SessionKeyScope,
+    ) -> Result<TrustTier, KernelError> {
+        let blocked = match &scope {
+            SessionKeyScope::Direct { sender_ref } => {
+                self.channel_state
+                    .get_grant_by_scope(
+                        channel_id,
+                        Some(sender_ref),
+                        None,
+                        None,
+                        ChannelRoutingProfile::Direct,
+                        ChannelGrantStatus::Blocked,
+                    )
+                    .await
+            }
+            SessionKeyScope::Conversation {
+                sender_ref,
+                conversation_ref,
+            } => {
+                self.channel_state
+                    .get_grant_by_scope(
+                        channel_id,
+                        Some(sender_ref),
+                        Some(conversation_ref),
+                        None,
+                        ChannelRoutingProfile::Conversation,
+                        ChannelGrantStatus::Blocked,
+                    )
+                    .await
+            }
+            SessionKeyScope::Thread {
+                conversation_ref,
+                thread_ref,
+            } => {
+                self.channel_state
+                    .find_thread_session_grant(
+                        channel_id,
+                        conversation_ref,
+                        thread_ref,
+                        ChannelGrantStatus::Blocked,
+                    )
+                    .await
+            }
+        }
+        .map_err(internal)?;
+        if blocked.is_some() {
+            return Err(KernelError::Conflict(
+                "channel grant is blocked".to_string(),
+            ));
+        }
+
+        let approved = match &scope {
+            SessionKeyScope::Direct { sender_ref } => {
+                self.channel_state
+                    .get_grant_by_scope(
+                        channel_id,
+                        Some(sender_ref),
+                        None,
+                        None,
+                        ChannelRoutingProfile::Direct,
+                        ChannelGrantStatus::Approved,
+                    )
+                    .await
+            }
+            SessionKeyScope::Conversation {
+                sender_ref,
+                conversation_ref,
+            } => {
+                self.channel_state
+                    .get_grant_by_scope(
+                        channel_id,
+                        Some(sender_ref),
+                        Some(conversation_ref),
+                        None,
+                        ChannelRoutingProfile::Conversation,
+                        ChannelGrantStatus::Approved,
+                    )
+                    .await
+            }
+            SessionKeyScope::Thread {
+                conversation_ref,
+                thread_ref,
+            } => {
+                self.channel_state
+                    .find_thread_session_grant(
+                        channel_id,
+                        conversation_ref,
+                        thread_ref,
+                        ChannelGrantStatus::Approved,
+                    )
+                    .await
+            }
+        }
+        .map_err(internal)?
+        .ok_or_else(|| KernelError::BadRequest("channel grant is not approved".to_string()))?;
+
+        Ok(approved.trust_tier)
     }
 
     async fn run_session_action_with_sink(
@@ -826,6 +951,7 @@ impl Kernel {
                     kind: SessionTurnKind::Continue,
                     display_user_text: "/lionclaw continue".to_string(),
                     prompt_user_text: "Continue your previous assistant reply from where it stopped. Do not restart from the beginning unless necessary.".to_string(),
+                    prepared_turn: None,
                     requested_runtime_id: Some(
                         runtime_id_override
                             .unwrap_or_else(|| latest_turn.runtime_id.clone()),
@@ -845,6 +971,7 @@ impl Kernel {
                 kind: SessionTurnKind::Retry,
                 display_user_text: "/lionclaw retry".to_string(),
                 prompt_user_text: latest_turn.prompt_user_text,
+                prepared_turn: None,
                 requested_runtime_id: Some(
                     runtime_id_override.unwrap_or_else(|| latest_turn.runtime_id.clone()),
                 ),
@@ -894,6 +1021,311 @@ impl Kernel {
         Ok(ChannelListResponse { bindings })
     }
 
+    pub async fn list_channel_pairings(
+        &self,
+        channel_id: Option<String>,
+        status: Option<ChannelPairingStatus>,
+    ) -> Result<ChannelPairingListResponse, KernelError> {
+        let pairings = self
+            .channel_state
+            .list_pairing_requests(channel_id.as_deref(), status)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(to_channel_pairing_view)
+            .collect();
+
+        Ok(ChannelPairingListResponse { pairings })
+    }
+
+    pub async fn approve_channel_pairing(
+        &self,
+        req: ChannelPairingApproveRequest,
+    ) -> Result<ChannelGrantResponse, KernelError> {
+        let channel_id = trim_required(req.channel_id, "channel_id")?;
+        if req.pairing_id.is_some()
+            == req
+                .pairing_code
+                .as_ref()
+                .is_some_and(|v| !v.trim().is_empty())
+        {
+            return Err(KernelError::BadRequest(
+                "exactly one of pairing_id or pairing_code is required".to_string(),
+            ));
+        }
+        self.require_active_channel_binding(&channel_id).await?;
+
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let pairing = if let Some(pairing_id) = req.pairing_id {
+            self.channel_state
+                .get_pairing_request_by_id_in_tx(&mut tx, pairing_id)
+                .await
+                .map_err(internal)?
+        } else {
+            let pairing_code = req
+                .pairing_code
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| KernelError::BadRequest("pairing_code is required".to_string()))?;
+            let code_hash = hash_pairing_code(pairing_code);
+            self.channel_state
+                .get_pairing_request_by_code_hash_in_tx(&mut tx, &channel_id, &code_hash)
+                .await
+                .map_err(internal)?
+        }
+        .ok_or_else(|| KernelError::NotFound("channel pairing request not found".to_string()))?;
+
+        if pairing.channel_id != channel_id {
+            return Err(KernelError::BadRequest(
+                "pairing request does not belong to channel_id".to_string(),
+            ));
+        }
+        if pairing.status != ChannelPairingStatus::Pending {
+            return Err(KernelError::Conflict(format!(
+                "pairing request is {}",
+                pairing.status.as_str()
+            )));
+        }
+
+        let routing_profile = req.routing_profile.unwrap_or(pairing.requested_profile);
+        let (sender_ref, conversation_ref, thread_ref) =
+            grant_scope_from_pairing(&pairing, routing_profile)?;
+        let trust_tier = req.trust_tier.unwrap_or(TrustTier::Main);
+        let label = req
+            .label
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        let grant = self
+            .channel_state
+            .insert_or_update_grant_in_tx(
+                &mut tx,
+                &channel_id,
+                sender_ref.as_deref(),
+                conversation_ref.as_deref(),
+                thread_ref.as_deref(),
+                routing_profile,
+                trust_tier,
+                ChannelGrantStatus::Approved,
+                label,
+            )
+            .await
+            .map_err(internal)?;
+        self.channel_state
+            .mark_pairing_status_in_tx(
+                &mut tx,
+                pairing.pairing_id,
+                ChannelPairingStatus::Approved,
+                label,
+            )
+            .await
+            .map_err(internal)?;
+        self.audit
+            .append_in_tx(
+                &mut tx,
+                "channel.grant.approved",
+                None,
+                Some("api".to_string()),
+                json!({
+                    "channel_id": channel_id,
+                    "event_id": null,
+                    "sender_ref": grant.sender_ref,
+                    "conversation_ref": grant.conversation_ref,
+                    "thread_ref": grant.thread_ref,
+                    "reason_code": "operator_approved",
+                    "grant_id": grant.grant_id,
+                    "pairing_id": pairing.pairing_id,
+                    "routing_profile": grant.routing_profile.as_str(),
+                    "trust_tier": grant.trust_tier.as_str(),
+                }),
+            )
+            .await
+            .map_err(internal)?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "channel.grant.approved",
+            None,
+            "api",
+            json!({
+                "channel_id": channel_id,
+                "grant_id": grant.grant_id,
+                "pairing_id": pairing.pairing_id,
+            }),
+        )
+        .await;
+
+        Ok(ChannelGrantResponse {
+            grant: to_channel_grant_view(grant),
+        })
+    }
+
+    pub async fn block_channel_pairing(
+        &self,
+        req: ChannelPairingBlockRequest,
+    ) -> Result<ChannelGrantResponse, KernelError> {
+        let channel_id = trim_required(req.channel_id, "channel_id")?;
+        self.require_active_channel_binding(&channel_id).await?;
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|err| internal(err.into()))?;
+
+        let (pairing_id, routing_profile, sender_ref, conversation_ref, thread_ref) =
+            if let Some(pairing_id) = req.pairing_id {
+                let pairing = self
+                    .channel_state
+                    .get_pairing_request_by_id_in_tx(&mut tx, pairing_id)
+                    .await
+                    .map_err(internal)?
+                    .ok_or_else(|| {
+                        KernelError::NotFound("channel pairing request not found".to_string())
+                    })?;
+                if pairing.channel_id != channel_id {
+                    return Err(KernelError::BadRequest(
+                        "pairing request does not belong to channel_id".to_string(),
+                    ));
+                }
+                let (sender_ref, conversation_ref, thread_ref) =
+                    grant_scope_from_pairing(&pairing, pairing.requested_profile)?;
+                (
+                    Some(pairing.pairing_id),
+                    pairing.requested_profile,
+                    sender_ref,
+                    conversation_ref,
+                    thread_ref,
+                )
+            } else {
+                let sender_ref = trim_optional(req.sender_ref);
+                let conversation_ref = trim_optional(req.conversation_ref);
+                let thread_ref = trim_optional(req.thread_ref);
+                let routing_profile = infer_block_profile(
+                    sender_ref.as_deref(),
+                    conversation_ref.as_deref(),
+                    thread_ref.as_deref(),
+                )?;
+                (
+                    None,
+                    routing_profile,
+                    sender_ref,
+                    conversation_ref,
+                    thread_ref,
+                )
+            };
+
+        let grant = self
+            .channel_state
+            .insert_or_update_grant_in_tx(
+                &mut tx,
+                &channel_id,
+                sender_ref.as_deref(),
+                conversation_ref.as_deref(),
+                thread_ref.as_deref(),
+                routing_profile,
+                TrustTier::Untrusted,
+                ChannelGrantStatus::Blocked,
+                None,
+            )
+            .await
+            .map_err(internal)?;
+        if let Some(pairing_id) = pairing_id {
+            self.channel_state
+                .mark_pairing_status_in_tx(&mut tx, pairing_id, ChannelPairingStatus::Blocked, None)
+                .await
+                .map_err(internal)?;
+        }
+        self.audit
+            .append_in_tx(
+                &mut tx,
+                "channel.grant.blocked",
+                None,
+                Some("api".to_string()),
+                json!({
+                    "channel_id": channel_id,
+                    "event_id": null,
+                    "sender_ref": grant.sender_ref,
+                    "conversation_ref": grant.conversation_ref,
+                    "thread_ref": grant.thread_ref,
+                    "reason_code": req.reason.unwrap_or_else(|| "operator_blocked".to_string()),
+                    "grant_id": grant.grant_id,
+                    "pairing_id": pairing_id,
+                    "routing_profile": grant.routing_profile.as_str(),
+                }),
+            )
+            .await
+            .map_err(internal)?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "channel.grant.blocked",
+            None,
+            "api",
+            json!({
+                "channel_id": channel_id,
+                "grant_id": grant.grant_id,
+                "pairing_id": pairing_id,
+            }),
+        )
+        .await;
+
+        Ok(ChannelGrantResponse {
+            grant: to_channel_grant_view(grant),
+        })
+    }
+
+    pub async fn revoke_channel_grant(
+        &self,
+        req: ChannelGrantRevokeRequest,
+    ) -> Result<ChannelGrantRevokeResponse, KernelError> {
+        let channel_id = trim_required(req.channel_id, "channel_id")?;
+        self.require_active_channel_binding(&channel_id).await?;
+        let revoked = self
+            .channel_state
+            .revoke_grant(&channel_id, req.grant_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("channel grant not found".to_string()))?;
+        self.audit
+            .append(
+                "channel.grant.revoked",
+                None,
+                Some("api".to_string()),
+                json!({
+                    "channel_id": channel_id,
+                    "event_id": null,
+                    "sender_ref": revoked.sender_ref,
+                    "conversation_ref": revoked.conversation_ref,
+                    "thread_ref": revoked.thread_ref,
+                    "reason_code": req.reason.unwrap_or_else(|| "operator_revoked".to_string()),
+                    "grant_id": revoked.grant_id,
+                    "routing_profile": revoked.routing_profile.as_str(),
+                }),
+            )
+            .await
+            .map_err(internal)?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "channel.grant.revoked",
+            None,
+            "api",
+            json!({
+                "channel_id": channel_id,
+                "grant_id": revoked.grant_id,
+            }),
+        )
+        .await;
+
+        Ok(ChannelGrantRevokeResponse {
+            grant_id: req.grant_id,
+            revoked: true,
+        })
+    }
+
     pub async fn list_channel_peers(
         &self,
         channel_id: Option<String>,
@@ -925,62 +1357,28 @@ impl Kernel {
 
         let channel_id = req.channel_id.trim().to_string();
         let peer_id = req.peer_id.trim().to_string();
-        let pairing_code = req.pairing_code.trim().to_string();
         let trust_tier = req.trust_tier.unwrap_or(TrustTier::Main);
-
-        let mut tx = self
-            .channel_state
-            .pool()
-            .begin()
-            .await
-            .map_err(|err| internal(err.into()))?;
-        let peer = self
-            .channel_state
-            .get_peer_in_tx(&mut tx, &channel_id, &peer_id)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| KernelError::NotFound("channel peer not found".to_string()))?;
-
-        if peer.pairing_code != pairing_code {
-            return Err(KernelError::BadRequest("invalid pairing_code".to_string()));
-        }
-
-        let approved = self
-            .channel_state
-            .approve_peer_in_tx(&mut tx, &channel_id, &peer_id, trust_tier)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| KernelError::NotFound("channel peer not found".to_string()))?;
-
-        self.audit
-            .append_in_tx(
-                &mut tx,
-                "channel.peer.approved",
-                None,
-                Some("api".to_string()),
-                json!({
-                    "channel_id": approved.channel_id,
-                    "peer_id": approved.peer_id,
-                    "trust_tier": approved.trust_tier.as_str(),
-                }),
-            )
-            .await
-            .map_err(internal)?;
-        tx.commit().await.map_err(|err| internal(err.into()))?;
-        self.refresh_active_continuity_after_commit_best_effort(
-            "channel.peer.approved",
-            None,
-            "api",
-            json!({
-                "channel_id": approved.channel_id,
-                "peer_id": approved.peer_id,
-                "trust_tier": approved.trust_tier.as_str(),
-            }),
-        )
-        .await;
-
+        let grant = self
+            .approve_channel_pairing(ChannelPairingApproveRequest {
+                channel_id: channel_id.clone(),
+                pairing_id: None,
+                pairing_code: Some(req.pairing_code),
+                routing_profile: Some(ChannelRoutingProfile::Direct),
+                trust_tier: Some(trust_tier.clone()),
+                label: Some(peer_id.clone()),
+            })
+            .await?
+            .grant;
         Ok(ChannelPeerResponse {
-            peer: to_channel_peer_view(approved),
+            peer: ChannelPeerView {
+                channel_id,
+                peer_id,
+                status: grant.status,
+                trust_tier,
+                pairing_code: None,
+                first_seen: grant.created_at,
+                updated_at: grant.updated_at,
+            },
         })
     }
 
@@ -996,46 +1394,27 @@ impl Kernel {
 
         let channel_id = req.channel_id.trim().to_string();
         let peer_id = req.peer_id.trim().to_string();
-        let mut tx = self
-            .channel_state
-            .pool()
-            .begin()
-            .await
-            .map_err(|err| internal(err.into()))?;
-        let blocked = self
-            .channel_state
-            .block_peer_in_tx(&mut tx, &channel_id, &peer_id)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| KernelError::NotFound("channel peer not found".to_string()))?;
-
-        self.audit
-            .append_in_tx(
-                &mut tx,
-                "channel.peer.blocked",
-                None,
-                Some("api".to_string()),
-                json!({
-                    "channel_id": blocked.channel_id,
-                    "peer_id": blocked.peer_id,
-                }),
-            )
-            .await
-            .map_err(internal)?;
-        tx.commit().await.map_err(|err| internal(err.into()))?;
-        self.refresh_active_continuity_after_commit_best_effort(
-            "channel.peer.blocked",
-            None,
-            "api",
-            json!({
-                "channel_id": blocked.channel_id,
-                "peer_id": blocked.peer_id,
-            }),
-        )
-        .await;
-
+        let grant = self
+            .block_channel_pairing(ChannelPairingBlockRequest {
+                channel_id: channel_id.clone(),
+                pairing_id: None,
+                sender_ref: Some(peer_id.clone()),
+                conversation_ref: None,
+                thread_ref: None,
+                reason: Some("legacy_peer_block".to_string()),
+            })
+            .await?
+            .grant;
         Ok(ChannelPeerResponse {
-            peer: to_channel_peer_view(blocked),
+            peer: ChannelPeerView {
+                channel_id,
+                peer_id,
+                status: grant.status,
+                trust_tier: TrustTier::Untrusted,
+                pairing_code: None,
+                first_seen: grant.created_at,
+                updated_at: grant.updated_at,
+            },
         })
     }
 
@@ -1043,16 +1422,7 @@ impl Kernel {
         &self,
         req: ChannelInboundRequest,
     ) -> Result<ChannelInboundResponse, KernelError> {
-        self.process_inbound_channel_text(InboundChannelText {
-            channel_id: req.channel_id,
-            peer_id: req.peer_id,
-            text: req.text,
-            session_id: req.session_id,
-            runtime_id: req.runtime_id,
-            update_id: req.update_id,
-            external_message_id: req.external_message_id,
-        })
-        .await
+        self.process_channel_inbound(req, None).await
     }
 
     pub async fn pull_channel_stream(
@@ -1215,262 +1585,352 @@ impl Kernel {
             ));
         }
 
-        self.require_active_channel_binding(&channel_id).await?;
+        let event_id = external_message_id
+            .or_else(|| update_id.map(|value| format!("legacy-update:{value}")))
+            .unwrap_or_else(|| format!("legacy-event:{}", Uuid::new_v4()));
+        let _legacy_session_id = session_id;
+        self.process_channel_inbound(
+            ChannelInboundRequest {
+                channel_id,
+                event_id,
+                sender_ref: peer_id.clone(),
+                conversation_ref: peer_id,
+                thread_ref: None,
+                message_ref: None,
+                text: Some(text),
+                attachments: Vec::new(),
+                reply_to_ref: None,
+                trigger: ChannelTrigger::Dm,
+                received_at: None,
+                provider_metadata: json!({ "legacy": true, "update_id": update_id }),
+            },
+            runtime_id,
+        )
+        .await
+    }
+
+    async fn process_channel_inbound(
+        &self,
+        req: ChannelInboundRequest,
+        runtime_id_override: Option<String>,
+    ) -> Result<ChannelInboundResponse, KernelError> {
+        let inbound = validate_channel_inbound_request(req)?;
+        self.require_active_channel_binding(&inbound.channel_id)
+            .await?;
 
         let inserted = self
             .channel_state
-            .insert_inbound_message(&channel_id, &peer_id, external_message_id, update_id, &text)
+            .insert_inbound_event(
+                &inbound.event_id,
+                &inbound.channel_id,
+                &inbound.sender_ref,
+                &inbound.conversation_ref,
+                inbound.thread_ref.as_deref(),
+                inbound.message_ref.as_deref(),
+                inbound.trigger,
+                &inbound.attachments,
+                inbound.reply_to_ref.as_deref(),
+                &inbound.provider_metadata,
+                inbound.received_at,
+            )
             .await
             .map_err(internal)?;
-        let Some(inbound_message) = inserted else {
-            return Ok(ChannelInboundResponse {
-                outcome: ChannelInboundOutcome::Duplicate,
-                turn_id: None,
-                session_id: None,
-            });
+        if inserted.is_none() {
+            self.audit_channel_inbound(
+                "channel.inbound.duplicate",
+                &inbound,
+                "duplicate_event",
+                None,
+                None,
+            )
+            .await?;
+            return Ok(channel_inbound_response(
+                ChannelInboundOutcome::Duplicate,
+                "duplicate_event",
+                None,
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+
+        if self
+            .channel_state
+            .find_blocking_grant(
+                &inbound.channel_id,
+                &inbound.sender_ref,
+                &inbound.conversation_ref,
+                inbound.thread_ref.as_deref(),
+            )
+            .await
+            .map_err(internal)?
+            .is_some()
+        {
+            self.audit_channel_inbound(
+                "channel.inbound.blocked",
+                &inbound,
+                "blocked_grant",
+                None,
+                None,
+            )
+            .await?;
+            return Ok(channel_inbound_response(
+                ChannelInboundOutcome::Blocked,
+                "blocked_grant",
+                None,
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+
+        let grant = self
+            .channel_state
+            .find_approved_grant(
+                &inbound.channel_id,
+                &inbound.sender_ref,
+                &inbound.conversation_ref,
+                inbound.thread_ref.as_deref(),
+                inbound.trigger,
+            )
+            .await
+            .map_err(internal)?;
+        let Some(grant) = grant else {
+            let requested_profile =
+                default_pending_profile(inbound.trigger, inbound.thread_ref.as_deref());
+            let (sender_ref, conversation_ref, thread_ref) =
+                pending_scope_for_profile(&inbound, requested_profile)?;
+            let pairing_code = generate_pairing_code();
+            let (pairing, created) = self
+                .channel_state
+                .create_or_refresh_operator_pairing(
+                    &inbound.channel_id,
+                    sender_ref.as_deref(),
+                    conversation_ref.as_deref(),
+                    thread_ref.as_deref(),
+                    requested_profile,
+                    &hash_pairing_code(&pairing_code),
+                )
+                .await
+                .map_err(internal)?;
+            self.audit_channel_inbound(
+                "channel.inbound.pending",
+                &inbound,
+                "approval_required",
+                Some(pairing.pairing_id),
+                None,
+            )
+            .await?;
+            self.record_channel_pairing_pending_continuity_best_effort(&pairing)
+                .await;
+            return Ok(channel_inbound_response(
+                ChannelInboundOutcome::PendingApproval,
+                "approval_required",
+                Some(pairing.pairing_id),
+                created.then_some(pairing_code),
+                None,
+                None,
+                None,
+            ));
         };
 
-        let peer = match self
-            .channel_state
-            .get_peer(&channel_id, &peer_id)
+        if !trigger_allows(grant.routing_profile, inbound.trigger) {
+            self.audit_channel_inbound(
+                "channel.inbound.trigger_ignored",
+                &inbound,
+                "trigger_insufficient",
+                None,
+                None,
+            )
+            .await?;
+            return Ok(channel_inbound_response(
+                ChannelInboundOutcome::TriggerIgnored,
+                "trigger_insufficient",
+                None,
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+
+        let session_key = session_key_for_grant(&grant)?;
+        let runtime_id = self.resolve_runtime_id(
+            runtime_id_override
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+        )?;
+        let session = match self
+            .sessions
+            .find_latest_by_channel_peer(&inbound.channel_id, &session_key, self.session_scope())
             .await
             .map_err(internal)?
         {
             Some(existing) => existing,
-            None => {
-                let pending = self
-                    .channel_state
-                    .upsert_pending_peer(&channel_id, &peer_id, &generate_pairing_code())
-                    .await
-                    .map_err(internal)?;
-
-                self.audit
-                    .append(
-                        "channel.peer.pending",
-                        None,
-                        Some("kernel".to_string()),
-                        json!({
-                            "channel_id": channel_id,
-                            "peer_id": peer_id,
-                            "pairing_code": pending.pairing_code,
-                        }),
-                    )
-                    .await
-                    .map_err(internal)?;
-                if let Err(err) = self
-                    .record_pairing_pending_continuity(&channel_id, &peer_id, &pending.pairing_code)
-                    .await
-                {
-                    warn!(
-                        ?err,
-                        channel_id, peer_id, "failed to record pending pairing continuity"
-                    );
-                }
-
-                if let Err(err) = self
-                    .emit_channel_message(
-                        &channel_id,
-                        &peer_id,
-                        None,
-                        None,
-                        &format!(
-                            "Pairing required. Approve with: lionclaw channel pairing approve {} {} {} --trust-tier main",
-                            channel_id, peer_id, pending.pairing_code
-                        ),
-                    )
-                    .await
-                {
-                    warn!(?err, channel_id, peer_id, "failed to emit pending pairing message");
-                }
-
-                self.audit
-                    .append(
-                        "channel.inbound.rejected",
-                        None,
-                        Some("kernel".to_string()),
-                        json!({
-                            "channel_id": channel_id,
-                            "peer_id": peer_id,
-                            "reason": "peer_pending_approval",
-                            "update_id": update_id,
-                        }),
-                    )
-                    .await
-                    .map_err(internal)?;
-
-                return Ok(ChannelInboundResponse {
-                    outcome: ChannelInboundOutcome::PairingPending,
-                    turn_id: None,
-                    session_id: None,
-                });
-            }
-        };
-
-        match peer.status {
-            ChannelPeerStatus::Pending => {
-                if let Err(err) = self
-                    .emit_channel_message(
-                        &channel_id,
-                        &peer_id,
-                        None,
-                        None,
-                        &format!(
-                            "Peer is pending approval. Approve with: lionclaw channel pairing approve {} {} {} --trust-tier main",
-                            channel_id, peer_id, peer.pairing_code
-                        ),
-                    )
-                    .await
-                {
-                    warn!(?err, channel_id, peer_id, "failed to emit pending peer message");
-                }
-                self.audit
-                    .append(
-                        "channel.inbound.rejected",
-                        None,
-                        Some("kernel".to_string()),
-                        json!({
-                            "channel_id": channel_id,
-                            "peer_id": peer_id,
-                            "reason": "peer_pending_approval",
-                            "update_id": update_id,
-                        }),
-                    )
-                    .await
-                    .map_err(internal)?;
-                return Ok(ChannelInboundResponse {
-                    outcome: ChannelInboundOutcome::PairingPending,
-                    turn_id: None,
-                    session_id: None,
-                });
-            }
-            ChannelPeerStatus::Blocked => {
-                self.audit
-                    .append(
-                        "channel.inbound.rejected",
-                        None,
-                        Some("kernel".to_string()),
-                        json!({
-                            "channel_id": channel_id,
-                            "peer_id": peer_id,
-                            "reason": "peer_blocked",
-                            "update_id": update_id,
-                        }),
-                    )
-                    .await
-                    .map_err(internal)?;
-                return Ok(ChannelInboundResponse {
-                    outcome: ChannelInboundOutcome::PeerBlocked,
-                    turn_id: None,
-                    session_id: None,
-                });
-            }
-            ChannelPeerStatus::Approved => {}
-        }
-
-        self.audit
-            .append(
-                "channel.inbound.accepted",
-                None,
-                Some("kernel".to_string()),
-                json!({
-                    "channel_id": channel_id,
-                    "peer_id": peer_id,
-                    "update_id": update_id,
-                    "text_len": text.len(),
-                }),
-            )
-            .await
-            .map_err(internal)?;
-
-        let session = match session_id {
-            Some(session_id) => {
-                let session = self
-                    .get_scoped_session(session_id)
-                    .await
-                    .map_err(|_| KernelError::BadRequest("session_id not found".to_string()))?;
-                if session.channel_id != channel_id || session.peer_id != peer_id {
-                    return Err(KernelError::BadRequest(
-                        "session_id does not belong to this channel_id and peer_id".to_string(),
-                    ));
-                }
-                session
-            }
-            None => match self
+            None => self
                 .sessions
-                .find_latest_by_channel_peer(&channel_id, &peer_id, self.session_scope())
+                .open(
+                    inbound.channel_id.clone(),
+                    session_key.clone(),
+                    self.session_scope().to_string(),
+                    grant.trust_tier.clone(),
+                    SessionHistoryPolicy::Conservative,
+                )
                 .await
-                .map_err(internal)?
-            {
-                Some(existing) => existing,
-                None => self
-                    .sessions
-                    .open(
-                        channel_id.clone(),
-                        peer_id.clone(),
-                        self.session_scope().to_string(),
-                        peer.trust_tier.clone(),
-                        SessionHistoryPolicy::Conservative,
-                    )
-                    .await
-                    .map_err(internal)?,
-            },
+                .map_err(internal)?,
         };
-        let resolved_channel_runtime_id = self
-            .resolve_channel_runtime_id(&channel_id, runtime_id)
-            .await?;
-        let runtime_id = self.resolve_runtime_id(resolved_channel_runtime_id.as_deref())?;
 
         let turn_id = Uuid::new_v4();
-        self.channel_state
-            .enqueue_turn(
-                turn_id,
-                &channel_id,
-                &peer_id,
-                session.session_id,
-                inbound_message.message_id,
-                &runtime_id,
+        let waiting_for_attachments = !inbound.attachments.is_empty();
+        let turn_status = if waiting_for_attachments {
+            ChannelTurnStatus::WaitingForAttachments
+        } else {
+            ChannelTurnStatus::Pending
+        };
+        let session_turn_status = if waiting_for_attachments {
+            SessionTurnStatus::WaitingForAttachments
+        } else {
+            SessionTurnStatus::Running
+        };
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|err| internal(err.into()))?;
+        self.session_turns
+            .begin_turn_with_status_in_tx(
+                &mut tx,
+                NewSessionTurn {
+                    turn_id,
+                    session_id: session.session_id,
+                    kind: SessionTurnKind::Normal,
+                    display_user_text: inbound.text.clone().unwrap_or_default(),
+                    prompt_user_text: inbound.text.clone().unwrap_or_default(),
+                    runtime_id: runtime_id.clone(),
+                },
+                session_turn_status,
             )
             .await
             .map_err(internal)?;
-
-        let stream_context = self
-            .channel_stream_context_for_session(session.session_id, &channel_id, &peer_id, turn_id)
-            .await?;
-        if let Some(stream_context) = &stream_context {
-            self.emit_runtime_event(
-                &Some(stream_context.clone()),
-                &None,
-                RuntimeEvent::Status {
-                    code: Some("queue.queued".to_string()),
-                    text: "queued".to_string(),
-                },
+        self.channel_state
+            .enqueue_turn_in_tx(
+                &mut tx,
+                turn_id,
+                &inbound.channel_id,
+                &session_key,
+                session.session_id,
+                &inbound.event_id,
+                &runtime_id,
+                turn_status,
             )
-            .await?;
-        }
+            .await
+            .map_err(internal)?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
 
+        let event_type = if waiting_for_attachments {
+            "channel.inbound.waiting_for_attachments"
+        } else {
+            "channel.inbound.accepted"
+        };
+        let reason_code = if waiting_for_attachments {
+            "waiting_for_attachments"
+        } else {
+            "accepted"
+        };
+        self.audit_channel_inbound(event_type, &inbound, reason_code, None, Some(turn_id))
+            .await?;
         self.audit
             .append(
                 "channel.turn.queued",
                 Some(session.session_id),
                 Some("kernel".to_string()),
                 json!({
-                    "channel_id": channel_id,
-                    "peer_id": peer_id,
+                    "channel_id": inbound.channel_id,
+                    "session_key": session_key,
                     "runtime_id": runtime_id,
                     "turn_id": turn_id,
-                    "inbound_message_id": inbound_message.message_id,
+                    "inbound_event_id": inbound.event_id,
+                    "status": turn_status.as_str(),
                 }),
             )
             .await
             .map_err(internal)?;
 
-        self.ensure_channel_turn_worker(&channel_id, &peer_id).await;
+        if !waiting_for_attachments {
+            let stream_context = self
+                .channel_stream_context_for_session(
+                    session.session_id,
+                    &inbound.channel_id,
+                    &session_key,
+                    turn_id,
+                )
+                .await?;
+            if let Some(stream_context) = &stream_context {
+                self.emit_runtime_event(
+                    &Some(stream_context.clone()),
+                    &None,
+                    RuntimeEvent::Status {
+                        code: Some("queue.queued".to_string()),
+                        text: "queued".to_string(),
+                    },
+                )
+                .await?;
+            }
+            self.ensure_channel_turn_worker(&inbound.channel_id, &session_key)
+                .await;
+        }
 
-        Ok(ChannelInboundResponse {
-            outcome: ChannelInboundOutcome::Queued,
-            turn_id: Some(turn_id),
-            session_id: Some(session.session_id),
-        })
+        Ok(channel_inbound_response(
+            if waiting_for_attachments {
+                ChannelInboundOutcome::WaitingForAttachments
+            } else {
+                ChannelInboundOutcome::Queued
+            },
+            reason_code,
+            None,
+            None,
+            Some(session.session_id),
+            Some(turn_id),
+            Some(session_key),
+        ))
+    }
+
+    async fn audit_channel_inbound(
+        &self,
+        event_type: &str,
+        inbound: &ValidatedChannelInbound,
+        reason_code: &str,
+        pairing_id: Option<Uuid>,
+        turn_id: Option<Uuid>,
+    ) -> Result<(), KernelError> {
+        let edited = inbound
+            .provider_metadata
+            .get("edited")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        self.audit
+            .append(
+                event_type,
+                None,
+                Some("kernel".to_string()),
+                json!({
+                    "channel_id": inbound.channel_id,
+                    "event_id": inbound.event_id,
+                    "sender_ref": inbound.sender_ref,
+                    "conversation_ref": inbound.conversation_ref,
+                    "thread_ref": inbound.thread_ref,
+                    "reason_code": reason_code,
+                    "pairing_id": pairing_id,
+                    "turn_id": turn_id,
+                    "edited": edited,
+                }),
+            )
+            .await
+            .map_err(internal)
     }
 
     pub async fn grant_policy(
@@ -1958,6 +2418,51 @@ impl Kernel {
         Ok(())
     }
 
+    async fn record_channel_pairing_pending_continuity_best_effort(
+        &self,
+        pairing: &ChannelPairingRequestRecord,
+    ) {
+        let Some(layout) = &self.continuity else {
+            return;
+        };
+        let scope = channel_pairing_continuity_scope(pairing);
+        if let Err(err) = layout
+            .append_daily_event(ContinuityEvent {
+                at: Utc::now(),
+                title: format!("Pairing required for {scope}"),
+                details: vec![
+                    format!("pairing {}", pairing.pairing_id),
+                    format!("profile {}", pairing.requested_profile.as_str()),
+                ],
+            })
+            .await
+            .map_err(internal)
+        {
+            self.append_audit_event_best_effort(
+                "channel.pairing_pending_continuity.failed",
+                None,
+                "kernel",
+                json!({
+                    "channel_id": pairing.channel_id,
+                    "pairing_id": pairing.pairing_id,
+                    "error": err.to_string(),
+                }),
+            )
+            .await;
+            return;
+        }
+        self.refresh_active_continuity_after_commit_best_effort(
+            "channel.inbound.pending",
+            None,
+            "kernel",
+            json!({
+                "channel_id": pairing.channel_id,
+                "pairing_id": pairing.pairing_id,
+            }),
+        )
+        .await;
+    }
+
     pub(super) async fn record_scheduler_continuity_failure(
         &self,
         job: &SchedulerJobRecord,
@@ -1983,37 +2488,6 @@ impl Kernel {
             json!({
                 "job_id": job.job_id,
                 "run_id": run.run_id,
-            }),
-        )
-        .await;
-        Ok(())
-    }
-
-    async fn record_pairing_pending_continuity(
-        &self,
-        channel_id: &str,
-        peer_id: &str,
-        pairing_code: &str,
-    ) -> Result<(), KernelError> {
-        let Some(layout) = &self.continuity else {
-            return Ok(());
-        };
-
-        layout
-            .append_daily_event(ContinuityEvent {
-                at: Utc::now(),
-                title: format!("Pairing required for {channel_id}/{peer_id}"),
-                details: vec![format!("pairing code {}", pairing_code)],
-            })
-            .await
-            .map_err(internal)?;
-        self.refresh_active_continuity_after_commit_best_effort(
-            "channel.peer.pairing_pending",
-            None,
-            "kernel",
-            json!({
-                "channel_id": channel_id,
-                "peer_id": peer_id,
             }),
         )
         .await;
@@ -2179,11 +2653,12 @@ impl Kernel {
 
         let pending_approvals = self
             .channel_state
-            .list_pending_peers(ACTIVE_GLOBAL_SLICE_LIMIT)
+            .list_pairing_requests(None, Some(ChannelPairingStatus::Pending))
             .await
             .map_err(internal)?
             .into_iter()
-            .map(|peer| format!("{}/{}", peer.channel_id, peer.peer_id))
+            .take(ACTIVE_GLOBAL_SLICE_LIMIT)
+            .map(|pairing| channel_pairing_continuity_scope(&pairing))
             .collect::<Vec<_>>();
 
         let mut matters_today = Vec::new();
@@ -2541,6 +3016,7 @@ impl Kernel {
                 kind: SessionTurnKind::Normal,
                 display_user_text: job.prompt_text.clone(),
                 prompt_user_text: job.prompt_text.clone(),
+                prepared_turn: None,
                 requested_runtime_id: Some(job.runtime_id.clone()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
@@ -3829,6 +4305,65 @@ fn to_channel_peer_view(peer: super::channel_state::ChannelPeerRecord) -> Channe
     }
 }
 
+fn to_channel_pairing_view(pairing: ChannelPairingRequestRecord) -> ChannelPairingView {
+    ChannelPairingView {
+        pairing_id: pairing.pairing_id,
+        channel_id: pairing.channel_id,
+        sender_ref: pairing.sender_ref,
+        conversation_ref: pairing.conversation_ref,
+        thread_ref: pairing.thread_ref,
+        requested_profile: pairing.requested_profile,
+        status: pairing.status,
+        label: pairing.label,
+        created_at: pairing.created_at,
+        expires_at: pairing.expires_at,
+    }
+}
+
+fn channel_pairing_continuity_scope(pairing: &ChannelPairingRequestRecord) -> String {
+    match pairing.requested_profile {
+        ChannelRoutingProfile::Direct => format!(
+            "{}/{}",
+            pairing.channel_id,
+            pairing.sender_ref.as_deref().unwrap_or("unknown")
+        ),
+        ChannelRoutingProfile::Conversation => format!(
+            "{}/conversation:{}/sender:{}",
+            pairing.channel_id,
+            pairing.conversation_ref.as_deref().unwrap_or("unknown"),
+            pairing.sender_ref.as_deref().unwrap_or("unknown")
+        ),
+        ChannelRoutingProfile::Thread => format!(
+            "{}/thread:{}/{}",
+            pairing.channel_id,
+            pairing.conversation_ref.as_deref().unwrap_or("unknown"),
+            pairing.thread_ref.as_deref().unwrap_or("unknown")
+        ),
+        ChannelRoutingProfile::Outbound => format!(
+            "{}/outbound:{}",
+            pairing.channel_id,
+            pairing.conversation_ref.as_deref().unwrap_or("unknown")
+        ),
+    }
+}
+
+fn to_channel_grant_view(grant: ChannelGrantRecord) -> ChannelGrantView {
+    ChannelGrantView {
+        grant_id: grant.grant_id,
+        channel_id: grant.channel_id,
+        sender_ref: grant.sender_ref,
+        conversation_ref: grant.conversation_ref,
+        thread_ref: grant.thread_ref,
+        routing_profile: grant.routing_profile,
+        trust_tier: grant.trust_tier,
+        status: grant.status.as_str().to_string(),
+        label: grant.label,
+        created_at: grant.created_at,
+        updated_at: grant.updated_at,
+        revoked_at: grant.revoked_at,
+    }
+}
+
 fn to_channel_stream_event_view(event: ChannelStreamEventRecord) -> ChannelStreamEventView {
     ChannelStreamEventView {
         sequence: event.sequence,
@@ -4069,6 +4604,343 @@ fn to_stream_event_view(event: RuntimeEvent) -> StreamEventDto {
 
 fn internal(err: anyhow::Error) -> KernelError {
     KernelError::Internal(format!("{err:#}"))
+}
+
+const MAX_PROVIDER_METADATA_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone)]
+struct ValidatedChannelInbound {
+    channel_id: String,
+    event_id: String,
+    sender_ref: String,
+    conversation_ref: String,
+    thread_ref: Option<String>,
+    message_ref: Option<String>,
+    text: Option<String>,
+    attachments: Vec<ChannelAttachmentDescriptor>,
+    reply_to_ref: Option<String>,
+    trigger: ChannelTrigger,
+    received_at: DateTime<Utc>,
+    provider_metadata: serde_json::Value,
+}
+
+fn validate_channel_inbound_request(
+    req: ChannelInboundRequest,
+) -> Result<ValidatedChannelInbound, KernelError> {
+    let channel_id = trim_required(req.channel_id, "channel_id")?;
+    let event_id = trim_required(req.event_id, "event_id")?;
+    let sender_ref = trim_required(req.sender_ref, "sender_ref")?;
+    let conversation_ref = trim_required(req.conversation_ref, "conversation_ref")?;
+    let thread_ref = trim_optional(req.thread_ref);
+    let message_ref = trim_optional(req.message_ref);
+    let reply_to_ref = trim_optional(req.reply_to_ref);
+    let text = trim_optional(req.text);
+    if text.is_none() && req.attachments.is_empty() {
+        return Err(KernelError::BadRequest(
+            "at least one of text or attachments is required".to_string(),
+        ));
+    }
+
+    for attachment in &req.attachments {
+        validate_attachment_descriptor(attachment)?;
+    }
+    let provider_metadata = if req.provider_metadata.is_null() {
+        json!({})
+    } else {
+        req.provider_metadata
+    };
+    let metadata_bytes = serde_json::to_vec(&provider_metadata)
+        .map_err(|err| KernelError::BadRequest(format!("invalid provider_metadata: {err}")))?;
+    if metadata_bytes.len() > MAX_PROVIDER_METADATA_BYTES {
+        return Err(KernelError::BadRequest(format!(
+            "provider_metadata exceeds {} bytes",
+            MAX_PROVIDER_METADATA_BYTES
+        )));
+    }
+
+    Ok(ValidatedChannelInbound {
+        channel_id,
+        event_id,
+        sender_ref,
+        conversation_ref,
+        thread_ref,
+        message_ref,
+        text,
+        attachments: req.attachments,
+        reply_to_ref,
+        trigger: req.trigger,
+        received_at: req.received_at.unwrap_or_else(Utc::now),
+        provider_metadata,
+    })
+}
+
+fn validate_attachment_descriptor(
+    attachment: &ChannelAttachmentDescriptor,
+) -> Result<(), KernelError> {
+    if attachment.attachment_id.trim().is_empty()
+        || attachment.kind.trim().is_empty()
+        || attachment.provider_file_ref.trim().is_empty()
+    {
+        return Err(KernelError::BadRequest(
+            "attachment_id, kind and provider_file_ref are required for every attachment"
+                .to_string(),
+        ));
+    }
+    if attachment.size_bytes.is_some_and(|value| value < 0) {
+        return Err(KernelError::BadRequest(
+            "attachment size_bytes cannot be negative".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn trim_required(value: String, field: &str) -> Result<String, KernelError> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(KernelError::BadRequest(format!("{field} is required")));
+    }
+    Ok(value)
+}
+
+fn trim_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn hash_pairing_code(raw: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn channel_inbound_response(
+    outcome: ChannelInboundOutcome,
+    reason_code: &str,
+    pairing_id: Option<Uuid>,
+    pairing_code: Option<String>,
+    session_id: Option<Uuid>,
+    turn_id: Option<Uuid>,
+    session_key: Option<String>,
+) -> ChannelInboundResponse {
+    ChannelInboundResponse {
+        outcome,
+        reason_code: Some(reason_code.to_string()),
+        pairing_id,
+        pairing_code,
+        turn_id,
+        session_id,
+        session_key,
+    }
+}
+
+fn default_pending_profile(
+    trigger: ChannelTrigger,
+    thread_ref: Option<&str>,
+) -> ChannelRoutingProfile {
+    if trigger == ChannelTrigger::Dm {
+        ChannelRoutingProfile::Direct
+    } else if thread_ref.is_some() {
+        ChannelRoutingProfile::Thread
+    } else {
+        ChannelRoutingProfile::Conversation
+    }
+}
+
+fn pending_scope_for_profile(
+    inbound: &ValidatedChannelInbound,
+    profile: ChannelRoutingProfile,
+) -> Result<(Option<String>, Option<String>, Option<String>), KernelError> {
+    match profile {
+        ChannelRoutingProfile::Direct => Ok((Some(inbound.sender_ref.clone()), None, None)),
+        ChannelRoutingProfile::Conversation => Ok((
+            Some(inbound.sender_ref.clone()),
+            Some(inbound.conversation_ref.clone()),
+            None,
+        )),
+        ChannelRoutingProfile::Thread => {
+            let thread_ref = inbound.thread_ref.clone().ok_or_else(|| {
+                KernelError::BadRequest("thread routing profile requires thread_ref".to_string())
+            })?;
+            Ok((
+                Some(inbound.sender_ref.clone()),
+                Some(inbound.conversation_ref.clone()),
+                Some(thread_ref),
+            ))
+        }
+        ChannelRoutingProfile::Outbound => Err(KernelError::BadRequest(
+            "outbound routing profile cannot admit inbound events".to_string(),
+        )),
+    }
+}
+
+fn grant_scope_from_pairing(
+    pairing: &ChannelPairingRequestRecord,
+    profile: ChannelRoutingProfile,
+) -> Result<(Option<String>, Option<String>, Option<String>), KernelError> {
+    match profile {
+        ChannelRoutingProfile::Direct => {
+            let sender_ref = pairing.sender_ref.clone().ok_or_else(|| {
+                KernelError::BadRequest("direct grant requires sender_ref".to_string())
+            })?;
+            Ok((Some(sender_ref), None, None))
+        }
+        ChannelRoutingProfile::Conversation => {
+            let sender_ref = pairing.sender_ref.clone().ok_or_else(|| {
+                KernelError::BadRequest("conversation grant requires sender_ref".to_string())
+            })?;
+            let conversation_ref = pairing.conversation_ref.clone().ok_or_else(|| {
+                KernelError::BadRequest("conversation grant requires conversation_ref".to_string())
+            })?;
+            Ok((Some(sender_ref), Some(conversation_ref), None))
+        }
+        ChannelRoutingProfile::Thread => {
+            let sender_ref = pairing.sender_ref.clone().ok_or_else(|| {
+                KernelError::BadRequest("thread grant requires sender_ref".to_string())
+            })?;
+            let conversation_ref = pairing.conversation_ref.clone().ok_or_else(|| {
+                KernelError::BadRequest("thread grant requires conversation_ref".to_string())
+            })?;
+            let thread_ref = pairing.thread_ref.clone().ok_or_else(|| {
+                KernelError::BadRequest("thread grant requires thread_ref".to_string())
+            })?;
+            Ok((Some(sender_ref), Some(conversation_ref), Some(thread_ref)))
+        }
+        ChannelRoutingProfile::Outbound => {
+            let conversation_ref = pairing.conversation_ref.clone().ok_or_else(|| {
+                KernelError::BadRequest("outbound grant requires conversation_ref".to_string())
+            })?;
+            Ok((None, Some(conversation_ref), None))
+        }
+    }
+}
+
+fn infer_block_profile(
+    sender_ref: Option<&str>,
+    conversation_ref: Option<&str>,
+    thread_ref: Option<&str>,
+) -> Result<ChannelRoutingProfile, KernelError> {
+    match (sender_ref, conversation_ref, thread_ref) {
+        (Some(_), Some(_), Some(_)) => Ok(ChannelRoutingProfile::Thread),
+        (Some(_), Some(_), None) => Ok(ChannelRoutingProfile::Conversation),
+        (Some(_), None, None) => Ok(ChannelRoutingProfile::Direct),
+        _ => Err(KernelError::BadRequest(
+            "block requires sender_ref, optionally with conversation_ref and thread_ref"
+                .to_string(),
+        )),
+    }
+}
+
+fn trigger_allows(profile: ChannelRoutingProfile, trigger: ChannelTrigger) -> bool {
+    match profile {
+        ChannelRoutingProfile::Direct => true,
+        ChannelRoutingProfile::Conversation => {
+            matches!(
+                trigger,
+                ChannelTrigger::Mention | ChannelTrigger::ReplyToBot
+            )
+        }
+        ChannelRoutingProfile::Thread => matches!(
+            trigger,
+            ChannelTrigger::Mention
+                | ChannelTrigger::ReplyToBot
+                | ChannelTrigger::ThreadContinuation
+        ),
+        ChannelRoutingProfile::Outbound => false,
+    }
+}
+
+fn session_key_for_grant(grant: &ChannelGrantRecord) -> Result<String, KernelError> {
+    match grant.routing_profile {
+        ChannelRoutingProfile::Direct => {
+            let sender_ref = grant.sender_ref.as_deref().ok_or_else(|| {
+                KernelError::Internal("direct grant missing sender_ref".to_string())
+            })?;
+            Ok(format!(
+                "channel:{}:direct:{}",
+                grant.channel_id, sender_ref
+            ))
+        }
+        ChannelRoutingProfile::Conversation => {
+            let sender_ref = grant.sender_ref.as_deref().ok_or_else(|| {
+                KernelError::Internal("conversation grant missing sender_ref".to_string())
+            })?;
+            let conversation_ref = grant.conversation_ref.as_deref().ok_or_else(|| {
+                KernelError::Internal("conversation grant missing conversation_ref".to_string())
+            })?;
+            Ok(format!(
+                "channel:{}:conversation:{}:sender:{}",
+                grant.channel_id, conversation_ref, sender_ref
+            ))
+        }
+        ChannelRoutingProfile::Thread => {
+            let conversation_ref = grant.conversation_ref.as_deref().ok_or_else(|| {
+                KernelError::Internal("thread grant missing conversation_ref".to_string())
+            })?;
+            let thread_ref = grant.thread_ref.as_deref().ok_or_else(|| {
+                KernelError::Internal("thread grant missing thread_ref".to_string())
+            })?;
+            Ok(format!(
+                "channel:{}:thread:{}:{}",
+                grant.channel_id, conversation_ref, thread_ref
+            ))
+        }
+        ChannelRoutingProfile::Outbound => Err(KernelError::BadRequest(
+            "outbound grants do not accept inbound turns".to_string(),
+        )),
+    }
+}
+
+fn stream_peer_ref_for_session_peer(channel_id: &str, session_peer_id: &str) -> String {
+    let direct_prefix = format!("channel:{channel_id}:direct:");
+    if let Some(sender_ref) = session_peer_id.strip_prefix(&direct_prefix) {
+        return sender_ref.to_string();
+    }
+
+    let conversation_prefix = format!("channel:{channel_id}:conversation:");
+    if let Some(rest) = session_peer_id.strip_prefix(&conversation_prefix) {
+        if let Some((conversation_ref, _sender_ref)) = rest.split_once(":sender:") {
+            return conversation_ref.to_string();
+        }
+    }
+
+    let thread_prefix = format!("channel:{channel_id}:thread:");
+    if let Some(rest) = session_peer_id.strip_prefix(&thread_prefix) {
+        if let Some((conversation_ref, _thread_ref)) = rest.split_once(':') {
+            return conversation_ref.to_string();
+        }
+    }
+
+    session_peer_id.to_string()
+}
+
+fn parse_session_key_scope(channel_id: &str, session_peer_id: &str) -> Option<SessionKeyScope> {
+    let direct_prefix = format!("channel:{channel_id}:direct:");
+    if let Some(sender_ref) = session_peer_id.strip_prefix(&direct_prefix) {
+        return Some(SessionKeyScope::Direct {
+            sender_ref: sender_ref.to_string(),
+        });
+    }
+
+    let conversation_prefix = format!("channel:{channel_id}:conversation:");
+    if let Some(rest) = session_peer_id.strip_prefix(&conversation_prefix) {
+        let (conversation_ref, sender_ref) = rest.split_once(":sender:")?;
+        return Some(SessionKeyScope::Conversation {
+            sender_ref: sender_ref.to_string(),
+            conversation_ref: conversation_ref.to_string(),
+        });
+    }
+
+    let thread_prefix = format!("channel:{channel_id}:thread:");
+    if let Some(rest) = session_peer_id.strip_prefix(&thread_prefix) {
+        let (conversation_ref, thread_ref) = rest.split_once(':')?;
+        return Some(SessionKeyScope::Thread {
+            conversation_ref: conversation_ref.to_string(),
+            thread_ref: thread_ref.to_string(),
+        });
+    }
+
+    None
 }
 
 fn draft_request_error(err: anyhow::Error) -> KernelError {
@@ -4334,6 +5206,21 @@ struct ChannelStreamContext {
 }
 
 #[derive(Debug)]
+enum SessionKeyScope {
+    Direct {
+        sender_ref: String,
+    },
+    Conversation {
+        sender_ref: String,
+        conversation_ref: String,
+    },
+    Thread {
+        conversation_ref: String,
+        thread_ref: String,
+    },
+}
+
+#[derive(Debug)]
 struct CollectedRuntimeTurn {
     events: Vec<RuntimeEvent>,
     result: RuntimeTurnResult,
@@ -4403,6 +5290,7 @@ struct SessionTurnExecution {
     kind: SessionTurnKind,
     display_user_text: String,
     prompt_user_text: String,
+    prepared_turn: Option<SessionTurnRecord>,
     requested_runtime_id: Option<String>,
     runtime_working_dir: Option<String>,
     runtime_timeout_ms: Option<u64>,
@@ -4620,6 +5508,7 @@ impl Kernel {
                 kind: SessionTurnKind::Normal,
                 display_user_text: req.user_text.clone(),
                 prompt_user_text: req.user_text,
+                prepared_turn: None,
                 requested_runtime_id: req.runtime_id,
                 runtime_working_dir: req.runtime_working_dir,
                 runtime_timeout_ms: req.runtime_timeout_ms,
@@ -4654,6 +5543,7 @@ impl Kernel {
             kind,
             display_user_text,
             prompt_user_text,
+            prepared_turn,
             requested_runtime_id,
             runtime_working_dir,
             runtime_timeout_ms,
@@ -4740,18 +5630,33 @@ impl Kernel {
         }
         self.materialize_runtime_plan(&runtime_id, &runtime_kind, &execution_plan)
             .await?;
-        let persisted_turn = self
-            .session_turns
-            .begin_turn(NewSessionTurn {
-                turn_id,
-                session_id: session.session_id,
-                kind,
-                display_user_text: display_user_text.clone(),
-                prompt_user_text: prompt_user_text.clone(),
-                runtime_id: runtime_id.clone(),
-            })
-            .await
-            .map_err(internal)?;
+        if let Some(turn) = &prepared_turn {
+            if turn.turn_id != turn_id || turn.session_id != session.session_id {
+                return Err(KernelError::Internal(
+                    "prepared session turn does not match execution context".to_string(),
+                ));
+            }
+            if turn.runtime_id != runtime_id {
+                return Err(KernelError::Internal(
+                    "prepared session turn runtime does not match execution context".to_string(),
+                ));
+            }
+        }
+        let persisted_turn = match prepared_turn {
+            Some(turn) => turn,
+            None => self
+                .session_turns
+                .begin_turn(NewSessionTurn {
+                    turn_id,
+                    session_id: session.session_id,
+                    kind,
+                    display_user_text: display_user_text.clone(),
+                    prompt_user_text: prompt_user_text.clone(),
+                    runtime_id: runtime_id.clone(),
+                })
+                .await
+                .map_err(internal)?,
+        };
 
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
@@ -5070,11 +5975,7 @@ impl Kernel {
             if !artifacts.saw_error && !artifacts.assistant_text.trim().is_empty() {
                 let message_id = self
                     .channel_state
-                    .insert_outbound_message(
-                        &stream_context.channel_id,
-                        &stream_context.peer_id,
-                        &artifacts.assistant_text,
-                    )
+                    .insert_outbound_message(&stream_context.channel_id, &stream_context.peer_id)
                     .await
                     .map_err(internal)?;
                 self.audit
@@ -5700,27 +6601,11 @@ impl Kernel {
         }
     }
 
-    async fn resolve_channel_runtime_id(
-        &self,
-        _channel_id: &str,
-        requested_runtime_id: Option<String>,
-    ) -> Result<Option<String>, KernelError> {
-        if let Some(runtime_id) = requested_runtime_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            return Ok(Some(runtime_id.to_string()));
-        }
-
-        Ok(None)
-    }
-
     async fn channel_stream_context_for_session(
         &self,
         session_id: Uuid,
         channel_id: &str,
-        peer_id: &str,
+        session_peer_id: &str,
         turn_id: Uuid,
     ) -> Result<Option<ChannelStreamContext>, KernelError> {
         let binding = self.applied_channel(channel_id).cloned();
@@ -5735,7 +6620,7 @@ impl Kernel {
 
         Ok(Some(ChannelStreamContext {
             channel_id: channel_id.to_string(),
-            peer_id: peer_id.to_string(),
+            peer_id: stream_peer_ref_for_session_peer(channel_id, session_peer_id),
             session_id,
             turn_id,
         }))
@@ -6038,8 +6923,8 @@ impl Kernel {
         Ok(())
     }
 
-    fn peer_worker_key(channel_id: &str, peer_id: &str) -> String {
-        format!("{channel_id}:{peer_id}")
+    fn session_key_worker_key(channel_id: &str, session_key: &str) -> String {
+        format!("{channel_id}:{session_key}")
     }
 
     pub(super) async fn emit_channel_message(
@@ -6056,7 +6941,7 @@ impl Kernel {
         for chunk in split_text_chunks(content, 3500) {
             let message_id = self
                 .channel_state
-                .insert_outbound_message(channel_id, peer_id, &chunk)
+                .insert_outbound_message(channel_id, peer_id)
                 .await
                 .map_err(internal)?;
             message_ids.push(message_id);
@@ -6102,8 +6987,8 @@ impl Kernel {
         Ok(message_ids)
     }
 
-    async fn ensure_channel_turn_worker(&self, channel_id: &str, peer_id: &str) {
-        let worker_key = Self::peer_worker_key(channel_id, peer_id);
+    async fn ensure_channel_turn_worker(&self, channel_id: &str, session_key: &str) {
+        let worker_key = Self::session_key_worker_key(channel_id, session_key);
         {
             let mut workers = self.channel_turn_workers.write().await;
             if !workers.insert(worker_key.clone()) {
@@ -6113,25 +6998,25 @@ impl Kernel {
 
         let kernel = self.clone();
         let channel_id = channel_id.to_string();
-        let peer_id = peer_id.to_string();
+        let session_key = session_key.to_string();
         tokio::spawn(async move {
             kernel
-                .drain_channel_turns_for_peer(worker_key, channel_id, peer_id)
+                .drain_channel_turns_for_session_key(worker_key, channel_id, session_key)
                 .await;
         });
     }
 
-    async fn drain_channel_turns_for_peer(
+    async fn drain_channel_turns_for_session_key(
         self,
         worker_key: String,
         channel_id: String,
-        peer_id: String,
+        session_key: String,
     ) {
         loop {
             loop {
                 let turn = match self
                     .channel_state
-                    .claim_next_pending_turn(&channel_id, &peer_id)
+                    .claim_next_pending_turn(&channel_id, &session_key)
                     .await
                 {
                     Ok(value) => value,
@@ -6142,7 +7027,7 @@ impl Kernel {
                             "kernel",
                             json!({
                                 "channel_id": channel_id,
-                                "peer_id": peer_id,
+                                "session_key": session_key,
                                 "error": err.to_string(),
                             }),
                         )
@@ -6162,7 +7047,7 @@ impl Kernel {
             self.channel_turn_workers.write().await.remove(&worker_key);
             if !self
                 .channel_state
-                .has_pending_turns(&channel_id, &peer_id)
+                .has_pending_turns(&channel_id, &session_key)
                 .await
                 .unwrap_or(false)
             {
@@ -6181,7 +7066,7 @@ impl Kernel {
             .channel_stream_context_for_session(
                 turn.session_id,
                 &turn.channel_id,
-                &turn.peer_id,
+                &turn.session_key,
                 turn.turn_id,
             )
             .await
@@ -6224,31 +7109,26 @@ impl Kernel {
             json!({
                 "turn_id": turn.turn_id,
                 "channel_id": turn.channel_id,
-                "peer_id": turn.peer_id,
+                "session_key": turn.session_key,
                 "runtime_id": turn.runtime_id,
-                "inbound_message_id": turn.inbound_message_id,
+                "inbound_event_id": turn.inbound_event_id,
             }),
         )
         .await;
 
-        let inbound_message = match self
-            .channel_state
-            .get_message(turn.inbound_message_id)
-            .await
-            .map_err(internal)
-        {
-            Ok(Some(message)) => message,
+        let persisted_turn = match self.session_turns.get(turn.turn_id).await.map_err(internal) {
+            Ok(Some(persisted_turn)) => persisted_turn,
             Ok(None) => {
                 if let Err(err) = self
                     .fail_queued_turn(
                         &turn,
                         "queue.failed",
-                        "queued inbound message no longer exists",
+                        "queued session turn no longer exists",
                         stream_context,
                     )
                     .await
                 {
-                    warn!(?err, turn_id = %turn.turn_id, "failed to mark missing-message queued turn failed");
+                    warn!(?err, turn_id = %turn.turn_id, "failed to mark missing queued session turn failed");
                 }
                 return;
             }
@@ -6257,7 +7137,7 @@ impl Kernel {
                     .fail_queued_turn(&turn, "queue.failed", &err.to_string(), stream_context)
                     .await
                 {
-                    warn!(?fail_err, turn_id = %turn.turn_id, "failed to mark queued turn failed after message load error");
+                    warn!(?fail_err, turn_id = %turn.turn_id, "failed to mark queued turn failed after session turn load error");
                 }
                 return;
             }
@@ -6317,9 +7197,10 @@ impl Kernel {
                 session,
                 SessionTurnExecution {
                     turn_id: turn.turn_id,
-                    kind: SessionTurnKind::Normal,
-                    display_user_text: inbound_message.content.clone(),
-                    prompt_user_text: inbound_message.content,
+                    kind: persisted_turn.kind,
+                    display_user_text: persisted_turn.display_user_text.clone(),
+                    prompt_user_text: persisted_turn.prompt_user_text.clone(),
+                    prepared_turn: Some(persisted_turn),
                     requested_runtime_id: Some(turn.runtime_id.clone()),
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
@@ -6369,7 +7250,7 @@ impl Kernel {
             json!({
                 "turn_id": turn.turn_id,
                 "channel_id": turn.channel_id,
-                "peer_id": turn.peer_id,
+                "session_key": turn.session_key,
                 "command_name": control.command_name.clone(),
             }),
         )
@@ -6503,7 +7384,7 @@ impl Kernel {
             json!({
                 "turn_id": turn.turn_id,
                 "channel_id": turn.channel_id,
-                "peer_id": turn.peer_id,
+                "session_key": turn.session_key,
                 "runtime_id": runtime_id,
                 "assistant_text_len": assistant_text_len,
             }),
@@ -6522,6 +7403,31 @@ impl Kernel {
             .fail_turn(turn.turn_id, message)
             .await
             .map_err(internal)?;
+        if let Some(persisted_turn) = self
+            .session_turns
+            .get(turn.turn_id)
+            .await
+            .map_err(internal)?
+        {
+            if persisted_turn.status == SessionTurnStatus::Running {
+                self.session_turns
+                    .complete_turn(
+                        turn.turn_id,
+                        SessionTurnCompletion {
+                            status: SessionTurnStatus::Failed,
+                            assistant_text: persisted_turn.assistant_text,
+                            error_code: Some(code.to_string()),
+                            error_text: Some(message.to_string()),
+                        },
+                    )
+                    .await
+                    .map_err(internal)?;
+                self.sessions
+                    .record_turn(turn.session_id)
+                    .await
+                    .map_err(internal)?;
+            }
+        }
         self.audit
             .append(
                 "channel.turn.failed",
@@ -6530,7 +7436,7 @@ impl Kernel {
                 json!({
                     "turn_id": turn.turn_id,
                     "channel_id": turn.channel_id,
-                    "peer_id": turn.peer_id,
+                    "session_key": turn.session_key,
                     "runtime_id": turn.runtime_id,
                     "error": message,
                     "code": code,
@@ -7667,9 +8573,14 @@ impl Kernel {
             }
 
             if reason.is_none() {
+                let broker_session_peer_id = if capability == Capability::ChannelSend {
+                    stream_peer_ref_for_session_peer(session_channel_id, session_peer_id)
+                } else {
+                    session_peer_id.to_string()
+                };
                 let context = CapabilityExecutionContext {
                     session_channel_id,
-                    session_peer_id,
+                    session_peer_id: &broker_session_peer_id,
                 };
                 executed = true;
                 match self

@@ -4,12 +4,12 @@ use async_trait::async_trait;
 use common::{write_skill_source, TestHome};
 use lionclaw::{
     contracts::{
-        ChannelInboundOutcome, ChannelInboundRequest, ChannelPeerApproveRequest,
+        ChannelInboundOutcome, ChannelInboundRequest, ChannelPairingApproveRequest,
         ChannelPeerBlockRequest, ChannelStreamAckRequest, ChannelStreamEventView,
-        ChannelStreamPullRequest, ChannelStreamStartMode, SessionActionKind, SessionActionRequest,
-        SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest,
-        SessionTurnKind, SessionTurnRequest, SessionTurnStatus, StreamEventKindDto, StreamLaneDto,
-        TrustTier,
+        ChannelStreamPullRequest, ChannelStreamStartMode, ChannelTrigger, SessionActionKind,
+        SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery,
+        SessionOpenRequest, SessionTurnKind, SessionTurnRequest, SessionTurnStatus,
+        StreamEventKindDto, StreamLaneDto, TrustTier,
     },
     kernel::{
         runtime::{
@@ -21,6 +21,7 @@ use lionclaw::{
     },
     operator::{config::ChannelLaunchMode, reconcile::add_channel},
 };
+use sqlx::Row;
 use tokio::time::{sleep, Duration, Instant};
 
 #[tokio::test]
@@ -109,28 +110,21 @@ async fn channel_peer_must_be_approved_before_inbound_turn_executes() {
         })
         .await
         .expect("pending inbound handled");
-    assert_eq!(pending.outcome, ChannelInboundOutcome::PairingPending);
+    assert_eq!(pending.outcome, ChannelInboundOutcome::PendingApproval);
     assert!(pending.turn_id.is_none());
 
-    let peers = kernel
-        .list_channel_peers(Some("local-cli".to_string()))
-        .await
-        .expect("list peers");
-    let pairing_code = peers
-        .peers
-        .iter()
-        .find(|peer| peer.peer_id == "peer-local")
-        .and_then(|peer| peer.pairing_code.clone())
-        .expect("pending peer pairing code");
+    let pairing_code = pending.pairing_code.expect("pending pairing code");
     kernel
-        .approve_channel_peer(ChannelPeerApproveRequest {
+        .approve_channel_pairing(ChannelPairingApproveRequest {
             channel_id: "local-cli".to_string(),
-            peer_id: "peer-local".to_string(),
-            pairing_code,
+            pairing_id: None,
+            pairing_code: Some(pairing_code),
+            routing_profile: None,
             trust_tier: Some(TrustTier::Main),
+            label: None,
         })
         .await
-        .expect("approve peer");
+        .expect("approve pairing");
 
     let queued = kernel
         .process_inbound_channel_text(InboundChannelText {
@@ -170,6 +164,9 @@ async fn channel_peer_must_be_approved_before_inbound_turn_executes() {
         codes.contains(&"queue.queued")
             && codes.contains(&"queue.started")
             && codes.contains(&"queue.completed")
+            && events.iter().any(|event| {
+                event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::Done
+            })
     })
     .await;
     let codes = stream
@@ -206,30 +203,37 @@ async fn channel_stream_pull_and_ack_round_trip() {
         })
         .await
         .expect("process inbound");
-    assert_eq!(inbound.outcome, ChannelInboundOutcome::PairingPending);
+    assert_eq!(inbound.outcome, ChannelInboundOutcome::PendingApproval);
     assert!(inbound.turn_id.is_none());
+    approve_peer(&kernel, "telegram", "peer-tele").await;
 
-    let stream = kernel
-        .pull_channel_stream(ChannelStreamPullRequest {
+    let queued = kernel
+        .process_inbound_channel_text(InboundChannelText {
             channel_id: "telegram".to_string(),
-            consumer_id: "telegram-worker".to_string(),
-            start_mode: Some(ChannelStreamStartMode::Resume),
-            start_after_sequence: None,
-            limit: Some(10),
-            wait_ms: Some(0),
+            peer_id: "peer-tele".to_string(),
+            text: "hello approved kernel".to_string(),
+            session_id: None,
+            runtime_id: Some("mock".to_string()),
+            update_id: Some(4002),
+            external_message_id: Some("update-4002".to_string()),
         })
         .await
-        .expect("pull stream");
+        .expect("process approved inbound");
+    assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
+
+    let stream = wait_for_stream_events(&kernel, "telegram", "telegram-worker", |events| {
+        events
+            .iter()
+            .filter_map(|event| event.code.as_deref())
+            .any(|code| code == "queue.completed")
+    })
+    .await;
     assert!(!stream.events.is_empty());
     let last_sequence = stream.events.last().expect("last event").sequence;
-    assert!(stream.events.iter().any(|event| {
-        event.kind == StreamEventKindDto::MessageDelta
-            && event.lane == Some(StreamLaneDto::Answer)
-            && event
-                .text
-                .as_deref()
-                .is_some_and(|text| text.contains("Pairing required"))
-    }));
+    assert!(stream
+        .events
+        .iter()
+        .any(|event| event.peer_id == "peer-tele"));
 
     let ack = kernel
         .ack_channel_stream(ChannelStreamAckRequest {
@@ -273,7 +277,7 @@ async fn channel_stream_tail_starts_from_current_head() {
         })
         .await
         .expect("process inbound");
-    assert_eq!(pending.outcome, ChannelInboundOutcome::PairingPending);
+    assert_eq!(pending.outcome, ChannelInboundOutcome::PendingApproval);
 
     let initial = kernel
         .pull_channel_stream(ChannelStreamPullRequest {
@@ -332,7 +336,21 @@ async fn channel_stream_long_poll_wakes_for_new_events() {
             })
             .await
             .expect("delayed inbound");
-        assert_eq!(pending.outcome, ChannelInboundOutcome::PairingPending);
+        assert_eq!(pending.outcome, ChannelInboundOutcome::PendingApproval);
+        approve_peer(&kernel, "telegram", "peer-wait").await;
+        let queued = kernel
+            .process_inbound_channel_text(InboundChannelText {
+                channel_id: "telegram".to_string(),
+                peer_id: "peer-wait".to_string(),
+                text: "hello after approval".to_string(),
+                session_id: None,
+                runtime_id: Some("mock".to_string()),
+                update_id: Some(6002),
+                external_message_id: Some("wait-6002".to_string()),
+            })
+            .await
+            .expect("delayed approved inbound");
+        assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
     };
 
     let (stream, _) = tokio::join!(
@@ -348,14 +366,11 @@ async fn channel_stream_long_poll_wakes_for_new_events() {
     );
     let stream = stream.expect("long-poll stream");
 
-    assert!(stream.events.iter().any(|event| {
-        event.kind == StreamEventKindDto::MessageDelta
-            && event.lane == Some(StreamLaneDto::Answer)
-            && event
-                .text
-                .as_deref()
-                .is_some_and(|text| text.contains("Pairing required"))
-    }));
+    assert!(stream
+        .events
+        .iter()
+        .filter_map(|event| event.code.as_deref())
+        .any(|code| code == "queue.queued"));
 }
 
 #[tokio::test]
@@ -367,7 +382,7 @@ async fn channel_backed_session_open_requires_approved_peer() {
     let unapproved_err = kernel
         .open_session(SessionOpenRequest {
             channel_id: "terminal".to_string(),
-            peer_id: "peer-open".to_string(),
+            peer_id: direct_session_key("terminal", "peer-open"),
             trust_tier: TrustTier::Untrusted,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -382,7 +397,7 @@ async fn channel_backed_session_open_requires_approved_peer() {
     let pending_err = kernel
         .open_session(SessionOpenRequest {
             channel_id: "terminal".to_string(),
-            peer_id: "peer-open".to_string(),
+            peer_id: direct_session_key("terminal", "peer-open"),
             trust_tier: TrustTier::Untrusted,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -390,14 +405,14 @@ async fn channel_backed_session_open_requires_approved_peer() {
         .expect_err("pending peer should be rejected");
     assert!(matches!(
         pending_err,
-        KernelError::BadRequest(message) if message.contains("pending approval")
+        KernelError::BadRequest(message) if message.contains("not approved")
     ));
 
     approve_peer(&kernel, "terminal", "peer-open").await;
     let opened = kernel
         .open_session(SessionOpenRequest {
             channel_id: "terminal".to_string(),
-            peer_id: "peer-open".to_string(),
+            peer_id: direct_session_key("terminal", "peer-open"),
             trust_tier: TrustTier::Untrusted,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -424,7 +439,7 @@ async fn direct_channel_session_turn_streams_turn_completed_then_done() {
     let session = kernel
         .open_session(SessionOpenRequest {
             channel_id: "terminal".to_string(),
-            peer_id: "peer-direct".to_string(),
+            peer_id: direct_session_key("terminal", "peer-direct"),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -457,6 +472,341 @@ async fn direct_channel_session_turn_streams_turn_completed_then_done() {
         .await
         .expect("pull direct turn stream");
     assert_turn_completed_before_done(&stream.events, response.turn_id, "direct channel turn");
+}
+
+#[tokio::test]
+async fn channels_v2_pending_pairing_hashes_code_and_rejects_runtime_id() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "v2-pairing-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    let rejected = serde_json::from_value::<ChannelInboundRequest>(serde_json::json!({
+        "channel_id": "terminal",
+        "event_id": "event-runtime",
+        "sender_ref": "alice",
+        "conversation_ref": "alice",
+        "text": "hello",
+        "attachments": [],
+        "trigger": "dm",
+        "provider_metadata": {},
+        "runtime_id": "mock"
+    }));
+    assert!(
+        rejected.is_err(),
+        "worker-supplied runtime_id must be rejected"
+    );
+
+    let pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "event-1",
+            "alice",
+            "alice",
+            None,
+            "hello",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("pending v2 inbound");
+    assert_eq!(pending.outcome, ChannelInboundOutcome::PendingApproval);
+    let pairing_id = pending.pairing_id.expect("pairing id");
+    let pairing_code = pending.pairing_code.expect("one-time pairing code");
+
+    let pairings = kernel
+        .list_channel_pairings(Some("terminal".to_string()), None)
+        .await
+        .expect("list pairings");
+    assert_eq!(pairings.pairings.len(), 1);
+    let serialized = serde_json::to_value(&pairings.pairings[0]).expect("serialize pairing");
+    assert!(serialized.get("pairing_code").is_none());
+
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    let code_row =
+        sqlx::query("SELECT code_hash FROM channel_pairing_requests WHERE pairing_id = ?1")
+            .bind(pairing_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("query code hash");
+    let code_hash: String = code_row.get("code_hash");
+    assert_ne!(code_hash, pairing_code);
+    assert!(!code_hash.contains(&pairing_code));
+
+    let duplicate = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "event-1",
+            "alice",
+            "alice",
+            None,
+            "hello again",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("duplicate v2 inbound");
+    assert_eq!(duplicate.outcome, ChannelInboundOutcome::Duplicate);
+    assert_eq!(duplicate.reason_code.as_deref(), Some("duplicate_event"));
+
+    let grant = kernel
+        .approve_channel_pairing(ChannelPairingApproveRequest {
+            channel_id: "terminal".to_string(),
+            pairing_id: None,
+            pairing_code: Some(pairing_code),
+            routing_profile: None,
+            trust_tier: Some(TrustTier::Main),
+            label: Some("alice".to_string()),
+        })
+        .await
+        .expect("approve by raw code")
+        .grant;
+    assert_eq!(grant.routing_profile.as_str(), "direct");
+    assert_eq!(grant.sender_ref.as_deref(), Some("alice"));
+
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "event-2",
+            "alice",
+            "alice",
+            None,
+            "run this",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("approved v2 inbound");
+    assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
+    assert_eq!(
+        queued.session_key.as_deref(),
+        Some(direct_session_key("terminal", "alice").as_str())
+    );
+    let queued_turn_id = queued.turn_id.expect("queued turn id");
+
+    let channel_message_columns = sqlx::query("PRAGMA table_info(channel_messages)")
+        .fetch_all(&pool)
+        .await
+        .expect("query channel message columns")
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<Vec<_>>();
+    assert!(
+        !channel_message_columns.iter().any(|name| name == "content"),
+        "channel message records must not store message content"
+    );
+    let inbound_event_columns = sqlx::query("PRAGMA table_info(channel_inbound_events)")
+        .fetch_all(&pool)
+        .await
+        .expect("query inbound event columns")
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<Vec<_>>();
+    assert!(
+        !inbound_event_columns.iter().any(|name| name == "text"),
+        "normalized inbound facts must not duplicate message text"
+    );
+    let session_turn_row = sqlx::query(
+        "SELECT display_user_text, prompt_user_text FROM session_turns WHERE turn_id = ?1",
+    )
+    .bind(queued_turn_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query persisted session turn");
+    assert_eq!(
+        session_turn_row.get::<String, _>("display_user_text"),
+        "run this"
+    );
+    assert_eq!(
+        session_turn_row.get::<String, _>("prompt_user_text"),
+        "run this"
+    );
+
+    let accepted = wait_for_audit_event_count(&kernel, "channel.inbound.accepted", 1).await;
+    assert!(accepted.events.iter().any(|event| {
+        event.details["reason_code"].as_str() == Some("accepted")
+            && event.details["event_id"].as_str() == Some("event-2")
+    }));
+}
+
+#[tokio::test]
+async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "slack", "v2-routing-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    let pending_conversation = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "slack",
+            "conversation-pending",
+            "alice",
+            "room-1",
+            None,
+            "mention",
+            ChannelTrigger::Mention,
+        ))
+        .await
+        .expect("pending conversation");
+    assert_eq!(
+        pending_conversation.outcome,
+        ChannelInboundOutcome::PendingApproval
+    );
+    let conversation_pairing_id = pending_conversation.pairing_id.expect("pairing id");
+
+    kernel
+        .approve_channel_pairing(ChannelPairingApproveRequest {
+            channel_id: "slack".to_string(),
+            pairing_id: Some(conversation_pairing_id),
+            pairing_code: None,
+            routing_profile: None,
+            trust_tier: Some(TrustTier::Main),
+            label: Some("alice in room".to_string()),
+        })
+        .await
+        .expect("approve conversation by id");
+
+    let queued_topic = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "slack",
+            "conversation-topic",
+            "alice",
+            "room-1",
+            Some("topic-a"),
+            "mention in topic",
+            ChannelTrigger::Mention,
+        ))
+        .await
+        .expect("conversation grant handles topic mention");
+    assert_eq!(queued_topic.outcome, ChannelInboundOutcome::Queued);
+    assert_eq!(
+        queued_topic.session_key.as_deref(),
+        Some("channel:slack:conversation:room-1:sender:alice")
+    );
+
+    let ignored_plain = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "slack",
+            "conversation-plain",
+            "alice",
+            "room-1",
+            None,
+            "plain message",
+            ChannelTrigger::None,
+        ))
+        .await
+        .expect("plain conversation message");
+    assert_eq!(ignored_plain.outcome, ChannelInboundOutcome::TriggerIgnored);
+    assert_eq!(
+        ignored_plain.reason_code.as_deref(),
+        Some("trigger_insufficient")
+    );
+
+    let pending_thread = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "slack",
+            "thread-pending",
+            "bob",
+            "room-1",
+            Some("topic-b"),
+            "thread continuation",
+            ChannelTrigger::ThreadContinuation,
+        ))
+        .await
+        .expect("pending thread");
+    let thread_pairing_id = pending_thread.pairing_id.expect("thread pairing id");
+    kernel
+        .approve_channel_pairing(ChannelPairingApproveRequest {
+            channel_id: "slack".to_string(),
+            pairing_id: Some(thread_pairing_id),
+            pairing_code: None,
+            routing_profile: None,
+            trust_tier: Some(TrustTier::Main),
+            label: None,
+        })
+        .await
+        .expect("approve thread");
+
+    let queued_thread = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "slack",
+            "thread-queued",
+            "bob",
+            "room-1",
+            Some("topic-b"),
+            "thread again",
+            ChannelTrigger::ThreadContinuation,
+        ))
+        .await
+        .expect("thread continuation");
+    assert_eq!(queued_thread.outcome, ChannelInboundOutcome::Queued);
+    assert_eq!(
+        queued_thread.session_key.as_deref(),
+        Some("channel:slack:thread:room-1:topic-b")
+    );
+
+    let waiting = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            attachments: vec![lionclaw::contracts::ChannelAttachmentDescriptor {
+                attachment_id: "att-1".to_string(),
+                kind: "image".to_string(),
+                mime_type: Some("image/png".to_string()),
+                filename: Some("image.png".to_string()),
+                size_bytes: Some(12),
+                provider_file_ref: "provider-file-1".to_string(),
+                caption: None,
+            }],
+            ..v2_text_request(
+                "slack",
+                "thread-attachment",
+                "bob",
+                "room-1",
+                Some("topic-b"),
+                "see image",
+                ChannelTrigger::ThreadContinuation,
+            )
+        })
+        .await
+        .expect("attachment inbound");
+    assert_eq!(
+        waiting.outcome,
+        ChannelInboundOutcome::WaitingForAttachments
+    );
+    let waiting_turn_id = waiting.turn_id.expect("waiting turn id");
+    sleep(Duration::from_millis(100)).await;
+
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    let status_row = sqlx::query("SELECT status FROM channel_turns WHERE turn_id = ?1")
+        .bind(waiting_turn_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("query waiting turn");
+    let status: String = status_row.get("status");
+    assert_eq!(status, "waiting_for_attachments");
+    let transcript_row = sqlx::query(
+        "SELECT status, display_user_text, prompt_user_text FROM session_turns WHERE turn_id = ?1",
+    )
+    .bind(waiting_turn_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query waiting transcript turn");
+    assert_eq!(
+        transcript_row.get::<String, _>("status"),
+        "waiting_for_attachments"
+    );
+    assert_eq!(
+        transcript_row.get::<String, _>("display_user_text"),
+        "see image"
+    );
+    assert_eq!(
+        transcript_row.get::<String, _>("prompt_user_text"),
+        "see image"
+    );
 }
 
 #[tokio::test]
@@ -516,7 +866,12 @@ async fn latest_session_snapshot_is_project_scoped() {
 async fn latest_session_snapshot_uses_stream_head_before_first_answer_checkpoint() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "terminal", "resume-head-skill").await;
-    let kernel = env.kernel().await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("slow-answer".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
     kernel
         .register_runtime_adapter(
             "slow-answer",
@@ -537,10 +892,10 @@ async fn latest_session_snapshot_uses_stream_head_before_first_answer_checkpoint
     )
     .await;
     approve_peer(&kernel, "terminal", "peer-resume-head").await;
-    let session = kernel
+    let _session = kernel
         .open_session(SessionOpenRequest {
             channel_id: "terminal".to_string(),
-            peer_id: "peer-resume-head".to_string(),
+            peer_id: direct_session_key("terminal", "peer-resume-head"),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -550,18 +905,27 @@ async fn latest_session_snapshot_uses_stream_head_before_first_answer_checkpoint
     kernel
         .ingest_channel_inbound(ChannelInboundRequest {
             channel_id: "terminal".to_string(),
-            peer_id: "peer-resume-head".to_string(),
-            text: "resume before answer".to_string(),
-            session_id: Some(session.session_id),
-            update_id: Some(7252),
-            external_message_id: Some("resume-head-7252".to_string()),
-            runtime_id: Some("slow-answer".to_string()),
+            event_id: "resume-head-7252".to_string(),
+            sender_ref: "peer-resume-head".to_string(),
+            conversation_ref: "peer-resume-head".to_string(),
+            thread_ref: None,
+            message_ref: Some("resume-head-7252".to_string()),
+            text: Some("resume before answer".to_string()),
+            attachments: Vec::new(),
+            reply_to_ref: None,
+            trigger: ChannelTrigger::Dm,
+            received_at: None,
+            provider_metadata: serde_json::json!({"update_id": 7252}),
         })
         .await
         .expect("queue running turn");
 
-    let resume_after_sequence =
-        wait_for_running_snapshot_without_answer(&kernel, "terminal", "peer-resume-head").await;
+    let resume_after_sequence = wait_for_running_snapshot_without_answer(
+        &kernel,
+        "terminal",
+        &direct_session_key("terminal", "peer-resume-head"),
+    )
+    .await;
 
     let resumed = kernel
         .pull_channel_stream(ChannelStreamPullRequest {
@@ -614,7 +978,7 @@ async fn channel_session_actions_return_immediately_and_respect_peer_blocking() 
     let session = kernel
         .open_session(SessionOpenRequest {
             channel_id: "terminal".to_string(),
-            peer_id: "peer-action".to_string(),
+            peer_id: direct_session_key("terminal", "peer-action"),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -680,7 +1044,12 @@ async fn channel_session_actions_return_immediately_and_respect_peer_blocking() 
 async fn channel_runtime_error_event_persists_failed_turn_and_supports_continue() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "terminal", "failure-skill").await;
-    let kernel = env.kernel().await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("partial-failure".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
     kernel
         .register_runtime_adapter(
             "partial-failure",
@@ -704,7 +1073,7 @@ async fn channel_runtime_error_event_persists_failed_turn_and_supports_continue(
     let session = kernel
         .open_session(SessionOpenRequest {
             channel_id: "terminal".to_string(),
-            peer_id: "peer-failure".to_string(),
+            peer_id: direct_session_key("terminal", "peer-failure"),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -714,12 +1083,17 @@ async fn channel_runtime_error_event_persists_failed_turn_and_supports_continue(
     let queued = kernel
         .ingest_channel_inbound(ChannelInboundRequest {
             channel_id: "terminal".to_string(),
-            peer_id: "peer-failure".to_string(),
-            text: "fail-case".to_string(),
-            session_id: Some(session.session_id),
-            update_id: Some(7302),
-            external_message_id: Some("failure-7302".to_string()),
-            runtime_id: Some("partial-failure".to_string()),
+            event_id: "failure-7302".to_string(),
+            sender_ref: "peer-failure".to_string(),
+            conversation_ref: "peer-failure".to_string(),
+            thread_ref: None,
+            message_ref: Some("failure-7302".to_string()),
+            text: Some("fail-case".to_string()),
+            attachments: Vec::new(),
+            reply_to_ref: None,
+            trigger: ChannelTrigger::Dm,
+            received_at: None,
+            provider_metadata: serde_json::json!({"update_id": 7302}),
         })
         .await
         .expect("queue failing turn");
@@ -1112,6 +1486,42 @@ fn assert_error_before_done(
     (error_position, done_position)
 }
 
+fn direct_session_key(channel_id: &str, peer_id: &str) -> String {
+    format!("channel:{channel_id}:direct:{peer_id}")
+}
+
+fn v2_text_request(
+    channel_id: &str,
+    event_id: &str,
+    sender_ref: &str,
+    conversation_ref: &str,
+    thread_ref: Option<&str>,
+    text: &str,
+    trigger: ChannelTrigger,
+) -> ChannelInboundRequest {
+    ChannelInboundRequest {
+        channel_id: channel_id.to_string(),
+        event_id: event_id.to_string(),
+        sender_ref: sender_ref.to_string(),
+        conversation_ref: conversation_ref.to_string(),
+        thread_ref: thread_ref.map(str::to_string),
+        message_ref: Some(event_id.to_string()),
+        text: Some(text.to_string()),
+        attachments: Vec::new(),
+        reply_to_ref: None,
+        trigger,
+        received_at: None,
+        provider_metadata: serde_json::json!({}),
+    }
+}
+
+async fn connect_test_pool(db_path: &std::path::Path) -> sqlx::SqlitePool {
+    let db_url = format!("sqlite://{}", db_path.display());
+    sqlx::SqlitePool::connect(&db_url)
+        .await
+        .expect("connect test db")
+}
+
 async fn create_pending_peer(
     kernel: &Kernel,
     channel_id: &str,
@@ -1132,29 +1542,31 @@ async fn create_pending_peer(
         })
         .await
         .expect("create pending peer");
-    assert_eq!(response.outcome, ChannelInboundOutcome::PairingPending);
+    assert_eq!(response.outcome, ChannelInboundOutcome::PendingApproval);
 }
 
 async fn approve_peer(kernel: &Kernel, channel_id: &str, peer_id: &str) {
-    let peers = kernel
-        .list_channel_peers(Some(channel_id.to_string()))
+    let pairings = kernel
+        .list_channel_pairings(Some(channel_id.to_string()), None)
         .await
-        .expect("list peers");
-    let pairing_code = peers
-        .peers
+        .expect("list pairings");
+    let pairing_id = pairings
+        .pairings
         .iter()
-        .find(|value| value.peer_id == peer_id)
-        .and_then(|peer| peer.pairing_code.clone())
-        .expect("pairing code");
+        .find(|value| value.sender_ref.as_deref() == Some(peer_id))
+        .map(|pairing| pairing.pairing_id)
+        .expect("pairing id");
     kernel
-        .approve_channel_peer(ChannelPeerApproveRequest {
+        .approve_channel_pairing(ChannelPairingApproveRequest {
             channel_id: channel_id.to_string(),
-            peer_id: peer_id.to_string(),
-            pairing_code,
+            pairing_id: Some(pairing_id),
+            pairing_code: None,
+            routing_profile: None,
             trust_tier: Some(TrustTier::Main),
+            label: None,
         })
         .await
-        .expect("approve peer");
+        .expect("approve pairing");
 }
 
 async fn wait_for_latest_turn<F>(kernel: &Kernel, session_id: uuid::Uuid, predicate: F, label: &str)
@@ -1485,7 +1897,7 @@ async fn channel_session_start_failure_streams_error_before_done() {
     let session = kernel
         .open_session(SessionOpenRequest {
             channel_id: "terminal".to_string(),
-            peer_id: "peer-start-failure".to_string(),
+            peer_id: direct_session_key("terminal", "peer-start-failure"),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -1572,7 +1984,7 @@ async fn channel_close_failure_does_not_override_streamed_runtime_error() {
     let session = kernel
         .open_session(SessionOpenRequest {
             channel_id: "terminal".to_string(),
-            peer_id: "peer-close-failure".to_string(),
+            peer_id: direct_session_key("terminal", "peer-close-failure"),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
