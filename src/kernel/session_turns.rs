@@ -195,6 +195,34 @@ impl SessionTurnStore {
         self.get(turn_id).await
     }
 
+    pub async fn update_running_turn_input(
+        &self,
+        turn_id: Uuid,
+        kind: SessionTurnKind,
+        display_user_text: &str,
+        prompt_user_text: &str,
+    ) -> Result<Option<SessionTurnRecord>> {
+        let updated = sqlx::query(
+            "UPDATE session_turns \
+             SET kind = ?2, display_user_text = ?3, prompt_user_text = ?4 \
+             WHERE turn_id = ?1 AND status = ?5",
+        )
+        .bind(turn_id.to_string())
+        .bind(kind.as_str())
+        .bind(display_user_text)
+        .bind(prompt_user_text)
+        .bind(SessionTurnStatus::Running.as_str())
+        .execute(&self.pool)
+        .await
+        .context("failed to update running session turn input")?;
+
+        if updated.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        self.get(turn_id).await
+    }
+
     pub async fn interrupt_running_turns_without_pending_channel_turns(
         &self,
         reason: &str,
