@@ -766,6 +766,47 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
         })
         .await;
 
+    let ignored_unpaired_plain = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "slack",
+            "unpaired-plain",
+            "charlie",
+            "room-1",
+            None,
+            "ordinary message",
+            ChannelTrigger::None,
+        ))
+        .await
+        .expect("plain unpaired message");
+    assert_eq!(
+        ignored_unpaired_plain.outcome,
+        ChannelInboundOutcome::TriggerIgnored
+    );
+    assert_eq!(
+        ignored_unpaired_plain.reason_code.as_deref(),
+        Some("trigger_insufficient")
+    );
+    assert!(
+        ignored_unpaired_plain.pairing_id.is_none(),
+        "untargeted inbound must not create a pairing"
+    );
+    assert!(
+        ignored_unpaired_plain.pairing_code.is_none(),
+        "untargeted inbound must not mint a pairing code"
+    );
+
+    let unpaired_access_state = kernel
+        .list_channel_pairings(Some("slack".to_string()), None)
+        .await
+        .expect("list access state after untargeted inbound");
+    assert!(
+        unpaired_access_state
+            .pairings
+            .iter()
+            .all(|pairing| pairing.sender_ref.as_deref() != Some("charlie")),
+        "untargeted inbound must not surface as an approval request"
+    );
+
     let pending_conversation = kernel
         .ingest_channel_inbound(v2_text_request(
             "slack",

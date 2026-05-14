@@ -1576,6 +1576,13 @@ impl Kernel {
             ));
         }
 
+        if inbound.trigger == ChannelTrigger::None {
+            self.audit_channel_trigger_ignored_in_tx(&mut tx, &inbound)
+                .await?;
+            tx.commit().await.map_err(|err| internal(err.into()))?;
+            return Ok(channel_trigger_ignored_response());
+        }
+
         let grant = self
             .channel_state
             .find_approved_grant_in_tx(
@@ -1633,25 +1640,10 @@ impl Kernel {
         };
 
         if !trigger_allows(grant.routing_profile, inbound.trigger) {
-            self.audit_channel_inbound_in_tx(
-                &mut tx,
-                "channel.inbound.trigger_ignored",
-                &inbound,
-                "trigger_insufficient",
-                None,
-                None,
-            )
-            .await?;
+            self.audit_channel_trigger_ignored_in_tx(&mut tx, &inbound)
+                .await?;
             tx.commit().await.map_err(|err| internal(err.into()))?;
-            return Ok(channel_inbound_response(
-                ChannelInboundOutcome::TriggerIgnored,
-                "trigger_insufficient",
-                None,
-                None,
-                None,
-                None,
-                None,
-            ));
+            return Ok(channel_trigger_ignored_response());
         }
 
         let session_key = session_key_for_grant(&grant)?;
@@ -1881,6 +1873,22 @@ impl Kernel {
             )
             .await
             .map_err(internal)
+    }
+
+    async fn audit_channel_trigger_ignored_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        inbound: &ValidatedChannelInbound,
+    ) -> Result<(), KernelError> {
+        self.audit_channel_inbound_in_tx(
+            tx,
+            "channel.inbound.trigger_ignored",
+            inbound,
+            "trigger_insufficient",
+            None,
+            None,
+        )
+        .await
     }
 
     pub async fn grant_policy(
@@ -4688,6 +4696,18 @@ fn channel_inbound_response(
         session_id,
         session_key,
     }
+}
+
+fn channel_trigger_ignored_response() -> ChannelInboundResponse {
+    channel_inbound_response(
+        ChannelInboundOutcome::TriggerIgnored,
+        "trigger_insufficient",
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 fn default_pending_profile(
