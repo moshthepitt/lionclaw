@@ -13,9 +13,9 @@ use chrono::{Duration as ChronoDuration, Utc};
 use lionclaw::{
     applied::AppliedState,
     contracts::{
-        ChannelPairingApproveRequest, ChannelPairingStatus, ContinuityPathRequest,
-        ContinuitySearchRequest, JobCreateRequest, PolicyGrantRequest, SessionHistoryPolicy,
-        SessionOpenRequest, SessionTurnRequest, TrustTier,
+        ChannelGrantRevokeRequest, ChannelPairingApproveRequest, ChannelPairingStatus,
+        ContinuityPathRequest, ContinuitySearchRequest, JobCreateRequest, PolicyGrantRequest,
+        SessionHistoryPolicy, SessionOpenRequest, SessionTurnRequest, TrustTier,
     },
     home::LionClawHome,
     kernel::{
@@ -627,6 +627,62 @@ async fn approve_channel_pairing_rolls_back_when_audit_append_fails() {
         .find(|pairing| pairing.sender_ref.as_deref() == Some("alice"))
         .expect("alice pairing");
     assert_eq!(alice.status, ChannelPairingStatus::Pending);
+}
+
+#[tokio::test]
+async fn revoke_channel_grant_rolls_back_when_audit_append_fails() {
+    let env = TestEnv::new();
+    bootstrap_workspace(&env.workspace_root())
+        .await
+        .expect("bootstrap workspace");
+    install_and_bind_channel(&env, "terminal").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            workspace_root: Some(env.workspace_root()),
+            project_workspace_root: Some(env.project_root()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    let pairing_code = seed_pending_peer(&kernel, "terminal", "alice").await;
+    let grant = kernel
+        .approve_channel_pairing(ChannelPairingApproveRequest {
+            channel_id: "terminal".to_string(),
+            pairing_id: None,
+            pairing_code: Some(pairing_code),
+            label: None,
+            routing_profile: None,
+            trust_tier: Some(TrustTier::Main),
+        })
+        .await
+        .expect("approve grant before revoke rollback")
+        .grant;
+
+    let pool = SqlitePool::connect(&env.db_url())
+        .await
+        .expect("open sqlite pool");
+    sqlx::query("DROP TABLE audit_events")
+        .execute(&pool)
+        .await
+        .expect("drop audit_events");
+
+    let err = kernel
+        .revoke_channel_grant(ChannelGrantRevokeRequest {
+            channel_id: "terminal".to_string(),
+            grant_id: grant.grant_id,
+            reason: None,
+        })
+        .await
+        .expect_err("revoke should fail when audit append fails");
+    assert!(err.to_string().contains("failed to append audit event"));
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM channel_grants WHERE grant_id = ?1")
+            .bind(grant.grant_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("query grant status after rollback");
+    assert_eq!(status, "approved");
 }
 
 #[tokio::test]

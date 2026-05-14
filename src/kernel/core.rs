@@ -1287,14 +1287,21 @@ impl Kernel {
     ) -> Result<ChannelGrantRevokeResponse, KernelError> {
         let channel_id = trim_required(req.channel_id, "channel_id")?;
         self.require_active_channel_binding(&channel_id).await?;
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|err| internal(err.into()))?;
         let revoked = self
             .channel_state
-            .revoke_grant(&channel_id, req.grant_id)
+            .revoke_grant_in_tx(&mut tx, &channel_id, req.grant_id)
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::NotFound("channel grant not found".to_string()))?;
         self.audit
-            .append(
+            .append_in_tx(
+                &mut tx,
                 "channel.grant.revoked",
                 None,
                 Some("api".to_string()),
@@ -1311,6 +1318,7 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
         self.refresh_active_continuity_after_commit_best_effort(
             "channel.grant.revoked",
             None,
@@ -1786,6 +1794,7 @@ impl Kernel {
 
         let turn_id = Uuid::new_v4();
         let waiting_for_attachments = !inbound.attachments.is_empty();
+        let user_text = channel_turn_user_text(&inbound);
         let turn_status = if waiting_for_attachments {
             ChannelTurnStatus::WaitingForAttachments
         } else {
@@ -1809,8 +1818,8 @@ impl Kernel {
                     turn_id,
                     session_id: session.session_id,
                     kind: SessionTurnKind::Normal,
-                    display_user_text: inbound.text.clone().unwrap_or_default(),
-                    prompt_user_text: inbound.text.clone().unwrap_or_default(),
+                    display_user_text: user_text.clone(),
+                    prompt_user_text: user_text,
                     runtime_id: runtime_id.clone(),
                 },
                 session_turn_status,
@@ -4803,6 +4812,21 @@ fn pending_scope_for_profile(
             "outbound routing profile cannot admit inbound events".to_string(),
         )),
     }
+}
+
+fn channel_turn_user_text(inbound: &ValidatedChannelInbound) -> String {
+    if let Some(text) = &inbound.text {
+        return text.clone();
+    }
+
+    inbound
+        .attachments
+        .iter()
+        .filter_map(|attachment| attachment.caption.as_deref())
+        .map(str::trim)
+        .filter(|caption| !caption.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn grant_scope_from_pairing(

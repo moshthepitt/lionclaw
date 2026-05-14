@@ -351,7 +351,8 @@ impl ChannelStateStore {
         &self,
         event: NewChannelInboundEvent<'_>,
     ) -> Result<Option<ChannelInboundEventRecord>> {
-        let attachments_json = serde_json::to_string(event.attachments)
+        let stored_attachments = attachment_descriptors_without_message_content(event.attachments);
+        let attachments_json = serde_json::to_string(&stored_attachments)
             .context("failed to encode attachment descriptors")?;
         let provider_metadata_json = serde_json::to_string(event.provider_metadata)
             .context("failed to encode provider metadata")?;
@@ -822,6 +823,26 @@ impl ChannelStateStore {
         channel_id: &str,
         grant_id: Uuid,
     ) -> Result<Option<ChannelGrantRecord>> {
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .context("failed to start channel grant revoke transaction")?;
+        let revoked = self
+            .revoke_grant_in_tx(&mut tx, channel_id, grant_id)
+            .await?;
+        tx.commit()
+            .await
+            .context("failed to commit channel grant revoke transaction")?;
+        Ok(revoked)
+    }
+
+    pub(crate) async fn revoke_grant_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        channel_id: &str,
+        grant_id: Uuid,
+    ) -> Result<Option<ChannelGrantRecord>> {
         let now = now_ms();
         let changed = sqlx::query(
             "UPDATE channel_grants \
@@ -831,14 +852,14 @@ impl ChannelStateStore {
         .bind(channel_id)
         .bind(grant_id.to_string())
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await
         .context("failed to revoke channel grant")?;
 
         if changed.rows_affected() == 0 {
             return Ok(None);
         }
-        self.get_grant(grant_id).await
+        self.get_grant_in_tx(tx, grant_id).await
     }
 
     pub async fn get_grant(&self, grant_id: Uuid) -> Result<Option<ChannelGrantRecord>> {
@@ -1722,6 +1743,19 @@ fn map_grant_row(row: SqliteRow) -> Result<ChannelGrantRecord> {
         updated_at,
         revoked_at,
     })
+}
+
+fn attachment_descriptors_without_message_content(
+    attachments: &[ChannelAttachmentDescriptor],
+) -> Vec<ChannelAttachmentDescriptor> {
+    attachments
+        .iter()
+        .cloned()
+        .map(|mut attachment| {
+            attachment.caption = None;
+            attachment
+        })
+        .collect()
 }
 
 fn map_inbound_event_row(row: SqliteRow) -> Result<ChannelInboundEventRecord> {

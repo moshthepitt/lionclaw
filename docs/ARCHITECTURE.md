@@ -42,7 +42,7 @@ The Rust kernel owns:
 
 - sessions and turn history
 - runtime launch plans
-- channel peer approval, inbound queues, outbound streams
+- channel pairing, scoped grants, inbound queues, outbound streams
 - scheduler definitions and run records
 - policy grants and audit events
 - assistant-home continuity files and derived search index
@@ -480,7 +480,7 @@ home.
 9. Audit covers API mutations, runtime plan allow/deny, runtime
    start/finish/error/timeout, channel lifecycle events, scheduler events, and
    brokered capability decisions.
-10. Channel inbound is gated by pairing approval with duplicate update
+10. Channel inbound is gated by scoped grants with duplicate event
     suppression and worker-controlled polling offsets.
 
 ## Planned Hardening
