@@ -155,8 +155,8 @@ is launched through its app-server protocol with `externalSandbox` permissions
 inside the outer Podman boundary. LionClaw does not use `codex exec` as a
 fallback path. Codex app-server request/notification assumptions are pinned by
 checked-in protocol fixtures under `tests/fixtures/codex_app_server`, including
-the target Codex CLI version; update those fixtures with the adapter when the
-target app-server contract changes.
+the target Codex CLI version and immutable source commit; update those fixtures
+with the adapter when the target app-server contract changes.
 
 ## Runtime Control Commands
 
