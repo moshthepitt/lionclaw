@@ -31,6 +31,18 @@ default_peer_id() {
   printf 'local-user\n'
 }
 
+process_nonce() {
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then
+    local uuid
+    uuid="$(</proc/sys/kernel/random/uuid)"
+    printf '%s\n' "${uuid//-/}"
+    return
+  fi
+
+  od -An -N16 -tx1 /dev/urandom | tr -d ' \n'
+  printf '\n'
+}
+
 LIONCLAW_HOME="${LIONCLAW_HOME:-$HOME/.lionclaw}"
 LIONCLAW_BASE_URL="${LIONCLAW_BASE_URL:-http://127.0.0.1:8979}"
 LIONCLAW_CHANNEL_ID="${LIONCLAW_CHANNEL_ID:-terminal}"
@@ -42,7 +54,7 @@ LIONCLAW_CONSUMER_ID="${LIONCLAW_CONSUMER_ID:-terminal:$LIONCLAW_CHANNEL_ID:$LIO
 LIONCLAW_STREAM_RETRY_SECS="${LIONCLAW_STREAM_RETRY_SECS:-1}"
 LIONCLAW_SESSION_ID="${LIONCLAW_SESSION_ID:-}"
 
-WORKER_INSTANCE_ID="terminal-${LIONCLAW_CHANNEL_ID}-$$"
+WORKER_INSTANCE_ID="terminal-${LIONCLAW_CHANNEL_ID}-$(process_nonce)"
 inbound_sequence=0
 stream_pid=""
 
