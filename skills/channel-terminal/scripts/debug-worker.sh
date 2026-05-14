@@ -79,7 +79,25 @@ fetch_peer_json() {
 
   jq -c \
     --arg sender_ref "$LIONCLAW_PEER_ID" \
-    '.pairings[]? | select(.sender_ref == $sender_ref and .requested_profile == "direct")' <<<"$pairings_json"
+    '(
+      [
+        .grants[]?
+        | select(
+            .sender_ref == $sender_ref
+            and .routing_profile == "direct"
+            and (.status == "approved" or .status == "blocked")
+          )
+      ][0]
+    ) // (
+      [
+        .pairings[]?
+        | select(
+            .sender_ref == $sender_ref
+            and .requested_profile == "direct"
+            and .status == "pending"
+          )
+      ][0]
+    ) // empty' <<<"$pairings_json"
 }
 
 print_pairing_status() {
