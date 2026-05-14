@@ -2,6 +2,7 @@
   "codexCliVersion": "0.130.0",
   "source": "https://github.com/openai/codex/blob/58573da43ab697e8b79f152c53df4b42230395a8/codex-rs/app-server/README.md",
   "client": {
+    "id": 1,
     "method": "thread/compact/start",
     "params": {
       "threadId": "thr_1"

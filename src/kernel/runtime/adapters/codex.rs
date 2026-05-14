@@ -1085,7 +1085,6 @@ where
 
 fn app_server_request_message(id: u64, method: &str, params: Value) -> Value {
     json!({
-        "jsonrpc": "2.0",
         "id": id,
         "method": method,
         "params": params,
@@ -1094,7 +1093,6 @@ fn app_server_request_message(id: u64, method: &str, params: Value) -> Value {
 
 fn app_server_notification_message(method: &str, params: Value) -> Value {
     json!({
-        "jsonrpc": "2.0",
         "method": method,
         "params": params,
     })
@@ -1102,7 +1100,6 @@ fn app_server_notification_message(method: &str, params: Value) -> Value {
 
 fn app_server_error_response(id: Value, code: i64, message: String) -> Value {
     json!({
-        "jsonrpc": "2.0",
         "id": id,
         "error": {
             "code": code,
@@ -1651,8 +1648,8 @@ mod tests {
         (adapter, handle, thread_state)
     }
 
-    fn is_jsonrpc_message(message: &Value) -> bool {
-        message.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+    fn omits_jsonrpc_header(message: &Value) -> bool {
+        message.get("jsonrpc").is_none()
     }
 
     fn codex_protocol_fixture(name: &str) -> Value {
@@ -1684,6 +1681,13 @@ mod tests {
             .expect("fixture client method");
         let params = client.get("params").cloned().unwrap_or(Value::Null);
         (method, params)
+    }
+
+    fn fixture_client_message(fixture: &Value) -> Value {
+        fixture
+            .get("client")
+            .expect("fixture client request")
+            .clone()
     }
 
     #[async_trait]
@@ -1948,7 +1952,7 @@ mod tests {
         );
 
         let sent = sent.lock().expect("sent lock").clone();
-        assert!(sent.iter().all(is_jsonrpc_message));
+        assert!(sent.iter().all(omits_jsonrpc_header));
         assert_eq!(sent[0]["method"], "initialize");
         assert_eq!(sent[1]["method"], "initialized");
         assert_eq!(sent[2]["method"], "thread/start");
@@ -2075,9 +2079,7 @@ mod tests {
             .expect("context compaction should complete through turn notifications");
 
         let sent = sent.lock().expect("sent lock").clone();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0]["method"], "thread/compact/start");
-        assert_eq!(sent[0]["params"]["threadId"], "thr_1");
+        assert_eq!(sent, vec![fixture_client_message(&fixture)]);
 
         let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
         assert!(events.iter().any(|event| matches!(
@@ -2105,11 +2107,8 @@ mod tests {
             .await
             .expect("turn interrupt should accept interrupted terminal notification");
 
-        let (method, params) = fixture_client_request(&fixture);
         let sent = sent.lock().expect("sent lock").clone();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0]["method"], method);
-        assert_eq!(sent[0]["params"], params);
+        assert_eq!(sent, vec![fixture_client_message(&fixture)]);
 
         adapter.close(&handle).await.expect("close");
     }
@@ -2362,7 +2361,7 @@ mod tests {
         let sent = sent.lock().expect("sent lock").clone();
         assert!(sent.iter().any(|message| {
             message.get("id").and_then(Value::as_str) == Some("approval-1")
-                && is_jsonrpc_message(message)
+                && omits_jsonrpc_header(message)
                 && message.pointer("/error/code").and_then(Value::as_i64) == Some(-32601)
                 && message
                     .pointer("/error/message")

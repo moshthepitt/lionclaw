@@ -82,7 +82,37 @@ fn is_path_like_slash_token(command_token: &str) -> bool {
     let Some(rest) = command_token.strip_prefix('/') else {
         return false;
     };
-    rest.contains('/')
+    rest.is_empty()
+        || rest.contains('/')
+        || rest.contains('.')
+        || is_common_root_path_component(rest)
+}
+
+fn is_common_root_path_component(component: &str) -> bool {
+    // Unknown single-component slash tokens stay available for runtime commands;
+    // standard root entries are ordinary absolute paths in user prompts.
+    matches!(
+        component,
+        "bin"
+            | "boot"
+            | "dev"
+            | "etc"
+            | "home"
+            | "lib"
+            | "lib64"
+            | "media"
+            | "mnt"
+            | "opt"
+            | "proc"
+            | "root"
+            | "run"
+            | "sbin"
+            | "srv"
+            | "sys"
+            | "tmp"
+            | "usr"
+            | "var"
+    )
 }
 
 #[cfg(test)]
@@ -145,6 +175,18 @@ mod tests {
         assert_eq!(
             classify_input("/"),
             ClassifiedInput::Prompt("/".to_string())
+        );
+        assert_eq!(
+            classify_input("/tmp explain this path"),
+            ClassifiedInput::Prompt("/tmp explain this path".to_string())
+        );
+        assert_eq!(
+            classify_input("/etc"),
+            ClassifiedInput::Prompt("/etc".to_string())
+        );
+        assert_eq!(
+            classify_input("/README.md summarize"),
+            ClassifiedInput::Prompt("/README.md summarize".to_string())
         );
         assert_eq!(
             classify_input("/home/user/file.rs fix this"),
