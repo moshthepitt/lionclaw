@@ -5,11 +5,12 @@ use common::{write_skill_source, TestHome};
 use lionclaw::{
     contracts::{
         ChannelAttachmentDescriptor, ChannelInboundOutcome, ChannelInboundRequest,
-        ChannelPairingApproveRequest, ChannelPeerBlockRequest, ChannelStreamAckRequest,
-        ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamStartMode, ChannelTrigger,
-        SessionActionKind, SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest,
-        SessionLatestQuery, SessionOpenRequest, SessionTurnKind, SessionTurnRequest,
-        SessionTurnStatus, StreamEventKindDto, StreamLaneDto, TrustTier,
+        ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPeerBlockRequest,
+        ChannelStreamAckRequest, ChannelStreamEventView, ChannelStreamPullRequest,
+        ChannelStreamStartMode, ChannelTrigger, SessionActionKind, SessionActionRequest,
+        SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest,
+        SessionTurnKind, SessionTurnRequest, SessionTurnStatus, StreamEventKindDto, StreamLaneDto,
+        TrustTier,
     },
     kernel::{
         runtime::{
@@ -724,6 +725,38 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
         Some("trigger_insufficient")
     );
 
+    let blocked_grant = kernel
+        .block_channel_pairing(ChannelPairingBlockRequest {
+            channel_id: "slack".to_string(),
+            pairing_id: None,
+            sender_ref: Some("mallory".to_string()),
+            conversation_ref: None,
+            thread_ref: None,
+            reason: Some("test_block".to_string()),
+        })
+        .await
+        .expect("block sender");
+    assert_eq!(blocked_grant.grant.status, "blocked");
+
+    let blocked = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "slack",
+            "blocked-sender",
+            "mallory",
+            "room-1",
+            None,
+            "untrusted plain message",
+            ChannelTrigger::None,
+        ))
+        .await
+        .expect("blocked sender inbound");
+    assert_eq!(blocked.outcome, ChannelInboundOutcome::Blocked);
+    assert_eq!(blocked.reason_code.as_deref(), Some("blocked_grant"));
+    assert!(
+        blocked.turn_id.is_none(),
+        "blocked channel inbound must not create a turn"
+    );
+
     let pending_thread = kernel
         .ingest_channel_inbound(v2_text_request(
             "slack",
@@ -769,7 +802,8 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
 
     let waiting = kernel
         .ingest_channel_inbound(ChannelInboundRequest {
-            attachments: vec![attachment_descriptor("att-1")],
+            text: None,
+            attachments: vec![captioned_attachment_descriptor("att-1", "see image")],
             ..v2_text_request(
                 "slack",
                 "thread-attachment",
@@ -838,6 +872,20 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
     assert_eq!(
         transcript_row.get::<String, _>("prompt_user_text"),
         "see image"
+    );
+    let attachments_json: String = sqlx::query_scalar(
+        "SELECT attachments_json FROM channel_inbound_events WHERE event_id = ?1",
+    )
+    .bind("thread-attachment")
+    .fetch_one(&pool)
+    .await
+    .expect("query stored attachment descriptors");
+    let stored_attachments: Vec<ChannelAttachmentDescriptor> =
+        serde_json::from_str(&attachments_json).expect("decode stored attachment descriptors");
+    assert_eq!(stored_attachments.len(), 1);
+    assert!(
+        stored_attachments[0].caption.is_none(),
+        "normalized inbound event facts must not persist message captions"
     );
 
     let colon_pending = kernel
@@ -1628,6 +1676,16 @@ fn attachment_descriptor(attachment_id: &str) -> ChannelAttachmentDescriptor {
         size_bytes: Some(12),
         provider_file_ref: "provider-file-1".to_string(),
         caption: None,
+    }
+}
+
+fn captioned_attachment_descriptor(
+    attachment_id: &str,
+    caption: &str,
+) -> ChannelAttachmentDescriptor {
+    ChannelAttachmentDescriptor {
+        caption: Some(caption.to_string()),
+        ..attachment_descriptor(attachment_id)
     }
 }
 

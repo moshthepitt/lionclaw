@@ -170,7 +170,7 @@ message through the terminal UI.
 
 Expected:
 
-- pairing approval is explicit
+- scoped grant approval is explicit
 - the channel response comes from the configured runtime
 - `lionclaw logs -f` can inspect the selected instance without raw HTTP
 
@@ -188,7 +188,7 @@ Expected when credentials are available:
 
 - the token is stored in selected-instance private channel env
 - `doctor` does not print the token
-- Telegram delivery works through the configured runtime after peer approval
+- Telegram delivery works through the configured runtime after scoped grant approval
 
 If credentials are not available, record this subphase as skipped with
 `missing Telegram bot token`.
