@@ -1522,10 +1522,6 @@ while IFS= read -r line; do
       printf '%s\n' '{"id":3,"result":{"threadId":"thr_test"}}'
       printf '%s\n' '{"method":"thread/compacted","params":{"threadId":"thr_test"}}'
       ;;
-    *'"method":"review/start"'*)
-      printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn_test"}}}'
-      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thr_test","turnId":"turn_test"}}'
-      ;;
   esac
 done
 "#,

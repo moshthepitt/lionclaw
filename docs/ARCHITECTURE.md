@@ -167,10 +167,10 @@ persisted as `runtime_control` turns. The kernel records
 `runtime.control.outcome` audit events around those turns. Runtime adapters
 decide whether a control is handled, unsupported, interactive-only, or failed.
 
-This keeps native runtime commands such as Codex `/model`, `/rename`,
-`/compact`, and `/review` native to the selected runtime without teaching the
-kernel runtime-specific command semantics. Leading-space slash input and
-path-like slash input remain ordinary prompts.
+This keeps native runtime commands such as Codex `/model`, `/rename`, and
+`/compact` native to the selected runtime without teaching the kernel
+runtime-specific command semantics. Leading-space slash input and path-like
+slash input remain ordinary prompts.
 
 ## Direct Runtime And Brokered Capability Flow
 

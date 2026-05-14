@@ -125,9 +125,10 @@ impl CodexRuntimeAdapter {
                     "Codex permission changes must be made through LionClaw runtime policy, not a runtime slash command."
                         .to_string(),
             }),
-            "rename" | "name" | "compact" | "review" => {
-                self.run_thread_control(execution, events).await
-            }
+            "rename" | "name" | "compact" => self.run_thread_control(execution, events).await,
+            "review" => Ok(RuntimeControlOutcome::Unsupported {
+                message: "Codex review control is not exposed through LionClaw yet.".to_string(),
+            }),
             _ => Ok(RuntimeControlOutcome::Unsupported {
                 message: format!("Codex does not support native control command '/{command}'"),
             }),
@@ -248,32 +249,6 @@ impl CodexRuntimeAdapter {
                         .await?;
                     RuntimeControlOutcome::Handled {
                         message: "Compacted Codex thread.".to_string(),
-                    }
-                }
-                "review" => {
-                    let response = client
-                        .request(
-                            "review/start",
-                            json!({
-                                "threadId": thread_id,
-                                "delivery": "inline",
-                                "target": review_target_from_arguments(&input.arguments),
-                            }),
-                            &events,
-                            &thread_state,
-                        )
-                        .await?;
-                    let turn_id = extract_app_server_turn_id(&response);
-                    client
-                        .wait_for_turn_completed(turn_id.as_deref(), &events, &thread_state)
-                        .await?;
-                    let answer = client.answer_text().trim().to_string();
-                    RuntimeControlOutcome::Handled {
-                        message: if answer.is_empty() {
-                            "Codex review completed.".to_string()
-                        } else {
-                            answer
-                        },
                     }
                 }
                 other => RuntimeControlOutcome::Unsupported {
@@ -544,7 +519,6 @@ struct CodexAppServerClient<T> {
     unmatched_turn_failure: Option<String>,
     compacted_threads: HashSet<String>,
     unmatched_thread_compacted: bool,
-    answer_text: String,
 }
 
 impl<T> CodexAppServerClient<T>
@@ -561,12 +535,7 @@ where
             unmatched_turn_failure: None,
             compacted_threads: HashSet::new(),
             unmatched_thread_compacted: false,
-            answer_text: String::new(),
         }
-    }
-
-    fn answer_text(&self) -> &str {
-        &self.answer_text
     }
 
     async fn initialize(
@@ -802,7 +771,6 @@ where
             }
             "item/agentMessage/delta" => {
                 if let Some(text) = app_server_text(params, &["delta", "text", "content"]) {
-                    self.answer_text.push_str(&text);
                     drop(events.send(RuntimeEvent::MessageDelta {
                         lane: RuntimeMessageLane::Answer,
                         text,
@@ -971,38 +939,6 @@ fn insert_optional_model(params: &mut Value, model: Option<&str>) {
         return;
     };
     params.insert("model".to_string(), json!(model));
-}
-
-fn review_target_from_arguments(arguments: &str) -> Value {
-    let trimmed = arguments.trim();
-    if trimmed.is_empty() || trimmed == "changes" || trimmed == "uncommitted" {
-        return json!({"type": "uncommittedChanges"});
-    }
-    if let Some(branch) = trimmed
-        .strip_prefix("base ")
-        .or_else(|| trimmed.strip_prefix("baseBranch "))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return json!({
-            "type": "baseBranch",
-            "branch": branch,
-        });
-    }
-    if let Some(sha) = trimmed
-        .strip_prefix("commit ")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return json!({
-            "type": "commit",
-            "sha": sha,
-        });
-    }
-    json!({
-        "type": "custom",
-        "instructions": trimmed,
-    })
 }
 
 fn invalid_thread_control_arguments(
@@ -1318,11 +1254,14 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
             Arc, Mutex,
         },
+        time::Duration,
     };
 
     use crate::kernel::runtime::{
-        ExecutionOutput, RuntimeAdapter, RuntimeControlOutcome, RuntimeEvent, RuntimeMessageLane,
-        RuntimeSessionHandle, RuntimeSessionStartInput,
+        ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionOutput, NetworkMode,
+        OciConfinementConfig, RuntimeAdapter, RuntimeControlExecution, RuntimeControlInput,
+        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeMessageLane,
+        RuntimeSessionHandle, RuntimeSessionStartInput, WorkspaceAccess,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -1492,7 +1431,38 @@ mod tests {
                 if code.as_deref() == Some("runtime.control.invalid_arguments")
                     && message.contains("does not accept arguments")
         ));
-        assert!(super::invalid_thread_control_arguments("review", "base main").is_none());
+    }
+
+    #[tokio::test]
+    async fn review_control_is_unsupported_without_a_verified_native_mapping() {
+        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let outcome = adapter
+            .run_app_server_control(
+                RuntimeControlExecution {
+                    input: RuntimeControlInput {
+                        runtime_session_id: "codex-test".to_string(),
+                        raw: "/review base main".to_string(),
+                        command_name: "review".to_string(),
+                        arguments: "base main".to_string(),
+                        origin: RuntimeControlOrigin::SessionTurn,
+                        runtime_skill_ids: Vec::new(),
+                    },
+                    plan: test_execution_plan(),
+                    runtime_secrets_mount: None,
+                    codex_home_override: None,
+                },
+                event_tx,
+            )
+            .await
+            .expect("review outcome");
+
+        assert!(matches!(
+            outcome,
+            RuntimeControlOutcome::Unsupported { message }
+                if message.contains("not exposed through LionClaw")
+        ));
     }
 
     #[test]
@@ -2046,5 +2016,23 @@ mod tests {
 
         adapter.close(&handle_a).await.expect("close a");
         adapter.close(&handle_b).await.expect("close b");
+    }
+
+    fn test_execution_plan() -> EffectiveExecutionPlan {
+        EffectiveExecutionPlan {
+            runtime_id: "codex".to_string(),
+            preset_name: "everyday".to_string(),
+            confinement: ConfinementConfig::Oci(OciConfinementConfig::default()),
+            workspace_access: WorkspaceAccess::ReadWrite,
+            network_mode: NetworkMode::On,
+            working_dir: None,
+            environment: Vec::new(),
+            idle_timeout: Duration::from_secs(30),
+            hard_timeout: Duration::from_secs(90),
+            mounts: Vec::new(),
+            mount_runtime_secrets: false,
+            escape_classes: Default::default(),
+            limits: ExecutionLimits::default(),
+        }
     }
 }
