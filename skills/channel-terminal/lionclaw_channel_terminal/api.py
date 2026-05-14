@@ -13,6 +13,7 @@ class PeerState:
     status: PeerStatus
     pairing_code: str | None = None
     trust_tier: str | None = None
+    pairing_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -20,6 +21,8 @@ class InboundResponse:
     outcome: str
     turn_id: str | None = None
     session_id: str | None = None
+    pairing_id: str | None = None
+    pairing_code: str | None = None
 
 
 @dataclass(slots=True)
@@ -63,7 +66,6 @@ class LionClawApi:
         peer_id: str,
         consumer_id: str,
         start_mode: str,
-        runtime_id: str | None,
         stream_limit: int,
         stream_wait_ms: int,
         timeout_seconds: float = 35.0,
@@ -73,29 +75,33 @@ class LionClawApi:
         self.peer_id = peer_id
         self.consumer_id = consumer_id
         self.start_mode = start_mode
-        self.runtime_id = runtime_id
         self.stream_limit = stream_limit
         self.stream_wait_ms = stream_wait_ms
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout_seconds)
         self._inbound_sequence = 0
+
+    @property
+    def session_key(self) -> str:
+        return f"channel:{self.channel_id}:direct:{self.peer_id}"
 
     async def close(self) -> None:
         await self._client.aclose()
 
     async def fetch_peer_state(self) -> PeerState:
         response = await self._client.get(
-            "/v0/channels/peers",
+            "/v0/channels/pairing",
             params={"channel_id": self.channel_id},
         )
         _raise_for_status(response)
         payload = response.json()
-        for peer in payload.get("peers", []):
-            if peer.get("peer_id") != self.peer_id:
+        for pairing in payload.get("pairings", []):
+            if pairing.get("sender_ref") != self.peer_id:
+                continue
+            if pairing.get("requested_profile") != "direct":
                 continue
             return PeerState(
-                status=peer.get("status", "unknown"),
-                pairing_code=peer.get("pairing_code"),
-                trust_tier=peer.get("trust_tier"),
+                status=pairing.get("status", "unknown"),
+                pairing_id=pairing.get("pairing_id"),
             )
         return PeerState(status="unknown")
 
@@ -105,7 +111,7 @@ class LionClawApi:
     ) -> SessionLatestSnapshot:
         params: dict[str, str] = {
             "channel_id": self.channel_id,
-            "peer_id": self.peer_id,
+            "peer_id": self.session_key,
         }
         if history_policy:
             params["history_policy"] = history_policy
@@ -138,7 +144,7 @@ class LionClawApi:
             "/v0/sessions/open",
             json={
                 "channel_id": self.channel_id,
-                "peer_id": self.peer_id,
+                "peer_id": self.session_key,
                 "trust_tier": trust_tier,
                 "history_policy": history_policy,
             },
@@ -169,17 +175,17 @@ class LionClawApi:
         )
 
     async def send_inbound(self, text: str, session_id: str | None = None) -> InboundResponse:
-        external_message_id = f"terminal-inbound:{self.consumer_id}:{self._inbound_sequence}"
+        event_id = f"terminal-inbound:{self.consumer_id}:{self._inbound_sequence}"
         payload: dict[str, Any] = {
             "channel_id": self.channel_id,
-            "peer_id": self.peer_id,
+            "event_id": event_id,
+            "sender_ref": self.peer_id,
+            "conversation_ref": self.peer_id,
             "text": text,
-            "external_message_id": external_message_id,
+            "attachments": [],
+            "trigger": "dm",
+            "provider_metadata": {"source": "channel-terminal"},
         }
-        if session_id:
-            payload["session_id"] = session_id
-        if self.runtime_id:
-            payload["runtime_id"] = self.runtime_id
         response = await self._client.post("/v0/channels/inbound", json=payload)
         _raise_for_status(response)
         data = response.json()
@@ -188,6 +194,8 @@ class LionClawApi:
             outcome=data["outcome"],
             turn_id=data.get("turn_id"),
             session_id=data.get("session_id"),
+            pairing_id=data.get("pairing_id"),
+            pairing_code=data.get("pairing_code"),
         )
 
     async def pull_stream(

@@ -60,7 +60,7 @@ class ChannelViewStateTests(unittest.TestCase):
         state.set_pairing_state(status="pending", pairing_code="123456")
         banner = state.pairing_banner("terminal", "mosh")
         self.assertIn("123456", banner)
-        self.assertIn("lionclaw channel pairing approve terminal mosh 123456", banner)
+        self.assertIn("lionclaw channel pairing approve terminal 123456", banner)
 
     def test_channel_scoped_stream_event_does_not_select_active_session(self):
         state = ChannelViewState(peer_id="mosh")
@@ -455,7 +455,6 @@ def _make_app() -> TerminalChannelApp:
             stream_start_mode="tail",
             stream_limit=50,
             stream_wait_ms=0,
-            runtime_id=None,
         )
     )
 
@@ -526,15 +525,13 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
 
         async with app.run_test() as pilot:
             await pilot.pause()
-            self.assertTrue(app.query_one(Input).has_focus)
-
-            await pilot.press("tab")
-            await pilot.pause()
+            self.assertTrue(app.query_one(Input).disabled)
             self.assertFalse(app.query_one(Input).has_focus)
 
             api.peer_state = PeerState(status="approved", trust_tier="main")
             await app.refresh_pairing_state()
             await pilot.pause()
+            self.assertFalse(app.query_one(Input).disabled)
             self.assertTrue(app.query_one(Input).has_focus)
 
             await pilot.press("tab")
@@ -588,7 +585,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(app.state.input_disabled())
 
-    async def test_submit_text_opens_interactive_session_for_approved_peer(self):
+    async def test_submit_text_lets_inbound_select_session_for_approved_peer(self):
         app = _make_app()
         api = _InteractiveApi()
         app.api = api
@@ -598,8 +595,8 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
         accepted = await app.submit_text("hello")
 
         self.assertTrue(accepted)
-        self.assertEqual(api.open_calls, 1)
-        self.assertEqual(api.sent_session_id, "session-opened")
+        self.assertEqual(api.open_calls, 0)
+        self.assertIsNone(api.sent_session_id)
         self.assertEqual(app.state.active_session_id, "session-1")
 
     async def test_reset_swaps_to_fresh_session_and_clears_history(self):
@@ -737,7 +734,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("lionclaw> restored answer", app.state.transcript_text())
         self.assertEqual(app.state.activity_text(), "[status] peer approved")
 
-    async def test_submit_text_blocks_fresh_session_when_restore_is_pending_and_fails(self):
+    async def test_submit_text_does_not_block_on_failed_restore(self):
         app = _make_app()
         api = _FailingRestoreApi()
         app.api = api
@@ -746,13 +743,11 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
 
         accepted = await app.submit_text("hello")
 
-        self.assertFalse(accepted)
-        self.assertEqual(api.fetch_latest_calls, 1)
+        self.assertTrue(accepted)
+        self.assertEqual(api.fetch_latest_calls, 0)
         self.assertEqual(api.open_calls, 0)
-        self.assertIsNone(api.sent_text)
-        self.assertIsNone(app.state.active_session_id)
-        self.assertEqual(app.state.transcript_text(), "")
-        self.assertIn("send blocked: latest session restore failed", app.state.activity_text())
+        self.assertEqual(api.sent_text, "hello")
+        self.assertEqual(app.state.active_session_id, "session-1")
 
 
 if __name__ == "__main__":

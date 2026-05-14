@@ -23,7 +23,6 @@ class AppConfig:
     stream_start_mode: str
     stream_limit: int
     stream_wait_ms: int
-    runtime_id: str | None
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -36,7 +35,6 @@ class AppConfig:
             stream_start_mode=os.environ.get("LIONCLAW_STREAM_START_MODE", "tail"),
             stream_limit=int(os.environ.get("LIONCLAW_STREAM_LIMIT", "50")),
             stream_wait_ms=int(os.environ.get("LIONCLAW_STREAM_WAIT_MS", "30000")),
-            runtime_id=os.environ.get("LIONCLAW_RUNTIME_ID") or None,
         )
 
 
@@ -123,7 +121,6 @@ class TerminalChannelApp(App[None]):
             peer_id=config.peer_id,
             consumer_id=config.consumer_id,
             start_mode=config.stream_start_mode,
-            runtime_id=config.runtime_id,
             stream_limit=config.stream_limit,
             stream_wait_ms=config.stream_wait_ms,
         )
@@ -212,6 +209,8 @@ class TerminalChannelApp(App[None]):
             response.outcome,
             response.turn_id,
             response.session_id,
+            response.pairing_id,
+            response.pairing_code,
         )
         self._render_views()
         return accepted
@@ -283,7 +282,8 @@ class TerminalChannelApp(App[None]):
 
         self.state.set_pairing_state(
             status=peer_state.status,
-            pairing_code=peer_state.pairing_code,
+            pairing_code=peer_state.pairing_code or self.state.pairing.pairing_code,
+            pairing_id=peer_state.pairing_id or self.state.pairing.pairing_id,
             trust_tier=peer_state.trust_tier,
         )
 
@@ -320,16 +320,7 @@ class TerminalChannelApp(App[None]):
         return True
 
     async def ensure_interactive_session_for_send(self) -> str | None:
-        if self.state.active_session_id is not None:
-            return self.state.active_session_id
-        if self.state.pairing.status != "approved":
-            return None
-        if not self._approved_peer_session_restore_complete:
-            if not await self._restore_approved_peer_session():
-                raise RuntimeError("latest session restore failed; retrying")
-            if self.state.active_session_id is not None:
-                return self.state.active_session_id
-        return await self.open_interactive_session()
+        return self.state.active_session_id
 
     async def open_interactive_session(self) -> str | None:
         if self.state.pairing.status != "approved":
@@ -452,18 +443,41 @@ class TerminalChannelApp(App[None]):
         outcome: str,
         turn_id: str | None,
         session_id: str | None,
+        response_pairing_id: str | None,
+        response_pairing_code: str | None,
     ) -> bool:
         if outcome == "queued" and turn_id:
             self.state.mark_queued(turn_id, session_id)
+            self.state.set_pairing_state(
+                status="approved",
+                pairing_code=self.state.pairing.pairing_code,
+                pairing_id=self.state.pairing.pairing_id,
+                trust_tier=self.state.pairing.trust_tier or "main",
+            )
             return True
-        if outcome == "pairing_pending":
+        if outcome == "pending_approval":
             self.state.discard_pending_turn()
+            self.state.set_pairing_state(
+                status="pending",
+                pairing_code=response_pairing_code,
+                pairing_id=response_pairing_id,
+                trust_tier=self.state.pairing.trust_tier,
+            )
             self.state.activity_lines.append("[status] pairing pending")
             return True
-        if outcome == "peer_blocked":
+        if outcome == "blocked":
             self.state.discard_pending_turn()
-            self.state.activity_lines.append("[error] peer_blocked: peer is blocked")
+            self.state.set_pairing_state(status="blocked")
+            self.state.activity_lines.append("[error] blocked: peer is blocked")
             return False
+        if outcome == "trigger_ignored":
+            self.state.discard_pending_turn()
+            self.state.activity_lines.append("[status] trigger ignored")
+            return False
+        if outcome == "waiting_for_attachments":
+            self.state.discard_pending_turn()
+            self.state.activity_lines.append("[status] waiting for attachments")
+            return True
         if outcome == "duplicate":
             self.state.discard_pending_turn()
             self.state.activity_lines.append("[status] duplicate: inbound ignored")
