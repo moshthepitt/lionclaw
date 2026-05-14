@@ -15,19 +15,21 @@ use crate::{
         AuditQueryParams, AuditQueryResponse, ChannelGrantResponse, ChannelGrantRevokeRequest,
         ChannelGrantRevokeResponse, ChannelInboundRequest, ChannelInboundResponse,
         ChannelListResponse, ChannelPairingApproveRequest, ChannelPairingBlockRequest,
-        ChannelPairingListParams, ChannelPairingListResponse, ChannelStreamAckRequest,
-        ChannelStreamAckResponse, ChannelStreamPullRequest, ChannelStreamPullResponse,
-        ContinuityDraftActionRequest, ContinuityDraftDiscardResponse, ContinuityDraftListRequest,
-        ContinuityDraftListResponse, ContinuityDraftPromoteResponse, ContinuityGetResponse,
-        ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse, ContinuityPathRequest,
-        ContinuityProposalActionResponse, ContinuityProposalListResponse, ContinuitySearchRequest,
-        ContinuitySearchResponse, ContinuityStatusResponse, DaemonInfoResponse, JobCreateRequest,
-        JobCreateResponse, JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest,
-        JobRemoveResponse, JobRunsRequest, JobRunsResponse, JobTickResponse, JobToggleResponse,
-        PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeRequest, PolicyRevokeResponse,
-        SessionActionRequest, SessionActionResponse, SessionHistoryRequest, SessionHistoryResponse,
-        SessionLatestQuery, SessionLatestResponse, SessionOpenRequest, SessionOpenResponse,
-        SessionTurnRequest, SessionTurnResponse,
+        ChannelPairingBlockResponse, ChannelPairingClaimRequest, ChannelPairingClaimResponse,
+        ChannelPairingInviteRequest, ChannelPairingInviteResponse, ChannelPairingListParams,
+        ChannelPairingListResponse, ChannelStreamAckRequest, ChannelStreamAckResponse,
+        ChannelStreamPullRequest, ChannelStreamPullResponse, ContinuityDraftActionRequest,
+        ContinuityDraftDiscardResponse, ContinuityDraftListRequest, ContinuityDraftListResponse,
+        ContinuityDraftPromoteResponse, ContinuityGetResponse, ContinuityOpenLoopActionResponse,
+        ContinuityOpenLoopListResponse, ContinuityPathRequest, ContinuityProposalActionResponse,
+        ContinuityProposalListResponse, ContinuitySearchRequest, ContinuitySearchResponse,
+        ContinuityStatusResponse, DaemonInfoResponse, JobCreateRequest, JobCreateResponse,
+        JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest, JobRemoveResponse,
+        JobRunsRequest, JobRunsResponse, JobTickResponse, JobToggleResponse, PolicyGrantRequest,
+        PolicyGrantResponse, PolicyRevokeRequest, PolicyRevokeResponse, SessionActionRequest,
+        SessionActionResponse, SessionHistoryRequest, SessionHistoryResponse, SessionLatestQuery,
+        SessionLatestResponse, SessionOpenRequest, SessionOpenResponse, SessionTurnRequest,
+        SessionTurnResponse,
     },
     kernel::{Kernel, KernelError},
 };
@@ -58,6 +60,8 @@ pub fn build_router(kernel: Arc<Kernel>, daemon_info: DaemonInfoResponse) -> Rou
             "/v0/channels/pairing/approve",
             post(approve_channel_pairing),
         )
+        .route("/v0/channels/pairing/invite", post(invite_channel_pairing))
+        .route("/v0/channels/pairing/claim", post(claim_channel_pairing))
         .route("/v0/channels/pairing/block", post(block_channel_pairing))
         .route("/v0/channels/grants/revoke", post(revoke_channel_grant))
         .route("/v0/channels/inbound", post(channel_inbound))
@@ -178,10 +182,26 @@ async fn approve_channel_pairing(
     Ok(Json(result))
 }
 
+async fn invite_channel_pairing(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelPairingInviteRequest>,
+) -> Result<Json<ChannelPairingInviteResponse>, ApiError> {
+    let result = state.kernel.invite_channel_pairing(req).await?;
+    Ok(Json(result))
+}
+
+async fn claim_channel_pairing(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelPairingClaimRequest>,
+) -> Result<Json<ChannelPairingClaimResponse>, ApiError> {
+    let result = state.kernel.claim_channel_pairing(req).await?;
+    Ok(Json(result))
+}
+
 async fn block_channel_pairing(
     State(state): State<ApiState>,
     Json(req): Json<ChannelPairingBlockRequest>,
-) -> Result<Json<ChannelGrantResponse>, ApiError> {
+) -> Result<Json<ChannelPairingBlockResponse>, ApiError> {
     let result = state.kernel.block_channel_pairing(req).await?;
     Ok(Json(result))
 }

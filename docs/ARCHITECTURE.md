@@ -274,6 +274,8 @@ with the CLI.
 
 - `GET /v0/channels/list`
 - `GET /v0/channels/pairing` (pairing requests and current grant state)
+- `POST /v0/channels/pairing/invite`
+- `POST /v0/channels/pairing/claim`
 - `POST /v0/channels/pairing/approve`
 - `POST /v0/channels/pairing/block`
 - `POST /v0/channels/grants/revoke`
@@ -335,9 +337,13 @@ External channel skills integrate over HTTP:
    consumer cursor.
 5. `POST /v0/channels/stream/ack` records that a worker durably handled events
    through a sequence.
-6. Pairing approve/block and grant revoke endpoints manage channel trust.
-   Blocking a scope also closes matching pending pairing requests.
-   Blocks are enforced from the most-specific scope back to the direct sender.
+6. Pairing invite/claim, approve/block, and grant revoke endpoints manage
+   channel trust. Invite tokens are returned once, stored only as hashes, and
+   claimed through worker-submitted provider facts.
+   Blocking a sender scope also closes matching pending operator-approval
+   pairing requests. Blocking a token invite by `pairing_id` marks that invite
+   blocked without creating a sender grant. Blocks are enforced from the
+   most-specific scope back to the direct sender.
 
 Queued channel turns emit machine-stable status/error codes through the same
 stream contract. Kernel-generated lifecycle codes include:
@@ -389,6 +395,12 @@ not part of the inbound channel contract; the kernel resolves runtime execution
 from the instance/default runtime configuration.
 Session-key components escape `:` and `%` so provider refs such as
 `telegram:chat:-123` remain unambiguous.
+Proactive pairing invites reuse `channel_pairing_requests` with
+`claim_policy = token_claim`; raw invite tokens are never stored, claim counts
+advance inside the same transaction that creates the scoped grant, and expired
+blocked, or over-claimed tokens cannot authorize a channel sender. Pairing claim
+audit stores normalized identity and outcome facts only, never raw worker
+provider metadata.
 
 Kernel bootstrap converts stale `running` session turns into durable
 `interrupted` turns before they can be reused. Durable pending channel turns are

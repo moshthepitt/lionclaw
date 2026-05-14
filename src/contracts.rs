@@ -806,6 +806,77 @@ pub struct ChannelPairingListParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ChannelPairingInviteRequest {
+    pub channel_id: String,
+    pub requested_profile: ChannelRoutingProfile,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub conversation_ref: Option<String>,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
+    #[serde(default)]
+    pub expires_in_ms: Option<u64>,
+    #[serde(default)]
+    pub max_claims: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPairingInviteResponse {
+    pub pairing_id: Uuid,
+    pub channel_id: String,
+    pub token: String,
+    pub requested_profile: ChannelRoutingProfile,
+    pub expires_at: DateTime<Utc>,
+    pub max_claims: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelPairingClaimRequest {
+    pub channel_id: String,
+    pub token: String,
+    pub sender_ref: String,
+    pub conversation_ref: String,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
+    #[serde(default)]
+    pub provider_metadata: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelPairingClaimOutcome {
+    Approved,
+    Expired,
+    AlreadyClaimed,
+    InvalidToken,
+    ScopeMismatch,
+}
+
+impl ChannelPairingClaimOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Expired => "expired",
+            Self::AlreadyClaimed => "already_claimed",
+            Self::InvalidToken => "invalid_token",
+            Self::ScopeMismatch => "scope_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPairingClaimResponse {
+    pub outcome: ChannelPairingClaimOutcome,
+    #[serde(default)]
+    pub grant_id: Option<Uuid>,
+    #[serde(default)]
+    pub reason_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelPairingApproveRequest {
     pub channel_id: String,
     #[serde(default)]
@@ -834,6 +905,13 @@ pub struct ChannelPairingBlockRequest {
     pub thread_ref: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPairingBlockResponse {
+    #[serde(default)]
+    pub grant: Option<ChannelGrantView>,
+    pub blocked_pairing_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

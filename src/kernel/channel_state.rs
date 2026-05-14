@@ -14,6 +14,9 @@ use crate::{
     kernel::db::{datetime_to_ms, ms_to_datetime, now_ms},
 };
 
+pub(crate) const PAIRING_CLAIM_POLICY_OPERATOR_APPROVAL: &str = "operator_approval";
+pub(crate) const PAIRING_CLAIM_POLICY_TOKEN_CLAIM: &str = "token_claim";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelGrantStatus {
     Approved,
@@ -128,6 +131,18 @@ pub(crate) struct OperatorPairingUpsert<'a> {
     pub thread_ref: Option<&'a str>,
     pub requested_profile: ChannelRoutingProfile,
     pub code_hash: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TokenPairingCreate<'a> {
+    pub channel_id: &'a str,
+    pub code_hash: &'a str,
+    pub conversation_ref: Option<&'a str>,
+    pub thread_ref: Option<&'a str>,
+    pub requested_profile: ChannelRoutingProfile,
+    pub label: Option<&'a str>,
+    pub max_claims: u32,
+    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -413,18 +428,102 @@ impl ChannelStateStore {
         conversation_ref: &str,
         thread_ref: Option<&str>,
     ) -> Result<Option<ChannelGrantRecord>> {
-        if let Some(thread_ref) = thread_ref {
-            if let Some(grant) = self
-                .get_grant_by_scope_with_status_in_tx(
+        let routing_profile = if thread_ref.is_some() {
+            ChannelRoutingProfile::Thread
+        } else {
+            ChannelRoutingProfile::Conversation
+        };
+
+        self.find_blocking_grant_for_scope_in_tx(
+            tx,
+            channel_id,
+            Some(sender_ref),
+            Some(conversation_ref),
+            thread_ref,
+            routing_profile,
+        )
+        .await
+    }
+
+    pub(crate) async fn find_blocking_grant_for_scope_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        channel_id: &str,
+        sender_ref: Option<&str>,
+        conversation_ref: Option<&str>,
+        thread_ref: Option<&str>,
+        routing_profile: ChannelRoutingProfile,
+    ) -> Result<Option<ChannelGrantRecord>> {
+        let Some(sender_ref) = sender_ref else {
+            return Ok(None);
+        };
+
+        match routing_profile {
+            ChannelRoutingProfile::Thread => {
+                if let (Some(conversation_ref), Some(thread_ref)) = (conversation_ref, thread_ref) {
+                    if let Some(grant) = self
+                        .get_blocking_grant_by_scope_in_tx(
+                            tx,
+                            channel_id,
+                            Some(sender_ref),
+                            Some(conversation_ref),
+                            Some(thread_ref),
+                            ChannelRoutingProfile::Thread,
+                        )
+                        .await?
+                    {
+                        return Ok(Some(grant));
+                    }
+                }
+
+                self.find_blocking_conversation_or_direct_grant_in_tx(
                     tx,
-                    ChannelGrantScopeLookup {
-                        channel_id,
-                        sender_ref: Some(sender_ref),
-                        conversation_ref: Some(conversation_ref),
-                        thread_ref: Some(thread_ref),
-                        routing_profile: ChannelRoutingProfile::Thread,
-                        status: ChannelGrantStatus::Blocked,
-                    },
+                    channel_id,
+                    sender_ref,
+                    conversation_ref,
+                )
+                .await
+            }
+            ChannelRoutingProfile::Conversation => {
+                self.find_blocking_conversation_or_direct_grant_in_tx(
+                    tx,
+                    channel_id,
+                    sender_ref,
+                    conversation_ref,
+                )
+                .await
+            }
+            ChannelRoutingProfile::Direct => {
+                self.get_blocking_grant_by_scope_in_tx(
+                    tx,
+                    channel_id,
+                    Some(sender_ref),
+                    None,
+                    None,
+                    ChannelRoutingProfile::Direct,
+                )
+                .await
+            }
+            ChannelRoutingProfile::Outbound => Ok(None),
+        }
+    }
+
+    async fn find_blocking_conversation_or_direct_grant_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        channel_id: &str,
+        sender_ref: &str,
+        conversation_ref: Option<&str>,
+    ) -> Result<Option<ChannelGrantRecord>> {
+        if let Some(conversation_ref) = conversation_ref {
+            if let Some(grant) = self
+                .get_blocking_grant_by_scope_in_tx(
+                    tx,
+                    channel_id,
+                    Some(sender_ref),
+                    Some(conversation_ref),
+                    None,
+                    ChannelRoutingProfile::Conversation,
                 )
                 .await?
             {
@@ -432,31 +531,34 @@ impl ChannelStateStore {
             }
         }
 
-        if let Some(grant) = self
-            .get_grant_by_scope_with_status_in_tx(
-                tx,
-                ChannelGrantScopeLookup {
-                    channel_id,
-                    sender_ref: Some(sender_ref),
-                    conversation_ref: Some(conversation_ref),
-                    thread_ref: None,
-                    routing_profile: ChannelRoutingProfile::Conversation,
-                    status: ChannelGrantStatus::Blocked,
-                },
-            )
-            .await?
-        {
-            return Ok(Some(grant));
-        }
+        self.get_blocking_grant_by_scope_in_tx(
+            tx,
+            channel_id,
+            Some(sender_ref),
+            None,
+            None,
+            ChannelRoutingProfile::Direct,
+        )
+        .await
+    }
 
+    async fn get_blocking_grant_by_scope_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        channel_id: &str,
+        sender_ref: Option<&str>,
+        conversation_ref: Option<&str>,
+        thread_ref: Option<&str>,
+        routing_profile: ChannelRoutingProfile,
+    ) -> Result<Option<ChannelGrantRecord>> {
         self.get_grant_by_scope_with_status_in_tx(
             tx,
             ChannelGrantScopeLookup {
                 channel_id,
-                sender_ref: Some(sender_ref),
-                conversation_ref: None,
-                thread_ref: None,
-                routing_profile: ChannelRoutingProfile::Direct,
+                sender_ref,
+                conversation_ref,
+                thread_ref,
+                routing_profile,
                 status: ChannelGrantStatus::Blocked,
             },
         )
@@ -695,11 +797,12 @@ impl ChannelStateStore {
         sqlx::query(
             "INSERT INTO channel_pairing_requests \
              (pairing_id, channel_id, code_hash, claim_policy, sender_ref, conversation_ref, thread_ref, requested_profile, status, label, max_claims, claim_count, created_at_ms, expires_at_ms, claimed_at_ms, updated_at_ms) \
-             VALUES (?1, ?2, ?3, 'operator_approval', ?4, ?5, ?6, ?7, 'pending', NULL, 1, 0, ?8, NULL, NULL, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', NULL, 1, 0, ?9, NULL, NULL, ?9)",
         )
         .bind(pairing_id.to_string())
         .bind(pairing.channel_id)
         .bind(pairing.code_hash)
+        .bind(PAIRING_CLAIM_POLICY_OPERATOR_APPROVAL)
         .bind(pairing.sender_ref)
         .bind(pairing.conversation_ref)
         .bind(pairing.thread_ref)
@@ -751,6 +854,70 @@ impl ChannelStateStore {
         .context("failed to query channel pairing request by code hash")?;
 
         row.map(map_pairing_row).transpose()
+    }
+
+    pub(crate) async fn create_token_pairing_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        pairing: TokenPairingCreate<'_>,
+    ) -> Result<ChannelPairingRequestRecord> {
+        let now = now_ms();
+        let pairing_id = Uuid::new_v4();
+        let expires_at_ms = datetime_to_ms(pairing.expires_at);
+        sqlx::query(
+            "INSERT INTO channel_pairing_requests \
+             (pairing_id, channel_id, code_hash, claim_policy, sender_ref, conversation_ref, thread_ref, requested_profile, status, label, max_claims, claim_count, created_at_ms, expires_at_ms, claimed_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, 'pending', ?8, ?9, 0, ?10, ?11, NULL, ?10)",
+        )
+        .bind(pairing_id.to_string())
+        .bind(pairing.channel_id)
+        .bind(pairing.code_hash)
+        .bind(PAIRING_CLAIM_POLICY_TOKEN_CLAIM)
+        .bind(pairing.conversation_ref)
+        .bind(pairing.thread_ref)
+        .bind(pairing.requested_profile.as_str())
+        .bind(pairing.label)
+        .bind(i64::from(pairing.max_claims))
+        .bind(now)
+        .bind(expires_at_ms)
+        .execute(&mut **tx)
+        .await
+        .context("failed to create token channel pairing request")?;
+
+        self.get_pairing_request_by_id_in_tx(tx, pairing_id)
+            .await?
+            .ok_or_else(|| anyhow!("channel token pairing disappeared after insert"))
+    }
+
+    pub(crate) async fn increment_pairing_claim_count_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        pairing_id: Uuid,
+    ) -> Result<Option<ChannelPairingRequestRecord>> {
+        let now = now_ms();
+        let changed = sqlx::query(
+            "UPDATE channel_pairing_requests \
+             SET claim_count = claim_count + 1, \
+                 status = CASE \
+                    WHEN claim_count + 1 >= max_claims THEN 'approved' \
+                    ELSE status \
+                 END, \
+                 claimed_at_ms = COALESCE(claimed_at_ms, ?2), \
+                 updated_at_ms = ?2 \
+             WHERE pairing_id = ?1 \
+               AND status = 'pending' \
+               AND claim_count < max_claims",
+        )
+        .bind(pairing_id.to_string())
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .context("failed to increment channel pairing claim count")?;
+
+        if changed.rows_affected() == 0 {
+            return Ok(None);
+        }
+        self.get_pairing_request_by_id_in_tx(tx, pairing_id).await
     }
 
     pub(crate) async fn insert_or_update_grant_in_tx(
@@ -999,7 +1166,7 @@ impl ChannelStateStore {
         row.map(map_grant_row).transpose()
     }
 
-    async fn get_grant_by_scope_in_tx(
+    pub(crate) async fn get_grant_by_scope_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
         channel_id: &str,
@@ -1042,16 +1209,17 @@ impl ChannelStateStore {
             "SELECT pairing_id, channel_id, code_hash, claim_policy, sender_ref, conversation_ref, thread_ref, requested_profile, status, label, max_claims, claim_count, created_at_ms, expires_at_ms, claimed_at_ms, updated_at_ms \
              FROM channel_pairing_requests \
              WHERE channel_id = ?1 \
-               AND claim_policy = 'operator_approval' \
-               AND COALESCE(sender_ref, '') = COALESCE(?2, '') \
-               AND COALESCE(conversation_ref, '') = COALESCE(?3, '') \
-               AND COALESCE(thread_ref, '') = COALESCE(?4, '') \
-               AND requested_profile = ?5 \
+               AND claim_policy = ?2 \
+               AND COALESCE(sender_ref, '') = COALESCE(?3, '') \
+               AND COALESCE(conversation_ref, '') = COALESCE(?4, '') \
+               AND COALESCE(thread_ref, '') = COALESCE(?5, '') \
+               AND requested_profile = ?6 \
                AND status = 'pending' \
              ORDER BY updated_at_ms DESC \
              LIMIT 1",
         )
         .bind(channel_id)
+        .bind(PAIRING_CLAIM_POLICY_OPERATOR_APPROVAL)
         .bind(sender_ref)
         .bind(conversation_ref)
         .bind(thread_ref)
