@@ -82,7 +82,7 @@ class LionClawApi:
 
     @property
     def session_key(self) -> str:
-        return f"channel:{self.channel_id}:direct:{self.peer_id}"
+        return f"channel:{self.channel_id}:direct:{_encode_session_key_part(self.peer_id)}"
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -254,6 +254,10 @@ def _parse_session_open_result(payload: dict[str, Any] | None) -> SessionOpenRes
         trust_tier=payload["trust_tier"],
         history_policy=payload["history_policy"],
     )
+
+
+def _encode_session_key_part(value: str) -> str:
+    return value.replace("%", "%25").replace(":", "%3A")
 
 
 def _raise_for_status(response: httpx.Response) -> None:

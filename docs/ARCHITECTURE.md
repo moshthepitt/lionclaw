@@ -382,6 +382,8 @@ through scoped grants, and derives deterministic session keys such as
 `channel:<channel_id>:direct:<sender_ref>`. Worker-supplied runtime selection is
 not part of the inbound channel contract; the kernel resolves runtime execution
 from the instance/default runtime configuration.
+Session-key components escape `:` and `%` so provider refs such as
+`telegram:chat:-123` remain unambiguous.
 
 Kernel bootstrap converts stale `running` session turns into durable
 `interrupted` turns before they can be reused.

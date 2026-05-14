@@ -144,6 +144,44 @@ pub struct ChannelInboundEventRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NewChannelInboundEvent<'a> {
+    pub event_id: &'a str,
+    pub channel_id: &'a str,
+    pub sender_ref: &'a str,
+    pub conversation_ref: &'a str,
+    pub thread_ref: Option<&'a str>,
+    pub message_ref: Option<&'a str>,
+    pub trigger: ChannelTrigger,
+    pub attachments: &'a [ChannelAttachmentDescriptor],
+    pub reply_to_ref: Option<&'a str>,
+    pub provider_metadata: &'a Value,
+    pub received_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ChannelGrantUpsert<'a> {
+    pub channel_id: &'a str,
+    pub sender_ref: Option<&'a str>,
+    pub conversation_ref: Option<&'a str>,
+    pub thread_ref: Option<&'a str>,
+    pub routing_profile: ChannelRoutingProfile,
+    pub trust_tier: TrustTier,
+    pub status: ChannelGrantStatus,
+    pub label: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NewChannelTurn<'a> {
+    pub turn_id: Uuid,
+    pub channel_id: &'a str,
+    pub session_key: &'a str,
+    pub session_id: Uuid,
+    pub inbound_event_id: &'a str,
+    pub runtime_id: &'a str,
+    pub status: ChannelTurnStatus,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChannelStreamEventRecord {
     pub sequence: i64,
@@ -309,25 +347,15 @@ impl ChannelStateStore {
         &self.pool
     }
 
-    pub async fn insert_inbound_event(
+    pub(crate) async fn insert_inbound_event(
         &self,
-        event_id: &str,
-        channel_id: &str,
-        sender_ref: &str,
-        conversation_ref: &str,
-        thread_ref: Option<&str>,
-        message_ref: Option<&str>,
-        trigger: ChannelTrigger,
-        attachments: &[ChannelAttachmentDescriptor],
-        reply_to_ref: Option<&str>,
-        provider_metadata: &Value,
-        received_at: DateTime<Utc>,
+        event: NewChannelInboundEvent<'_>,
     ) -> Result<Option<ChannelInboundEventRecord>> {
-        let attachments_json = serde_json::to_string(attachments)
+        let attachments_json = serde_json::to_string(event.attachments)
             .context("failed to encode attachment descriptors")?;
-        let provider_metadata_json = serde_json::to_string(provider_metadata)
+        let provider_metadata_json = serde_json::to_string(event.provider_metadata)
             .context("failed to encode provider metadata")?;
-        let received_at_ms = datetime_to_ms(received_at);
+        let received_at_ms = datetime_to_ms(event.received_at);
         let created_at_ms = now_ms();
 
         let result = sqlx::query(
@@ -335,15 +363,15 @@ impl ChannelStateStore {
              (event_id, channel_id, sender_ref, conversation_ref, thread_ref, message_ref, trigger, attachments_json, reply_to_ref, provider_metadata_json, received_at_ms, created_at_ms) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
-        .bind(event_id)
-        .bind(channel_id)
-        .bind(sender_ref)
-        .bind(conversation_ref)
-        .bind(thread_ref)
-        .bind(message_ref)
-        .bind(trigger.as_str())
+        .bind(event.event_id)
+        .bind(event.channel_id)
+        .bind(event.sender_ref)
+        .bind(event.conversation_ref)
+        .bind(event.thread_ref)
+        .bind(event.message_ref)
+        .bind(event.trigger.as_str())
         .bind(attachments_json)
-        .bind(reply_to_ref)
+        .bind(event.reply_to_ref)
         .bind(provider_metadata_json)
         .bind(received_at_ms)
         .bind(created_at_ms)
@@ -355,7 +383,8 @@ impl ChannelStateStore {
                 if done.rows_affected() == 0 {
                     return Ok(None);
                 }
-                self.get_inbound_event(channel_id, event_id).await
+                self.get_inbound_event(event.channel_id, event.event_id)
+                    .await
             }
             Err(err) => {
                 if let sqlx::Error::Database(db_err) = &err {
@@ -685,28 +714,21 @@ impl ChannelStateStore {
     pub(crate) async fn insert_or_update_grant_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
-        channel_id: &str,
-        sender_ref: Option<&str>,
-        conversation_ref: Option<&str>,
-        thread_ref: Option<&str>,
-        routing_profile: ChannelRoutingProfile,
-        trust_tier: TrustTier,
-        status: ChannelGrantStatus,
-        label: Option<&str>,
+        grant: ChannelGrantUpsert<'_>,
     ) -> Result<ChannelGrantRecord> {
         let now = now_ms();
         if let Some(existing) = self
             .get_grant_by_scope_in_tx(
                 tx,
-                channel_id,
-                sender_ref,
-                conversation_ref,
-                thread_ref,
-                routing_profile,
+                grant.channel_id,
+                grant.sender_ref,
+                grant.conversation_ref,
+                grant.thread_ref,
+                grant.routing_profile,
             )
             .await?
         {
-            let revoked_at = if status == ChannelGrantStatus::Revoked {
+            let revoked_at = if grant.status == ChannelGrantStatus::Revoked {
                 Some(now)
             } else {
                 None
@@ -717,9 +739,9 @@ impl ChannelStateStore {
                  WHERE grant_id = ?1",
             )
             .bind(existing.grant_id.to_string())
-            .bind(trust_tier.as_str())
-            .bind(status.as_str())
-            .bind(label)
+            .bind(grant.trust_tier.as_str())
+            .bind(grant.status.as_str())
+            .bind(grant.label)
             .bind(now)
             .bind(revoked_at)
             .execute(&mut **tx)
@@ -732,7 +754,7 @@ impl ChannelStateStore {
         }
 
         let grant_id = Uuid::new_v4();
-        let revoked_at = if status == ChannelGrantStatus::Revoked {
+        let revoked_at = if grant.status == ChannelGrantStatus::Revoked {
             Some(now)
         } else {
             None
@@ -743,14 +765,14 @@ impl ChannelStateStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11)",
         )
         .bind(grant_id.to_string())
-        .bind(channel_id)
-        .bind(sender_ref)
-        .bind(conversation_ref)
-        .bind(thread_ref)
-        .bind(routing_profile.as_str())
-        .bind(trust_tier.as_str())
-        .bind(status.as_str())
-        .bind(label)
+        .bind(grant.channel_id)
+        .bind(grant.sender_ref)
+        .bind(grant.conversation_ref)
+        .bind(grant.thread_ref)
+        .bind(grant.routing_profile.as_str())
+        .bind(grant.trust_tier.as_str())
+        .bind(grant.status.as_str())
+        .bind(grant.label)
         .bind(now)
         .bind(revoked_at)
         .execute(&mut **tx)
@@ -1338,49 +1360,10 @@ impl ChannelStateStore {
         Ok(changed.rows_affected() > 0)
     }
 
-    pub async fn enqueue_turn(
-        &self,
-        turn_id: Uuid,
-        channel_id: &str,
-        session_key: &str,
-        session_id: Uuid,
-        inbound_event_id: &str,
-        runtime_id: &str,
-        status: ChannelTurnStatus,
-    ) -> Result<ChannelTurnRecord> {
-        let queued_at_ms = now_ms();
-        sqlx::query(
-            "INSERT INTO channel_turns \
-             (turn_id, channel_id, session_key, session_id, inbound_event_id, runtime_id, status, last_error, answer_checkpoint_sequence, queued_at_ms, started_at_ms, finished_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, NULL, NULL)",
-        )
-        .bind(turn_id.to_string())
-        .bind(channel_id)
-        .bind(session_key)
-        .bind(session_id.to_string())
-        .bind(inbound_event_id)
-        .bind(runtime_id)
-        .bind(status.as_str())
-        .bind(queued_at_ms)
-        .execute(&self.pool)
-        .await
-        .context("failed to enqueue channel turn")?;
-
-        self.get_turn(turn_id)
-            .await?
-            .ok_or_else(|| anyhow!("channel turn disappeared immediately after enqueue"))
-    }
-
-    pub async fn enqueue_turn_in_tx(
+    pub(crate) async fn enqueue_turn_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
-        turn_id: Uuid,
-        channel_id: &str,
-        session_key: &str,
-        session_id: Uuid,
-        inbound_event_id: &str,
-        runtime_id: &str,
-        status: ChannelTurnStatus,
+        turn: NewChannelTurn<'_>,
     ) -> Result<()> {
         let queued_at_ms = now_ms();
         sqlx::query(
@@ -1388,13 +1371,13 @@ impl ChannelStateStore {
              (turn_id, channel_id, session_key, session_id, inbound_event_id, runtime_id, status, last_error, answer_checkpoint_sequence, queued_at_ms, started_at_ms, finished_at_ms) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, NULL, NULL)",
         )
-        .bind(turn_id.to_string())
-        .bind(channel_id)
-        .bind(session_key)
-        .bind(session_id.to_string())
-        .bind(inbound_event_id)
-        .bind(runtime_id)
-        .bind(status.as_str())
+        .bind(turn.turn_id.to_string())
+        .bind(turn.channel_id)
+        .bind(turn.session_key)
+        .bind(turn.session_id.to_string())
+        .bind(turn.inbound_event_id)
+        .bind(turn.runtime_id)
+        .bind(turn.status.as_str())
         .bind(queued_at_ms)
         .execute(&mut **tx)
         .await
@@ -1596,9 +1579,8 @@ impl ChannelStateStore {
             let count_raw: i64 = row.get("count");
             let count = u64::try_from(count_raw)
                 .with_context(|| format!("invalid channel pairing count '{count_raw}'"))?;
-            match status.as_str() {
-                "pending" => pending_peer_count = count,
-                _ => {}
+            if status.as_str() == "pending" {
+                pending_peer_count = count;
             }
         }
 

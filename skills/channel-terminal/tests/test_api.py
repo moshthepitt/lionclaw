@@ -7,6 +7,24 @@ from lionclaw_channel_terminal.api import LionClawApi
 
 
 class TerminalApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_session_key_escapes_provider_shaped_peer_ref(self):
+        api = LionClawApi(
+            base_url="http://lionclaw.test",
+            channel_id="terminal",
+            peer_id="telegram:user:%456",
+            consumer_id="interactive:test",
+            start_mode="tail",
+            stream_limit=50,
+            stream_wait_ms=0,
+        )
+        try:
+            self.assertEqual(
+                api.session_key,
+                "channel:terminal:direct:telegram%3Auser%3A%25456",
+            )
+        finally:
+            await api.close()
+
     async def test_send_inbound_reuses_event_id_after_transport_failure(self):
         seen_event_ids: list[str] = []
 
