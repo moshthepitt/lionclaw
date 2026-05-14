@@ -195,7 +195,7 @@ impl SessionTurnStore {
         self.get(turn_id).await
     }
 
-    pub async fn interrupt_running_turns(
+    pub async fn interrupt_running_turns_without_pending_channel_turns(
         &self,
         reason: &str,
     ) -> Result<Vec<InterruptedSessionTurn>> {
@@ -210,6 +210,11 @@ impl SessionTurnStore {
             "SELECT turn_id, session_id \
              FROM session_turns \
              WHERE status = ?1 \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM channel_turns \
+                 WHERE channel_turns.turn_id = session_turns.turn_id \
+                   AND channel_turns.status = 'pending' \
+               ) \
              ORDER BY started_at_ms ASC, turn_id ASC",
         )
         .bind(SessionTurnStatus::Running.as_str())
@@ -220,7 +225,12 @@ impl SessionTurnStore {
         sqlx::query(
             "UPDATE session_turns \
              SET status = ?1, error_code = ?2, error_text = ?3, finished_at_ms = ?4 \
-             WHERE status = ?5",
+             WHERE status = ?5 \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM channel_turns \
+                 WHERE channel_turns.turn_id = session_turns.turn_id \
+                   AND channel_turns.status = 'pending' \
+               )",
         )
         .bind(SessionTurnStatus::Interrupted.as_str())
         .bind("runtime.interrupted")

@@ -315,6 +315,12 @@ pub struct ChannelTurnRecord {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct PendingChannelTurnWorker {
+    pub channel_id: String,
+    pub session_key: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ChannelStateStore {
     pool: SqlitePool,
 }
@@ -1298,43 +1304,95 @@ impl ChannelStateStore {
         channel_id: &str,
         session_key: &str,
     ) -> Result<Option<ChannelTurnRecord>> {
-        let row = sqlx::query(
-            "SELECT turn_id \
-             FROM channel_turns \
-             WHERE channel_id = ?1 AND session_key = ?2 AND status = 'pending' \
-             ORDER BY queued_at_ms ASC \
-             LIMIT 1",
-        )
-        .bind(channel_id)
-        .bind(session_key)
-        .fetch_optional(&self.pool)
-        .await
-        .context("failed to select pending channel turn")?;
+        loop {
+            let mut tx = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("failed to start pending channel turn claim transaction")?;
+            let row = sqlx::query(
+                "SELECT channel_turns.turn_id, session_turns.status AS session_status \
+                 FROM channel_turns \
+                 LEFT JOIN session_turns ON session_turns.turn_id = channel_turns.turn_id \
+                 WHERE channel_turns.channel_id = ?1 \
+                   AND channel_turns.session_key = ?2 \
+                   AND channel_turns.status = 'pending' \
+                 ORDER BY channel_turns.queued_at_ms ASC \
+                 LIMIT 1",
+            )
+            .bind(channel_id)
+            .bind(session_key)
+            .fetch_optional(&mut *tx)
+            .await
+            .context("failed to select pending channel turn")?;
 
-        let Some(row) = row else {
-            return Ok(None);
-        };
+            let Some(row) = row else {
+                tx.commit()
+                    .await
+                    .context("failed to commit empty channel turn claim transaction")?;
+                return Ok(None);
+            };
 
-        let turn_id_raw: String = row.get("turn_id");
-        let started_at_ms = now_ms();
-        let changed = sqlx::query(
-            "UPDATE channel_turns \
-             SET status = 'running', started_at_ms = ?2, last_error = NULL, answer_checkpoint_sequence = NULL \
-             WHERE turn_id = ?1 AND status = 'pending'",
-        )
-        .bind(&turn_id_raw)
-        .bind(started_at_ms)
-        .execute(&self.pool)
-        .await
-        .context("failed to claim pending channel turn")?;
+            let turn_id_raw: String = row.get("turn_id");
+            let session_status: Option<String> = row.get("session_status");
+            if !matches!(
+                session_status.as_deref(),
+                Some("running") | Some("interrupted")
+            ) {
+                let finished_at_ms = now_ms();
+                sqlx::query(
+                    "UPDATE channel_turns \
+                     SET status = 'failed', last_error = ?2, finished_at_ms = ?3 \
+                     WHERE turn_id = ?1 AND status = 'pending'",
+                )
+                .bind(&turn_id_raw)
+                .bind("queued session turn is no longer runnable")
+                .bind(finished_at_ms)
+                .execute(&mut *tx)
+                .await
+                .context("failed to fail unrunnable pending channel turn")?;
+                tx.commit()
+                    .await
+                    .context("failed to commit unrunnable channel turn claim transaction")?;
+                continue;
+            }
 
-        if changed.rows_affected() == 0 {
-            return Ok(None);
+            let started_at_ms = now_ms();
+            sqlx::query(
+                "UPDATE session_turns \
+                 SET status = 'running', error_code = NULL, error_text = NULL, finished_at_ms = NULL \
+                 WHERE turn_id = ?1 AND status IN ('running', 'interrupted')",
+            )
+            .bind(&turn_id_raw)
+            .execute(&mut *tx)
+            .await
+            .context("failed to recover pending channel session turn")?;
+
+            let changed = sqlx::query(
+                "UPDATE channel_turns \
+                 SET status = 'running', started_at_ms = ?2, last_error = NULL, answer_checkpoint_sequence = NULL \
+                 WHERE turn_id = ?1 AND status = 'pending'",
+            )
+            .bind(&turn_id_raw)
+            .bind(started_at_ms)
+            .execute(&mut *tx)
+            .await
+            .context("failed to claim pending channel turn")?;
+
+            if changed.rows_affected() == 0 {
+                tx.commit()
+                    .await
+                    .context("failed to commit raced channel turn claim transaction")?;
+                continue;
+            }
+
+            tx.commit()
+                .await
+                .context("failed to commit channel turn claim transaction")?;
+            let turn_id = Uuid::parse_str(&turn_id_raw)
+                .with_context(|| format!("invalid claimed turn id '{turn_id_raw}'"))?;
+            return self.get_turn(turn_id).await;
         }
-
-        let turn_id = Uuid::parse_str(&turn_id_raw)
-            .with_context(|| format!("invalid claimed turn id '{turn_id_raw}'"))?;
-        self.get_turn(turn_id).await
     }
 
     pub async fn complete_turn(&self, turn_id: Uuid) -> Result<bool> {
@@ -1384,6 +1442,27 @@ impl ChannelStateStore {
         .context("failed to fail stale running channel turns")?;
 
         Ok(changed.rows_affected())
+    }
+
+    pub(crate) async fn pending_turn_workers(&self) -> Result<Vec<PendingChannelTurnWorker>> {
+        let rows = sqlx::query(
+            "SELECT channel_id, session_key, MIN(queued_at_ms) AS first_queued_at_ms \
+             FROM channel_turns \
+             WHERE status = 'pending' \
+             GROUP BY channel_id, session_key \
+             ORDER BY first_queued_at_ms ASC, channel_id ASC, session_key ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to query pending channel turn workers")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| PendingChannelTurnWorker {
+                channel_id: row.get("channel_id"),
+                session_key: row.get("session_key"),
+            })
+            .collect())
     }
 
     pub async fn has_pending_turns(&self, channel_id: &str, session_key: &str) -> Result<bool> {

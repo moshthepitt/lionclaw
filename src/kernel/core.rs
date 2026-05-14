@@ -384,7 +384,11 @@ impl Kernel {
             }
         }
         let reason = "turn interrupted by kernel restart";
-        if let Ok(interrupted_turns) = self.session_turns.interrupt_running_turns(reason).await {
+        if let Ok(interrupted_turns) = self
+            .session_turns
+            .interrupt_running_turns_without_pending_channel_turns(reason)
+            .await
+        {
             for turn in &interrupted_turns {
                 if let Err(err) = self.sessions.record_turn(turn.session_id).await {
                     warn!(?err, session_id = %turn.session_id, "failed to touch interrupted session");
@@ -412,6 +416,7 @@ impl Kernel {
                 "failed to reconcile running channel turns during bootstrap"
             );
         }
+        self.ensure_pending_channel_turn_workers().await;
         if let Err(err) = self
             .jobs
             .interrupt_running_runs("scheduled job interrupted by kernel restart")
@@ -1739,24 +1744,34 @@ impl Kernel {
         tx.commit().await.map_err(|err| internal(err.into()))?;
 
         if !waiting_for_attachments {
-            let stream_context = self
+            match self
                 .channel_stream_context_for_session(
                     session.session_id,
                     &inbound.channel_id,
                     &session_key,
                     turn_id,
                 )
-                .await?;
-            if let Some(stream_context) = &stream_context {
-                self.emit_runtime_event(
-                    &Some(stream_context.clone()),
-                    &None,
-                    RuntimeEvent::Status {
-                        code: Some("queue.queued".to_string()),
-                        text: "queued".to_string(),
-                    },
-                )
-                .await?;
+                .await
+            {
+                Ok(Some(stream_context)) => {
+                    if let Err(err) = self
+                        .emit_runtime_event(
+                            &Some(stream_context),
+                            &None,
+                            RuntimeEvent::Status {
+                                code: Some("queue.queued".to_string()),
+                                text: "queued".to_string(),
+                            },
+                        )
+                        .await
+                    {
+                        warn!(?err, %turn_id, "failed to emit queued channel turn status");
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(?err, %turn_id, "failed to resolve queued channel turn stream context");
+                }
             }
             self.ensure_channel_turn_worker(&inbound.channel_id, &session_key)
                 .await;
@@ -7012,6 +7027,24 @@ impl Kernel {
                 .drain_channel_turns_for_session_key(worker_key, channel_id, session_key)
                 .await;
         });
+    }
+
+    async fn ensure_pending_channel_turn_workers(&self) {
+        let workers = match self.channel_state.pending_turn_workers().await {
+            Ok(workers) => workers,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "failed to load pending channel turns during bootstrap"
+                );
+                return;
+            }
+        };
+
+        for worker in workers {
+            self.ensure_channel_turn_worker(&worker.channel_id, &worker.session_key)
+                .await;
+        }
     }
 
     async fn drain_channel_turns_for_session_key(
