@@ -5,11 +5,12 @@ use common::{write_skill_source, TestHome};
 use lionclaw::{
     contracts::{
         ChannelAttachmentDescriptor, ChannelInboundOutcome, ChannelInboundRequest,
-        ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelStreamAckRequest,
-        ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamStartMode, ChannelTrigger,
-        SessionActionKind, SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest,
-        SessionLatestQuery, SessionOpenRequest, SessionTurnKind, SessionTurnRequest,
-        SessionTurnStatus, StreamEventKindDto, StreamLaneDto, TrustTier,
+        ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingStatus,
+        ChannelStreamAckRequest, ChannelStreamEventView, ChannelStreamPullRequest,
+        ChannelStreamStartMode, ChannelTrigger, SessionActionKind, SessionActionRequest,
+        SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest,
+        SessionTurnKind, SessionTurnRequest, SessionTurnStatus, StreamEventKindDto, StreamLaneDto,
+        TrustTier,
     },
     kernel::{
         runtime::{
@@ -676,6 +677,114 @@ async fn channels_v2_pending_pairing_hashes_code_and_rejects_runtime_id() {
         event.details["reason_code"].as_str() == Some("accepted")
             && event.details["event_id"].as_str() == Some("event-2")
     }));
+}
+
+#[tokio::test]
+async fn channels_v2_block_by_scope_closes_matching_pending_pairing() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "slack", "v2-scope-block-skill").await;
+    let kernel = env.kernel().await;
+
+    let pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "slack",
+            "scope-block-pending",
+            "mallory",
+            "room-1",
+            Some("topic-a"),
+            "please approve this thread",
+            ChannelTrigger::ThreadContinuation,
+        ))
+        .await
+        .expect("create pending thread pairing");
+    assert_eq!(pending.outcome, ChannelInboundOutcome::PendingApproval);
+    let pairing_id = pending.pairing_id.expect("pairing id");
+    let pairing_code = pending.pairing_code.expect("pairing code");
+
+    let blocked = kernel
+        .block_channel_pairing(ChannelPairingBlockRequest {
+            channel_id: "slack".to_string(),
+            pairing_id: None,
+            sender_ref: Some("mallory".to_string()),
+            conversation_ref: Some("room-1".to_string()),
+            thread_ref: Some("topic-a".to_string()),
+            reason: Some("operator_blocked".to_string()),
+        })
+        .await
+        .expect("block pending scope");
+    assert_eq!(blocked.grant.status, "blocked");
+
+    let access_state = kernel
+        .list_channel_pairings(Some("slack".to_string()), None)
+        .await
+        .expect("list channel access state");
+    let listed_pairing = access_state
+        .pairings
+        .iter()
+        .find(|pairing| pairing.pairing_id == pairing_id)
+        .expect("blocked pairing listed");
+    assert_eq!(listed_pairing.status, ChannelPairingStatus::Blocked);
+    assert!(access_state.grants.iter().any(|grant| {
+        grant.status == "blocked"
+            && grant.sender_ref.as_deref() == Some("mallory")
+            && grant.conversation_ref.as_deref() == Some("room-1")
+            && grant.thread_ref.as_deref() == Some("topic-a")
+    }));
+
+    let pending_state = kernel
+        .list_channel_pairings(
+            Some("slack".to_string()),
+            Some(ChannelPairingStatus::Pending),
+        )
+        .await
+        .expect("list pending pairings");
+    assert!(
+        pending_state.pairings.is_empty(),
+        "blocked scope must not leave a stale pending approval"
+    );
+
+    let approve_by_id = kernel
+        .approve_channel_pairing(ChannelPairingApproveRequest {
+            channel_id: "slack".to_string(),
+            pairing_id: Some(pairing_id),
+            pairing_code: None,
+            routing_profile: None,
+            trust_tier: Some(TrustTier::Main),
+            label: None,
+        })
+        .await
+        .expect_err("blocked pairing id must not be approvable");
+    assert!(matches!(approve_by_id, KernelError::Conflict(message) if message.contains("blocked")));
+
+    let approve_by_code = kernel
+        .approve_channel_pairing(ChannelPairingApproveRequest {
+            channel_id: "slack".to_string(),
+            pairing_id: None,
+            pairing_code: Some(pairing_code),
+            routing_profile: None,
+            trust_tier: Some(TrustTier::Main),
+            label: None,
+        })
+        .await
+        .expect_err("blocked pairing code must not be approvable");
+    assert!(
+        matches!(approve_by_code, KernelError::Conflict(message) if message.contains("blocked"))
+    );
+
+    let inbound = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "slack",
+            "scope-block-after",
+            "mallory",
+            "room-1",
+            Some("topic-a"),
+            "still blocked",
+            ChannelTrigger::ThreadContinuation,
+        ))
+        .await
+        .expect("blocked inbound handled");
+    assert_eq!(inbound.outcome, ChannelInboundOutcome::Blocked);
+    assert_eq!(inbound.reason_code.as_deref(), Some("blocked_grant"));
 }
 
 #[tokio::test]

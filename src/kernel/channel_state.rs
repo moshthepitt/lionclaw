@@ -859,6 +859,72 @@ impl ChannelStateStore {
         self.get_pairing_request_by_id_in_tx(tx, pairing_id).await
     }
 
+    pub(crate) async fn mark_matching_pending_pairings_blocked_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        channel_id: &str,
+        sender_ref: Option<&str>,
+        conversation_ref: Option<&str>,
+        thread_ref: Option<&str>,
+        requested_profile: ChannelRoutingProfile,
+    ) -> Result<Vec<Uuid>> {
+        let rows = sqlx::query(
+            "SELECT pairing_id \
+             FROM channel_pairing_requests \
+             WHERE channel_id = ?1 \
+               AND claim_policy = 'operator_approval' \
+               AND COALESCE(sender_ref, '') = COALESCE(?2, '') \
+               AND COALESCE(conversation_ref, '') = COALESCE(?3, '') \
+               AND COALESCE(thread_ref, '') = COALESCE(?4, '') \
+               AND requested_profile = ?5 \
+               AND status = 'pending'",
+        )
+        .bind(channel_id)
+        .bind(sender_ref)
+        .bind(conversation_ref)
+        .bind(thread_ref)
+        .bind(requested_profile.as_str())
+        .fetch_all(&mut **tx)
+        .await
+        .context("failed to query pending channel pairings by scope")?;
+
+        let pairing_ids = rows
+            .into_iter()
+            .map(|row| {
+                let raw: String = row.get("pairing_id");
+                Uuid::parse_str(&raw).with_context(|| format!("invalid pairing_id '{raw}'"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if pairing_ids.is_empty() {
+            return Ok(pairing_ids);
+        }
+
+        let now = now_ms();
+        sqlx::query(
+            "UPDATE channel_pairing_requests \
+             SET status = 'blocked', updated_at_ms = ?6 \
+             WHERE channel_id = ?1 \
+               AND claim_policy = 'operator_approval' \
+               AND COALESCE(sender_ref, '') = COALESCE(?2, '') \
+               AND COALESCE(conversation_ref, '') = COALESCE(?3, '') \
+               AND COALESCE(thread_ref, '') = COALESCE(?4, '') \
+               AND requested_profile = ?5 \
+               AND status = 'pending'",
+        )
+        .bind(channel_id)
+        .bind(sender_ref)
+        .bind(conversation_ref)
+        .bind(thread_ref)
+        .bind(requested_profile.as_str())
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .context("failed to block pending channel pairings by scope")?;
+
+        Ok(pairing_ids)
+    }
+
     pub async fn revoke_grant(
         &self,
         channel_id: &str,
