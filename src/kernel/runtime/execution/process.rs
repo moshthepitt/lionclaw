@@ -186,6 +186,10 @@ impl ProcessSession {
 
     pub async fn wait(mut self) -> Result<ProcessOutput> {
         self.close_stdin().await?;
+        self.stdout_reader
+            .read_to_end(&mut self.captured_stdout)
+            .await
+            .context("failed to read remaining subprocess stdout")?;
         let status = self
             .child
             .wait()
@@ -303,7 +307,7 @@ async fn spawn_with_retry(
 
 #[cfg(test)]
 mod tests {
-    use super::ProcessInvocation;
+    use super::{spawn_process_session, ProcessInvocation};
 
     #[test]
     fn process_invocation_debug_redacts_environment_and_input_values() {
@@ -321,5 +325,29 @@ mod tests {
         assert!(debug.contains("environment_count"));
         assert!(!debug.contains("ghp_secret"));
         assert!(!debug.contains("sensitive stdin"));
+    }
+
+    #[tokio::test]
+    async fn process_session_wait_drains_stdout_written_after_stdin_closes() {
+        let session = spawn_process_session(&ProcessInvocation {
+            executable: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "cat >/dev/null; printf 'tail-after-close\\n'".to_string(),
+            ],
+            working_dir: None,
+            environment: Vec::new(),
+            input: String::new(),
+        })
+        .await
+        .expect("spawn session");
+
+        let output = session.wait().await.expect("wait");
+
+        assert!(output.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("stdout"),
+            "tail-after-close\n"
+        );
     }
 }

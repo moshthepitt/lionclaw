@@ -311,8 +311,12 @@ impl CodexRuntimeAdapter {
                 thread_state,
             )
             .await?;
-        let thread_id = extract_app_server_thread_id(&response)
-            .ok_or_else(|| anyhow!("codex app-server thread/start response missing thread id"))?;
+        let thread_id = match extract_app_server_thread_id(&response) {
+            Some(thread_id) => thread_id,
+            None => self.current_thread_id(runtime_session_id)?.ok_or_else(|| {
+                anyhow!("codex app-server thread/start response missing thread id")
+            })?,
+        };
         thread_state.persist_thread_id(&thread_id)?;
         Ok(thread_id)
     }
@@ -768,23 +772,21 @@ where
             .cloned()
             .context("codex app-server request missing id")?;
         let method = message.get("method").and_then(Value::as_str).unwrap_or("");
-        let response = match method {
+        let message = match method {
             "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-                json!({
-                    "id": id,
-                    "result": {
-                        "decision": "accept",
-                    },
-                })
+                format!(
+                    "LionClaw does not grant runtime-internal approval callback '{method}'; runtime permissions are controlled by LionClaw policy"
+                )
             }
-            _ => json!({
-                "id": id,
-                "error": {
-                    "code": -32601,
-                    "message": format!("unsupported LionClaw app-server callback '{method}'"),
-                },
-            }),
+            _ => format!("unsupported LionClaw app-server callback '{method}'"),
         };
+        let response = json!({
+            "id": id,
+            "error": {
+                "code": -32601,
+                "message": message,
+            },
+        });
         self.transport.send(&response).await
     }
 }
@@ -820,9 +822,7 @@ fn thread_start_params(model: Option<&str>) -> Value {
         "approvalPolicy": "never",
         "threadSource": "user",
     });
-    if let Some(model) = model {
-        params["model"] = json!(model);
-    }
+    insert_optional_model(&mut params, model);
     params
 }
 
@@ -831,9 +831,7 @@ fn thread_resume_params(thread_id: &str, model: Option<&str>) -> Value {
         "threadId": thread_id,
         "approvalPolicy": "never",
     });
-    if let Some(model) = model {
-        params["model"] = json!(model);
-    }
+    insert_optional_model(&mut params, model);
     params
 }
 
@@ -860,10 +858,18 @@ fn turn_start_params(
             },
         },
     });
-    if let Some(model) = model {
-        params["model"] = json!(model);
-    }
+    insert_optional_model(&mut params, model);
     params
+}
+
+fn insert_optional_model(params: &mut Value, model: Option<&str>) {
+    let Some(model) = model else {
+        return;
+    };
+    let Some(params) = params.as_object_mut() else {
+        return;
+    };
+    params.insert("model".to_string(), json!(model));
 }
 
 fn review_target_from_arguments(arguments: &str) -> Value {
@@ -1210,7 +1216,8 @@ mod tests {
         let thread_state = adapter.thread_state_for(&handle.runtime_session_id);
         let transport = FakeAppServerTransport::new(vec![
             json!({"id": 1, "result": {"serverInfo": {"name": "codex", "version": "test"}, "userAgent": "codex/test"}}),
-            json!({"id": 2, "result": {"thread": {"id": "thr_1"}}}),
+            json!({"method": "thread/started", "params": {"threadId": "thr_1"}}),
+            json!({"id": 2, "result": {}}),
             json!({"id": 3, "result": {"turn": {"id": "turn_1"}}}),
             json!({"method": "item/agentMessage/delta", "params": {"threadId": "thr_1", "turnId": "turn_1", "delta": "Hello"}}),
             json!({"method": "turn/completed", "params": {"threadId": "thr_1", "turnId": "turn_1"}}),
@@ -1285,7 +1292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_app_server_protocol_accepts_internal_approval_callbacks() {
+    async fn codex_app_server_protocol_rejects_internal_approval_callbacks() {
         let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig::default());
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
@@ -1323,7 +1330,11 @@ mod tests {
         let sent = sent.lock().expect("sent lock").clone();
         assert!(sent.iter().any(|message| {
             message.get("id").and_then(Value::as_str) == Some("approval-1")
-                && message.pointer("/result/decision").and_then(Value::as_str) == Some("accept")
+                && message.pointer("/error/code").and_then(Value::as_i64) == Some(-32601)
+                && message
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|message| message.contains("LionClaw policy"))
         }));
 
         adapter.close(&handle).await.expect("close");

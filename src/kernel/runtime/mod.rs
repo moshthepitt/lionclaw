@@ -198,12 +198,10 @@ impl RuntimeControlOutcome {
         }
     }
 
-    pub fn error_code(&self) -> Option<&str> {
+    pub fn failed_error_code(&self) -> Option<&str> {
         match self {
             Self::Failed { code, .. } => code.as_deref().or(Some("runtime.control.failed")),
-            Self::Unsupported { .. } => Some("runtime.control.unsupported"),
-            Self::InteractiveOnly { .. } => Some("runtime.control.interactive_only"),
-            Self::Handled { .. } => None,
+            Self::Handled { .. } | Self::Unsupported { .. } | Self::InteractiveOnly { .. } => None,
         }
     }
 }

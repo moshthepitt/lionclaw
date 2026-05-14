@@ -45,9 +45,14 @@ pub fn classify_input(raw: &str) -> ClassifiedInput {
         });
     }
 
+    let command_name = command_token.trim_start_matches('/');
+    if command_name.is_empty() {
+        return ClassifiedInput::Prompt(input.to_string());
+    }
+
     ClassifiedInput::RuntimeControl(RuntimeControlCommand {
         raw: input.to_string(),
-        command_name: command_token.trim_start_matches('/').to_string(),
+        command_name: command_name.to_string(),
         arguments: arguments.to_string(),
     })
 }
@@ -137,6 +142,10 @@ mod tests {
 
     #[test]
     fn classifies_path_like_slash_input_as_prompt() {
+        assert_eq!(
+            classify_input("/"),
+            ClassifiedInput::Prompt("/".to_string())
+        );
         assert_eq!(
             classify_input("/home/user/file.rs fix this"),
             ClassifiedInput::Prompt("/home/user/file.rs fix this".to_string())

@@ -4249,9 +4249,10 @@ fn runtime_control_turn_status(outcome: &RuntimeControlOutcome) -> SessionTurnSt
 fn runtime_control_outcome_event(outcome: &RuntimeControlOutcome) -> RuntimeEvent {
     match outcome {
         RuntimeControlOutcome::Failed { code, message } => RuntimeEvent::Error {
-            code: code
-                .clone()
-                .or_else(|| Some("runtime.control.failed".to_string())),
+            code: Some(
+                code.clone()
+                    .unwrap_or_else(|| "runtime.control.failed".to_string()),
+            ),
             text: message.clone(),
         },
         RuntimeControlOutcome::Handled { message } => RuntimeEvent::Status {
@@ -4507,6 +4508,35 @@ struct RuntimeTurnAbortExecution<'a> {
     timeout_ms: u64,
     reason: String,
     timeout_kind: &'a str,
+}
+
+struct RuntimeControlAbortExecution<'a> {
+    adapter: &'a dyn RuntimeAdapter,
+    handle: &'a RuntimeSessionHandle,
+    session_id: Uuid,
+    runtime_id: &'a str,
+    control_task: &'a mut tokio::task::JoinHandle<Result<RuntimeControlOutcome, anyhow::Error>>,
+    stream_context: &'a Option<ChannelStreamContext>,
+    event_sink: &'a Option<RuntimeEventSink>,
+    events: Vec<RuntimeEvent>,
+    timeout_ms: u64,
+    reason: String,
+    timeout_kind: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuntimeSessionCloseContext {
+    Turn,
+    Control,
+}
+
+impl RuntimeSessionCloseContext {
+    fn error_event(self) -> &'static str {
+        match self {
+            Self::Turn => "runtime.turn.close_error",
+            Self::Control => "runtime.control.close_error",
+        }
+    }
 }
 
 impl Kernel {
@@ -4766,6 +4796,7 @@ impl Kernel {
                         &runtime_id,
                         session.session_id,
                         &handle,
+                        RuntimeSessionCloseContext::Turn,
                     )
                     .await
                 {
@@ -4842,6 +4873,7 @@ impl Kernel {
                 &runtime_id,
                 session.session_id,
                 &handle,
+                RuntimeSessionCloseContext::Turn,
             )
             .await;
         let runtime_events = match (runtime_events_result, close_result) {
@@ -5105,6 +5137,7 @@ impl Kernel {
                         &runtime_id,
                         session.session_id,
                         &handle,
+                        RuntimeSessionCloseContext::Control,
                     )
                     .await
                 {
@@ -5137,6 +5170,7 @@ impl Kernel {
                 &runtime_id,
                 session.session_id,
                 &handle,
+                RuntimeSessionCloseContext::Control,
             )
             .await;
         if let Err(err) = close_result {
@@ -5195,13 +5229,15 @@ impl Kernel {
         let error_code = if status == SessionTurnStatus::Failed {
             runtime_control
                 .outcome
-                .error_code()
+                .failed_error_code()
                 .map(str::to_string)
-                .or_else(|| Some("runtime.control.failed".to_string()))
         } else {
             None
         };
         let error_text = (status == SessionTurnStatus::Failed).then(|| assistant_text.clone());
+        if status == SessionTurnStatus::Failed {
+            self.clear_runtime_session_ready(&execution_plan).await;
+        }
 
         self.session_turns
             .complete_turn(
@@ -7039,19 +7075,19 @@ impl Kernel {
                         format_duration(idle_timeout)
                     );
                     return self
-                        .abort_runtime_control(
-                            adapter.as_ref(),
+                        .abort_runtime_control(RuntimeControlAbortExecution {
+                            adapter: adapter.as_ref(),
                             handle,
                             session_id,
                             runtime_id,
-                            &mut control_task,
-                            &stream_context,
-                            &event_sink,
-                            events.clone(),
-                            idle_timeout_ms,
+                            control_task: &mut control_task,
+                            stream_context: &stream_context,
+                            event_sink: &event_sink,
+                            events: events.clone(),
+                            timeout_ms: idle_timeout_ms,
                             reason,
-                            "idle",
-                        )
+                            timeout_kind: "idle",
+                        })
                         .await;
                 }
                 _ = &mut hard_sleep => {
@@ -7060,40 +7096,42 @@ impl Kernel {
                         format_duration(hard_timeout)
                     );
                     return self
-                        .abort_runtime_control(
-                            adapter.as_ref(),
+                        .abort_runtime_control(RuntimeControlAbortExecution {
+                            adapter: adapter.as_ref(),
                             handle,
                             session_id,
                             runtime_id,
-                            &mut control_task,
-                            &stream_context,
-                            &event_sink,
-                            events.clone(),
-                            hard_timeout_ms,
+                            control_task: &mut control_task,
+                            stream_context: &stream_context,
+                            event_sink: &event_sink,
+                            events: events.clone(),
+                            timeout_ms: hard_timeout_ms,
                             reason,
-                            "hard",
-                        )
+                            timeout_kind: "hard",
+                        })
                         .await;
                 }
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn abort_runtime_control(
         &self,
-        adapter: &(dyn RuntimeAdapter + Send + Sync),
-        handle: &RuntimeSessionHandle,
-        session_id: Uuid,
-        runtime_id: &str,
-        control_task: &mut tokio::task::JoinHandle<Result<RuntimeControlOutcome, anyhow::Error>>,
-        stream_context: &Option<ChannelStreamContext>,
-        event_sink: &Option<RuntimeEventSink>,
-        events: Vec<RuntimeEvent>,
-        timeout_ms: u64,
-        reason: String,
-        timeout_kind: &str,
+        execution: RuntimeControlAbortExecution<'_>,
     ) -> Result<CollectedRuntimeControl, FailedRuntimeTurn> {
+        let RuntimeControlAbortExecution {
+            adapter,
+            handle,
+            session_id,
+            runtime_id,
+            control_task,
+            stream_context,
+            event_sink,
+            events,
+            timeout_ms,
+            reason,
+            timeout_kind,
+        } = execution;
         if let Err(cancel_err) = adapter.cancel(handle, Some(reason.clone())).await {
             self.audit
                 .append(
@@ -7305,12 +7343,13 @@ impl Kernel {
         runtime_id: &str,
         session_id: uuid::Uuid,
         handle: &RuntimeSessionHandle,
+        context: RuntimeSessionCloseContext,
     ) -> Result<(), KernelError> {
         if let Err(err) = adapter.close(handle).await {
             let message = err.to_string();
             self.audit
                 .append(
-                    "runtime.turn.close_error",
+                    context.error_event(),
                     Some(session_id),
                     Some("kernel".to_string()),
                     json!({
