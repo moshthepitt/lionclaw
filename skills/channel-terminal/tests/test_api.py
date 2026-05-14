@@ -7,13 +7,14 @@ from lionclaw_channel_terminal.api import LionClawApi
 
 
 class TerminalApiTests(unittest.IsolatedAsyncioTestCase):
-    async def test_send_inbound_reuses_external_message_id_after_transport_failure(self):
-        seen_external_message_ids: list[str] = []
+    async def test_send_inbound_reuses_event_id_after_transport_failure(self):
+        seen_event_ids: list[str] = []
 
         async def handler(request: httpx.Request) -> httpx.Response:
             data = json.loads(request.content.decode())
-            seen_external_message_ids.append(data["external_message_id"])
-            if len(seen_external_message_ids) == 1:
+            seen_event_ids.append(data["event_id"])
+            self.assertNotIn("runtime_id", data)
+            if len(seen_event_ids) == 1:
                 raise httpx.TransportError("dropped response")
             return httpx.Response(
                 200,
@@ -30,7 +31,6 @@ class TerminalApiTests(unittest.IsolatedAsyncioTestCase):
             peer_id="mosh",
             consumer_id="interactive:test",
             start_mode="tail",
-            runtime_id=None,
             stream_limit=50,
             stream_wait_ms=0,
         )
@@ -49,7 +49,7 @@ class TerminalApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.outcome, "queued")
             await api.send_inbound("hello again")
             self.assertEqual(
-                seen_external_message_ids,
+                seen_event_ids,
                 [
                     "terminal-inbound:interactive:test:0",
                     "terminal-inbound:interactive:test:0",

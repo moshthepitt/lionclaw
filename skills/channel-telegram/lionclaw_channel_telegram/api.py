@@ -31,7 +31,6 @@ class LionClawApi:
         channel_id: str,
         consumer_id: str,
         start_mode: str,
-        runtime_id: str | None,
         stream_limit: int,
         stream_wait_ms: int,
         timeout_seconds: float = 35.0,
@@ -40,7 +39,6 @@ class LionClawApi:
         self.channel_id = channel_id
         self.consumer_id = consumer_id
         self.start_mode = start_mode
-        self.runtime_id = runtime_id
         self.stream_limit = stream_limit
         self.stream_wait_ms = stream_wait_ms
         self._client = client or httpx.AsyncClient(
@@ -54,13 +52,14 @@ class LionClawApi:
     async def send_inbound(self, update: TelegramTextUpdate) -> InboundResponse:
         payload: dict[str, Any] = {
             "channel_id": self.channel_id,
-            "peer_id": update.peer_id,
+            "event_id": f"telegram-update:{update.update_id}",
+            "sender_ref": update.peer_id,
+            "conversation_ref": update.peer_id,
             "text": update.text,
-            "update_id": update.update_id,
-            "external_message_id": f"telegram-update:{update.update_id}",
+            "attachments": [],
+            "trigger": "dm",
+            "provider_metadata": {"update_id": update.update_id},
         }
-        if self.runtime_id is not None:
-            payload["runtime_id"] = self.runtime_id
         response = await self._client.post("/v0/channels/inbound", json=payload)
         _raise_for_status(response)
         return InboundResponse(outcome=response.json()["outcome"])

@@ -35,7 +35,6 @@ LIONCLAW_HOME="${LIONCLAW_HOME:-$HOME/.lionclaw}"
 LIONCLAW_BASE_URL="${LIONCLAW_BASE_URL:-http://127.0.0.1:8979}"
 LIONCLAW_CHANNEL_ID="${LIONCLAW_CHANNEL_ID:-terminal}"
 LIONCLAW_PEER_ID="${LIONCLAW_PEER_ID:-$(default_peer_id)}"
-LIONCLAW_RUNTIME_ID="${LIONCLAW_RUNTIME_ID:-}"
 LIONCLAW_STREAM_LIMIT="${LIONCLAW_STREAM_LIMIT:-50}"
 LIONCLAW_STREAM_WAIT_MS="${LIONCLAW_STREAM_WAIT_MS:-30000}"
 LIONCLAW_STREAM_START_MODE="${LIONCLAW_STREAM_START_MODE:-tail}"
@@ -62,13 +61,13 @@ lionclaw_post() {
 }
 
 fetch_peer_json() {
-  local peers_json
-  peers_json="$(lionclaw_get '/v0/channels/peers' \
+  local pairings_json
+  pairings_json="$(lionclaw_get '/v0/channels/pairing' \
     --data-urlencode "channel_id=$LIONCLAW_CHANNEL_ID")" || return 1
 
   jq -c \
-    --arg peer_id "$LIONCLAW_PEER_ID" \
-    '.peers[]? | select(.peer_id == $peer_id)' <<<"$peers_json"
+    --arg sender_ref "$LIONCLAW_PEER_ID" \
+    '.pairings[]? | select(.sender_ref == $sender_ref and .requested_profile == "direct")' <<<"$pairings_json"
 }
 
 print_pairing_status() {
@@ -93,10 +92,10 @@ print_pairing_status() {
       echo "status: peer '$LIONCLAW_PEER_ID' is approved (trust_tier=$trust_tier)"
       ;;
     pending)
-      local pairing_code
-      pairing_code="$(jq -r '.pairing_code' <<<"$peer_json")"
+      local pairing_id
+      pairing_id="$(jq -r '.pairing_id' <<<"$peer_json")"
       echo "status: peer '$LIONCLAW_PEER_ID' is pending approval"
-      echo "approve: lionclaw channel pairing approve $LIONCLAW_CHANNEL_ID $LIONCLAW_PEER_ID $pairing_code --trust-tier main"
+      echo "approve: lionclaw channel pairing approve $LIONCLAW_CHANNEL_ID $pairing_id --trust-tier main"
       ;;
     blocked)
       echo "status: peer '$LIONCLAW_PEER_ID' is blocked on channel '$LIONCLAW_CHANNEL_ID'"
@@ -109,28 +108,29 @@ print_pairing_status() {
 
 send_inbound() {
   local text="$1"
-  local external_message_id
+  local event_id
   local payload
   local response
   local outcome
   local turn_id
 
-  external_message_id="terminal-inbound:$WORKER_INSTANCE_ID:$inbound_sequence"
+  event_id="terminal-inbound:$WORKER_INSTANCE_ID:$inbound_sequence"
   payload="$(jq -nc \
     --arg channel_id "$LIONCLAW_CHANNEL_ID" \
-    --arg peer_id "$LIONCLAW_PEER_ID" \
+    --arg event_id "$event_id" \
+    --arg sender_ref "$LIONCLAW_PEER_ID" \
+    --arg conversation_ref "$LIONCLAW_PEER_ID" \
     --arg text "$text" \
-    --arg external_message_id "$external_message_id" \
-    --arg session_id "$LIONCLAW_SESSION_ID" \
-    --arg runtime_id "$LIONCLAW_RUNTIME_ID" \
     '{
       channel_id: $channel_id,
-      peer_id: $peer_id,
+      event_id: $event_id,
+      sender_ref: $sender_ref,
+      conversation_ref: $conversation_ref,
       text: $text,
-      external_message_id: $external_message_id
-    }
-    + (if $session_id == "" then {} else { session_id: $session_id } end)
-    + (if $runtime_id == "" then {} else { runtime_id: $runtime_id } end)'
+      attachments: [],
+      trigger: "dm",
+      provider_metadata: {source: "debug-worker"}
+    }'
   )"
 
   response="$(lionclaw_post '/v0/channels/inbound' "$payload")" || return 1
@@ -146,14 +146,20 @@ send_inbound() {
         print_status_message "queued" "queue.queued"
       fi
       ;;
-    pairing_pending)
+    pending_approval)
       print_status_message "pairing pending" "pairing.pending"
       ;;
     duplicate)
       print_status_message "duplicate inbound ignored" "queue.duplicate"
       ;;
-    peer_blocked)
-      print_error_message "peer is blocked" "peer_blocked"
+    blocked)
+      print_error_message "peer is blocked" "blocked"
+      ;;
+    trigger_ignored)
+      print_status_message "trigger ignored" "trigger_ignored"
+      ;;
+    waiting_for_attachments)
+      print_status_message "waiting for attachments" "waiting_for_attachments"
       ;;
     *)
       print_error_message "unexpected inbound outcome '$outcome'"

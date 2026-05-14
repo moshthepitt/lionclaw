@@ -16,7 +16,14 @@ from lionclaw_channel_telegram.telegram import (
 
 logger = logging.getLogger(__name__)
 
-EXPECTED_INBOUND_OUTCOMES = {"queued", "pairing_pending", "duplicate", "peer_blocked"}
+EXPECTED_INBOUND_OUTCOMES = {
+    "queued",
+    "waiting_for_attachments",
+    "duplicate",
+    "pending_approval",
+    "blocked",
+    "trigger_ignored",
+}
 TYPING_STATUS_CODES = {"queue.started", "runtime.started"}
 
 
@@ -216,7 +223,6 @@ async def run() -> None:
         channel_id=config.channel_id,
         consumer_id=config.consumer_id,
         start_mode=config.stream_start_mode,
-        runtime_id=config.runtime_id,
         stream_limit=config.stream_limit,
         stream_wait_ms=config.stream_wait_ms,
     )
