@@ -2,10 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -44,6 +46,19 @@ const CODEX_THREAD_ID_STATE_FILE: &str = ".lionclaw-codex-thread-id";
 struct CodexSessionState {
     runtime_state_root: Option<PathBuf>,
     thread_id: Option<String>,
+    active_turn: Option<ActiveCodexTurn>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveCodexTurn {
+    thread_id: String,
+    turn_id: String,
+    interrupt_tx: mpsc::UnboundedSender<CodexInterruptRequest>,
+}
+
+#[derive(Debug)]
+struct CodexInterruptRequest {
+    ack_tx: oneshot::Sender<Result<()>>,
 }
 
 #[derive(Clone)]
@@ -102,8 +117,16 @@ impl CodexRuntimeAdapter {
                 )
                 .await?;
             let turn_id = extract_app_server_turn_id(&response);
+            let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
             client
-                .wait_for_turn_completed(turn_id.as_deref(), &events, &thread_state)
+                .wait_for_turn_completed(
+                    turn_id.as_deref(),
+                    Some(&thread_id),
+                    Some(interrupt_tx),
+                    &events,
+                    &thread_state,
+                    Some(&mut interrupt_rx),
+                )
                 .await?;
             Ok(RuntimeTurnResult::default())
         }
@@ -234,6 +257,7 @@ impl CodexRuntimeAdapter {
                     }
                 }
                 "compact" => {
+                    let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel();
                     client
                         .request(
                             "thread/compact/start",
@@ -245,7 +269,13 @@ impl CodexRuntimeAdapter {
                         )
                         .await?;
                     client
-                        .wait_for_thread_compacted(Some(&thread_id), &events, &thread_state)
+                        .wait_for_context_compaction_completed(
+                            &thread_id,
+                            interrupt_tx,
+                            &mut interrupt_rx,
+                            &events,
+                            &thread_state,
+                        )
                         .await?;
                     RuntimeControlOutcome::Handled {
                         message: "Compacted Codex thread.".to_string(),
@@ -387,6 +417,7 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
                 CodexSessionState {
                     runtime_state_root: input.runtime_state_root,
                     thread_id,
+                    active_turn: None,
                 },
             );
 
@@ -427,8 +458,42 @@ impl RuntimeAdapter for CodexRuntimeAdapter {
         Ok(())
     }
 
-    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
-        Ok(())
+    async fn cancel(&self, handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        let active_turn = self
+            .session_state(&handle.runtime_session_id)
+            .ok()
+            .and_then(|state| state.active_turn);
+        let Some(active_turn) = active_turn else {
+            return Ok(());
+        };
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        active_turn
+            .interrupt_tx
+            .send(CodexInterruptRequest { ack_tx })
+            .map_err(|_| {
+                anyhow!(
+                    "codex turn interrupt channel closed before turn/interrupt for {}",
+                    active_turn.turn_id
+                )
+            })?;
+
+        tokio::time::timeout(Duration::from_secs(5), ack_rx)
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "timed out waiting for codex turn/interrupt acknowledgement for {}/{}",
+                    active_turn.thread_id,
+                    active_turn.turn_id
+                )
+            })?
+            .map_err(|_| {
+                anyhow!(
+                    "codex turn interrupt task dropped acknowledgement for {}/{}",
+                    active_turn.thread_id,
+                    active_turn.turn_id
+                )
+            })?
     }
 
     async fn close(&self, handle: &RuntimeSessionHandle) -> Result<()> {
@@ -510,11 +575,13 @@ struct CodexAppServerClient<T> {
     transport: T,
     next_id: u64,
     completed_turns: HashSet<String>,
+    completed_turn_threads: HashSet<String>,
     unmatched_turn_completed: bool,
     failed_turns: HashMap<String, String>,
     unmatched_turn_failure: Option<String>,
-    compacted_threads: HashSet<String>,
-    unmatched_thread_compacted: bool,
+    started_thread_turns: HashMap<String, String>,
+    completed_context_compaction_threads: HashSet<String>,
+    unmatched_context_compaction_completed: bool,
 }
 
 impl<T> CodexAppServerClient<T>
@@ -526,11 +593,13 @@ where
             transport,
             next_id: 1,
             completed_turns: HashSet::new(),
+            completed_turn_threads: HashSet::new(),
             unmatched_turn_completed: false,
             failed_turns: HashMap::new(),
             unmatched_turn_failure: None,
-            compacted_threads: HashSet::new(),
-            unmatched_thread_compacted: false,
+            started_thread_turns: HashMap::new(),
+            completed_context_compaction_threads: HashSet::new(),
+            unmatched_context_compaction_completed: false,
         }
     }
 
@@ -593,54 +662,198 @@ where
     async fn wait_for_turn_completed(
         &mut self,
         turn_id: Option<&str>,
+        thread_id: Option<&str>,
+        interrupt_tx: Option<mpsc::UnboundedSender<CodexInterruptRequest>>,
         events: &RuntimeEventSender,
         thread_state: &CodexThreadState,
+        mut interrupt_rx: Option<&mut mpsc::UnboundedReceiver<CodexInterruptRequest>>,
     ) -> Result<()> {
         if let Some(message) = self.turn_failure(turn_id) {
             bail!("{message}");
         }
-        if self.turn_completed(turn_id) {
-            return Ok(());
-        }
-
-        loop {
-            let Some(message) = self.transport.recv().await? else {
-                bail!("codex app-server closed before turn completed");
-            };
-            self.handle_message(message, events, thread_state).await?;
-            if let Some(message) = self.turn_failure(turn_id) {
-                bail!("{message}");
-            }
-            if self.turn_completed(turn_id) {
+        let mut registered_turn_id = None;
+        let result = async {
+            self.register_active_wait_turn(
+                thread_id,
+                turn_id,
+                interrupt_tx.as_ref(),
+                &mut registered_turn_id,
+                thread_state,
+            )?;
+            if self.wait_turn_completed(turn_id, thread_id) {
                 return Ok(());
             }
+
+            loop {
+                if let Some(interrupt_rx) = interrupt_rx.as_mut() {
+                    tokio::select! {
+                        message = self.transport.recv() => {
+                            let Some(message) = message? else {
+                                bail!("codex app-server closed before turn completed");
+                            };
+                            self.handle_message(message, events, thread_state).await?;
+                        }
+                        interrupt = interrupt_rx.recv() => {
+                            if let Some(interrupt) = interrupt {
+                                self.handle_turn_interrupt(
+                                    thread_id,
+                                    registered_turn_id.as_deref().or(turn_id),
+                                    interrupt,
+                                    events,
+                                    thread_state,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                } else {
+                    let Some(message) = self.transport.recv().await? else {
+                        bail!("codex app-server closed before turn completed");
+                    };
+                    self.handle_message(message, events, thread_state).await?;
+                }
+                self.register_active_wait_turn(
+                    thread_id,
+                    turn_id,
+                    interrupt_tx.as_ref(),
+                    &mut registered_turn_id,
+                    thread_state,
+                )?;
+                if let Some(message) = self.turn_failure(turn_id) {
+                    bail!("{message}");
+                }
+                if self.wait_turn_completed(turn_id, thread_id) {
+                    return Ok(());
+                }
+            }
         }
+        .await;
+
+        if let (Some(thread_id), Some(turn_id)) = (thread_id, registered_turn_id.as_deref()) {
+            thread_state.clear_active_turn(thread_id, turn_id)?;
+        }
+        result
     }
 
-    async fn wait_for_thread_compacted(
+    async fn wait_for_context_compaction_completed(
         &mut self,
-        thread_id: Option<&str>,
+        thread_id: &str,
+        interrupt_tx: mpsc::UnboundedSender<CodexInterruptRequest>,
+        interrupt_rx: &mut mpsc::UnboundedReceiver<CodexInterruptRequest>,
         events: &RuntimeEventSender,
         thread_state: &CodexThreadState,
     ) -> Result<()> {
         if let Some(message) = self.turn_failure(None) {
             bail!("{message}");
         }
-        if self.thread_compacted(thread_id) {
+        if self.context_compaction_completed(thread_id) && self.thread_turn_completed(thread_id) {
             return Ok(());
         }
 
+        let mut registered_turn_id = None;
+        let result = async {
+            self.register_active_wait_turn(
+                Some(thread_id),
+                None,
+                Some(&interrupt_tx),
+                &mut registered_turn_id,
+                thread_state,
+            )?;
+            loop {
+                tokio::select! {
+                    message = self.transport.recv() => {
+                        let Some(message) = message? else {
+                            bail!("codex app-server closed before context compaction completed");
+                        };
+                        self.handle_message(message, events, thread_state).await?;
+                    }
+                    interrupt = interrupt_rx.recv() => {
+                        if let Some(interrupt) = interrupt {
+                            self.handle_turn_interrupt(
+                                Some(thread_id),
+                                registered_turn_id.as_deref(),
+                                interrupt,
+                                events,
+                                thread_state,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                self.register_active_wait_turn(
+                    Some(thread_id),
+                    None,
+                    Some(&interrupt_tx),
+                    &mut registered_turn_id,
+                    thread_state,
+                )?;
+                if let Some(message) = self.turn_failure(None) {
+                    bail!("{message}");
+                }
+                if self.context_compaction_completed(thread_id)
+                    && self.thread_turn_completed(thread_id)
+                {
+                    return Ok(());
+                }
+            }
+        }
+        .await;
+
+        if let Some(turn_id) = registered_turn_id.as_deref() {
+            thread_state.clear_active_turn(thread_id, turn_id)?;
+        }
+        result
+    }
+
+    async fn handle_turn_interrupt(
+        &mut self,
+        thread_id: Option<&str>,
+        turn_id: Option<&str>,
+        interrupt: CodexInterruptRequest,
+        events: &RuntimeEventSender,
+        thread_state: &CodexThreadState,
+    ) {
+        let result = match (thread_id, turn_id) {
+            (Some(thread_id), Some(turn_id)) => {
+                self.interrupt_turn(thread_id, turn_id, events, thread_state)
+                    .await
+            }
+            _ => Err(anyhow!(
+                "codex turn/interrupt requested before app-server reported an active turn id"
+            )),
+        };
+        drop(interrupt.ack_tx.send(result));
+    }
+
+    async fn interrupt_turn(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        events: &RuntimeEventSender,
+        thread_state: &CodexThreadState,
+    ) -> Result<()> {
+        let method = "turn/interrupt";
+        let id = self.next_request_id();
+        self.transport
+            .send(&app_server_request_message(
+                id,
+                method,
+                json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                }),
+            ))
+            .await?;
+
         loop {
             let Some(message) = self.transport.recv().await? else {
-                bail!("codex app-server closed before thread compacted");
+                bail!("codex app-server closed before responding to {method}");
             };
-            self.handle_message(message, events, thread_state).await?;
-            if let Some(message) = self.turn_failure(None) {
-                bail!("{message}");
-            }
-            if self.thread_compacted(thread_id) {
+            if response_id(&message).is_some_and(|response_id| response_id == id) {
+                parse_app_server_response(message, method)?;
                 return Ok(());
             }
+            self.handle_message(message, events, thread_state).await?;
         }
     }
 
@@ -661,6 +874,44 @@ where
             }
             None => self.unmatched_turn_completed || !self.completed_turns.is_empty(),
         }
+    }
+
+    fn wait_turn_completed(&self, turn_id: Option<&str>, thread_id: Option<&str>) -> bool {
+        match (turn_id, thread_id) {
+            (Some(turn_id), _) => self.turn_completed(Some(turn_id)),
+            (None, Some(thread_id)) => self.thread_turn_completed(thread_id),
+            (None, None) => self.turn_completed(None),
+        }
+    }
+
+    fn thread_turn_completed(&self, thread_id: &str) -> bool {
+        self.unmatched_turn_completed || self.completed_turn_threads.contains(thread_id)
+    }
+
+    fn register_active_wait_turn(
+        &self,
+        thread_id: Option<&str>,
+        turn_id: Option<&str>,
+        interrupt_tx: Option<&mpsc::UnboundedSender<CodexInterruptRequest>>,
+        registered_turn_id: &mut Option<String>,
+        thread_state: &CodexThreadState,
+    ) -> Result<()> {
+        let (Some(thread_id), Some(interrupt_tx)) = (thread_id, interrupt_tx) else {
+            return Ok(());
+        };
+        if registered_turn_id.is_some() {
+            return Ok(());
+        }
+        let turn_id = turn_id
+            .map(str::to_string)
+            .or_else(|| self.started_thread_turns.get(thread_id).cloned());
+        let Some(turn_id) = turn_id else {
+            return Ok(());
+        };
+
+        thread_state.set_active_turn(thread_id, &turn_id, interrupt_tx.clone())?;
+        *registered_turn_id = Some(turn_id);
+        Ok(())
     }
 
     fn turn_failure(&self, turn_id: Option<&str>) -> Option<&str> {
@@ -685,13 +936,11 @@ where
         }
     }
 
-    fn thread_compacted(&self, thread_id: Option<&str>) -> bool {
-        match thread_id {
-            Some(thread_id) => {
-                self.unmatched_thread_compacted || self.compacted_threads.contains(thread_id)
-            }
-            None => self.unmatched_thread_compacted || !self.compacted_threads.is_empty(),
-        }
+    fn context_compaction_completed(&self, thread_id: &str) -> bool {
+        self.unmatched_context_compaction_completed
+            || self
+                .completed_context_compaction_threads
+                .contains(thread_id)
     }
 
     async fn handle_message(
@@ -725,18 +974,13 @@ where
                     text: "codex thread renamed".to_string(),
                 }));
             }
-            "thread/compacted" => {
-                if let Some(thread_id) = extract_app_server_thread_id(params) {
-                    self.compacted_threads.insert(thread_id);
-                } else {
-                    self.unmatched_thread_compacted = true;
-                }
-                drop(events.send(RuntimeEvent::Status {
-                    code: None,
-                    text: "codex thread compacted".to_string(),
-                }));
-            }
             "turn/started" => {
+                if let (Some(thread_id), Some(turn_id)) = (
+                    extract_app_server_thread_id(params),
+                    extract_app_server_turn_id(params),
+                ) {
+                    self.started_thread_turns.insert(thread_id, turn_id);
+                }
                 drop(events.send(RuntimeEvent::Status {
                     code: None,
                     text: "codex turn started".to_string(),
@@ -746,6 +990,9 @@ where
                 if let Some(message) = completed_turn_error_text(params) {
                     self.remember_turn_failure(params, message);
                 } else {
+                    if let Some(thread_id) = extract_app_server_thread_id(params) {
+                        self.completed_turn_threads.insert(thread_id);
+                    }
                     if let Some(turn_id) = extract_app_server_turn_id(params) {
                         self.completed_turns.insert(turn_id);
                     } else {
@@ -775,7 +1022,8 @@ where
                 }
             }
             "item/started" | "item/completed" | "item/updated" => {
-                if let Some(status) = describe_app_server_item(params) {
+                let status = self.record_app_server_item(method, params);
+                if let Some(status) = status {
                     drop(events.send(RuntimeEvent::Status {
                         code: None,
                         text: status,
@@ -796,6 +1044,24 @@ where
             _ => {}
         }
         Ok(())
+    }
+
+    fn record_app_server_item(&mut self, method: &str, params: &Value) -> Option<String> {
+        match (method, app_server_item_type(params)) {
+            ("item/started", Some("contextCompaction")) => {
+                Some("codex context compaction started".to_string())
+            }
+            ("item/completed", Some("contextCompaction")) => {
+                if let Some(thread_id) = extract_app_server_thread_id(params) {
+                    self.completed_context_compaction_threads.insert(thread_id);
+                } else {
+                    self.unmatched_context_compaction_completed = true;
+                }
+                Some("codex context compacted".to_string())
+            }
+            (_, Some(_)) => describe_app_server_item(params),
+            (_, None) => None,
+        }
     }
 
     async fn respond_to_server_request(&mut self, message: &Value) -> Result<()> {
@@ -900,7 +1166,6 @@ where
 fn thread_start_params(model: Option<&str>) -> Value {
     let mut params = json!({
         "approvalPolicy": "never",
-        "threadSource": "user",
     });
     insert_optional_model(&mut params, model);
     params
@@ -1001,9 +1266,11 @@ fn extract_app_server_thread_id(value: &Value) -> Option<String> {
     value
         .pointer("/thread/id")
         .and_then(Value::as_str)
+        .or_else(|| value.pointer("/turn/threadId").and_then(Value::as_str))
+        .or_else(|| value.pointer("/turn/thread/id").and_then(Value::as_str))
+        .or_else(|| value.pointer("/item/threadId").and_then(Value::as_str))
         .or_else(|| value.get("threadId").and_then(Value::as_str))
         .or_else(|| value.get("thread_id").and_then(Value::as_str))
-        .or_else(|| value.get("id").and_then(Value::as_str))
         .filter(|thread_id| !thread_id.trim().is_empty())
         .map(|thread_id| thread_id.trim().to_string())
 }
@@ -1012,11 +1279,16 @@ fn extract_app_server_turn_id(value: &Value) -> Option<String> {
     value
         .pointer("/turn/id")
         .and_then(Value::as_str)
+        .or_else(|| value.pointer("/item/turnId").and_then(Value::as_str))
         .or_else(|| value.get("turnId").and_then(Value::as_str))
         .or_else(|| value.get("turn_id").and_then(Value::as_str))
-        .or_else(|| value.get("id").and_then(Value::as_str))
         .filter(|turn_id| !turn_id.trim().is_empty())
         .map(|turn_id| turn_id.trim().to_string())
+}
+
+fn app_server_item_type(params: &Value) -> Option<&str> {
+    let item = params.get("item").unwrap_or(params);
+    item.get("type").and_then(Value::as_str)
 }
 
 fn app_server_text(value: &Value, keys: &[&str]) -> Option<String> {
@@ -1077,9 +1349,7 @@ fn error_notification_will_retry(params: &Value) -> bool {
 }
 
 fn describe_app_server_item(params: &Value) -> Option<String> {
-    let item = params.get("item").unwrap_or(params);
-    let item_type = item.get("type").and_then(Value::as_str)?;
-    match item_type {
+    match app_server_item_type(params)? {
         "enteredReviewMode" => Some("codex review started".to_string()),
         "exitedReviewMode" => Some("codex review completed".to_string()),
         other => Some(format!("codex item: {other}")),
@@ -1185,6 +1455,47 @@ fn runtime_session_is_ready(root: &Path) -> Result<bool> {
 }
 
 impl CodexThreadState {
+    fn set_active_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        interrupt_tx: mpsc::UnboundedSender<CodexInterruptRequest>,
+    ) -> Result<()> {
+        let mut sessions = self
+            .sessions
+            .write()
+            .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?;
+        let session = sessions
+            .get_mut(&self.runtime_session_id)
+            .ok_or_else(|| anyhow!("runtime session '{}' not found", self.runtime_session_id))?;
+        session.active_turn = Some(ActiveCodexTurn {
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.to_string(),
+            interrupt_tx,
+        });
+        drop(sessions);
+        Ok(())
+    }
+
+    fn clear_active_turn(&self, thread_id: &str, turn_id: &str) -> Result<()> {
+        let mut sessions = self
+            .sessions
+            .write()
+            .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?;
+        let Some(session) = sessions.get_mut(&self.runtime_session_id) else {
+            return Ok(());
+        };
+        if session
+            .active_turn
+            .as_ref()
+            .is_some_and(|active| active.thread_id == thread_id && active.turn_id == turn_id)
+        {
+            session.active_turn = None;
+        }
+        drop(sessions);
+        Ok(())
+    }
+
     fn persist_thread_id(&self, thread_id: &str) -> Result<()> {
         let root = self
             .sessions
@@ -1342,6 +1653,37 @@ mod tests {
 
     fn is_jsonrpc_message(message: &Value) -> bool {
         message.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+    }
+
+    fn codex_protocol_fixture(name: &str) -> Value {
+        let raw = match name {
+            "compact_context_compaction_v2" => include_str!(
+                "../../../../tests/fixtures/codex_app_server/compact_context_compaction_v2.json"
+            ),
+            "turn_interrupt_v2" => {
+                include_str!("../../../../tests/fixtures/codex_app_server/turn_interrupt_v2.json")
+            }
+            other => panic!("unknown Codex protocol fixture: {other}"),
+        };
+        serde_json::from_str(raw).expect("Codex protocol fixture is valid JSON")
+    }
+
+    fn fixture_server_messages(fixture: &Value) -> Vec<Value> {
+        fixture
+            .get("server")
+            .and_then(Value::as_array)
+            .expect("fixture server messages")
+            .clone()
+    }
+
+    fn fixture_client_request(fixture: &Value) -> (&str, Value) {
+        let client = fixture.get("client").expect("fixture client request");
+        let method = client
+            .get("method")
+            .and_then(Value::as_str)
+            .expect("fixture client method");
+        let params = client.get("params").cloned().unwrap_or(Value::Null);
+        (method, params)
     }
 
     #[async_trait]
@@ -1585,8 +1927,11 @@ mod tests {
         client
             .wait_for_turn_completed(
                 super::extract_app_server_turn_id(&response).as_deref(),
+                None,
+                None,
                 &event_tx,
                 &thread_state,
+                None,
             )
             .await
             .expect("turn completed");
@@ -1686,8 +2031,11 @@ mod tests {
         client
             .wait_for_turn_completed(
                 super::extract_app_server_turn_id(&response).as_deref(),
+                None,
+                None,
                 &event_tx,
                 &thread_state,
+                None,
             )
             .await
             .expect("id-less completion should complete the active turn");
@@ -1697,16 +2045,141 @@ mod tests {
             .iter()
             .any(|event| matches!(event, RuntimeEvent::Done)));
 
-        let transport = FakeAppServerTransport::new(vec![json!({
-            "method": "thread/compacted",
-            "params": {}
-        })]);
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_compaction_uses_context_compaction_contract_fixture() {
+        let fixture = codex_protocol_fixture("compact_context_compaction_v2");
+        let (method, params) = fixture_client_request(&fixture);
+        let (adapter, handle, thread_state) = start_codex_test_session(None).await;
+        let transport = FakeAppServerTransport::new(fixture_server_messages(&fixture));
+        let sent = transport.sent.clone();
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (interrupt_tx, mut interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        client
+            .request(method, params, &event_tx, &thread_state)
+            .await
+            .expect("compact start request");
+        client
+            .wait_for_context_compaction_completed(
+                "thr_1",
+                interrupt_tx,
+                &mut interrupt_rx,
+                &event_tx,
+                &thread_state,
+            )
+            .await
+            .expect("context compaction should complete through turn notifications");
+
+        let sent = sent.lock().expect("sent lock").clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["method"], "thread/compact/start");
+        assert_eq!(sent[0]["params"]["threadId"], "thr_1");
+
+        let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::Status { text, .. } if text == "codex context compacted"
+        )));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Done)));
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_turn_interrupt_uses_contract_fixture() {
+        let fixture = codex_protocol_fixture("turn_interrupt_v2");
+        let (adapter, handle, thread_state) = start_codex_test_session(None).await;
+        let transport = FakeAppServerTransport::new(fixture_server_messages(&fixture));
+        let sent = transport.sent.clone();
         let mut client = CodexAppServerClient::new(transport);
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+
         client
-            .wait_for_thread_compacted(Some("thr_1"), &event_tx, &thread_state)
+            .interrupt_turn("thr_1", "turn_1", &event_tx, &thread_state)
             .await
-            .expect("id-less compaction should complete the active compaction");
+            .expect("turn interrupt should accept interrupted terminal notification");
+
+        let (method, params) = fixture_client_request(&fixture);
+        let sent = sent.lock().expect("sent lock").clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["method"], method);
+        assert_eq!(sent[0]["params"], params);
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn codex_cancel_interrupts_active_app_server_turn() {
+        let (adapter, handle, thread_state) = start_codex_test_session(None).await;
+        let (interrupt_tx, mut interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+        thread_state
+            .set_active_turn("thr_1", "turn_1", interrupt_tx)
+            .expect("set active turn");
+
+        let wait_task = tokio::spawn(async move {
+            let request = interrupt_rx.recv().await.expect("interrupt request");
+            request.ack_tx.send(Ok(())).expect("ack interrupt");
+        });
+
+        adapter
+            .cancel(&handle, Some("test timeout".to_string()))
+            .await
+            .expect("cancel sends native Codex interrupt");
+        wait_task.await.expect("wait task joins");
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn codex_turn_started_notification_registers_active_cancel_target() {
+        let (adapter, handle, thread_state) = start_codex_test_session(None).await;
+        let transport = FakeAppServerTransport::new(Vec::new());
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (interrupt_tx, mut interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut registered_turn_id = None;
+
+        client
+            .handle_message(
+                json!({
+                    "method": "turn/started",
+                    "params": {
+                        "threadId": "thr_1",
+                        "turnId": "turn_1"
+                    }
+                }),
+                &event_tx,
+                &thread_state,
+            )
+            .await
+            .expect("turn started notification");
+        client
+            .register_active_wait_turn(
+                Some("thr_1"),
+                None,
+                Some(&interrupt_tx),
+                &mut registered_turn_id,
+                &thread_state,
+            )
+            .expect("register active wait turn");
+
+        assert_eq!(registered_turn_id.as_deref(), Some("turn_1"));
+        let wait_task = tokio::spawn(async move {
+            let request = interrupt_rx.recv().await.expect("interrupt request");
+            request.ack_tx.send(Ok(())).expect("ack interrupt");
+        });
+
+        adapter
+            .cancel(&handle, Some("test timeout".to_string()))
+            .await
+            .expect("cancel sends native Codex interrupt");
+        wait_task.await.expect("wait task joins");
 
         adapter.close(&handle).await.expect("close");
     }
@@ -1738,8 +2211,11 @@ mod tests {
         let err = client
             .wait_for_turn_completed(
                 super::extract_app_server_turn_id(&response).as_deref(),
+                None,
+                None,
                 &event_tx,
                 &thread_state,
+                None,
             )
             .await
             .expect_err("failed turn should be returned as an adapter error");
@@ -1777,8 +2253,11 @@ mod tests {
         let err = client
             .wait_for_turn_completed(
                 super::extract_app_server_turn_id(&response).as_deref(),
+                None,
+                None,
                 &event_tx,
                 &thread_state,
+                None,
             )
             .await
             .expect_err("unmatched terminal errors should fail a specific turn");
@@ -1827,8 +2306,11 @@ mod tests {
         client
             .wait_for_turn_completed(
                 super::extract_app_server_turn_id(&response).as_deref(),
+                None,
+                None,
                 &event_tx,
                 &thread_state,
+                None,
             )
             .await
             .expect("retryable error should not fail a completed turn");
@@ -1868,8 +2350,11 @@ mod tests {
         client
             .wait_for_turn_completed(
                 super::extract_app_server_turn_id(&response).as_deref(),
+                None,
+                None,
                 &event_tx,
                 &thread_state,
+                None,
             )
             .await
             .expect("turn completed");

@@ -1520,7 +1520,9 @@ while IFS= read -r line; do
       ;;
     *'"method":"thread/compact/start"'*)
       printf '%s\n' '{"id":3,"result":{"threadId":"thr_test"}}'
-      printf '%s\n' '{"method":"thread/compacted","params":{"threadId":"thr_test"}}'
+      printf '%s\n' '{"method":"turn/started","params":{"threadId":"thr_test","turnId":"turn_compact_test"}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"thr_test","turnId":"turn_compact_test","item":{"id":"item_compact_test","type":"contextCompaction"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thr_test","turnId":"turn_compact_test","turn":{"id":"turn_compact_test","status":"completed"}}}'
       ;;
   esac
 done
