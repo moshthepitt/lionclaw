@@ -293,7 +293,7 @@ CREATE TABLE session_turns_channels_v2 (
     turn_id TEXT PRIMARY KEY NOT NULL,
     session_id TEXT NOT NULL,
     sequence_no INTEGER NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('normal', 'retry', 'continue')),
+    kind TEXT NOT NULL CHECK (kind IN ('normal', 'retry', 'continue', 'runtime_control')),
     status TEXT NOT NULL CHECK (status IN ('running', 'waiting_for_attachments', 'completed', 'failed', 'timed_out', 'cancelled', 'interrupted')),
     display_user_text TEXT NOT NULL,
     prompt_user_text TEXT NOT NULL,

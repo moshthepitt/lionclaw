@@ -1459,22 +1459,26 @@ async fn channel_runtime_error_event_persists_failed_turn_and_supports_continue(
 async fn channel_inbound_first_column_slash_input_uses_runtime_control_route() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "terminal", "runtime-control-skill").await;
-    let kernel = env.kernel().await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
 
-    create_pending_peer(
+    create_pending_pairing(
         &kernel,
         "terminal",
         "peer-runtime-control",
-        "mock",
-        7451,
         "runtime-control-7451",
     )
     .await;
-    approve_peer(&kernel, "terminal", "peer-runtime-control").await;
+    approve_pairing(&kernel, "terminal", "peer-runtime-control").await;
+    let session_key = direct_session_key("terminal", "peer-runtime-control");
     let session = kernel
         .open_session(SessionOpenRequest {
             channel_id: "terminal".to_string(),
-            peer_id: "peer-runtime-control".to_string(),
+            peer_id: session_key,
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -1482,15 +1486,15 @@ async fn channel_inbound_first_column_slash_input_uses_runtime_control_route() {
         .expect("open interactive runtime-control session");
 
     let queued = kernel
-        .ingest_channel_inbound(ChannelInboundRequest {
-            channel_id: "terminal".to_string(),
-            peer_id: "peer-runtime-control".to_string(),
-            text: "/handled now".to_string(),
-            session_id: Some(session.session_id),
-            update_id: Some(7452),
-            external_message_id: Some("runtime-control-7452".to_string()),
-            runtime_id: Some("mock".to_string()),
-        })
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "runtime-control-7452",
+            "peer-runtime-control",
+            "peer-runtime-control",
+            None,
+            "/handled now",
+            ChannelTrigger::Dm,
+        ))
         .await
         .expect("queue runtime control");
     assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
@@ -1539,22 +1543,26 @@ async fn channel_inbound_first_column_slash_input_uses_runtime_control_route() {
 async fn channel_inbound_lionclaw_retry_uses_lionclaw_action_route() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "terminal", "lionclaw-action-skill").await;
-    let kernel = env.kernel().await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
 
-    create_pending_peer(
+    create_pending_pairing(
         &kernel,
         "terminal",
         "peer-lionclaw-action",
-        "mock",
-        7501,
         "lionclaw-action-7501",
     )
     .await;
-    approve_peer(&kernel, "terminal", "peer-lionclaw-action").await;
+    approve_pairing(&kernel, "terminal", "peer-lionclaw-action").await;
+    let session_key = direct_session_key("terminal", "peer-lionclaw-action");
     let session = kernel
         .open_session(SessionOpenRequest {
             channel_id: "terminal".to_string(),
-            peer_id: "peer-lionclaw-action".to_string(),
+            peer_id: session_key,
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -1574,15 +1582,15 @@ async fn channel_inbound_lionclaw_retry_uses_lionclaw_action_route() {
         .expect("seed retry source");
 
     let queued = kernel
-        .ingest_channel_inbound(ChannelInboundRequest {
-            channel_id: "terminal".to_string(),
-            peer_id: "peer-lionclaw-action".to_string(),
-            text: "/lionclaw retry".to_string(),
-            session_id: Some(session.session_id),
-            update_id: Some(7502),
-            external_message_id: Some("lionclaw-action-7502".to_string()),
-            runtime_id: Some("mock".to_string()),
-        })
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "lionclaw-action-7502",
+            "peer-lionclaw-action",
+            "peer-lionclaw-action",
+            None,
+            "/lionclaw retry",
+            ChannelTrigger::Dm,
+        ))
         .await
         .expect("queue LionClaw retry");
     assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
@@ -1622,25 +1630,158 @@ async fn channel_inbound_lionclaw_retry_uses_lionclaw_action_route() {
 }
 
 #[tokio::test]
-async fn channel_inbound_bare_retry_stays_runtime_owned() {
+async fn channel_inbound_lionclaw_reset_completes_queued_turn() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "bare-runtime-skill").await;
-    let kernel = env.kernel().await;
+    install_and_bind_channel(&env, "terminal", "lionclaw-reset-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
 
-    create_pending_peer(
+    create_pending_pairing(
         &kernel,
         "terminal",
-        "peer-bare-runtime",
-        "mock",
-        7551,
-        "bare-runtime-7551",
+        "peer-lionclaw-reset",
+        "lionclaw-reset-7521",
     )
     .await;
-    approve_peer(&kernel, "terminal", "peer-bare-runtime").await;
+    approve_pairing(&kernel, "terminal", "peer-lionclaw-reset").await;
+    let session_key = direct_session_key("terminal", "peer-lionclaw-reset");
     let session = kernel
         .open_session(SessionOpenRequest {
             channel_id: "terminal".to_string(),
-            peer_id: "peer-bare-runtime".to_string(),
+            peer_id: session_key,
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open interactive reset session");
+
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "lionclaw-reset-7522",
+            "peer-lionclaw-reset",
+            "peer-lionclaw-reset",
+            None,
+            "/lionclaw reset",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue LionClaw reset");
+    assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
+    let queued_turn_id = queued.turn_id.expect("queued turn id");
+
+    wait_for_latest_turn(
+        &kernel,
+        session.session_id,
+        |turn| {
+            turn.turn_id == queued_turn_id
+                && turn.status == SessionTurnStatus::Completed
+                && turn.display_user_text == "/lionclaw reset"
+                && turn.prompt_user_text.is_empty()
+                && turn.assistant_text.starts_with("opened a fresh session: ")
+        },
+        "completed channel LionClaw reset",
+    )
+    .await;
+
+    let stream = wait_for_stream_events(&kernel, "terminal", "terminal-lionclaw-reset", |events| {
+        events.iter().any(|event| {
+            event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::TurnCompleted
+        })
+    })
+    .await;
+    assert_turn_completed_before_done(&stream.events, queued_turn_id, "channel LionClaw reset");
+}
+
+#[tokio::test]
+async fn channel_inbound_unknown_lionclaw_command_does_not_become_runtime_prompt() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "lionclaw-unknown-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    create_pending_pairing(
+        &kernel,
+        "terminal",
+        "peer-lionclaw-unknown",
+        "lionclaw-unknown-7531",
+    )
+    .await;
+    approve_pairing(&kernel, "terminal", "peer-lionclaw-unknown").await;
+    let session_key = direct_session_key("terminal", "peer-lionclaw-unknown");
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: session_key,
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open interactive unknown-command session");
+
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "lionclaw-unknown-7532",
+            "peer-lionclaw-unknown",
+            "peer-lionclaw-unknown",
+            None,
+            "/lionclaw frobnicate",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue unknown LionClaw command");
+    assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
+    let queued_turn_id = queued.turn_id.expect("queued turn id");
+
+    wait_for_latest_turn(
+        &kernel,
+        session.session_id,
+        |turn| {
+            turn.turn_id == queued_turn_id
+                && turn.status == SessionTurnStatus::Failed
+                && turn.display_user_text == "/lionclaw frobnicate"
+                && turn.prompt_user_text.is_empty()
+                && turn.error_text.as_deref()
+                    == Some("bad request: unknown LionClaw command: frobnicate")
+        },
+        "failed unknown channel LionClaw command",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn channel_inbound_bare_retry_stays_runtime_owned() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "bare-runtime-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    create_pending_pairing(
+        &kernel,
+        "terminal",
+        "peer-bare-runtime",
+        "bare-runtime-7551",
+    )
+    .await;
+    approve_pairing(&kernel, "terminal", "peer-bare-runtime").await;
+    let session_key = direct_session_key("terminal", "peer-bare-runtime");
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: session_key,
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -1648,15 +1789,15 @@ async fn channel_inbound_bare_retry_stays_runtime_owned() {
         .expect("open interactive runtime-owned session");
 
     let queued = kernel
-        .ingest_channel_inbound(ChannelInboundRequest {
-            channel_id: "terminal".to_string(),
-            peer_id: "peer-bare-runtime".to_string(),
-            text: "/retry".to_string(),
-            session_id: Some(session.session_id),
-            update_id: Some(7552),
-            external_message_id: Some("bare-runtime-7552".to_string()),
-            runtime_id: Some("mock".to_string()),
-        })
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "bare-runtime-7552",
+            "peer-bare-runtime",
+            "peer-bare-runtime",
+            None,
+            "/retry",
+            ChannelTrigger::Dm,
+        ))
         .await
         .expect("queue bare runtime control");
     assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
