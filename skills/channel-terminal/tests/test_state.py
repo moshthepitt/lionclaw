@@ -585,7 +585,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(app.state.input_disabled())
 
-    async def test_submit_text_lets_inbound_select_session_for_approved_peer(self):
+    async def test_submit_text_opens_interactive_session_for_approved_peer(self):
         app = _make_app()
         api = _InteractiveApi()
         app.api = api
@@ -595,8 +595,8 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
         accepted = await app.submit_text("hello")
 
         self.assertTrue(accepted)
-        self.assertEqual(api.open_calls, 0)
-        self.assertIsNone(api.sent_session_id)
+        self.assertEqual(api.open_calls, 1)
+        self.assertEqual(api.sent_session_id, "session-opened")
         self.assertEqual(app.state.active_session_id, "session-1")
 
     async def test_reset_swaps_to_fresh_session_and_clears_history(self):
@@ -734,7 +734,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("lionclaw> restored answer", app.state.transcript_text())
         self.assertEqual(app.state.activity_text(), "[status] peer approved")
 
-    async def test_submit_text_does_not_block_on_failed_restore(self):
+    async def test_submit_text_opens_interactive_session_without_blocking_on_restore(self):
         app = _make_app()
         api = _FailingRestoreApi()
         app.api = api
@@ -745,8 +745,9 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(accepted)
         self.assertEqual(api.fetch_latest_calls, 0)
-        self.assertEqual(api.open_calls, 0)
+        self.assertEqual(api.open_calls, 1)
         self.assertEqual(api.sent_text, "hello")
+        self.assertEqual(api.sent_session_id, "session-opened")
         self.assertEqual(app.state.active_session_id, "session-1")
 
 

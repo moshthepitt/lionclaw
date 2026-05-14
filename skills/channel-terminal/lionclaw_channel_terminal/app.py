@@ -320,7 +320,11 @@ class TerminalChannelApp(App[None]):
         return True
 
     async def ensure_interactive_session_for_send(self) -> str | None:
-        return self.state.active_session_id
+        if self.state.active_session_id is not None:
+            return self.state.active_session_id
+        if self.state.pairing.status == "approved":
+            return await self.open_interactive_session()
+        return None
 
     async def open_interactive_session(self) -> str | None:
         if self.state.pairing.status != "approved":

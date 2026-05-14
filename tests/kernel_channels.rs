@@ -756,6 +756,147 @@ async fn channels_v2_admission_rolls_back_dedupe_when_turn_cannot_be_queued() {
 }
 
 #[tokio::test]
+async fn channels_v2_migration_uses_legacy_message_id_for_event_identity() {
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(":memory:")
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("connect in-memory migration db");
+
+    sqlx::raw_sql(
+        r#"
+        CREATE TABLE sessions (
+            session_id TEXT PRIMARY KEY NOT NULL,
+            channel_id TEXT NOT NULL,
+            peer_id TEXT NOT NULL,
+            project_scope TEXT NOT NULL,
+            trust_tier TEXT NOT NULL CHECK (trust_tier IN ('main', 'untrusted')),
+            history_policy TEXT NOT NULL CHECK (history_policy IN ('interactive', 'conservative')),
+            created_at_ms INTEGER NOT NULL,
+            last_turn_at_ms INTEGER,
+            last_activity_at_ms INTEGER,
+            turn_count INTEGER NOT NULL
+        );
+
+        CREATE TABLE channel_peers (
+            channel_id TEXT NOT NULL,
+            peer_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'blocked')),
+            trust_tier TEXT NOT NULL CHECK (trust_tier IN ('main', 'untrusted')),
+            pairing_code TEXT NOT NULL,
+            first_seen_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (channel_id, peer_id)
+        );
+
+        CREATE TABLE channel_messages (
+            message_id TEXT PRIMARY KEY NOT NULL,
+            channel_id TEXT NOT NULL,
+            peer_id TEXT NOT NULL,
+            direction TEXT NOT NULL CHECK (direction IN ('inbound', 'outbound')),
+            external_message_id TEXT,
+            update_id INTEGER,
+            content TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TABLE session_turns (
+            turn_id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL,
+            sequence_no INTEGER NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('normal', 'retry', 'continue', 'runtime_control')),
+            status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'timed_out', 'cancelled', 'interrupted')),
+            display_user_text TEXT NOT NULL,
+            prompt_user_text TEXT NOT NULL,
+            assistant_text TEXT NOT NULL,
+            error_code TEXT,
+            error_text TEXT,
+            runtime_id TEXT NOT NULL,
+            started_at_ms INTEGER NOT NULL,
+            finished_at_ms INTEGER,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+            UNIQUE (session_id, sequence_no)
+        );
+
+        CREATE TABLE channel_turns (
+            turn_id TEXT PRIMARY KEY,
+            channel_id TEXT NOT NULL,
+            peer_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            inbound_message_id TEXT NOT NULL UNIQUE,
+            runtime_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+            last_error TEXT,
+            queued_at_ms INTEGER NOT NULL,
+            started_at_ms INTEGER,
+            finished_at_ms INTEGER,
+            answer_checkpoint_sequence INTEGER,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+            FOREIGN KEY (inbound_message_id) REFERENCES channel_messages(message_id) ON DELETE CASCADE
+        );
+
+        INSERT INTO sessions
+            (session_id, channel_id, peer_id, project_scope, trust_tier, history_policy, created_at_ms, last_turn_at_ms, last_activity_at_ms, turn_count)
+        VALUES
+            ('session-1', 'terminal', 'alice', 'project-test', 'main', 'interactive', 1000, 1002, 1002, 2);
+
+        INSERT INTO channel_peers
+            (channel_id, peer_id, status, trust_tier, pairing_code, first_seen_ms, updated_at_ms)
+        VALUES
+            ('terminal', 'alice', 'approved', 'main', 'raw-code', 1000, 1002);
+
+        INSERT INTO channel_messages
+            (message_id, channel_id, peer_id, direction, external_message_id, update_id, content, created_at_ms)
+        VALUES
+            ('message-a', 'terminal', 'alice', 'inbound', 'duplicate-provider-id', NULL, 'first prompt', 1001),
+            ('message-b', 'terminal', 'alice', 'inbound', 'duplicate-provider-id', NULL, 'second prompt', 1002);
+
+        INSERT INTO channel_turns
+            (turn_id, channel_id, peer_id, session_id, inbound_message_id, runtime_id, status, last_error, queued_at_ms, started_at_ms, finished_at_ms, answer_checkpoint_sequence)
+        VALUES
+            ('turn-a', 'terminal', 'alice', 'session-1', 'message-a', 'mock', 'completed', NULL, 1001, 1001, 1001, NULL),
+            ('turn-b', 'terminal', 'alice', 'session-1', 'message-b', 'mock', 'completed', NULL, 1002, 1002, 1002, NULL);
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("seed legacy v1 channel schema");
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/202605140002_channels_v2_core.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("run channels v2 migration");
+
+    let event_ids = sqlx::query_scalar::<_, String>(
+        "SELECT event_id FROM channel_inbound_events ORDER BY event_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("query migrated inbound events");
+    assert_eq!(
+        event_ids,
+        vec![
+            "v1-message:message-a".to_string(),
+            "v1-message:message-b".to_string(),
+        ]
+    );
+
+    let turn_event_ids = sqlx::query_scalar::<_, String>(
+        "SELECT inbound_event_id FROM channel_turns ORDER BY turn_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("query migrated channel turns");
+    assert_eq!(turn_event_ids, event_ids);
+}
+
+#[tokio::test]
 async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "slack", "v2-routing-skill").await;
@@ -1563,10 +1704,7 @@ async fn channel_inbound_first_column_slash_input_uses_runtime_control_route() {
                 .filter_map(|event| event.code.as_deref())
                 .collect::<Vec<_>>();
             codes.contains(&"queue.completed")
-                && events.iter().any(|event| {
-                    event.turn_id == Some(queued_turn_id)
-                        && event.kind == StreamEventKindDto::TurnCompleted
-                })
+                && stream_has_completed_and_done(events, queued_turn_id)
         })
         .await;
     assert_turn_completed_before_done(&stream.events, queued_turn_id, "channel runtime control");
@@ -1654,10 +1792,7 @@ async fn channel_inbound_lionclaw_retry_uses_lionclaw_action_route() {
 
     let stream =
         wait_for_stream_events(&kernel, "terminal", "terminal-lionclaw-action", |events| {
-            events.iter().any(|event| {
-                event.turn_id == Some(queued_turn_id)
-                    && event.kind == StreamEventKindDto::TurnCompleted
-            })
+            stream_has_completed_and_done(events, queued_turn_id)
         })
         .await;
     assert_turn_completed_before_done(&stream.events, queued_turn_id, "channel LionClaw retry");
@@ -1730,9 +1865,7 @@ async fn channel_inbound_lionclaw_reset_completes_queued_turn() {
     .await;
 
     let stream = wait_for_stream_events(&kernel, "terminal", "terminal-lionclaw-reset", |events| {
-        events.iter().any(|event| {
-            event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::TurnCompleted
-        })
+        stream_has_completed_and_done(events, queued_turn_id)
     })
     .await;
     assert_turn_completed_before_done(&stream.events, queued_turn_id, "channel LionClaw reset");
@@ -1994,6 +2127,14 @@ fn assert_turn_completed_before_done(
         "{context} should publish turn_completed before done"
     );
     (completed_position, done_position)
+}
+
+fn stream_has_completed_and_done(events: &[ChannelStreamEventView], turn_id: uuid::Uuid) -> bool {
+    events.iter().any(|event| {
+        event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::TurnCompleted
+    }) && events
+        .iter()
+        .any(|event| event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::Done)
 }
 
 fn assert_error_before_done(
