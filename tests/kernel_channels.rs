@@ -4,12 +4,12 @@ use async_trait::async_trait;
 use common::{write_skill_source, TestHome};
 use lionclaw::{
     contracts::{
-        ChannelInboundOutcome, ChannelInboundRequest, ChannelPairingApproveRequest,
-        ChannelPeerBlockRequest, ChannelStreamAckRequest, ChannelStreamEventView,
-        ChannelStreamPullRequest, ChannelStreamStartMode, ChannelTrigger, SessionActionKind,
-        SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery,
-        SessionOpenRequest, SessionTurnKind, SessionTurnRequest, SessionTurnStatus,
-        StreamEventKindDto, StreamLaneDto, TrustTier,
+        ChannelAttachmentDescriptor, ChannelInboundOutcome, ChannelInboundRequest,
+        ChannelPairingApproveRequest, ChannelPeerBlockRequest, ChannelStreamAckRequest,
+        ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamStartMode, ChannelTrigger,
+        SessionActionKind, SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest,
+        SessionLatestQuery, SessionOpenRequest, SessionTurnKind, SessionTurnRequest,
+        SessionTurnStatus, StreamEventKindDto, StreamLaneDto, TrustTier,
     },
     kernel::{
         runtime::{
@@ -516,6 +516,8 @@ async fn channels_v2_pending_pairing_hashes_code_and_rejects_runtime_id() {
     assert_eq!(pending.outcome, ChannelInboundOutcome::PendingApproval);
     let pairing_id = pending.pairing_id.expect("pairing id");
     let pairing_code = pending.pairing_code.expect("one-time pairing code");
+    assert!(pairing_code.starts_with("pc_"));
+    assert_eq!(pairing_code.len(), 23);
 
     let pairings = kernel
         .list_channel_pairings(Some("terminal".to_string()), None)
@@ -550,6 +552,21 @@ async fn channels_v2_pending_pairing_hashes_code_and_rejects_runtime_id() {
         .expect("duplicate v2 inbound");
     assert_eq!(duplicate.outcome, ChannelInboundOutcome::Duplicate);
     assert_eq!(duplicate.reason_code.as_deref(), Some("duplicate_event"));
+
+    let invalid_approve = kernel
+        .approve_channel_pairing(ChannelPairingApproveRequest {
+            channel_id: "terminal".to_string(),
+            pairing_id: Some(pairing_id),
+            pairing_code: Some(pairing_code.clone()),
+            routing_profile: None,
+            trust_tier: Some(TrustTier::Main),
+            label: None,
+        })
+        .await
+        .expect_err("approve must identify pairing by id or code, not both");
+    assert!(
+        matches!(invalid_approve, KernelError::BadRequest(message) if message.contains("exactly one"))
+    );
 
     let grant = kernel
         .approve_channel_pairing(ChannelPairingApproveRequest {
@@ -752,15 +769,7 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
 
     let waiting = kernel
         .ingest_channel_inbound(ChannelInboundRequest {
-            attachments: vec![lionclaw::contracts::ChannelAttachmentDescriptor {
-                attachment_id: "att-1".to_string(),
-                kind: "image".to_string(),
-                mime_type: Some("image/png".to_string()),
-                filename: Some("image.png".to_string()),
-                size_bytes: Some(12),
-                provider_file_ref: "provider-file-1".to_string(),
-                caption: None,
-            }],
+            attachments: vec![attachment_descriptor("att-1")],
             ..v2_text_request(
                 "slack",
                 "thread-attachment",
@@ -777,6 +786,29 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
         waiting.outcome,
         ChannelInboundOutcome::WaitingForAttachments
     );
+
+    let duplicate_attachment = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            attachments: vec![
+                attachment_descriptor("att-duplicate"),
+                attachment_descriptor(" att-duplicate "),
+            ],
+            ..v2_text_request(
+                "slack",
+                "thread-duplicate-attachment",
+                "bob",
+                "room-1",
+                Some("topic-b"),
+                "ambiguous image",
+                ChannelTrigger::ThreadContinuation,
+            )
+        })
+        .await
+        .expect_err("duplicate attachment ids must be rejected");
+    assert!(
+        matches!(duplicate_attachment, KernelError::BadRequest(message) if message.contains("duplicate attachment_id"))
+    );
+
     let waiting_turn_id = waiting.turn_id.expect("waiting turn id");
     sleep(Duration::from_millis(100)).await;
 
@@ -1584,6 +1616,18 @@ fn v2_text_request(
         trigger,
         received_at: None,
         provider_metadata: serde_json::json!({}),
+    }
+}
+
+fn attachment_descriptor(attachment_id: &str) -> ChannelAttachmentDescriptor {
+    ChannelAttachmentDescriptor {
+        attachment_id: attachment_id.to_string(),
+        kind: "image".to_string(),
+        mime_type: Some("image/png".to_string()),
+        filename: Some("image.png".to_string()),
+        size_bytes: Some(12),
+        provider_file_ref: "provider-file-1".to_string(),
+        caption: None,
     }
 }
 
