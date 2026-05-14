@@ -337,6 +337,7 @@ External channel skills integrate over HTTP:
    through a sequence.
 6. Pairing approve/block and grant revoke endpoints manage channel trust.
    Blocking a scope also closes matching pending pairing requests.
+   Blocks are enforced from the most-specific scope back to the direct sender.
 
 Queued channel turns emit machine-stable status/error codes through the same
 stream contract. Kernel-generated lifecycle codes include:

@@ -759,107 +759,60 @@ impl Kernel {
         channel_id: &str,
         scope: SessionKeyScope,
     ) -> Result<TrustTier, KernelError> {
-        let blocked = match &scope {
-            SessionKeyScope::Direct { sender_ref } => {
-                self.channel_state
-                    .get_grant_by_scope(
-                        channel_id,
-                        Some(sender_ref),
-                        None,
-                        None,
-                        ChannelRoutingProfile::Direct,
-                        ChannelGrantStatus::Blocked,
-                    )
-                    .await
-            }
-            SessionKeyScope::Conversation {
-                sender_ref,
-                conversation_ref,
-            } => {
-                self.channel_state
-                    .get_grant_by_scope(
-                        channel_id,
-                        Some(sender_ref),
-                        Some(conversation_ref),
-                        None,
-                        ChannelRoutingProfile::Conversation,
-                        ChannelGrantStatus::Blocked,
-                    )
-                    .await
-            }
-            SessionKeyScope::Thread {
-                sender_ref,
-                conversation_ref,
-                thread_ref,
-            } => {
-                self.channel_state
-                    .get_grant_by_scope(
-                        channel_id,
-                        Some(sender_ref),
-                        Some(conversation_ref),
-                        Some(thread_ref),
-                        ChannelRoutingProfile::Thread,
-                        ChannelGrantStatus::Blocked,
-                    )
-                    .await
-            }
-        }
-        .map_err(internal)?;
+        let blocked = self
+            .find_channel_session_blocking_grant(channel_id, &scope)
+            .await?;
         if blocked.is_some() {
             return Err(KernelError::Conflict(
                 "channel grant is blocked".to_string(),
             ));
         }
 
-        let approved = match &scope {
-            SessionKeyScope::Direct { sender_ref } => {
-                self.channel_state
-                    .get_grant_by_scope(
-                        channel_id,
-                        Some(sender_ref),
-                        None,
-                        None,
-                        ChannelRoutingProfile::Direct,
-                        ChannelGrantStatus::Approved,
-                    )
-                    .await
-            }
-            SessionKeyScope::Conversation {
-                sender_ref,
-                conversation_ref,
-            } => {
-                self.channel_state
-                    .get_grant_by_scope(
-                        channel_id,
-                        Some(sender_ref),
-                        Some(conversation_ref),
-                        None,
-                        ChannelRoutingProfile::Conversation,
-                        ChannelGrantStatus::Approved,
-                    )
-                    .await
-            }
-            SessionKeyScope::Thread {
-                sender_ref,
-                conversation_ref,
-                thread_ref,
-            } => {
-                self.channel_state
-                    .get_grant_by_scope(
-                        channel_id,
-                        Some(sender_ref),
-                        Some(conversation_ref),
-                        Some(thread_ref),
-                        ChannelRoutingProfile::Thread,
-                        ChannelGrantStatus::Approved,
-                    )
-                    .await
-            }
-        }
-        .map_err(internal)?
-        .ok_or_else(|| KernelError::BadRequest("channel grant is not approved".to_string()))?;
+        let approved = self
+            .get_channel_session_grant(
+                channel_id,
+                exact_session_grant_lookup(&scope),
+                ChannelGrantStatus::Approved,
+            )
+            .await?
+            .ok_or_else(|| KernelError::BadRequest("channel grant is not approved".to_string()))?;
 
         Ok(approved.trust_tier)
+    }
+
+    async fn find_channel_session_blocking_grant(
+        &self,
+        channel_id: &str,
+        scope: &SessionKeyScope,
+    ) -> Result<Option<ChannelGrantRecord>, KernelError> {
+        for lookup in blocking_session_grant_lookups(scope) {
+            if let Some(grant) = self
+                .get_channel_session_grant(channel_id, lookup, ChannelGrantStatus::Blocked)
+                .await?
+            {
+                return Ok(Some(grant));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn get_channel_session_grant(
+        &self,
+        channel_id: &str,
+        lookup: ChannelSessionGrantLookup<'_>,
+        status: ChannelGrantStatus,
+    ) -> Result<Option<ChannelGrantRecord>, KernelError> {
+        self.channel_state
+            .get_grant_by_scope(
+                channel_id,
+                lookup.sender_ref,
+                lookup.conversation_ref,
+                lookup.thread_ref,
+                lookup.routing_profile,
+                status,
+            )
+            .await
+            .map_err(internal)
     }
 
     async fn run_session_action_with_sink(
@@ -5321,6 +5274,78 @@ enum SessionKeyScope {
         conversation_ref: String,
         thread_ref: String,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChannelSessionGrantLookup<'a> {
+    sender_ref: Option<&'a str>,
+    conversation_ref: Option<&'a str>,
+    thread_ref: Option<&'a str>,
+    routing_profile: ChannelRoutingProfile,
+}
+
+fn exact_session_grant_lookup(scope: &SessionKeyScope) -> ChannelSessionGrantLookup<'_> {
+    match scope {
+        SessionKeyScope::Direct { sender_ref } => ChannelSessionGrantLookup {
+            sender_ref: Some(sender_ref),
+            conversation_ref: None,
+            thread_ref: None,
+            routing_profile: ChannelRoutingProfile::Direct,
+        },
+        SessionKeyScope::Conversation {
+            sender_ref,
+            conversation_ref,
+        } => ChannelSessionGrantLookup {
+            sender_ref: Some(sender_ref),
+            conversation_ref: Some(conversation_ref),
+            thread_ref: None,
+            routing_profile: ChannelRoutingProfile::Conversation,
+        },
+        SessionKeyScope::Thread {
+            sender_ref,
+            conversation_ref,
+            thread_ref,
+        } => ChannelSessionGrantLookup {
+            sender_ref: Some(sender_ref),
+            conversation_ref: Some(conversation_ref),
+            thread_ref: Some(thread_ref),
+            routing_profile: ChannelRoutingProfile::Thread,
+        },
+    }
+}
+
+fn blocking_session_grant_lookups(scope: &SessionKeyScope) -> Vec<ChannelSessionGrantLookup<'_>> {
+    match scope {
+        SessionKeyScope::Direct { .. } => vec![exact_session_grant_lookup(scope)],
+        SessionKeyScope::Conversation { sender_ref, .. } => vec![
+            exact_session_grant_lookup(scope),
+            ChannelSessionGrantLookup {
+                sender_ref: Some(sender_ref),
+                conversation_ref: None,
+                thread_ref: None,
+                routing_profile: ChannelRoutingProfile::Direct,
+            },
+        ],
+        SessionKeyScope::Thread {
+            sender_ref,
+            conversation_ref,
+            ..
+        } => vec![
+            exact_session_grant_lookup(scope),
+            ChannelSessionGrantLookup {
+                sender_ref: Some(sender_ref),
+                conversation_ref: Some(conversation_ref),
+                thread_ref: None,
+                routing_profile: ChannelRoutingProfile::Conversation,
+            },
+            ChannelSessionGrantLookup {
+                sender_ref: Some(sender_ref),
+                conversation_ref: None,
+                thread_ref: None,
+                routing_profile: ChannelRoutingProfile::Direct,
+            },
+        ],
+    }
 }
 
 #[derive(Debug)]
