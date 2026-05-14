@@ -26,13 +26,13 @@ pub use adapters::{
 pub use builtins::{register_builtin_runtime_adapters, BUILTIN_RUNTIME_MOCK};
 pub use codex_host_auth::{ensure_codex_host_auth_ready, sync_codex_home_into_runtime};
 pub use execution::{
-    resolve_oci_image_compatibility_identity, skill_mount_target,
+    resolve_oci_image_compatibility_identity, skill_mount_target, spawn_interactive,
     validate_oci_launch_prerequisites, ConfinementBackend, ConfinementConfig,
     EffectiveExecutionPlan, EscapeClass, ExecutionBackend, ExecutionLimits, ExecutionOutput,
     ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
-    ExecutionPreset, ExecutionRequest, MountAccess, MountSpec, NetworkMode, OciConfinementConfig,
-    OciExecutionBackend, RuntimeAuthKind, RuntimeExecutionProfile, RuntimeProgramSpec,
-    RuntimeSecretsMount, WorkspaceAccess, BUILTIN_PRESET_EVERYDAY,
+    ExecutionPreset, ExecutionRequest, ExecutionSession, MountAccess, MountSpec, NetworkMode,
+    OciConfinementConfig, OciExecutionBackend, RuntimeAuthKind, RuntimeExecutionProfile,
+    RuntimeProgramSpec, RuntimeSecretsMount, WorkspaceAccess, BUILTIN_PRESET_EVERYDAY,
     BUILTIN_PRESET_HIDDEN_COMPACTION, SKILLS_MOUNT_TARGET_ROOT,
 };
 pub use skill_projection::project_runtime_skills;
@@ -135,6 +135,91 @@ pub struct RuntimeTurnInput {
     pub prompt: String,
     pub fresh_prompt: Option<String>,
     pub runtime_skill_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeControlOrigin {
+    SessionTurn,
+    ChannelInbound,
+}
+
+impl RuntimeControlOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionTurn => "session_turn",
+            Self::ChannelInbound => "channel_inbound",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeControlInput {
+    pub runtime_session_id: String,
+    pub raw: String,
+    pub command_name: String,
+    pub arguments: String,
+    pub origin: RuntimeControlOrigin,
+    pub runtime_skill_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeControlOutcome {
+    Handled {
+        message: String,
+    },
+    Unsupported {
+        message: String,
+    },
+    InteractiveOnly {
+        message: String,
+    },
+    Failed {
+        code: Option<String>,
+        message: String,
+    },
+}
+
+impl RuntimeControlOutcome {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Handled { message }
+            | Self::Unsupported { message }
+            | Self::InteractiveOnly { message }
+            | Self::Failed { message, .. } => message,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Handled { .. } => "handled",
+            Self::Unsupported { .. } => "unsupported",
+            Self::InteractiveOnly { .. } => "interactive_only",
+            Self::Failed { .. } => "failed",
+        }
+    }
+
+    pub fn failed_error_code(&self) -> Option<&str> {
+        match self {
+            Self::Failed { code, .. } => Some(code.as_deref().unwrap_or("runtime.control.failed")),
+            Self::Handled { .. } | Self::Unsupported { .. } | Self::InteractiveOnly { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeControlExecution {
+    pub input: RuntimeControlInput,
+    pub plan: EffectiveExecutionPlan,
+    pub runtime_secrets_mount: Option<RuntimeSecretsMount>,
+    pub codex_home_override: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeProgramTurnExecution {
+    pub input: RuntimeTurnInput,
+    pub plan: EffectiveExecutionPlan,
+    pub runtime_secrets_mount: Option<RuntimeSecretsMount>,
+    pub codex_home_override: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +352,33 @@ pub trait RuntimeAdapter: Send + Sync {
     ) -> Result<bool> {
         Ok(false)
     }
+    async fn program_backed_turn(
+        &self,
+        execution: RuntimeProgramTurnExecution,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        execute_program_backed_turn(
+            self,
+            execution.plan,
+            execution.runtime_secrets_mount,
+            execution.codex_home_override,
+            execution.input,
+            events,
+        )
+        .await
+    }
+    async fn runtime_control(
+        &self,
+        execution: RuntimeControlExecution,
+        _events: RuntimeEventSender,
+    ) -> Result<RuntimeControlOutcome> {
+        Ok(RuntimeControlOutcome::Unsupported {
+            message: format!(
+                "runtime does not support native control command '/{}'",
+                execution.input.command_name
+            ),
+        })
+    }
     async fn resolve_capability_requests(
         &self,
         handle: &RuntimeSessionHandle,
@@ -300,14 +412,17 @@ impl RuntimeRegistry {
     }
 }
 
-pub async fn execute_program_backed_turn(
-    adapter: &(dyn RuntimeAdapter + Send + Sync),
+pub async fn execute_program_backed_turn<A>(
+    adapter: &A,
     plan: EffectiveExecutionPlan,
     runtime_secrets_mount: Option<RuntimeSecretsMount>,
     codex_home_override: Option<PathBuf>,
     input: RuntimeTurnInput,
     events: RuntimeEventSender,
-) -> Result<RuntimeTurnResult> {
+) -> Result<RuntimeTurnResult>
+where
+    A: RuntimeAdapter + Send + Sync + ?Sized,
+{
     execute_program_backed_turn_with_executor(
         adapter,
         plan,
@@ -320,8 +435,8 @@ pub async fn execute_program_backed_turn(
     .await
 }
 
-async fn execute_program_backed_turn_with_executor<E, Fut>(
-    adapter: &(dyn RuntimeAdapter + Send + Sync),
+async fn execute_program_backed_turn_with_executor<A, E, Fut>(
+    adapter: &A,
     plan: EffectiveExecutionPlan,
     runtime_secrets_mount: Option<RuntimeSecretsMount>,
     codex_home_override: Option<PathBuf>,
@@ -330,6 +445,7 @@ async fn execute_program_backed_turn_with_executor<E, Fut>(
     mut executor: E,
 ) -> Result<RuntimeTurnResult>
 where
+    A: RuntimeAdapter + Send + Sync + ?Sized,
     E: FnMut(ExecutionRequest, execution::backend::ExecutionStdoutSender) -> Fut,
     Fut: Future<Output = Result<ExecutionOutput>>,
 {
@@ -392,8 +508,8 @@ struct ProgramBackedAttemptOutcome {
     last_error_text: Option<String>,
 }
 
-async fn run_program_backed_attempt<E, Fut>(
-    adapter: &(dyn RuntimeAdapter + Send + Sync),
+async fn run_program_backed_attempt<A, E, Fut>(
+    adapter: &A,
     plan: &EffectiveExecutionPlan,
     runtime_secrets_mount: Option<RuntimeSecretsMount>,
     codex_home_override: Option<PathBuf>,
@@ -402,6 +518,7 @@ async fn run_program_backed_attempt<E, Fut>(
     executor: &mut E,
 ) -> Result<ProgramBackedAttemptOutcome>
 where
+    A: RuntimeAdapter + Send + Sync + ?Sized,
     E: FnMut(ExecutionRequest, execution::backend::ExecutionStdoutSender) -> Fut,
     Fut: Future<Output = Result<ExecutionOutput>>,
 {
@@ -485,15 +602,17 @@ where
     }
 }
 
-fn observe_program_output_line(
-    adapter: &(dyn RuntimeAdapter + Send + Sync),
+fn observe_program_output_line<A>(
+    adapter: &A,
     output_parser: &mut Option<Box<dyn RuntimeProgramOutputParser>>,
     events: &RuntimeEventSender,
     buffered_errors: &mut Option<Vec<RuntimeEvent>>,
     line: &str,
     saw_done: &mut bool,
     last_error_text: &mut Option<String>,
-) {
+) where
+    A: RuntimeAdapter + Send + Sync + ?Sized,
+{
     let parsed_events = if let Some(parser) = output_parser.as_mut() {
         parser.parse_line(line)
     } else {
@@ -564,13 +683,16 @@ fn flush_buffered_program_output_events(
     }
 }
 
-fn finish_program_backed_turn(
-    adapter: &(dyn RuntimeAdapter + Send + Sync),
+fn finish_program_backed_turn<A>(
+    adapter: &A,
     output: ExecutionOutput,
     observed_error_text: Option<&str>,
     saw_done: bool,
     events: &RuntimeEventSender,
-) -> Result<RuntimeTurnResult> {
+) -> Result<RuntimeTurnResult>
+where
+    A: RuntimeAdapter + Send + Sync + ?Sized,
+{
     if !output.success() {
         return Err(anyhow!(
             adapter.format_program_exit_error(&output, observed_error_text)
@@ -594,24 +716,143 @@ mod tests {
         time::Duration,
     };
 
+    use super::{
+        execute_program_backed_turn_with_executor, ConfinementConfig, EffectiveExecutionPlan,
+        ExecutionLimits, ExecutionOutput, MountAccess, MountSpec, NetworkMode,
+        OciConfinementConfig, RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult,
+        RuntimeEvent, RuntimeEventSender, RuntimeMessageLane, RuntimeProgramSpec,
+        RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
+        RuntimeTurnResult, WorkspaceAccess,
+    };
+    use anyhow::{anyhow, Result};
+    use async_trait::async_trait;
     use tokio::{
         sync::mpsc,
         time::{sleep, timeout},
-    };
-    use uuid::Uuid;
-
-    use super::{
-        execute_program_backed_turn_with_executor, CodexRuntimeAdapter, CodexRuntimeConfig,
-        ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionOutput, MountAccess,
-        MountSpec, NetworkMode, OciConfinementConfig, RuntimeAdapter, RuntimeEvent,
-        RuntimeProgramSpec, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
-        WorkspaceAccess,
     };
 
     #[derive(Clone)]
     struct StubAttempt {
         stdout_lines: Vec<String>,
         output: ExecutionOutput,
+    }
+
+    struct TestProgramAdapter {
+        retry_used: std::sync::atomic::AtomicBool,
+    }
+
+    impl Default for TestProgramAdapter {
+        fn default() -> Self {
+            Self {
+                retry_used: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeAdapter for TestProgramAdapter {
+        async fn info(&self) -> RuntimeAdapterInfo {
+            RuntimeAdapterInfo {
+                id: "test-program".to_string(),
+                version: "0.1".to_string(),
+                healthy: true,
+            }
+        }
+
+        fn turn_mode(&self) -> RuntimeTurnMode {
+            RuntimeTurnMode::ProgramBacked
+        }
+
+        async fn session_start(
+            &self,
+            _input: RuntimeSessionStartInput,
+        ) -> Result<RuntimeSessionHandle> {
+            Ok(RuntimeSessionHandle {
+                runtime_session_id: "test-program-session".to_string(),
+                resumes_existing_session: false,
+            })
+        }
+
+        fn build_turn_program(&self, input: &RuntimeTurnInput) -> Result<RuntimeProgramSpec> {
+            Ok(RuntimeProgramSpec {
+                executable: "agent".to_string(),
+                args: vec!["run".to_string()],
+                environment: Vec::new(),
+                stdin: input.prompt.clone(),
+                auth: None,
+            })
+        }
+
+        fn parse_program_output_line(&self, line: &str) -> Vec<RuntimeEvent> {
+            let line = line.trim();
+            if let Some(text) = line.strip_prefix("status:") {
+                return vec![RuntimeEvent::Status {
+                    code: None,
+                    text: text.trim().to_string(),
+                }];
+            }
+            if let Some(text) = line.strip_prefix("answer:") {
+                return vec![RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: text.trim().to_string(),
+                }];
+            }
+            if let Some(text) = line.strip_prefix("error:") {
+                return vec![RuntimeEvent::Error {
+                    code: Some("runtime.error".to_string()),
+                    text: text.trim().to_string(),
+                }];
+            }
+            Vec::new()
+        }
+
+        fn prepare_program_retry_after_failure(
+            &self,
+            _input: &RuntimeTurnInput,
+            _output: &ExecutionOutput,
+            observed_error_text: Option<&str>,
+            events: &RuntimeEventSender,
+        ) -> Result<bool> {
+            if self
+                .retry_used
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(false);
+            }
+            if observed_error_text != Some("stale thread") {
+                return Ok(false);
+            }
+            drop(events.send(RuntimeEvent::Status {
+                code: None,
+                text: "program retry requested".to_string(),
+            }));
+            Ok(true)
+        }
+
+        async fn resolve_capability_requests(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            results: Vec<RuntimeCapabilityResult>,
+            _events: RuntimeEventSender,
+        ) -> Result<()> {
+            if results.is_empty() {
+                Ok(())
+            } else {
+                Err(anyhow!("test adapter does not resolve capabilities"))
+            }
+        }
+
+        async fn cancel(
+            &self,
+            _handle: &RuntimeSessionHandle,
+            _reason: Option<String>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
+            Ok(())
+        }
     }
 
     fn test_execution_plan() -> EffectiveExecutionPlan {
@@ -637,53 +878,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_resume_failure_restarts_once_and_reports_continuity_restart() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let runtime_state_root = temp_dir.path().join("runtime-state");
-        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
-        std::fs::write(
-            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
-            "",
-        )
-        .expect("write ready marker");
-        std::fs::write(
-            runtime_state_root.join(".lionclaw-codex-thread-id"),
-            "thread-old\n",
-        )
-        .expect("write saved thread id");
-
-        let adapter = CodexRuntimeAdapter::new(CodexRuntimeConfig {
-            executable: "codex".to_string(),
-            model: Some("gpt-5-codex".to_string()),
-        });
-        let handle = adapter
-            .session_start(RuntimeSessionStartInput {
-                session_id: Uuid::new_v4(),
-                working_dir: None,
-                environment: Vec::new(),
-                runtime_skill_ids: Vec::new(),
-                runtime_state_root: Some(runtime_state_root.clone()),
-            })
-            .await
-            .expect("start");
-        assert!(handle.resumes_existing_session);
-
+    async fn program_backed_retry_uses_fresh_prompt_when_adapter_requests_retry() {
+        let adapter = TestProgramAdapter::default();
         let attempts = Arc::new(Mutex::new(VecDeque::from([
             StubAttempt {
-                stdout_lines: vec![
-                    r#"{"type":"error","message":"thread not found for resume"}"#.to_string(),
-                ],
+                stdout_lines: vec!["error: stale thread".to_string()],
                 output: ExecutionOutput {
                     exit_code: Some(1),
                     ..ExecutionOutput::default()
                 },
             },
             StubAttempt {
-                stdout_lines: vec![
-                    r#"{"type":"thread.started","thread_id":"thread-new"}"#.to_string(),
-                    r#"{"id":"2","msg":{"type":"task_complete","last_agent_message":"Done."}}"#
-                        .to_string(),
-                ],
+                stdout_lines: vec!["answer: Done.".to_string()],
                 output: ExecutionOutput {
                     exit_code: Some(0),
                     ..ExecutionOutput::default()
@@ -700,7 +906,7 @@ mod tests {
             None,
             None,
             RuntimeTurnInput {
-                runtime_session_id: handle.runtime_session_id.clone(),
+                runtime_session_id: "test-program-session".to_string(),
                 prompt: "hello".to_string(),
                 fresh_prompt: Some("fresh history prompt".to_string()),
                 runtime_skill_ids: Vec::new(),
@@ -750,29 +956,9 @@ mod tests {
             .expect("recorded programs lock")
             .clone();
         assert_eq!(programs.len(), 2, "expected one retry");
-        assert_eq!(
-            programs[0].args,
-            vec![
-                "exec".to_string(),
-                "resume".to_string(),
-                "--dangerously-bypass-approvals-and-sandbox".to_string(),
-                "--json".to_string(),
-                "--model".to_string(),
-                "gpt-5-codex".to_string(),
-                "thread-old".to_string(),
-                "-".to_string(),
-            ]
-        );
-        assert_eq!(
-            programs[1].args,
-            vec![
-                "exec".to_string(),
-                "--dangerously-bypass-approvals-and-sandbox".to_string(),
-                "--json".to_string(),
-                "--model".to_string(),
-                "gpt-5-codex".to_string(),
-            ]
-        );
+        assert!(programs
+            .iter()
+            .all(|program| program.args == ["run".to_string()]));
         let stdin = recorded_stdin.lock().expect("recorded stdin lock").clone();
         assert_eq!(stdin.as_slice(), ["hello", "fresh history prompt"]);
 
@@ -783,62 +969,24 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event,
             RuntimeEvent::Status { code: None, text }
-                if text == "codex continuity restarted with a fresh thread"
+                if text == "program retry requested"
         )));
         assert!(!events.iter().any(|event| matches!(
             event,
             RuntimeEvent::Error { text, .. }
-                if text.contains("thread not found for resume")
+                if text.contains("stale thread")
         )));
         assert!(events.iter().any(|event| matches!(
             event,
             RuntimeEvent::MessageDelta { text, .. } if text == "Done."
         )));
-
-        assert_eq!(
-            std::fs::read_to_string(runtime_state_root.join(".lionclaw-codex-thread-id"))
-                .expect("read saved thread id"),
-            "thread-new\n"
-        );
-
-        adapter.close(&handle).await.expect("close");
     }
 
     #[tokio::test]
-    async fn resumed_turn_streams_non_error_events_before_attempt_finishes() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let runtime_state_root = temp_dir.path().join("runtime-state");
-        std::fs::create_dir_all(&runtime_state_root).expect("create runtime state root");
-        std::fs::write(
-            runtime_state_root.join(crate::home::RUNTIME_SESSION_READY_MARKER),
-            "",
-        )
-        .expect("write ready marker");
-        std::fs::write(
-            runtime_state_root.join(".lionclaw-codex-thread-id"),
-            "thread-old\n",
-        )
-        .expect("write saved thread id");
-
-        let adapter = Arc::new(CodexRuntimeAdapter::new(CodexRuntimeConfig {
-            executable: "codex".to_string(),
-            model: Some("gpt-5-codex".to_string()),
-        }));
-        let handle = adapter
-            .session_start(RuntimeSessionStartInput {
-                session_id: Uuid::new_v4(),
-                working_dir: None,
-                environment: Vec::new(),
-                runtime_skill_ids: Vec::new(),
-                runtime_state_root: Some(runtime_state_root),
-            })
-            .await
-            .expect("start");
-        assert!(handle.resumes_existing_session);
-
+    async fn program_backed_turn_streams_events_before_attempt_finishes() {
+        let adapter = Arc::new(TestProgramAdapter::default());
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let adapter_for_turn = Arc::clone(&adapter);
-        let runtime_session_id = handle.runtime_session_id.clone();
         let turn = tokio::spawn(async move {
             execute_program_backed_turn_with_executor(
                 adapter_for_turn.as_ref(),
@@ -846,7 +994,7 @@ mod tests {
                 None,
                 None,
                 RuntimeTurnInput {
-                    runtime_session_id,
+                    runtime_session_id: "test-program-session".to_string(),
                     prompt: "hello".to_string(),
                     fresh_prompt: Some("fresh history prompt".to_string()),
                     runtime_skill_ids: Vec::new(),
@@ -854,15 +1002,11 @@ mod tests {
                 event_tx,
                 move |_request, stdout| async move {
                     stdout
-                        .send(r#"{"id":"0","msg":{"type":"task_started"}}"#.to_string() + "\n")
+                        .send("status: started\n".to_string())
                         .expect("send started");
                     sleep(Duration::from_millis(100)).await;
                     stdout
-                        .send(
-                            r#"{"id":"1","msg":{"type":"task_complete","last_agent_message":"Done."}}"#
-                                .to_string()
-                                + "\n",
-                        )
+                        .send("answer: Done.\n".to_string())
                         .expect("send complete");
                     Ok(ExecutionOutput {
                         exit_code: Some(0),
@@ -879,7 +1023,7 @@ mod tests {
             .expect("streamed event");
         assert!(matches!(
             first_event,
-            RuntimeEvent::Status { code: None, text } if text == "codex turn started"
+            RuntimeEvent::Status { code: None, text } if text == "started"
         ));
 
         let result = turn.await.expect("join turn");
@@ -898,7 +1042,5 @@ mod tests {
             event,
             RuntimeEvent::MessageDelta { text, .. } if text == "Done."
         )));
-
-        adapter.close(&handle).await.expect("close");
     }
 }

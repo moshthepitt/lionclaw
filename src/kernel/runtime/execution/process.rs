@@ -3,7 +3,7 @@ use std::{fmt, io::ErrorKind, process::Stdio, time::Duration};
 use anyhow::{Context, Result};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::Command,
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
 };
 
 #[derive(Clone)]
@@ -130,6 +130,149 @@ where
     })
 }
 
+pub struct ProcessSession {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout_reader: BufReader<ChildStdout>,
+    stderr_task: tokio::task::JoinHandle<Result<Vec<u8>>>,
+    captured_stdout: Vec<u8>,
+}
+
+impl ProcessSession {
+    pub async fn write_line(&mut self, line: &str) -> Result<()> {
+        let stdin = self
+            .stdin
+            .as_mut()
+            .context("subprocess stdin is already closed")?;
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .context("failed to write line to subprocess stdin")?;
+        stdin
+            .write_all(b"\n")
+            .await
+            .context("failed to write line terminator to subprocess stdin")?;
+        stdin
+            .flush()
+            .await
+            .context("failed to flush subprocess stdin")?;
+        Ok(())
+    }
+
+    pub async fn read_line(&mut self) -> Result<Option<String>> {
+        let mut line = Vec::new();
+        let bytes_read = self
+            .stdout_reader
+            .read_until(b'\n', &mut line)
+            .await
+            .context("failed to read subprocess stdout")?;
+        if bytes_read == 0 {
+            return Ok(None);
+        }
+        self.captured_stdout.extend_from_slice(&line);
+        Ok(Some(String::from_utf8_lossy(&line).to_string()))
+    }
+
+    pub async fn close_stdin(&mut self) -> Result<()> {
+        let Some(mut stdin) = self.stdin.take() else {
+            return Ok(());
+        };
+        stdin
+            .shutdown()
+            .await
+            .context("failed to close subprocess stdin")?;
+        Ok(())
+    }
+
+    pub async fn wait(mut self) -> Result<ProcessOutput> {
+        self.close_stdin().await?;
+        self.stdout_reader
+            .read_to_end(&mut self.captured_stdout)
+            .await
+            .context("failed to read remaining subprocess stdout")?;
+        let status = self
+            .child
+            .wait()
+            .await
+            .context("failed to wait for subprocess")?;
+        let captured_stderr = self
+            .stderr_task
+            .await
+            .context("stderr reader task failed")??;
+
+        Ok(ProcessOutput {
+            stdout: self.captured_stdout,
+            stderr: captured_stderr,
+            exit_code: status.code(),
+        })
+    }
+}
+
+pub async fn spawn_process_session(invocation: &ProcessInvocation) -> Result<ProcessSession> {
+    let mut command = Command::new(&invocation.executable);
+    command.args(&invocation.args);
+
+    if let Some(working_dir) = invocation.working_dir.as_deref() {
+        command.current_dir(working_dir);
+    }
+    if !invocation.environment.is_empty() {
+        command.envs(
+            invocation
+                .environment
+                .iter()
+                .map(|(key, value)| (key, value)),
+        );
+    }
+    command.kill_on_drop(true);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = spawn_with_retry(&mut command, &invocation.executable).await?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("subprocess stdin was not captured")?;
+    if !invocation.input.is_empty() {
+        stdin
+            .write_all(invocation.input.as_bytes())
+            .await
+            .context("failed to write input to subprocess stdin")?;
+        stdin
+            .flush()
+            .await
+            .context("failed to flush subprocess stdin")?;
+    }
+    let stdout = child
+        .stdout
+        .take()
+        .context("subprocess stdout was not captured")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("subprocess stderr was not captured")?;
+
+    Ok(ProcessSession {
+        child,
+        stdin: Some(stdin),
+        stdout_reader: BufReader::new(stdout),
+        stderr_task: spawn_stderr_reader(stderr),
+        captured_stdout: Vec::new(),
+    })
+}
+
+fn spawn_stderr_reader(mut stderr: ChildStderr) -> tokio::task::JoinHandle<Result<Vec<u8>>> {
+    tokio::spawn(async move {
+        let mut captured = Vec::new();
+        stderr
+            .read_to_end(&mut captured)
+            .await
+            .context("failed to read subprocess stderr")?;
+        Ok::<Vec<u8>, anyhow::Error>(captured)
+    })
+}
+
 async fn spawn_with_retry(
     command: &mut Command,
     executable: &str,
@@ -164,7 +307,7 @@ async fn spawn_with_retry(
 
 #[cfg(test)]
 mod tests {
-    use super::ProcessInvocation;
+    use super::{spawn_process_session, ProcessInvocation};
 
     #[test]
     fn process_invocation_debug_redacts_environment_and_input_values() {
@@ -182,5 +325,29 @@ mod tests {
         assert!(debug.contains("environment_count"));
         assert!(!debug.contains("ghp_secret"));
         assert!(!debug.contains("sensitive stdin"));
+    }
+
+    #[tokio::test]
+    async fn process_session_wait_drains_stdout_written_after_stdin_closes() {
+        let session = spawn_process_session(&ProcessInvocation {
+            executable: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "cat >/dev/null; printf 'tail-after-close\\n'".to_string(),
+            ],
+            working_dir: None,
+            environment: Vec::new(),
+            input: String::new(),
+        })
+        .await
+        .expect("spawn session");
+
+        let output = session.wait().await.expect("wait");
+
+        assert!(output.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("stdout"),
+            "tail-after-close\n"
+        );
     }
 }

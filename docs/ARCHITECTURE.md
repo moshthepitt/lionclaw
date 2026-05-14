@@ -102,6 +102,8 @@ Runtime adapters implement:
 - `info()`
 - `session_start()`
 - `turn()`
+- `program_backed_turn()`
+- `runtime_control()`
 - `resolve_capability_requests()`
 - `cancel()`
 - `close()`
@@ -130,7 +132,9 @@ For `lionclaw run <runtime>`, channel turns, or scheduled jobs:
    timeouts, and compatibility key.
 5. The kernel audits `runtime.plan.allow` or `runtime.plan.deny`.
 6. The OCI backend launches the runtime in the confined layout.
-7. The adapter maps runtime output into typed stream events.
+7. The adapter maps runtime output into typed stream events. Codex uses its
+   native `app-server` JSON-RPC protocol over stdio inside the confined
+   process; OpenCode uses its configured machine-readable run output.
 8. The kernel persists canonical answer text, turn status, checkpoints, audit,
    and any continuity changes it owns.
 
@@ -147,8 +151,31 @@ before the terminal `done` marker.
 
 Configured OpenCode profiles are pinned to machine-readable JSON output so
 LionClaw receives typed events instead of a degraded plain-text stream. Codex
-is launched through its program-backed adapter and official external-sandbox
-mode inside the outer Podman boundary.
+is launched through its app-server protocol with `externalSandbox` permissions
+inside the outer Podman boundary. LionClaw does not use `codex exec` as a
+fallback path. Codex app-server request/notification assumptions are pinned by
+checked-in protocol fixtures under `tests/fixtures/codex_app_server`, including
+the target Codex CLI version and immutable source commit; update those fixtures
+with the adapter when the target app-server contract changes.
+
+## Runtime Control Commands
+
+The first column is command space. `lionclaw run` and channel inbound routing
+reserve `/lionclaw ...` for LionClaw-owned controls such as
+`/lionclaw retry`, `/lionclaw reset`, and `/lionclaw exit`. Local-only controls
+such as `/lionclaw exit` are acknowledged by channel routing but do not exit a
+channel worker.
+
+Other first-column slash commands are classified as runtime controls and are
+persisted as `runtime_control` turns. The kernel records
+`runtime.control.route`, `runtime.control.start`, `runtime.control.finish`, and
+`runtime.control.outcome` audit events around those turns. Runtime adapters
+decide whether a control is handled, unsupported, interactive-only, or failed.
+
+This keeps native runtime commands such as Codex `/model`, `/rename`, and
+`/compact` native to the selected runtime without teaching the kernel
+runtime-specific command semantics. Leading-space slash input and path-like
+slash input remain ordinary prompts.
 
 ## Direct Runtime And Brokered Capability Flow
 
@@ -336,7 +363,7 @@ prompts:
 
 `session_turns` is the durable source of truth for prompt history. It records:
 
-- `kind = normal | retry | continue`
+- `kind = normal | retry | continue | runtime_control`
 - `status = running | completed | failed | timed_out | cancelled | interrupted`
 - `display_user_text`
 - `prompt_user_text`

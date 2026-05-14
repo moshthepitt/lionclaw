@@ -1,0 +1,29 @@
+{
+  "codexCliVersion": "0.130.0",
+  "source": "https://github.com/openai/codex/blob/58573da43ab697e8b79f152c53df4b42230395a8/codex-rs/app-server/README.md",
+  "client": {
+    "id": 1,
+    "method": "turn/interrupt",
+    "params": {
+      "threadId": "thr_1",
+      "turnId": "turn_1"
+    }
+  },
+  "server": [
+    {
+      "method": "turn/completed",
+      "params": {
+        "threadId": "thr_1",
+        "turnId": "turn_1",
+        "turn": {
+          "id": "turn_1",
+          "status": "interrupted"
+        }
+      }
+    },
+    {
+      "id": 1,
+      "result": {}
+    }
+  ]
+}

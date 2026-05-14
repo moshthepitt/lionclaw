@@ -13,14 +13,16 @@ use async_trait::async_trait;
 use lionclaw::{
     contracts::{
         SessionActionKind, SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery,
-        SessionOpenRequest, SessionTurnKind, SessionTurnRequest, SessionTurnStatus, TrustTier,
+        SessionOpenRequest, SessionTurnKind, SessionTurnRequest, SessionTurnResponse,
+        SessionTurnStatus, TrustTier,
     },
     home::RUNTIME_SESSION_READY_MARKER,
     kernel::{
         runtime::{
             ConfinementConfig, OciConfinementConfig, RuntimeAdapter, RuntimeAdapterInfo,
-            RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender, RuntimeExecutionProfile,
-            RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
+            RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent,
+            RuntimeEventSender, RuntimeExecutionProfile, RuntimeSessionHandle,
+            RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
         },
         Kernel, KernelError, KernelOptions,
     },
@@ -317,9 +319,378 @@ async fn continue_and_retry_actions_create_durable_turns() {
         .expect("history");
     assert_eq!(history.turns.len(), 3);
     assert_eq!(history.turns[1].kind, SessionTurnKind::Continue);
-    assert_eq!(history.turns[1].display_user_text, "/continue");
+    assert_eq!(history.turns[1].display_user_text, "/lionclaw continue");
     assert_eq!(history.turns[2].kind, SessionTurnKind::Retry);
-    assert_eq!(history.turns[2].display_user_text, "/retry");
+    assert_eq!(history.turns[2].display_user_text, "/lionclaw retry");
+}
+
+#[tokio::test]
+async fn first_column_runtime_control_is_persisted_as_runtime_control_turn() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let session = open_session(
+        &kernel,
+        "runtime-control-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    let response = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "/handled now".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("runtime control turn");
+
+    assert_eq!(response.assistant_text, "mock runtime handled control");
+
+    let history = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: session.session_id,
+            limit: Some(4),
+        })
+        .await
+        .expect("history");
+    let turn = history.turns.last().expect("runtime control turn");
+    assert_eq!(turn.kind, SessionTurnKind::RuntimeControl);
+    assert_eq!(turn.status, SessionTurnStatus::Completed);
+    assert_eq!(turn.display_user_text, "/handled now");
+    assert_eq!(turn.prompt_user_text, "");
+    assert_eq!(turn.assistant_text, "mock runtime handled control");
+}
+
+#[tokio::test]
+async fn prompt_history_does_not_replay_runtime_control_turns() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let recorded_prompts = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "capture",
+            Arc::new(CapturePromptAdapter {
+                prompts: recorded_prompts.clone(),
+                reply: "captured".to_string(),
+            }),
+        )
+        .await;
+    let session = open_session(
+        &kernel,
+        "runtime-control-history-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    turn_session(&kernel, session.session_id, "capture", "real prompt")
+        .await
+        .expect("initial prompt");
+    turn_session(&kernel, session.session_id, "mock", "/handled now")
+        .await
+        .expect("runtime control");
+    turn_session(&kernel, session.session_id, "capture", "follow up")
+        .await
+        .expect("follow-up prompt");
+
+    let prompts = recorded_prompts.lock().expect("prompt lock").clone();
+    assert_eq!(prompts.len(), 2);
+    let follow_up_prompt = &prompts[1];
+    assert!(follow_up_prompt.contains("real prompt"));
+    assert!(follow_up_prompt.contains("follow up"));
+    assert!(!follow_up_prompt.contains("/handled now"));
+    assert!(!follow_up_prompt.contains("mock runtime handled control"));
+}
+
+#[tokio::test]
+async fn retry_ignores_latest_runtime_control_turn() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let recorded_prompts = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "capture",
+            Arc::new(CapturePromptAdapter {
+                prompts: recorded_prompts.clone(),
+                reply: "retried".to_string(),
+            }),
+        )
+        .await;
+    let session = open_session(
+        &kernel,
+        "runtime-control-retry-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    turn_session(&kernel, session.session_id, "capture", "original prompt")
+        .await
+        .expect("initial prompt");
+    turn_session(&kernel, session.session_id, "mock", "/handled now")
+        .await
+        .expect("runtime control");
+
+    let response = kernel
+        .run_session_action(
+            session.session_id,
+            SessionActionKind::RetryLastTurn,
+            Some("capture".to_string()),
+        )
+        .await
+        .expect("retry action");
+    assert_eq!(response.assistant_text, "retried");
+
+    let prompts = recorded_prompts.lock().expect("prompt lock").clone();
+    assert_eq!(prompts.len(), 2);
+    let retry_prompt = &prompts[1];
+    assert!(retry_prompt.contains("original prompt"));
+    assert!(!retry_prompt.contains("/handled now"));
+    assert!(!retry_prompt.contains("mock runtime handled control"));
+}
+
+#[tokio::test]
+async fn slash_input_with_leading_space_remains_a_normal_prompt() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let session = open_session(
+        &kernel,
+        "runtime-control-prompt-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    let response = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: " /handled as prompt".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("normal prompt turn");
+
+    assert!(response.assistant_text.contains("/handled as prompt"));
+    assert_ne!(response.assistant_text, "mock runtime handled control");
+
+    let history = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: session.session_id,
+            limit: Some(4),
+        })
+        .await
+        .expect("history");
+    let turn = history.turns.last().expect("normal prompt turn");
+    assert_eq!(turn.kind, SessionTurnKind::Normal);
+    assert_eq!(turn.display_user_text, " /handled as prompt");
+    assert_eq!(turn.prompt_user_text, " /handled as prompt");
+}
+
+#[tokio::test]
+async fn failed_runtime_control_persists_failed_turn_with_runtime_error_code() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    let session = open_session(
+        &kernel,
+        "runtime-control-failure-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    let err = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "/failed".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect_err("runtime control should fail");
+
+    assert!(
+        matches!(err, KernelError::Runtime(message) if message == "mock runtime control failed")
+    );
+
+    let history = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: session.session_id,
+            limit: Some(4),
+        })
+        .await
+        .expect("history");
+    let turn = history.turns.last().expect("failed runtime control turn");
+    assert_eq!(turn.kind, SessionTurnKind::RuntimeControl);
+    assert_eq!(turn.status, SessionTurnStatus::Failed);
+    assert_eq!(turn.display_user_text, "/failed");
+    assert_eq!(turn.prompt_user_text, "");
+    assert_eq!(turn.assistant_text, "mock runtime control failed");
+    assert_eq!(turn.error_code.as_deref(), Some("mock.control_failed"));
+}
+
+#[tokio::test]
+async fn failed_runtime_control_close_failure_preserves_control_error() {
+    let env = TestEnv::new();
+    let kernel = Kernel::new(&env.db_path()).await.expect("kernel init");
+    kernel
+        .register_runtime_adapter(
+            "control-close-fail",
+            Arc::new(RuntimeControlCloseFailureAdapter {
+                control_error_code: "runtime.control.failed_before_close".to_string(),
+                control_error_text: "control failed before close".to_string(),
+                close_error_text: "control close failed".to_string(),
+            }),
+        )
+        .await;
+    let session = open_session(
+        &kernel,
+        "runtime-control-close-failure-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    let err = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "/failed".to_string(),
+            runtime_id: Some("control-close-fail".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect_err("runtime control should fail");
+
+    assert!(
+        matches!(err, KernelError::Runtime(message) if message == "control failed before close")
+    );
+
+    let history = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: session.session_id,
+            limit: Some(4),
+        })
+        .await
+        .expect("history");
+    let turn = history.turns.last().expect("failed runtime control turn");
+    assert_eq!(turn.kind, SessionTurnKind::RuntimeControl);
+    assert_eq!(turn.status, SessionTurnStatus::Failed);
+    assert_eq!(turn.assistant_text, "control failed before close");
+    assert_eq!(
+        turn.error_code.as_deref(),
+        Some("runtime.control.failed_before_close")
+    );
+    assert_eq!(
+        turn.error_text.as_deref(),
+        Some("control failed before close")
+    );
+
+    let close_errors = kernel
+        .query_audit(
+            Some(session.session_id),
+            Some("runtime.control.close_error".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query close error audit");
+    assert_eq!(close_errors.events.len(), 1);
+    assert_eq!(
+        close_errors.events[0].details["error"].as_str(),
+        Some("control close failed")
+    );
+}
+
+#[tokio::test]
+async fn failed_runtime_control_clears_runtime_session_resumability_for_next_turn() {
+    let env = TestEnv::new();
+    let workspace_root = env.path().join("workspace");
+    let project_root = env.path().join("project");
+    let runtime_root = env.path().join("runtime");
+    std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+    std::fs::create_dir_all(&project_root).expect("create project root");
+    let kernel = Kernel::new_with_options(
+        &env.db_path(),
+        KernelOptions {
+            workspace_root: Some(workspace_root),
+            project_workspace_root: Some(project_root),
+            runtime_root: Some(runtime_root),
+            workspace_name: Some("main".to_string()),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let runtime_roots = Arc::new(Mutex::new(Vec::new()));
+    let resumed_flags = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "control-failure",
+            Arc::new(RuntimeControlFailureClearingAdapter {
+                runtime_roots: runtime_roots.clone(),
+                resumed_flags: resumed_flags.clone(),
+            }),
+        )
+        .await;
+
+    let session = open_session(
+        &kernel,
+        "control-failure-peer",
+        SessionHistoryPolicy::Interactive,
+    )
+    .await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "first request".to_string(),
+            runtime_id: Some("control-failure".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("first turn");
+
+    let err = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "/failed".to_string(),
+            runtime_id: Some("control-failure".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect_err("runtime control should fail");
+    assert!(matches!(err, KernelError::Runtime(_)));
+
+    let roots = runtime_roots.lock().expect("roots lock").clone();
+    assert_eq!(roots.len(), 2);
+    assert!(
+        !roots[1].join(RUNTIME_SESSION_READY_MARKER).is_file(),
+        "failed runtime controls should clear resumability before the next follow-up"
+    );
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session.session_id,
+            user_text: "second request".to_string(),
+            runtime_id: Some("control-failure".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("second turn");
+
+    let resumed_flags = resumed_flags.lock().expect("resumed flags lock").clone();
+    assert_eq!(resumed_flags, vec![false, true, false]);
 }
 
 #[tokio::test]
@@ -1172,6 +1543,24 @@ async fn open_session(
         .expect("open session")
 }
 
+async fn turn_session(
+    kernel: &Kernel,
+    session_id: Uuid,
+    runtime_id: &str,
+    user_text: &str,
+) -> Result<SessionTurnResponse, KernelError> {
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id,
+            user_text: user_text.to_string(),
+            runtime_id: Some(runtime_id.to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+}
+
 struct PartialTimeoutAdapter {
     partial_text: String,
     sleep_for: Duration,
@@ -1198,6 +1587,17 @@ struct ResumeAfterFailureAdapter {
     runtime_roots: Arc<Mutex<Vec<PathBuf>>>,
     resumed_flags: Arc<Mutex<Vec<bool>>>,
     turn_counter: AtomicUsize,
+}
+
+struct RuntimeControlFailureClearingAdapter {
+    runtime_roots: Arc<Mutex<Vec<PathBuf>>>,
+    resumed_flags: Arc<Mutex<Vec<bool>>>,
+}
+
+struct RuntimeControlCloseFailureAdapter {
+    control_error_code: String,
+    control_error_text: String,
+    close_error_text: String,
 }
 
 struct BlockingAnswerAdapter {
@@ -1532,6 +1932,128 @@ impl RuntimeAdapter for ResumeAfterFailureAdapter {
 
     async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
         Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for RuntimeControlFailureClearingAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "control-failure".to_string(),
+            version: "0.1".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
+        let runtime_state_root = input
+            .runtime_state_root
+            .expect("runtime state root should be provided");
+        let resumes_existing_session = runtime_state_root
+            .join(RUNTIME_SESSION_READY_MARKER)
+            .is_file();
+        self.runtime_roots
+            .lock()
+            .expect("roots lock")
+            .push(runtime_state_root);
+        self.resumed_flags
+            .lock()
+            .expect("resumed flags lock")
+            .push(resumes_existing_session);
+
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("control-failure-{}", Uuid::new_v4()),
+            resumes_existing_session,
+        })
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        let _ = events.send(RuntimeEvent::MessageDelta {
+            lane: lionclaw::kernel::runtime::RuntimeMessageLane::Answer,
+            text: "control failure adapter reply".to_string(),
+        });
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(RuntimeTurnResult::default())
+    }
+
+    async fn runtime_control(
+        &self,
+        _execution: RuntimeControlExecution,
+        _events: RuntimeEventSender,
+    ) -> Result<RuntimeControlOutcome> {
+        Ok(RuntimeControlOutcome::Failed {
+            code: Some("runtime.control.failed".to_string()),
+            message: "control failed".to_string(),
+        })
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        events: RuntimeEventSender,
+    ) -> Result<()> {
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
+    }
+
+    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for RuntimeControlCloseFailureAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "control-close-fail".to_string(),
+            version: "0.1".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(&self, input: RuntimeSessionStartInput) -> Result<RuntimeSessionHandle> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("control-close-fail-{}", input.session_id),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn runtime_control(
+        &self,
+        _execution: RuntimeControlExecution,
+        _events: RuntimeEventSender,
+    ) -> Result<RuntimeControlOutcome> {
+        Ok(RuntimeControlOutcome::Failed {
+            code: Some(self.control_error_code.clone()),
+            message: self.control_error_text.clone(),
+        })
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        events: RuntimeEventSender,
+    ) -> Result<()> {
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
+    }
+
+    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
+        anyhow::bail!(self.close_error_text.clone())
     }
 }
 

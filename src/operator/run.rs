@@ -14,7 +14,10 @@ use crate::{
         StreamEventKindDto, StreamLaneDto, TrustTier,
     },
     home::{runtime_project_partition_key, LionClawHome},
-    kernel::Kernel,
+    kernel::{
+        input_routing::{classify_input, ClassifiedInput, LionClawControlInput},
+        Kernel,
+    },
     operator::{
         config::OperatorConfig,
         reconcile::{open_runtime_kernel_for_work_root, render_runtime_cache_for_work_root},
@@ -173,7 +176,7 @@ async fn run_repl<R: BufRead + Send, W: Write + Send>(
 
     writeln!(
         output,
-        "LionClaw interactive mode\nruntime: {}\nwork root: {}\ntimeout: idle {}, hard {}\nType /continue, /retry, /reset, or /exit.\n",
+        "LionClaw interactive mode\nruntime: {}\nwork root: {}\ntimeout: idle {}, hard {}\nType /lionclaw continue, /lionclaw retry, /lionclaw reset, or /lionclaw exit.\n",
         context.runtime_id,
         context.project_workspace_root,
         crate::runtime_timeouts::format_duration(context.timeouts.idle),
@@ -194,52 +197,88 @@ async fn run_repl<R: BufRead + Send, W: Write + Send>(
             break;
         }
 
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+        let input_text = line.trim_end_matches(['\r', '\n']);
+        match classify_input(input_text) {
+            ClassifiedInput::Empty => continue,
+            ClassifiedInput::Prompt(prompt) => {
+                render_streaming_turn(kernel, session_id, context.runtime_id, &prompt, output)
+                    .await?;
+            }
+            ClassifiedInput::RuntimeControl(control) => {
+                render_streaming_turn(kernel, session_id, context.runtime_id, &control.raw, output)
+                    .await?;
+            }
+            ClassifiedInput::LionClawControl(control) => {
+                if handle_lionclaw_repl_control(
+                    kernel,
+                    &mut session_id,
+                    context.runtime_id,
+                    control,
+                    output,
+                )
+                .await?
+                {
+                    break;
+                }
+            }
         }
-        if matches!(trimmed, "/exit" | "/quit") {
-            break;
-        }
-        if trimmed == "/continue" {
+    }
+
+    Ok(())
+}
+
+async fn handle_lionclaw_repl_control<W: Write + Send>(
+    kernel: &Kernel,
+    session_id: &mut uuid::Uuid,
+    runtime_id: &str,
+    control: LionClawControlInput,
+    output: &mut W,
+) -> Result<bool> {
+    match control.command_name.as_str() {
+        "exit" | "quit" => Ok(true),
+        "continue" => {
             render_session_action(
                 kernel,
-                session_id,
-                context.runtime_id,
+                *session_id,
+                runtime_id,
                 SessionActionKind::ContinueLastPartial,
                 output,
             )
             .await?;
-            continue;
+            Ok(false)
         }
-        if trimmed == "/retry" {
+        "retry" => {
             render_session_action(
                 kernel,
-                session_id,
-                context.runtime_id,
+                *session_id,
+                runtime_id,
                 SessionActionKind::RetryLastTurn,
                 output,
             )
             .await?;
-            continue;
+            Ok(false)
         }
-        if trimmed == "/reset" {
+        "reset" => {
             let response = kernel
                 .session_action(SessionActionRequest {
-                    session_id,
+                    session_id: *session_id,
                     action: SessionActionKind::ResetSession,
                 })
                 .await
                 .map_err(kernel_to_anyhow)?;
-            session_id = response.session_id;
+            *session_id = response.session_id;
             writeln!(output, "[status] opened a fresh session")?;
-            continue;
+            Ok(false)
         }
-
-        render_streaming_turn(kernel, session_id, context.runtime_id, trimmed, output).await?;
+        "" => {
+            writeln!(output, "[error] missing LionClaw command")?;
+            Ok(false)
+        }
+        other => {
+            writeln!(output, "[error] unknown LionClaw command: {other}")?;
+            Ok(false)
+        }
     }
-
-    Ok(())
 }
 
 fn local_user_id() -> String {
@@ -321,10 +360,10 @@ async fn render_session_action<W: Write + Send>(
 ) -> Result<()> {
     match action {
         SessionActionKind::ContinueLastPartial => {
-            writeln!(output, "you> /continue")?;
+            writeln!(output, "you> /lionclaw continue")?;
         }
         SessionActionKind::RetryLastTurn => {
-            writeln!(output, "you> /retry")?;
+            writeln!(output, "you> /lionclaw retry")?;
         }
         SessionActionKind::ResetSession => {}
     }
@@ -407,6 +446,7 @@ where
     let mut answer_output_seen = false;
     let mut error_seen = false;
     let mut turn_error: Option<crate::kernel::KernelError> = None;
+    let mut event_stream_open = true;
 
     loop {
         tokio::select! {
@@ -417,21 +457,25 @@ where
                 }
                 break;
             }
-            maybe_event = rx.recv() => {
-                let Some(event) = maybe_event else {
-                    continue;
-                };
-                if is_visible_message_delta(&event) {
-                    visible_output_seen = true;
+            maybe_event = rx.recv(), if event_stream_open => {
+                match maybe_event {
+                    Some(event) => {
+                        if is_visible_message_delta(&event) {
+                            visible_output_seen = true;
+                        }
+                        if is_answer_message_delta(&event) {
+                            answer_output_seen = true;
+                        }
+                        if matches!(event.kind, StreamEventKindDto::Error) {
+                            error_seen = true;
+                        }
+                        render_turn_event(&event, output)?;
+                        output.flush()?;
+                    }
+                    None => {
+                        event_stream_open = false;
+                    }
                 }
-                if is_answer_message_delta(&event) {
-                    answer_output_seen = true;
-                }
-                if matches!(event.kind, StreamEventKindDto::Error) {
-                    error_seen = true;
-                }
-                render_turn_event(&event, output)?;
-                output.flush()?;
             }
         }
     }
@@ -456,7 +500,7 @@ where
                 crate::kernel::KernelError::RuntimeTimeout(_) => {
                     writeln!(
                         output,
-                        "Timed out. Partial output is shown above. Use /continue, /retry, or /reset."
+                        "Timed out. Partial output is shown above. Use /lionclaw continue, /lionclaw retry, or /lionclaw reset."
                     )?;
                     output.flush()?;
                     return Ok(());
@@ -464,7 +508,7 @@ where
                 crate::kernel::KernelError::Runtime(_) => {
                     writeln!(
                         output,
-                        "Runtime error. Partial output is shown above. Use /continue, /retry, or /reset."
+                        "Runtime error. Partial output is shown above. Use /lionclaw continue, /lionclaw retry, or /lionclaw reset."
                     )?;
                     output.flush()?;
                     return Ok(());
@@ -477,7 +521,7 @@ where
                 crate::kernel::KernelError::RuntimeTimeout(_) => {
                     writeln!(
                         output,
-                        "Timed out. Partial output is shown above. Use /retry or /reset."
+                        "Timed out. Partial output is shown above. Use /lionclaw retry or /lionclaw reset."
                     )?;
                     output.flush()?;
                     return Ok(());
@@ -485,7 +529,7 @@ where
                 crate::kernel::KernelError::Runtime(_) => {
                     writeln!(
                         output,
-                        "Runtime error. Partial output is shown above. Use /retry or /reset."
+                        "Runtime error. Partial output is shown above. Use /lionclaw retry or /lionclaw reset."
                     )?;
                     output.flush()?;
                     return Ok(());
@@ -578,12 +622,13 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        local_peer_id_for_project, render_turn_stream, resolve_repl_session, run_local_with_io,
-        run_local_with_io_and_timeouts, RunLocalInvocation,
+        local_peer_id_for_project, render_streaming_future, render_turn_stream,
+        resolve_repl_session, run_local_with_io, run_local_with_io_and_timeouts,
+        RunLocalInvocation,
     };
     use crate::{
         config::resolve_project_workspace_root,
-        contracts::{StreamEventDto, StreamEventKindDto, StreamLaneDto},
+        contracts::{SessionTurnResponse, StreamEventDto, StreamEventKindDto, StreamLaneDto},
         home::{runtime_project_partition_key, LionClawHome},
         kernel::{
             db::Db,
@@ -594,18 +639,46 @@ mod tests {
         runtime_timeouts::RuntimeTurnTimeouts,
     };
 
+    #[tokio::test]
+    async fn render_streaming_future_waits_after_event_stream_closes() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEventDto>();
+        drop(tx);
+        let session_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let mut turn_future = Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            Ok(SessionTurnResponse {
+                session_id,
+                turn_id,
+                assistant_text: String::new(),
+                runtime_skill_ids: Vec::new(),
+                runtime_id: "mock".to_string(),
+                stream_events: Vec::new(),
+            })
+        });
+        let mut output = Vec::new();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            render_streaming_future(&mut turn_future, &mut rx, &mut output),
+        )
+        .await
+        .expect("renderer should wait for the turn future after stream close")
+        .expect("rendering should succeed");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn run_local_uses_existing_setup_and_executes_turns() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let stub = temp_dir.path().join("codex-stub.sh");
-        write_script(
+        write_codex_app_server_stub(
             &stub,
-            r#"#!/usr/bin/env bash
-cat >/dev/null
-echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from repl"}}'
-"#,
+            &[
+                r#"{"method":"item/agentMessage/delta","params":{"threadId":"thr_test","turnId":"turn_test","delta":"hello from repl"}}"#,
+            ],
+            0,
         );
 
         let mut config = OperatorConfig::default();
@@ -613,7 +686,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
 
-        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut input = Cursor::new(b"hello\n/lionclaw exit\n".to_vec());
         let mut output = Vec::new();
         run_local_with_io(&home, None, false, &mut input, &mut output)
             .await
@@ -656,7 +729,7 @@ sleep 1
         save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
 
-        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut input = Cursor::new(b"hello\n/lionclaw exit\n".to_vec());
         let mut output = Vec::new();
         let work_root = std::env::current_dir().expect("current dir");
         run_local_with_io_and_timeouts(
@@ -694,12 +767,12 @@ sleep 1
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let stub = temp_dir.path().join("codex-stub.sh");
-        write_script(
+        write_codex_app_server_stub(
             &stub,
-            r#"#!/usr/bin/env bash
-cat >/dev/null
-echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from repl"}}'
-"#,
+            &[
+                r#"{"method":"item/agentMessage/delta","params":{"threadId":"thr_test","turnId":"turn_test","delta":"hello from repl"}}"#,
+            ],
+            0,
         );
 
         let mut config = OperatorConfig::default();
@@ -707,13 +780,13 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
 
-        let mut first_input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut first_input = Cursor::new(b"hello\n/lionclaw exit\n".to_vec());
         let mut first_output = Vec::new();
         run_local_with_io(&home, None, false, &mut first_input, &mut first_output)
             .await
             .expect("first run");
 
-        let mut second_input = Cursor::new(b"/exit\n".to_vec());
+        let mut second_input = Cursor::new(b"/lionclaw exit\n".to_vec());
         let mut second_output = Vec::new();
         run_local_with_io(&home, None, true, &mut second_input, &mut second_output)
             .await
@@ -740,12 +813,12 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let stub = temp_dir.path().join("codex-stub.sh");
-        write_script(
+        write_codex_app_server_stub(
             &stub,
-            r#"#!/usr/bin/env bash
-cat >/dev/null
-echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from repl"}}'
-"#,
+            &[
+                r#"{"method":"item/agentMessage/delta","params":{"threadId":"thr_test","turnId":"turn_test","delta":"hello from repl"}}"#,
+            ],
+            0,
         );
 
         let mut config = OperatorConfig::default();
@@ -753,7 +826,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
 
-        let mut first_input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut first_input = Cursor::new(b"hello\n/lionclaw exit\n".to_vec());
         let mut first_output = Vec::new();
         run_local_with_io(&home, None, false, &mut first_input, &mut first_output)
             .await
@@ -793,7 +866,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         .await
         .expect("insert newer idle session");
 
-        let mut second_input = Cursor::new(b"/exit\n".to_vec());
+        let mut second_input = Cursor::new(b"/lionclaw exit\n".to_vec());
         let mut second_output = Vec::new();
         run_local_with_io(&home, None, true, &mut second_input, &mut second_output)
             .await
@@ -864,7 +937,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         .await
         .expect("insert interrupted turn");
 
-        let mut input = Cursor::new(b"/exit\n".to_vec());
+        let mut input = Cursor::new(b"/lionclaw exit\n".to_vec());
         let mut output = Vec::new();
         run_local_with_io(&home, None, true, &mut input, &mut output)
             .await
@@ -928,7 +1001,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
 
-        let mut input = Cursor::new(b"/reset\n/exit\n".to_vec());
+        let mut input = Cursor::new(b"/lionclaw reset\n/lionclaw exit\n".to_vec());
         let mut output = Vec::new();
         run_local_with_io(&home, None, false, &mut input, &mut output)
             .await
@@ -965,7 +1038,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
 
-        let mut input = Cursor::new(b"/exit\n".to_vec());
+        let mut input = Cursor::new(b"/lionclaw exit\n".to_vec());
         let mut output = Vec::new();
         run_local_with_io(&home, None, false, &mut input, &mut output)
             .await
@@ -1108,13 +1181,13 @@ exit 0
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let stub = temp_dir.path().join("codex-stub.sh");
-        write_script(
+        write_codex_app_server_stub(
             &stub,
-            r#"#!/usr/bin/env bash
-cat >/dev/null
-echo '{"type":"item.updated","item":{"type":"reasoning","text":"planning next step"}}'
-echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from codex"}}'
-"#,
+            &[
+                r#"{"method":"item/agentReasoning/delta","params":{"threadId":"thr_test","turnId":"turn_test","delta":"planning next step"}}"#,
+                r#"{"method":"item/agentMessage/delta","params":{"threadId":"thr_test","turnId":"turn_test","delta":"hello from codex"}}"#,
+            ],
+            0,
         );
 
         let mut config = OperatorConfig::default();
@@ -1122,7 +1195,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"hello from
         save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
 
-        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut input = Cursor::new(b"hello\n/lionclaw exit\n".to_vec());
         let mut output = Vec::new();
         run_local_with_io(&home, None, false, &mut input, &mut output)
             .await
@@ -1151,7 +1224,7 @@ echo '{"type":"response.output_text.delta","text":"hello from opencode"}'
         config.upsert_runtime("opencode".to_string(), stubbed_opencode_runtime(&stub));
         save_prepared_config(&home, &config).await;
 
-        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut input = Cursor::new(b"hello\n/lionclaw exit\n".to_vec());
         let mut output = Vec::new();
         run_local_with_io(&home, None, false, &mut input, &mut output)
             .await
@@ -1212,7 +1285,7 @@ exit 0
             .expect("set default runtime");
         save_prepared_config(&home, &config).await;
 
-        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut input = Cursor::new(b"hello\n/lionclaw exit\n".to_vec());
         let mut output = Vec::new();
         run_local_with_io(&home, None, false, &mut input, &mut output)
             .await
@@ -1242,7 +1315,7 @@ echo '{"type":"text","text":"hello from opencode"}'
         config.upsert_runtime("opencode".to_string(), stubbed_opencode_runtime(&stub));
         save_prepared_config(&home, &config).await;
 
-        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut input = Cursor::new(b"hello\n/lionclaw exit\n".to_vec());
         let mut output = Vec::new();
         run_local_with_io(&home, None, false, &mut input, &mut output)
             .await
@@ -1274,7 +1347,7 @@ exit 7
         config.upsert_runtime("opencode".to_string(), stubbed_opencode_runtime(&stub));
         save_prepared_config(&home, &config).await;
 
-        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut input = Cursor::new(b"hello\n/lionclaw exit\n".to_vec());
         let mut output = Vec::new();
         run_local_with_io(&home, None, false, &mut input, &mut output)
             .await
@@ -1283,8 +1356,8 @@ exit 7
         let output = String::from_utf8(output).expect("utf8 output");
         assert!(output.contains("thinking> checking the workspace"));
         assert!(output.contains("Runtime error. Partial output is shown above."));
-        assert!(output.contains("Use /retry or /reset."));
-        assert!(!output.contains("Use /continue, /retry, or /reset."));
+        assert!(output.contains("Use /lionclaw retry or /lionclaw reset."));
+        assert!(!output.contains("Use /lionclaw continue, /lionclaw retry, or /lionclaw reset."));
         assert!(!output.contains("Timed out. Partial output is shown above."));
     }
 
@@ -1294,13 +1367,12 @@ exit 7
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let stub = temp_dir.path().join("codex-stub.sh");
-        write_script(
+        write_codex_app_server_stub(
             &stub,
-            r#"#!/usr/bin/env bash
-cat >/dev/null
-echo '{"type":"item.updated","item":{"type":"reasoning","text":"checking the workspace"}}'
-exit 7
-"#,
+            &[
+                r#"{"method":"item/agentReasoning/delta","params":{"threadId":"thr_test","turnId":"turn_test","delta":"checking the workspace"}}"#,
+            ],
+            7,
         );
 
         let mut config = OperatorConfig::default();
@@ -1308,7 +1380,7 @@ exit 7
         save_prepared_config(&home, &config).await;
         write_codex_runtime_auth(&home).await;
 
-        let mut input = Cursor::new(b"hello\n/exit\n".to_vec());
+        let mut input = Cursor::new(b"hello\n/lionclaw exit\n".to_vec());
         let mut output = Vec::new();
         run_local_with_io(&home, None, false, &mut input, &mut output)
             .await
@@ -1317,8 +1389,8 @@ exit 7
         let output = String::from_utf8(output).expect("utf8 output");
         assert!(output.contains("thinking> checking the workspace"));
         assert!(output.contains("Runtime error. Partial output is shown above."));
-        assert!(output.contains("Use /retry or /reset."));
-        assert!(!output.contains("Use /continue, /retry, or /reset."));
+        assert!(output.contains("Use /lionclaw retry or /lionclaw reset."));
+        assert!(!output.contains("Use /lionclaw continue, /lionclaw retry, or /lionclaw reset."));
         assert!(!output.contains("Timed out. Partial output is shown above."));
     }
 
@@ -1390,6 +1462,74 @@ exit 7
         std::fs::rename(&temp_path, path).expect("rename script");
         let permissions = std::fs::Permissions::from_mode(0o755);
         std::fs::set_permissions(path, permissions).expect("chmod script");
+    }
+
+    #[cfg(unix)]
+    fn write_codex_app_server_stub(path: &std::path::Path, turn_events: &[&str], exit_code: i32) {
+        let mut script = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+while IFS= read -r line; do
+  case "${line}" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"serverInfo":{"name":"codex-test","version":"0.0.0"}}}'
+      ;;
+    *'"method":"initialized"'*)
+      ;;
+    *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+      printf '%s\n' '{"id":2,"result":{"thread":{"id":"thr_test"}}}'
+      printf '%s\n' '{"method":"thread/started","params":{"threadId":"thr_test"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn_test"}}}'
+      printf '%s\n' '{"method":"turn/started","params":{"threadId":"thr_test","turnId":"turn_test"}}'
+"#
+        .to_string();
+
+        for event in turn_events {
+            assert!(
+                !event.contains('\''),
+                "test event JSON cannot contain single quotes"
+            );
+            script.push_str("      printf '%s\\n' '");
+            script.push_str(event);
+            script.push_str("'\n");
+        }
+
+        if exit_code == 0 {
+            script.push_str(
+                r#"      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thr_test","turnId":"turn_test"}}'
+      ;;
+"#,
+            );
+        } else {
+            script.push_str(&format!(
+                r#"      exit {exit_code}
+      ;;
+"#
+            ));
+        }
+
+        script.push_str(
+            r#"    *'"method":"model/list"'*)
+      printf '%s\n' '{"id":2,"result":{"data":[{"id":"gpt-test"}]}}'
+      ;;
+    *'"method":"thread/name/set"'*)
+      printf '%s\n' '{"id":3,"result":{}}'
+      printf '%s\n' '{"method":"thread/name/updated","params":{"threadId":"thr_test"}}'
+      ;;
+    *'"method":"thread/compact/start"'*)
+      printf '%s\n' '{"id":3,"result":{"threadId":"thr_test"}}'
+      printf '%s\n' '{"method":"turn/started","params":{"threadId":"thr_test","turnId":"turn_compact_test"}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"thr_test","turnId":"turn_compact_test","item":{"id":"item_compact_test","type":"contextCompaction"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thr_test","turnId":"turn_compact_test","turn":{"id":"turn_compact_test","status":"completed"}}}'
+      ;;
+  esac
+done
+"#,
+        );
+
+        write_script(path, &script);
     }
 
     #[cfg(unix)]
