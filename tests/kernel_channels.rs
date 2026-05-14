@@ -788,6 +788,128 @@ async fn channels_v2_block_by_scope_closes_matching_pending_pairing() {
 }
 
 #[tokio::test]
+async fn channels_v2_direct_block_denies_scoped_session_access() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "slack", "v2-direct-block-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    let thread_pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "slack",
+            "direct-block-thread-pending",
+            "alice",
+            "room-1",
+            Some("topic-a"),
+            "approve this thread",
+            ChannelTrigger::ThreadContinuation,
+        ))
+        .await
+        .expect("create thread pairing");
+    approve_pairing_id(
+        &kernel,
+        "slack",
+        thread_pending.pairing_id.expect("thread pairing id"),
+    )
+    .await;
+
+    let thread = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "slack",
+            "direct-block-thread-queued",
+            "alice",
+            "room-1",
+            Some("topic-a"),
+            "run thread turn",
+            ChannelTrigger::ThreadContinuation,
+        ))
+        .await
+        .expect("queue thread turn");
+    assert_eq!(thread.outcome, ChannelInboundOutcome::Queued);
+
+    let conversation_pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "slack",
+            "direct-block-conversation-pending",
+            "alice",
+            "room-1",
+            None,
+            "approve this room",
+            ChannelTrigger::Mention,
+        ))
+        .await
+        .expect("create conversation pairing");
+    approve_pairing_id(
+        &kernel,
+        "slack",
+        conversation_pending
+            .pairing_id
+            .expect("conversation pairing id"),
+    )
+    .await;
+
+    let conversation = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "slack",
+            "direct-block-conversation-queued",
+            "alice",
+            "room-1",
+            None,
+            "run conversation turn",
+            ChannelTrigger::Mention,
+        ))
+        .await
+        .expect("queue conversation turn");
+    assert_eq!(conversation.outcome, ChannelInboundOutcome::Queued);
+
+    kernel
+        .block_channel_pairing(ChannelPairingBlockRequest {
+            channel_id: "slack".to_string(),
+            pairing_id: None,
+            sender_ref: Some("alice".to_string()),
+            conversation_ref: None,
+            thread_ref: None,
+            reason: Some("operator_blocked".to_string()),
+        })
+        .await
+        .expect("block direct sender");
+
+    let conversation_open = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "slack".to_string(),
+            peer_id: conversation_session_key("slack", "room-1", "alice"),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect_err("direct block must deny conversation session open");
+    assert!(matches!(
+        conversation_open,
+        KernelError::Conflict(message) if message.contains("blocked")
+    ));
+
+    let thread_turn = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: thread.session_id.expect("thread session id"),
+            user_text: "blocked thread follow up".to_string(),
+            runtime_id: Some("mock".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect_err("direct block must deny thread session mutation");
+    assert!(matches!(
+        thread_turn,
+        KernelError::Conflict(message) if message.contains("blocked")
+    ));
+}
+
+#[tokio::test]
 async fn channels_v2_admission_rolls_back_dedupe_when_turn_cannot_be_queued() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "terminal", "v2-atomic-skill").await;
@@ -2322,6 +2444,14 @@ fn direct_session_key(channel_id: &str, peer_id: &str) -> String {
     format!("channel:{channel_id}:direct:{}", session_key_part(peer_id))
 }
 
+fn conversation_session_key(channel_id: &str, conversation_ref: &str, sender_ref: &str) -> String {
+    format!(
+        "channel:{channel_id}:conversation:{}:sender:{}",
+        session_key_part(conversation_ref),
+        session_key_part(sender_ref)
+    )
+}
+
 fn thread_session_key(
     channel_id: &str,
     conversation_ref: &str,
@@ -2432,6 +2562,20 @@ async fn approve_pairing(kernel: &Kernel, channel_id: &str, peer_id: &str) {
         })
         .await
         .expect("approve pairing");
+}
+
+async fn approve_pairing_id(kernel: &Kernel, channel_id: &str, pairing_id: uuid::Uuid) {
+    kernel
+        .approve_channel_pairing(ChannelPairingApproveRequest {
+            channel_id: channel_id.to_string(),
+            pairing_id: Some(pairing_id),
+            pairing_code: None,
+            routing_profile: None,
+            trust_tier: Some(TrustTier::Main),
+            label: None,
+        })
+        .await
+        .expect("approve pairing by id");
 }
 
 async fn wait_for_latest_turn<F>(kernel: &Kernel, session_id: uuid::Uuid, predicate: F, label: &str)
