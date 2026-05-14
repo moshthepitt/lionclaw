@@ -380,7 +380,7 @@ pub async fn pairing_approve(
 ) -> Result<ChannelGrantResponse> {
     let config = OperatorConfig::load(home).await?;
     let kernel = open_kernel(home, &config, None).await?;
-    let (pairing_id, pairing_code) = pairing_ref(pairing);
+    let (pairing_id, pairing_code) = uuid_or_ref(pairing);
     kernel
         .approve_channel_pairing(ChannelPairingApproveRequest {
             channel_id,
@@ -404,7 +404,7 @@ pub async fn pairing_block(
 ) -> Result<ChannelGrantResponse> {
     let config = OperatorConfig::load(home).await?;
     let kernel = open_kernel(home, &config, None).await?;
-    let (pairing_id, sender_ref) = pairing_id_or_sender_ref(target);
+    let (pairing_id, sender_ref) = uuid_or_ref(target);
     kernel
         .block_channel_pairing(ChannelPairingBlockRequest {
             channel_id,
@@ -436,15 +436,7 @@ pub async fn pairing_revoke(
         .map_err(to_anyhow)
 }
 
-fn pairing_ref(raw: String) -> (Option<Uuid>, Option<String>) {
-    let trimmed = raw.trim();
-    match Uuid::parse_str(trimmed) {
-        Ok(pairing_id) => (Some(pairing_id), None),
-        Err(_) => (None, Some(trimmed.to_string())),
-    }
-}
-
-fn pairing_id_or_sender_ref(raw: String) -> (Option<Uuid>, Option<String>) {
+fn uuid_or_ref(raw: String) -> (Option<Uuid>, Option<String>) {
     let trimmed = raw.trim();
     match Uuid::parse_str(trimmed) {
         Ok(pairing_id) => (Some(pairing_id), None),

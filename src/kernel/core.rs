@@ -1043,16 +1043,22 @@ impl Kernel {
         req: ChannelPairingApproveRequest,
     ) -> Result<ChannelGrantResponse, KernelError> {
         let channel_id = trim_required(req.channel_id, "channel_id")?;
-        if req.pairing_id.is_some()
-            == req
-                .pairing_code
-                .as_ref()
-                .is_some_and(|v| !v.trim().is_empty())
-        {
-            return Err(KernelError::BadRequest(
-                "exactly one of pairing_id or pairing_code is required".to_string(),
-            ));
-        }
+        let pairing_id = req.pairing_id;
+        let pairing_code = req
+            .pairing_code
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let lookup = match (pairing_id, pairing_code) {
+            (Some(pairing_id), None) => PairingLookup::Id(pairing_id),
+            (None, Some(pairing_code)) => PairingLookup::Code(pairing_code),
+            _ => {
+                return Err(KernelError::BadRequest(
+                    "exactly one of pairing_id or pairing_code is required".to_string(),
+                ));
+            }
+        };
         self.require_active_channel_binding(&channel_id).await?;
 
         let mut tx = self
@@ -1061,29 +1067,30 @@ impl Kernel {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|err| internal(err.into()))?;
-        let pairing = if let Some(pairing_id) = req.pairing_id {
-            self.channel_state
+        let pairing = match lookup {
+            PairingLookup::Id(pairing_id) => self
+                .channel_state
                 .get_pairing_request_by_id_in_tx(&mut tx, pairing_id)
                 .await
-                .map_err(internal)?
-        } else {
-            let pairing_code = req
-                .pairing_code
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| KernelError::BadRequest("pairing_code is required".to_string()))?;
-            let code_hash = hash_pairing_code(pairing_code);
-            self.channel_state
-                .get_pairing_request_by_code_hash_in_tx(&mut tx, &channel_id, &code_hash)
-                .await
-                .map_err(internal)?
+                .map_err(internal)?,
+            PairingLookup::Code(pairing_code) => {
+                let code_hash = hash_pairing_code(&pairing_code);
+                self.channel_state
+                    .get_pairing_request_by_code_hash_in_tx(&mut tx, &channel_id, &code_hash)
+                    .await
+                    .map_err(internal)?
+            }
         }
         .ok_or_else(|| KernelError::NotFound("channel pairing request not found".to_string()))?;
 
         if pairing.channel_id != channel_id {
             return Err(KernelError::BadRequest(
                 "pairing request does not belong to channel_id".to_string(),
+            ));
+        }
+        if pairing.claim_policy != "operator_approval" {
+            return Err(KernelError::Conflict(
+                "pairing request is not pending operator approval".to_string(),
             ));
         }
         if pairing.status != ChannelPairingStatus::Pending {
@@ -4603,6 +4610,7 @@ fn internal(err: anyhow::Error) -> KernelError {
 }
 
 const MAX_PROVIDER_METADATA_BYTES: usize = 16 * 1024;
+const PAIRING_CODE_HEX_CHARS: usize = 20;
 
 #[derive(Debug, Clone)]
 struct ValidatedChannelInbound {
@@ -4627,6 +4635,12 @@ struct GrantScope {
     thread_ref: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+enum PairingLookup {
+    Id(Uuid),
+    Code(String),
+}
+
 fn validate_channel_inbound_request(
     req: ChannelInboundRequest,
 ) -> Result<ValidatedChannelInbound, KernelError> {
@@ -4644,8 +4658,17 @@ fn validate_channel_inbound_request(
         ));
     }
 
-    for attachment in &req.attachments {
-        validate_attachment_descriptor(attachment)?;
+    let mut attachments = Vec::with_capacity(req.attachments.len());
+    let mut attachment_ids = HashSet::with_capacity(req.attachments.len());
+    for attachment in req.attachments {
+        let attachment = normalize_attachment_descriptor(attachment)?;
+        if !attachment_ids.insert(attachment.attachment_id.clone()) {
+            return Err(KernelError::BadRequest(format!(
+                "duplicate attachment_id '{}'",
+                attachment.attachment_id
+            )));
+        }
+        attachments.push(attachment);
     }
     let provider_metadata = if req.provider_metadata.is_null() {
         json!({})
@@ -4668,7 +4691,7 @@ fn validate_channel_inbound_request(
         thread_ref,
         message_ref,
         text,
-        attachments: req.attachments,
+        attachments,
         reply_to_ref,
         trigger: req.trigger,
         received_at: req.received_at.unwrap_or_else(Utc::now),
@@ -4676,24 +4699,26 @@ fn validate_channel_inbound_request(
     })
 }
 
-fn validate_attachment_descriptor(
-    attachment: &ChannelAttachmentDescriptor,
-) -> Result<(), KernelError> {
-    if attachment.attachment_id.trim().is_empty()
-        || attachment.kind.trim().is_empty()
-        || attachment.provider_file_ref.trim().is_empty()
-    {
-        return Err(KernelError::BadRequest(
-            "attachment_id, kind and provider_file_ref are required for every attachment"
-                .to_string(),
-        ));
-    }
+fn normalize_attachment_descriptor(
+    attachment: ChannelAttachmentDescriptor,
+) -> Result<ChannelAttachmentDescriptor, KernelError> {
+    let attachment_id = trim_required(attachment.attachment_id, "attachment_id")?;
+    let kind = trim_required(attachment.kind, "kind")?;
+    let provider_file_ref = trim_required(attachment.provider_file_ref, "provider_file_ref")?;
     if attachment.size_bytes.is_some_and(|value| value < 0) {
         return Err(KernelError::BadRequest(
             "attachment size_bytes cannot be negative".to_string(),
         ));
     }
-    Ok(())
+    Ok(ChannelAttachmentDescriptor {
+        attachment_id,
+        kind,
+        mime_type: trim_optional(attachment.mime_type),
+        filename: trim_optional(attachment.filename),
+        size_bytes: attachment.size_bytes,
+        provider_file_ref,
+        caption: trim_optional(attachment.caption),
+    })
 }
 
 fn trim_required(value: String, field: &str) -> Result<String, KernelError> {
@@ -5152,9 +5177,9 @@ fn split_text_chunks(content: &str, max_len: usize) -> Vec<String> {
 }
 
 fn generate_pairing_code() -> String {
-    let bytes = *Uuid::new_v4().as_bytes();
-    let number = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 1_000_000;
-    format!("{number:06}")
+    let raw = Uuid::new_v4().simple().to_string();
+    // Keep enough entropy that storing only a hash is meaningful if state leaks.
+    format!("pc_{}", &raw[..PAIRING_CODE_HEX_CHARS])
 }
 
 fn assistant_text_from_events(events: &[RuntimeEvent]) -> String {
