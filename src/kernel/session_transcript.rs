@@ -1028,6 +1028,7 @@ mod tests {
             assistant_text: assistant_text.to_string(),
             error_code: None,
             error_text: error_text.map(ToString::to_string),
+            attachment_source_turn_id: None,
             runtime_id: "mock".to_string(),
             started_at: Utc::now(),
             finished_at: None,

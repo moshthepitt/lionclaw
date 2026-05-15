@@ -199,6 +199,8 @@ The everyday runtime layout is mount-first:
 - `/runtime`: runtime-private writable state root
 - `/drafts`: runtime-private draft/output area
 - `/lionclaw/skills/<alias>`: installed non-channel skill snapshot assets mounted read-only
+- `/attachments`: read-only channel attachment files for the current inbound
+  event, present only after attachment finalization staged files for that turn
 
 For local `lionclaw run`, target resolution selects one project instance and
 uses that instance's recorded work root. The work root is mounted at
@@ -280,6 +282,8 @@ with the CLI.
 - `POST /v0/channels/pairing/block`
 - `POST /v0/channels/grants/revoke`
 - `POST /v0/channels/inbound`
+- `POST /v0/channels/attachments/stage` (multipart worker upload)
+- `POST /v0/channels/attachments/finalize`
 - `POST /v0/channels/stream/pull`
 - `POST /v0/channels/stream/ack`
 
@@ -330,20 +334,67 @@ External channel skills integrate over HTTP:
 1. `GET /v0/sessions/latest` restores the latest durable session snapshot for
    a deterministic `(channel_id, session_key)`.
 2. `POST /v0/channels/inbound` submits normalized inbound facts. Approved
-   grants queue a channel turn and receive an explicit outcome.
-3. `POST /v0/sessions/action` starts `continue_last_partial`,
+   grants queue a channel turn and receive an explicit outcome. Inbound v2
+   carries attachment descriptors first; workers fetch binary files only after
+   admission.
+3. If the inbound outcome is `waiting_for_attachments`, the worker uploads each
+   admitted file with `POST /v0/channels/attachments/stage`, then calls
+   `POST /v0/channels/attachments/finalize`. Finalization rejects missing or
+   unstaged descriptors and makes the turn claimable. At execution time, the
+   kernel derives a runtime-only prompt manifest from the stored attachment
+   rows. Descriptors rejected at admission by known size policy are recorded in
+   the manifest immediately; if no stageable attachments remain, the turn queues
+   without waiting for a worker finalize call.
+4. `POST /v0/sessions/action` starts `continue_last_partial`,
    `retry_last_turn`, or `reset_session` for a channel-backed session.
-4. `POST /v0/channels/stream/pull` fetches typed outbound stream events for a
+5. `POST /v0/channels/stream/pull` fetches typed outbound stream events for a
    consumer cursor.
-5. `POST /v0/channels/stream/ack` records that a worker durably handled events
+6. `POST /v0/channels/stream/ack` records that a worker durably handled events
    through a sequence.
-6. Pairing invite/claim, approve/block, and grant revoke endpoints manage
+7. Pairing invite/claim, approve/block, and grant revoke endpoints manage
    channel trust. Invite tokens are returned once, stored only as hashes, and
    claimed through worker-submitted provider facts.
    Blocking a sender scope also closes matching pending operator-approval
    pairing requests. Blocking a token invite by `pairing_id` marks that invite
    blocked without creating a sender grant. Blocks are enforced from the
    most-specific scope back to the direct sender.
+
+Attachment files are stored under LionClaw runtime state at
+`runtime/channels/sha256-<channel-id-digest>/attachments/sha256-<event-id-digest>/sha256-<attachment-id-digest>/`.
+The hash components are derived from the normalized IDs; raw provider IDs remain
+in the database and runtime manifest. Staging uses a temp file and commits only
+into kernel-derived path components without following symlinks. Admission and
+staging enforce 10 attachments per event, 25 MiB per attachment, and 50 MiB per
+event. Multipart staging accepts enough body to report typed policy rejections
+for oversized uploads inside the event-size envelope; larger bodies are
+transport rejected. Runtime turns see only staged files through a
+manifest-derived, read-only `/attachments` projection mount. Projection copies
+are removed after the runtime turn; maintenance removes stale projection
+directories left behind by crashes. The runtime-only prompt manifest shape is:
+
+```json
+{
+  "channel_attachments": [
+    {
+      "id": "att-1",
+      "kind": "image",
+      "filename": "image.png",
+      "mime_type": "image/png",
+      "size_bytes": 123,
+      "sha256": "...",
+      "path": "/attachments/att-1-4f4a9410ffcdf895/image.png",
+      "caption": "optional caption"
+    }
+  ],
+  "rejected_channel_attachments": [
+    {
+      "id": "att-2",
+      "kind": "image",
+      "reason_code": "not_staged"
+    }
+  ]
+}
+```
 
 Queued channel turns emit machine-stable status/error codes through the same
 stream contract. Kernel-generated lifecycle codes include:
@@ -406,6 +457,10 @@ Kernel bootstrap converts stale `running` session turns into durable
 `interrupted` turns before they can be reused. Durable pending channel turns are
 not interrupted on restart; bootstrap re-drives their channel workers so
 accepted inbound work is recoverable after commit.
+Attachment-waiting channel turns are not claimable. Bootstrap finalizes waiting
+attachment batches older than one hour by rejecting unstaged descriptors with
+`not_staged`, then queues the turn. Stale temp uploads older than one day are
+removed, while committed staged blobs are retained.
 
 ## Assistant Continuity
 
