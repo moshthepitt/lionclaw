@@ -2335,6 +2335,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configure_codex_reports_missing_podman_without_writing_config() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let err = configure_runtime_with_io_and_engine_resolver(
+            &home,
+            Some("codex".to_string()),
+            false,
+            &mut input,
+            &mut output,
+            |_| normalize_podman_executable("lionclaw-definitely-missing-podman"),
+        )
+        .await
+        .expect_err("missing podman should fail");
+
+        let message = err.to_string();
+        assert!(message.contains("Podman is required for OCI confinement"));
+        assert!(message.contains("environment running LionClaw"));
+        assert!(
+            !home.config_path().exists(),
+            "configure should not create config when Podman is missing"
+        );
+    }
+
+    #[tokio::test]
     async fn interactive_configure_requires_runtime_input() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join("home"));

@@ -15,14 +15,17 @@ use crate::{
         channel_env::validate_channel_env_contract,
         channel_metadata::{load_channel_metadata, validate_channel_id},
         command_display::{lionclaw_home_command_prefix, shell_quote_arg},
-        config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
+        config::{
+            normalize_podman_executable, podman_executable_inspect_command,
+            podman_executable_repair_note, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig,
+        },
         daemon_probe::{classify_daemon, DaemonClassification},
         managed_units::{
             daemon_unit_name, existing_unit_identity, unit_file_metadata, unit_status_is_active,
             UnitManager,
         },
         runtime::resolve_runtime_execution_context,
-        runtime_integration::runtime_auth_guidance,
+        runtime_integration::{runtime_auth_guidance, DEFAULT_OCI_ENGINE},
         target::{
             discover_diagnostic_project_root, instance_home_path, instances_dir_path,
             normalize_project_default_instance, project_dir_path, project_file_path,
@@ -856,7 +859,31 @@ fn inspect_runtime_config(
     config: &OperatorConfig,
     findings: &mut Vec<DoctorFinding>,
 ) {
+    inspect_runtime_config_with_podman_resolver(name, commands, config, findings, || {
+        normalize_podman_executable(DEFAULT_OCI_ENGINE)
+    });
+}
+
+fn inspect_runtime_config_with_podman_resolver<F>(
+    name: &str,
+    commands: &DoctorCommands,
+    config: &OperatorConfig,
+    findings: &mut Vec<DoctorFinding>,
+    resolve_default_podman: F,
+) where
+    F: FnOnce() -> Result<String>,
+{
+    let default_runtime_repair = commands.selected("configure --runtime codex");
     let Some(runtime_id) = config.defaults.runtime.as_deref() else {
+        if let Err(err) = resolve_default_podman() {
+            findings.push(podman_blocks_runtime_configure_finding(
+                name,
+                default_runtime_repair,
+                err,
+            ));
+            return;
+        }
+
         findings.push(
             DoctorFinding::error(
                 FindingKind::Runtime,
@@ -865,12 +892,21 @@ fn inspect_runtime_config(
                 "runtime setup is required before run/up/connect can launch workers",
             )
             .with_inspect(commands.selected("status"))
-            .with_repair(commands.selected("configure --runtime codex")),
+            .with_repair(default_runtime_repair),
         );
         return;
     };
 
     let Some(profile) = config.runtimes.get(runtime_id) else {
+        if let Err(err) = resolve_default_podman() {
+            findings.push(podman_blocks_runtime_configure_finding(
+                name,
+                default_runtime_repair,
+                err,
+            ));
+            return;
+        }
+
         findings.push(
             DoctorFinding::error(
                 FindingKind::Runtime,
@@ -879,7 +915,7 @@ fn inspect_runtime_config(
                 "defaults.runtime points at a profile that is not configured",
             )
             .with_inspect(commands.selected("status"))
-            .with_repair(commands.selected("configure --runtime codex")),
+            .with_repair(default_runtime_repair),
         );
         return;
     };
@@ -893,7 +929,7 @@ fn inspect_runtime_config(
                 err.to_string(),
             )
             .with_inspect(commands.selected("status"))
-            .with_repair(commands.selected("configure --runtime codex")),
+            .with_repair(default_runtime_repair),
         );
     }
 
@@ -908,6 +944,25 @@ fn inspect_runtime_config(
             .with_inspect(commands.selected("status")),
         );
     }
+}
+
+fn podman_blocks_runtime_configure_finding(
+    name: &str,
+    repair_command: String,
+    err: anyhow::Error,
+) -> DoctorFinding {
+    DoctorFinding::error(
+        FindingKind::Runtime,
+        format!("instance \"{name}\" cannot configure Codex because Podman is unavailable"),
+        format!("instance {name} OCI engine {DEFAULT_OCI_ENGINE}"),
+        err.to_string(),
+    )
+    .with_inspect(podman_executable_inspect_command(DEFAULT_OCI_ENGINE))
+    .with_note(format!(
+        "{} before running the repair command",
+        podman_executable_repair_note()
+    ))
+    .with_repair(repair_command)
 }
 
 fn inspect_channels(
@@ -2056,6 +2111,46 @@ mod tests {
         );
         assert!(rendered.contains("observed: configure first"));
         assert!(rendered.contains("inspect: lionclaw status"));
+    }
+
+    #[test]
+    fn doctor_reports_missing_podman_before_configure_repair() {
+        let commands = DoctorCommands::for_target(
+            Some(Path::new("/repo")),
+            "main",
+            Path::new("/repo/.lionclaw/instances/main"),
+        );
+        let config = OperatorConfig::default();
+        let mut findings = Vec::new();
+
+        inspect_runtime_config_with_podman_resolver(
+            "main",
+            &commands,
+            &config,
+            &mut findings,
+            || {
+                Err(anyhow::anyhow!(
+                    "Podman is required for OCI confinement, but host executable `podman` is not available in the environment running LionClaw"
+                ))
+            },
+        );
+
+        let finding = findings.first().expect("runtime finding");
+        assert_eq!(finding.id, "LC-D050");
+        assert_eq!(
+            finding.subject.as_ref(),
+            "instance \"main\" cannot configure Codex because Podman is unavailable"
+        );
+        assert_eq!(finding.target.as_ref(), "instance main OCI engine podman");
+        assert_eq!(finding.runbook.inspect.as_ref(), "command -v podman");
+        assert_eq!(
+            finding.runbook.note.as_deref(),
+            Some("Install Podman or run LionClaw where Podman is available before running the repair command")
+        );
+        assert_eq!(
+            finding.runbook.repair.as_deref(),
+            Some("lionclaw --project /repo --instance main configure --runtime codex")
+        );
     }
 
     #[tokio::test]

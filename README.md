@@ -93,9 +93,10 @@ runtime:
 lionclaw run
 ```
 
-For Codex, use a logged-in Codex CLI. If `run` reports a missing runtime image,
-build or provide the image named in the error. The bundled image definition
-lives at `containers/runtime/Containerfile`.
+For Codex, use a logged-in Codex CLI and run LionClaw where the `podman`
+executable is available. If `run` reports a missing runtime image, build or
+provide the image named in the error. The bundled image definition lives at
+`containers/runtime/Containerfile`.
 
 `doctor` checks setup. `run` checks launch. Use `lionclaw --help` and
 subcommand `--help` for current syntax.
