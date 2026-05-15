@@ -41,6 +41,7 @@ const UNRESOLVED_WORK_ROOT_NOTE: &str =
 pub enum FindingSeverity {
     Error,
     Warning,
+    Info,
 }
 
 impl FindingSeverity {
@@ -48,6 +49,7 @@ impl FindingSeverity {
         match self {
             Self::Error => "error",
             Self::Warning => "warning",
+            Self::Info => "info",
         }
     }
 }
@@ -146,7 +148,7 @@ impl FindingKind {
                 "instance config is a readable regular version = 1 TOML file"
             }
             Self::Runtime => "selected instance has a valid configured runtime profile",
-            Self::RuntimeAuth => "runtime authentication state is handled outside doctor",
+            Self::RuntimeAuth => "runtime authentication is checked when the runtime launches",
             Self::Channel => {
                 "configured channels reference installed skills with matching metadata and valid private env state"
             }
@@ -207,6 +209,15 @@ impl DoctorFinding {
         Self::new(FindingSeverity::Warning, kind, subject, target, observed)
     }
 
+    fn info(
+        kind: FindingKind,
+        subject: impl Into<String>,
+        target: impl Into<String>,
+        observed: impl Into<String>,
+    ) -> Self {
+        Self::new(FindingSeverity::Info, kind, subject, target, observed)
+    }
+
     fn new(
         severity: FindingSeverity,
         kind: FindingKind,
@@ -261,6 +272,7 @@ fn target_looks_like_path(target: &str) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct DoctorReport {
     pub findings: Vec<DoctorFinding>,
+    pub next_command: Option<Box<str>>,
 }
 
 impl DoctorReport {
@@ -271,11 +283,24 @@ impl DoctorReport {
     }
 
     pub fn render(&self) -> String {
-        if self.findings.is_empty() {
-            return "doctor: no errors or warnings\n".to_string();
+        let error_count = self.severity_count(FindingSeverity::Error);
+        let non_error_count = self.findings.len().saturating_sub(error_count);
+        let mut output = String::new();
+
+        if error_count > 0 {
+            output.push_str("doctor: setup blocked\n");
+            output.push_str("next: inspect or repair findings below, then rerun doctor\n\n");
+        } else {
+            output.push_str("doctor: no blocking setup issues\n");
+            if let Some(next_command) = self.next_command.as_deref() {
+                output.push_str(&format!("next: {next_command}\n"));
+            }
+            if non_error_count == 0 {
+                return output;
+            }
+            output.push_str("note: non-error findings below are advisory\n\n");
         }
 
-        let mut output = String::new();
         for finding in &self.findings {
             output.push_str(&format!(
                 "[{}] {}: {}\n",
@@ -298,12 +323,23 @@ impl DoctorReport {
         output
     }
 
+    fn severity_count(&self, severity: FindingSeverity) -> usize {
+        self.findings
+            .iter()
+            .filter(|finding| finding.severity == severity)
+            .count()
+    }
+
     fn push(&mut self, finding: DoctorFinding) {
         self.findings.push(finding);
     }
 
     fn extend(&mut self, findings: Vec<DoctorFinding>) {
         self.findings.extend(findings);
+    }
+
+    fn set_next_command(&mut self, command: impl Into<String>) {
+        self.next_command = Some(command.into().into_boxed_str());
     }
 }
 
@@ -366,6 +402,10 @@ impl DoctorCommands {
 
     fn selected(&self, command: &str) -> String {
         format!("{} {command}", self.selected_prefix)
+    }
+
+    fn run(&self) -> String {
+        self.selected("run")
     }
 
     fn create_instance_repair(&self) -> Option<String> {
@@ -507,6 +547,16 @@ async fn inspect_project<M: UnitManager>(
         }
     }
 
+    if !all && selected_names.len() == 1 {
+        let name = &selected_names[0];
+        let home = instances
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| instance_home_path(project_root, name));
+        let commands = DoctorCommands::for_target(Some(project_root), name, &home);
+        report.set_next_command(commands.run());
+    }
+
     for name in selected_names {
         let home = instances
             .get(&name)
@@ -611,6 +661,8 @@ fn project_has_no_instances_finding(project_root: &Path, repair_instance: &str) 
 async fn inspect_direct_home<M: UnitManager>(home: &Path, manager: &M) -> Result<DoctorReport> {
     let mut report = DoctorReport::default();
     let name = "direct-home";
+    let commands = DoctorCommands::for_target(None, name, home);
+    report.set_next_command(commands.run());
     for finding in inspect_instance(None, name, home, manager).await {
         report.push(finding);
     }
@@ -935,9 +987,9 @@ fn inspect_runtime_config_with_podman_resolver<F>(
 
     if let Some(guidance) = runtime_auth_guidance(profile) {
         findings.push(
-            DoctorFinding::warning(
+            DoctorFinding::info(
                 FindingKind::RuntimeAuth,
-                format!("runtime auth for \"{runtime_id}\" is not refreshed by doctor"),
+                format!("runtime auth for \"{runtime_id}\" is checked at launch"),
                 format!("instance {name} runtime auth {runtime_id}"),
                 guidance,
             )
@@ -1917,6 +1969,8 @@ mod tests {
         channel_unit_name, daemon_unit_name, ensure_unit_identity, render_daemon_unit,
         DaemonUnitSpec, FakeUnitManager, UnitManager,
     };
+    use crate::operator::runtime_integration::configure_runtime_profile_with_engine_resolver;
+    use crate::operator::target::init_project;
 
     async fn configured_bind_fixture() -> (
         tempfile::TempDir,
@@ -1936,6 +1990,22 @@ mod tests {
         let mut config = OperatorConfig::default();
         config.daemon.bind_configured = true;
         (temp_dir, home, work_root, commands, config)
+    }
+
+    fn fake_podman(root: &Path) -> PathBuf {
+        let path = root.join("podman");
+        fs::write(&path, "#!/usr/bin/env bash\nexit 0\n").expect("write fake podman");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod fake podman");
+        path
+    }
+
+    async fn configure_test_codex(home: &LionClawHome, engine: &Path) {
+        let mut config = OperatorConfig::load(home).await.expect("load config");
+        configure_runtime_profile_with_engine_resolver(&mut config, "codex", |_| {
+            Ok(engine.to_string_lossy().to_string())
+        })
+        .expect("configure codex");
+        config.save(home).await.expect("save config");
     }
 
     fn raw_daemon_fingerprint(home: &LionClawHome, config: &OperatorConfig) -> String {
@@ -2057,6 +2127,10 @@ mod tests {
             "lionclaw --project /repo --instance reviewer up"
         );
         assert_eq!(
+            commands.run(),
+            "lionclaw --project /repo --instance reviewer run"
+        );
+        assert_eq!(
             commands.unresolved_work_root_note(),
             UNRESOLVED_WORK_ROOT_NOTE
         );
@@ -2075,6 +2149,7 @@ mod tests {
             commands.selected("status"),
             "lionclaw --home /tmp/lionclaw-home status"
         );
+        assert_eq!(commands.run(), "lionclaw --home /tmp/lionclaw-home run");
         assert!(commands.create_instance_repair().is_none());
         assert_eq!(
             commands.unresolved_work_root_note(),
@@ -2091,6 +2166,7 @@ mod tests {
                 "lionclaw-old.service",
                 "left alone",
             )],
+            ..DoctorReport::default()
         };
         assert!(!warning.has_errors());
 
@@ -2101,9 +2177,12 @@ mod tests {
                 "instance main runtime defaults",
                 "configure first",
             )],
+            ..DoctorReport::default()
         };
         assert!(error.has_errors());
         let rendered = error.render();
+        assert!(rendered.starts_with("doctor: setup blocked\n"));
+        assert!(rendered.contains("next: inspect or repair findings below, then rerun doctor"));
         assert!(rendered.contains("[LC-D050] error: missing runtime"));
         assert!(rendered.contains("target: instance main runtime defaults"));
         assert!(
@@ -2111,6 +2190,58 @@ mod tests {
         );
         assert!(rendered.contains("observed: configure first"));
         assert!(rendered.contains("inspect: lionclaw status"));
+    }
+
+    #[test]
+    fn doctor_report_renders_ready_next_action_before_advisories() {
+        let mut report = DoctorReport {
+            findings: vec![DoctorFinding::info(
+                FindingKind::RuntimeAuth,
+                "runtime auth for \"codex\" is checked at launch",
+                "instance main runtime auth codex",
+                "Codex auth is checked at launch",
+            )],
+            ..DoctorReport::default()
+        };
+        report.set_next_command("lionclaw run");
+
+        let rendered = report.render();
+
+        assert!(rendered.starts_with(
+            "doctor: no blocking setup issues\nnext: lionclaw run\nnote: non-error findings below are advisory\n\n"
+        ));
+        assert!(
+            rendered.contains("[LC-D051] info: runtime auth for \"codex\" is checked at launch")
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_ready_project_reports_scoped_run_next_action() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        let home = LionClawHome::new(project.instance.home.clone());
+        configure_test_codex(&home, &fake_podman(temp_dir.path())).await;
+
+        let report = inspect_project(temp_dir.path(), None, false, &FakeUnitManager::default())
+            .await
+            .expect("doctor report");
+
+        assert!(!report.has_errors());
+        assert_eq!(
+            report.next_command.as_deref(),
+            Some(project_command(temp_dir.path(), "--instance main run").as_str())
+        );
+        let auth = finding(&report, "runtime auth for \"codex\" is checked at launch");
+        assert_eq!(auth.severity, FindingSeverity::Info);
+        let rendered = report.render();
+        assert!(rendered.contains("doctor: no blocking setup issues"));
+        assert!(rendered.contains(&format!(
+            "next: {}",
+            project_command(temp_dir.path(), "--instance main run")
+        )));
+        assert!(
+            rendered.contains("[LC-D051] info: runtime auth for \"codex\" is checked at launch")
+        );
     }
 
     #[test]

@@ -73,7 +73,7 @@ Expected:
 
 - project metadata exists under `.lionclaw/`
 - `status` targets the selected project instance
-- `doctor` prints no errors for a healthy setup
+- `doctor` reports no blocking setup issues and prints the scoped `run` command
 
 ## Phase 2: Direct Run
 
@@ -359,7 +359,7 @@ Expected:
 - every finding has `[LC-D...]`, severity, target, expected, and observed
 - every finding has a read-only `inspect` command
 - optional `repair` commands are explicit LionClaw or platform commands
-- warnings alone exit 0
+- info and warnings exit 0
 - errors exit 1
 
 ## Cleanup

@@ -18,7 +18,8 @@ cd /path/to/your/project
 lionclaw doctor
 ```
 
-`doctor` points at the next setup problem. Fix, rerun, repeat.
+`doctor` points at the next setup problem. Fix, rerun, repeat; when setup is
+ready, run the command it prints next.
 
 ## Why LionClaw
 
@@ -86,8 +87,8 @@ cd /path/to/your/project
 lionclaw doctor
 ```
 
-Follow the repair commands until `doctor` is clean. Then run the configured
-runtime:
+Follow the repair commands until `doctor` reports no blocking setup issues.
+Then run the configured runtime:
 
 ```bash
 lionclaw run
@@ -98,8 +99,9 @@ executable is available. If `run` reports a missing runtime image, build or
 provide the image named in the error. The bundled image definition lives at
 `containers/runtime/Containerfile`.
 
-`doctor` checks setup. `run` checks launch. Use `lionclaw --help` and
-subcommand `--help` for current syntax.
+`doctor` checks setup and prints the next run command when setup is no longer
+blocked. `run` checks launch. Use `lionclaw --help` and subcommand `--help`
+for current syntax.
 
 Runtime auth stays runtime-specific. LionClaw stages only the runtime-local auth
 files needed for the confined launch.
@@ -173,7 +175,8 @@ inspect: ss -ltnp '( sport = :8787 )'
 note: stop the process shown by inspect
 ```
 
-Warnings alone exit 0, errors exit 1, and internal doctor failures exit 2.
+Info and warnings are advisory and exit 0. Errors exit 1, and internal doctor
+failures exit 2.
 
 ## Requirements
 
