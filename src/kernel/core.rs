@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, Transaction};
@@ -22,7 +22,9 @@ use crate::contracts::{
     AuditEventView, AuditQueryResponse, ChannelAttachmentDescriptor, ChannelBindingView,
     ChannelGrantResponse, ChannelGrantRevokeRequest, ChannelGrantRevokeResponse, ChannelGrantView,
     ChannelInboundOutcome, ChannelInboundRequest, ChannelInboundResponse, ChannelListResponse,
-    ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingListResponse,
+    ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
+    ChannelPairingClaimOutcome, ChannelPairingClaimRequest, ChannelPairingClaimResponse,
+    ChannelPairingInviteRequest, ChannelPairingInviteResponse, ChannelPairingListResponse,
     ChannelPairingStatus, ChannelPairingView, ChannelRoutingProfile, ChannelStreamAckRequest,
     ChannelStreamAckResponse, ChannelStreamEventView, ChannelStreamPullRequest,
     ChannelStreamPullResponse, ChannelTrigger, ContinuityDraftActionRequest,
@@ -60,6 +62,8 @@ use super::{
         ChannelStateStore, ChannelStreamEventInsert, ChannelStreamEventKind,
         ChannelStreamEventRecord, ChannelTurnRecord, ChannelTurnStatus, NewChannelInboundEvent,
         NewChannelTurn, OperatorPairingUpsert, StreamMessageLane as ChannelStreamLane,
+        TokenPairingCreate, PAIRING_CLAIM_POLICY_OPERATOR_APPROVAL,
+        PAIRING_CLAIM_POLICY_TOKEN_CLAIM,
     },
     continuity::{
         ActiveContinuitySnapshot, ContinuityArtifact, ContinuityEvent, ContinuityLayout,
@@ -1000,6 +1004,291 @@ impl Kernel {
         Ok(ChannelPairingListResponse { pairings, grants })
     }
 
+    pub async fn invite_channel_pairing(
+        &self,
+        req: ChannelPairingInviteRequest,
+    ) -> Result<ChannelPairingInviteResponse, KernelError> {
+        let invite = validate_channel_pairing_invite(req)?;
+        self.require_active_channel_binding(&invite.channel_id)
+            .await?;
+
+        let token = generate_pairing_token();
+        let token_hash = hash_pairing_code(&token);
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let pairing = self
+            .channel_state
+            .create_token_pairing_in_tx(
+                &mut tx,
+                TokenPairingCreate {
+                    channel_id: &invite.channel_id,
+                    code_hash: &token_hash,
+                    conversation_ref: invite.conversation_ref.as_deref(),
+                    thread_ref: invite.thread_ref.as_deref(),
+                    requested_profile: invite.requested_profile,
+                    label: invite.label.as_deref(),
+                    max_claims: invite.max_claims,
+                    expires_at: invite.expires_at,
+                },
+            )
+            .await
+            .map_err(internal)?;
+        self.audit
+            .append_in_tx(
+                &mut tx,
+                "channel.pairing.invite_created",
+                None,
+                Some("api".to_string()),
+                json!({
+                    "channel_id": pairing.channel_id,
+                    "pairing_id": pairing.pairing_id,
+                    "requested_profile": pairing.requested_profile.as_str(),
+                    "sender_ref": pairing.sender_ref,
+                    "conversation_ref": pairing.conversation_ref,
+                    "thread_ref": pairing.thread_ref,
+                    "max_claims": pairing.max_claims,
+                    "expires_at": pairing.expires_at,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+
+        Ok(ChannelPairingInviteResponse {
+            pairing_id: pairing.pairing_id,
+            channel_id: pairing.channel_id,
+            token,
+            requested_profile: pairing.requested_profile,
+            expires_at: invite.expires_at,
+            max_claims: invite.max_claims,
+        })
+    }
+
+    pub async fn claim_channel_pairing(
+        &self,
+        req: ChannelPairingClaimRequest,
+    ) -> Result<ChannelPairingClaimResponse, KernelError> {
+        let claim = validate_channel_pairing_claim(req)?;
+        self.require_active_channel_binding(&claim.channel_id)
+            .await?;
+
+        let token_hash = hash_pairing_code(&claim.token);
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let pairing = self
+            .channel_state
+            .get_pairing_request_by_code_hash_in_tx(&mut tx, &claim.channel_id, &token_hash)
+            .await
+            .map_err(internal)?;
+        let Some(pairing) =
+            pairing.filter(|pairing| pairing.claim_policy == PAIRING_CLAIM_POLICY_TOKEN_CLAIM)
+        else {
+            return self
+                .finish_pairing_claim(
+                    tx,
+                    &claim,
+                    None,
+                    None,
+                    ChannelPairingClaimOutcome::InvalidToken,
+                    "invalid_token",
+                )
+                .await;
+        };
+
+        if pairing.status == ChannelPairingStatus::Blocked {
+            return self
+                .finish_pairing_claim(
+                    tx,
+                    &claim,
+                    Some(&pairing),
+                    None,
+                    ChannelPairingClaimOutcome::InvalidToken,
+                    "invalid_token",
+                )
+                .await;
+        }
+
+        if pairing.status == ChannelPairingStatus::Expired
+            || pairing
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= Utc::now())
+        {
+            if pairing.status == ChannelPairingStatus::Pending {
+                self.channel_state
+                    .mark_pairing_status_in_tx(
+                        &mut tx,
+                        pairing.pairing_id,
+                        ChannelPairingStatus::Expired,
+                        None,
+                    )
+                    .await
+                    .map_err(internal)?;
+            }
+            return self
+                .finish_pairing_claim(
+                    tx,
+                    &claim,
+                    Some(&pairing),
+                    None,
+                    ChannelPairingClaimOutcome::Expired,
+                    "expired_token",
+                )
+                .await;
+        }
+
+        if pairing.status != ChannelPairingStatus::Pending
+            || pairing.claim_count >= pairing.max_claims
+        {
+            return self
+                .finish_pairing_claim(
+                    tx,
+                    &claim,
+                    Some(&pairing),
+                    None,
+                    ChannelPairingClaimOutcome::AlreadyClaimed,
+                    "already_claimed",
+                )
+                .await;
+        }
+
+        let grant_scope = match grant_scope_from_token_claim(&pairing, &claim) {
+            Ok(scope) => scope,
+            Err(reason_code) => {
+                return self
+                    .finish_pairing_claim(
+                        tx,
+                        &claim,
+                        Some(&pairing),
+                        None,
+                        ChannelPairingClaimOutcome::ScopeMismatch,
+                        reason_code,
+                    )
+                    .await;
+            }
+        };
+
+        let blocking_grant = self
+            .channel_state
+            .find_blocking_grant_for_scope_in_tx(
+                &mut tx,
+                &claim.channel_id,
+                grant_scope.sender_ref.as_deref(),
+                grant_scope.conversation_ref.as_deref(),
+                grant_scope.thread_ref.as_deref(),
+                pairing.requested_profile,
+            )
+            .await
+            .map_err(internal)?;
+        if let Some(blocking_grant) = blocking_grant {
+            return self
+                .finish_pairing_claim(
+                    tx,
+                    &claim,
+                    Some(&pairing),
+                    Some(blocking_grant.grant_id),
+                    ChannelPairingClaimOutcome::ScopeMismatch,
+                    "scope_blocked",
+                )
+                .await;
+        }
+
+        let existing_grant = self
+            .channel_state
+            .get_grant_by_scope_in_tx(
+                &mut tx,
+                &claim.channel_id,
+                grant_scope.sender_ref.as_deref(),
+                grant_scope.conversation_ref.as_deref(),
+                grant_scope.thread_ref.as_deref(),
+                pairing.requested_profile,
+            )
+            .await
+            .map_err(internal)?;
+        if let Some(existing_grant) = existing_grant {
+            if let Some((outcome, reason_code)) =
+                existing_token_claim_grant_outcome(existing_grant.status)
+            {
+                return self
+                    .finish_pairing_claim(
+                        tx,
+                        &claim,
+                        Some(&pairing),
+                        Some(existing_grant.grant_id),
+                        outcome,
+                        reason_code,
+                    )
+                    .await;
+            }
+        }
+
+        let claimed = self
+            .channel_state
+            .increment_pairing_claim_count_in_tx(&mut tx, pairing.pairing_id)
+            .await
+            .map_err(internal)?;
+        if claimed.is_none() {
+            return self
+                .finish_pairing_claim(
+                    tx,
+                    &claim,
+                    Some(&pairing),
+                    None,
+                    ChannelPairingClaimOutcome::AlreadyClaimed,
+                    "already_claimed",
+                )
+                .await;
+        }
+
+        let grant = self
+            .channel_state
+            .insert_or_update_grant_in_tx(
+                &mut tx,
+                ChannelGrantUpsert {
+                    channel_id: &claim.channel_id,
+                    sender_ref: grant_scope.sender_ref.as_deref(),
+                    conversation_ref: grant_scope.conversation_ref.as_deref(),
+                    thread_ref: grant_scope.thread_ref.as_deref(),
+                    routing_profile: pairing.requested_profile,
+                    trust_tier: TrustTier::Main,
+                    status: ChannelGrantStatus::Approved,
+                    label: pairing.label.as_deref(),
+                },
+            )
+            .await
+            .map_err(internal)?;
+        let response = self
+            .finish_pairing_claim(
+                tx,
+                &claim,
+                Some(&pairing),
+                Some(grant.grant_id),
+                ChannelPairingClaimOutcome::Approved,
+                "approved",
+            )
+            .await?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "channel.pairing.claim_approved",
+            None,
+            "kernel",
+            json!({
+                "channel_id": claim.channel_id,
+                "grant_id": grant.grant_id,
+                "pairing_id": pairing.pairing_id,
+            }),
+        )
+        .await;
+
+        Ok(response)
+    }
+
     pub async fn approve_channel_pairing(
         &self,
         req: ChannelPairingApproveRequest,
@@ -1050,7 +1339,7 @@ impl Kernel {
                 "pairing request does not belong to channel_id".to_string(),
             ));
         }
-        if pairing.claim_policy != "operator_approval" {
+        if pairing.claim_policy != PAIRING_CLAIM_POLICY_OPERATOR_APPROVAL {
             return Err(KernelError::Conflict(
                 "pairing request is not pending operator approval".to_string(),
             ));
@@ -1138,7 +1427,7 @@ impl Kernel {
     pub async fn block_channel_pairing(
         &self,
         req: ChannelPairingBlockRequest,
-    ) -> Result<ChannelGrantResponse, KernelError> {
+    ) -> Result<ChannelPairingBlockResponse, KernelError> {
         let channel_id = trim_required(req.channel_id, "channel_id")?;
         self.require_active_channel_binding(&channel_id).await?;
         let mut tx = self
@@ -1161,6 +1450,36 @@ impl Kernel {
                 return Err(KernelError::BadRequest(
                     "pairing request does not belong to channel_id".to_string(),
                 ));
+            }
+            if pairing.claim_policy == PAIRING_CLAIM_POLICY_TOKEN_CLAIM {
+                if pairing.status != ChannelPairingStatus::Pending {
+                    return Err(KernelError::Conflict(format!(
+                        "pairing request is {}",
+                        pairing.status.as_str()
+                    )));
+                }
+                self.channel_state
+                    .mark_pairing_status_in_tx(
+                        &mut tx,
+                        pairing.pairing_id,
+                        ChannelPairingStatus::Blocked,
+                        None,
+                    )
+                    .await
+                    .map_err(internal)?;
+                return self
+                    .finish_channel_pairing_block(
+                        tx,
+                        ChannelPairingBlockCommit {
+                            channel_id: &channel_id,
+                            grant: None,
+                            pairing_id: Some(pairing.pairing_id),
+                            blocked_pairing_ids: vec![pairing.pairing_id],
+                            reason: req.reason,
+                            event_type: "channel.pairing.blocked",
+                        },
+                    )
+                    .await;
             }
             let grant_scope = grant_scope_from_pairing(&pairing, pairing.requested_profile)?;
             (
@@ -1218,43 +1537,71 @@ impl Kernel {
                 .await
                 .map_err(internal)?
         };
+        self.finish_channel_pairing_block(
+            tx,
+            ChannelPairingBlockCommit {
+                channel_id: &channel_id,
+                grant: Some(grant),
+                pairing_id,
+                blocked_pairing_ids,
+                reason: req.reason,
+                event_type: "channel.grant.blocked",
+            },
+        )
+        .await
+    }
+
+    async fn finish_channel_pairing_block(
+        &self,
+        mut tx: Transaction<'_, Sqlite>,
+        blocked: ChannelPairingBlockCommit<'_>,
+    ) -> Result<ChannelPairingBlockResponse, KernelError> {
+        let reason_code = blocked
+            .reason
+            .unwrap_or_else(|| "operator_blocked".to_string());
+        let grant_id = blocked.grant.as_ref().map(|grant| grant.grant_id);
+        let routing_profile = blocked
+            .grant
+            .as_ref()
+            .map(|grant| grant.routing_profile.as_str().to_string());
         self.audit
             .append_in_tx(
                 &mut tx,
-                "channel.grant.blocked",
+                blocked.event_type,
                 None,
                 Some("api".to_string()),
                 json!({
-                    "channel_id": channel_id,
+                    "channel_id": blocked.channel_id,
                     "event_id": null,
-                    "sender_ref": grant.sender_ref,
-                    "conversation_ref": grant.conversation_ref,
-                    "thread_ref": grant.thread_ref,
-                    "reason_code": req.reason.unwrap_or_else(|| "operator_blocked".to_string()),
-                    "grant_id": grant.grant_id,
-                    "pairing_id": pairing_id,
-                    "pairing_ids": blocked_pairing_ids.clone(),
-                    "routing_profile": grant.routing_profile.as_str(),
+                    "sender_ref": blocked.grant.as_ref().and_then(|grant| grant.sender_ref.as_deref()),
+                    "conversation_ref": blocked.grant.as_ref().and_then(|grant| grant.conversation_ref.as_deref()),
+                    "thread_ref": blocked.grant.as_ref().and_then(|grant| grant.thread_ref.as_deref()),
+                    "reason_code": reason_code,
+                    "grant_id": grant_id,
+                    "pairing_id": blocked.pairing_id,
+                    "pairing_ids": blocked.blocked_pairing_ids.clone(),
+                    "routing_profile": routing_profile,
                 }),
             )
             .await
             .map_err(internal)?;
         tx.commit().await.map_err(|err| internal(err.into()))?;
         self.refresh_active_continuity_after_commit_best_effort(
-            "channel.grant.blocked",
+            blocked.event_type,
             None,
             "api",
             json!({
-                "channel_id": channel_id,
-                "grant_id": grant.grant_id,
-                "pairing_id": pairing_id,
-                "pairing_ids": blocked_pairing_ids,
+                "channel_id": blocked.channel_id,
+                "grant_id": grant_id,
+                "pairing_id": blocked.pairing_id,
+                "pairing_ids": blocked.blocked_pairing_ids,
             }),
         )
         .await;
 
-        Ok(ChannelGrantResponse {
-            grant: to_channel_grant_view(grant),
+        Ok(ChannelPairingBlockResponse {
+            grant: blocked.grant.map(to_channel_grant_view),
+            blocked_pairing_ids: blocked.blocked_pairing_ids,
         })
     }
 
@@ -1863,6 +2210,62 @@ impl Kernel {
             None,
         )
         .await
+    }
+
+    async fn finish_pairing_claim(
+        &self,
+        mut tx: Transaction<'_, Sqlite>,
+        claim: &ValidatedPairingClaim,
+        pairing: Option<&ChannelPairingRequestRecord>,
+        grant_id: Option<Uuid>,
+        outcome: ChannelPairingClaimOutcome,
+        reason_code: &'static str,
+    ) -> Result<ChannelPairingClaimResponse, KernelError> {
+        self.audit_pairing_claim_in_tx(&mut tx, claim, pairing, grant_id, outcome, reason_code)
+            .await?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        Ok(channel_pairing_claim_response(
+            outcome,
+            reason_code,
+            grant_id,
+        ))
+    }
+
+    async fn audit_pairing_claim_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        claim: &ValidatedPairingClaim,
+        pairing: Option<&ChannelPairingRequestRecord>,
+        grant_id: Option<Uuid>,
+        outcome: ChannelPairingClaimOutcome,
+        reason_code: &str,
+    ) -> Result<(), KernelError> {
+        let event_type = if outcome == ChannelPairingClaimOutcome::Approved {
+            "channel.pairing.claim_approved"
+        } else {
+            "channel.pairing.claim_denied"
+        };
+        let requested_profile = pairing.map(|pairing| pairing.requested_profile.as_str());
+        self.audit
+            .append_in_tx(
+                tx,
+                event_type,
+                None,
+                Some("kernel".to_string()),
+                json!({
+                    "channel_id": claim.channel_id,
+                    "pairing_id": pairing.map(|pairing| pairing.pairing_id),
+                    "requested_profile": requested_profile,
+                    "sender_ref": claim.sender_ref,
+                    "conversation_ref": claim.conversation_ref,
+                    "thread_ref": claim.thread_ref,
+                    "grant_id": grant_id,
+                    "outcome": outcome.as_str(),
+                    "reason_code": reason_code,
+                }),
+            )
+            .await
+            .map_err(internal)
     }
 
     pub async fn grant_policy(
@@ -4522,6 +4925,7 @@ fn internal(err: anyhow::Error) -> KernelError {
 
 const MAX_PROVIDER_METADATA_BYTES: usize = 16 * 1024;
 const PAIRING_CODE_HEX_CHARS: usize = 20;
+const PAIRING_TOKEN_DEFAULT_EXPIRES_IN_MS: u64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone)]
 struct ValidatedChannelInbound {
@@ -4540,16 +4944,150 @@ struct ValidatedChannelInbound {
 }
 
 #[derive(Debug, Clone)]
+struct ValidatedPairingClaim {
+    channel_id: String,
+    token: String,
+    sender_ref: String,
+    conversation_ref: String,
+    thread_ref: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedPairingInvite {
+    channel_id: String,
+    requested_profile: ChannelRoutingProfile,
+    label: Option<String>,
+    conversation_ref: Option<String>,
+    thread_ref: Option<String>,
+    expires_at: DateTime<Utc>,
+    max_claims: u32,
+}
+
+#[derive(Debug, Clone)]
 struct GrantScope {
     sender_ref: Option<String>,
     conversation_ref: Option<String>,
     thread_ref: Option<String>,
 }
 
+#[derive(Debug)]
+struct ChannelPairingBlockCommit<'a> {
+    channel_id: &'a str,
+    grant: Option<ChannelGrantRecord>,
+    pairing_id: Option<Uuid>,
+    blocked_pairing_ids: Vec<Uuid>,
+    reason: Option<String>,
+    event_type: &'static str,
+}
+
 #[derive(Debug, Clone)]
 enum PairingLookup {
     Id(Uuid),
     Code(String),
+}
+
+fn validate_channel_pairing_invite(
+    req: ChannelPairingInviteRequest,
+) -> Result<ValidatedPairingInvite, KernelError> {
+    let channel_id = trim_required(req.channel_id, "channel_id")?;
+    let label = trim_optional(req.label);
+    let conversation_ref = trim_optional(req.conversation_ref);
+    let thread_ref = trim_optional(req.thread_ref);
+    validate_invite_profile_scope(
+        req.requested_profile,
+        conversation_ref.as_deref(),
+        thread_ref.as_deref(),
+    )?;
+
+    let expires_in_ms = req
+        .expires_in_ms
+        .unwrap_or(PAIRING_TOKEN_DEFAULT_EXPIRES_IN_MS);
+    if expires_in_ms == 0 {
+        return Err(KernelError::BadRequest(
+            "expires_in_ms must be greater than zero".to_string(),
+        ));
+    }
+    let expires_in_ms = i64::try_from(expires_in_ms).map_err(|_| invalid_invite_expiry_error())?;
+    let expires_in =
+        ChronoDuration::try_milliseconds(expires_in_ms).ok_or_else(invalid_invite_expiry_error)?;
+    let expires_at = Utc::now()
+        .checked_add_signed(expires_in)
+        .ok_or_else(invalid_invite_expiry_error)?;
+    let max_claims = req.max_claims.unwrap_or(1);
+    if max_claims == 0 {
+        return Err(KernelError::BadRequest(
+            "max_claims must be greater than zero".to_string(),
+        ));
+    }
+
+    Ok(ValidatedPairingInvite {
+        channel_id,
+        requested_profile: req.requested_profile,
+        label,
+        conversation_ref,
+        thread_ref,
+        expires_at,
+        max_claims,
+    })
+}
+
+fn invalid_invite_expiry_error() -> KernelError {
+    KernelError::BadRequest("expires_in_ms is too large to represent".to_string())
+}
+
+fn validate_invite_profile_scope(
+    requested_profile: ChannelRoutingProfile,
+    conversation_ref: Option<&str>,
+    thread_ref: Option<&str>,
+) -> Result<(), KernelError> {
+    match requested_profile {
+        ChannelRoutingProfile::Direct => {
+            if conversation_ref.is_some() || thread_ref.is_some() {
+                return Err(KernelError::BadRequest(
+                    "direct invites cannot pre-bind conversation_ref or thread_ref".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        ChannelRoutingProfile::Conversation => {
+            if thread_ref.is_some() {
+                return Err(KernelError::BadRequest(
+                    "conversation invites cannot pre-bind thread_ref".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        ChannelRoutingProfile::Thread => {
+            if thread_ref.is_some() && conversation_ref.is_none() {
+                return Err(KernelError::BadRequest(
+                    "thread invites with thread_ref require conversation_ref".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        ChannelRoutingProfile::Outbound => Err(KernelError::BadRequest(
+            "outbound grants are not user invites".to_string(),
+        )),
+    }
+}
+
+fn validate_channel_pairing_claim(
+    req: ChannelPairingClaimRequest,
+) -> Result<ValidatedPairingClaim, KernelError> {
+    let channel_id = trim_required(req.channel_id, "channel_id")?;
+    let token = trim_required(req.token, "token")?;
+    let sender_ref = trim_required(req.sender_ref, "sender_ref")?;
+    let conversation_ref = trim_required(req.conversation_ref, "conversation_ref")?;
+    let thread_ref = trim_optional(req.thread_ref);
+    validate_provider_metadata(req.provider_metadata)?;
+
+    Ok(ValidatedPairingClaim {
+        channel_id,
+        token,
+        sender_ref,
+        conversation_ref,
+        thread_ref,
+    })
 }
 
 fn validate_channel_inbound_request(
@@ -4581,18 +5119,7 @@ fn validate_channel_inbound_request(
         }
         attachments.push(attachment);
     }
-    let provider_metadata = if req.provider_metadata.is_null() {
-        json!({})
-    } else {
-        req.provider_metadata
-    };
-    let metadata_bytes = serde_json::to_vec(&provider_metadata)
-        .map_err(|err| KernelError::BadRequest(format!("invalid provider_metadata: {err}")))?;
-    if metadata_bytes.len() > MAX_PROVIDER_METADATA_BYTES {
-        return Err(KernelError::BadRequest(format!(
-            "provider_metadata exceeds {MAX_PROVIDER_METADATA_BYTES} bytes"
-        )));
-    }
+    let provider_metadata = validate_provider_metadata(req.provider_metadata)?;
 
     Ok(ValidatedChannelInbound {
         channel_id,
@@ -4646,6 +5173,24 @@ fn trim_optional(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn validate_provider_metadata(
+    provider_metadata: serde_json::Value,
+) -> Result<serde_json::Value, KernelError> {
+    let provider_metadata = if provider_metadata.is_null() {
+        json!({})
+    } else {
+        provider_metadata
+    };
+    let metadata_bytes = serde_json::to_vec(&provider_metadata)
+        .map_err(|err| KernelError::BadRequest(format!("invalid provider_metadata: {err}")))?;
+    if metadata_bytes.len() > MAX_PROVIDER_METADATA_BYTES {
+        return Err(KernelError::BadRequest(format!(
+            "provider_metadata exceeds {MAX_PROVIDER_METADATA_BYTES} bytes"
+        )));
+    }
+    Ok(provider_metadata)
+}
+
 fn hash_pairing_code(raw: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(raw.as_bytes());
@@ -4682,6 +5227,18 @@ fn channel_trigger_ignored_response() -> ChannelInboundResponse {
         None,
         None,
     )
+}
+
+fn channel_pairing_claim_response(
+    outcome: ChannelPairingClaimOutcome,
+    reason_code: &str,
+    grant_id: Option<Uuid>,
+) -> ChannelPairingClaimResponse {
+    ChannelPairingClaimResponse {
+        outcome,
+        grant_id,
+        reason_code: Some(reason_code.to_string()),
+    }
 }
 
 fn default_pending_profile(
@@ -4741,6 +5298,79 @@ fn channel_turn_user_text(inbound: &ValidatedChannelInbound) -> String {
         .filter(|caption| !caption.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+fn grant_scope_from_token_claim(
+    pairing: &ChannelPairingRequestRecord,
+    claim: &ValidatedPairingClaim,
+) -> Result<GrantScope, &'static str> {
+    if pairing
+        .sender_ref
+        .as_deref()
+        .is_some_and(|expected| expected != claim.sender_ref)
+    {
+        return Err("sender_ref_mismatch");
+    }
+
+    match pairing.requested_profile {
+        ChannelRoutingProfile::Direct => Ok(GrantScope {
+            sender_ref: Some(claim.sender_ref.clone()),
+            conversation_ref: None,
+            thread_ref: None,
+        }),
+        ChannelRoutingProfile::Conversation => {
+            if pairing
+                .conversation_ref
+                .as_deref()
+                .is_some_and(|expected| expected != claim.conversation_ref)
+            {
+                return Err("conversation_ref_mismatch");
+            }
+            Ok(GrantScope {
+                sender_ref: Some(claim.sender_ref.clone()),
+                conversation_ref: Some(claim.conversation_ref.clone()),
+                thread_ref: None,
+            })
+        }
+        ChannelRoutingProfile::Thread => {
+            if pairing
+                .conversation_ref
+                .as_deref()
+                .is_some_and(|expected| expected != claim.conversation_ref)
+            {
+                return Err("conversation_ref_mismatch");
+            }
+            let thread_ref = claim.thread_ref.clone().ok_or("thread_ref_required")?;
+            if pairing
+                .thread_ref
+                .as_deref()
+                .is_some_and(|expected| expected != thread_ref)
+            {
+                return Err("thread_ref_mismatch");
+            }
+            Ok(GrantScope {
+                sender_ref: Some(claim.sender_ref.clone()),
+                conversation_ref: Some(claim.conversation_ref.clone()),
+                thread_ref: Some(thread_ref),
+            })
+        }
+        ChannelRoutingProfile::Outbound => Err("outbound_invite_unsupported"),
+    }
+}
+
+fn existing_token_claim_grant_outcome(
+    status: ChannelGrantStatus,
+) -> Option<(ChannelPairingClaimOutcome, &'static str)> {
+    match status {
+        ChannelGrantStatus::Approved => Some((
+            ChannelPairingClaimOutcome::AlreadyClaimed,
+            "already_claimed",
+        )),
+        ChannelGrantStatus::Blocked => {
+            Some((ChannelPairingClaimOutcome::ScopeMismatch, "scope_blocked"))
+        }
+        ChannelGrantStatus::Revoked => None,
+    }
 }
 
 fn grant_scope_from_pairing(
@@ -5127,6 +5757,10 @@ fn generate_pairing_code() -> String {
     let raw = Uuid::new_v4().simple().to_string();
     // Keep enough entropy that storing only a hash is meaningful if state leaks.
     format!("pc_{}", &raw[..PAIRING_CODE_HEX_CHARS])
+}
+
+fn generate_pairing_token() -> String {
+    format!("lc_{}", Uuid::new_v4().simple())
 }
 
 fn assistant_text_from_events(events: &[RuntimeEvent]) -> String {

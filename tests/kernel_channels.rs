@@ -4,8 +4,10 @@ use async_trait::async_trait;
 use common::{write_skill_source, TestHome};
 use lionclaw::{
     contracts::{
-        ChannelAttachmentDescriptor, ChannelInboundOutcome, ChannelInboundRequest,
-        ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingStatus,
+        ChannelAttachmentDescriptor, ChannelGrantView, ChannelInboundOutcome,
+        ChannelInboundRequest, ChannelPairingApproveRequest, ChannelPairingBlockRequest,
+        ChannelPairingBlockResponse, ChannelPairingClaimOutcome, ChannelPairingClaimRequest,
+        ChannelPairingInviteRequest, ChannelPairingStatus, ChannelRoutingProfile,
         ChannelStreamAckRequest, ChannelStreamEventView, ChannelStreamPullRequest,
         ChannelStreamStartMode, ChannelTrigger, SessionActionKind, SessionActionRequest,
         SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest,
@@ -24,6 +26,12 @@ use lionclaw::{
 };
 use sqlx::Row;
 use tokio::time::{sleep, Duration, Instant};
+
+fn expect_blocked_grant(blocked: ChannelPairingBlockResponse) -> ChannelGrantView {
+    let grant = blocked.grant.expect("block response should include grant");
+    assert_eq!(grant.status, "blocked");
+    grant
+}
 
 #[tokio::test]
 async fn add_channel_requires_installed_alias() {
@@ -701,18 +709,19 @@ async fn channels_v2_block_by_scope_closes_matching_pending_pairing() {
     let pairing_id = pending.pairing_id.expect("pairing id");
     let pairing_code = pending.pairing_code.expect("pairing code");
 
-    let blocked = kernel
-        .block_channel_pairing(ChannelPairingBlockRequest {
-            channel_id: "slack".to_string(),
-            pairing_id: None,
-            sender_ref: Some("mallory".to_string()),
-            conversation_ref: Some("room-1".to_string()),
-            thread_ref: Some("topic-a".to_string()),
-            reason: Some("operator_blocked".to_string()),
-        })
-        .await
-        .expect("block pending scope");
-    assert_eq!(blocked.grant.status, "blocked");
+    expect_blocked_grant(
+        kernel
+            .block_channel_pairing(ChannelPairingBlockRequest {
+                channel_id: "slack".to_string(),
+                pairing_id: None,
+                sender_ref: Some("mallory".to_string()),
+                conversation_ref: Some("room-1".to_string()),
+                thread_ref: Some("topic-a".to_string()),
+                reason: Some("operator_blocked".to_string()),
+            })
+            .await
+            .expect("block pending scope"),
+    );
 
     let access_state = kernel
         .list_channel_pairings(Some("slack".to_string()), None)
@@ -907,6 +916,629 @@ async fn channels_v2_direct_block_denies_scoped_session_access() {
         thread_turn,
         KernelError::Conflict(message) if message.contains("blocked")
     ));
+}
+
+#[tokio::test]
+async fn channel_pairing_invite_returns_raw_token_once_and_direct_claim_creates_grant() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "invite-direct-skill").await;
+    let kernel = env.kernel().await;
+
+    let invite = kernel
+        .invite_channel_pairing(ChannelPairingInviteRequest {
+            channel_id: "terminal".to_string(),
+            requested_profile: ChannelRoutingProfile::Direct,
+            label: Some("alice".to_string()),
+            conversation_ref: None,
+            thread_ref: None,
+            expires_in_ms: None,
+            max_claims: None,
+        })
+        .await
+        .expect("create direct invite");
+    assert!(invite.token.starts_with("lc_"));
+    assert_eq!(invite.max_claims, 1);
+
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    let row = sqlx::query(
+        "SELECT code_hash, claim_policy, status, label, max_claims, claim_count \
+         FROM channel_pairing_requests WHERE pairing_id = ?1",
+    )
+    .bind(invite.pairing_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query invite pairing");
+    let code_hash: String = row.get("code_hash");
+    assert_ne!(code_hash, invite.token);
+    assert!(!code_hash.contains(&invite.token));
+    assert_eq!(row.get::<String, _>("claim_policy"), "token_claim");
+    assert_eq!(row.get::<String, _>("status"), "pending");
+    assert_eq!(row.get::<String, _>("label"), "alice");
+    assert_eq!(row.get::<i64, _>("max_claims"), 1);
+    assert_eq!(row.get::<i64, _>("claim_count"), 0);
+
+    let pairings = kernel
+        .list_channel_pairings(Some("terminal".to_string()), None)
+        .await
+        .expect("list invite pairing");
+    let serialized = serde_json::to_value(&pairings.pairings[0]).expect("serialize pairing");
+    assert!(serialized.get("token").is_none());
+    assert!(serialized.get("code_hash").is_none());
+
+    let claimed = kernel
+        .claim_channel_pairing(claim_request(
+            "terminal",
+            &invite.token,
+            "sender-alice",
+            "dm-alice",
+            None,
+        ))
+        .await
+        .expect("claim direct invite");
+    assert_eq!(claimed.outcome, ChannelPairingClaimOutcome::Approved);
+    let grant_id = claimed.grant_id.expect("direct claim grant id");
+
+    let access = kernel
+        .list_channel_pairings(Some("terminal".to_string()), None)
+        .await
+        .expect("list grants");
+    let grant = access
+        .grants
+        .iter()
+        .find(|grant| grant.grant_id == grant_id)
+        .expect("claimed grant");
+    assert_eq!(grant.routing_profile, ChannelRoutingProfile::Direct);
+    assert_eq!(grant.sender_ref.as_deref(), Some("sender-alice"));
+    assert!(grant.conversation_ref.is_none());
+    assert_eq!(grant.label.as_deref(), Some("alice"));
+
+    let claimed_row = sqlx::query(
+        "SELECT status, claim_count FROM channel_pairing_requests WHERE pairing_id = ?1",
+    )
+    .bind(invite.pairing_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query claimed invite");
+    assert_eq!(claimed_row.get::<String, _>("status"), "approved");
+    assert_eq!(claimed_row.get::<i64, _>("claim_count"), 1);
+
+    let reused = kernel
+        .claim_channel_pairing(claim_request(
+            "terminal",
+            &invite.token,
+            "sender-bob",
+            "dm-bob",
+            None,
+        ))
+        .await
+        .expect("reuse one-claim invite");
+    assert_eq!(reused.outcome, ChannelPairingClaimOutcome::AlreadyClaimed);
+    assert!(reused.grant_id.is_none());
+
+    let outbound = kernel
+        .invite_channel_pairing(ChannelPairingInviteRequest {
+            channel_id: "terminal".to_string(),
+            requested_profile: ChannelRoutingProfile::Outbound,
+            label: None,
+            conversation_ref: None,
+            thread_ref: None,
+            expires_in_ms: None,
+            max_claims: None,
+        })
+        .await
+        .expect_err("outbound invite should be rejected");
+    assert!(matches!(
+        outbound,
+        KernelError::BadRequest(message) if message.contains("outbound grants are not user invites")
+    ));
+
+    let created = wait_for_audit_event_count(&kernel, "channel.pairing.invite_created", 1).await;
+    assert!(created.events.iter().any(|event| {
+        event.details["pairing_id"].as_str() == Some(&invite.pairing_id.to_string())
+            && event.details["requested_profile"].as_str() == Some("direct")
+    }));
+    wait_for_audit_event_count(&kernel, "channel.pairing.claim_approved", 1).await;
+    wait_for_audit_event_count(&kernel, "channel.pairing.claim_denied", 1).await;
+}
+
+#[tokio::test]
+async fn channel_pairing_invite_block_by_pairing_id_revokes_pending_token() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "invite-block-skill").await;
+    let kernel = env.kernel().await;
+
+    let invite = kernel
+        .invite_channel_pairing(ChannelPairingInviteRequest {
+            channel_id: "terminal".to_string(),
+            requested_profile: ChannelRoutingProfile::Direct,
+            label: Some("exposed invite".to_string()),
+            conversation_ref: None,
+            thread_ref: None,
+            expires_in_ms: None,
+            max_claims: None,
+        })
+        .await
+        .expect("create invite to block");
+
+    let blocked = kernel
+        .block_channel_pairing(ChannelPairingBlockRequest {
+            channel_id: "terminal".to_string(),
+            pairing_id: Some(invite.pairing_id),
+            sender_ref: None,
+            conversation_ref: None,
+            thread_ref: None,
+            reason: Some("token_exposed".to_string()),
+        })
+        .await
+        .expect("block pending token invite");
+    assert!(blocked.grant.is_none());
+    assert_eq!(blocked.blocked_pairing_ids, vec![invite.pairing_id]);
+
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    let blocked_row = sqlx::query(
+        "SELECT status, claim_count FROM channel_pairing_requests WHERE pairing_id = ?1",
+    )
+    .bind(invite.pairing_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query blocked invite");
+    assert_eq!(blocked_row.get::<String, _>("status"), "blocked");
+    assert_eq!(blocked_row.get::<i64, _>("claim_count"), 0);
+
+    let claim = kernel
+        .claim_channel_pairing(claim_request(
+            "terminal",
+            &invite.token,
+            "sender-alice",
+            "dm-alice",
+            None,
+        ))
+        .await
+        .expect("claim blocked invite");
+    assert_eq!(claim.outcome, ChannelPairingClaimOutcome::InvalidToken);
+    assert_eq!(claim.reason_code.as_deref(), Some("invalid_token"));
+    assert!(claim.grant_id.is_none());
+
+    let access = kernel
+        .list_channel_pairings(Some("terminal".to_string()), None)
+        .await
+        .expect("list blocked invite");
+    let listed = access
+        .pairings
+        .iter()
+        .find(|pairing| pairing.pairing_id == invite.pairing_id)
+        .expect("blocked invite listed");
+    assert_eq!(listed.status, ChannelPairingStatus::Blocked);
+    assert!(access.grants.is_empty());
+
+    let blocked_event = wait_for_audit_event_count(&kernel, "channel.pairing.blocked", 1).await;
+    assert!(blocked_event.events.iter().any(|event| {
+        event.details["pairing_id"].as_str() == Some(&invite.pairing_id.to_string())
+            && event.details["reason_code"].as_str() == Some("token_exposed")
+            && event.details["grant_id"].is_null()
+    }));
+}
+
+#[tokio::test]
+async fn channel_pairing_claim_audit_excludes_provider_metadata_and_raw_tokens() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "invite-audit-skill").await;
+    let kernel = env.kernel().await;
+
+    let invite = kernel
+        .invite_channel_pairing(ChannelPairingInviteRequest {
+            channel_id: "terminal".to_string(),
+            requested_profile: ChannelRoutingProfile::Direct,
+            label: None,
+            conversation_ref: None,
+            thread_ref: None,
+            expires_in_ms: None,
+            max_claims: None,
+        })
+        .await
+        .expect("create direct invite");
+    let raw_token = invite.token.clone();
+    let approved = kernel
+        .claim_channel_pairing(ChannelPairingClaimRequest {
+            channel_id: "terminal".to_string(),
+            token: raw_token.clone(),
+            sender_ref: "sender-alice".to_string(),
+            conversation_ref: "dm-alice".to_string(),
+            thread_ref: None,
+            provider_metadata: serde_json::json!({
+                "message_text": format!("/start {raw_token}"),
+                "nested": { "payload": raw_token.clone() },
+            }),
+        })
+        .await
+        .expect("claim invite with token-bearing metadata");
+    assert_eq!(approved.outcome, ChannelPairingClaimOutcome::Approved);
+    let approved_audit =
+        wait_for_audit_event_count(&kernel, "channel.pairing.claim_approved", 1).await;
+    assert_audit_details_exclude_raw_tokens(&approved_audit.events[0].details, &[&invite.token]);
+
+    let invalid_token = "lc_invalid-denied-token";
+    let denied = kernel
+        .claim_channel_pairing(ChannelPairingClaimRequest {
+            channel_id: "terminal".to_string(),
+            token: invalid_token.to_string(),
+            sender_ref: "sender-bob".to_string(),
+            conversation_ref: "dm-bob".to_string(),
+            thread_ref: None,
+            provider_metadata: serde_json::json!({
+                "message_text": format!("LC-ACCEPT {invalid_token}"),
+                "original_invite": raw_token.clone(),
+            }),
+        })
+        .await
+        .expect("deny invalid claim with token-bearing metadata");
+    assert_eq!(denied.outcome, ChannelPairingClaimOutcome::InvalidToken);
+    let denied_audit = wait_for_audit_event_count(&kernel, "channel.pairing.claim_denied", 1).await;
+    assert_audit_details_exclude_raw_tokens(
+        &denied_audit.events[0].details,
+        &[&raw_token, invalid_token],
+    );
+}
+
+#[tokio::test]
+async fn channel_pairing_invite_rejects_expiry_overflow() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "invite-expiry-skill").await;
+    let kernel = env.kernel().await;
+
+    let err = kernel
+        .invite_channel_pairing(ChannelPairingInviteRequest {
+            channel_id: "terminal".to_string(),
+            requested_profile: ChannelRoutingProfile::Direct,
+            label: None,
+            conversation_ref: None,
+            thread_ref: None,
+            expires_in_ms: Some(i64::MAX as u64),
+            max_claims: None,
+        })
+        .await
+        .expect_err("overflowing invite expiry should be rejected");
+
+    assert!(matches!(
+        err,
+        KernelError::BadRequest(message) if message.contains("expires_in_ms is too large")
+    ));
+}
+
+#[tokio::test]
+async fn channel_pairing_conversation_invite_scopes_each_claimed_sender() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "slack", "invite-conversation-skill").await;
+    let kernel = env.kernel().await;
+
+    let invite = kernel
+        .invite_channel_pairing(ChannelPairingInviteRequest {
+            channel_id: "slack".to_string(),
+            requested_profile: ChannelRoutingProfile::Conversation,
+            label: Some("room invite".to_string()),
+            conversation_ref: Some("room-1".to_string()),
+            thread_ref: None,
+            expires_in_ms: None,
+            max_claims: Some(2),
+        })
+        .await
+        .expect("create conversation invite");
+
+    let mismatch = kernel
+        .claim_channel_pairing(claim_request(
+            "slack",
+            &invite.token,
+            "alice",
+            "room-2",
+            None,
+        ))
+        .await
+        .expect("claim wrong conversation");
+    assert_eq!(mismatch.outcome, ChannelPairingClaimOutcome::ScopeMismatch);
+    assert_eq!(
+        mismatch.reason_code.as_deref(),
+        Some("conversation_ref_mismatch")
+    );
+
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    let alice = kernel
+        .claim_channel_pairing(claim_request(
+            "slack",
+            &invite.token,
+            "alice",
+            "room-1",
+            None,
+        ))
+        .await
+        .expect("claim conversation invite for alice");
+    assert_eq!(alice.outcome, ChannelPairingClaimOutcome::Approved);
+
+    let replayed_alice = kernel
+        .claim_channel_pairing(claim_request(
+            "slack",
+            &invite.token,
+            "alice",
+            "room-1",
+            None,
+        ))
+        .await
+        .expect("replay alice conversation invite");
+    assert_eq!(
+        replayed_alice.outcome,
+        ChannelPairingClaimOutcome::AlreadyClaimed
+    );
+    assert_eq!(replayed_alice.grant_id, alice.grant_id);
+    let one_claim_row = sqlx::query(
+        "SELECT status, claim_count FROM channel_pairing_requests WHERE pairing_id = ?1",
+    )
+    .bind(invite.pairing_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query one claimed invite");
+    assert_eq!(one_claim_row.get::<String, _>("status"), "pending");
+    assert_eq!(one_claim_row.get::<i64, _>("claim_count"), 1);
+
+    let bob = kernel
+        .claim_channel_pairing(claim_request("slack", &invite.token, "bob", "room-1", None))
+        .await
+        .expect("claim conversation invite for bob");
+    assert_eq!(bob.outcome, ChannelPairingClaimOutcome::Approved);
+
+    let claimed_row = sqlx::query(
+        "SELECT status, claim_count FROM channel_pairing_requests WHERE pairing_id = ?1",
+    )
+    .bind(invite.pairing_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query multi-claim invite");
+    assert_eq!(claimed_row.get::<String, _>("status"), "approved");
+    assert_eq!(claimed_row.get::<i64, _>("claim_count"), 2);
+
+    let access = kernel
+        .list_channel_pairings(Some("slack".to_string()), None)
+        .await
+        .expect("list conversation grants");
+    for sender in ["alice", "bob"] {
+        assert!(access.grants.iter().any(|grant| {
+            grant.routing_profile == ChannelRoutingProfile::Conversation
+                && grant.sender_ref.as_deref() == Some(sender)
+                && grant.conversation_ref.as_deref() == Some("room-1")
+                && grant.thread_ref.is_none()
+        }));
+    }
+
+    let over_claimed = kernel
+        .claim_channel_pairing(claim_request(
+            "slack",
+            &invite.token,
+            "carol",
+            "room-1",
+            None,
+        ))
+        .await
+        .expect("over-claim conversation invite");
+    assert_eq!(
+        over_claimed.outcome,
+        ChannelPairingClaimOutcome::AlreadyClaimed
+    );
+
+    let blocked_invite = kernel
+        .invite_channel_pairing(ChannelPairingInviteRequest {
+            channel_id: "slack".to_string(),
+            requested_profile: ChannelRoutingProfile::Conversation,
+            label: None,
+            conversation_ref: Some("room-blocked".to_string()),
+            thread_ref: None,
+            expires_in_ms: None,
+            max_claims: None,
+        })
+        .await
+        .expect("create blocked conversation invite");
+    let blocked_grant = expect_blocked_grant(
+        kernel
+            .block_channel_pairing(ChannelPairingBlockRequest {
+                channel_id: "slack".to_string(),
+                pairing_id: None,
+                sender_ref: Some("mallory".to_string()),
+                conversation_ref: None,
+                thread_ref: None,
+                reason: Some("qa_block".to_string()),
+            })
+            .await
+            .expect("block sender scope"),
+    );
+    let blocked = kernel
+        .claim_channel_pairing(claim_request(
+            "slack",
+            &blocked_invite.token,
+            "mallory",
+            "room-blocked",
+            None,
+        ))
+        .await
+        .expect("claim conversation invite with blocked sender");
+    assert_eq!(blocked.outcome, ChannelPairingClaimOutcome::ScopeMismatch);
+    assert_eq!(blocked.reason_code.as_deref(), Some("scope_blocked"));
+    assert_eq!(blocked.grant_id, Some(blocked_grant.grant_id));
+    let blocked_row = sqlx::query(
+        "SELECT status, claim_count FROM channel_pairing_requests WHERE pairing_id = ?1",
+    )
+    .bind(blocked_invite.pairing_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query blocked invite");
+    assert_eq!(blocked_row.get::<String, _>("status"), "pending");
+    assert_eq!(blocked_row.get::<i64, _>("claim_count"), 0);
+}
+
+#[tokio::test]
+async fn channel_pairing_thread_expired_and_invalid_claims_are_denied() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "telegram", "invite-thread-skill").await;
+    let kernel = env.kernel().await;
+
+    let thread_invite = kernel
+        .invite_channel_pairing(ChannelPairingInviteRequest {
+            channel_id: "telegram".to_string(),
+            requested_profile: ChannelRoutingProfile::Thread,
+            label: None,
+            conversation_ref: None,
+            thread_ref: None,
+            expires_in_ms: None,
+            max_claims: None,
+        })
+        .await
+        .expect("create thread invite");
+
+    let missing_thread = kernel
+        .claim_channel_pairing(claim_request(
+            "telegram",
+            &thread_invite.token,
+            "telegram:user:1",
+            "telegram:chat:-1",
+            None,
+        ))
+        .await
+        .expect("claim thread invite without thread_ref");
+    assert_eq!(
+        missing_thread.outcome,
+        ChannelPairingClaimOutcome::ScopeMismatch
+    );
+    assert_eq!(
+        missing_thread.reason_code.as_deref(),
+        Some("thread_ref_required")
+    );
+
+    let claimed_thread = kernel
+        .claim_channel_pairing(claim_request(
+            "telegram",
+            &thread_invite.token,
+            "telegram:user:1",
+            "telegram:chat:-1",
+            Some("telegram:topic:42"),
+        ))
+        .await
+        .expect("claim thread invite");
+    assert_eq!(claimed_thread.outcome, ChannelPairingClaimOutcome::Approved);
+    let thread_grant_id = claimed_thread.grant_id.expect("thread claim grant id");
+    let access = kernel
+        .list_channel_pairings(Some("telegram".to_string()), None)
+        .await
+        .expect("list thread grants");
+    let thread_grant = access
+        .grants
+        .iter()
+        .find(|grant| grant.grant_id == thread_grant_id)
+        .expect("claimed thread grant");
+    assert_eq!(thread_grant.routing_profile, ChannelRoutingProfile::Thread);
+    assert_eq!(thread_grant.sender_ref.as_deref(), Some("telegram:user:1"));
+    assert_eq!(
+        thread_grant.conversation_ref.as_deref(),
+        Some("telegram:chat:-1")
+    );
+    assert_eq!(
+        thread_grant.thread_ref.as_deref(),
+        Some("telegram:topic:42")
+    );
+
+    let blocked_thread_invite = kernel
+        .invite_channel_pairing(ChannelPairingInviteRequest {
+            channel_id: "telegram".to_string(),
+            requested_profile: ChannelRoutingProfile::Thread,
+            label: None,
+            conversation_ref: Some("telegram:chat:-blocked".to_string()),
+            thread_ref: None,
+            expires_in_ms: None,
+            max_claims: None,
+        })
+        .await
+        .expect("create blocked thread invite");
+    let blocked_thread_grant = expect_blocked_grant(
+        kernel
+            .block_channel_pairing(ChannelPairingBlockRequest {
+                channel_id: "telegram".to_string(),
+                pairing_id: None,
+                sender_ref: Some("telegram:user:blocked".to_string()),
+                conversation_ref: Some("telegram:chat:-blocked".to_string()),
+                thread_ref: None,
+                reason: Some("qa_block".to_string()),
+            })
+            .await
+            .expect("block thread conversation scope"),
+    );
+    let blocked_thread = kernel
+        .claim_channel_pairing(claim_request(
+            "telegram",
+            &blocked_thread_invite.token,
+            "telegram:user:blocked",
+            "telegram:chat:-blocked",
+            Some("telegram:topic:blocked"),
+        ))
+        .await
+        .expect("claim thread invite in blocked conversation");
+    assert_eq!(
+        blocked_thread.outcome,
+        ChannelPairingClaimOutcome::ScopeMismatch
+    );
+    assert_eq!(blocked_thread.reason_code.as_deref(), Some("scope_blocked"));
+    assert_eq!(blocked_thread.grant_id, Some(blocked_thread_grant.grant_id));
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    let blocked_thread_row = sqlx::query(
+        "SELECT status, claim_count FROM channel_pairing_requests WHERE pairing_id = ?1",
+    )
+    .bind(blocked_thread_invite.pairing_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query blocked thread invite");
+    assert_eq!(blocked_thread_row.get::<String, _>("status"), "pending");
+    assert_eq!(blocked_thread_row.get::<i64, _>("claim_count"), 0);
+
+    let expired_invite = kernel
+        .invite_channel_pairing(ChannelPairingInviteRequest {
+            channel_id: "telegram".to_string(),
+            requested_profile: ChannelRoutingProfile::Direct,
+            label: None,
+            conversation_ref: None,
+            thread_ref: None,
+            expires_in_ms: None,
+            max_claims: None,
+        })
+        .await
+        .expect("create expirable invite");
+    sqlx::query("UPDATE channel_pairing_requests SET expires_at_ms = 1 WHERE pairing_id = ?1")
+        .bind(expired_invite.pairing_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("expire invite");
+
+    let expired = kernel
+        .claim_channel_pairing(claim_request(
+            "telegram",
+            &expired_invite.token,
+            "telegram:user:2",
+            "telegram:user:2",
+            None,
+        ))
+        .await
+        .expect("claim expired invite");
+    assert_eq!(expired.outcome, ChannelPairingClaimOutcome::Expired);
+    assert!(expired.grant_id.is_none());
+
+    let invalid = kernel
+        .claim_channel_pairing(claim_request(
+            "telegram",
+            "lc_not-a-real-token",
+            "telegram:user:3",
+            "telegram:user:3",
+            None,
+        ))
+        .await
+        .expect("claim invalid invite");
+    assert_eq!(invalid.outcome, ChannelPairingClaimOutcome::InvalidToken);
+    assert_eq!(invalid.reason_code.as_deref(), Some("invalid_token"));
+    assert!(invalid.grant_id.is_none());
+
+    wait_for_audit_event_count(&kernel, "channel.pairing.claim_denied", 3).await;
 }
 
 #[tokio::test]
@@ -1245,18 +1877,19 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
         Some("trigger_insufficient")
     );
 
-    let blocked_grant = kernel
-        .block_channel_pairing(ChannelPairingBlockRequest {
-            channel_id: "slack".to_string(),
-            pairing_id: None,
-            sender_ref: Some("mallory".to_string()),
-            conversation_ref: None,
-            thread_ref: None,
-            reason: Some("test_block".to_string()),
-        })
-        .await
-        .expect("block sender");
-    assert_eq!(blocked_grant.grant.status, "blocked");
+    expect_blocked_grant(
+        kernel
+            .block_channel_pairing(ChannelPairingBlockRequest {
+                channel_id: "slack".to_string(),
+                pairing_id: None,
+                sender_ref: Some("mallory".to_string()),
+                conversation_ref: None,
+                thread_ref: None,
+                reason: Some("test_block".to_string()),
+            })
+            .await
+            .expect("block sender"),
+    );
 
     let access_state = kernel
         .list_channel_pairings(Some("slack".to_string()), None)
@@ -2492,6 +3125,37 @@ fn v2_text_request(
         trigger,
         received_at: None,
         provider_metadata: serde_json::json!({}),
+    }
+}
+
+fn claim_request(
+    channel_id: &str,
+    token: &str,
+    sender_ref: &str,
+    conversation_ref: &str,
+    thread_ref: Option<&str>,
+) -> ChannelPairingClaimRequest {
+    ChannelPairingClaimRequest {
+        channel_id: channel_id.to_string(),
+        token: token.to_string(),
+        sender_ref: sender_ref.to_string(),
+        conversation_ref: conversation_ref.to_string(),
+        thread_ref: thread_ref.map(str::to_string),
+        provider_metadata: serde_json::json!({}),
+    }
+}
+
+fn assert_audit_details_exclude_raw_tokens(details: &serde_json::Value, raw_tokens: &[&str]) {
+    assert!(
+        details.get("provider_metadata").is_none(),
+        "pairing claim audit must not persist worker provider metadata"
+    );
+    let details_raw = serde_json::to_string(details).expect("serialize audit details");
+    for raw_token in raw_tokens {
+        assert!(
+            !details_raw.contains(raw_token),
+            "pairing claim audit must not persist raw token {raw_token}"
+        );
     }
 }
 
