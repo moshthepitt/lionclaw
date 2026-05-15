@@ -144,7 +144,7 @@ struct RunArgs {
     #[arg(
         long,
         value_parser = parse_runtime_timeout,
-        help = "Runtime safety limit for each turn, such as 30m, 2h, or 7200s"
+        help = "Runtime turn limit, such as 30m, 2h, or 7200s"
     )]
     timeout: Option<Duration>,
     runtime: Option<String>,
@@ -674,7 +674,7 @@ pub async fn run() -> Result<ExitCode> {
             let target = resolved_target
                 .as_ref()
                 .ok_or_else(|| anyhow!("run requires a resolved LionClaw target"))?;
-            let timeout_override = args.timeout.map(RuntimeTurnTimeouts::with_hard_timeout);
+            let timeout_override = args.timeout.map(RuntimeTurnTimeouts::with_turn_timeout);
             run_local(
                 &target.instance_home,
                 target.require_work_root()?,
