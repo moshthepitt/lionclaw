@@ -80,6 +80,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     tokio::spawn(async move {
         scheduler_kernel.run_scheduler_loop().await;
     });
+    let attachment_maintenance_kernel = Arc::clone(&kernel);
+    tokio::spawn(async move {
+        attachment_maintenance_kernel
+            .run_channel_attachment_maintenance_loop()
+            .await;
+    });
     let app = build_router(
         kernel,
         DaemonInfoResponse {

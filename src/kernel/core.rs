@@ -1,10 +1,12 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    ffi::OsStr,
     fmt,
-    path::{Path, PathBuf},
+    io::ErrorKind,
+    path::{Component, Path, PathBuf},
     str::FromStr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -12,6 +14,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, Transaction};
 use tokio::{
+    io::AsyncWriteExt,
     sync::{Mutex, Notify, RwLock},
     time::{sleep, timeout, Instant},
 };
@@ -19,23 +22,25 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::contracts::{
-    AuditEventView, AuditQueryResponse, ChannelAttachmentDescriptor, ChannelBindingView,
-    ChannelGrantResponse, ChannelGrantRevokeRequest, ChannelGrantRevokeResponse, ChannelGrantView,
-    ChannelInboundOutcome, ChannelInboundRequest, ChannelInboundResponse, ChannelListResponse,
-    ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
-    ChannelPairingClaimOutcome, ChannelPairingClaimRequest, ChannelPairingClaimResponse,
-    ChannelPairingInviteRequest, ChannelPairingInviteResponse, ChannelPairingListResponse,
-    ChannelPairingStatus, ChannelPairingView, ChannelRoutingProfile, ChannelStreamAckRequest,
-    ChannelStreamAckResponse, ChannelStreamEventView, ChannelStreamPullRequest,
-    ChannelStreamPullResponse, ChannelTrigger, ContinuityDraftActionRequest,
-    ContinuityDraftDiscardResponse, ContinuityDraftListRequest, ContinuityDraftListResponse,
-    ContinuityDraftPromoteResponse, ContinuityDraftView, ContinuityGetResponse,
-    ContinuityMemoryProposalView, ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse,
-    ContinuityOpenLoopView, ContinuityPathRequest, ContinuityProposalActionResponse,
-    ContinuityProposalListResponse, ContinuitySearchMatchView, ContinuitySearchRequest,
-    ContinuitySearchResponse, ContinuityStatusResponse, JobCreateRequest, JobCreateResponse,
-    JobDeliveryTargetDto, JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest,
-    JobRemoveResponse, JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto,
+    AuditEventView, AuditQueryResponse, ChannelAttachmentDescriptor,
+    ChannelAttachmentFinalizeOutcome, ChannelAttachmentFinalizeRequest,
+    ChannelAttachmentFinalizeResponse, ChannelAttachmentStageResponse, ChannelAttachmentStatus,
+    ChannelBindingView, ChannelGrantResponse, ChannelGrantRevokeRequest,
+    ChannelGrantRevokeResponse, ChannelGrantView, ChannelInboundOutcome, ChannelInboundRequest,
+    ChannelInboundResponse, ChannelListResponse, ChannelPairingApproveRequest,
+    ChannelPairingBlockRequest, ChannelPairingBlockResponse, ChannelPairingClaimOutcome,
+    ChannelPairingClaimRequest, ChannelPairingClaimResponse, ChannelPairingInviteRequest,
+    ChannelPairingInviteResponse, ChannelPairingListResponse, ChannelPairingStatus,
+    ChannelPairingView, ChannelRoutingProfile, ChannelStreamAckRequest, ChannelStreamAckResponse,
+    ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamPullResponse, ChannelTrigger,
+    ContinuityDraftActionRequest, ContinuityDraftDiscardResponse, ContinuityDraftListRequest,
+    ContinuityDraftListResponse, ContinuityDraftPromoteResponse, ContinuityDraftView,
+    ContinuityGetResponse, ContinuityMemoryProposalView, ContinuityOpenLoopActionResponse,
+    ContinuityOpenLoopListResponse, ContinuityOpenLoopView, ContinuityPathRequest,
+    ContinuityProposalActionResponse, ContinuityProposalListResponse, ContinuitySearchMatchView,
+    ContinuitySearchRequest, ContinuitySearchResponse, ContinuityStatusResponse, JobCreateRequest,
+    JobCreateResponse, JobDeliveryTargetDto, JobGetResponse, JobListResponse, JobManualRunResponse,
+    JobRefRequest, JobRemoveResponse, JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto,
     JobTickResponse, JobToggleResponse, JobView, PolicyGrantRequest, PolicyGrantResponse,
     PolicyRevokeResponse, SchedulerJobDeliveryStatusDto, SchedulerJobRunStatusDto,
     SchedulerJobTriggerKindDto, SessionActionKind, SessionActionRequest, SessionActionResponse,
@@ -57,6 +62,12 @@ use crate::{
 use super::{
     audit::AuditLog,
     capability_broker::{CapabilityBroker, CapabilityExecutionContext},
+    channel_attachments::{
+        ChannelAttachmentBatchStatus, ChannelAttachmentRecord, ChannelAttachmentRecordStatus,
+        ChannelAttachmentStore, DeclareAttachmentRejection, RejectAttachmentUpdate,
+        StageAttachmentUpdate, MAX_CHANNEL_ATTACHMENTS_PER_EVENT, MAX_CHANNEL_ATTACHMENT_BYTES,
+        MAX_CHANNEL_EVENT_ATTACHMENT_BYTES,
+    },
     channel_state::{
         ChannelGrantRecord, ChannelGrantStatus, ChannelGrantUpsert, ChannelPairingRequestRecord,
         ChannelStateStore, ChannelStreamEventInsert, ChannelStreamEventKind,
@@ -108,6 +119,54 @@ use super::{
 
 const ACTIVE_GLOBAL_SLICE_LIMIT: usize = 5;
 const HIDDEN_COMPACTION_TURN_TIMEOUT: Duration = Duration::from_secs(30);
+const STALE_CHANNEL_ATTACHMENT_BATCH_AFTER: Duration = Duration::from_secs(60 * 60);
+const STALE_CHANNEL_ATTACHMENT_TEMP_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+const STALE_CHANNEL_ATTACHMENT_PROJECTION_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+const CHANNEL_ATTACHMENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+const CHANNEL_ATTACHMENT_NOT_STAGED: &str = "not_staged";
+const CHANNEL_ATTACHMENT_TOO_LARGE: &str = "attachment_too_large";
+const CHANNEL_ATTACHMENT_EVENT_TOO_LARGE: &str = "event_attachments_too_large";
+const CHANNEL_ATTACHMENT_PROJECTIONS_DIR: &str = "attachment-projections";
+const CHANNEL_ATTACHMENT_MOUNT_TARGET: &str = "/attachments";
+
+#[derive(Debug, Clone)]
+pub enum ChannelAttachmentStageContent {
+    Bytes(Vec<u8>),
+    RejectedByPolicy {
+        reason_code: String,
+        size_bytes: i64,
+        sha256: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelAttachmentStageInput {
+    pub channel_id: String,
+    pub event_id: String,
+    pub attachment_id: String,
+    pub kind: String,
+    pub filename: Option<String>,
+    pub mime_type: Option<String>,
+    pub caption: Option<String>,
+    pub content: ChannelAttachmentStageContent,
+}
+
+#[derive(Debug, Clone)]
+struct StagedAttachmentContent {
+    content: Option<Vec<u8>>,
+    size_bytes: i64,
+    sha256: String,
+    policy_rejection_code: Option<String>,
+}
+
+struct ChannelAttachmentStageRejection<'a> {
+    channel_id: &'a str,
+    event_id: &'a str,
+    attachment_id: &'a str,
+    size_bytes: i64,
+    sha256: &'a str,
+    reason_code: &'a str,
+}
 
 #[derive(Clone)]
 pub struct KernelOptions {
@@ -191,6 +250,7 @@ pub struct Kernel {
     jobs: JobStore,
     runtime: RuntimeRegistry,
     channel_state: ChannelStateStore,
+    channel_attachments: ChannelAttachmentStore,
     audit: AuditLog,
     capability_broker: CapabilityBroker,
     scheduler: SchedulerEngine,
@@ -352,6 +412,7 @@ impl Kernel {
             jobs: JobStore::new(pool.clone()),
             runtime,
             channel_state: ChannelStateStore::new(pool.clone()),
+            channel_attachments: ChannelAttachmentStore::new(pool.clone()),
             audit: AuditLog::new(pool),
             capability_broker,
             scheduler: SchedulerEngine::new(options.scheduler),
@@ -420,6 +481,12 @@ impl Kernel {
                 "failed to reconcile running channel turns during bootstrap"
             );
         }
+        if let Err(err) = self.reconcile_stale_channel_attachments().await {
+            warn!(
+                ?err,
+                "failed to reconcile stale channel attachments during bootstrap"
+            );
+        }
         self.ensure_pending_channel_turn_workers().await;
         if let Err(err) = self
             .jobs
@@ -433,6 +500,274 @@ impl Kernel {
         }
         if let Err(err) = self.refresh_active_continuity().await {
             warn!(?err, "failed to refresh active continuity during bootstrap");
+        }
+    }
+
+    pub async fn reconcile_stale_channel_attachments(&self) -> Result<(), KernelError> {
+        self.cleanup_stale_channel_attachment_temp_uploads().await?;
+        self.cleanup_stale_channel_attachment_runtime_projections()
+            .await?;
+        self.finalize_stale_channel_attachment_batches().await
+    }
+
+    pub async fn run_channel_attachment_maintenance_loop(self: Arc<Self>) {
+        loop {
+            sleep(CHANNEL_ATTACHMENT_MAINTENANCE_INTERVAL).await;
+            if let Err(err) = self.reconcile_stale_channel_attachments().await {
+                warn!(?err, "failed to reconcile stale channel attachments");
+            }
+        }
+    }
+
+    async fn finalize_stale_channel_attachment_batches(&self) -> Result<(), KernelError> {
+        let threshold_ms = Utc::now()
+            .timestamp_millis()
+            .saturating_sub(STALE_CHANNEL_ATTACHMENT_BATCH_AFTER.as_millis() as i64);
+        let batches = self
+            .channel_attachments
+            .stale_waiting_batches(threshold_ms)
+            .await
+            .map_err(internal)?;
+        for (channel_id, event_id) in batches {
+            if let Err(err) = self
+                .finalize_channel_attachments(ChannelAttachmentFinalizeRequest {
+                    channel_id: channel_id.clone(),
+                    event_id: event_id.clone(),
+                    worker_id: "kernel-stale-attachment-cleanup".to_string(),
+                    missing: Vec::new(),
+                })
+                .await
+            {
+                warn!(?err, %channel_id, %event_id, "failed to finalize stale channel attachment batch");
+            }
+        }
+        Ok(())
+    }
+
+    async fn cleanup_stale_channel_attachment_temp_uploads(&self) -> Result<(), KernelError> {
+        let Some(runtime_root) = self.runtime_root.as_ref() else {
+            return Ok(());
+        };
+        let channels_root = runtime_root.join("channels");
+        if !tokio::fs::try_exists(&channels_root)
+            .await
+            .map_err(|err| internal(err.into()))?
+        {
+            return Ok(());
+        }
+        ensure_existing_directory_is_safe(&channels_root).await?;
+
+        let cutoff = SystemTime::now()
+            .checked_sub(STALE_CHANNEL_ATTACHMENT_TEMP_AFTER)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let mut stack = vec![channels_root];
+        while let Some(dir) = stack.pop() {
+            let mut entries = match tokio::fs::read_dir(&dir).await {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(internal(err.into())),
+            };
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|err| internal(err.into()))?
+            {
+                let path = entry.path();
+                let metadata = match tokio::fs::symlink_metadata(&path).await {
+                    Ok(metadata) => metadata,
+                    Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                    Err(err) => return Err(internal(err.into())),
+                };
+                if metadata.file_type().is_symlink() {
+                    continue;
+                }
+                if metadata.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !metadata.is_file() || !is_channel_attachment_temp_upload(&path) {
+                    continue;
+                }
+                let stale = metadata
+                    .modified()
+                    .ok()
+                    .is_some_and(|modified| modified < cutoff);
+                if stale {
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == ErrorKind::NotFound => {}
+                        Err(err) => return Err(internal(err.into())),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn cleanup_stale_channel_attachment_runtime_projections(
+        &self,
+    ) -> Result<(), KernelError> {
+        let Some(runtime_root) = self.runtime_root.as_ref() else {
+            return Ok(());
+        };
+        let channels_root = runtime_root.join("channels");
+        if !tokio::fs::try_exists(&channels_root)
+            .await
+            .map_err(|err| internal(err.into()))?
+        {
+            return Ok(());
+        }
+        ensure_existing_directory_is_safe(&channels_root).await?;
+
+        let cutoff = SystemTime::now()
+            .checked_sub(STALE_CHANNEL_ATTACHMENT_PROJECTION_AFTER)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let mut channel_entries = tokio::fs::read_dir(&channels_root)
+            .await
+            .map_err(|err| internal(err.into()))?;
+        while let Some(channel_entry) = channel_entries
+            .next_entry()
+            .await
+            .map_err(|err| internal(err.into()))?
+        {
+            let channel_dir = channel_entry.path();
+            let Ok(channel_metadata) = tokio::fs::symlink_metadata(&channel_dir).await else {
+                continue;
+            };
+            if channel_metadata.file_type().is_symlink() || !channel_metadata.is_dir() {
+                continue;
+            }
+
+            let projections_root = channel_dir.join(CHANNEL_ATTACHMENT_PROJECTIONS_DIR);
+            let projections_metadata = match tokio::fs::symlink_metadata(&projections_root).await {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(internal(err.into())),
+            };
+            if projections_metadata.file_type().is_symlink() || !projections_metadata.is_dir() {
+                continue;
+            }
+
+            let mut event_entries = tokio::fs::read_dir(&projections_root)
+                .await
+                .map_err(|err| internal(err.into()))?;
+            while let Some(event_entry) = event_entries
+                .next_entry()
+                .await
+                .map_err(|err| internal(err.into()))?
+            {
+                let event_dir = event_entry.path();
+                let Ok(event_metadata) = tokio::fs::symlink_metadata(&event_dir).await else {
+                    continue;
+                };
+                if event_metadata.file_type().is_symlink() || !event_metadata.is_dir() {
+                    continue;
+                }
+
+                let mut projection_entries = tokio::fs::read_dir(&event_dir)
+                    .await
+                    .map_err(|err| internal(err.into()))?;
+                while let Some(projection_entry) = projection_entries
+                    .next_entry()
+                    .await
+                    .map_err(|err| internal(err.into()))?
+                {
+                    let projection_dir = projection_entry.path();
+                    let Ok(projection_metadata) =
+                        tokio::fs::symlink_metadata(&projection_dir).await
+                    else {
+                        continue;
+                    };
+                    if projection_metadata.file_type().is_symlink() || !projection_metadata.is_dir()
+                    {
+                        continue;
+                    }
+                    let stale = projection_metadata
+                        .modified()
+                        .ok()
+                        .is_some_and(|modified| modified < cutoff);
+                    if stale {
+                        if let Err(err) = self
+                            .remove_channel_attachment_runtime_projection(&projection_dir)
+                            .await
+                        {
+                            warn!(
+                                ?err,
+                                path = %projection_dir.display(),
+                                "failed to remove stale channel attachment runtime projection"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn remove_channel_attachment_runtime_projection(
+        &self,
+        projection_dir: &Path,
+    ) -> Result<(), KernelError> {
+        let Some(runtime_root) = self.runtime_root.as_ref() else {
+            return Ok(());
+        };
+
+        let metadata = match tokio::fs::symlink_metadata(projection_dir).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(internal(err.into())),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(KernelError::Conflict(format!(
+                "channel attachment runtime projection '{}' is not a regular directory",
+                projection_dir.display()
+            )));
+        }
+
+        let runtime_root = tokio::fs::canonicalize(runtime_root).await.map_err(|err| {
+            KernelError::Internal(format!(
+                "failed to resolve runtime root '{}': {err}",
+                runtime_root.display()
+            ))
+        })?;
+        let projection_dir = tokio::fs::canonicalize(projection_dir)
+            .await
+            .map_err(|err| {
+                KernelError::Internal(format!(
+                    "failed to resolve channel attachment runtime projection '{}': {err}",
+                    projection_dir.display()
+                ))
+            })?;
+        if !is_channel_attachment_runtime_projection_path(&runtime_root, &projection_dir) {
+            return Err(KernelError::Conflict(format!(
+                "channel attachment runtime projection '{}' is outside the projection namespace",
+                projection_dir.display()
+            )));
+        }
+
+        match tokio::fs::remove_dir_all(&projection_dir).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(internal(err.into())),
+        }
+    }
+
+    async fn remove_channel_attachment_runtime_projection_dirs_best_effort(
+        &self,
+        projection_dirs: &[PathBuf],
+    ) {
+        for projection_dir in projection_dirs {
+            if let Err(err) = self
+                .remove_channel_attachment_runtime_projection(projection_dir)
+                .await
+            {
+                warn!(
+                    ?err,
+                    path = %projection_dir.display(),
+                    "failed to remove channel attachment runtime projection"
+                );
+            }
         }
     }
 
@@ -678,7 +1013,10 @@ impl Kernel {
                 let kernel = self.clone();
                 tokio::spawn(async move {
                     let _guard = guard;
-                    if let Err(err) = kernel.execute_session_turn(&session, execution).await {
+                    if let Err(err) = kernel
+                        .execute_session_turn_with_attachment_cleanup(&session, execution)
+                        .await
+                    {
                         warn!(?err, session_id = %session.session_id, turn_id = %turn_id, "session action turn failed");
                     }
                 });
@@ -846,7 +1184,8 @@ impl Kernel {
             .prepare_session_action_execution(session_id, action, options)
             .await?;
 
-        self.execute_session_turn(&session, execution).await
+        self.execute_session_turn_with_attachment_cleanup(&session, execution)
+            .await
     }
 
     async fn prepare_session_action_execution(
@@ -894,6 +1233,13 @@ impl Kernel {
                     ));
                 }
 
+                let prompt_user_text = "Continue your previous assistant reply from where it stopped. Do not restart from the beginning unless necessary.".to_string();
+                let attachment_context = self
+                    .channel_attachment_execution_context_for_session_action_source(
+                        &latest_turn,
+                        &prompt_user_text,
+                    )
+                    .await?;
                 let display_user_text = prepared_turn
                     .as_ref()
                     .map(|turn| turn.display_user_text.clone())
@@ -902,15 +1248,17 @@ impl Kernel {
                     turn_id,
                     kind: SessionTurnKind::Continue,
                     display_user_text,
-                    prompt_user_text: "Continue your previous assistant reply from where it stopped. Do not restart from the beginning unless necessary.".to_string(),
+                    prompt_user_text,
+                    runtime_prompt_user_text: attachment_context.runtime_prompt_user_text,
+                    attachment_source_turn_id: attachment_context.attachment_source_turn_id,
                     prepared_turn: prepared_turn.take(),
                     requested_runtime_id: Some(
-                        runtime_id_override
-                            .unwrap_or_else(|| latest_turn.runtime_id.clone()),
+                        runtime_id_override.unwrap_or_else(|| latest_turn.runtime_id.clone()),
                     ),
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
                     runtime_env_passthrough: None,
+                    extra_mounts: attachment_context.extra_mounts,
                     default_policy_scope: Scope::Session(session_id),
                     sink,
                     emit_channel_stream_done,
@@ -919,6 +1267,12 @@ impl Kernel {
                 }
             }
             SessionActionKind::RetryLastTurn => {
+                let attachment_context = self
+                    .channel_attachment_execution_context_for_session_action_source(
+                        &latest_turn,
+                        &latest_turn.prompt_user_text,
+                    )
+                    .await?;
                 let display_user_text = prepared_turn
                     .as_ref()
                     .map(|turn| turn.display_user_text.clone())
@@ -928,6 +1282,8 @@ impl Kernel {
                     kind: SessionTurnKind::Retry,
                     display_user_text,
                     prompt_user_text: latest_turn.prompt_user_text,
+                    runtime_prompt_user_text: attachment_context.runtime_prompt_user_text,
+                    attachment_source_turn_id: attachment_context.attachment_source_turn_id,
                     prepared_turn: prepared_turn.take(),
                     requested_runtime_id: Some(
                         runtime_id_override.unwrap_or_else(|| latest_turn.runtime_id.clone()),
@@ -935,6 +1291,7 @@ impl Kernel {
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
                     runtime_env_passthrough: None,
+                    extra_mounts: attachment_context.extra_mounts,
                     default_policy_scope: Scope::Session(session_id),
                     sink,
                     emit_channel_stream_done,
@@ -950,6 +1307,18 @@ impl Kernel {
         };
 
         Ok((session, execution))
+    }
+
+    async fn execute_session_turn_with_attachment_cleanup(
+        &self,
+        session: &super::sessions::Session,
+        execution: SessionTurnExecution,
+    ) -> Result<SessionTurnResponse, KernelError> {
+        let projection_mounts = channel_attachment_projection_dirs(&execution.extra_mounts);
+        let result = self.execute_session_turn(session, execution).await;
+        self.remove_channel_attachment_runtime_projection_dirs_best_effort(&projection_mounts)
+            .await;
+        result
     }
 
     pub async fn turn_session(
@@ -1667,6 +2036,794 @@ impl Kernel {
         self.process_channel_inbound(req).await
     }
 
+    pub async fn stage_channel_attachment(
+        &self,
+        input: ChannelAttachmentStageInput,
+    ) -> Result<ChannelAttachmentStageResponse, KernelError> {
+        let channel_id = trim_required(input.channel_id, "channel_id")?;
+        let event_id = trim_required(input.event_id, "event_id")?;
+        let attachment_id = trim_required(input.attachment_id, "attachment_id")?;
+        let kind = trim_required(input.kind, "kind")?;
+        let incoming_filename = trim_optional(input.filename);
+        let incoming_mime_type = trim_optional(input.mime_type);
+        let incoming_caption = trim_optional(input.caption);
+        let staged_content = match input.content {
+            ChannelAttachmentStageContent::Bytes(content) => {
+                let size_bytes = i64::try_from(content.len()).map_err(|_| {
+                    KernelError::BadRequest("attachment content is too large".to_string())
+                })?;
+                let sha256 = sha256_hex(&content);
+                StagedAttachmentContent {
+                    content: Some(content),
+                    size_bytes,
+                    sha256,
+                    policy_rejection_code: None,
+                }
+            }
+            ChannelAttachmentStageContent::RejectedByPolicy {
+                reason_code,
+                size_bytes,
+                sha256,
+            } => {
+                if size_bytes < 0 {
+                    return Err(KernelError::BadRequest(
+                        "attachment content size cannot be negative".to_string(),
+                    ));
+                }
+                StagedAttachmentContent {
+                    content: None,
+                    size_bytes,
+                    sha256: trim_required(sha256, "sha256")?,
+                    policy_rejection_code: Some(trim_required(reason_code, "reason_code")?),
+                }
+            }
+        };
+
+        self.require_active_channel_binding(&channel_id).await?;
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let turn = self
+            .channel_state
+            .get_turn_by_inbound_event_in_tx(&mut tx, &channel_id, &event_id)
+            .await
+            .map_err(internal)?;
+        let Some(turn) = turn else {
+            let inbound_exists = self
+                .channel_state
+                .get_inbound_event_in_tx(&mut tx, &channel_id, &event_id)
+                .await
+                .map_err(internal)?
+                .is_some();
+            if inbound_exists {
+                return Err(KernelError::Conflict(
+                    "channel inbound event is not waiting for attachments".to_string(),
+                ));
+            }
+            return Err(KernelError::NotFound(
+                "channel inbound event not found".to_string(),
+            ));
+        };
+        if turn.status != ChannelTurnStatus::WaitingForAttachments {
+            return Err(KernelError::Conflict(
+                "channel inbound event is not waiting for attachments".to_string(),
+            ));
+        }
+
+        let batch = self
+            .channel_attachments
+            .get_batch_in_tx(&mut tx, &channel_id, &event_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                KernelError::NotFound("channel attachment batch not found".to_string())
+            })?;
+        if batch.status != ChannelAttachmentBatchStatus::Waiting {
+            return Err(KernelError::Conflict(
+                "channel attachment batch is already finalized".to_string(),
+            ));
+        }
+
+        let declared = self
+            .channel_attachments
+            .get_attachment_in_tx(&mut tx, &channel_id, &event_id, &attachment_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::BadRequest("attachment is not declared".to_string()))?;
+        if declared.status != ChannelAttachmentRecordStatus::Declared {
+            return Err(KernelError::Conflict(format!(
+                "attachment is already {}",
+                declared.status.as_str()
+            )));
+        }
+
+        let descriptor_metadata_mismatch = declared.kind != kind
+            || declared.mime_type.as_deref().is_some_and(|expected| {
+                incoming_mime_type
+                    .as_deref()
+                    .is_some_and(|actual| actual != expected)
+            })
+            || declared.filename.as_deref().is_some_and(|expected| {
+                incoming_filename
+                    .as_deref()
+                    .is_some_and(|actual| actual != expected)
+            });
+        let descriptor_size_mismatch = declared
+            .size_bytes
+            .is_some_and(|expected| expected != staged_content.size_bytes);
+
+        let rejection_reason_code = if descriptor_metadata_mismatch {
+            Some("descriptor_mismatch")
+        } else if let Some(reason_code) = staged_content.policy_rejection_code.as_deref() {
+            Some(reason_code)
+        } else if descriptor_size_mismatch {
+            Some("descriptor_mismatch")
+        } else {
+            None
+        };
+
+        if let Some(reason_code) = rejection_reason_code {
+            let response = self
+                .reject_channel_attachment_stage_in_tx(
+                    &mut tx,
+                    ChannelAttachmentStageRejection {
+                        channel_id: &channel_id,
+                        event_id: &event_id,
+                        attachment_id: &attachment_id,
+                        size_bytes: staged_content.size_bytes,
+                        sha256: &staged_content.sha256,
+                        reason_code,
+                    },
+                )
+                .await?;
+            tx.commit().await.map_err(|err| internal(err.into()))?;
+            return Ok(response);
+        }
+
+        let content = staged_content.content.ok_or_else(|| {
+            KernelError::Internal("stageable attachment content is missing".to_string())
+        })?;
+        if content.len() > MAX_CHANNEL_ATTACHMENT_BYTES {
+            let response = self
+                .reject_channel_attachment_stage_in_tx(
+                    &mut tx,
+                    ChannelAttachmentStageRejection {
+                        channel_id: &channel_id,
+                        event_id: &event_id,
+                        attachment_id: &attachment_id,
+                        size_bytes: staged_content.size_bytes,
+                        sha256: &staged_content.sha256,
+                        reason_code: CHANNEL_ATTACHMENT_TOO_LARGE,
+                    },
+                )
+                .await?;
+            tx.commit().await.map_err(|err| internal(err.into()))?;
+            return Ok(response);
+        }
+
+        let staged_bytes = self
+            .channel_attachments
+            .staged_size_for_event_in_tx(&mut tx, &channel_id, &event_id)
+            .await
+            .map_err(internal)?;
+        if staged_bytes.saturating_add(staged_content.size_bytes)
+            > MAX_CHANNEL_EVENT_ATTACHMENT_BYTES as i64
+        {
+            let response = self
+                .reject_channel_attachment_stage_in_tx(
+                    &mut tx,
+                    ChannelAttachmentStageRejection {
+                        channel_id: &channel_id,
+                        event_id: &event_id,
+                        attachment_id: &attachment_id,
+                        size_bytes: staged_content.size_bytes,
+                        sha256: &staged_content.sha256,
+                        reason_code: CHANNEL_ATTACHMENT_EVENT_TOO_LARGE,
+                    },
+                )
+                .await?;
+            tx.commit().await.map_err(|err| internal(err.into()))?;
+            return Ok(response);
+        }
+
+        let filename = sanitize_channel_attachment_filename(
+            incoming_filename
+                .as_deref()
+                .or(declared.filename.as_deref()),
+        );
+        let mime_type = incoming_mime_type.or(declared.mime_type);
+        let caption = incoming_caption.or(declared.caption);
+        let storage_attachment_id = channel_attachment_storage_component(&attachment_id);
+        let event_dir = self
+            .ensure_channel_attachment_event_dir(&channel_id, &event_id)
+            .await?;
+        let attachment_dir =
+            ensure_safe_child_directory(&event_dir, &[storage_attachment_id.as_str()]).await?;
+        let final_path = attachment_dir.join(&filename);
+        match tokio::fs::symlink_metadata(&final_path).await {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(KernelError::Conflict(
+                        "attachment content path is not a regular file".to_string(),
+                    ));
+                }
+                tokio::fs::remove_file(&final_path).await.map_err(|err| {
+                    KernelError::Internal(format!(
+                        "failed to remove orphaned staged attachment file: {err}"
+                    ))
+                })?;
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(KernelError::Internal(format!(
+                    "failed to inspect staged attachment path: {err}"
+                )));
+            }
+        }
+
+        let temp_path = attachment_dir.join(format!(".upload-{}.tmp", Uuid::new_v4()));
+        let write_result = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+                .await?;
+            file.write_all(&content).await?;
+            file.sync_all().await?;
+            drop(file);
+            tokio::fs::rename(&temp_path, &final_path).await
+        }
+        .await;
+        if let Err(err) = write_result {
+            remove_file_best_effort(&temp_path).await;
+            return Err(KernelError::Internal(format!(
+                "failed to stage channel attachment file: {err}"
+            )));
+        }
+
+        let storage_path = match tokio::fs::canonicalize(&final_path).await {
+            Ok(path) => path,
+            Err(err) => {
+                remove_file_best_effort(&final_path).await;
+                return Err(KernelError::Internal(format!(
+                    "failed to resolve staged channel attachment path: {err}"
+                )));
+            }
+        };
+        ensure_staged_attachment_file_is_safe(&storage_path).await?;
+        let event_dir = match tokio::fs::canonicalize(&event_dir).await {
+            Ok(path) => path,
+            Err(err) => {
+                remove_file_best_effort(&storage_path).await;
+                return Err(KernelError::Internal(format!(
+                    "failed to resolve channel attachment event directory '{}': {err}",
+                    event_dir.display()
+                )));
+            }
+        };
+        if !storage_path.starts_with(&event_dir) {
+            remove_file_best_effort(&storage_path).await;
+            return Err(KernelError::Conflict(format!(
+                "staged attachment path '{}' is outside its event directory",
+                storage_path.display()
+            )));
+        }
+        let storage_path_string = storage_path.to_string_lossy().into_owned();
+        let staged = self
+            .channel_attachments
+            .stage_attachment_in_tx(
+                &mut tx,
+                StageAttachmentUpdate {
+                    channel_id: &channel_id,
+                    event_id: &event_id,
+                    attachment_id: &attachment_id,
+                    filename: Some(&filename),
+                    mime_type: mime_type.as_deref(),
+                    caption: caption.as_deref(),
+                    size_bytes: staged_content.size_bytes,
+                    sha256: &staged_content.sha256,
+                    storage_path: &storage_path_string,
+                },
+            )
+            .await
+            .map_err(internal)?;
+        if !staged {
+            remove_file_best_effort(&storage_path).await;
+            return Err(KernelError::Conflict(
+                "attachment is no longer stageable".to_string(),
+            ));
+        }
+        if let Err(err) = tx.commit().await {
+            remove_file_best_effort(&storage_path).await;
+            return Err(internal(err.into()));
+        }
+
+        let runtime_path = channel_attachment_runtime_path(&attachment_id, &filename);
+        Ok(ChannelAttachmentStageResponse {
+            channel_id,
+            event_id,
+            attachment_id,
+            status: ChannelAttachmentStatus::Staged,
+            size_bytes: staged_content.size_bytes,
+            sha256: staged_content.sha256,
+            runtime_path: Some(runtime_path),
+            reason_code: None,
+        })
+    }
+
+    pub async fn finalize_channel_attachments(
+        &self,
+        req: ChannelAttachmentFinalizeRequest,
+    ) -> Result<ChannelAttachmentFinalizeResponse, KernelError> {
+        let channel_id = trim_required(req.channel_id, "channel_id")?;
+        let event_id = trim_required(req.event_id, "event_id")?;
+        let worker_id = trim_required(req.worker_id, "worker_id")?;
+        self.require_active_channel_binding(&channel_id).await?;
+
+        let mut missing = Vec::with_capacity(req.missing.len());
+        let mut missing_ids = HashSet::with_capacity(req.missing.len());
+        for report in req.missing {
+            let attachment_id = trim_required(report.attachment_id, "missing.attachment_id")?;
+            let reason_code = trim_required(report.reason_code, "missing.reason_code")?;
+            if !missing_ids.insert(attachment_id.clone()) {
+                return Err(KernelError::BadRequest(format!(
+                    "duplicate missing attachment_id '{attachment_id}'"
+                )));
+            }
+            missing.push((attachment_id, reason_code));
+        }
+
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let batch = self
+            .channel_attachments
+            .get_batch_in_tx(&mut tx, &channel_id, &event_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                KernelError::NotFound("channel attachment batch not found".to_string())
+            })?;
+        let turn = self
+            .channel_state
+            .get_turn_by_inbound_event_in_tx(&mut tx, &channel_id, &event_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("channel turn not found".to_string()))?;
+
+        if batch.status == ChannelAttachmentBatchStatus::Finalized {
+            tx.rollback().await.map_err(|err| internal(err.into()))?;
+            return Ok(channel_attachment_finalize_response(
+                channel_id,
+                event_id,
+                ChannelAttachmentFinalizeOutcome::AlreadyFinalized,
+                Some(turn.session_id),
+                Some(turn.turn_id),
+            ));
+        }
+        if turn.status != ChannelTurnStatus::WaitingForAttachments {
+            tx.rollback().await.map_err(|err| internal(err.into()))?;
+            return Ok(channel_attachment_finalize_response(
+                channel_id,
+                event_id,
+                ChannelAttachmentFinalizeOutcome::NotReady,
+                Some(turn.session_id),
+                Some(turn.turn_id),
+            ));
+        }
+
+        let persisted_turn = self
+            .session_turns
+            .get_in_tx(&mut tx, turn.turn_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("session turn not found".to_string()))?;
+        if persisted_turn.status != SessionTurnStatus::WaitingForAttachments {
+            tx.rollback().await.map_err(|err| internal(err.into()))?;
+            return Ok(channel_attachment_finalize_response(
+                channel_id,
+                event_id,
+                ChannelAttachmentFinalizeOutcome::NotReady,
+                Some(turn.session_id),
+                Some(turn.turn_id),
+            ));
+        }
+
+        let attachments = self
+            .channel_attachments
+            .list_event_attachments_in_tx(&mut tx, &channel_id, &event_id)
+            .await
+            .map_err(internal)?;
+        for (attachment_id, reason_code) in &missing {
+            let attachment = attachments
+                .iter()
+                .find(|attachment| attachment.attachment_id == *attachment_id)
+                .ok_or_else(|| {
+                    KernelError::BadRequest(format!(
+                        "missing attachment '{attachment_id}' is not declared"
+                    ))
+                })?;
+            if attachment.status == ChannelAttachmentRecordStatus::Staged {
+                return Err(KernelError::Conflict(format!(
+                    "missing attachment '{attachment_id}' is already staged"
+                )));
+            }
+            self.channel_attachments
+                .reject_attachment_in_tx(
+                    &mut tx,
+                    RejectAttachmentUpdate {
+                        channel_id: &channel_id,
+                        event_id: &event_id,
+                        attachment_id,
+                        rejection_code: reason_code,
+                    },
+                )
+                .await
+                .map_err(internal)?;
+        }
+
+        self.channel_attachments
+            .reject_unstaged_in_tx(
+                &mut tx,
+                &channel_id,
+                &event_id,
+                CHANNEL_ATTACHMENT_NOT_STAGED,
+            )
+            .await
+            .map_err(internal)?;
+        let finalized_attachments = self
+            .channel_attachments
+            .list_event_attachments_in_tx(&mut tx, &channel_id, &event_id)
+            .await
+            .map_err(internal)?;
+
+        self.session_turns
+            .mark_waiting_for_attachments_ready_in_tx(&mut tx, turn.turn_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                KernelError::Conflict("session turn is no longer waiting".to_string())
+            })?;
+        if !self
+            .channel_state
+            .mark_waiting_turn_pending_in_tx(&mut tx, turn.turn_id)
+            .await
+            .map_err(internal)?
+        {
+            return Err(KernelError::Conflict(
+                "channel turn is no longer waiting".to_string(),
+            ));
+        }
+        if !self
+            .channel_attachments
+            .finalize_batch_in_tx(&mut tx, &channel_id, &event_id)
+            .await
+            .map_err(internal)?
+        {
+            return Err(KernelError::Conflict(
+                "channel attachment batch is already finalized".to_string(),
+            ));
+        }
+
+        let staged_count = finalized_attachments
+            .iter()
+            .filter(|attachment| attachment.status == ChannelAttachmentRecordStatus::Staged)
+            .count();
+        let rejected_count = finalized_attachments
+            .iter()
+            .filter(|attachment| attachment.status == ChannelAttachmentRecordStatus::Rejected)
+            .count();
+        self.audit
+            .append_in_tx(
+                &mut tx,
+                "channel.attachments.finalized",
+                Some(turn.session_id),
+                Some(worker_id.clone()),
+                json!({
+                    "channel_id": &channel_id,
+                    "event_id": &event_id,
+                    "turn_id": turn.turn_id,
+                    "session_id": turn.session_id,
+                    "worker_id": &worker_id,
+                    "staged_count": staged_count,
+                    "rejected_count": rejected_count,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+
+        self.emit_queued_channel_turn_status(
+            turn.session_id,
+            &turn.channel_id,
+            &turn.session_key,
+            turn.turn_id,
+        )
+        .await;
+        self.ensure_channel_turn_worker(&turn.channel_id, &turn.session_key)
+            .await;
+
+        Ok(channel_attachment_finalize_response(
+            channel_id,
+            event_id,
+            ChannelAttachmentFinalizeOutcome::Queued,
+            Some(turn.session_id),
+            Some(turn.turn_id),
+        ))
+    }
+
+    async fn reject_channel_attachment_stage_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        rejection: ChannelAttachmentStageRejection<'_>,
+    ) -> Result<ChannelAttachmentStageResponse, KernelError> {
+        self.channel_attachments
+            .reject_attachment_in_tx(
+                tx,
+                RejectAttachmentUpdate {
+                    channel_id: rejection.channel_id,
+                    event_id: rejection.event_id,
+                    attachment_id: rejection.attachment_id,
+                    rejection_code: rejection.reason_code,
+                },
+            )
+            .await
+            .map_err(internal)?;
+
+        Ok(ChannelAttachmentStageResponse {
+            channel_id: rejection.channel_id.to_string(),
+            event_id: rejection.event_id.to_string(),
+            attachment_id: rejection.attachment_id.to_string(),
+            status: ChannelAttachmentStatus::Rejected,
+            size_bytes: rejection.size_bytes,
+            sha256: rejection.sha256.to_string(),
+            runtime_path: None,
+            reason_code: Some(rejection.reason_code.to_string()),
+        })
+    }
+
+    async fn ensure_channel_attachment_event_dir(
+        &self,
+        channel_id: &str,
+        event_id: &str,
+    ) -> Result<PathBuf, KernelError> {
+        let runtime_root = self
+            .runtime_root
+            .as_deref()
+            .ok_or_else(|| KernelError::NotFound("runtime root is not configured".to_string()))?;
+        let safe_channel_id = channel_attachment_storage_component(channel_id);
+        let safe_event_id = channel_attachment_storage_component(event_id);
+        ensure_safe_child_directory(
+            runtime_root,
+            &[
+                "channels",
+                safe_channel_id.as_str(),
+                "attachments",
+                safe_event_id.as_str(),
+            ],
+        )
+        .await
+    }
+
+    fn channel_attachment_event_dir_path(
+        &self,
+        channel_id: &str,
+        event_id: &str,
+    ) -> Result<PathBuf, KernelError> {
+        let runtime_root = self
+            .runtime_root
+            .as_deref()
+            .ok_or_else(|| KernelError::NotFound("runtime root is not configured".to_string()))?;
+        Ok(runtime_root
+            .join("channels")
+            .join(channel_attachment_storage_component(channel_id))
+            .join("attachments")
+            .join(channel_attachment_storage_component(event_id)))
+    }
+
+    async fn channel_attachment_execution_context_for_turn(
+        &self,
+        turn: &ChannelTurnRecord,
+        prompt_user_text: &str,
+    ) -> Result<ChannelAttachmentExecutionContext, KernelError> {
+        let attachments = self
+            .channel_attachments
+            .list_event_attachments(&turn.channel_id, &turn.inbound_event_id)
+            .await
+            .map_err(internal)?;
+        let runtime_prompt_user_text =
+            channel_attachment_runtime_prompt(prompt_user_text, &attachments)?;
+        let extra_mounts = self
+            .channel_attachment_mounts_for_records(turn, &attachments)
+            .await?;
+        let attachment_source_turn_id = if attachments.is_empty() {
+            None
+        } else {
+            Some(turn.turn_id)
+        };
+
+        Ok(ChannelAttachmentExecutionContext {
+            runtime_prompt_user_text,
+            extra_mounts,
+            attachment_source_turn_id,
+        })
+    }
+
+    async fn channel_attachment_execution_context_for_session_action_source(
+        &self,
+        source_turn: &SessionTurnRecord,
+        prompt_user_text: &str,
+    ) -> Result<ChannelAttachmentExecutionContext, KernelError> {
+        let attachment_source_turn_id = source_turn
+            .attachment_source_turn_id
+            .unwrap_or(source_turn.turn_id);
+        self.channel_attachment_execution_context_for_session_turn(
+            attachment_source_turn_id,
+            prompt_user_text,
+        )
+        .await
+    }
+
+    async fn channel_attachment_execution_context_for_session_turn(
+        &self,
+        turn_id: Uuid,
+        prompt_user_text: &str,
+    ) -> Result<ChannelAttachmentExecutionContext, KernelError> {
+        let Some(turn) = self
+            .channel_state
+            .get_turn(turn_id)
+            .await
+            .map_err(internal)?
+        else {
+            return Ok(ChannelAttachmentExecutionContext::default());
+        };
+
+        self.channel_attachment_execution_context_for_turn(&turn, prompt_user_text)
+            .await
+    }
+
+    async fn channel_attachment_mounts_for_records(
+        &self,
+        turn: &ChannelTurnRecord,
+        attachments: &[ChannelAttachmentRecord],
+    ) -> Result<Vec<MountSpec>, KernelError> {
+        let staged = attachments
+            .iter()
+            .filter(|attachment| attachment.status == ChannelAttachmentRecordStatus::Staged)
+            .collect::<Vec<_>>();
+        if staged.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let upload_event_dir =
+            self.channel_attachment_event_dir_path(&turn.channel_id, &turn.inbound_event_id)?;
+        ensure_existing_directory_is_safe(&upload_event_dir).await?;
+        let upload_event_dir = tokio::fs::canonicalize(&upload_event_dir)
+            .await
+            .map_err(|err| {
+                KernelError::Internal(format!(
+                    "failed to resolve channel attachment event directory '{}': {err}",
+                    upload_event_dir.display()
+                ))
+            })?;
+        let projection_dir = self
+            .prepare_channel_attachment_runtime_projection(turn, &staged, &upload_event_dir)
+            .await?;
+
+        Ok(vec![MountSpec {
+            source: projection_dir,
+            target: CHANNEL_ATTACHMENT_MOUNT_TARGET.to_string(),
+            access: MountAccess::ReadOnly,
+        }])
+    }
+
+    async fn prepare_channel_attachment_runtime_projection(
+        &self,
+        turn: &ChannelTurnRecord,
+        staged: &[&ChannelAttachmentRecord],
+        upload_event_dir: &Path,
+    ) -> Result<PathBuf, KernelError> {
+        let runtime_root = self
+            .runtime_root
+            .as_deref()
+            .ok_or_else(|| KernelError::NotFound("runtime root is not configured".to_string()))?;
+        let channel_component = channel_attachment_storage_component(&turn.channel_id);
+        let event_component = channel_attachment_storage_component(&turn.inbound_event_id);
+        let projection_id = Uuid::new_v4().to_string();
+        let projection_dir = ensure_safe_child_directory(
+            runtime_root,
+            &[
+                "channels",
+                channel_component.as_str(),
+                CHANNEL_ATTACHMENT_PROJECTIONS_DIR,
+                event_component.as_str(),
+                projection_id.as_str(),
+            ],
+        )
+        .await?;
+        let projection_dir = tokio::fs::canonicalize(&projection_dir)
+            .await
+            .map_err(|err| {
+                KernelError::Internal(format!(
+                    "failed to resolve channel attachment runtime projection '{}': {err}",
+                    projection_dir.display()
+                ))
+            })?;
+
+        if let Err(err) = self
+            .populate_channel_attachment_runtime_projection(
+                &projection_dir,
+                staged,
+                upload_event_dir,
+            )
+            .await
+        {
+            self.remove_channel_attachment_runtime_projection_dirs_best_effort(
+                std::slice::from_ref(&projection_dir),
+            )
+            .await;
+            return Err(err);
+        }
+
+        Ok(projection_dir)
+    }
+
+    async fn populate_channel_attachment_runtime_projection(
+        &self,
+        projection_dir: &Path,
+        staged: &[&ChannelAttachmentRecord],
+        upload_event_dir: &Path,
+    ) -> Result<(), KernelError> {
+        for attachment in staged {
+            let storage_path = attachment.storage_path.as_deref().ok_or_else(|| {
+                KernelError::Internal(format!(
+                    "staged attachment '{}' has no storage path",
+                    attachment.attachment_id
+                ))
+            })?;
+            ensure_staged_attachment_file_is_safe(storage_path).await?;
+            let storage_path = tokio::fs::canonicalize(storage_path).await.map_err(|err| {
+                KernelError::Internal(format!(
+                    "failed to resolve staged attachment path '{}': {err}",
+                    storage_path.display()
+                ))
+            })?;
+            if !storage_path.starts_with(upload_event_dir) {
+                return Err(KernelError::Conflict(format!(
+                    "staged attachment path '{}' is outside its event directory",
+                    storage_path.display()
+                )));
+            }
+
+            let filename = attachment
+                .filename
+                .as_deref()
+                .map(|filename| sanitize_channel_attachment_filename(Some(filename)))
+                .unwrap_or_else(|| sanitize_channel_attachment_filename(None));
+            let runtime_component = channel_attachment_runtime_component(&attachment.attachment_id);
+            let target_dir =
+                ensure_safe_child_directory(projection_dir, &[runtime_component.as_str()]).await?;
+            let target_path = target_dir.join(&filename);
+            tokio::fs::copy(&storage_path, &target_path)
+                .await
+                .map_err(|err| {
+                    KernelError::Internal(format!(
+                        "failed to project channel attachment '{}' into runtime mount: {err}",
+                        attachment.attachment_id
+                    ))
+                })?;
+            ensure_staged_attachment_file_is_safe(&target_path).await?;
+        }
+
+        Ok(())
+    }
+
     pub async fn pull_channel_stream(
         &self,
         req: ChannelStreamPullRequest,
@@ -1995,9 +3152,30 @@ impl Kernel {
                 .map_err(internal)?,
         };
 
-        let turn_id = Uuid::new_v4();
-        let waiting_for_attachments = !inbound.attachments.is_empty();
+        let has_attachments = !inbound.attachments.is_empty();
+        let waiting_for_attachments = inbound.stageable_attachment_count > 0;
         let user_text = channel_turn_user_text(&inbound);
+        if has_attachments {
+            let initial_rejections = inbound
+                .initial_attachment_rejections
+                .iter()
+                .map(|rejection| DeclareAttachmentRejection {
+                    attachment_id: rejection.attachment_id.as_str(),
+                    reason_code: rejection.reason_code,
+                })
+                .collect::<Vec<_>>();
+            self.channel_attachments
+                .declare_batch_in_tx(
+                    &mut tx,
+                    &inbound.channel_id,
+                    &inbound.event_id,
+                    &inbound.attachments,
+                    &initial_rejections,
+                )
+                .await
+                .map_err(internal)?;
+        }
+        let turn_id = Uuid::new_v4();
         let turn_status = if waiting_for_attachments {
             ChannelTurnStatus::WaitingForAttachments
         } else {
@@ -2008,6 +3186,18 @@ impl Kernel {
         } else {
             SessionTurnStatus::Running
         };
+        if has_attachments && !waiting_for_attachments {
+            let finalized = self
+                .channel_attachments
+                .finalize_batch_in_tx(&mut tx, &inbound.channel_id, &inbound.event_id)
+                .await
+                .map_err(internal)?;
+            if !finalized {
+                return Err(KernelError::Conflict(
+                    "channel attachment batch is already finalized".to_string(),
+                ));
+            }
+        }
         self.session_turns
             .begin_turn_with_status_in_tx(
                 &mut tx,
@@ -2016,7 +3206,8 @@ impl Kernel {
                     session_id: session.session_id,
                     kind: SessionTurnKind::Normal,
                     display_user_text: user_text.clone(),
-                    prompt_user_text: user_text,
+                    prompt_user_text: user_text.clone(),
+                    attachment_source_turn_id: has_attachments.then_some(turn_id),
                     runtime_id: runtime_id.clone(),
                 },
                 session_turn_status,
@@ -2058,6 +3249,26 @@ impl Kernel {
             Some(turn_id),
         )
         .await?;
+        if has_attachments && !waiting_for_attachments {
+            self.audit
+                .append_in_tx(
+                    &mut tx,
+                    "channel.attachments.finalized",
+                    Some(session.session_id),
+                    Some("kernel-admission-policy".to_string()),
+                    json!({
+                        "channel_id": &inbound.channel_id,
+                        "event_id": &inbound.event_id,
+                        "turn_id": turn_id,
+                        "session_id": session.session_id,
+                        "worker_id": "kernel-admission-policy",
+                        "staged_count": 0,
+                        "rejected_count": inbound.initial_attachment_rejections.len(),
+                    }),
+                )
+                .await
+                .map_err(internal)?;
+        }
         self.audit
             .append_in_tx(
                 &mut tx,
@@ -2078,35 +3289,13 @@ impl Kernel {
         tx.commit().await.map_err(|err| internal(err.into()))?;
 
         if !waiting_for_attachments {
-            match self
-                .channel_stream_context_for_session(
-                    session.session_id,
-                    &inbound.channel_id,
-                    &session_key,
-                    turn_id,
-                )
-                .await
-            {
-                Ok(Some(stream_context)) => {
-                    if let Err(err) = self
-                        .emit_runtime_event(
-                            &Some(stream_context),
-                            &None,
-                            RuntimeEvent::Status {
-                                code: Some("queue.queued".to_string()),
-                                text: "queued".to_string(),
-                            },
-                        )
-                        .await
-                    {
-                        warn!(?err, %turn_id, "failed to emit queued channel turn status");
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    warn!(?err, %turn_id, "failed to resolve queued channel turn stream context");
-                }
-            }
+            self.emit_queued_channel_turn_status(
+                session.session_id,
+                &inbound.channel_id,
+                &session_key,
+                turn_id,
+            )
+            .await;
             self.ensure_channel_turn_worker(&inbound.channel_id, &session_key)
                 .await;
         }
@@ -3164,6 +4353,7 @@ impl Kernel {
                     working_dir: None,
                     env_passthrough_keys: Vec::new(),
                     skill_mounts: Vec::new(),
+                    extra_mounts: Vec::new(),
                     timeout_ms: Some(hidden_compaction_turn_timeout.as_millis() as u64),
                 },
             )
@@ -3351,11 +4541,14 @@ impl Kernel {
                 kind: SessionTurnKind::Normal,
                 display_user_text: job.prompt_text.clone(),
                 prompt_user_text: job.prompt_text.clone(),
+                runtime_prompt_user_text: None,
+                attachment_source_turn_id: None,
                 prepared_turn: None,
                 requested_runtime_id: Some(job.runtime_id.clone()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
                 runtime_env_passthrough: None,
+                extra_mounts: Vec::new(),
                 default_policy_scope: Scope::Job(job.job_id),
                 sink: None,
                 emit_channel_stream_done: true,
@@ -4164,6 +5357,7 @@ mod tests {
                     working_dir: None,
                     env_passthrough_keys: Vec::new(),
                     skill_mounts: Vec::new(),
+                    extra_mounts: Vec::new(),
                     timeout_ms: None,
                 },
             )
@@ -4937,10 +6131,18 @@ struct ValidatedChannelInbound {
     message_ref: Option<String>,
     text: Option<String>,
     attachments: Vec<ChannelAttachmentDescriptor>,
+    initial_attachment_rejections: Vec<InitialAttachmentRejection>,
+    stageable_attachment_count: usize,
     reply_to_ref: Option<String>,
     trigger: ChannelTrigger,
     received_at: DateTime<Utc>,
     provider_metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct InitialAttachmentRejection {
+    attachment_id: String,
+    reason_code: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -4963,7 +6165,6 @@ struct ValidatedPairingInvite {
     max_claims: u32,
 }
 
-#[derive(Debug, Clone)]
 struct GrantScope {
     sender_ref: Option<String>,
     conversation_ref: Option<String>,
@@ -5106,9 +6307,17 @@ fn validate_channel_inbound_request(
             "at least one of text or attachments is required".to_string(),
         ));
     }
+    if req.attachments.len() > MAX_CHANNEL_ATTACHMENTS_PER_EVENT {
+        return Err(KernelError::BadRequest(format!(
+            "attachments exceeds {MAX_CHANNEL_ATTACHMENTS_PER_EVENT} per event"
+        )));
+    }
 
     let mut attachments = Vec::with_capacity(req.attachments.len());
     let mut attachment_ids = HashSet::with_capacity(req.attachments.len());
+    let mut initial_attachment_rejections = Vec::new();
+    let mut stageable_attachment_count = 0;
+    let mut declared_bytes: i64 = 0;
     for attachment in req.attachments {
         let attachment = normalize_attachment_descriptor(attachment)?;
         if !attachment_ids.insert(attachment.attachment_id.clone()) {
@@ -5116,6 +6325,27 @@ fn validate_channel_inbound_request(
                 "duplicate attachment_id '{}'",
                 attachment.attachment_id
             )));
+        }
+        let mut rejection_code = None;
+        if let Some(size_bytes) = attachment.size_bytes {
+            if usize::try_from(size_bytes).unwrap_or(usize::MAX) > MAX_CHANNEL_ATTACHMENT_BYTES {
+                rejection_code = Some(CHANNEL_ATTACHMENT_TOO_LARGE);
+            } else if usize::try_from(declared_bytes.saturating_add(size_bytes))
+                .unwrap_or(usize::MAX)
+                > MAX_CHANNEL_EVENT_ATTACHMENT_BYTES
+            {
+                rejection_code = Some(CHANNEL_ATTACHMENT_EVENT_TOO_LARGE);
+            } else {
+                declared_bytes = declared_bytes.saturating_add(size_bytes);
+            }
+        }
+        if let Some(reason_code) = rejection_code {
+            initial_attachment_rejections.push(InitialAttachmentRejection {
+                attachment_id: attachment.attachment_id.clone(),
+                reason_code,
+            });
+        } else {
+            stageable_attachment_count += 1;
         }
         attachments.push(attachment);
     }
@@ -5130,6 +6360,8 @@ fn validate_channel_inbound_request(
         message_ref,
         text,
         attachments,
+        initial_attachment_rejections,
+        stageable_attachment_count,
         reply_to_ref,
         trigger: req.trigger,
         received_at: req.received_at.unwrap_or_else(Utc::now),
@@ -5238,6 +6470,287 @@ fn channel_pairing_claim_response(
         outcome,
         grant_id,
         reason_code: Some(reason_code.to_string()),
+    }
+}
+
+fn channel_attachment_finalize_response(
+    channel_id: String,
+    event_id: String,
+    outcome: ChannelAttachmentFinalizeOutcome,
+    session_id: Option<Uuid>,
+    turn_id: Option<Uuid>,
+) -> ChannelAttachmentFinalizeResponse {
+    ChannelAttachmentFinalizeResponse {
+        channel_id,
+        event_id,
+        outcome,
+        session_id,
+        turn_id,
+    }
+}
+
+fn channel_attachment_manifest_value(attachments: &[ChannelAttachmentRecord]) -> serde_json::Value {
+    let staged = attachments
+        .iter()
+        .filter(|attachment| attachment.status == ChannelAttachmentRecordStatus::Staged)
+        .map(|attachment| {
+            let filename = attachment
+                .filename
+                .as_deref()
+                .map(|filename| sanitize_channel_attachment_filename(Some(filename)))
+                .unwrap_or_else(|| sanitize_channel_attachment_filename(None));
+            json!({
+                "id": &attachment.attachment_id,
+                "kind": &attachment.kind,
+                "filename": filename,
+                "mime_type": &attachment.mime_type,
+                "size_bytes": attachment.size_bytes.unwrap_or(0),
+                "sha256": &attachment.sha256,
+                "path": channel_attachment_runtime_path(&attachment.attachment_id, &filename),
+                "caption": &attachment.caption,
+            })
+        })
+        .collect::<Vec<_>>();
+    let rejected = attachments
+        .iter()
+        .filter(|attachment| attachment.status == ChannelAttachmentRecordStatus::Rejected)
+        .map(|attachment| {
+            json!({
+                "id": &attachment.attachment_id,
+                "kind": &attachment.kind,
+                "reason_code": &attachment.rejection_code,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "channel_attachments": staged,
+        "rejected_channel_attachments": rejected,
+    })
+}
+
+fn channel_attachment_runtime_prompt(
+    prompt_user_text: &str,
+    attachments: &[ChannelAttachmentRecord],
+) -> Result<Option<String>, KernelError> {
+    if attachments.is_empty() {
+        return Ok(None);
+    }
+
+    append_channel_attachment_manifest(
+        prompt_user_text,
+        &channel_attachment_manifest_value(attachments),
+    )
+    .map(Some)
+}
+
+fn append_channel_attachment_manifest(
+    prompt_user_text: &str,
+    manifest: &serde_json::Value,
+) -> Result<String, KernelError> {
+    let manifest = serde_json::to_string(manifest).map_err(|err| {
+        KernelError::Internal(format!("failed to encode attachment manifest: {err}"))
+    })?;
+    let prompt_user_text = prompt_user_text.trim_end_matches(['\r', '\n']);
+    let manifest_block =
+        format!("<lionclaw_channel_attachment_manifest>\n{manifest}\n</lionclaw_channel_attachment_manifest>");
+    if prompt_user_text.trim().is_empty() {
+        Ok(manifest_block)
+    } else {
+        Ok(format!("{prompt_user_text}\n\n{manifest_block}"))
+    }
+}
+
+fn channel_attachment_runtime_path(attachment_id: &str, filename: &str) -> String {
+    format!(
+        "/attachments/{}/{}",
+        channel_attachment_runtime_component(attachment_id),
+        filename
+    )
+}
+
+fn channel_attachment_projection_dirs(mounts: &[MountSpec]) -> Vec<PathBuf> {
+    mounts
+        .iter()
+        .filter(|mount| mount.target == CHANNEL_ATTACHMENT_MOUNT_TARGET)
+        .map(|mount| mount.source.clone())
+        .collect()
+}
+
+fn is_channel_attachment_runtime_projection_path(runtime_root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(runtime_root) else {
+        return false;
+    };
+    let mut components = relative.components();
+    matches!(
+        (
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+        ),
+        (
+            Some(Component::Normal(channels)),
+            Some(Component::Normal(channel)),
+            Some(Component::Normal(projections)),
+            Some(Component::Normal(event)),
+            Some(Component::Normal(projection)),
+            None,
+        ) if channels == OsStr::new("channels")
+            && !channel.is_empty()
+            && projections == OsStr::new(CHANNEL_ATTACHMENT_PROJECTIONS_DIR)
+            && !event.is_empty()
+            && !projection.is_empty()
+    )
+}
+
+fn is_channel_attachment_temp_upload(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(".upload-") && name.ends_with(".tmp"))
+}
+
+fn sanitize_channel_attachment_filename(filename: Option<&str>) -> String {
+    let fallback = "attachment.bin";
+    let Some(filename) = filename.map(str::trim).filter(|value| !value.is_empty()) else {
+        return fallback.to_string();
+    };
+    let leaf = filename
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(filename)
+        .trim();
+    let safe = safe_path_label(leaf, fallback, 120);
+    if safe == "." || safe == ".." || safe.is_empty() {
+        fallback.to_string()
+    } else {
+        safe
+    }
+}
+
+fn channel_attachment_storage_component(raw: &str) -> String {
+    format!("sha256-{}", sha256_hex(raw.trim().as_bytes()))
+}
+
+fn channel_attachment_runtime_component(raw: &str) -> String {
+    let digest = sha256_hex(raw.trim().as_bytes());
+    format!(
+        "{}-{}",
+        safe_path_label(raw, "attachment", 80),
+        &digest[..16]
+    )
+}
+
+fn safe_path_label(raw: &str, fallback: &str, max_len: usize) -> String {
+    let raw = raw.trim();
+    let mut out = String::with_capacity(raw.len().max(1));
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-') {
+            out.push(byte as char);
+        } else {
+            out.push('_');
+            out.push(hex_digit(byte >> 4));
+            out.push(hex_digit(byte & 0x0f));
+        }
+    }
+    if out.is_empty() {
+        out.push_str(fallback);
+    }
+    if out == "." || out == ".." {
+        out.insert(0, '_');
+    }
+    if out.len() > max_len {
+        out.truncate(max_len);
+    }
+    out
+}
+
+fn hex_digit(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        10..=15 => (b'a' + (nibble - 10)) as char,
+        _ => '0',
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+async fn ensure_safe_child_directory(
+    root: &Path,
+    components: &[&str],
+) -> Result<PathBuf, KernelError> {
+    tokio::fs::create_dir_all(root)
+        .await
+        .map_err(|err| KernelError::Internal(format!("failed to create runtime root: {err}")))?;
+    ensure_existing_directory_is_safe(root).await?;
+
+    let mut current = root.to_path_buf();
+    for component in components {
+        if component.is_empty() || component.contains('/') || component.contains('\\') {
+            return Err(KernelError::Internal(
+                "unsafe attachment storage path component".to_string(),
+            ));
+        }
+        current.push(component);
+        match tokio::fs::create_dir(&current).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(KernelError::Internal(format!(
+                    "failed to create attachment storage directory '{}': {err}",
+                    current.display()
+                )));
+            }
+        }
+        ensure_existing_directory_is_safe(&current).await?;
+    }
+
+    Ok(current)
+}
+
+async fn ensure_existing_directory_is_safe(path: &Path) -> Result<(), KernelError> {
+    let metadata = tokio::fs::symlink_metadata(path).await.map_err(|err| {
+        KernelError::Internal(format!(
+            "failed to inspect attachment storage directory '{}': {err}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(KernelError::Conflict(format!(
+            "attachment storage path '{}' is not a regular directory",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn ensure_staged_attachment_file_is_safe(path: &Path) -> Result<(), KernelError> {
+    let metadata = tokio::fs::symlink_metadata(path).await.map_err(|err| {
+        KernelError::Internal(format!(
+            "failed to inspect staged attachment '{}': {err}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(KernelError::Conflict(format!(
+            "staged attachment path '{}' is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn remove_file_best_effort(path: &Path) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => warn!(?err, path = %path.display(), "failed to remove file"),
     }
 }
 
@@ -6047,16 +7560,26 @@ struct RuntimeControlSessionExecution<'a> {
     audit_actor: String,
 }
 
+#[derive(Default)]
+struct ChannelAttachmentExecutionContext {
+    runtime_prompt_user_text: Option<String>,
+    extra_mounts: Vec<MountSpec>,
+    attachment_source_turn_id: Option<Uuid>,
+}
+
 struct SessionTurnExecution {
     turn_id: Uuid,
     kind: SessionTurnKind,
     display_user_text: String,
     prompt_user_text: String,
+    runtime_prompt_user_text: Option<String>,
+    attachment_source_turn_id: Option<Uuid>,
     prepared_turn: Option<SessionTurnRecord>,
     requested_runtime_id: Option<String>,
     runtime_working_dir: Option<String>,
     runtime_timeout_ms: Option<u64>,
     runtime_env_passthrough: Option<Vec<String>>,
+    extra_mounts: Vec<MountSpec>,
     default_policy_scope: Scope,
     sink: Option<RuntimeEventSink>,
     emit_channel_stream_done: bool,
@@ -6277,11 +7800,14 @@ impl Kernel {
                 kind: SessionTurnKind::Normal,
                 display_user_text: req.user_text.clone(),
                 prompt_user_text: req.user_text,
+                runtime_prompt_user_text: None,
+                attachment_source_turn_id: None,
                 prepared_turn: None,
                 requested_runtime_id: req.runtime_id,
                 runtime_working_dir: req.runtime_working_dir,
                 runtime_timeout_ms: req.runtime_timeout_ms,
                 runtime_env_passthrough: req.runtime_env_passthrough,
+                extra_mounts: Vec::new(),
                 default_policy_scope: Scope::Session(req.session_id),
                 sink,
                 emit_channel_stream_done: true,
@@ -6312,11 +7838,14 @@ impl Kernel {
             kind,
             display_user_text,
             prompt_user_text,
+            runtime_prompt_user_text,
+            attachment_source_turn_id,
             prepared_turn,
             requested_runtime_id,
             runtime_working_dir,
             runtime_timeout_ms,
             runtime_env_passthrough,
+            extra_mounts,
             default_policy_scope,
             sink,
             emit_channel_stream_done,
@@ -6325,17 +7854,30 @@ impl Kernel {
         } = execution;
         let mut kind = kind;
         let mut display_user_text = display_user_text;
-        let mut prompt_user_text = prompt_user_text;
+        let mut stored_prompt_user_text = prompt_user_text;
+        let mut runtime_prompt_user_text = runtime_prompt_user_text;
+        let mut execution_prompt_user_text = stored_prompt_user_text.clone();
         let mut runtime_control = None;
+        let preserve_prepared_display_text = prepared_turn.is_some();
 
         if kind == SessionTurnKind::Normal {
-            match classify_input(&prompt_user_text) {
+            match classify_input(&stored_prompt_user_text) {
                 ClassifiedInput::Empty => {
-                    return Err(KernelError::BadRequest("user_text is required".to_string()));
+                    execution_prompt_user_text = runtime_prompt_user_text
+                        .take()
+                        .filter(|prompt| !prompt.trim().is_empty())
+                        .ok_or_else(|| {
+                            KernelError::BadRequest("user_text is required".to_string())
+                        })?;
                 }
                 ClassifiedInput::Prompt(prompt) => {
-                    display_user_text = prompt.clone();
-                    prompt_user_text = prompt;
+                    if !preserve_prepared_display_text {
+                        display_user_text = prompt.clone();
+                    }
+                    stored_prompt_user_text = prompt;
+                    execution_prompt_user_text = runtime_prompt_user_text
+                        .take()
+                        .unwrap_or_else(|| stored_prompt_user_text.clone());
                 }
                 ClassifiedInput::LionClawControl(control) => {
                     return Err(KernelError::BadRequest(format!(
@@ -6345,7 +7887,8 @@ impl Kernel {
                 }
                 ClassifiedInput::RuntimeControl(control) => {
                     display_user_text = control.raw.clone();
-                    prompt_user_text.clear();
+                    stored_prompt_user_text.clear();
+                    execution_prompt_user_text.clear();
                     kind = SessionTurnKind::RuntimeControl;
                     runtime_control = Some(control);
                 }
@@ -6360,11 +7903,18 @@ impl Kernel {
             }
             if turn.kind != kind
                 || turn.display_user_text != display_user_text
-                || turn.prompt_user_text != prompt_user_text
+                || turn.prompt_user_text != stored_prompt_user_text
+                || turn.attachment_source_turn_id != attachment_source_turn_id
             {
                 let updated = self
                     .session_turns
-                    .update_running_turn_input(turn_id, kind, &display_user_text, &prompt_user_text)
+                    .update_running_turn_input(
+                        turn_id,
+                        kind,
+                        &display_user_text,
+                        &stored_prompt_user_text,
+                        attachment_source_turn_id,
+                    )
                     .await
                     .map_err(internal)?
                     .ok_or_else(|| {
@@ -6416,6 +7966,7 @@ impl Kernel {
                     working_dir: runtime_working_dir.clone(),
                     env_passthrough_keys: runtime_env_passthrough.clone().unwrap_or_default(),
                     skill_mounts,
+                    extra_mounts,
                     timeout_ms: runtime_timeout_ms,
                 },
             )
@@ -6443,7 +7994,8 @@ impl Kernel {
                     session_id: session.session_id,
                     kind,
                     display_user_text: display_user_text.clone(),
-                    prompt_user_text: prompt_user_text.clone(),
+                    prompt_user_text: stored_prompt_user_text.clone(),
+                    attachment_source_turn_id,
                     runtime_id: runtime_id.clone(),
                 })
                 .await
@@ -6504,7 +8056,7 @@ impl Kernel {
         let prompt_envelope = self
             .build_prompt_envelope(
                 session,
-                &prompt_user_text,
+                &execution_prompt_user_text,
                 handle.resumes_existing_session,
                 Some(persisted_turn.sequence_no),
             )
@@ -6513,7 +8065,7 @@ impl Kernel {
             Some(
                 self.build_prompt_envelope(
                     session,
-                    &prompt_user_text,
+                    &execution_prompt_user_text,
                     false,
                     Some(persisted_turn.sequence_no),
                 )
@@ -6797,7 +8349,7 @@ impl Kernel {
                     "turn_id": turn_id,
                     "runtime_id": runtime_id,
                     "runtime_skill_ids": runtime_skill_ids,
-                    "prompt_len": prompt_user_text.len(),
+                    "prompt_len": execution_prompt_user_text.len(),
                     "runtime_preset_name": execution_plan.preset_name,
                     "runtime_working_dir": execution_plan.working_dir,
                     "runtime_idle_timeout_ms": execution_plan.idle_timeout.as_millis() as u64,
@@ -7418,6 +8970,39 @@ impl Kernel {
         }))
     }
 
+    async fn emit_queued_channel_turn_status(
+        &self,
+        session_id: Uuid,
+        channel_id: &str,
+        session_key: &str,
+        turn_id: Uuid,
+    ) {
+        match self
+            .channel_stream_context_for_session(session_id, channel_id, session_key, turn_id)
+            .await
+        {
+            Ok(Some(stream_context)) => {
+                if let Err(err) = self
+                    .emit_runtime_event(
+                        &Some(stream_context),
+                        &None,
+                        RuntimeEvent::Status {
+                            code: Some("queue.queued".to_string()),
+                            text: "queued".to_string(),
+                        },
+                    )
+                    .await
+                {
+                    warn!(?err, %turn_id, "failed to emit queued channel turn status");
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(?err, %turn_id, "failed to resolve queued channel turn stream context");
+            }
+        }
+    }
+
     async fn resolve_stream_consumer_cursor(
         &self,
         channel_id: &str,
@@ -7792,9 +9377,12 @@ impl Kernel {
         let channel_id = channel_id.to_string();
         let session_key = session_key.to_string();
         tokio::spawn(async move {
-            kernel
-                .drain_channel_turns_for_session_key(worker_key, channel_id, session_key)
-                .await;
+            Box::pin(kernel.drain_channel_turns_for_session_key(
+                worker_key,
+                channel_id,
+                session_key,
+            ))
+            .await;
         });
     }
 
@@ -7857,7 +9445,7 @@ impl Kernel {
             self.channel_turn_workers.write().await.remove(&worker_key);
             if !self
                 .channel_state
-                .has_pending_turns(&channel_id, &session_key)
+                .has_claimable_pending_turns(&channel_id, &session_key)
                 .await
                 .unwrap_or(false)
             {
@@ -8009,6 +9597,25 @@ impl Kernel {
             return;
         }
 
+        let attachment_context = match self
+            .channel_attachment_execution_context_for_turn(&turn, &persisted_turn.prompt_user_text)
+            .await
+        {
+            Ok(context) => context,
+            Err(err) => {
+                let code = queued_turn_failure_code(&err);
+                if let Err(fail_err) = self
+                    .fail_queued_turn(&turn, code, &err.to_string(), stream_context)
+                    .await
+                {
+                    warn!(?fail_err, turn_id = %turn.turn_id, "failed to mark queued turn failed after attachment mount error");
+                }
+                return;
+            }
+        };
+        let projection_mounts =
+            channel_attachment_projection_dirs(&attachment_context.extra_mounts);
+
         let result = self
             .execute_session_turn_serialized(
                 session,
@@ -8017,11 +9624,14 @@ impl Kernel {
                     kind: persisted_turn.kind,
                     display_user_text: persisted_turn.display_user_text.clone(),
                     prompt_user_text: persisted_turn.prompt_user_text.clone(),
+                    runtime_prompt_user_text: attachment_context.runtime_prompt_user_text,
+                    attachment_source_turn_id: attachment_context.attachment_source_turn_id,
                     prepared_turn: Some(persisted_turn),
                     requested_runtime_id: Some(turn.runtime_id.clone()),
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
                     runtime_env_passthrough: None,
+                    extra_mounts: attachment_context.extra_mounts,
                     default_policy_scope: Scope::Session(turn.session_id),
                     sink: None,
                     emit_channel_stream_done: false,
@@ -8029,6 +9639,8 @@ impl Kernel {
                     runtime_control_origin: RuntimeControlOrigin::ChannelInbound,
                 },
             )
+            .await;
+        self.remove_channel_attachment_runtime_projection_dirs_best_effort(&projection_mounts)
             .await;
 
         match result {
@@ -8230,6 +9842,7 @@ impl Kernel {
                 kind,
                 &prepared_turn.display_user_text,
                 "",
+                None,
             )
             .await
             .map_err(internal)?

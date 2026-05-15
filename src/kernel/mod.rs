@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod capability_broker;
+pub mod channel_attachments;
 pub mod channel_state;
 pub mod continuity;
 pub mod continuity_fs;
@@ -20,6 +21,6 @@ pub mod session_turns;
 pub mod sessions;
 pub mod skills;
 
-pub use core::{Kernel, KernelOptions};
+pub use core::{ChannelAttachmentStageContent, ChannelAttachmentStageInput, Kernel, KernelOptions};
 pub use error::KernelError;
 pub use runtime_policy::{RuntimeExecutionPolicy, RuntimeExecutionRule};

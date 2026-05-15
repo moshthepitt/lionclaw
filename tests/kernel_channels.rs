@@ -3,27 +3,33 @@ mod common;
 use async_trait::async_trait;
 use common::{write_skill_source, TestHome};
 use lionclaw::{
+    api::build_router,
     contracts::{
-        ChannelAttachmentDescriptor, ChannelGrantView, ChannelInboundOutcome,
-        ChannelInboundRequest, ChannelPairingApproveRequest, ChannelPairingBlockRequest,
-        ChannelPairingBlockResponse, ChannelPairingClaimOutcome, ChannelPairingClaimRequest,
-        ChannelPairingInviteRequest, ChannelPairingStatus, ChannelRoutingProfile,
-        ChannelStreamAckRequest, ChannelStreamEventView, ChannelStreamPullRequest,
-        ChannelStreamStartMode, ChannelTrigger, SessionActionKind, SessionActionRequest,
-        SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest,
-        SessionTurnKind, SessionTurnRequest, SessionTurnStatus, StreamEventKindDto, StreamLaneDto,
-        TrustTier,
+        ChannelAttachmentDescriptor, ChannelAttachmentFinalizeOutcome,
+        ChannelAttachmentFinalizeRequest, ChannelAttachmentMissingReport,
+        ChannelAttachmentStageResponse, ChannelAttachmentStatus, ChannelGrantView,
+        ChannelInboundOutcome, ChannelInboundRequest, ChannelPairingApproveRequest,
+        ChannelPairingBlockRequest, ChannelPairingBlockResponse, ChannelPairingClaimOutcome,
+        ChannelPairingClaimRequest, ChannelPairingInviteRequest, ChannelPairingStatus,
+        ChannelRoutingProfile, ChannelStreamAckRequest, ChannelStreamEventView,
+        ChannelStreamPullRequest, ChannelStreamStartMode, ChannelTrigger, DaemonInfoResponse,
+        SessionActionKind, SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest,
+        SessionLatestQuery, SessionOpenRequest, SessionTurnKind, SessionTurnRequest,
+        SessionTurnStatus, StreamEventKindDto, StreamLaneDto, TrustTier,
     },
     kernel::{
+        channel_attachments::{MAX_CHANNEL_ATTACHMENT_BYTES, MAX_CHANNEL_EVENT_ATTACHMENT_BYTES},
         runtime::{
             RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent,
             RuntimeEventSender, RuntimeMessageLane, RuntimeSessionHandle, RuntimeSessionStartInput,
             RuntimeTurnInput, RuntimeTurnResult,
         },
-        Kernel, KernelError, KernelOptions,
+        ChannelAttachmentStageContent, ChannelAttachmentStageInput, Kernel, KernelError,
+        KernelOptions,
     },
     operator::{config::ChannelLaunchMode, reconcile::add_channel},
 };
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tokio::time::{sleep, Duration, Instant};
 
@@ -2171,6 +2177,1533 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
 }
 
 #[tokio::test]
+async fn channel_attachment_stage_finalize_queues_manifest_and_runtime_mount() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "attachment-skill").await;
+    let release_runtime = std::sync::Arc::new(tokio::sync::Notify::new());
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("paused-echo".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            ..KernelOptions::default()
+        })
+        .await;
+    kernel
+        .register_runtime_adapter(
+            "paused-echo",
+            std::sync::Arc::new(PausedEchoAdapter {
+                release: release_runtime.clone(),
+            }),
+        )
+        .await;
+
+    create_pending_pairing(&kernel, "terminal", "peer-attach", "attach-1001").await;
+    approve_pairing(&kernel, "terminal", "peer-attach").await;
+
+    let staged_content = b"hello staged attachment".to_vec();
+    let waiting = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            attachments: vec![
+                ChannelAttachmentDescriptor {
+                    attachment_id: "att-doc".to_string(),
+                    kind: "document".to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    filename: Some("../report.txt".to_string()),
+                    size_bytes: Some(staged_content.len() as i64),
+                    provider_file_ref: "provider-doc".to_string(),
+                    caption: Some("doc caption".to_string()),
+                },
+                ChannelAttachmentDescriptor {
+                    attachment_id: "att-missing".to_string(),
+                    kind: "image".to_string(),
+                    mime_type: Some("image/png".to_string()),
+                    filename: Some("missing.png".to_string()),
+                    size_bytes: None,
+                    provider_file_ref: "provider-missing".to_string(),
+                    caption: None,
+                },
+            ],
+            ..v2_text_request(
+                "terminal",
+                "attach-1002",
+                "peer-attach",
+                "peer-attach",
+                None,
+                "please inspect attached files",
+                ChannelTrigger::Dm,
+            )
+        })
+        .await
+        .expect("attachment turn waits");
+    assert_eq!(
+        waiting.outcome,
+        ChannelInboundOutcome::WaitingForAttachments
+    );
+
+    let orphan_path = env
+        .home()
+        .runtime_dir()
+        .join("channels")
+        .join(test_storage_component("terminal"))
+        .join("attachments")
+        .join(test_storage_component("attach-1002"))
+        .join(test_storage_component("att-doc"))
+        .join("report.txt");
+    std::fs::create_dir_all(orphan_path.parent().expect("orphan parent"))
+        .expect("create orphan attachment dir");
+    std::fs::write(&orphan_path, b"orphaned pre-commit upload").expect("write orphaned upload");
+    let upload_event_dir = orphan_path
+        .parent()
+        .expect("attachment dir")
+        .parent()
+        .expect("event dir")
+        .to_path_buf();
+
+    let staged = kernel
+        .stage_channel_attachment(ChannelAttachmentStageInput {
+            channel_id: "terminal".to_string(),
+            event_id: "attach-1002".to_string(),
+            attachment_id: "att-doc".to_string(),
+            kind: "document".to_string(),
+            filename: Some("../report.txt".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            caption: Some("doc caption".to_string()),
+            content: ChannelAttachmentStageContent::Bytes(staged_content.clone()),
+        })
+        .await
+        .expect("stage attachment");
+    assert_eq!(staged.status, ChannelAttachmentStatus::Staged);
+    assert_eq!(staged.size_bytes, staged_content.len() as i64);
+    let expected_runtime_path = format!(
+        "/attachments/{}/report.txt",
+        test_runtime_attachment_component("att-doc")
+    );
+    assert_eq!(
+        staged.runtime_path.as_deref(),
+        Some(expected_runtime_path.as_str())
+    );
+    std::fs::write(
+        upload_event_dir.join("unmanifested.txt"),
+        b"must not be mounted",
+    )
+    .expect("write unmanifested attachment-side file");
+
+    let finalized = kernel
+        .finalize_channel_attachments(ChannelAttachmentFinalizeRequest {
+            channel_id: "terminal".to_string(),
+            event_id: "attach-1002".to_string(),
+            worker_id: "attachment-worker-test".to_string(),
+            missing: vec![ChannelAttachmentMissingReport {
+                attachment_id: "att-missing".to_string(),
+                reason_code: "provider_missing".to_string(),
+                reason_text: None,
+            }],
+        })
+        .await
+        .expect("finalize attachments");
+    assert_eq!(finalized.outcome, ChannelAttachmentFinalizeOutcome::Queued);
+    assert_eq!(finalized.turn_id, waiting.turn_id);
+    let audit = wait_for_audit_event_count(&kernel, "channel.attachments.finalized", 1).await;
+    let audit_event = audit
+        .events
+        .iter()
+        .find(|event| event.details["event_id"].as_str() == Some("attach-1002"))
+        .expect("attachment finalized audit event");
+    assert_eq!(audit_event.details["staged_count"].as_i64(), Some(1));
+    assert_eq!(audit_event.details["rejected_count"].as_i64(), Some(1));
+
+    let session_id = waiting.session_id.expect("waiting session id");
+    let mount_source = wait_for_attachment_mount_source(&kernel, session_id).await;
+    assert_ne!(
+        std::fs::canonicalize(&mount_source).expect("canonical projection"),
+        std::fs::canonicalize(&upload_event_dir).expect("canonical upload event dir")
+    );
+    assert!(!mount_source.join("unmanifested.txt").exists());
+    assert!(mount_source
+        .join(test_runtime_attachment_component("att-doc"))
+        .join("report.txt")
+        .exists());
+    release_runtime.notify_one();
+
+    wait_for_latest_turn(
+        &kernel,
+        session_id,
+        |turn| turn.status == SessionTurnStatus::Completed,
+        "attachment turn completion",
+    )
+    .await;
+    wait_for_path_removed(&mount_source, "runtime projection cleanup").await;
+
+    let history = kernel
+        .session_history(SessionHistoryRequest {
+            session_id,
+            limit: Some(12),
+        })
+        .await
+        .expect("session history");
+    let turn = history.turns.last().expect("attachment turn");
+    assert_eq!(turn.display_user_text, "please inspect attached files");
+    assert!(!turn
+        .display_user_text
+        .contains("lionclaw_channel_attachment_manifest"));
+    assert_eq!(turn.prompt_user_text, "please inspect attached files");
+    assert!(turn.assistant_text.contains("channel_attachments"));
+    assert!(turn
+        .assistant_text
+        .contains("lionclaw_channel_attachment_manifest"));
+    assert!(turn.assistant_text.contains(&expected_runtime_path));
+    assert!(turn.assistant_text.contains("provider_missing"));
+
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    let row = sqlx::query(
+        "SELECT status, filename, storage_path FROM channel_attachments \
+         WHERE channel_id = 'terminal' AND event_id = 'attach-1002' AND attachment_id = 'att-doc'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query staged attachment");
+    assert_eq!(row.get::<String, _>("status"), "staged");
+    assert_eq!(row.get::<String, _>("filename"), "report.txt");
+    let storage_path: String = row.get("storage_path");
+    assert!(storage_path.starts_with(env.home().runtime_dir().to_str().expect("utf8 runtime dir")));
+    assert!(!storage_path.contains(".."));
+    assert_eq!(
+        std::fs::read(&storage_path).expect("read staged file"),
+        staged_content
+    );
+}
+
+#[tokio::test]
+async fn channel_attachment_waiting_turn_blocks_later_session_turns() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "attachment-order-skill").await;
+    let prompts = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("recording-echo".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            ..KernelOptions::default()
+        })
+        .await;
+    kernel
+        .register_runtime_adapter(
+            "recording-echo",
+            std::sync::Arc::new(RecordingEchoAdapter {
+                prompts: prompts.clone(),
+            }),
+        )
+        .await;
+
+    create_pending_pairing(&kernel, "terminal", "peer-order", "order-pairing").await;
+    approve_pairing(&kernel, "terminal", "peer-order").await;
+
+    let waiting = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            attachments: vec![attachment_descriptor("order-att")],
+            ..v2_text_request(
+                "terminal",
+                "order-waiting",
+                "peer-order",
+                "peer-order",
+                None,
+                "inspect the attachment first",
+                ChannelTrigger::Dm,
+            )
+        })
+        .await
+        .expect("attachment turn waits");
+    assert_eq!(
+        waiting.outcome,
+        ChannelInboundOutcome::WaitingForAttachments
+    );
+
+    let later = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "order-later",
+            "peer-order",
+            "peer-order",
+            None,
+            "plain follow up after attachment",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("later turn queues");
+    assert_eq!(later.outcome, ChannelInboundOutcome::Queued);
+    assert_eq!(later.session_id, waiting.session_id);
+
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    let later_turn_id = later.turn_id.expect("later turn id");
+    assert_channel_turn_status_stays(
+        &pool,
+        later_turn_id,
+        "pending",
+        Duration::from_millis(250),
+        "later turn must stay queued behind waiting attachments",
+    )
+    .await;
+    assert!(
+        prompts.lock().await.is_empty(),
+        "runtime must not start a later turn while an earlier turn waits for attachments"
+    );
+
+    let finalized = kernel
+        .finalize_channel_attachments(ChannelAttachmentFinalizeRequest {
+            channel_id: "terminal".to_string(),
+            event_id: "order-waiting".to_string(),
+            worker_id: "attachment-worker-test".to_string(),
+            missing: vec![ChannelAttachmentMissingReport {
+                attachment_id: "order-att".to_string(),
+                reason_code: "provider_missing".to_string(),
+                reason_text: None,
+            }],
+        })
+        .await
+        .expect("finalize waiting attachment turn");
+    assert_eq!(finalized.outcome, ChannelAttachmentFinalizeOutcome::Queued);
+
+    let waiting_turn_id = waiting.turn_id.expect("waiting turn id");
+    wait_for_joined_turn_statuses(&pool, waiting_turn_id, "completed", "completed").await;
+    wait_for_joined_turn_statuses(&pool, later_turn_id, "completed", "completed").await;
+
+    let recorded = prompts.lock().await.clone();
+    assert_eq!(recorded.len(), 2);
+    assert!(recorded[0].contains("inspect the attachment first"));
+    assert!(recorded[0].contains("lionclaw_channel_attachment_manifest"));
+    assert!(recorded[1].contains("plain follow up after attachment"));
+    assert!(!recorded[1].contains("lionclaw_channel_attachment_manifest"));
+}
+
+#[tokio::test]
+async fn channel_lionclaw_retry_preserves_attachment_manifest_and_mount() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "attachment-retry-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    create_pending_pairing(
+        &kernel,
+        "terminal",
+        "peer-attach-retry",
+        "attach-retry-1001",
+    )
+    .await;
+    approve_pairing(&kernel, "terminal", "peer-attach-retry").await;
+
+    let staged_content = b"retry attachment content".to_vec();
+    let waiting = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            attachments: vec![ChannelAttachmentDescriptor {
+                attachment_id: "att-retry".to_string(),
+                kind: "document".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                filename: Some("retry.txt".to_string()),
+                size_bytes: Some(staged_content.len() as i64),
+                provider_file_ref: "provider-retry".to_string(),
+                caption: Some("retry caption".to_string()),
+            }],
+            ..v2_text_request(
+                "terminal",
+                "attach-retry-1002",
+                "peer-attach-retry",
+                "peer-attach-retry",
+                None,
+                "inspect retry attachment",
+                ChannelTrigger::Dm,
+            )
+        })
+        .await
+        .expect("attachment turn waits");
+    assert_eq!(
+        waiting.outcome,
+        ChannelInboundOutcome::WaitingForAttachments
+    );
+
+    let staged = kernel
+        .stage_channel_attachment(ChannelAttachmentStageInput {
+            channel_id: "terminal".to_string(),
+            event_id: "attach-retry-1002".to_string(),
+            attachment_id: "att-retry".to_string(),
+            kind: "document".to_string(),
+            filename: Some("retry.txt".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            caption: Some("retry caption".to_string()),
+            content: ChannelAttachmentStageContent::Bytes(staged_content),
+        })
+        .await
+        .expect("stage retry attachment");
+    assert_eq!(staged.status, ChannelAttachmentStatus::Staged);
+    let expected_runtime_path = format!(
+        "/attachments/{}/retry.txt",
+        test_runtime_attachment_component("att-retry")
+    );
+
+    kernel
+        .finalize_channel_attachments(ChannelAttachmentFinalizeRequest {
+            channel_id: "terminal".to_string(),
+            event_id: "attach-retry-1002".to_string(),
+            worker_id: "attachment-retry-worker-test".to_string(),
+            missing: Vec::new(),
+        })
+        .await
+        .expect("finalize retry source attachments");
+
+    let session_id = waiting.session_id.expect("waiting session id");
+    wait_for_latest_turn(
+        &kernel,
+        session_id,
+        |turn| {
+            turn.status == SessionTurnStatus::Completed
+                && turn.prompt_user_text == "inspect retry attachment"
+                && turn.assistant_text.contains(&expected_runtime_path)
+        },
+        "attachment source turn completion",
+    )
+    .await;
+
+    let retry = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "attach-retry-1003",
+            "peer-attach-retry",
+            "peer-attach-retry",
+            None,
+            "/lionclaw retry",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue attachment retry command");
+    assert_eq!(retry.outcome, ChannelInboundOutcome::Queued);
+    let retry_turn_id = retry.turn_id.expect("retry turn id");
+
+    wait_for_latest_turn(
+        &kernel,
+        session_id,
+        |turn| {
+            turn.turn_id == retry_turn_id
+                && turn.kind == SessionTurnKind::Retry
+                && turn.status == SessionTurnStatus::Completed
+                && turn.display_user_text == "/lionclaw retry"
+                && turn.prompt_user_text == "inspect retry attachment"
+                && turn
+                    .assistant_text
+                    .contains("lionclaw_channel_attachment_manifest")
+                && turn.assistant_text.contains(&expected_runtime_path)
+        },
+        "attachment retry completion",
+    )
+    .await;
+
+    let retry_again = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "attach-retry-1004",
+            "peer-attach-retry",
+            "peer-attach-retry",
+            None,
+            "/lionclaw retry",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue second attachment retry command");
+    assert_eq!(retry_again.outcome, ChannelInboundOutcome::Queued);
+    let retry_again_turn_id = retry_again.turn_id.expect("second retry turn id");
+
+    wait_for_latest_turn(
+        &kernel,
+        session_id,
+        |turn| {
+            turn.turn_id == retry_again_turn_id
+                && turn.kind == SessionTurnKind::Retry
+                && turn.status == SessionTurnStatus::Completed
+                && turn.display_user_text == "/lionclaw retry"
+                && turn.prompt_user_text == "inspect retry attachment"
+                && turn
+                    .assistant_text
+                    .contains("lionclaw_channel_attachment_manifest")
+                && turn.assistant_text.contains(&expected_runtime_path)
+        },
+        "second attachment retry completion",
+    )
+    .await;
+
+    let plain_same_prompt = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "attach-retry-1005",
+            "peer-attach-retry",
+            "peer-attach-retry",
+            None,
+            "inspect retry attachment",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue same prompt without attachments");
+    assert_eq!(plain_same_prompt.outcome, ChannelInboundOutcome::Queued);
+    let plain_same_prompt_turn_id = plain_same_prompt
+        .turn_id
+        .expect("plain same prompt turn id");
+
+    wait_for_latest_turn(
+        &kernel,
+        session_id,
+        |turn| {
+            turn.turn_id == plain_same_prompt_turn_id
+                && turn.kind == SessionTurnKind::Normal
+                && turn.status == SessionTurnStatus::Completed
+                && turn.prompt_user_text == "inspect retry attachment"
+        },
+        "same prompt without attachments completion",
+    )
+    .await;
+
+    let plain_retry = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "attach-retry-1006",
+            "peer-attach-retry",
+            "peer-attach-retry",
+            None,
+            "/lionclaw retry",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue same prompt retry without attachments");
+    assert_eq!(plain_retry.outcome, ChannelInboundOutcome::Queued);
+    let plain_retry_turn_id = plain_retry.turn_id.expect("plain retry turn id");
+
+    wait_for_latest_turn(
+        &kernel,
+        session_id,
+        |turn| {
+            turn.turn_id == plain_retry_turn_id
+                && turn.kind == SessionTurnKind::Retry
+                && turn.status == SessionTurnStatus::Completed
+                && turn.prompt_user_text == "inspect retry attachment"
+        },
+        "same prompt retry without attachments completion",
+    )
+    .await;
+
+    let plain_retry_again = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "attach-retry-1007",
+            "peer-attach-retry",
+            "peer-attach-retry",
+            None,
+            "/lionclaw retry",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue second same prompt retry without attachments");
+    assert_eq!(plain_retry_again.outcome, ChannelInboundOutcome::Queued);
+    let plain_retry_again_turn_id = plain_retry_again
+        .turn_id
+        .expect("second plain retry turn id");
+
+    wait_for_latest_turn(
+        &kernel,
+        session_id,
+        |turn| {
+            turn.turn_id == plain_retry_again_turn_id
+                && turn.kind == SessionTurnKind::Retry
+                && turn.status == SessionTurnStatus::Completed
+                && turn.prompt_user_text == "inspect retry attachment"
+        },
+        "second same prompt retry without attachments completion",
+    )
+    .await;
+
+    let attachment_mounts = attachment_mount_sources(&kernel, session_id).await;
+    assert_eq!(
+        attachment_mounts.len(),
+        3,
+        "only the attachment-backed source turn and retries should mount staged attachments"
+    );
+    for source in attachment_mounts {
+        wait_for_path_removed(&source, "attachment retry projection cleanup").await;
+    }
+}
+
+#[tokio::test]
+async fn channel_attachment_only_turn_runs_from_runtime_manifest() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "attachment-only-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    create_pending_pairing(&kernel, "terminal", "peer-attach-only", "attach-only-1001").await;
+    approve_pairing(&kernel, "terminal", "peer-attach-only").await;
+
+    let staged_content = b"attachment-only content".to_vec();
+    let waiting = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            text: None,
+            attachments: vec![ChannelAttachmentDescriptor {
+                attachment_id: "att-only".to_string(),
+                kind: "document".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                filename: Some("only.txt".to_string()),
+                size_bytes: Some(staged_content.len() as i64),
+                provider_file_ref: "provider-only".to_string(),
+                caption: None,
+            }],
+            ..v2_text_request(
+                "terminal",
+                "attach-only-1002",
+                "peer-attach-only",
+                "peer-attach-only",
+                None,
+                "ignored fallback text",
+                ChannelTrigger::Dm,
+            )
+        })
+        .await
+        .expect("attachment-only turn waits");
+    assert_eq!(
+        waiting.outcome,
+        ChannelInboundOutcome::WaitingForAttachments
+    );
+
+    let staged = kernel
+        .stage_channel_attachment(ChannelAttachmentStageInput {
+            channel_id: "terminal".to_string(),
+            event_id: "attach-only-1002".to_string(),
+            attachment_id: "att-only".to_string(),
+            kind: "document".to_string(),
+            filename: Some("only.txt".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            caption: None,
+            content: ChannelAttachmentStageContent::Bytes(staged_content),
+        })
+        .await
+        .expect("stage attachment-only file");
+    assert_eq!(staged.status, ChannelAttachmentStatus::Staged);
+    let expected_runtime_path = format!(
+        "/attachments/{}/only.txt",
+        test_runtime_attachment_component("att-only")
+    );
+    assert_eq!(
+        staged.runtime_path.as_deref(),
+        Some(expected_runtime_path.as_str())
+    );
+
+    let finalized = kernel
+        .finalize_channel_attachments(ChannelAttachmentFinalizeRequest {
+            channel_id: "terminal".to_string(),
+            event_id: "attach-only-1002".to_string(),
+            worker_id: "attachment-only-worker-test".to_string(),
+            missing: Vec::new(),
+        })
+        .await
+        .expect("finalize attachment-only turn");
+    assert_eq!(finalized.outcome, ChannelAttachmentFinalizeOutcome::Queued);
+
+    let session_id = waiting.session_id.expect("waiting session id");
+    wait_for_latest_turn(
+        &kernel,
+        session_id,
+        |turn| {
+            turn.status == SessionTurnStatus::Completed
+                && turn.display_user_text.is_empty()
+                && turn.prompt_user_text.is_empty()
+                && turn.assistant_text.contains("channel_attachments")
+                && turn.assistant_text.contains(&expected_runtime_path)
+        },
+        "attachment-only runtime manifest",
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn channel_attachment_projection_rejects_symlinked_parent() {
+    use std::os::unix::fs::symlink;
+
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "attachment-symlink-projection-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    create_pending_pairing(&kernel, "terminal", "peer-symlink", "symlink-1001").await;
+    approve_pairing(&kernel, "terminal", "peer-symlink").await;
+    let waiting = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            attachments: vec![ChannelAttachmentDescriptor {
+                attachment_id: "att-doc".to_string(),
+                kind: "document".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                filename: Some("report.txt".to_string()),
+                size_bytes: Some(11),
+                provider_file_ref: "provider-doc".to_string(),
+                caption: None,
+            }],
+            ..v2_text_request(
+                "terminal",
+                "symlink-1002",
+                "peer-symlink",
+                "peer-symlink",
+                None,
+                "inspect symlink attachment",
+                ChannelTrigger::Dm,
+            )
+        })
+        .await
+        .expect("attachment turn waits");
+    assert_eq!(
+        waiting.outcome,
+        ChannelInboundOutcome::WaitingForAttachments
+    );
+
+    kernel
+        .stage_channel_attachment(ChannelAttachmentStageInput {
+            channel_id: "terminal".to_string(),
+            event_id: "symlink-1002".to_string(),
+            attachment_id: "att-doc".to_string(),
+            kind: "document".to_string(),
+            filename: Some("report.txt".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            caption: None,
+            content: ChannelAttachmentStageContent::Bytes(b"hello world".to_vec()),
+        })
+        .await
+        .expect("stage attachment");
+
+    let outside = env.temp_dir().join("outside-projections");
+    std::fs::create_dir_all(&outside).expect("create outside projection target");
+    let projection_parent = env
+        .home()
+        .runtime_dir()
+        .join("channels")
+        .join(test_storage_component("terminal"))
+        .join("attachment-projections");
+    symlink(&outside, &projection_parent).expect("symlink projection parent");
+
+    let finalized = kernel
+        .finalize_channel_attachments(ChannelAttachmentFinalizeRequest {
+            channel_id: "terminal".to_string(),
+            event_id: "symlink-1002".to_string(),
+            worker_id: "attachment-worker-symlink-test".to_string(),
+            missing: Vec::new(),
+        })
+        .await
+        .expect("finalize attachments");
+    assert_eq!(finalized.outcome, ChannelAttachmentFinalizeOutcome::Queued);
+
+    let session_id = waiting.session_id.expect("waiting session id");
+    wait_for_latest_turn(
+        &kernel,
+        session_id,
+        |turn| {
+            turn.status == SessionTurnStatus::Failed
+                && turn
+                    .error_text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("attachment storage path"))
+        },
+        "symlinked projection parent failure",
+    )
+    .await;
+
+    assert!(
+        std::fs::read_dir(&outside)
+            .expect("read outside projection target")
+            .next()
+            .is_none(),
+        "projection creation must not follow symlinked parents"
+    );
+}
+
+#[tokio::test]
+async fn channel_attachment_temp_cleanup_ignores_staged_blobs() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "attachment-temp-cleanup-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    create_pending_pairing(&kernel, "terminal", "peer-temp", "temp-1001").await;
+    approve_pairing(&kernel, "terminal", "peer-temp").await;
+    let content = b"committed staged blob".to_vec();
+    let waiting = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            attachments: vec![ChannelAttachmentDescriptor {
+                attachment_id: "att-temp".to_string(),
+                kind: "document".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                filename: Some("report.txt".to_string()),
+                size_bytes: Some(content.len() as i64),
+                provider_file_ref: "provider-temp".to_string(),
+                caption: None,
+            }],
+            ..v2_text_request(
+                "terminal",
+                "temp-1002",
+                "peer-temp",
+                "peer-temp",
+                None,
+                "temp cleanup attachment",
+                ChannelTrigger::Dm,
+            )
+        })
+        .await
+        .expect("attachment turn waits");
+    assert_eq!(
+        waiting.outcome,
+        ChannelInboundOutcome::WaitingForAttachments
+    );
+
+    kernel
+        .stage_channel_attachment(ChannelAttachmentStageInput {
+            channel_id: "terminal".to_string(),
+            event_id: "temp-1002".to_string(),
+            attachment_id: "att-temp".to_string(),
+            kind: "document".to_string(),
+            filename: Some("report.txt".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            caption: None,
+            content: ChannelAttachmentStageContent::Bytes(content.clone()),
+        })
+        .await
+        .expect("stage attachment");
+
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    let storage_path: String = sqlx::query_scalar(
+        "SELECT storage_path FROM channel_attachments \
+         WHERE channel_id = 'terminal' AND event_id = 'temp-1002' AND attachment_id = 'att-temp'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query staged storage path");
+    let staged_path = std::path::PathBuf::from(storage_path);
+    assert_eq!(
+        std::fs::read(&staged_path).expect("read staged attachment before cleanup"),
+        content
+    );
+
+    let temp_path = staged_path
+        .parent()
+        .expect("attachment dir")
+        .join(".upload-old.tmp");
+    std::fs::write(&temp_path, b"stale partial upload").expect("write stale temp upload");
+    std::fs::File::open(&temp_path)
+        .expect("open stale temp upload")
+        .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+        .expect("age stale temp upload");
+
+    let _restarted = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    assert!(!temp_path.exists(), "stale temp upload should be removed");
+    assert_eq!(
+        std::fs::read(&staged_path).expect("read staged attachment after cleanup"),
+        content
+    );
+}
+
+#[tokio::test]
+async fn attachment_maintenance_removes_stale_runtime_projections() {
+    let env = TestHome::new().await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            ..KernelOptions::default()
+        })
+        .await;
+    let projection_dir = env
+        .home()
+        .runtime_dir()
+        .join("channels")
+        .join(test_storage_component("terminal"))
+        .join("attachment-projections")
+        .join(test_storage_component("projection-cleanup-1001"))
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&projection_dir).expect("create stale projection");
+    std::fs::write(projection_dir.join("projected.txt"), b"projected copy")
+        .expect("write projected copy");
+    std::fs::File::open(&projection_dir)
+        .expect("open stale projection dir")
+        .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+        .expect("age stale projection dir");
+
+    kernel
+        .reconcile_stale_channel_attachments()
+        .await
+        .expect("run attachment maintenance");
+
+    assert!(
+        !projection_dir.exists(),
+        "stale runtime projection should be removed"
+    );
+}
+
+#[tokio::test]
+async fn channel_attachment_storage_identity_does_not_collide_after_sanitizing() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "attachment-collision-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    create_pending_pairing(&kernel, "terminal", "peer-collision", "collision-1001").await;
+    approve_pairing(&kernel, "terminal", "peer-collision").await;
+    let first_id = "a/b";
+    let second_id = "a_2fb";
+    let waiting = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            attachments: vec![
+                ChannelAttachmentDescriptor {
+                    attachment_id: first_id.to_string(),
+                    kind: "document".to_string(),
+                    filename: Some("same.txt".to_string()),
+                    size_bytes: Some(5),
+                    provider_file_ref: "provider-first".to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    caption: None,
+                },
+                ChannelAttachmentDescriptor {
+                    attachment_id: second_id.to_string(),
+                    kind: "document".to_string(),
+                    filename: Some("same.txt".to_string()),
+                    size_bytes: Some(6),
+                    provider_file_ref: "provider-second".to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    caption: None,
+                },
+            ],
+            ..v2_text_request(
+                "terminal",
+                "collision-1002",
+                "peer-collision",
+                "peer-collision",
+                None,
+                "compare both attachments",
+                ChannelTrigger::Dm,
+            )
+        })
+        .await
+        .expect("attachment turn waits");
+    assert_eq!(
+        waiting.outcome,
+        ChannelInboundOutcome::WaitingForAttachments
+    );
+
+    let first_runtime_path = kernel
+        .stage_channel_attachment(ChannelAttachmentStageInput {
+            channel_id: "terminal".to_string(),
+            event_id: "collision-1002".to_string(),
+            attachment_id: first_id.to_string(),
+            kind: "document".to_string(),
+            filename: Some("same.txt".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            caption: None,
+            content: ChannelAttachmentStageContent::Bytes(b"first".to_vec()),
+        })
+        .await
+        .expect("stage first attachment")
+        .runtime_path
+        .expect("first runtime path");
+    let second_runtime_path = kernel
+        .stage_channel_attachment(ChannelAttachmentStageInput {
+            channel_id: "terminal".to_string(),
+            event_id: "collision-1002".to_string(),
+            attachment_id: second_id.to_string(),
+            kind: "document".to_string(),
+            filename: Some("same.txt".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            caption: None,
+            content: ChannelAttachmentStageContent::Bytes(b"second".to_vec()),
+        })
+        .await
+        .expect("stage second attachment")
+        .runtime_path
+        .expect("second runtime path");
+    assert_ne!(first_runtime_path, second_runtime_path);
+
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    let rows = sqlx::query(
+        "SELECT attachment_id, storage_path FROM channel_attachments \
+         WHERE channel_id = 'terminal' AND event_id = 'collision-1002' \
+         ORDER BY attachment_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("query collision attachment paths");
+    let first_path = rows
+        .iter()
+        .find(|row| row.get::<String, _>("attachment_id") == first_id)
+        .map(|row| row.get::<String, _>("storage_path"))
+        .expect("first storage path");
+    let second_path = rows
+        .iter()
+        .find(|row| row.get::<String, _>("attachment_id") == second_id)
+        .map(|row| row.get::<String, _>("storage_path"))
+        .expect("second storage path");
+    assert_ne!(first_path, second_path);
+    assert_eq!(
+        std::fs::read(first_path).expect("read first staged file"),
+        b"first"
+    );
+    assert_eq!(
+        std::fs::read(second_path).expect("read second staged file"),
+        b"second"
+    );
+}
+
+#[tokio::test]
+async fn channel_attachment_stage_requires_waiting_declared_attachment() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "attachment-precondition-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    let pending = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            attachments: vec![attachment_descriptor("pending-attachment")],
+            ..v2_text_request(
+                "terminal",
+                "precondition-pending",
+                "peer-unapproved",
+                "peer-unapproved",
+                None,
+                "unapproved attachment",
+                ChannelTrigger::Dm,
+            )
+        })
+        .await
+        .expect("unapproved attachment event is pending");
+    assert_eq!(pending.outcome, ChannelInboundOutcome::PendingApproval);
+
+    let err = kernel
+        .stage_channel_attachment(ChannelAttachmentStageInput {
+            channel_id: "terminal".to_string(),
+            event_id: "precondition-pending".to_string(),
+            attachment_id: "pending-attachment".to_string(),
+            kind: "image".to_string(),
+            filename: Some("image.png".to_string()),
+            mime_type: Some("image/png".to_string()),
+            caption: None,
+            content: ChannelAttachmentStageContent::Bytes(b"hello".to_vec()),
+        })
+        .await
+        .expect_err("pending approval event cannot stage");
+    assert!(matches!(err, KernelError::Conflict(message) if message.contains("not waiting")));
+
+    create_pending_pairing(
+        &kernel,
+        "terminal",
+        "peer-precondition",
+        "precondition-1001",
+    )
+    .await;
+    approve_pairing(&kernel, "terminal", "peer-precondition").await;
+    let waiting = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            attachments: vec![attachment_descriptor("declared-attachment")],
+            ..v2_text_request(
+                "terminal",
+                "precondition-waiting",
+                "peer-precondition",
+                "peer-precondition",
+                None,
+                "waiting attachment",
+                ChannelTrigger::Dm,
+            )
+        })
+        .await
+        .expect("queue waiting attachment turn");
+    assert_eq!(
+        waiting.outcome,
+        ChannelInboundOutcome::WaitingForAttachments
+    );
+
+    let err = kernel
+        .stage_channel_attachment(ChannelAttachmentStageInput {
+            channel_id: "terminal".to_string(),
+            event_id: "precondition-waiting".to_string(),
+            attachment_id: "not-declared".to_string(),
+            kind: "image".to_string(),
+            filename: Some("image.png".to_string()),
+            mime_type: Some("image/png".to_string()),
+            caption: None,
+            content: ChannelAttachmentStageContent::Bytes(b"hello".to_vec()),
+        })
+        .await
+        .expect_err("undeclared attachment cannot stage");
+    assert!(matches!(err, KernelError::BadRequest(message) if message.contains("not declared")));
+
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "precondition-1002",
+            "peer-precondition",
+            "peer-precondition",
+            None,
+            "no attachments here",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue regular turn");
+    assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
+
+    let err = kernel
+        .stage_channel_attachment(ChannelAttachmentStageInput {
+            channel_id: "terminal".to_string(),
+            event_id: "precondition-1002".to_string(),
+            attachment_id: "not-declared".to_string(),
+            kind: "image".to_string(),
+            filename: Some("image.png".to_string()),
+            mime_type: Some("image/png".to_string()),
+            caption: None,
+            content: ChannelAttachmentStageContent::Bytes(b"hello".to_vec()),
+        })
+        .await
+        .expect_err("non-waiting event cannot stage");
+    assert!(matches!(err, KernelError::Conflict(message) if message.contains("not waiting")));
+}
+
+#[tokio::test]
+async fn channel_attachment_descriptor_size_policy_records_rejections() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "attachment-size-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    create_pending_pairing(&kernel, "terminal", "peer-size", "size-1001").await;
+    approve_pairing(&kernel, "terminal", "peer-size").await;
+
+    let queued = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            attachments: vec![ChannelAttachmentDescriptor {
+                size_bytes: Some((MAX_CHANNEL_ATTACHMENT_BYTES + 1) as i64),
+                ..attachment_descriptor("too-large")
+            }],
+            ..v2_text_request(
+                "terminal",
+                "size-1002",
+                "peer-size",
+                "peer-size",
+                None,
+                "oversized attachment",
+                ChannelTrigger::Dm,
+            )
+        })
+        .await
+        .expect("oversized descriptor with text should queue with rejection manifest");
+    assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
+    let session_id = queued.session_id.expect("queued session id");
+    wait_for_latest_turn(
+        &kernel,
+        session_id,
+        |turn| {
+            turn.status == SessionTurnStatus::Completed
+                && turn.prompt_user_text == "oversized attachment"
+                && !turn
+                    .prompt_user_text
+                    .contains("lionclaw_channel_attachment_manifest")
+                && turn.assistant_text.contains("too-large")
+                && turn.assistant_text.contains("attachment_too_large")
+        },
+        "oversized descriptor rejection manifest",
+    )
+    .await;
+
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    let (status, reason_code): (String, String) = sqlx::query_as(
+        "SELECT status, rejection_code FROM channel_attachments \
+         WHERE channel_id = 'terminal' AND event_id = 'size-1002' AND attachment_id = 'too-large'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query oversized descriptor rejection");
+    assert_eq!(status, "rejected");
+    assert_eq!(reason_code, "attachment_too_large");
+
+    let waiting = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            attachments: vec![
+                ChannelAttachmentDescriptor {
+                    attachment_id: "large-a".to_string(),
+                    size_bytes: Some(MAX_CHANNEL_ATTACHMENT_BYTES as i64),
+                    ..attachment_descriptor("large-a")
+                },
+                ChannelAttachmentDescriptor {
+                    attachment_id: "large-b".to_string(),
+                    size_bytes: Some(MAX_CHANNEL_ATTACHMENT_BYTES as i64),
+                    ..attachment_descriptor("large-b")
+                },
+                ChannelAttachmentDescriptor {
+                    attachment_id: "large-c".to_string(),
+                    size_bytes: Some(
+                        (MAX_CHANNEL_EVENT_ATTACHMENT_BYTES - (MAX_CHANNEL_ATTACHMENT_BYTES * 2)
+                            + 1) as i64,
+                    ),
+                    ..attachment_descriptor("large-c")
+                },
+            ],
+            ..v2_text_request(
+                "terminal",
+                "size-1003",
+                "peer-size",
+                "peer-size",
+                None,
+                "oversized event",
+                ChannelTrigger::Dm,
+            )
+        })
+        .await
+        .expect("event-total overflow should leave stageable descriptors waiting");
+    assert_eq!(
+        waiting.outcome,
+        ChannelInboundOutcome::WaitingForAttachments
+    );
+    let (status, reason_code): (String, String) = sqlx::query_as(
+        "SELECT status, rejection_code FROM channel_attachments \
+         WHERE channel_id = 'terminal' AND event_id = 'size-1003' AND attachment_id = 'large-c'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query event-total descriptor rejection");
+    assert_eq!(status, "rejected");
+    assert_eq!(reason_code, "event_attachments_too_large");
+}
+
+#[tokio::test]
+async fn channel_attachment_stage_policy_rejection_is_manifested() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "attachment-stage-policy-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    create_pending_pairing(&kernel, "terminal", "peer-policy", "policy-1001").await;
+    approve_pairing(&kernel, "terminal", "peer-policy").await;
+
+    let waiting = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            text: Some("inspect upload".to_string()),
+            attachments: vec![ChannelAttachmentDescriptor {
+                size_bytes: Some((MAX_CHANNEL_ATTACHMENT_BYTES - 1) as i64),
+                ..attachment_descriptor("too-large-upload")
+            }],
+            ..v2_text_request(
+                "terminal",
+                "policy-1002",
+                "peer-policy",
+                "peer-policy",
+                None,
+                "inspect upload",
+                ChannelTrigger::Dm,
+            )
+        })
+        .await
+        .expect("attachment turn waits");
+    assert_eq!(
+        waiting.outcome,
+        ChannelInboundOutcome::WaitingForAttachments
+    );
+
+    let rejected = kernel
+        .stage_channel_attachment(ChannelAttachmentStageInput {
+            channel_id: "terminal".to_string(),
+            event_id: "policy-1002".to_string(),
+            attachment_id: "too-large-upload".to_string(),
+            kind: "image".to_string(),
+            filename: Some("image.png".to_string()),
+            mime_type: Some("image/png".to_string()),
+            caption: None,
+            content: ChannelAttachmentStageContent::RejectedByPolicy {
+                reason_code: "attachment_too_large".to_string(),
+                size_bytes: (MAX_CHANNEL_ATTACHMENT_BYTES + 1) as i64,
+                sha256: "0".repeat(64),
+            },
+        })
+        .await
+        .expect("oversized staged upload is recorded as rejected");
+    assert_eq!(rejected.status, ChannelAttachmentStatus::Rejected);
+    assert_eq!(
+        rejected.reason_code.as_deref(),
+        Some("attachment_too_large")
+    );
+    assert_eq!(rejected.runtime_path, None);
+
+    let finalized = kernel
+        .finalize_channel_attachments(ChannelAttachmentFinalizeRequest {
+            channel_id: "terminal".to_string(),
+            event_id: "policy-1002".to_string(),
+            worker_id: "attachment-worker-policy-test".to_string(),
+            missing: vec![ChannelAttachmentMissingReport {
+                attachment_id: "too-large-upload".to_string(),
+                reason_code: "provider_missing".to_string(),
+                reason_text: None,
+            }],
+        })
+        .await
+        .expect("finalize rejected attachment");
+    assert_eq!(finalized.outcome, ChannelAttachmentFinalizeOutcome::Queued);
+
+    let session_id = waiting.session_id.expect("waiting session id");
+    wait_for_latest_turn(
+        &kernel,
+        session_id,
+        |turn| {
+            turn.status == SessionTurnStatus::Completed
+                && turn.prompt_user_text == "inspect upload"
+                && !turn
+                    .prompt_user_text
+                    .contains("lionclaw_channel_attachment_manifest")
+                && turn.assistant_text.contains("attachment_too_large")
+        },
+        "policy rejected attachment manifest",
+    )
+    .await;
+
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    let reason_code: String = sqlx::query_scalar(
+        "SELECT rejection_code FROM channel_attachments \
+         WHERE channel_id = 'terminal' AND event_id = 'policy-1002' AND attachment_id = 'too-large-upload'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query policy rejection code");
+    assert_eq!(reason_code, "attachment_too_large");
+}
+
+#[tokio::test]
+async fn channel_attachment_stage_http_oversized_upload_records_policy_rejection() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "attachment-stage-http-policy-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    create_pending_pairing(&kernel, "terminal", "peer-http-policy", "http-policy-1001").await;
+    approve_pairing(&kernel, "terminal", "peer-http-policy").await;
+
+    let waiting = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            text: Some("inspect oversized upload".to_string()),
+            attachments: vec![ChannelAttachmentDescriptor {
+                size_bytes: Some((MAX_CHANNEL_ATTACHMENT_BYTES - 1) as i64),
+                ..attachment_descriptor("too-large-http-upload")
+            }],
+            ..v2_text_request(
+                "terminal",
+                "http-policy-1002",
+                "peer-http-policy",
+                "peer-http-policy",
+                None,
+                "inspect oversized upload",
+                ChannelTrigger::Dm,
+            )
+        })
+        .await
+        .expect("attachment turn waits");
+    assert_eq!(
+        waiting.outcome,
+        ChannelInboundOutcome::WaitingForAttachments
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test api");
+    let bind_addr = listener.local_addr().expect("test api addr").to_string();
+    let app = build_router(
+        std::sync::Arc::new(kernel.clone()),
+        test_daemon_info(&env, bind_addr.clone()),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test api");
+    });
+
+    let oversized_size = MAX_CHANNEL_ATTACHMENT_BYTES + 1024 * 1024 + 1;
+    let file_content = vec![b'x'; oversized_size];
+    let mut hasher = Sha256::new();
+    hasher.update(&file_content);
+    let expected_sha = hex::encode(hasher.finalize());
+    let boundary = "lionclaw-http-attachment-policy-test";
+    let body = multipart_stage_body(
+        boundary,
+        &[
+            ("channel_id", "terminal"),
+            ("event_id", "http-policy-1002"),
+            ("attachment_id", "too-large-http-upload"),
+            ("kind", "image"),
+            ("filename", "image.png"),
+            ("mime_type", "image/png"),
+        ],
+        "image.png",
+        "image/png",
+        &file_content,
+    );
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{bind_addr}/v0/channels/attachments/stage"))
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
+        .await
+        .expect("stage oversized upload over http");
+    let status = response.status();
+    let text = response.text().await.expect("read stage response");
+    assert!(status.is_success(), "{status}: {text}");
+    let rejected: ChannelAttachmentStageResponse =
+        serde_json::from_str(&text).expect("decode stage response");
+    assert_eq!(rejected.status, ChannelAttachmentStatus::Rejected);
+    assert_eq!(rejected.size_bytes, oversized_size as i64);
+    assert_eq!(rejected.sha256, expected_sha);
+    assert_eq!(
+        rejected.reason_code.as_deref(),
+        Some("attachment_too_large")
+    );
+    assert_eq!(rejected.runtime_path, None);
+
+    let finalized = kernel
+        .finalize_channel_attachments(ChannelAttachmentFinalizeRequest {
+            channel_id: "terminal".to_string(),
+            event_id: "http-policy-1002".to_string(),
+            worker_id: "attachment-worker-http-policy-test".to_string(),
+            missing: Vec::new(),
+        })
+        .await
+        .expect("finalize http policy rejected attachment");
+    assert_eq!(finalized.outcome, ChannelAttachmentFinalizeOutcome::Queued);
+
+    let session_id = waiting.session_id.expect("waiting session id");
+    wait_for_latest_turn(
+        &kernel,
+        session_id,
+        |turn| {
+            turn.status == SessionTurnStatus::Completed
+                && turn.prompt_user_text == "inspect oversized upload"
+                && !turn
+                    .prompt_user_text
+                    .contains("lionclaw_channel_attachment_manifest")
+                && turn.assistant_text.contains("attachment_too_large")
+                && !turn.assistant_text.contains("not_staged")
+        },
+        "http policy rejected attachment manifest",
+    )
+    .await;
+
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    let reason_code: String = sqlx::query_scalar(
+        "SELECT rejection_code FROM channel_attachments \
+         WHERE channel_id = 'terminal' AND event_id = 'http-policy-1002' AND attachment_id = 'too-large-http-upload'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query http policy rejection code");
+    assert_eq!(reason_code, "attachment_too_large");
+    server.abort();
+}
+
+#[tokio::test]
+async fn bootstrap_finalizes_stale_channel_attachment_batches() {
+    let env = TestHome::new().await;
+    let (_kernel, session_id, pool) = create_aged_waiting_attachment_batch(
+        &env,
+        "attachment-stale-bootstrap-skill",
+        "peer-stale-bootstrap",
+        "stale-bootstrap-1001",
+        "stale-bootstrap-1002",
+    )
+    .await;
+
+    let restarted = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            ..KernelOptions::default()
+        })
+        .await;
+    assert_stale_attachment_batch_finalized(
+        &restarted,
+        &pool,
+        session_id,
+        "stale-bootstrap-1002",
+        "bootstrap stale attachment turn completion",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn attachment_maintenance_finalizes_stale_batches_without_restart() {
+    let env = TestHome::new().await;
+    let (kernel, session_id, pool) = create_aged_waiting_attachment_batch(
+        &env,
+        "attachment-stale-maintenance-skill",
+        "peer-stale-maintenance",
+        "stale-maintenance-1001",
+        "stale-maintenance-1002",
+    )
+    .await;
+
+    kernel
+        .reconcile_stale_channel_attachments()
+        .await
+        .expect("run attachment maintenance");
+    assert_stale_attachment_batch_finalized(
+        &kernel,
+        &pool,
+        session_id,
+        "stale-maintenance-1002",
+        "live stale attachment turn completion",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn latest_session_snapshot_is_project_scoped() {
     let env = TestHome::new().await;
     let project_a = env.temp_dir().join("project-a");
@@ -3013,6 +4546,46 @@ async fn install_and_bind_channel(env: &TestHome, channel_id: &str, skill_name: 
         .await;
 }
 
+fn test_daemon_info(env: &TestHome, bind_addr: String) -> DaemonInfoResponse {
+    DaemonInfoResponse {
+        daemon: "lionclawd".to_string(),
+        status: "ok".to_string(),
+        home_id: "test-home".to_string(),
+        home_root: env.home().root().to_string_lossy().into_owned(),
+        bind_addr,
+        project_scope: "test-project".to_string(),
+        daemon_fingerprint: "test-fingerprint".to_string(),
+    }
+}
+
+fn multipart_stage_body(
+    boundary: &str,
+    fields: &[(&str, &str)],
+    file_name: &str,
+    mime_type: &str,
+    file_content: &[u8],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (name, value) in fields {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\n")
+            .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {mime_type}\r\n\r\n").as_bytes());
+    body.extend_from_slice(file_content);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body
+}
+
 fn assert_turn_completed_before_done(
     events: &[ChannelStreamEventView],
     turn_id: uuid::Uuid,
@@ -3181,11 +4754,143 @@ fn captioned_attachment_descriptor(
     }
 }
 
+fn test_storage_component(raw: &str) -> String {
+    format!("sha256-{}", test_sha256_hex(raw.trim().as_bytes()))
+}
+
+fn test_runtime_attachment_component(raw: &str) -> String {
+    let digest = test_sha256_hex(raw.trim().as_bytes());
+    format!(
+        "{}-{}",
+        test_safe_path_label(raw, "attachment", 80),
+        &digest[..16]
+    )
+}
+
+fn test_safe_path_label(raw: &str, fallback: &str, max_len: usize) -> String {
+    let raw = raw.trim();
+    let mut out = String::with_capacity(raw.len().max(1));
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-') {
+            out.push(byte as char);
+        } else {
+            out.push('_');
+            out.push(char::from_digit((byte >> 4).into(), 16).expect("hex high nibble"));
+            out.push(char::from_digit((byte & 0x0f).into(), 16).expect("hex low nibble"));
+        }
+    }
+    if out.is_empty() {
+        out.push_str(fallback);
+    }
+    if out == "." || out == ".." {
+        out.insert(0, '_');
+    }
+    if out.len() > max_len {
+        out.truncate(max_len);
+    }
+    out
+}
+
+fn test_sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
 async fn connect_test_pool(db_path: &std::path::Path) -> sqlx::SqlitePool {
     let db_url = format!("sqlite://{}", db_path.display());
     sqlx::SqlitePool::connect(&db_url)
         .await
         .expect("connect test db")
+}
+
+async fn create_aged_waiting_attachment_batch(
+    env: &TestHome,
+    skill_name: &str,
+    peer_id: &str,
+    pairing_event_id: &str,
+    inbound_event_id: &str,
+) -> (Kernel, uuid::Uuid, sqlx::SqlitePool) {
+    install_and_bind_channel(env, "terminal", skill_name).await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    create_pending_pairing(&kernel, "terminal", peer_id, pairing_event_id).await;
+    approve_pairing(&kernel, "terminal", peer_id).await;
+    let waiting = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            text: None,
+            attachments: vec![captioned_attachment_descriptor("stale-att", "stale image")],
+            ..v2_text_request(
+                "terminal",
+                inbound_event_id,
+                peer_id,
+                peer_id,
+                None,
+                "stale image",
+                ChannelTrigger::Dm,
+            )
+        })
+        .await
+        .expect("create waiting attachment turn");
+    assert_eq!(
+        waiting.outcome,
+        ChannelInboundOutcome::WaitingForAttachments
+    );
+
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    sqlx::query(
+        "UPDATE channel_attachment_batches \
+         SET created_at_ms = 1, updated_at_ms = 1 \
+         WHERE channel_id = ?1 AND event_id = ?2",
+    )
+    .bind("terminal")
+    .bind(inbound_event_id)
+    .execute(&pool)
+    .await
+    .expect("age attachment batch");
+
+    let session_id = waiting.session_id.expect("waiting session id");
+    (kernel, session_id, pool)
+}
+
+async fn assert_stale_attachment_batch_finalized(
+    kernel: &Kernel,
+    pool: &sqlx::SqlitePool,
+    session_id: uuid::Uuid,
+    event_id: &str,
+    label: &str,
+) {
+    wait_for_latest_turn(
+        kernel,
+        session_id,
+        |turn| {
+            turn.status == SessionTurnStatus::Completed
+                && turn.prompt_user_text == "stale image"
+                && !turn
+                    .prompt_user_text
+                    .contains("lionclaw_channel_attachment_manifest")
+                && turn.assistant_text.contains("not_staged")
+        },
+        label,
+    )
+    .await;
+
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM channel_attachment_batches \
+         WHERE channel_id = ?1 AND event_id = ?2",
+    )
+    .bind("terminal")
+    .bind(event_id)
+    .fetch_one(pool)
+    .await
+    .expect("query finalized batch");
+    assert_eq!(status, "finalized");
 }
 
 async fn create_pending_pairing(kernel: &Kernel, channel_id: &str, peer_id: &str, event_id: &str) {
@@ -3262,6 +4967,77 @@ where
     panic!("timed out waiting for {label}");
 }
 
+async fn wait_for_path_removed(path: &std::path::Path, label: &str) {
+    for _ in 0..60 {
+        if !path.exists() {
+            return;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for {label}");
+}
+
+async fn wait_for_attachment_mount_source(
+    kernel: &Kernel,
+    session_id: uuid::Uuid,
+) -> std::path::PathBuf {
+    for _ in 0..60 {
+        let plan_events = kernel
+            .query_audit(
+                Some(session_id),
+                Some("runtime.plan.allow".to_string()),
+                None,
+                Some(10),
+            )
+            .await
+            .expect("query runtime plan audit");
+        if let Some(source) = plan_events
+            .events
+            .iter()
+            .filter_map(|event| event.details["mounts"].as_array())
+            .flatten()
+            .find(|mount| {
+                mount["target"].as_str() == Some("/attachments")
+                    && mount["access"].as_str() == Some("read-only")
+            })
+            .and_then(|mount| mount["source"].as_str())
+        {
+            return std::path::PathBuf::from(source);
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    panic!("timed out waiting for runtime attachment mount source");
+}
+
+async fn attachment_mount_sources(
+    kernel: &Kernel,
+    session_id: uuid::Uuid,
+) -> Vec<std::path::PathBuf> {
+    let plan_events = kernel
+        .query_audit(
+            Some(session_id),
+            Some("runtime.plan.allow".to_string()),
+            None,
+            Some(20),
+        )
+        .await
+        .expect("query runtime plan audit");
+
+    plan_events
+        .events
+        .iter()
+        .filter_map(|event| event.details["mounts"].as_array())
+        .flatten()
+        .filter(|mount| {
+            mount["target"].as_str() == Some("/attachments")
+                && mount["access"].as_str() == Some("read-only")
+        })
+        .filter_map(|mount| mount["source"].as_str())
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
 async fn wait_for_joined_turn_statuses(
     pool: &sqlx::SqlitePool,
     turn_id: uuid::Uuid,
@@ -3277,6 +5053,26 @@ async fn wait_for_joined_turn_statuses(
     }
 
     query_joined_turn_statuses(pool, turn_id).await
+}
+
+async fn assert_channel_turn_status_stays(
+    pool: &sqlx::SqlitePool,
+    turn_id: uuid::Uuid,
+    expected_status: &str,
+    duration: Duration,
+    label: &str,
+) {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM channel_turns WHERE turn_id = ?1")
+                .bind(turn_id.to_string())
+                .fetch_one(pool)
+                .await
+                .expect("query channel turn status");
+        assert_eq!(status, expected_status, "{label}");
+        sleep(Duration::from_millis(25)).await;
+    }
 }
 
 async fn query_joined_turn_statuses(
@@ -3549,6 +5345,136 @@ impl RuntimeAdapter for SlowAnswerAdapter {
                 text: self.answer.clone(),
             })
             .expect("send answer");
+        Ok(RuntimeTurnResult {
+            capability_requests: Vec::new(),
+        })
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        _event_tx: RuntimeEventSender,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn cancel(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+}
+
+struct RecordingEchoAdapter {
+    prompts: std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl RuntimeAdapter for RecordingEchoAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "recording-echo".to_string(),
+            version: "test".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle, anyhow::Error> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("recording-echo:{}", input.session_id),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn turn(
+        &self,
+        input: RuntimeTurnInput,
+        event_tx: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult, anyhow::Error> {
+        let answer = {
+            let mut prompts = self.prompts.lock().await;
+            prompts.push(input.prompt);
+            format!("recorded answer {}", prompts.len())
+        };
+        event_tx
+            .send(RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: answer,
+            })
+            .expect("send echoed prompt");
+        Ok(RuntimeTurnResult {
+            capability_requests: Vec::new(),
+        })
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        _event_tx: RuntimeEventSender,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn cancel(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+}
+
+struct PausedEchoAdapter {
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl RuntimeAdapter for PausedEchoAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "paused-echo".to_string(),
+            version: "test".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle, anyhow::Error> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("paused-echo:{}", input.session_id),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn turn(
+        &self,
+        input: RuntimeTurnInput,
+        event_tx: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult, anyhow::Error> {
+        self.release.notified().await;
+        event_tx
+            .send(RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: input.prompt,
+            })
+            .expect("send echoed prompt");
         Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
         })
