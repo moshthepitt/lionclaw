@@ -15,10 +15,11 @@ use uuid::Uuid;
 
 use crate::{
     contracts::{
-        ChannelGrantView, ChannelPairingListResponse, ChannelPairingStatus, ChannelPairingView,
-        ChannelRoutingProfile, ContinuityDraftActionRequest, ContinuityDraftListRequest,
-        ContinuityPathRequest, ContinuitySearchRequest, JobCreateRequest, JobRefRequest,
-        JobRunsRequest, JobScheduleDto, TrustTier,
+        ChannelGrantView, ChannelPairingInviteRequest, ChannelPairingListResponse,
+        ChannelPairingStatus, ChannelPairingView, ChannelRoutingProfile,
+        ContinuityDraftActionRequest, ContinuityDraftListRequest, ContinuityPathRequest,
+        ContinuitySearchRequest, JobCreateRequest, JobRefRequest, JobRunsRequest, JobScheduleDto,
+        TrustTier,
     },
     home::LionClawHome,
     kernel::{
@@ -42,8 +43,8 @@ use crate::{
         },
         reconcile::{
             add_channel, add_skill, open_kernel, open_runtime_kernel_for_work_root,
-            pairing_approve, pairing_block, pairing_list, pairing_revoke, remove_channel,
-            remove_skill, resolve_installed_skill_worker_entrypoint,
+            pairing_approve, pairing_block, pairing_invite, pairing_list, pairing_revoke,
+            remove_channel, remove_skill, resolve_installed_skill_worker_entrypoint,
         },
         run::run_local,
         runtime::{resolve_runtime_id, validate_runtime_availability},
@@ -393,6 +394,7 @@ struct ChannelAttachArgs {
 #[derive(Debug, Subcommand)]
 enum ChannelPairingCommand {
     List(PairingListArgs),
+    Invite(PairingInviteArgs),
     Approve(PairingApproveArgs),
     Block(PairingBlockArgs),
     Revoke(PairingRevokeArgs),
@@ -468,6 +470,23 @@ struct PairingApproveArgs {
     routing_profile: Option<String>,
     #[arg(long, default_value = "main")]
     trust_tier: String,
+}
+
+#[derive(Debug, Args)]
+struct PairingInviteArgs {
+    channel_id: String,
+    #[arg(long = "scope")]
+    scope: String,
+    #[arg(long)]
+    label: Option<String>,
+    #[arg(long = "conversation-ref")]
+    conversation_ref: Option<String>,
+    #[arg(long = "thread-ref")]
+    thread_ref: Option<String>,
+    #[arg(long = "expires-in", value_parser = parse_runtime_timeout)]
+    expires_in: Option<Duration>,
+    #[arg(long = "max-claims")]
+    max_claims: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -984,6 +1003,33 @@ pub async fn run() -> Result<ExitCode> {
                     let response = pairing_list(&home, args.channel_id, status).await?;
                     print!("{}", render_channel_pairing_list(&response));
                 }
+                ChannelPairingCommand::Invite(args) => {
+                    let requested_profile =
+                        ChannelRoutingProfile::from_str(&args.scope).map_err(anyhow::Error::msg)?;
+                    let expires_in_ms = args
+                        .expires_in
+                        .map(|duration| {
+                            u64::try_from(duration.as_millis())
+                                .context("expires-in is too large to represent")
+                        })
+                        .transpose()?;
+                    let invite = pairing_invite(
+                        &home,
+                        ChannelPairingInviteRequest {
+                            channel_id: args.channel_id,
+                            requested_profile,
+                            label: args.label,
+                            conversation_ref: args.conversation_ref,
+                            thread_ref: args.thread_ref,
+                            expires_in_ms,
+                            max_claims: args.max_claims,
+                        },
+                    )
+                    .await?;
+                    println!("Pairing token: {}", invite.token);
+                    println!("Expires: {}", invite.expires_at.to_rfc3339());
+                    println!("Claims: {}", invite.max_claims);
+                }
                 ChannelPairingCommand::Approve(args) => {
                     let trust_tier =
                         TrustTier::from_str(&args.trust_tier).map_err(anyhow::Error::msg)?;
@@ -1011,9 +1057,10 @@ pub async fn run() -> Result<ExitCode> {
                     );
                 }
                 ChannelPairingCommand::Block(args) => {
-                    let grant = pairing_block(
+                    let channel_id = args.channel_id;
+                    let blocked = pairing_block(
                         &home,
-                        args.channel_id,
+                        channel_id.clone(),
                         args.sender_ref,
                         args.pairing_id,
                         args.conversation_ref,
@@ -1021,12 +1068,21 @@ pub async fn run() -> Result<ExitCode> {
                         args.reason,
                     )
                     .await?;
-                    println!(
-                        "blocked channel={} grant={} profile={}",
-                        grant.grant.channel_id,
-                        grant.grant.grant_id,
-                        grant.grant.routing_profile.as_str()
-                    );
+                    if let Some(grant) = blocked.grant {
+                        println!(
+                            "blocked channel={} grant={} profile={} pairings={}",
+                            grant.channel_id,
+                            grant.grant_id,
+                            grant.routing_profile.as_str(),
+                            blocked.blocked_pairing_ids.len()
+                        );
+                    } else {
+                        println!(
+                            "blocked channel={} pairings={}",
+                            channel_id,
+                            blocked.blocked_pairing_ids.len()
+                        );
+                    }
                 }
                 ChannelPairingCommand::Revoke(args) => {
                     let revoked =
@@ -2409,6 +2465,48 @@ mod tests {
         assert!(command.contains(&home.root().display().to_string()));
         assert!(command.contains("channel pairing list --channel-id telegram"));
         assert!(!command.starts_with("lionclaw channel pairing"));
+    }
+
+    #[test]
+    fn channel_pairing_invite_parses_scope_limits_and_bindings() {
+        let cli = Cli::try_parse_from([
+            "lionclaw",
+            "channel",
+            "pairing",
+            "invite",
+            "telegram",
+            "--scope",
+            "thread",
+            "--conversation-ref",
+            "chat-1",
+            "--thread-ref",
+            "topic-42",
+            "--expires-in",
+            "5m",
+            "--max-claims",
+            "3",
+            "--label",
+            "reviewers",
+        ])
+        .expect("parse pairing invite");
+
+        match cli.command {
+            Command::Channel {
+                command:
+                    ChannelCommand::Pairing {
+                        command: ChannelPairingCommand::Invite(args),
+                    },
+            } => {
+                assert_eq!(args.channel_id, "telegram");
+                assert_eq!(args.scope, "thread");
+                assert_eq!(args.conversation_ref.as_deref(), Some("chat-1"));
+                assert_eq!(args.thread_ref.as_deref(), Some("topic-42"));
+                assert_eq!(args.expires_in, Some(std::time::Duration::from_secs(300)));
+                assert_eq!(args.max_claims, Some(3));
+                assert_eq!(args.label.as_deref(), Some("reviewers"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]
