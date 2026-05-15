@@ -2067,6 +2067,17 @@ mod tests {
     }
 
     #[test]
+    fn plain_doctor_does_not_pre_resolve_a_target() {
+        let target = resolve_command_target(
+            &TargetSelection::default(),
+            &Command::Doctor(DoctorArgs { all: false }),
+        )
+        .expect("doctor target resolution");
+
+        assert!(target.is_none());
+    }
+
+    #[test]
     fn project_wide_commands_reject_home_and_instance_selectors() {
         let with_home = TargetSelection {
             home: Some(PathBuf::from("/tmp/lionclaw-home")),

@@ -1577,6 +1577,17 @@ fn inspect_project_units(
 fn inspect_project_metadata_dir(project_root: &Path) -> std::result::Result<(), DoctorFinding> {
     let path = project_dir_path(project_root);
     let metadata = fs::symlink_metadata(&path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return DoctorFinding::error(
+                FindingKind::ProjectMetadata,
+                "no LionClaw project found",
+                project_root.display().to_string(),
+                format!("no .lionclaw metadata found at {}", path.display()),
+            )
+            .with_inspect(default_inspect_command(&path.display().to_string()))
+            .with_repair(project_command(project_root, "project init"));
+        }
+
         DoctorFinding::error(
             FindingKind::ProjectMetadata,
             "project metadata directory is missing or unreadable",
@@ -2496,21 +2507,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn doctor_scopes_missing_project_metadata_repair_to_project() {
+    async fn doctor_reports_absent_project_metadata_as_no_project_found() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
 
         let report = inspect_project(temp_dir.path(), None, false, &FakeUnitManager::default())
             .await
             .expect("doctor report");
 
-        let finding = finding(
-            &report,
-            "project metadata directory is missing or unreadable",
+        let finding = finding(&report, "no LionClaw project found");
+        assert_eq!(finding.id, "LC-D010");
+        assert_eq!(
+            finding.target.as_ref(),
+            temp_dir.path().display().to_string()
+        );
+        assert_eq!(
+            finding.observed.as_ref(),
+            format!(
+                "no .lionclaw metadata found at {}",
+                project_dir_path(temp_dir.path()).display()
+            )
+        );
+        assert_eq!(
+            finding.runbook.inspect.as_ref(),
+            format!(
+                "ls -ld {}",
+                shell_quote_arg(&project_dir_path(temp_dir.path()).display().to_string())
+            )
         );
         assert_eq!(
             finding.runbook.repair.as_deref(),
             Some(project_command(temp_dir.path(), "project init").as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_existing_bad_project_metadata_as_metadata_error() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        fs::write(project_dir_path(temp_dir.path()), "not a directory").expect("metadata file");
+
+        let report = inspect_project(temp_dir.path(), None, false, &FakeUnitManager::default())
+            .await
+            .expect("doctor report");
+
+        let finding = finding(&report, "project metadata path is not a directory");
+        assert_eq!(
+            finding.target.as_ref(),
+            project_dir_path(temp_dir.path()).display().to_string()
+        );
+        assert_eq!(finding.runbook.repair.as_deref(), None);
     }
 
     #[tokio::test]

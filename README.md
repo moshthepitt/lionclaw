@@ -158,8 +158,8 @@ runtime config, channels, managed units, and configured bind drift without
 allocating ports, starting units, stopping units, or changing files.
 
 If no project exists in the current directory or its immediate parent, `doctor`
-treats the current directory as the diagnostic target and tells you how to
-initialize it.
+treats the current directory as the diagnostic target, reports `no LionClaw
+project found`, and tells you how to initialize it.
 
 Findings render as stable runbook entries:
 
