@@ -547,14 +547,15 @@ async fn inspect_project<M: UnitManager>(
         }
     }
 
-    if !all && selected_names.len() == 1 {
-        let name = &selected_names[0];
-        let home = instances
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| instance_home_path(project_root, name));
-        let commands = DoctorCommands::for_target(Some(project_root), name, &home);
-        report.set_next_command(commands.run());
+    if !all {
+        if let [name] = selected_names.as_slice() {
+            let home = instances
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| instance_home_path(project_root, name));
+            let commands = DoctorCommands::for_target(Some(project_root), name, &home);
+            report.set_next_command(commands.run());
+        }
     }
 
     for name in selected_names {
