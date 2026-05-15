@@ -1,11 +1,9 @@
 use std::time::Duration;
 
-const INTERACTIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const INTERACTIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const INTERACTIVE_HARD_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
-const DAEMON_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const DAEMON_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DAEMON_HARD_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
-const MIN_DERIVED_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
-const MAX_DERIVED_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeTurnTimeouts {
@@ -22,14 +20,9 @@ impl RuntimeTurnTimeouts {
         Self::new(DAEMON_IDLE_TIMEOUT, DAEMON_HARD_TIMEOUT)
     }
 
-    pub fn with_hard_timeout(hard_timeout: Duration) -> Self {
-        let hard_timeout = normalize_nonzero(hard_timeout);
-        let derived_idle = hard_timeout
-            .checked_div(12)
-            .unwrap_or(hard_timeout)
-            .clamp(MIN_DERIVED_IDLE_TIMEOUT, MAX_DERIVED_IDLE_TIMEOUT)
-            .min(hard_timeout);
-        Self::new(derived_idle, hard_timeout)
+    pub fn with_turn_timeout(turn_timeout: Duration) -> Self {
+        let turn_timeout = normalize_nonzero(turn_timeout);
+        Self::new(turn_timeout, turn_timeout)
     }
 
     pub fn from_millis(idle_timeout_ms: u64, hard_timeout_ms: u64) -> Self {
@@ -108,21 +101,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn derives_idle_timeout_from_hard_timeout() {
+    fn defaults_use_tolerant_idle_timeouts() {
         assert_eq!(
-            RuntimeTurnTimeouts::with_hard_timeout(Duration::from_secs(2 * 60 * 60)),
+            RuntimeTurnTimeouts::interactive(),
             RuntimeTurnTimeouts::new(
-                Duration::from_secs(10 * 60),
+                Duration::from_secs(30 * 60),
                 Duration::from_secs(2 * 60 * 60)
             )
         );
         assert_eq!(
-            RuntimeTurnTimeouts::with_hard_timeout(Duration::from_secs(60)),
-            RuntimeTurnTimeouts::new(Duration::from_secs(60), Duration::from_secs(60))
+            RuntimeTurnTimeouts::daemon(),
+            RuntimeTurnTimeouts::new(
+                Duration::from_secs(30 * 60),
+                Duration::from_secs(4 * 60 * 60)
+            )
+        );
+    }
+
+    #[test]
+    fn explicit_turn_timeout_sets_single_budget() {
+        assert_eq!(
+            RuntimeTurnTimeouts::with_turn_timeout(Duration::from_secs(8 * 60 * 60)),
+            RuntimeTurnTimeouts::new(
+                Duration::from_secs(8 * 60 * 60),
+                Duration::from_secs(8 * 60 * 60)
+            )
         );
         assert_eq!(
-            RuntimeTurnTimeouts::with_hard_timeout(Duration::from_secs(30 * 60)),
-            RuntimeTurnTimeouts::new(Duration::from_secs(150), Duration::from_secs(30 * 60))
+            RuntimeTurnTimeouts::with_turn_timeout(Duration::from_secs(60)),
+            RuntimeTurnTimeouts::new(Duration::from_secs(60), Duration::from_secs(60))
         );
     }
 

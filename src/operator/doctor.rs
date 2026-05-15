@@ -15,14 +15,17 @@ use crate::{
         channel_env::validate_channel_env_contract,
         channel_metadata::{load_channel_metadata, validate_channel_id},
         command_display::{lionclaw_home_command_prefix, shell_quote_arg},
-        config::{ChannelLaunchMode, ManagedChannelConfig, OperatorConfig},
+        config::{
+            normalize_podman_executable, podman_executable_inspect_command,
+            podman_executable_repair_note, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig,
+        },
         daemon_probe::{classify_daemon, DaemonClassification},
         managed_units::{
             daemon_unit_name, existing_unit_identity, unit_file_metadata, unit_status_is_active,
             UnitManager,
         },
         runtime::resolve_runtime_execution_context,
-        runtime_integration::runtime_auth_guidance,
+        runtime_integration::{runtime_auth_guidance, DEFAULT_OCI_ENGINE},
         target::{
             discover_diagnostic_project_root, instance_home_path, instances_dir_path,
             normalize_project_default_instance, project_dir_path, project_file_path,
@@ -38,6 +41,7 @@ const UNRESOLVED_WORK_ROOT_NOTE: &str =
 pub enum FindingSeverity {
     Error,
     Warning,
+    Info,
 }
 
 impl FindingSeverity {
@@ -45,6 +49,7 @@ impl FindingSeverity {
         match self {
             Self::Error => "error",
             Self::Warning => "warning",
+            Self::Info => "info",
         }
     }
 }
@@ -143,7 +148,7 @@ impl FindingKind {
                 "instance config is a readable regular version = 1 TOML file"
             }
             Self::Runtime => "selected instance has a valid configured runtime profile",
-            Self::RuntimeAuth => "runtime authentication state is handled outside doctor",
+            Self::RuntimeAuth => "runtime authentication is checked when the runtime launches",
             Self::Channel => {
                 "configured channels reference installed skills with matching metadata and valid private env state"
             }
@@ -204,6 +209,15 @@ impl DoctorFinding {
         Self::new(FindingSeverity::Warning, kind, subject, target, observed)
     }
 
+    fn info(
+        kind: FindingKind,
+        subject: impl Into<String>,
+        target: impl Into<String>,
+        observed: impl Into<String>,
+    ) -> Self {
+        Self::new(FindingSeverity::Info, kind, subject, target, observed)
+    }
+
     fn new(
         severity: FindingSeverity,
         kind: FindingKind,
@@ -258,6 +272,7 @@ fn target_looks_like_path(target: &str) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct DoctorReport {
     pub findings: Vec<DoctorFinding>,
+    pub next_command: Option<Box<str>>,
 }
 
 impl DoctorReport {
@@ -268,11 +283,24 @@ impl DoctorReport {
     }
 
     pub fn render(&self) -> String {
-        if self.findings.is_empty() {
-            return "doctor: no errors or warnings\n".to_string();
+        let error_count = self.severity_count(FindingSeverity::Error);
+        let non_error_count = self.findings.len().saturating_sub(error_count);
+        let mut output = String::new();
+
+        if error_count > 0 {
+            output.push_str("doctor: setup blocked\n");
+            output.push_str("next: inspect or repair findings below, then rerun doctor\n\n");
+        } else {
+            output.push_str("doctor: no blocking setup issues\n");
+            if let Some(next_command) = self.next_command.as_deref() {
+                output.push_str(&format!("next: {next_command}\n"));
+            }
+            if non_error_count == 0 {
+                return output;
+            }
+            output.push_str("note: non-error findings below are advisory\n\n");
         }
 
-        let mut output = String::new();
         for finding in &self.findings {
             output.push_str(&format!(
                 "[{}] {}: {}\n",
@@ -295,12 +323,23 @@ impl DoctorReport {
         output
     }
 
+    fn severity_count(&self, severity: FindingSeverity) -> usize {
+        self.findings
+            .iter()
+            .filter(|finding| finding.severity == severity)
+            .count()
+    }
+
     fn push(&mut self, finding: DoctorFinding) {
         self.findings.push(finding);
     }
 
     fn extend(&mut self, findings: Vec<DoctorFinding>) {
         self.findings.extend(findings);
+    }
+
+    fn set_next_command(&mut self, command: impl Into<String>) {
+        self.next_command = Some(command.into().into_boxed_str());
     }
 }
 
@@ -363,6 +402,10 @@ impl DoctorCommands {
 
     fn selected(&self, command: &str) -> String {
         format!("{} {command}", self.selected_prefix)
+    }
+
+    fn run(&self) -> String {
+        self.selected("run")
     }
 
     fn create_instance_repair(&self) -> Option<String> {
@@ -504,6 +547,17 @@ async fn inspect_project<M: UnitManager>(
         }
     }
 
+    if !all {
+        if let [name] = selected_names.as_slice() {
+            let home = instances
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| instance_home_path(project_root, name));
+            let commands = DoctorCommands::for_target(Some(project_root), name, &home);
+            report.set_next_command(commands.run());
+        }
+    }
+
     for name in selected_names {
         let home = instances
             .get(&name)
@@ -608,6 +662,8 @@ fn project_has_no_instances_finding(project_root: &Path, repair_instance: &str) 
 async fn inspect_direct_home<M: UnitManager>(home: &Path, manager: &M) -> Result<DoctorReport> {
     let mut report = DoctorReport::default();
     let name = "direct-home";
+    let commands = DoctorCommands::for_target(None, name, home);
+    report.set_next_command(commands.run());
     for finding in inspect_instance(None, name, home, manager).await {
         report.push(finding);
     }
@@ -856,7 +912,31 @@ fn inspect_runtime_config(
     config: &OperatorConfig,
     findings: &mut Vec<DoctorFinding>,
 ) {
+    inspect_runtime_config_with_podman_resolver(name, commands, config, findings, || {
+        normalize_podman_executable(DEFAULT_OCI_ENGINE)
+    });
+}
+
+fn inspect_runtime_config_with_podman_resolver<F>(
+    name: &str,
+    commands: &DoctorCommands,
+    config: &OperatorConfig,
+    findings: &mut Vec<DoctorFinding>,
+    resolve_default_podman: F,
+) where
+    F: FnOnce() -> Result<String>,
+{
+    let default_runtime_repair = commands.selected("configure --runtime codex");
     let Some(runtime_id) = config.defaults.runtime.as_deref() else {
+        if let Some(finding) = default_codex_runtime_configure_blocker(
+            name,
+            &default_runtime_repair,
+            resolve_default_podman,
+        ) {
+            findings.push(finding);
+            return;
+        }
+
         findings.push(
             DoctorFinding::error(
                 FindingKind::Runtime,
@@ -865,12 +945,21 @@ fn inspect_runtime_config(
                 "runtime setup is required before run/up/connect can launch workers",
             )
             .with_inspect(commands.selected("status"))
-            .with_repair(commands.selected("configure --runtime codex")),
+            .with_repair(default_runtime_repair),
         );
         return;
     };
 
     let Some(profile) = config.runtimes.get(runtime_id) else {
+        if let Some(finding) = default_codex_runtime_configure_blocker(
+            name,
+            &default_runtime_repair,
+            resolve_default_podman,
+        ) {
+            findings.push(finding);
+            return;
+        }
+
         findings.push(
             DoctorFinding::error(
                 FindingKind::Runtime,
@@ -879,7 +968,7 @@ fn inspect_runtime_config(
                 "defaults.runtime points at a profile that is not configured",
             )
             .with_inspect(commands.selected("status"))
-            .with_repair(commands.selected("configure --runtime codex")),
+            .with_repair(default_runtime_repair),
         );
         return;
     };
@@ -893,21 +982,53 @@ fn inspect_runtime_config(
                 err.to_string(),
             )
             .with_inspect(commands.selected("status"))
-            .with_repair(commands.selected("configure --runtime codex")),
+            .with_repair(default_runtime_repair),
         );
     }
 
     if let Some(guidance) = runtime_auth_guidance(profile) {
         findings.push(
-            DoctorFinding::warning(
+            DoctorFinding::info(
                 FindingKind::RuntimeAuth,
-                format!("runtime auth for \"{runtime_id}\" is not refreshed by doctor"),
+                format!("runtime auth for \"{runtime_id}\" is checked at launch"),
                 format!("instance {name} runtime auth {runtime_id}"),
                 guidance,
             )
             .with_inspect(commands.selected("status")),
         );
     }
+}
+
+fn default_codex_runtime_configure_blocker<F>(
+    name: &str,
+    repair_command: &str,
+    resolve_default_podman: F,
+) -> Option<DoctorFinding>
+where
+    F: FnOnce() -> Result<String>,
+{
+    resolve_default_podman()
+        .err()
+        .map(|err| podman_blocks_runtime_configure_finding(name, repair_command.to_string(), err))
+}
+
+fn podman_blocks_runtime_configure_finding(
+    name: &str,
+    repair_command: String,
+    err: anyhow::Error,
+) -> DoctorFinding {
+    DoctorFinding::error(
+        FindingKind::Runtime,
+        format!("instance \"{name}\" cannot configure Codex because Podman is unavailable"),
+        format!("instance {name} OCI engine {DEFAULT_OCI_ENGINE}"),
+        err.to_string(),
+    )
+    .with_inspect(podman_executable_inspect_command(DEFAULT_OCI_ENGINE))
+    .with_note(format!(
+        "{} before running the repair command",
+        podman_executable_repair_note()
+    ))
+    .with_repair(repair_command)
 }
 
 fn inspect_channels(
@@ -1577,6 +1698,17 @@ fn inspect_project_units(
 fn inspect_project_metadata_dir(project_root: &Path) -> std::result::Result<(), DoctorFinding> {
     let path = project_dir_path(project_root);
     let metadata = fs::symlink_metadata(&path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return DoctorFinding::error(
+                FindingKind::ProjectMetadata,
+                "no LionClaw project found",
+                project_root.display().to_string(),
+                format!("no .lionclaw metadata found at {}", path.display()),
+            )
+            .with_inspect(default_inspect_command(&path.display().to_string()))
+            .with_repair(project_command(project_root, "project init"));
+        }
+
         DoctorFinding::error(
             FindingKind::ProjectMetadata,
             "project metadata directory is missing or unreadable",
@@ -1851,6 +1983,8 @@ mod tests {
         channel_unit_name, daemon_unit_name, ensure_unit_identity, render_daemon_unit,
         DaemonUnitSpec, FakeUnitManager, UnitManager,
     };
+    use crate::operator::runtime_integration::configure_runtime_profile_with_engine_resolver;
+    use crate::operator::target::init_project;
 
     async fn configured_bind_fixture() -> (
         tempfile::TempDir,
@@ -1870,6 +2004,22 @@ mod tests {
         let mut config = OperatorConfig::default();
         config.daemon.bind_configured = true;
         (temp_dir, home, work_root, commands, config)
+    }
+
+    fn fake_podman(root: &Path) -> PathBuf {
+        let path = root.join("podman");
+        fs::write(&path, "#!/usr/bin/env bash\nexit 0\n").expect("write fake podman");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod fake podman");
+        path
+    }
+
+    async fn configure_test_codex(home: &LionClawHome, engine: &Path) {
+        let mut config = OperatorConfig::load(home).await.expect("load config");
+        configure_runtime_profile_with_engine_resolver(&mut config, "codex", |_| {
+            Ok(engine.to_string_lossy().to_string())
+        })
+        .expect("configure codex");
+        config.save(home).await.expect("save config");
     }
 
     fn raw_daemon_fingerprint(home: &LionClawHome, config: &OperatorConfig) -> String {
@@ -1991,6 +2141,10 @@ mod tests {
             "lionclaw --project /repo --instance reviewer up"
         );
         assert_eq!(
+            commands.run(),
+            "lionclaw --project /repo --instance reviewer run"
+        );
+        assert_eq!(
             commands.unresolved_work_root_note(),
             UNRESOLVED_WORK_ROOT_NOTE
         );
@@ -2009,6 +2163,7 @@ mod tests {
             commands.selected("status"),
             "lionclaw --home /tmp/lionclaw-home status"
         );
+        assert_eq!(commands.run(), "lionclaw --home /tmp/lionclaw-home run");
         assert!(commands.create_instance_repair().is_none());
         assert_eq!(
             commands.unresolved_work_root_note(),
@@ -2025,6 +2180,7 @@ mod tests {
                 "lionclaw-old.service",
                 "left alone",
             )],
+            ..DoctorReport::default()
         };
         assert!(!warning.has_errors());
 
@@ -2035,9 +2191,12 @@ mod tests {
                 "instance main runtime defaults",
                 "configure first",
             )],
+            ..DoctorReport::default()
         };
         assert!(error.has_errors());
         let rendered = error.render();
+        assert!(rendered.starts_with("doctor: setup blocked\n"));
+        assert!(rendered.contains("next: inspect or repair findings below, then rerun doctor"));
         assert!(rendered.contains("[LC-D050] error: missing runtime"));
         assert!(rendered.contains("target: instance main runtime defaults"));
         assert!(
@@ -2045,6 +2204,136 @@ mod tests {
         );
         assert!(rendered.contains("observed: configure first"));
         assert!(rendered.contains("inspect: lionclaw status"));
+    }
+
+    #[test]
+    fn doctor_report_renders_ready_next_action_before_advisories() {
+        let mut report = DoctorReport {
+            findings: vec![DoctorFinding::info(
+                FindingKind::RuntimeAuth,
+                "runtime auth for \"codex\" is checked at launch",
+                "instance main runtime auth codex",
+                "Codex auth is checked at launch",
+            )],
+            ..DoctorReport::default()
+        };
+        report.set_next_command("lionclaw run");
+
+        let rendered = report.render();
+
+        assert!(rendered.starts_with(
+            "doctor: no blocking setup issues\nnext: lionclaw run\nnote: non-error findings below are advisory\n\n"
+        ));
+        assert!(
+            rendered.contains("[LC-D051] info: runtime auth for \"codex\" is checked at launch")
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_ready_project_reports_scoped_run_next_action() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        let home = LionClawHome::new(project.instance.home.clone());
+        configure_test_codex(&home, &fake_podman(temp_dir.path())).await;
+
+        let report = inspect_project(temp_dir.path(), None, false, &FakeUnitManager::default())
+            .await
+            .expect("doctor report");
+
+        assert!(!report.has_errors());
+        assert_eq!(
+            report.next_command.as_deref(),
+            Some(project_command(temp_dir.path(), "--instance main run").as_str())
+        );
+        let auth = finding(&report, "runtime auth for \"codex\" is checked at launch");
+        assert_eq!(auth.severity, FindingSeverity::Info);
+        let rendered = report.render();
+        assert!(rendered.contains("doctor: no blocking setup issues"));
+        assert!(rendered.contains(&format!(
+            "next: {}",
+            project_command(temp_dir.path(), "--instance main run")
+        )));
+        assert!(
+            rendered.contains("[LC-D051] info: runtime auth for \"codex\" is checked at launch")
+        );
+    }
+
+    #[test]
+    fn doctor_reports_missing_podman_before_configure_repair() {
+        let commands = DoctorCommands::for_target(
+            Some(Path::new("/repo")),
+            "main",
+            Path::new("/repo/.lionclaw/instances/main"),
+        );
+        let config = OperatorConfig::default();
+        let mut findings = Vec::new();
+
+        inspect_runtime_config_with_podman_resolver(
+            "main",
+            &commands,
+            &config,
+            &mut findings,
+            || {
+                Err(anyhow::anyhow!(
+                    "Podman is required for OCI confinement, but host executable `podman` is not available in the environment running LionClaw"
+                ))
+            },
+        );
+
+        let finding = findings.first().expect("runtime finding");
+        assert_eq!(findings.len(), 1);
+        assert_podman_configure_blocker(finding);
+    }
+
+    #[test]
+    fn doctor_reports_missing_podman_before_repairing_missing_default_profile() {
+        let commands = DoctorCommands::for_target(
+            Some(Path::new("/repo")),
+            "main",
+            Path::new("/repo/.lionclaw/instances/main"),
+        );
+        let config = OperatorConfig {
+            defaults: crate::operator::config::OperatorDefaults {
+                runtime: Some("codex".to_string()),
+                ..Default::default()
+            },
+            ..OperatorConfig::default()
+        };
+        let mut findings = Vec::new();
+
+        inspect_runtime_config_with_podman_resolver(
+            "main",
+            &commands,
+            &config,
+            &mut findings,
+            || {
+                Err(anyhow::anyhow!(
+                    "Podman is required for OCI confinement, but host executable `podman` is not available in the environment running LionClaw"
+                ))
+            },
+        );
+
+        let finding = findings.first().expect("runtime finding");
+        assert_eq!(findings.len(), 1);
+        assert_podman_configure_blocker(finding);
+    }
+
+    fn assert_podman_configure_blocker(finding: &DoctorFinding) {
+        assert_eq!(finding.id, "LC-D050");
+        assert_eq!(
+            finding.subject.as_ref(),
+            "instance \"main\" cannot configure Codex because Podman is unavailable"
+        );
+        assert_eq!(finding.target.as_ref(), "instance main OCI engine podman");
+        assert_eq!(finding.runbook.inspect.as_ref(), "command -v podman");
+        assert_eq!(
+            finding.runbook.note.as_deref(),
+            Some("Install Podman or run LionClaw where Podman is available before running the repair command")
+        );
+        assert_eq!(
+            finding.runbook.repair.as_deref(),
+            Some("lionclaw --project /repo --instance main configure --runtime codex")
+        );
     }
 
     #[tokio::test]
@@ -2496,21 +2785,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn doctor_scopes_missing_project_metadata_repair_to_project() {
+    async fn doctor_reports_absent_project_metadata_as_no_project_found() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
 
         let report = inspect_project(temp_dir.path(), None, false, &FakeUnitManager::default())
             .await
             .expect("doctor report");
 
-        let finding = finding(
-            &report,
-            "project metadata directory is missing or unreadable",
+        let finding = finding(&report, "no LionClaw project found");
+        assert_eq!(finding.id, "LC-D010");
+        assert_eq!(
+            finding.target.as_ref(),
+            temp_dir.path().display().to_string()
+        );
+        assert_eq!(
+            finding.observed.as_ref(),
+            format!(
+                "no .lionclaw metadata found at {}",
+                project_dir_path(temp_dir.path()).display()
+            )
+        );
+        assert_eq!(
+            finding.runbook.inspect.as_ref(),
+            format!(
+                "ls -ld {}",
+                shell_quote_arg(&project_dir_path(temp_dir.path()).display().to_string())
+            )
         );
         assert_eq!(
             finding.runbook.repair.as_deref(),
             Some(project_command(temp_dir.path(), "project init").as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_existing_bad_project_metadata_as_metadata_error() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        fs::write(project_dir_path(temp_dir.path()), "not a directory").expect("metadata file");
+
+        let report = inspect_project(temp_dir.path(), None, false, &FakeUnitManager::default())
+            .await
+            .expect("doctor report");
+
+        let finding = finding(&report, "project metadata path is not a directory");
+        assert_eq!(
+            finding.target.as_ref(),
+            project_dir_path(temp_dir.path()).display().to_string()
+        );
+        assert_eq!(finding.runbook.repair.as_deref(), None);
     }
 
     #[tokio::test]

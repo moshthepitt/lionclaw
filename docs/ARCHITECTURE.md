@@ -456,8 +456,8 @@ home.
 4. Configured Codex/OpenCode profiles run through the shared execution planner
    and Podman backend, then map runtime output into kernel events.
 5. Runtime idle timeout, hard timeout, and cancellation are kernel-enforced and
-   audited. Local interactive runs default to a 5 minute idle timeout and a 2
-   hour hard safety limit; daemon-backed work defaults to 10 minutes idle and 4
+   audited. Local interactive runs default to a 30 minute idle timeout and a 2
+   hour hard safety limit; daemon-backed work defaults to 30 minutes idle and 4
    hours hard unless env overrides are set.
 6. Runtime execution policy supports per-turn working directory, idle timeout
    override, and constrained env passthrough. Configured kernel defaults are

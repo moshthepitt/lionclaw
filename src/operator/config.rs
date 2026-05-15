@@ -11,6 +11,7 @@ use crate::kernel::runtime::{
     ConfinementConfig, ExecutionPreset, RuntimeAuthKind, RuntimeExecutionProfile,
 };
 use crate::kernel::skills::sanitize_skill_name;
+use crate::operator::command_display::shell_quote_arg;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OperatorConfig {
@@ -592,8 +593,10 @@ pub fn normalize_host_executable(source: &str) -> Result<String> {
 }
 
 pub fn normalize_podman_executable(source: &str) -> Result<String> {
-    let normalized = normalize_host_executable(source)?;
-    ensure_podman_executable(Path::new(&normalized))?;
+    let normalized = normalize_host_executable(source)
+        .map_err(|err| podman_executable_error(PodmanExecutableContext::Requested, source, err))?;
+    ensure_podman_executable(Path::new(&normalized))
+        .map_err(|err| podman_executable_error(PodmanExecutableContext::Requested, source, err))?;
     Ok(normalized)
 }
 
@@ -638,8 +641,59 @@ pub fn validate_host_executable(source: &str) -> Result<()> {
 
 pub fn validate_podman_executable(source: &str) -> Result<()> {
     let raw = source.trim();
-    validate_host_executable(raw)?;
+    validate_host_executable(raw)
+        .map_err(|err| podman_executable_error(PodmanExecutableContext::Stored, raw, err))?;
     ensure_podman_executable(Path::new(raw))
+        .map_err(|err| podman_executable_error(PodmanExecutableContext::Stored, raw, err))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PodmanExecutableContext {
+    Requested,
+    Stored,
+}
+
+fn podman_executable_error(
+    context: PodmanExecutableContext,
+    source: &str,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    anyhow!(podman_executable_error_message(context, source, &err))
+}
+
+fn podman_executable_error_message(
+    context: PodmanExecutableContext,
+    source: &str,
+    err: &anyhow::Error,
+) -> String {
+    let source = source.trim();
+    let guidance = podman_executable_repair_note();
+    match context {
+        PodmanExecutableContext::Requested if looks_like_path(source) => format!(
+            "Podman is required for OCI confinement, but {} is not a usable Podman executable: {err}. {guidance}",
+            shell_quote_arg(source)
+        ),
+        PodmanExecutableContext::Requested => format!(
+            "Podman is required for OCI confinement, but host executable `{source}` is not available in the environment running LionClaw: {err}. {guidance}"
+        ),
+        PodmanExecutableContext::Stored => format!(
+            "configured Podman engine {} is invalid or unavailable in the environment running LionClaw: {err}. {guidance}",
+            shell_quote_arg(source)
+        ),
+    }
+}
+
+pub fn podman_executable_repair_note() -> &'static str {
+    "Install Podman or run LionClaw where Podman is available"
+}
+
+pub fn podman_executable_inspect_command(source: &str) -> String {
+    let source = source.trim();
+    if looks_like_path(source) {
+        format!("ls -l {}", shell_quote_arg(source))
+    } else {
+        format!("command -v {}", shell_quote_arg(source))
+    }
 }
 
 fn looks_like_path(raw: &str) -> bool {
@@ -679,7 +733,8 @@ mod tests {
     use super::{
         daemon_compat_fingerprint, daemon_compat_fingerprint_with_runtime_context,
         default_channel_worker, derive_skill_alias, normalize_host_executable,
-        normalize_local_source, normalize_runtime_command, validate_host_executable,
+        normalize_local_source, normalize_podman_executable, normalize_runtime_command,
+        podman_executable_inspect_command, podman_executable_repair_note, validate_host_executable,
         validate_podman_executable, ChannelLaunchMode, ManagedChannelConfig, OperatorConfig,
         RuntimeProfileConfig,
     };
@@ -772,6 +827,21 @@ mod tests {
         assert!(err
             .to_string()
             .contains("must be stored as an absolute path"));
+    }
+
+    #[test]
+    fn missing_requested_podman_reports_actionable_environment_guidance() {
+        let missing = "lionclaw-definitely-missing-podman";
+        let err = normalize_podman_executable(missing).expect_err("missing podman");
+        let message = err.to_string();
+
+        assert!(message.contains("Podman is required for OCI confinement"));
+        assert!(message.contains("environment running LionClaw"));
+        assert!(message.contains(podman_executable_repair_note()));
+        assert_eq!(
+            podman_executable_inspect_command(missing),
+            format!("command -v {missing}")
+        );
     }
 
     #[test]

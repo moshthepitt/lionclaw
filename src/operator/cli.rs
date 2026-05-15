@@ -144,7 +144,7 @@ struct RunArgs {
     #[arg(
         long,
         value_parser = parse_runtime_timeout,
-        help = "Runtime safety limit for each turn, such as 30m, 2h, or 7200s"
+        help = "Runtime turn limit, such as 30m, 2h, or 7200s"
     )]
     timeout: Option<Duration>,
     runtime: Option<String>,
@@ -674,7 +674,7 @@ pub async fn run() -> Result<ExitCode> {
             let target = resolved_target
                 .as_ref()
                 .ok_or_else(|| anyhow!("run requires a resolved LionClaw target"))?;
-            let timeout_override = args.timeout.map(RuntimeTurnTimeouts::with_hard_timeout);
+            let timeout_override = args.timeout.map(RuntimeTurnTimeouts::with_turn_timeout);
             run_local(
                 &target.instance_home,
                 target.require_work_root()?,
@@ -2067,6 +2067,17 @@ mod tests {
     }
 
     #[test]
+    fn plain_doctor_does_not_pre_resolve_a_target() {
+        let target = resolve_command_target(
+            &TargetSelection::default(),
+            &Command::Doctor(DoctorArgs { all: false }),
+        )
+        .expect("doctor target resolution");
+
+        assert!(target.is_none());
+    }
+
+    #[test]
     fn project_wide_commands_reject_home_and_instance_selectors() {
         let with_home = TargetSelection {
             home: Some(PathBuf::from("/tmp/lionclaw-home")),
@@ -2320,6 +2331,33 @@ mod tests {
         assert!(
             !home.config_path().exists(),
             "configure should not create config when runtime is missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_codex_reports_missing_podman_without_writing_config() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let err = configure_runtime_with_io_and_engine_resolver(
+            &home,
+            Some("codex".to_string()),
+            false,
+            &mut input,
+            &mut output,
+            |_| normalize_podman_executable("lionclaw-definitely-missing-podman"),
+        )
+        .await
+        .expect_err("missing podman should fail");
+
+        let message = err.to_string();
+        assert!(message.contains("Podman is required for OCI confinement"));
+        assert!(message.contains("environment running LionClaw"));
+        assert!(
+            !home.config_path().exists(),
+            "configure should not create config when Podman is missing"
         );
     }
 

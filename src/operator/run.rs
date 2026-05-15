@@ -176,7 +176,7 @@ async fn run_repl<R: BufRead + Send, W: Write + Send>(
 
     writeln!(
         output,
-        "LionClaw interactive mode\nruntime: {}\nwork root: {}\ntimeout: idle {}, hard {}\nType /lionclaw continue, /lionclaw retry, /lionclaw reset, or /lionclaw exit.\n",
+        "LionClaw interactive mode\nruntime: {}\nwork root: {}\nturn limits: quiet {}, max {}\nType /lionclaw continue, /lionclaw retry, /lionclaw reset, or /lionclaw exit.\n",
         context.runtime_id,
         context.project_workspace_root,
         crate::runtime_timeouts::format_duration(context.timeouts.idle),
@@ -739,7 +739,7 @@ sleep 1
                 instance_name: Some("main"),
                 requested_runtime: None,
                 continue_last_session: false,
-                timeout_override: Some(RuntimeTurnTimeouts::with_hard_timeout(
+                timeout_override: Some(RuntimeTurnTimeouts::with_turn_timeout(
                     std::time::Duration::from_millis(60),
                 )),
             },
@@ -751,7 +751,7 @@ sleep 1
 
         let output = String::from_utf8(output).expect("utf8 output");
         assert!(
-            output.contains("timeout: idle 60ms, hard 60ms"),
+            output.contains("turn limits: quiet 60ms, max 60ms"),
             "REPL should print the effective timeout budget: {output}"
         );
         assert!(

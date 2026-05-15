@@ -258,7 +258,7 @@ mod tests {
     fn runtime_turn_timeout_env_uses_daemon_defaults() {
         assert_eq!(
             resolve_runtime_turn_timeout_ms(None, None, None),
-            (10 * 60 * 1_000, 4 * 60 * 60 * 1_000)
+            (30 * 60 * 1_000, 4 * 60 * 60 * 1_000)
         );
     }
 
@@ -274,7 +274,7 @@ mod tests {
     fn runtime_turn_timeout_env_accepts_explicit_hard_value() {
         assert_eq!(
             resolve_runtime_turn_timeout_ms(None, None, Some("1800000".to_string())),
-            (10 * 60 * 1_000, 30 * 60 * 1_000)
+            (30 * 60 * 1_000, 30 * 60 * 1_000)
         );
     }
 
