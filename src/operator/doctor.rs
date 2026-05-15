@@ -928,12 +928,12 @@ fn inspect_runtime_config_with_podman_resolver<F>(
 {
     let default_runtime_repair = commands.selected("configure --runtime codex");
     let Some(runtime_id) = config.defaults.runtime.as_deref() else {
-        if let Err(err) = resolve_default_podman() {
-            findings.push(podman_blocks_runtime_configure_finding(
-                name,
-                default_runtime_repair,
-                err,
-            ));
+        if let Some(finding) = default_codex_runtime_configure_blocker(
+            name,
+            &default_runtime_repair,
+            resolve_default_podman,
+        ) {
+            findings.push(finding);
             return;
         }
 
@@ -951,12 +951,12 @@ fn inspect_runtime_config_with_podman_resolver<F>(
     };
 
     let Some(profile) = config.runtimes.get(runtime_id) else {
-        if let Err(err) = resolve_default_podman() {
-            findings.push(podman_blocks_runtime_configure_finding(
-                name,
-                default_runtime_repair,
-                err,
-            ));
+        if let Some(finding) = default_codex_runtime_configure_blocker(
+            name,
+            &default_runtime_repair,
+            resolve_default_podman,
+        ) {
+            findings.push(finding);
             return;
         }
 
@@ -997,6 +997,19 @@ fn inspect_runtime_config_with_podman_resolver<F>(
             .with_inspect(commands.selected("status")),
         );
     }
+}
+
+fn default_codex_runtime_configure_blocker<F>(
+    name: &str,
+    repair_command: &str,
+    resolve_default_podman: F,
+) -> Option<DoctorFinding>
+where
+    F: FnOnce() -> Result<String>,
+{
+    resolve_default_podman()
+        .err()
+        .map(|err| podman_blocks_runtime_configure_finding(name, repair_command.to_string(), err))
 }
 
 fn podman_blocks_runtime_configure_finding(
@@ -2268,6 +2281,44 @@ mod tests {
         );
 
         let finding = findings.first().expect("runtime finding");
+        assert_eq!(findings.len(), 1);
+        assert_podman_configure_blocker(finding);
+    }
+
+    #[test]
+    fn doctor_reports_missing_podman_before_repairing_missing_default_profile() {
+        let commands = DoctorCommands::for_target(
+            Some(Path::new("/repo")),
+            "main",
+            Path::new("/repo/.lionclaw/instances/main"),
+        );
+        let config = OperatorConfig {
+            defaults: crate::operator::config::OperatorDefaults {
+                runtime: Some("codex".to_string()),
+                ..Default::default()
+            },
+            ..OperatorConfig::default()
+        };
+        let mut findings = Vec::new();
+
+        inspect_runtime_config_with_podman_resolver(
+            "main",
+            &commands,
+            &config,
+            &mut findings,
+            || {
+                Err(anyhow::anyhow!(
+                    "Podman is required for OCI confinement, but host executable `podman` is not available in the environment running LionClaw"
+                ))
+            },
+        );
+
+        let finding = findings.first().expect("runtime finding");
+        assert_eq!(findings.len(), 1);
+        assert_podman_configure_blocker(finding);
+    }
+
+    fn assert_podman_configure_blocker(finding: &DoctorFinding) {
         assert_eq!(finding.id, "LC-D050");
         assert_eq!(
             finding.subject.as_ref(),
