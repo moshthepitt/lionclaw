@@ -82,9 +82,10 @@ LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
 - The worker defaults `consumer_id` to `telegram:<channel_id>` and `start_mode=resume`, so unacked progress events are replayed after worker restart.
 - Telegram delivery is outbox-driven: typing comes from progress streams, final
   answers come from durable outbox leases, no reasoning lane delivery.
-- Outbound text is normalized to Telegram-safe HTML with plain-text fallback,
-  chunked to Telegram's message limits, and sent with link previews disabled so
-  local workspace paths do not become broken Telegram links.
+- Outbound text is sent as plain text by default. Markdown hints render to
+  Telegram-safe HTML only when the rendered chunks fit Telegram limits; otherwise
+  delivery falls back to plain text. Link previews stay disabled so local
+  workspace paths do not become broken Telegram links.
 - Outbox attachments are sent as native Telegram media where possible
   (`sendPhoto`, `sendVideo`, `sendAudio`/`sendVoice`) and fall back to
   documents by MIME type. Short text on media deliveries is used as the first

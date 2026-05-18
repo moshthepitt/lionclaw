@@ -7157,7 +7157,7 @@ async fn ensure_safe_child_directory(
     for component in components {
         if component.is_empty() || component.contains('/') || component.contains('\\') {
             return Err(KernelError::Internal(
-                "unsafe attachment storage path component".to_string(),
+                "unsafe runtime storage path component".to_string(),
             ));
         }
         current.push(component);
@@ -7166,7 +7166,7 @@ async fn ensure_safe_child_directory(
             Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
             Err(err) => {
                 return Err(KernelError::Internal(format!(
-                    "failed to create attachment storage directory '{}': {err}",
+                    "failed to create runtime storage directory '{}': {err}",
                     current.display()
                 )));
             }
@@ -7180,13 +7180,13 @@ async fn ensure_safe_child_directory(
 async fn ensure_existing_directory_is_safe(path: &Path) -> Result<(), KernelError> {
     let metadata = tokio::fs::symlink_metadata(path).await.map_err(|err| {
         KernelError::Internal(format!(
-            "failed to inspect attachment storage directory '{}': {err}",
+            "failed to inspect runtime storage directory '{}': {err}",
             path.display()
         ))
     })?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(KernelError::Conflict(format!(
-            "attachment storage path '{}' is not a regular directory",
+            "runtime storage path '{}' is not a regular directory",
             path.display()
         )));
     }
@@ -8818,7 +8818,7 @@ impl Kernel {
                     Some(&source_id),
                     ChannelDeliveryContent {
                         text: artifacts.assistant_text.clone(),
-                        format_hint: "markdown".to_string(),
+                        format_hint: "plain".to_string(),
                         attachments: outbox_attachments,
                     },
                 )
@@ -9838,7 +9838,7 @@ impl Kernel {
             source_id,
             ChannelDeliveryContent {
                 text: content.to_string(),
-                format_hint: "markdown".to_string(),
+                format_hint: "plain".to_string(),
                 attachments: Vec::new(),
             },
         )
@@ -9939,12 +9939,12 @@ impl Kernel {
                     runtime_root.display()
                 ))
             })?;
-        let delivery_root = runtime_root_canonical
-            .join(CHANNEL_OUTBOX_ARTIFACTS_DIR)
-            .join(turn_id.to_string());
-        tokio::fs::create_dir_all(&delivery_root)
-            .await
-            .map_err(|err| internal(err.into()))?;
+        let turn_id = turn_id.to_string();
+        let delivery_root = ensure_safe_child_directory(
+            &runtime_root_canonical,
+            &[CHANNEL_OUTBOX_ARTIFACTS_DIR, turn_id.as_str()],
+        )
+        .await?;
 
         let mut attachments = Vec::with_capacity(artifacts.len());
         for artifact in artifacts {

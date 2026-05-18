@@ -182,6 +182,40 @@ class ExtractInboundEventTests(unittest.TestCase):
         self.assertEqual(mapped.trigger, "reply_to_bot")
         self.assertEqual(mapped.reply_to_ref, "telegram:message:3")
 
+    def test_mention_takes_precedence_over_reply_to_bot(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 141,
+                "message": {
+                    "message_id": 41,
+                    "date": 0,
+                    "chat": {"id": -10042, "type": "supergroup"},
+                    "from": {"id": 9, "is_bot": False, "first_name": "Nia"},
+                    "text": "@lionclaw_bot yes",
+                    "entities": [{"type": "mention", "offset": 0, "length": 13}],
+                    "reply_to_message": {
+                        "message_id": 40,
+                        "date": 0,
+                        "chat": {"id": -10042, "type": "supergroup"},
+                        "from": {
+                            "id": 99,
+                            "is_bot": True,
+                            "first_name": "LionClaw",
+                            "username": "lionclaw_bot",
+                        },
+                        "text": "question",
+                    },
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(mapped.trigger, "mention")
+        self.assertEqual(mapped.reply_to_ref, "telegram:message:40")
+
     def test_plain_group_message_is_untargeted(self) -> None:
         update = Update.model_validate(
             {
@@ -313,6 +347,48 @@ class ExtractInboundEventTests(unittest.TestCase):
         self.assertEqual(mapped.sender_ref, "telegram:user:42")
         self.assertEqual(mapped.conversation_ref, "telegram:chat:42")
         self.assertEqual(mapped.message_ref, "telegram:message:9")
+
+    def test_startgroup_pairing_token_claim_is_not_inbound_turn(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 191,
+                "message": {
+                    "message_id": 91,
+                    "date": 0,
+                    "chat": {"id": -10042, "type": "supergroup"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Alice"},
+                    "text": "/startgroup@lionclaw_bot lc_0123456789abcdef",
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramPairingClaim)
+        assert isinstance(mapped, TelegramPairingClaim)
+        self.assertEqual(mapped.token, "lc_0123456789abcdef")
+        self.assertEqual(mapped.conversation_ref, "telegram:chat:-10042")
+
+    def test_plain_text_mentioning_pairing_token_remains_inbound(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 192,
+                "message": {
+                    "message_id": 92,
+                    "date": 0,
+                    "chat": {"id": 42, "type": "private"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Alice"},
+                    "text": "Please explain lc_0123456789abcdef",
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(mapped.text, "Please explain lc_0123456789abcdef")
+        self.assertEqual(mapped.trigger, "dm")
 
     def test_document_caption_becomes_text_and_attachment_descriptor(self) -> None:
         update = Update.model_validate(
@@ -1210,6 +1286,16 @@ class TelegramDeliveryHelperTests(unittest.TestCase):
         self.assertEqual(len(chunks), 1)
         self.assertEqual(chunks[0].plain_text, "<b>literal</b>")
         self.assertIsNone(chunks[0].html_text)
+
+    def test_markdown_rendering_falls_back_to_plain_when_html_would_exceed_limit(
+        self,
+    ) -> None:
+        chunks = _format_telegram_text_chunks("<" * 3990, "markdown")
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].plain_text, "<" * 3990)
+        self.assertIsNone(chunks[0].html_text)
+        self.assertTrue(_utf16_len(chunks[0].plain_text) <= 4000)
 
     def test_markdown_rendering_escapes_code_blocks(self) -> None:
         rendered = _markdown_to_telegram_html("```text\n<b>literal</b>\n```")
