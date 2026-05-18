@@ -4,14 +4,37 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Sequence
 
 import httpx
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Update
 
-from lionclaw_channel_telegram.api import LionClawApi, OutboxContent, OutboxDelivery, StreamEvent
+from lionclaw_channel_telegram.api import (
+    AttachmentFinalizeResponse,
+    AttachmentMissingReport,
+    AttachmentStageResponse,
+    InboundResponse,
+    LionClawApi,
+    OutboxAttachment,
+    OutboxContent,
+    OutboxDelivery,
+    PairingClaimResponse,
+    StreamEvent,
+)
 from lionclaw_channel_telegram.config import WorkerConfig
-from lionclaw_channel_telegram.telegram import TelegramTextUpdate, extract_text_update
+from lionclaw_channel_telegram.telegram import (
+    TelegramBotIdentity,
+    TelegramDownloadedAttachment,
+    TelegramInboundAttachment,
+    TelegramInboundUpdate,
+    TelegramOutboundAttachment,
+    TelegramPairingClaim,
+    TelegramReferenceError,
+    _coerce_thread_id,
+    _split_telegram_text,
+    extract_inbound_event,
+)
 from lionclaw_channel_telegram.worker import (
     OffsetStore,
     TelegramWorker,
@@ -19,82 +42,437 @@ from lionclaw_channel_telegram.worker import (
 )
 
 
-class ExtractTextUpdateTests(unittest.TestCase):
-    def test_private_text_sources_map_to_peer_and_text(self) -> None:
-        cases = {
-            "message": {
+BOT = TelegramBotIdentity(user_id=99, username="lionclaw_bot")
+
+
+class ExtractInboundEventTests(unittest.TestCase):
+    def test_private_text_maps_to_channels_v2_refs(self) -> None:
+        update = Update.model_validate(
+            {
                 "update_id": 11,
                 "message": {
                     "message_id": 1,
                     "date": 0,
                     "chat": {"id": 42, "type": "private"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Alice"},
                     "text": "hello",
                 },
-            },
-            "edited_message": {
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(mapped.event_id, "telegram:update:11")
+        self.assertEqual(mapped.sender_ref, "telegram:user:42")
+        self.assertEqual(mapped.conversation_ref, "telegram:chat:42")
+        self.assertEqual(mapped.message_ref, "telegram:message:1")
+        self.assertIsNone(mapped.thread_ref)
+        self.assertEqual(mapped.text, "hello")
+        self.assertEqual(mapped.trigger, "dm")
+        self.assertEqual(mapped.attachments, [])
+        self.assertEqual(mapped.provider_metadata["chat_type"], "private")
+
+    def test_group_mention_uses_entity_and_topic_refs(self) -> None:
+        update = Update.model_validate(
+            {
                 "update_id": 12,
-                "edited_message": {
+                "message": {
                     "message_id": 2,
                     "date": 0,
-                    "chat": {"id": 43, "type": "private"},
-                    "text": "edited",
+                    "chat": {"id": -10042, "type": "supergroup"},
+                    "from": {"id": 9, "is_bot": False, "first_name": "Nia"},
+                    "message_thread_id": 77,
+                    "is_topic_message": True,
+                    "text": "@lionclaw_bot status",
+                    "entities": [{"type": "mention", "offset": 0, "length": 13}],
                 },
-            },
-        }
+            }
+        )
 
-        for name, payload in cases.items():
-            with self.subTest(source=name):
-                update = Update.model_validate(payload)
-                mapped = extract_text_update(update)
-                self.assertIsNotNone(mapped)
-                assert mapped is not None
-                message = next(value for key, value in payload.items() if key != "update_id")
-                self.assertEqual(mapped.update_id, payload["update_id"])
-                self.assertEqual(mapped.peer_id, str(message["chat"]["id"]))
-                self.assertEqual(mapped.message_ref, str(message["message_id"]))
+        mapped = extract_inbound_event(update, bot_identity=BOT)
 
-    def test_non_private_text_updates_are_ignored(self) -> None:
-        cases = {
-            "group_message": {
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(mapped.sender_ref, "telegram:user:9")
+        self.assertEqual(mapped.conversation_ref, "telegram:chat:-10042")
+        self.assertEqual(mapped.thread_ref, "telegram:topic:77")
+        self.assertEqual(mapped.trigger, "mention")
+        self.assertTrue(mapped.provider_metadata["bot_mentioned"])
+
+    def test_group_command_targets_bot_by_entity(self) -> None:
+        update = Update.model_validate(
+            {
                 "update_id": 13,
                 "message": {
                     "message_id": 3,
                     "date": 0,
-                    "chat": {"id": -44, "type": "group"},
-                    "text": "group",
+                    "chat": {"id": -10042, "type": "supergroup"},
+                    "from": {"id": 9, "is_bot": False, "first_name": "Nia"},
+                    "text": "/status@lionclaw_bot",
+                    "entities": [{"type": "bot_command", "offset": 0, "length": 20}],
                 },
-            },
-            "channel_post": {
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(mapped.trigger, "mention")
+
+    def test_edited_message_sets_metadata_without_changing_message_ref(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 131,
+                "edited_message": {
+                    "message_id": 31,
+                    "date": 0,
+                    "edit_date": 1,
+                    "chat": {"id": 42, "type": "private"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Alice"},
+                    "text": "edited",
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(mapped.event_id, "telegram:update:131")
+        self.assertEqual(mapped.message_ref, "telegram:message:31")
+        self.assertTrue(mapped.provider_metadata["edited"])
+        self.assertEqual(mapped.provider_metadata["source"], "edited_message")
+
+    def test_reply_to_bot_uses_reply_trigger_and_ref(self) -> None:
+        update = Update.model_validate(
+            {
                 "update_id": 14,
-                "channel_post": {
+                "message": {
                     "message_id": 4,
                     "date": 0,
-                    "chat": {"id": -10044, "type": "channel"},
+                    "chat": {"id": -10042, "type": "supergroup"},
+                    "from": {"id": 9, "is_bot": False, "first_name": "Nia"},
+                    "text": "yes",
+                    "reply_to_message": {
+                        "message_id": 3,
+                        "date": 0,
+                        "chat": {"id": -10042, "type": "supergroup"},
+                        "from": {
+                            "id": 99,
+                            "is_bot": True,
+                            "first_name": "LionClaw",
+                            "username": "lionclaw_bot",
+                        },
+                        "text": "question",
+                    },
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(mapped.trigger, "reply_to_bot")
+        self.assertEqual(mapped.reply_to_ref, "telegram:message:3")
+
+    def test_plain_group_message_is_untargeted(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 15,
+                "message": {
+                    "message_id": 5,
+                    "date": 0,
+                    "chat": {"id": -44, "type": "group"},
+                    "from": {"id": 12, "is_bot": False, "first_name": "Bo"},
+                    "text": "ordinary",
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(mapped.trigger, "none")
+
+    def test_private_reply_message_thread_id_is_not_a_topic(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 16,
+                "message": {
+                    "message_id": 6,
+                    "date": 0,
+                    "chat": {"id": 42, "type": "private"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Alice"},
+                    "message_thread_id": 55,
+                    "is_topic_message": False,
+                    "text": "reply",
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertIsNone(mapped.thread_ref)
+        self.assertEqual(mapped.trigger, "dm")
+
+    def test_topic_message_maps_to_thread_continuation(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 17,
+                "message": {
+                    "message_id": 7,
+                    "date": 0,
+                    "chat": {"id": -10042, "type": "supergroup"},
+                    "from": {"id": 9, "is_bot": False, "first_name": "Nia"},
+                    "message_thread_id": 1,
+                    "is_topic_message": True,
+                    "text": "topic continuation",
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(mapped.thread_ref, "telegram:topic:1")
+        self.assertEqual(mapped.trigger, "thread_continuation")
+
+    def test_forum_general_topic_without_thread_id_maps_to_topic_one(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 171,
+                "message": {
+                    "message_id": 71,
+                    "date": 0,
+                    "chat": {"id": -10042, "type": "supergroup", "is_forum": True},
+                    "from": {"id": 9, "is_bot": False, "first_name": "Nia"},
+                    "text": "general topic",
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(mapped.thread_ref, "telegram:topic:1")
+        self.assertEqual(mapped.trigger, "thread_continuation")
+
+    def test_channel_post_uses_sender_chat_identity(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 18,
+                "channel_post": {
+                    "message_id": 8,
+                    "date": 0,
+                    "chat": {"id": -1007, "type": "channel", "title": "News"},
+                    "sender_chat": {"id": -1007, "type": "channel", "title": "News"},
                     "text": "broadcast",
                 },
-            },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(mapped.sender_ref, "telegram:sender_chat:-1007")
+        self.assertEqual(mapped.conversation_ref, "telegram:chat:-1007")
+        self.assertEqual(mapped.trigger, "none")
+
+    def test_pairing_token_claim_is_not_inbound_turn(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 19,
+                "message": {
+                    "message_id": 9,
+                    "date": 0,
+                    "chat": {"id": 42, "type": "private"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Alice"},
+                    "text": "/start lc_0123456789abcdef",
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramPairingClaim)
+        assert isinstance(mapped, TelegramPairingClaim)
+        self.assertEqual(mapped.token, "lc_0123456789abcdef")
+        self.assertEqual(mapped.sender_ref, "telegram:user:42")
+        self.assertEqual(mapped.conversation_ref, "telegram:chat:42")
+        self.assertEqual(mapped.message_ref, "telegram:message:9")
+
+    def test_document_caption_becomes_text_and_attachment_descriptor(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 20,
+                "message": {
+                    "message_id": 10,
+                    "date": 0,
+                    "chat": {"id": 42, "type": "private"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Alice"},
+                    "caption": "please read",
+                    "document": {
+                        "file_id": "doc-file-id",
+                        "file_unique_id": "doc-unique",
+                        "file_name": "brief.txt",
+                        "mime_type": "text/plain",
+                        "file_size": 123,
+                    },
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(mapped.text, "please read")
+        self.assertEqual(len(mapped.attachments), 1)
+        attachment = mapped.attachments[0]
+        self.assertEqual(
+            attachment.attachment_id,
+            "telegram:update:20:attachment:document:doc-unique",
+        )
+        self.assertEqual(attachment.provider_file_ref, "doc-file-id")
+        self.assertEqual(attachment.filename, "brief.txt")
+        self.assertEqual(attachment.mime_type, "text/plain")
+        self.assertEqual(attachment.size_bytes, 123)
+        self.assertEqual(attachment.caption, "please read")
+
+    def test_supported_media_types_create_attachment_descriptors(self) -> None:
+        cases = {
+            "photo": (
+                {
+                    "photo": [
+                        {
+                            "file_id": "photo-small",
+                            "file_unique_id": "photo-small-unique",
+                            "width": 32,
+                            "height": 32,
+                            "file_size": 10,
+                        },
+                        {
+                            "file_id": "photo-large",
+                            "file_unique_id": "photo-large-unique",
+                            "width": 640,
+                            "height": 480,
+                            "file_size": 100,
+                        },
+                    ]
+                },
+                "photo",
+                "image/jpeg",
+                "photo-large",
+            ),
+            "voice": (
+                {
+                    "voice": {
+                        "file_id": "voice-file",
+                        "file_unique_id": "voice-unique",
+                        "duration": 2,
+                        "mime_type": "audio/ogg",
+                        "file_size": 20,
+                    }
+                },
+                "voice",
+                "audio/ogg",
+                "voice-file",
+            ),
+            "video": (
+                {
+                    "video": {
+                        "file_id": "video-file",
+                        "file_unique_id": "video-unique",
+                        "width": 640,
+                        "height": 480,
+                        "duration": 2,
+                        "mime_type": "video/mp4",
+                        "file_size": 30,
+                    }
+                },
+                "video",
+                "video/mp4",
+                "video-file",
+            ),
+            "sticker": (
+                {
+                    "sticker": {
+                        "file_id": "sticker-file",
+                        "file_unique_id": "sticker-unique",
+                        "type": "regular",
+                        "width": 512,
+                        "height": 512,
+                        "is_animated": False,
+                        "is_video": False,
+                        "file_size": 40,
+                    }
+                },
+                "sticker",
+                "image/webp",
+                "sticker-file",
+            ),
         }
 
-        for name, payload in cases.items():
-            with self.subTest(source=name):
-                self.assertIsNone(extract_text_update(Update.model_validate(payload)))
+        for update_id, (name, (media, kind, mime_type, file_ref)) in enumerate(
+            cases.items(),
+            start=30,
+        ):
+            with self.subTest(media=name):
+                update = Update.model_validate(
+                    {
+                        "update_id": update_id,
+                        "message": {
+                            "message_id": update_id,
+                            "date": 0,
+                            "chat": {"id": 42, "type": "private"},
+                            "from": {
+                                "id": 42,
+                                "is_bot": False,
+                                "first_name": "Alice",
+                            },
+                            **media,
+                        },
+                    }
+                )
 
-    def test_non_text_updates_are_ignored(self) -> None:
+                mapped = extract_inbound_event(update, bot_identity=BOT)
+
+                self.assertIsInstance(mapped, TelegramInboundUpdate)
+                assert isinstance(mapped, TelegramInboundUpdate)
+                self.assertEqual(len(mapped.attachments), 1)
+                self.assertEqual(mapped.attachments[0].kind, kind)
+                self.assertEqual(mapped.attachments[0].mime_type, mime_type)
+                self.assertEqual(mapped.attachments[0].provider_file_ref, file_ref)
+
+    def test_bot_sender_is_ignored(self) -> None:
         update = Update.model_validate(
             {
                 "update_id": 21,
                 "message": {
-                    "message_id": 4,
+                    "message_id": 11,
                     "date": 0,
-                    "chat": {"id": 99, "type": "private"},
+                    "chat": {"id": 42, "type": "private"},
+                    "from": {"id": 99, "is_bot": True, "first_name": "Bot"},
+                    "text": "loop",
                 },
             }
         )
-        self.assertIsNone(extract_text_update(update))
+
+        self.assertIsNone(extract_inbound_event(update, bot_identity=BOT))
 
 
 class LionClawApiTests(unittest.IsolatedAsyncioTestCase):
-    async def test_send_inbound_uses_telegram_external_message_id(self) -> None:
+    async def test_send_inbound_uses_channels_v2_payload(self) -> None:
         captured: dict[str, object] = {}
 
         async def handler(request: httpx.Request) -> httpx.Response:
@@ -106,82 +484,108 @@ class LionClawApiTests(unittest.IsolatedAsyncioTestCase):
             base_url="http://127.0.0.1:8979",
             transport=httpx.MockTransport(handler),
         )
-        api = LionClawApi(
-            base_url="http://127.0.0.1:8979",
-            channel_id="telegram",
-            consumer_id="telegram:telegram",
-            start_mode="resume",
-            stream_limit=100,
-            stream_wait_ms=30000,
-            client=client,
-        )
+        api = build_api(client)
 
         response = await api.send_inbound(
-            TelegramTextUpdate(
+            TelegramInboundUpdate(
                 update_id=55,
-                peer_id="123",
-                message_ref="99",
+                event_id="telegram:update:55",
+                sender_ref="telegram:user:123",
+                conversation_ref="telegram:chat:123",
+                thread_ref=None,
+                message_ref="telegram:message:99",
+                reply_to_ref=None,
                 text="hello",
+                trigger="dm",
+                attachments=[
+                    TelegramInboundAttachment(
+                        attachment_id="telegram:update:55:attachment:document:file",
+                        kind="document",
+                        provider_file_ref="file-id",
+                        mime_type="text/plain",
+                        filename="note.txt",
+                        size_bytes=4,
+                        caption="hello",
+                    )
+                ],
+                provider_metadata={"update_id": 55},
             )
         )
 
         self.assertEqual(response.outcome, "queued")
         self.assertEqual(captured["path"], "/v0/channels/inbound")
+        payload = captured["payload"]
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["channel_id"], "telegram")
+        self.assertEqual(payload["event_id"], "telegram:update:55")
+        self.assertEqual(payload["sender_ref"], "telegram:user:123")
+        self.assertEqual(payload["conversation_ref"], "telegram:chat:123")
+        self.assertEqual(payload["message_ref"], "telegram:message:99")
+        self.assertEqual(payload["trigger"], "dm")
+        self.assertEqual(payload["provider_metadata"], {"update_id": 55})
+        self.assertNotIn("runtime_id", payload)
+        self.assertNotIn("peer_id", payload)
+        self.assertNotIn("external_message_id", payload)
         self.assertEqual(
-            captured["payload"],
-            {
-                "channel_id": "telegram",
-                "event_id": "telegram-update:55",
-                "sender_ref": "123",
-                "conversation_ref": "123",
-                "message_ref": "99",
-                "text": "hello",
-                "attachments": [],
-                "trigger": "dm",
-                "provider_metadata": {"update_id": 55, "message_id": "99"},
-            },
+            payload["attachments"],
+            [
+                {
+                    "attachment_id": "telegram:update:55:attachment:document:file",
+                    "kind": "document",
+                    "mime_type": "text/plain",
+                    "filename": "note.txt",
+                    "size_bytes": 4,
+                    "provider_file_ref": "file-id",
+                    "caption": "hello",
+                }
+            ],
         )
         await api.close()
 
-    async def test_pull_stream_uses_resume_start_mode(self) -> None:
+    async def test_claim_pairing_uses_claim_endpoint(self) -> None:
         captured: dict[str, object] = {}
 
         async def handler(request: httpx.Request) -> httpx.Response:
             captured["path"] = request.url.path
             captured["payload"] = json.loads(request.content.decode("utf-8"))
-            return httpx.Response(200, json={"events": []})
+            return httpx.Response(
+                200,
+                json={"outcome": "approved", "grant_id": "grant-1"},
+            )
 
         client = httpx.AsyncClient(
             base_url="http://127.0.0.1:8979",
             transport=httpx.MockTransport(handler),
         )
-        api = LionClawApi(
-            base_url="http://127.0.0.1:8979",
-            channel_id="telegram",
-            consumer_id="telegram:telegram",
-            start_mode="resume",
-            stream_limit=100,
-            stream_wait_ms=30000,
-            client=client,
+        api = build_api(client)
+
+        response = await api.claim_pairing(
+            TelegramPairingClaim(
+                token="lc_0123456789abcdef",
+                sender_ref="telegram:user:42",
+                conversation_ref="telegram:chat:42",
+                update_id=1,
+                message_ref="telegram:message:1",
+                provider_metadata={"source": "message"},
+            )
         )
 
-        events = await api.pull_stream()
-
-        self.assertEqual(events, [])
-        self.assertEqual(captured["path"], "/v0/channels/stream/pull")
+        self.assertEqual(response.outcome, "approved")
+        self.assertEqual(captured["path"], "/v0/channels/pairing/claim")
         self.assertEqual(
             captured["payload"],
             {
                 "channel_id": "telegram",
-                "consumer_id": "telegram:telegram",
-                "start_mode": "resume",
-                "limit": 100,
-                "wait_ms": 30000,
+                "token": "lc_0123456789abcdef",
+                "sender_ref": "telegram:user:42",
+                "conversation_ref": "telegram:chat:42",
+                "thread_ref": None,
+                "provider_metadata": {"source": "message"},
             },
         )
         await api.close()
 
-    async def test_pull_outbox_uses_worker_identity(self) -> None:
+    async def test_pull_outbox_parses_attachments_and_scoped_refs(self) -> None:
         captured: dict[str, object] = {}
 
         async def handler(request: httpx.Request) -> httpx.Response:
@@ -194,13 +598,20 @@ class LionClawApiTests(unittest.IsolatedAsyncioTestCase):
                         {
                             "delivery_id": "delivery-1",
                             "attempt_id": "attempt-1",
-                            "conversation_ref": "123",
-                            "thread_ref": "77",
-                            "reply_to_ref": "55",
+                            "conversation_ref": "telegram:chat:-1001",
+                            "thread_ref": "telegram:topic:77",
+                            "reply_to_ref": "telegram:message:55",
                             "content": {
                                 "text": "hello",
                                 "format_hint": "markdown",
-                                "attachments": [],
+                                "attachments": [
+                                    {
+                                        "attachment_id": "att-1",
+                                        "path": "/tmp/a.txt",
+                                        "filename": "a.txt",
+                                        "mime_type": "text/plain",
+                                    }
+                                ],
                             },
                         }
                     ]
@@ -211,15 +622,7 @@ class LionClawApiTests(unittest.IsolatedAsyncioTestCase):
             base_url="http://127.0.0.1:8979",
             transport=httpx.MockTransport(handler),
         )
-        api = LionClawApi(
-            base_url="http://127.0.0.1:8979",
-            channel_id="telegram",
-            consumer_id="telegram:telegram",
-            start_mode="resume",
-            stream_limit=100,
-            stream_wait_ms=30000,
-            client=client,
-        )
+        api = build_api(client)
 
         deliveries = await api.pull_outbox(limit=5, lease_ms=60000)
 
@@ -233,44 +636,57 @@ class LionClawApiTests(unittest.IsolatedAsyncioTestCase):
                 "lease_ms": 60000,
             },
         )
-        self.assertEqual(deliveries[0].delivery_id, "delivery-1")
-        self.assertEqual(deliveries[0].content.text, "hello")
-        self.assertEqual(deliveries[0].thread_ref, "77")
+        self.assertEqual(deliveries[0].conversation_ref, "telegram:chat:-1001")
+        self.assertEqual(deliveries[0].thread_ref, "telegram:topic:77")
+        self.assertEqual(deliveries[0].reply_to_ref, "telegram:message:55")
+        self.assertEqual(deliveries[0].content.attachments[0].path, "/tmp/a.txt")
         await api.close()
 
 
 class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_process_updates_persists_offset(self) -> None:
+    async def test_process_updates_routes_pairing_and_inbound_and_persists_offset(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 7,
+                            "message": {
+                                "message_id": 1,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/start lc_0123456789abcdef",
+                            },
+                        }
+                    ),
+                    Update.model_validate(
+                        {
+                            "update_id": 8,
+                            "message": {
+                                "message_id": 2,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "hi",
+                            },
+                        }
+                    ),
+                ]
+            )
             worker = TelegramWorker(
                 config=build_config(Path(temp_dir)),
-                lionclaw_api=FakeLionClawApi(),
-                telegram=FakeTelegramTransport(
-                    updates=[
-                        Update.model_validate(
-                            {
-                                "update_id": 7,
-                                "message": {
-                                    "message_id": 1,
-                                    "date": 0,
-                                    "chat": {"id": 77, "type": "private"},
-                                    "text": "hi",
-                                },
-                            }
-                        ),
-                        Update.model_validate(
-                            {
-                                "update_id": 8,
-                                "channel_post": {
-                                    "message_id": 2,
-                                    "date": 0,
-                                    "chat": {"id": -1009, "type": "channel"},
-                                    "text": "news",
-                                },
-                            }
-                        ),
-                    ]
-                ),
+                lionclaw_api=api,
+                telegram=telegram,
                 offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
             )
 
@@ -278,46 +694,247 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(worker.offset, 9)
             self.assertEqual(worker.offset_store.path.read_text(encoding="utf-8"), "9")
+            self.assertEqual(len(api.claims), 1)
+            self.assertEqual(api.claims[0].token, "lc_0123456789abcdef")
+            self.assertEqual(len(api.sent_inbound), 1)
+            self.assertEqual(api.sent_inbound[0].event_id, "telegram:update:8")
+            self.assertEqual(api.finalized, [])
             self.assertEqual(
-                worker.lionclaw_api.sent_inbound,
+                telegram.sent_messages[0],
+                (
+                    "telegram:chat:77",
+                    "Pairing approved. You can send a message now.",
+                    "telegram:message:1",
+                    None,
+                    [],
+                ),
+            )
+
+    async def test_waiting_for_attachments_downloads_stages_and_finalizes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(inbound_outcome="waiting_for_attachments")
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 9,
+                            "message": {
+                                "message_id": 3,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "caption": "read this",
+                                "document": {
+                                    "file_id": "doc-file",
+                                    "file_unique_id": "doc-unique",
+                                    "file_name": "brief.txt",
+                                    "mime_type": "text/plain",
+                                    "file_size": 12,
+                                },
+                            },
+                        }
+                    )
+                ],
+                downloaded_content=b"hello",
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+            self.assertEqual(
+                telegram.downloaded_attachment_ids,
+                ["telegram:update:9:attachment:document:doc-unique"],
+            )
+            self.assertEqual(len(api.staged_attachments), 1)
+            self.assertEqual(api.finalized[0][0].event_id, "telegram:update:9")
+            self.assertEqual(api.finalized[0][1], [])
+
+    async def test_blocked_attachment_inbound_does_not_download(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(inbound_outcome="blocked")
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 10,
+                            "message": {
+                                "message_id": 4,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "document": {
+                                    "file_id": "doc-file",
+                                    "file_unique_id": "doc-unique",
+                                    "file_name": "brief.txt",
+                                    "mime_type": "text/plain",
+                                    "file_size": 12,
+                                },
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+            self.assertEqual(telegram.downloaded_attachment_ids, [])
+            self.assertEqual(api.staged_attachments, [])
+            self.assertEqual(api.finalized, [])
+
+    async def test_pending_approval_notifies_with_pairing_code_without_download(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(
+                inbound_outcome="pending_approval",
+                inbound_pairing_code="pc_abcdef12",
+            )
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 11,
+                            "message": {
+                                "message_id": 5,
+                                "date": 0,
+                                "chat": {"id": -44, "type": "group"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "@lionclaw_bot hi",
+                                "entities": [
+                                    {"type": "mention", "offset": 0, "length": 13}
+                                ],
+                                "document": {
+                                    "file_id": "doc-file",
+                                    "file_unique_id": "doc-unique",
+                                    "file_name": "brief.txt",
+                                    "mime_type": "text/plain",
+                                    "file_size": 12,
+                                },
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+            self.assertEqual(telegram.downloaded_attachment_ids, [])
+            self.assertEqual(
+                telegram.sent_messages,
                 [
-                    TelegramTextUpdate(
-                        update_id=7,
-                        peer_id="77",
-                        message_ref="1",
-                        text="hi",
-                    ),
+                    (
+                        "telegram:chat:-44",
+                        "This Telegram scope needs approval. Pairing code: pc_abcdef12",
+                        "telegram:message:5",
+                        None,
+                        [],
+                    )
                 ],
             )
+
+    async def test_inaccessible_attachment_finalizes_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(inbound_outcome="waiting_for_attachments")
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 12,
+                            "message": {
+                                "message_id": 6,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "document": {
+                                    "file_id": "doc-file",
+                                    "file_unique_id": "doc-unique",
+                                    "file_name": "brief.txt",
+                                    "mime_type": "text/plain",
+                                    "file_size": 12,
+                                },
+                            },
+                        }
+                    )
+                ],
+                fail_download=True,
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker.process_updates()
+
+            self.assertEqual(api.staged_attachments, [])
+            missing = api.finalized[0][1]
+            self.assertEqual(len(missing), 1)
+            self.assertEqual(missing[0].reason_code, "telegram.download_failed")
 
     async def test_flush_stream_sends_typing_and_acks_done_sequence(self) -> None:
         api = FakeLionClawApi(
             stream_events=[
-                StreamEvent(sequence=1, peer_id="peer-1", turn_id="turn-1", kind="status", code="queue.started"),
                 StreamEvent(
-                    sequence=2,
-                    peer_id="peer-1",
+                    sequence=1,
+                    peer_id="telegram:user:77",
                     turn_id="turn-1",
-                    kind="message_delta",
-                    lane="reasoning",
-                    text="hidden",
+                    kind="status",
+                    code="queue.started",
                 ),
                 StreamEvent(
-                    sequence=3,
-                    peer_id="peer-1",
+                    sequence=2,
+                    peer_id="telegram:user:77",
                     turn_id="turn-1",
                     kind="message_delta",
                     lane="answer",
                     text="partial",
                 ),
                 StreamEvent(
-                    sequence=4,
-                    peer_id="peer-1",
+                    sequence=3,
+                    peer_id="telegram:user:77",
                     turn_id="turn-1",
                     kind="turn_completed",
                     text="final answer",
                 ),
-                StreamEvent(sequence=5, peer_id="peer-1", turn_id="turn-1", kind="done"),
+                StreamEvent(
+                    sequence=4,
+                    peer_id="telegram:user:77",
+                    turn_id="turn-1",
+                    kind="done",
+                ),
             ]
         )
         telegram = FakeTelegramTransport()
@@ -331,9 +948,9 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
             await worker.flush_stream()
 
-        self.assertEqual(telegram.typing_peers, ["peer-1"])
+        self.assertEqual(telegram.typing_peers, ["telegram:user:77"])
         self.assertEqual(telegram.sent_messages, [])
-        self.assertEqual(api.acked_sequences, [5])
+        self.assertEqual(api.acked_sequences, [4])
 
     async def test_flush_outbox_sends_delivery_and_reports_receipt(self) -> None:
         api = FakeLionClawApi(
@@ -341,10 +958,20 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 OutboxDelivery(
                     delivery_id="delivery-1",
                     attempt_id="attempt-1",
-                    conversation_ref="peer-1",
-                    thread_ref="topic-1",
-                    reply_to_ref="42",
-                    content=OutboxContent(text="final answer"),
+                    conversation_ref="telegram:chat:-1001",
+                    thread_ref="telegram:topic:77",
+                    reply_to_ref="telegram:message:42",
+                    content=OutboxContent(
+                        text="final answer",
+                        attachments=[
+                            OutboxAttachment(
+                                attachment_id="att-1",
+                                path="/tmp/a.txt",
+                                filename="a.txt",
+                                mime_type="text/plain",
+                            )
+                        ],
+                    ),
                 )
             ]
         )
@@ -359,7 +986,18 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
             await worker.flush_outbox()
 
-        self.assertEqual(telegram.sent_messages, [("peer-1", "final answer", "42", "topic-1")])
+        self.assertEqual(
+            telegram.sent_messages,
+            [
+                (
+                    "telegram:chat:-1001",
+                    "final answer",
+                    "telegram:message:42",
+                    "telegram:topic:77",
+                    ["/tmp/a.txt"],
+                )
+            ],
+        )
         self.assertEqual(
             api.outbox_reports,
             [
@@ -367,7 +1005,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                     "delivery-1",
                     "attempt-1",
                     "delivered",
-                    {"message_id": 101, "chat_id": "peer-1"},
+                    {"message_id": 101, "chat_id": "telegram:chat:-1001"},
                     None,
                     None,
                 )
@@ -380,7 +1018,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 OutboxDelivery(
                     delivery_id="delivery-1",
                     attempt_id="attempt-1",
-                    conversation_ref="peer-1",
+                    conversation_ref="telegram:user:77",
                     content=OutboxContent(text="final answer"),
                 )
             ]
@@ -400,13 +1038,71 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(api.outbox_reports[0][2], "retryable_failed")
         self.assertEqual(api.outbox_reports[0][4], "telegram.send_failed")
 
-    async def test_telegram_rejections_are_terminal_outbox_failures(self) -> None:
+    async def test_stale_outbox_report_is_not_retried_as_success(self) -> None:
+        api = FakeLionClawApi(
+            outbox_deliveries=[
+                OutboxDelivery(
+                    delivery_id="delivery-1",
+                    attempt_id="attempt-1",
+                    conversation_ref="telegram:user:77",
+                    content=OutboxContent(text="final answer"),
+                )
+            ],
+            report_accepted=False,
+        )
+        telegram = FakeTelegramTransport()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="WARNING"):
+                await worker.flush_outbox()
+
+        self.assertEqual(len(api.outbox_reports), 1)
+        self.assertEqual(api.outbox_reports[0][2], "delivered")
+
+    async def test_telegram_rejections_and_invalid_refs_are_terminal_outbox_failures(self) -> None:
         outcome, error_code = _classify_send_failure(
             TelegramBadRequest(method=object(), message="chat not found")
         )
 
         self.assertEqual(outcome, "terminal_failed")
         self.assertEqual(error_code, "telegram.send_rejected")
+
+        outcome, error_code = _classify_send_failure(TelegramReferenceError("bad ref"))
+
+        self.assertEqual(outcome, "terminal_failed")
+        self.assertEqual(error_code, "telegram.invalid_ref")
+
+
+class TelegramDeliveryHelperTests(unittest.TestCase):
+    def test_long_answer_chunks_by_telegram_utf16_limit(self) -> None:
+        chunks = _split_telegram_text("x" * 4001)
+
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(chunks[0], "x" * 4000)
+        self.assertEqual(chunks[1], "x")
+        self.assertTrue(all(_utf16_len(chunk) <= 4000 for chunk in chunks))
+
+    def test_topic_thread_ref_omits_general_topic_on_send(self) -> None:
+        self.assertEqual(_coerce_thread_id("telegram:topic:77", omit_general=True), 77)
+        self.assertIsNone(_coerce_thread_id("telegram:topic:1", omit_general=True))
+
+
+def build_api(client: httpx.AsyncClient) -> LionClawApi:
+    return LionClawApi(
+        base_url="http://127.0.0.1:8979",
+        channel_id="telegram",
+        consumer_id="telegram:telegram",
+        start_mode="resume",
+        stream_limit=100,
+        stream_wait_ms=30000,
+        client=client,
+    )
 
 
 def build_config(runtime_dir: Path) -> WorkerConfig:
@@ -430,10 +1126,21 @@ class FakeLionClawApi:
         self,
         stream_events: list[StreamEvent] | None = None,
         outbox_deliveries: list[OutboxDelivery] | None = None,
+        inbound_outcome: str = "queued",
+        inbound_pairing_code: str | None = None,
+        claim_outcome: str = "approved",
+        report_accepted: bool = True,
     ) -> None:
         self.stream_events = list(stream_events or [])
         self.outbox_deliveries = list(outbox_deliveries or [])
-        self.sent_inbound: list[TelegramTextUpdate] = []
+        self.inbound_outcome = inbound_outcome
+        self.inbound_pairing_code = inbound_pairing_code
+        self.claim_outcome = claim_outcome
+        self.report_accepted = report_accepted
+        self.sent_inbound: list[TelegramInboundUpdate] = []
+        self.claims: list[TelegramPairingClaim] = []
+        self.staged_attachments: list[tuple[TelegramInboundUpdate, TelegramInboundAttachment]] = []
+        self.finalized: list[tuple[TelegramInboundUpdate, list[AttachmentMissingReport]]] = []
         self.acked_sequences: list[int] = []
         self.outbox_reports: list[
             tuple[
@@ -446,9 +1153,33 @@ class FakeLionClawApi:
             ]
         ] = []
 
-    async def send_inbound(self, update: TelegramTextUpdate):
+    async def send_inbound(self, update: TelegramInboundUpdate) -> InboundResponse:
         self.sent_inbound.append(update)
-        return type("InboundResponse", (), {"outcome": "queued"})()
+        return InboundResponse(
+            outcome=self.inbound_outcome,
+            pairing_code=self.inbound_pairing_code,
+        )
+
+    async def claim_pairing(self, claim: TelegramPairingClaim) -> PairingClaimResponse:
+        self.claims.append(claim)
+        return PairingClaimResponse(outcome=self.claim_outcome)
+
+    async def stage_attachment(
+        self,
+        update: TelegramInboundUpdate,
+        attachment: TelegramInboundAttachment,
+        downloaded: TelegramDownloadedAttachment,
+    ) -> AttachmentStageResponse:
+        self.staged_attachments.append((update, attachment))
+        return AttachmentStageResponse(status="staged", size_bytes=len(downloaded.content), sha256="00")
+
+    async def finalize_attachments(
+        self,
+        update: TelegramInboundUpdate,
+        missing: list[AttachmentMissingReport],
+    ) -> AttachmentFinalizeResponse:
+        self.finalized.append((update, list(missing)))
+        return AttachmentFinalizeResponse(outcome="queued")
 
     async def pull_stream(self) -> list[StreamEvent]:
         return list(self.stream_events)
@@ -481,7 +1212,11 @@ class FakeLionClawApi:
         return type(
             "OutboxReportResponse",
             (),
-            {"accepted": True, "status": "delivered", "attempt_status": outcome},
+            {
+                "accepted": self.report_accepted,
+                "status": "delivered",
+                "attempt_status": outcome,
+            },
         )()
 
 
@@ -490,14 +1225,42 @@ class FakeTelegramTransport:
         self,
         updates: list[Update] | None = None,
         fail_send_message: bool = False,
+        fail_download: bool = False,
+        downloaded_content: bytes = b"file",
     ) -> None:
         self.updates = list(updates or [])
-        self.sent_messages: list[tuple[str, str, str | None, str | None]] = []
+        self.sent_messages: list[
+            tuple[str, str, str | None, str | None, list[str]]
+        ] = []
         self.typing_peers: list[str] = []
+        self.downloaded_attachment_ids: list[str] = []
         self.fail_send_message = fail_send_message
+        self.fail_download = fail_download
+        self.downloaded_content = downloaded_content
+
+    async def close(self) -> None:
+        pass
+
+    async def bot_identity(self) -> TelegramBotIdentity:
+        return BOT
 
     async def get_updates(self, offset: int, timeout_seconds: int) -> list[Update]:
         return list(self.updates)
+
+    async def download_attachment(
+        self,
+        attachment: TelegramInboundAttachment,
+        max_bytes: int,
+    ) -> TelegramDownloadedAttachment:
+        self.downloaded_attachment_ids.append(attachment.attachment_id)
+        if self.fail_download:
+            raise RuntimeError("download failed")
+        return TelegramDownloadedAttachment(
+            attachment=attachment,
+            content=self.downloaded_content,
+            filename=attachment.filename,
+            mime_type=attachment.mime_type,
+        )
 
     async def send_message(
         self,
@@ -505,11 +1268,24 @@ class FakeTelegramTransport:
         text: str,
         reply_to_ref: str | None = None,
         thread_ref: str | None = None,
+        attachments: Sequence[TelegramOutboundAttachment] = (),
     ) -> dict[str, object]:
         if self.fail_send_message:
             raise RuntimeError("send failed")
-        self.sent_messages.append((conversation_ref, text, reply_to_ref, thread_ref))
+        self.sent_messages.append(
+            (
+                conversation_ref,
+                text,
+                reply_to_ref,
+                thread_ref,
+                [attachment.path for attachment in attachments],
+            )
+        )
         return {"message_id": 101, "chat_id": conversation_ref}
 
     async def send_typing(self, peer_id: str) -> None:
         self.typing_peers.append(peer_id)
+
+
+def _utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2

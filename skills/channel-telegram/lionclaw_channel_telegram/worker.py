@@ -16,13 +16,22 @@ from aiogram.exceptions import (
     TelegramUnauthorizedError,
 )
 
-from lionclaw_channel_telegram.api import LionClawApi, OutboxDelivery, StreamEvent
+from lionclaw_channel_telegram.api import (
+    AttachmentMissingReport,
+    LionClawApi,
+    OutboxDelivery,
+    StreamEvent,
+)
 from lionclaw_channel_telegram.config import WorkerConfig
 from lionclaw_channel_telegram.telegram import (
     AiogramTelegramTransport,
-    TelegramTextUpdate,
+    TelegramEntityTooLargeForStage,
+    TelegramInboundUpdate,
+    TelegramOutboundAttachment,
+    TelegramPairingClaim,
+    TelegramReferenceError,
     TelegramTransport,
-    extract_text_update,
+    extract_inbound_event,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,6 +45,7 @@ EXPECTED_INBOUND_OUTCOMES = {
     "trigger_ignored",
 }
 TYPING_STATUS_CODES = {"queue.started", "runtime.started"}
+MAX_ATTACHMENT_STAGE_BYTES = 25 * 1024 * 1024
 
 
 @dataclass(slots=True)
@@ -75,14 +85,18 @@ class TelegramWorker:
                 offset=self.offset,
                 timeout_seconds=self.config.telegram_poll_timeout_secs,
             )
+            bot_identity = await self.telegram.bot_identity()
         except Exception:
             logger.exception("telegram getUpdates request failed")
             return
 
         for update in updates:
-            text_update = extract_text_update(update)
-            if text_update is not None:
-                if not await self._submit_inbound(text_update):
+            event = extract_inbound_event(update, bot_identity=bot_identity)
+            if event is not None:
+                if isinstance(event, TelegramPairingClaim):
+                    if not await self._claim_pairing(event):
+                        return
+                elif not await self._submit_inbound(event):
                     return
             self.offset = update.update_id + 1
             self.offset_store.save(self.offset)
@@ -127,7 +141,31 @@ class TelegramWorker:
             await self.flush_outbox()
             await asyncio.sleep(self.config.telegram_loop_delay_secs)
 
-    async def _submit_inbound(self, update: TelegramTextUpdate) -> bool:
+    async def _claim_pairing(self, claim: TelegramPairingClaim) -> bool:
+        try:
+            response = await self.lionclaw_api.claim_pairing(claim)
+        except Exception:
+            logger.exception(
+                "lionclaw pairing claim failed for update_id=%s",
+                claim.update_id,
+            )
+            return False
+
+        try:
+            await self.telegram.send_message(
+                claim.conversation_ref,
+                _pairing_claim_reply(response.outcome),
+                reply_to_ref=claim.message_ref,
+                thread_ref=claim.thread_ref,
+            )
+        except Exception:
+            logger.exception(
+                "telegram pairing acknowledgement failed for update_id=%s",
+                claim.update_id,
+            )
+        return True
+
+    async def _submit_inbound(self, update: TelegramInboundUpdate) -> bool:
         try:
             response = await self.lionclaw_api.send_inbound(update)
         except Exception:
@@ -141,6 +179,113 @@ class TelegramWorker:
                 "lionclaw inbound returned unknown outcome '%s' for update_id=%s",
                 response.outcome,
                 update.update_id,
+            )
+            return False
+        if response.outcome == "pending_approval":
+            await self._notify_pending_approval(update, response.pairing_code)
+        if response.outcome == "waiting_for_attachments":
+            return await self._stage_attachments(update)
+        return True
+
+    async def _notify_pending_approval(
+        self,
+        update: TelegramInboundUpdate,
+        pairing_code: str | None,
+    ) -> None:
+        text = "This Telegram scope is waiting for operator approval."
+        if pairing_code is not None:
+            text = f"This Telegram scope needs approval. Pairing code: {pairing_code}"
+        try:
+            await self.telegram.send_message(
+                update.conversation_ref,
+                text,
+                reply_to_ref=update.message_ref,
+                thread_ref=update.thread_ref,
+            )
+        except Exception:
+            logger.exception(
+                "telegram pending approval notice failed for update_id=%s",
+                update.update_id,
+            )
+
+    async def _stage_attachments(self, update: TelegramInboundUpdate) -> bool:
+        missing: list[AttachmentMissingReport] = []
+        for attachment in update.attachments:
+            try:
+                downloaded = await self.telegram.download_attachment(
+                    attachment,
+                    max_bytes=MAX_ATTACHMENT_STAGE_BYTES,
+                )
+            except TelegramEntityTooLargeForStage as err:
+                logger.warning(
+                    "telegram attachment too large for event_id=%s attachment_id=%s",
+                    update.event_id,
+                    attachment.attachment_id,
+                )
+                missing.append(
+                    AttachmentMissingReport(
+                        attachment_id=attachment.attachment_id,
+                        reason_code="telegram.file_too_large",
+                        reason_text=str(err),
+                    )
+                )
+                continue
+            except Exception as err:
+                logger.exception(
+                    "telegram attachment download failed for event_id=%s attachment_id=%s",
+                    update.event_id,
+                    attachment.attachment_id,
+                )
+                missing.append(
+                    AttachmentMissingReport(
+                        attachment_id=attachment.attachment_id,
+                        reason_code="telegram.download_failed",
+                        reason_text=str(err),
+                    )
+                )
+                continue
+
+            try:
+                stage = await self.lionclaw_api.stage_attachment(
+                    update,
+                    attachment,
+                    downloaded,
+                )
+            except Exception as err:
+                logger.exception(
+                    "lionclaw attachment stage failed for event_id=%s attachment_id=%s",
+                    update.event_id,
+                    attachment.attachment_id,
+                )
+                missing.append(
+                    AttachmentMissingReport(
+                        attachment_id=attachment.attachment_id,
+                        reason_code="telegram.stage_failed",
+                        reason_text=str(err),
+                    )
+                )
+                continue
+            if stage.status == "rejected":
+                logger.warning(
+                    "lionclaw rejected attachment event_id=%s attachment_id=%s reason_code=%s",
+                    update.event_id,
+                    attachment.attachment_id,
+                    stage.reason_code,
+                )
+
+        try:
+            response = await self.lionclaw_api.finalize_attachments(update, missing)
+        except Exception:
+            logger.exception(
+                "lionclaw attachment finalize failed for event_id=%s",
+                update.event_id,
+            )
+            return False
+        if response.outcome not in {"queued", "already_finalized"}:
+            logger.error(
+                "lionclaw attachment finalize returned unexpected outcome '%s' for event_id=%s",
+                response.outcome,
+                update.event_id,
             )
             return False
         return True
@@ -186,6 +331,14 @@ class TelegramWorker:
                 delivery.content.text,
                 delivery.reply_to_ref,
                 delivery.thread_ref,
+                attachments=[
+                    TelegramOutboundAttachment(
+                        path=attachment.path,
+                        filename=attachment.filename,
+                        mime_type=attachment.mime_type,
+                    )
+                    for attachment in delivery.content.attachments
+                ],
             )
         except Exception as err:
             logger.exception(
@@ -263,6 +416,8 @@ class TelegramWorker:
 
 
 def _classify_send_failure(err: Exception) -> tuple[str, str]:
+    if isinstance(err, TelegramReferenceError):
+        return "terminal_failed", "telegram.invalid_ref"
     if isinstance(
         err,
         (
@@ -277,6 +432,18 @@ def _classify_send_failure(err: Exception) -> tuple[str, str]:
     if isinstance(err, (TelegramNetworkError, TelegramRetryAfter, TelegramServerError)):
         return "retryable_failed", "telegram.send_retryable"
     return "retryable_failed", "telegram.send_failed"
+
+
+def _pairing_claim_reply(outcome: str) -> str:
+    if outcome == "approved":
+        return "Pairing approved. You can send a message now."
+    if outcome == "already_claimed":
+        return "That pairing link has already been used."
+    if outcome == "expired":
+        return "That pairing link has expired."
+    if outcome == "scope_mismatch":
+        return "That pairing link is not valid for this chat."
+    return "That pairing link is invalid."
 
 
 async def run() -> None:
