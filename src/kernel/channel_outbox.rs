@@ -636,7 +636,7 @@ fn retry_delay_ms(attempt_count: u32) -> i64 {
 }
 
 fn default_channel_delivery_format_hint() -> String {
-    "markdown".to_string()
+    "plain".to_string()
 }
 
 fn encode_optional_json(value: Option<&Value>) -> Result<Option<String>> {
