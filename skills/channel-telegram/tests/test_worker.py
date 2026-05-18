@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import tempfile
 import unittest
@@ -32,6 +34,7 @@ from lionclaw_channel_telegram.telegram import (
     TelegramPairingClaim,
     TelegramReferenceError,
     _coerce_thread_id,
+    _markdown_to_telegram_html,
     _split_telegram_text,
     extract_inbound_event,
 )
@@ -699,6 +702,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(api.sent_inbound), 1)
             self.assertEqual(api.sent_inbound[0].event_id, "telegram:update:8")
             self.assertEqual(api.finalized, [])
+            self.assertEqual(telegram.typing_peers, ["telegram:chat:77"])
             self.assertEqual(
                 telegram.sent_messages[0],
                 (
@@ -757,6 +761,86 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(api.staged_attachments), 1)
             self.assertEqual(api.finalized[0][0].event_id, "telegram:update:9")
             self.assertEqual(api.finalized[0][1], [])
+            self.assertEqual(telegram.typing_peers, ["telegram:chat:77"])
+
+    async def test_run_forever_flushes_outbox_while_update_poll_is_waiting(self) -> None:
+        api = FakeLionClawApi(
+            outbox_deliveries=[
+                OutboxDelivery(
+                    delivery_id="delivery-1",
+                    attempt_id="attempt-1",
+                    conversation_ref="telegram:user:77",
+                    thread_ref=None,
+                    reply_to_ref=None,
+                    content=OutboxContent(text="final answer"),
+                )
+            ]
+        )
+        telegram = BlockingUpdatesTelegramTransport()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            task = asyncio.create_task(worker.run_forever())
+
+            await asyncio.wait_for(telegram.poll_started.wait(), timeout=1.0)
+            await asyncio.wait_for(
+                _wait_until(lambda: len(telegram.sent_messages) >= 1),
+                timeout=1.0,
+            )
+
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def test_typing_preserves_topic_context_across_stream_events(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 15,
+                "message": {
+                    "message_id": 7,
+                    "date": 0,
+                    "chat": {"id": -1001, "type": "supergroup", "is_forum": True},
+                    "from": {"id": 77, "is_bot": False, "first_name": "Alice"},
+                    "message_thread_id": 1,
+                    "text": "@lionclaw_bot inspect",
+                    "entities": [
+                        {"type": "mention", "offset": 0, "length": len("@lionclaw_bot")}
+                    ],
+                },
+            }
+        )
+        api = FakeLionClawApi()
+        telegram = FakeTelegramTransport(updates=[update])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+            await worker._process_stream_event(
+                StreamEvent(
+                    sequence=16,
+                    peer_id="telegram:chat:-1001",
+                    turn_id="turn-1",
+                    kind="status",
+                    code="runtime.started",
+                )
+            )
+
+        self.assertEqual(
+            telegram.typing_calls,
+            [
+                ("telegram:chat:-1001", "telegram:topic:1"),
+                ("telegram:chat:-1001", "telegram:topic:1"),
+            ],
+        )
 
     async def test_blocked_attachment_inbound_does_not_download(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -998,6 +1082,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 )
             ],
         )
+        self.assertEqual(telegram.sent_format_hints, ["markdown"])
         self.assertEqual(
             api.outbox_reports,
             [
@@ -1091,6 +1176,28 @@ class TelegramDeliveryHelperTests(unittest.TestCase):
     def test_topic_thread_ref_omits_general_topic_on_send(self) -> None:
         self.assertEqual(_coerce_thread_id("telegram:topic:77", omit_general=True), 77)
         self.assertIsNone(_coerce_thread_id("telegram:topic:1", omit_general=True))
+
+    def test_topic_thread_ref_preserves_general_topic_on_typing(self) -> None:
+        self.assertEqual(_coerce_thread_id("telegram:topic:1", omit_general=False), 1)
+
+    def test_markdown_rendering_uses_telegram_html_and_suppresses_local_links(self) -> None:
+        rendered = _markdown_to_telegram_html(
+            "**Sauti Scribe Edge**\n"
+            "- [CONTEXT.md](/workspace/CONTEXT.md)\n"
+            "- [ADR 0001](docs/adr/0001.md)\n"
+            "- [OpenAI](https://openai.com)\n"
+        )
+
+        self.assertIn("<b>Sauti Scribe Edge</b>", rendered)
+        self.assertIn("<code>CONTEXT.md</code>", rendered)
+        self.assertNotIn("/workspace/CONTEXT.md", rendered)
+        self.assertNotIn("docs/adr/0001.md", rendered)
+        self.assertIn('<a href="https://openai.com">OpenAI</a>', rendered)
+
+    def test_markdown_rendering_escapes_code_blocks(self) -> None:
+        rendered = _markdown_to_telegram_html("```text\n<b>literal</b>\n```")
+
+        self.assertEqual(rendered, "<pre><code>&lt;b&gt;literal&lt;/b&gt;\n</code></pre>")
 
 
 def build_api(client: httpx.AsyncClient) -> LionClawApi:
@@ -1232,7 +1339,9 @@ class FakeTelegramTransport:
         self.sent_messages: list[
             tuple[str, str, str | None, str | None, list[str]]
         ] = []
+        self.sent_format_hints: list[str] = []
         self.typing_peers: list[str] = []
+        self.typing_calls: list[tuple[str, str | None]] = []
         self.downloaded_attachment_ids: list[str] = []
         self.fail_send_message = fail_send_message
         self.fail_download = fail_download
@@ -1268,10 +1377,12 @@ class FakeTelegramTransport:
         text: str,
         reply_to_ref: str | None = None,
         thread_ref: str | None = None,
+        format_hint: str = "markdown",
         attachments: Sequence[TelegramOutboundAttachment] = (),
     ) -> dict[str, object]:
         if self.fail_send_message:
             raise RuntimeError("send failed")
+        self.sent_format_hints.append(format_hint)
         self.sent_messages.append(
             (
                 conversation_ref,
@@ -1283,9 +1394,31 @@ class FakeTelegramTransport:
         )
         return {"message_id": 101, "chat_id": conversation_ref}
 
-    async def send_typing(self, peer_id: str) -> None:
-        self.typing_peers.append(peer_id)
+    async def send_typing(
+        self,
+        conversation_ref: str,
+        thread_ref: str | None = None,
+    ) -> None:
+        self.typing_peers.append(conversation_ref)
+        self.typing_calls.append((conversation_ref, thread_ref))
+
+
+class BlockingUpdatesTelegramTransport(FakeTelegramTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.poll_started = asyncio.Event()
+        self._release = asyncio.Event()
+
+    async def get_updates(self, offset: int, timeout_seconds: int) -> list[Update]:
+        self.poll_started.set()
+        await self._release.wait()
+        return []
 
 
 def _utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
+
+
+async def _wait_until(predicate, *, interval_seconds: float = 0.01) -> None:
+    while not predicate():
+        await asyncio.sleep(interval_seconds)
