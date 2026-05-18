@@ -214,11 +214,10 @@ For local `lionclaw run`, target resolution selects one project instance and
 uses that instance's recorded work root. In project mode, the operator console
 also renders the other configured project instances and can switch to another
 already-configured instance when no turn is active. Switching reads that
-instance's existing home, work root, runtime config, sessions, drafts, and
-audit scope; it does not mutate project, instance, runtime, channel, skill, or
-default configuration. The selected work root is mounted at `/workspace`. The
-instance home remains LionClaw's state root and is not the project tree or work
-root.
+instance's existing home, work root, runtime config, sessions, and audit scope;
+it does not mutate project, instance, runtime, channel, skill, or default
+configuration. The selected work root is mounted at `/workspace`. The instance
+home remains LionClaw's state root and is not the project tree or work root.
 
 The operator console treats the transcript as durable conversation: user prompts
 and assistant answer deltas are rendered as message blocks. Runtime status,

@@ -456,15 +456,6 @@ enum InspectorMode {
     Activity,
 }
 
-impl InspectorMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Instance => "instance",
-            Self::Activity => "activity",
-        }
-    }
-}
-
 #[derive(Clone)]
 struct ReadyInstance {
     summary: InstanceSummary,
@@ -612,7 +603,6 @@ const HELP_CONTEXT_KEY_HINTS: &[KeyHint] = &[
         "Submit / Open",
         "submit the composer or activate a project item",
     ),
-    KeyHint::new("Ctrl+O", "Activity", "toggle the activity inspector"),
     KeyHint::new("Shift+Enter", "Newline", "insert a composer newline"),
     KeyHint::new("Alt+Enter", "Newline", "insert a composer newline"),
     KeyHint::new(
@@ -2038,14 +2028,6 @@ async fn handle_key(
     match (key.code, key.modifiers) {
         (KeyCode::F(1), _) => app.overlay = Some(Overlay::Help),
         (KeyCode::Char('p'), KeyModifiers::CONTROL) => app.overlay = Some(Overlay::Palette),
-        (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
-            app.inspector_mode = match app.inspector_mode {
-                InspectorMode::Instance => InspectorMode::Activity,
-                InspectorMode::Activity => InspectorMode::Instance,
-            };
-            app.focus = Focus::Inspectors;
-            app.status = format!("inspector: {}", app.inspector_mode.label());
-        }
         (KeyCode::Tab, _) => {
             app.focus = app.focus.next(app.project_mode());
             app.status = format!("focus: {}", app.focus.label());
@@ -3956,7 +3938,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mockup_sized_layout_renders_ribbon_three_panes_composer_and_footer() {
+    async fn reference_sized_layout_renders_ribbon_three_panes_composer_and_footer() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let kernel = Kernel::new_with_options(
             &temp_dir.path().join("lionclaw.db"),
@@ -3989,7 +3971,7 @@ mod tests {
             work_root: None,
             work_root_finding: Some("missing runtime".to_string()),
             shared_work_root_count: 0,
-            default_runtime: Some("mock".to_string()),
+            default_runtime: Some("codex".to_string()),
         };
         let mut app = ConsoleApp {
             project_root: Some(PathBuf::from("/workspace/lionclaw")),
@@ -4052,8 +4034,6 @@ mod tests {
         assert!(rendered.contains("Help"));
         assert!(rendered.contains("Ctrl+P"));
         assert!(rendered.contains("Ctrl+D"));
-        assert!(!rendered.contains("Ctrl+O"));
-        assert!(!rendered.contains("F10"));
         assert_eq!(rendered.lines().count(), 50);
     }
 
@@ -4579,30 +4559,6 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_o_toggles_activity_inspector() {
-        let mut app = blocked_test_app();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime");
-        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
-
-        runtime.block_on(async {
-            handle_key(
-                &mut app,
-                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
-                &backend_tx,
-            )
-            .await;
-        });
-
-        assert_eq!(app.inspector_mode, InspectorMode::Activity);
-        assert_eq!(app.focus, Focus::Inspectors);
-        let rendered = render_to_text(&mut app, 100, 30);
-        assert!(rendered.contains("Inspector  Activity"));
-    }
-
-    #[test]
     fn tab_moves_focus_and_render_marks_focused_pane() {
         let mut app = blocked_test_app();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4779,7 +4735,7 @@ mod tests {
             work_root: Some(temp_dir.path().join("repo")),
             work_root_finding: None,
             shared_work_root_count: 0,
-            default_runtime: Some("mock".to_string()),
+            default_runtime: Some("codex".to_string()),
         };
         ConsoleApp {
             project_root: None,
@@ -4787,8 +4743,8 @@ mod tests {
             selected_index: 0,
             selected: SelectedInstanceState::Ready(Box::new(ReadyInstance {
                 summary: main,
-                runtime_id: "mock".to_string(),
-                runtime_kind: "mock".to_string(),
+                runtime_id: "codex".to_string(),
+                runtime_kind: "codex".to_string(),
                 runtime_override: None,
                 boundary: BoundarySummary {
                     workspace: "rw".to_string(),

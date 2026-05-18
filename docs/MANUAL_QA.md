@@ -92,8 +92,7 @@ Expected on a TTY:
   and timeout
 - the transcript pane shows durable user and assistant messages without raw
   runtime event spam
-- the inspector shows selected instance details, and `Ctrl+O` toggles runtime
-  activity details
+- the inspector shows selected instance and activity details as focus changes
 - the composer accepts printable characters such as `?`; `Tab` visibly moves
   focus, and `Ctrl+D` exits when idle
 
