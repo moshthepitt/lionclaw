@@ -67,8 +67,9 @@ const PANEL_SELECTED: Color = Color::Rgb(0, 68, 72);
 const PANEL_READY: Color = Color::Rgb(91, 255, 112);
 const PANEL_WARN: Color = Color::Rgb(255, 198, 55);
 const PANEL_ERROR: Color = Color::Rgb(255, 82, 82);
-const ACTIVITY_ITEM_LIMIT: usize = 12;
+const ACTIVITY_ITEM_HISTORY_LIMIT: usize = 200;
 const DEFAULT_TRANSCRIPT_PAGE_SCROLL: usize = 8;
+const DEFAULT_ACTIVITY_PAGE_SCROLL: usize = 8;
 const COMPOSER_MIN_HEIGHT: u16 = 6;
 const COMPOSER_MAX_HEIGHT: u16 = 12;
 const COMPOSER_CHROME_HEIGHT: u16 = 4;
@@ -94,6 +95,76 @@ const ACTIVITY_COMMAND_MARKERS: &[&str] = &[
 ];
 const ACTIVITY_PROGRESS_MARKERS: &[&str] =
     &["progress", "checking", "reading", "research", " editing:"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerticalScroll {
+    offset: usize,
+    limit: usize,
+    page_size: usize,
+    follow_tail: bool,
+}
+
+impl VerticalScroll {
+    fn top(page_size: usize) -> Self {
+        Self {
+            offset: 0,
+            limit: 0,
+            page_size,
+            follow_tail: false,
+        }
+    }
+
+    fn tail(page_size: usize) -> Self {
+        Self {
+            offset: 0,
+            limit: 0,
+            page_size,
+            follow_tail: true,
+        }
+    }
+
+    fn reset_top(&mut self) {
+        self.offset = 0;
+        self.limit = 0;
+        self.follow_tail = false;
+    }
+
+    fn reset_tail(&mut self) {
+        self.offset = 0;
+        self.limit = 0;
+        self.follow_tail = true;
+    }
+
+    fn scroll_up(&mut self, amount: usize) {
+        self.offset = self.offset.saturating_sub(amount);
+        self.follow_tail = false;
+    }
+
+    fn scroll_down(&mut self, amount: usize) {
+        self.offset = self.offset.saturating_add(amount).min(self.limit);
+        self.follow_tail = self.offset == self.limit;
+    }
+
+    fn scroll_to_top(&mut self) {
+        self.offset = 0;
+        self.follow_tail = false;
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        self.offset = self.limit;
+        self.follow_tail = true;
+    }
+
+    fn set_viewport(&mut self, line_count: usize, viewport_height: u16) {
+        self.page_size = usize::from(viewport_height.max(1));
+        self.limit = vertical_scroll_limit(line_count, viewport_height);
+        if self.follow_tail {
+            self.offset = self.limit;
+        } else {
+            self.offset = self.offset.min(self.limit);
+        }
+    }
+}
 
 pub(crate) struct RunConsoleInvocation<'a> {
     pub(crate) target: &'a TargetContext,
@@ -365,7 +436,7 @@ impl ActivitySummary {
             return None;
         }
         self.items.push(ActivityItem { kind, text });
-        let overflow = self.items.len().saturating_sub(ACTIVITY_ITEM_LIMIT);
+        let overflow = self.items.len().saturating_sub(ACTIVITY_ITEM_HISTORY_LIMIT);
         if overflow > 0 {
             self.items.drain(0..overflow);
             self.open_progress_item = self
@@ -571,10 +642,9 @@ pub(crate) struct ConsoleApp {
     overlay: Option<Overlay>,
     composer: ConsoleComposer,
     transcript: Vec<TranscriptLine>,
-    transcript_scroll: usize,
-    transcript_scroll_limit: usize,
-    transcript_page_size: usize,
+    transcript_scroll: VerticalScroll,
     activity: ActivitySummary,
+    activity_scroll: VerticalScroll,
     inspector_mode: InspectorMode,
     status: String,
     active_turn: Option<JoinHandle<()>>,
@@ -615,10 +685,9 @@ impl ConsoleApp {
             overlay: None,
             composer: ConsoleComposer::new(),
             transcript: Vec::new(),
-            transcript_scroll: 0,
-            transcript_scroll_limit: 0,
-            transcript_page_size: DEFAULT_TRANSCRIPT_PAGE_SCROLL,
+            transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
             activity: ActivitySummary::new(),
+            activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
             inspector_mode: InspectorMode::Instance,
             status: "idle".to_string(),
             active_turn: None,
@@ -639,24 +708,45 @@ impl ConsoleApp {
     }
 
     fn scroll_transcript_up(&mut self, amount: usize) {
-        self.transcript_scroll = self.transcript_scroll.saturating_sub(amount);
+        self.transcript_scroll.scroll_up(amount);
     }
 
     fn scroll_transcript_down(&mut self, amount: usize) {
-        self.transcript_scroll = self
-            .transcript_scroll
-            .saturating_add(amount)
-            .min(self.transcript_scroll_limit);
+        self.transcript_scroll.scroll_down(amount);
     }
 
-    fn set_transcript_scroll_limit(&mut self, limit: usize) {
-        self.transcript_scroll_limit = limit;
-        self.transcript_scroll = self.transcript_scroll.min(limit);
+    fn scroll_transcript_to_top(&mut self) {
+        self.transcript_scroll.scroll_to_top();
+    }
+
+    fn scroll_transcript_to_bottom(&mut self) {
+        self.transcript_scroll.scroll_to_bottom();
     }
 
     fn set_transcript_viewport(&mut self, line_count: usize, viewport_height: u16) {
-        self.transcript_page_size = usize::from(viewport_height.max(1));
-        self.set_transcript_scroll_limit(transcript_scroll_limit(line_count, viewport_height));
+        self.transcript_scroll
+            .set_viewport(line_count, viewport_height);
+    }
+
+    fn scroll_activity_up(&mut self, amount: usize) {
+        self.activity_scroll.scroll_up(amount);
+    }
+
+    fn scroll_activity_down(&mut self, amount: usize) {
+        self.activity_scroll.scroll_down(amount);
+    }
+
+    fn scroll_activity_to_top(&mut self) {
+        self.activity_scroll.scroll_to_top();
+    }
+
+    fn scroll_activity_to_bottom(&mut self) {
+        self.activity_scroll.scroll_to_bottom();
+    }
+
+    fn set_activity_viewport(&mut self, line_count: usize, viewport_height: u16) {
+        self.activity_scroll
+            .set_viewport(line_count, viewport_height);
     }
 
     fn composer_height(&self, terminal_height: u16) -> u16 {
@@ -756,10 +846,9 @@ impl ConsoleApp {
         }
         self.composer.clear();
         self.transcript.clear();
-        self.transcript_scroll = 0;
-        self.transcript_scroll_limit = 0;
-        self.transcript_page_size = DEFAULT_TRANSCRIPT_PAGE_SCROLL;
+        self.transcript_scroll.reset_top();
         self.activity = ActivitySummary::new();
+        self.activity_scroll.reset_tail();
         self.inspector_mode = InspectorMode::Instance;
         self.load_selected_history().await;
     }
@@ -846,6 +935,7 @@ impl ConsoleApp {
             prompt.clone(),
         ));
         self.activity.start();
+        self.activity_scroll.reset_tail();
         self.inspector_mode = InspectorMode::Activity;
         self.status = format!("running turn on {instance_name}");
         let (handle, cancel_tx) = spawn_streamed_turn(
@@ -915,6 +1005,7 @@ impl ConsoleApp {
         self.transcript
             .push(TranscriptLine::new(TranscriptLineKind::User, label));
         self.activity.start();
+        self.activity_scroll.reset_tail();
         self.inspector_mode = InspectorMode::Activity;
         self.status = format!("running {label}");
         let (handle, cancel_tx) = spawn_streamed_turn(
@@ -941,6 +1032,7 @@ impl ConsoleApp {
             "/lionclaw reset",
         ));
         self.activity.start();
+        self.activity_scroll.reset_tail();
         self.inspector_mode = InspectorMode::Activity;
         self.status = "resetting session".to_string();
         let backend_tx = backend_tx.clone();
@@ -1412,10 +1504,9 @@ pub(crate) async fn run_launch_blocker(blocker: LaunchBlocker) -> Result<()> {
         overlay: None,
         composer: ConsoleComposer::new(),
         transcript: Vec::new(),
-        transcript_scroll: 0,
-        transcript_scroll_limit: 0,
-        transcript_page_size: DEFAULT_TRANSCRIPT_PAGE_SCROLL,
+        transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
         activity: ActivitySummary::new(),
+        activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
         inspector_mode: InspectorMode::Instance,
         status: "launch blocked".to_string(),
         active_turn: None,
@@ -1450,10 +1541,9 @@ pub(crate) async fn run_project_launch_blocker(
         overlay: None,
         composer: ConsoleComposer::new(),
         transcript: Vec::new(),
-        transcript_scroll: 0,
-        transcript_scroll_limit: 0,
-        transcript_page_size: DEFAULT_TRANSCRIPT_PAGE_SCROLL,
+        transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
         activity: ActivitySummary::new(),
+        activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
         inspector_mode: InspectorMode::Instance,
         status: "no instances configured".to_string(),
         active_turn: None,
@@ -1615,13 +1705,49 @@ async fn handle_key(
             app.scroll_transcript_up(1);
         }
         (KeyCode::PageUp, _) if app.focus == Focus::Transcript => {
-            app.scroll_transcript_up(app.transcript_page_size);
+            app.scroll_transcript_up(app.transcript_scroll.page_size);
         }
         (KeyCode::Down, _) if app.focus == Focus::Transcript => {
             app.scroll_transcript_down(1);
         }
         (KeyCode::PageDown, _) if app.focus == Focus::Transcript => {
-            app.scroll_transcript_down(app.transcript_page_size);
+            app.scroll_transcript_down(app.transcript_scroll.page_size);
+        }
+        (KeyCode::Home, _) if app.focus == Focus::Transcript => {
+            app.scroll_transcript_to_top();
+        }
+        (KeyCode::End, _) if app.focus == Focus::Transcript => {
+            app.scroll_transcript_to_bottom();
+        }
+        (KeyCode::Up, _)
+            if app.focus == Focus::Inspectors && app.inspector_mode == InspectorMode::Activity =>
+        {
+            app.scroll_activity_up(1);
+        }
+        (KeyCode::PageUp, _)
+            if app.focus == Focus::Inspectors && app.inspector_mode == InspectorMode::Activity =>
+        {
+            app.scroll_activity_up(app.activity_scroll.page_size);
+        }
+        (KeyCode::Down, _)
+            if app.focus == Focus::Inspectors && app.inspector_mode == InspectorMode::Activity =>
+        {
+            app.scroll_activity_down(1);
+        }
+        (KeyCode::PageDown, _)
+            if app.focus == Focus::Inspectors && app.inspector_mode == InspectorMode::Activity =>
+        {
+            app.scroll_activity_down(app.activity_scroll.page_size);
+        }
+        (KeyCode::Home, _)
+            if app.focus == Focus::Inspectors && app.inspector_mode == InspectorMode::Activity =>
+        {
+            app.scroll_activity_to_top();
+        }
+        (KeyCode::End, _)
+            if app.focus == Focus::Inspectors && app.inspector_mode == InspectorMode::Activity =>
+        {
+            app.scroll_activity_to_bottom();
         }
         _ if app.focus == Focus::Composer => {
             app.composer.handle_key(key);
@@ -1879,12 +2005,13 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
         transcript_render_lines(&app.transcript)
     };
     let activity_rows = if app.activity.is_empty() { 0 } else { 3 };
-    let transcript_area = Rect {
+    let transcript_viewport = Rect {
         x: content.x,
         y: content.y,
-        width: content.width.saturating_sub(1),
+        width: content.width,
         height: content.height.saturating_sub(activity_rows),
     };
+    let (transcript_area, scrollbar_area) = split_scrollable_area(transcript_viewport);
     if transcript_area.width == 0 || transcript_area.height == 0 {
         app.set_transcript_viewport(0, transcript_area.height);
         return;
@@ -1892,18 +2019,12 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let rendered_line_count = paragraph.line_count(transcript_area.width);
     app.set_transcript_viewport(rendered_line_count, transcript_area.height);
-    let scroll = app.transcript_scroll;
+    let scroll = app.transcript_scroll.offset;
     frame.render_widget(
         paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         transcript_area,
     );
-    let scrollbar_area = Rect {
-        x: content.x + content.width.saturating_sub(1),
-        y: transcript_area.y,
-        width: 1.min(content.width),
-        height: transcript_area.height,
-    };
-    render_transcript_scrollbar(frame, scrollbar_area, rendered_line_count, scroll);
+    render_vertical_scrollbar(frame, scrollbar_area, rendered_line_count, scroll);
     if activity_rows > 0 && content.height > activity_rows {
         let rule_y = content.y + content.height - activity_rows;
         draw_horizontal_rule(frame, content.x, rule_y, content.width, PANEL_MUTED);
@@ -2146,18 +2267,30 @@ fn owned_transcript_line(line: Line<'_>) -> Line<'static> {
     }
 }
 
-fn transcript_scroll_limit(line_count: usize, viewport_height: u16) -> usize {
+fn vertical_scroll_limit(line_count: usize, viewport_height: u16) -> usize {
     line_count
         .saturating_sub(viewport_height as usize)
         .min(u16::MAX as usize)
 }
 
-fn render_transcript_scrollbar(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    line_count: usize,
-    scroll: usize,
-) {
+fn split_scrollable_area(area: Rect) -> (Rect, Rect) {
+    let scrollbar_width = if area.width > 0 { 1 } else { 0 };
+    let text_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width.saturating_sub(scrollbar_width),
+        height: area.height,
+    };
+    let scrollbar_area = Rect {
+        x: area.x + area.width.saturating_sub(scrollbar_width),
+        y: area.y,
+        width: scrollbar_width,
+        height: area.height,
+    };
+    (text_area, scrollbar_area)
+}
+
+fn render_vertical_scrollbar(frame: &mut Frame<'_>, area: Rect, line_count: usize, scroll: usize) {
     if line_count <= area.height as usize || area.width == 0 || area.height == 0 {
         return;
     }
@@ -2200,7 +2333,7 @@ fn multiline_prefixed_lines(
         .collect()
 }
 
-fn render_inspector(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
+fn render_inspector(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
     let title = match app.inspector_mode {
         InspectorMode::Instance => "Inspector  Instance",
         InspectorMode::Activity => "Inspector  Activity",
@@ -2352,7 +2485,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
     );
 }
 
-fn render_activity_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp) {
+fn render_activity_inspector(frame: &mut Frame<'_>, content: Rect, app: &mut ConsoleApp) {
     let mut lines = Vec::new();
     if app.activity.is_empty() {
         lines.push(Line::styled(
@@ -2383,13 +2516,24 @@ fn render_activity_inspector(frame: &mut Frame<'_>, content: Rect, app: &Console
         }
     }
 
+    let viewport = content.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let (text_area, scrollbar_area) = split_scrollable_area(viewport);
+    if text_area.width == 0 || text_area.height == 0 {
+        app.set_activity_viewport(0, text_area.height);
+        return;
+    }
+    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    let rendered_line_count = paragraph.line_count(text_area.width);
+    app.set_activity_viewport(rendered_line_count, text_area.height);
+    let scroll = app.activity_scroll.offset;
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
-        content.inner(Margin {
-            vertical: 1,
-            horizontal: 1,
-        }),
+        paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+        text_area,
     );
+    render_vertical_scrollbar(frame, scrollbar_area, rendered_line_count, scroll);
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, _app: &ConsoleApp) {
@@ -3099,10 +3243,9 @@ mod tests {
             overlay: None,
             composer: ConsoleComposer::new(),
             transcript: Vec::new(),
-            transcript_scroll: 0,
-            transcript_scroll_limit: 0,
-            transcript_page_size: DEFAULT_TRANSCRIPT_PAGE_SCROLL,
+            transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
             activity: ActivitySummary::new(),
+            activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
             inspector_mode: InspectorMode::Instance,
             status: "launch blocked".to_string(),
             active_turn: None,
@@ -3225,10 +3368,9 @@ mod tests {
                 ),
                 TranscriptLine::new(TranscriptLineKind::Answer, "Summary\nLooks good overall."),
             ],
-            transcript_scroll: 0,
-            transcript_scroll_limit: 0,
-            transcript_page_size: DEFAULT_TRANSCRIPT_PAGE_SCROLL,
+            transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
             activity: ActivitySummary::new(),
+            activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
             inspector_mode: InspectorMode::Instance,
             status: "idle".to_string(),
             active_turn: None,
@@ -3262,15 +3404,83 @@ mod tests {
         let mut app =
             ready_test_app(vec![TranscriptLine::new(TranscriptLineKind::Answer, body)]).await;
         app.focus = Focus::Transcript;
-        app.transcript_scroll = usize::MAX;
+        app.transcript_scroll.offset = usize::MAX;
 
         let rendered = render_to_text(&mut app, 100, 24);
 
-        assert!(app.transcript_scroll_limit > 0);
-        assert_eq!(app.transcript_scroll, app.transcript_scroll_limit);
+        assert!(app.transcript_scroll.limit > 0);
+        assert_eq!(app.transcript_scroll.offset, app.transcript_scroll.limit);
         assert!(rendered.contains("visible-line-39"));
         assert!(rendered.contains("^"));
         assert!(rendered.contains("v"));
+    }
+
+    #[tokio::test]
+    async fn activity_inspector_follows_tail_and_renders_scrollbar() {
+        let mut app = ready_test_app(Vec::new()).await;
+        app.focus = Focus::Inspectors;
+        app.inspector_mode = InspectorMode::Activity;
+        app.activity.start();
+        for index in 0..80 {
+            app.activity.push_item(
+                ActivityItemKind::Command,
+                format!("runtime ran: command-{index:02}\nexit 0"),
+            );
+        }
+
+        let rendered = render_to_text(&mut app, 120, 24);
+
+        assert!(app.activity_scroll.limit > 0);
+        assert_eq!(app.activity_scroll.offset, app.activity_scroll.limit);
+        assert!(rendered.contains("command-79"));
+        assert!(rendered.contains("^"));
+        assert!(rendered.contains("v"));
+    }
+
+    #[tokio::test]
+    async fn activity_inspector_keyboard_scroll_is_bounded() {
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let mut app = ready_test_app(Vec::new()).await;
+        app.focus = Focus::Inspectors;
+        app.inspector_mode = InspectorMode::Activity;
+        app.activity_scroll.limit = 30;
+        app.activity_scroll.offset = 30;
+        app.activity_scroll.page_size = 7;
+        app.activity_scroll.follow_tail = true;
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            &backend_tx,
+        )
+        .await;
+        assert_eq!(app.activity_scroll.offset, 23);
+        assert!(!app.activity_scroll.follow_tail);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+            &backend_tx,
+        )
+        .await;
+        assert_eq!(app.activity_scroll.offset, 0);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+            &backend_tx,
+        )
+        .await;
+        assert_eq!(app.activity_scroll.offset, 30);
+        assert!(app.activity_scroll.follow_tail);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &backend_tx,
+        )
+        .await;
+        assert_eq!(app.activity_scroll.offset, 30);
     }
 
     #[tokio::test]
@@ -3536,10 +3746,9 @@ mod tests {
             overlay: None,
             composer: ConsoleComposer::new(),
             transcript: Vec::new(),
-            transcript_scroll: 0,
-            transcript_scroll_limit: 0,
-            transcript_page_size: DEFAULT_TRANSCRIPT_PAGE_SCROLL,
+            transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
             activity: ActivitySummary::new(),
+            activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
             inspector_mode: InspectorMode::Instance,
             status: "idle".to_string(),
             active_turn: None,
@@ -3591,10 +3800,9 @@ mod tests {
             overlay: None,
             composer: ConsoleComposer::new(),
             transcript,
-            transcript_scroll: 0,
-            transcript_scroll_limit: 0,
-            transcript_page_size: DEFAULT_TRANSCRIPT_PAGE_SCROLL,
+            transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
             activity: ActivitySummary::new(),
+            activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
             inspector_mode: InspectorMode::Instance,
             status: "idle".to_string(),
             active_turn: None,
