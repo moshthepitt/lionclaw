@@ -547,8 +547,12 @@ struct JobAddArgs {
     allow_capabilities: Vec<String>,
     #[arg(long = "deliver-channel")]
     deliver_channel: Option<String>,
-    #[arg(long = "deliver-peer")]
-    deliver_peer: Option<String>,
+    #[arg(long = "deliver-conversation")]
+    deliver_conversation: Option<String>,
+    #[arg(long = "deliver-thread")]
+    deliver_thread: Option<String>,
+    #[arg(long = "deliver-reply-to")]
+    deliver_reply_to: Option<String>,
     #[arg(long = "retry-attempts")]
     retry_attempts: Option<u32>,
 }
@@ -1287,17 +1291,21 @@ pub async fn run() -> Result<ExitCode> {
                         let kernel = open_kernel(&home, &config, None).await?;
                         let prompt_text = load_job_prompt(args.prompt, args.prompt_file).await?;
                         let schedule = parse_job_schedule_spec(&args.schedule, args.tz.as_deref())?;
-                        let delivery = match (args.deliver_channel, args.deliver_peer) {
-                            (None, None) => None,
-                            (Some(channel_id), Some(peer_id)) => {
+                        let has_delivery_detail =
+                            args.deliver_thread.is_some() || args.deliver_reply_to.is_some();
+                        let delivery = match (args.deliver_channel, args.deliver_conversation) {
+                            (None, None) if !has_delivery_detail => None,
+                            (Some(channel_id), Some(conversation_ref)) => {
                                 Some(crate::contracts::JobDeliveryTargetDto {
                                     channel_id,
-                                    peer_id,
+                                    conversation_ref,
+                                    thread_ref: args.deliver_thread,
+                                    reply_to_ref: args.deliver_reply_to,
                                 })
                             }
                             _ => {
                                 return Err(anyhow!(
-                                        "--deliver-channel and --deliver-peer must be provided together"
+                                        "--deliver-channel and --deliver-conversation are required for delivery"
                                     ));
                             }
                         };
@@ -1356,7 +1364,7 @@ pub async fn run() -> Result<ExitCode> {
                         println!(
                             "delivery={}",
                             job.delivery
-                                .map(|value| format!("{}:{}", value.channel_id, value.peer_id))
+                                .map(format_job_delivery)
                                 .unwrap_or_else(|| "-".to_string())
                         );
                     }
@@ -1984,6 +1992,17 @@ async fn load_job_prompt(prompt: Option<String>, prompt_file: Option<String>) ->
 
 fn parse_job_id(raw: &str) -> Result<uuid::Uuid> {
     uuid::Uuid::parse_str(raw.trim()).map_err(|_| anyhow!("invalid job id '{raw}'"))
+}
+
+fn format_job_delivery(delivery: crate::contracts::JobDeliveryTargetDto) -> String {
+    let mut parts = vec![delivery.channel_id, delivery.conversation_ref];
+    if let Some(thread_ref) = delivery.thread_ref {
+        parts.push(thread_ref);
+    }
+    if let Some(reply_to_ref) = delivery.reply_to_ref {
+        parts.push(format!("reply_to={reply_to_ref}"));
+    }
+    parts.join(":")
 }
 
 fn parse_job_schedule_spec(raw: &str, timezone: Option<&str>) -> Result<JobScheduleDto> {

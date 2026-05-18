@@ -344,7 +344,11 @@ pub enum JobScheduleDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobDeliveryTargetDto {
     pub channel_id: String,
-    pub peer_id: String,
+    pub conversation_ref: String,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
+    #[serde(default)]
+    pub reply_to_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1181,4 +1185,97 @@ pub struct ChannelStreamAckResponse {
     pub consumer_id: String,
     pub through_sequence: i64,
     pub acknowledged: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxContentDto {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelOutboxDeliveryStatusDto {
+    Pending,
+    Leased,
+    Delivered,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelOutboxAttemptStatusDto {
+    Leased,
+    Delivered,
+    RetryableFailed,
+    TerminalFailed,
+    StaleRejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelOutboxReportOutcomeDto {
+    Delivered,
+    RetryableFailed,
+    TerminalFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxPullRequest {
+    pub channel_id: String,
+    pub worker_id: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub lease_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxDeliveryView {
+    pub delivery_id: Uuid,
+    pub attempt_id: Uuid,
+    pub channel_id: String,
+    pub conversation_ref: String,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
+    #[serde(default)]
+    pub reply_to_ref: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+    #[serde(default)]
+    pub turn_id: Option<Uuid>,
+    pub content: ChannelOutboxContentDto,
+    pub attempt_count: u32,
+    pub lease_expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxPullResponse {
+    pub deliveries: Vec<ChannelOutboxDeliveryView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxReportRequest {
+    pub delivery_id: Uuid,
+    pub attempt_id: Uuid,
+    pub channel_id: String,
+    pub worker_id: String,
+    pub outcome: ChannelOutboxReportOutcomeDto,
+    #[serde(default)]
+    pub provider_receipt: Option<serde_json::Value>,
+    #[serde(default)]
+    pub error_code: Option<String>,
+    #[serde(default)]
+    pub error_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxReportResponse {
+    pub delivery_id: Uuid,
+    pub attempt_id: Uuid,
+    pub accepted: bool,
+    pub status: ChannelOutboxDeliveryStatusDto,
+    pub attempt_status: ChannelOutboxAttemptStatusDto,
+    #[serde(default)]
+    pub next_attempt_at: Option<DateTime<Utc>>,
 }

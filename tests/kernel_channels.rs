@@ -8,14 +8,15 @@ use lionclaw::{
         ChannelAttachmentDescriptor, ChannelAttachmentFinalizeOutcome,
         ChannelAttachmentFinalizeRequest, ChannelAttachmentMissingReport,
         ChannelAttachmentStageResponse, ChannelAttachmentStatus, ChannelGrantView,
-        ChannelInboundOutcome, ChannelInboundRequest, ChannelPairingApproveRequest,
-        ChannelPairingBlockRequest, ChannelPairingBlockResponse, ChannelPairingClaimOutcome,
-        ChannelPairingClaimRequest, ChannelPairingInviteRequest, ChannelPairingStatus,
-        ChannelRoutingProfile, ChannelStreamAckRequest, ChannelStreamEventView,
-        ChannelStreamPullRequest, ChannelStreamStartMode, ChannelTrigger, DaemonInfoResponse,
-        SessionActionKind, SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest,
-        SessionLatestQuery, SessionOpenRequest, SessionTurnKind, SessionTurnRequest,
-        SessionTurnStatus, StreamEventKindDto, StreamLaneDto, TrustTier,
+        ChannelInboundOutcome, ChannelInboundRequest, ChannelOutboxDeliveryStatusDto,
+        ChannelOutboxPullRequest, ChannelOutboxReportOutcomeDto, ChannelOutboxReportRequest,
+        ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
+        ChannelPairingClaimOutcome, ChannelPairingClaimRequest, ChannelPairingInviteRequest,
+        ChannelPairingStatus, ChannelRoutingProfile, ChannelStreamAckRequest,
+        ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamStartMode, ChannelTrigger,
+        DaemonInfoResponse, SessionActionKind, SessionActionRequest, SessionHistoryPolicy,
+        SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest, SessionTurnKind,
+        SessionTurnRequest, SessionTurnStatus, StreamEventKindDto, StreamLaneDto, TrustTier,
     },
     kernel::{
         channel_attachments::{MAX_CHANNEL_ATTACHMENT_BYTES, MAX_CHANNEL_EVENT_ATTACHMENT_BYTES},
@@ -203,6 +204,166 @@ async fn channel_peer_must_be_approved_before_inbound_turn_executes() {
         .text
         .as_deref()
         .is_some_and(|text| text.contains("[mock]")));
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "channel-worker-test".to_string(),
+            limit: Some(10),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull channel outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    assert_eq!(outbox.deliveries[0].conversation_ref, "peer-local");
+    assert_eq!(
+        outbox.deliveries[0].reply_to_ref.as_deref(),
+        Some("msg-1002")
+    );
+    assert!(outbox.deliveries[0].content.text.contains("[mock]"));
+    let report = kernel
+        .report_channel_outbox(ChannelOutboxReportRequest {
+            delivery_id: outbox.deliveries[0].delivery_id,
+            attempt_id: outbox.deliveries[0].attempt_id,
+            channel_id: "local-cli".to_string(),
+            worker_id: "channel-worker-test".to_string(),
+            outcome: ChannelOutboxReportOutcomeDto::Delivered,
+            provider_receipt: Some(serde_json::json!({"message_ref": "provider-1"})),
+            error_code: None,
+            error_text: None,
+        })
+        .await
+        .expect("report channel outbox delivered");
+    assert!(report.accepted);
+    assert_eq!(report.status, ChannelOutboxDeliveryStatusDto::Delivered);
+}
+
+#[tokio::test]
+async fn channel_outbox_rejects_stale_reports_and_keeps_retry_backoff_in_kernel() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "channel-outbox-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    let pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "local-cli",
+            "msg-outbox-stale-run",
+            "peer-outbox",
+            "peer-outbox",
+            None,
+            "hello outbox",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("pending inbound handled");
+    kernel
+        .approve_channel_pairing(ChannelPairingApproveRequest {
+            channel_id: "local-cli".to_string(),
+            pairing_id: None,
+            pairing_code: pending.pairing_code,
+            routing_profile: None,
+            trust_tier: Some(TrustTier::Main),
+            label: None,
+        })
+        .await
+        .expect("approve pairing");
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "local-cli",
+            "msg-outbox-stale",
+            "peer-outbox",
+            "peer-outbox",
+            None,
+            "hello outbox",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("approved inbound handled");
+    let queued_turn_id = queued.turn_id.expect("queued turn id");
+    wait_for_stream_events(&kernel, "local-cli", "outbox-stale-stream", |events| {
+        events.iter().any(|event| {
+            event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::Done
+        })
+    })
+    .await;
+
+    let first_pull = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "worker-1".to_string(),
+            limit: Some(1),
+            lease_ms: Some(1),
+        })
+        .await
+        .expect("pull first outbox lease");
+    assert_eq!(first_pull.deliveries.len(), 1);
+    sleep(Duration::from_millis(5)).await;
+    let second_pull = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "worker-2".to_string(),
+            limit: Some(1),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("re-lease expired outbox delivery");
+    assert_eq!(second_pull.deliveries.len(), 1);
+    assert_eq!(
+        second_pull.deliveries[0].delivery_id,
+        first_pull.deliveries[0].delivery_id
+    );
+    assert_eq!(second_pull.deliveries[0].attempt_count, 2);
+
+    let stale_report = kernel
+        .report_channel_outbox(ChannelOutboxReportRequest {
+            delivery_id: first_pull.deliveries[0].delivery_id,
+            attempt_id: first_pull.deliveries[0].attempt_id,
+            channel_id: "local-cli".to_string(),
+            worker_id: "worker-1".to_string(),
+            outcome: ChannelOutboxReportOutcomeDto::Delivered,
+            provider_receipt: Some(serde_json::json!({"message_ref": "late"})),
+            error_code: None,
+            error_text: None,
+        })
+        .await
+        .expect("report stale delivery");
+    assert!(!stale_report.accepted);
+    assert_eq!(stale_report.status, ChannelOutboxDeliveryStatusDto::Leased);
+
+    let retryable_report = kernel
+        .report_channel_outbox(ChannelOutboxReportRequest {
+            delivery_id: second_pull.deliveries[0].delivery_id,
+            attempt_id: second_pull.deliveries[0].attempt_id,
+            channel_id: "local-cli".to_string(),
+            worker_id: "worker-2".to_string(),
+            outcome: ChannelOutboxReportOutcomeDto::RetryableFailed,
+            provider_receipt: None,
+            error_code: Some("provider.rate_limited".to_string()),
+            error_text: Some("try later".to_string()),
+        })
+        .await
+        .expect("report retryable delivery failure");
+    assert!(retryable_report.accepted);
+    assert_eq!(
+        retryable_report.status,
+        ChannelOutboxDeliveryStatusDto::Pending
+    );
+    assert!(retryable_report.next_attempt_at.is_some());
+    let immediate_pull = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "worker-2".to_string(),
+            limit: Some(1),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull during backoff");
+    assert!(immediate_pull.deliveries.is_empty());
 }
 
 #[tokio::test]
@@ -641,16 +802,26 @@ async fn channels_v2_pending_pairing_hashes_code_and_rejects_runtime_id() {
     );
     let queued_turn_id = queued.turn_id.expect("queued turn id");
 
-    let channel_message_columns = sqlx::query("PRAGMA table_info(channel_messages)")
+    let legacy_message_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'channel_messages'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query legacy channel message table count");
+    assert_eq!(
+        legacy_message_tables, 0,
+        "legacy channel_messages table must not remain in the final schema"
+    );
+    let outbox_columns = sqlx::query("PRAGMA table_info(channel_outbox_messages)")
         .fetch_all(&pool)
         .await
-        .expect("query channel message columns")
+        .expect("query channel outbox columns")
         .into_iter()
         .map(|row| row.get::<String, _>("name"))
         .collect::<Vec<_>>();
     assert!(
-        !channel_message_columns.iter().any(|name| name == "content"),
-        "channel message records must not store message content"
+        outbox_columns.iter().any(|name| name == "content_json"),
+        "durable channel outbound content must live in the outbox"
     );
     let inbound_event_columns = sqlx::query("PRAGMA table_info(channel_inbound_events)")
         .fetch_all(&pool)
@@ -1763,6 +1934,20 @@ async fn channels_v2_migration_uses_legacy_message_id_for_event_identity() {
     .await
     .expect("query migrated channel turns");
     assert_eq!(turn_event_ids, event_ids);
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/202605140005_channel_outbox.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("run channel outbox migration");
+    let legacy_message_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'channel_messages'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query legacy channel message table count");
+    assert_eq!(legacy_message_tables, 0);
 }
 
 #[tokio::test]

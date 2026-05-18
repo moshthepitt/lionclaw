@@ -27,7 +27,10 @@ use crate::contracts::{
     ChannelAttachmentFinalizeResponse, ChannelAttachmentStageResponse, ChannelAttachmentStatus,
     ChannelBindingView, ChannelGrantResponse, ChannelGrantRevokeRequest,
     ChannelGrantRevokeResponse, ChannelGrantView, ChannelInboundOutcome, ChannelInboundRequest,
-    ChannelInboundResponse, ChannelListResponse, ChannelPairingApproveRequest,
+    ChannelInboundResponse, ChannelListResponse, ChannelOutboxAttemptStatusDto,
+    ChannelOutboxContentDto, ChannelOutboxDeliveryStatusDto, ChannelOutboxDeliveryView,
+    ChannelOutboxPullRequest, ChannelOutboxPullResponse, ChannelOutboxReportOutcomeDto,
+    ChannelOutboxReportRequest, ChannelOutboxReportResponse, ChannelPairingApproveRequest,
     ChannelPairingBlockRequest, ChannelPairingBlockResponse, ChannelPairingClaimOutcome,
     ChannelPairingClaimRequest, ChannelPairingClaimResponse, ChannelPairingInviteRequest,
     ChannelPairingInviteResponse, ChannelPairingListResponse, ChannelPairingStatus,
@@ -67,6 +70,13 @@ use super::{
         ChannelAttachmentStore, DeclareAttachmentRejection, RejectAttachmentUpdate,
         StageAttachmentUpdate, MAX_CHANNEL_ATTACHMENTS_PER_EVENT, MAX_CHANNEL_ATTACHMENT_BYTES,
         MAX_CHANNEL_EVENT_ATTACHMENT_BYTES,
+    },
+    channel_outbox::{
+        ChannelDeliveryContent, ChannelDeliveryLease, ChannelDeliveryRecord, ChannelDeliveryRoute,
+        ChannelOutboxAttemptStatus, ChannelOutboxDeliveryStatus, ChannelOutboxPull,
+        ChannelOutboxReport, ChannelOutboxReportOutcome, ChannelOutboxStore, NewChannelDelivery,
+        DEFAULT_CHANNEL_OUTBOX_LEASE_MS, DEFAULT_CHANNEL_OUTBOX_PULL_LIMIT,
+        MAX_CHANNEL_OUTBOX_PULL_LIMIT,
     },
     channel_state::{
         ChannelGrantRecord, ChannelGrantStatus, ChannelGrantUpsert, ChannelPairingRequestRecord,
@@ -128,6 +138,8 @@ const CHANNEL_ATTACHMENT_TOO_LARGE: &str = "attachment_too_large";
 const CHANNEL_ATTACHMENT_EVENT_TOO_LARGE: &str = "event_attachments_too_large";
 const CHANNEL_ATTACHMENT_PROJECTIONS_DIR: &str = "attachment-projections";
 const CHANNEL_ATTACHMENT_MOUNT_TARGET: &str = "/attachments";
+const MAX_CHANNEL_OUTBOX_RECEIPT_JSON_BYTES: usize = 64 * 1024;
+const MAX_CHANNEL_OUTBOX_ERROR_TEXT_BYTES: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub enum ChannelAttachmentStageContent {
@@ -250,6 +262,7 @@ pub struct Kernel {
     jobs: JobStore,
     runtime: RuntimeRegistry,
     channel_state: ChannelStateStore,
+    channel_outbox: ChannelOutboxStore,
     channel_attachments: ChannelAttachmentStore,
     audit: AuditLog,
     capability_broker: CapabilityBroker,
@@ -412,6 +425,7 @@ impl Kernel {
             jobs: JobStore::new(pool.clone()),
             runtime,
             channel_state: ChannelStateStore::new(pool.clone()),
+            channel_outbox: ChannelOutboxStore::new(pool.clone()),
             channel_attachments: ChannelAttachmentStore::new(pool.clone()),
             audit: AuditLog::new(pool),
             capability_broker,
@@ -2923,6 +2937,154 @@ impl Kernel {
         })
     }
 
+    pub async fn pull_channel_outbox(
+        &self,
+        req: ChannelOutboxPullRequest,
+    ) -> Result<ChannelOutboxPullResponse, KernelError> {
+        if req.channel_id.trim().is_empty() || req.worker_id.trim().is_empty() {
+            return Err(KernelError::BadRequest(
+                "channel_id and worker_id are required".to_string(),
+            ));
+        }
+
+        let channel_id = req.channel_id.trim().to_string();
+        let worker_id = req.worker_id.trim().to_string();
+        self.require_active_channel_binding(&channel_id).await?;
+        let limit = req
+            .limit
+            .unwrap_or(DEFAULT_CHANNEL_OUTBOX_PULL_LIMIT)
+            .clamp(1, MAX_CHANNEL_OUTBOX_PULL_LIMIT);
+        let lease_ms = req.lease_ms.unwrap_or(DEFAULT_CHANNEL_OUTBOX_LEASE_MS);
+        let leases = self
+            .channel_outbox
+            .pull_due(ChannelOutboxPull {
+                channel_id: channel_id.clone(),
+                worker_id: worker_id.clone(),
+                limit,
+                lease_ms,
+            })
+            .await
+            .map_err(internal)?;
+
+        for lease in &leases {
+            self.audit
+                .append(
+                    "channel.outbox.leased",
+                    lease.delivery.session_id,
+                    Some("api".to_string()),
+                    json!({
+                        "channel_id": lease.delivery.channel_id,
+                        "delivery_id": lease.delivery.delivery_id,
+                        "attempt_id": lease.attempt_id,
+                        "worker_id": &worker_id,
+                        "attempt_count": lease.delivery.attempt_count,
+                        "lease_expires_at": lease.lease_expires_at,
+                    }),
+                )
+                .await
+                .map_err(internal)?;
+        }
+
+        Ok(ChannelOutboxPullResponse {
+            deliveries: leases
+                .into_iter()
+                .map(to_channel_outbox_delivery_view)
+                .collect(),
+        })
+    }
+
+    pub async fn report_channel_outbox(
+        &self,
+        req: ChannelOutboxReportRequest,
+    ) -> Result<ChannelOutboxReportResponse, KernelError> {
+        if req.channel_id.trim().is_empty() || req.worker_id.trim().is_empty() {
+            return Err(KernelError::BadRequest(
+                "channel_id and worker_id are required".to_string(),
+            ));
+        }
+        let channel_id = req.channel_id.trim().to_string();
+        let worker_id = req.worker_id.trim().to_string();
+        self.require_active_channel_binding(&channel_id).await?;
+        validate_optional_json_size(
+            req.provider_receipt.as_ref(),
+            "provider_receipt",
+            MAX_CHANNEL_OUTBOX_RECEIPT_JSON_BYTES,
+        )?;
+        let error_code = trim_optional_string(req.error_code);
+        let error_text = trim_optional_limited_string(
+            req.error_text,
+            "error_text",
+            MAX_CHANNEL_OUTBOX_ERROR_TEXT_BYTES,
+        )?;
+        let outcome = match req.outcome {
+            ChannelOutboxReportOutcomeDto::Delivered => ChannelOutboxReportOutcome::Delivered,
+            ChannelOutboxReportOutcomeDto::RetryableFailed => {
+                ChannelOutboxReportOutcome::RetryableFailed
+            }
+            ChannelOutboxReportOutcomeDto::TerminalFailed => {
+                ChannelOutboxReportOutcome::TerminalFailed
+            }
+        };
+        if outcome != ChannelOutboxReportOutcome::Delivered && error_text.is_none() {
+            return Err(KernelError::BadRequest(
+                "error_text is required for failed outbox reports".to_string(),
+            ));
+        }
+
+        let result = self
+            .channel_outbox
+            .report(ChannelOutboxReport {
+                delivery_id: req.delivery_id,
+                attempt_id: req.attempt_id,
+                channel_id,
+                worker_id: worker_id.clone(),
+                outcome,
+                provider_receipt: req.provider_receipt,
+                error_code,
+                error_text,
+            })
+            .await
+            .map_err(channel_outbox_report_error)?;
+
+        self.update_scheduler_delivery_from_outbox(&result.delivery)
+            .await?;
+
+        let audit_event = match result.attempt_status {
+            ChannelOutboxAttemptStatus::Delivered => "channel.outbox.delivered",
+            ChannelOutboxAttemptStatus::RetryableFailed => "channel.outbox.retryable_failed",
+            ChannelOutboxAttemptStatus::TerminalFailed => "channel.outbox.terminal_failed",
+            ChannelOutboxAttemptStatus::StaleRejected => "channel.outbox.stale_report_rejected",
+            ChannelOutboxAttemptStatus::Leased => "channel.outbox.leased",
+        };
+        self.audit
+            .append(
+                audit_event,
+                result.delivery.session_id,
+                Some("api".to_string()),
+                json!({
+                    "channel_id": result.delivery.channel_id,
+                    "delivery_id": result.delivery.delivery_id,
+                    "attempt_id": req.attempt_id,
+                    "worker_id": worker_id,
+                    "accepted": result.accepted,
+                    "status": result.delivery.status.as_str(),
+                    "attempt_status": result.attempt_status.as_str(),
+                    "error_code": result.delivery.last_error_code,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+
+        Ok(ChannelOutboxReportResponse {
+            delivery_id: result.delivery.delivery_id,
+            attempt_id: req.attempt_id,
+            accepted: result.accepted,
+            status: to_channel_outbox_status_dto(result.delivery.status),
+            attempt_status: to_channel_outbox_attempt_status_dto(result.attempt_status),
+            next_attempt_at: result.next_attempt_at,
+        })
+    }
+
     pub async fn get_channel_binding(
         &self,
         channel_id: &str,
@@ -3555,9 +3717,10 @@ impl Kernel {
             ));
         }
         if let Some(delivery) = &req.delivery {
-            if delivery.channel_id.trim().is_empty() || delivery.peer_id.trim().is_empty() {
+            if delivery.channel_id.trim().is_empty() || delivery.conversation_ref.trim().is_empty()
+            {
                 return Err(KernelError::BadRequest(
-                    "delivery channel_id and peer_id are required".to_string(),
+                    "delivery channel_id and conversation_ref are required".to_string(),
                 ));
             }
         }
@@ -3894,6 +4057,33 @@ impl Kernel {
 
     pub(super) fn audit_log(&self) -> &AuditLog {
         &self.audit
+    }
+
+    async fn update_scheduler_delivery_from_outbox(
+        &self,
+        delivery: &ChannelDeliveryRecord,
+    ) -> Result<(), KernelError> {
+        if delivery.source_kind.as_deref() != Some("scheduler_run") {
+            return Ok(());
+        }
+        let Some(source_id) = delivery.source_id.as_deref() else {
+            return Ok(());
+        };
+        let Ok(run_id) = Uuid::parse_str(source_id) else {
+            return Ok(());
+        };
+        let status = match delivery.status {
+            ChannelOutboxDeliveryStatus::Delivered => SchedulerJobDeliveryStatus::Delivered,
+            ChannelOutboxDeliveryStatus::Failed => SchedulerJobDeliveryStatus::Failed,
+            ChannelOutboxDeliveryStatus::Pending | ChannelOutboxDeliveryStatus::Leased => {
+                return Ok(());
+            }
+        };
+        self.jobs
+            .update_run_delivery_status(run_id, status)
+            .await
+            .map_err(internal)?;
+        Ok(())
     }
 
     pub(super) async fn record_scheduler_continuity_success(
@@ -6045,22 +6235,110 @@ fn to_job_schedule_dto(schedule: JobSchedule) -> JobScheduleDto {
 
 fn job_delivery_from_dto(delivery: JobDeliveryTargetDto) -> anyhow::Result<JobDeliveryTarget> {
     let channel_id = delivery.channel_id.trim().to_string();
-    let peer_id = delivery.peer_id.trim().to_string();
-    if channel_id.is_empty() || peer_id.is_empty() {
+    let conversation_ref = delivery.conversation_ref.trim().to_string();
+    if channel_id.is_empty() || conversation_ref.is_empty() {
         return Err(anyhow::anyhow!(
-            "delivery channel_id and peer_id are required"
+            "delivery channel_id and conversation_ref are required"
         ));
     }
     Ok(JobDeliveryTarget {
         channel_id,
-        peer_id,
+        conversation_ref,
+        thread_ref: trim_optional_string(delivery.thread_ref),
+        reply_to_ref: trim_optional_string(delivery.reply_to_ref),
     })
 }
 
 fn to_job_delivery_dto(delivery: JobDeliveryTarget) -> JobDeliveryTargetDto {
     JobDeliveryTargetDto {
         channel_id: delivery.channel_id,
-        peer_id: delivery.peer_id,
+        conversation_ref: delivery.conversation_ref,
+        thread_ref: delivery.thread_ref,
+        reply_to_ref: delivery.reply_to_ref,
+    }
+}
+
+fn trim_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+}
+
+fn trim_optional_limited_string(
+    value: Option<String>,
+    field_name: &str,
+    max_bytes: usize,
+) -> Result<Option<String>, KernelError> {
+    let Some(trimmed) = trim_optional_string(value) else {
+        return Ok(None);
+    };
+    if trimmed.len() > max_bytes {
+        return Err(KernelError::BadRequest(format!(
+            "{field_name} exceeds {max_bytes} bytes"
+        )));
+    }
+    Ok(Some(trimmed))
+}
+
+fn validate_optional_json_size(
+    value: Option<&serde_json::Value>,
+    field_name: &str,
+    max_bytes: usize,
+) -> Result<(), KernelError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let encoded = serde_json::to_vec(value)
+        .map_err(|err| KernelError::BadRequest(format!("invalid {field_name}: {err}")))?;
+    if encoded.len() > max_bytes {
+        return Err(KernelError::BadRequest(format!(
+            "{field_name} exceeds {max_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn to_channel_outbox_delivery_view(lease: ChannelDeliveryLease) -> ChannelOutboxDeliveryView {
+    ChannelOutboxDeliveryView {
+        delivery_id: lease.delivery.delivery_id,
+        attempt_id: lease.attempt_id,
+        channel_id: lease.delivery.channel_id,
+        conversation_ref: lease.delivery.conversation_ref,
+        thread_ref: lease.delivery.thread_ref,
+        reply_to_ref: lease.delivery.reply_to_ref,
+        session_id: lease.delivery.session_id,
+        turn_id: lease.delivery.turn_id,
+        content: ChannelOutboxContentDto {
+            text: lease.delivery.content.text,
+        },
+        attempt_count: lease.delivery.attempt_count,
+        lease_expires_at: lease.lease_expires_at,
+        created_at: lease.delivery.created_at,
+    }
+}
+
+fn to_channel_outbox_status_dto(
+    status: ChannelOutboxDeliveryStatus,
+) -> ChannelOutboxDeliveryStatusDto {
+    match status {
+        ChannelOutboxDeliveryStatus::Pending => ChannelOutboxDeliveryStatusDto::Pending,
+        ChannelOutboxDeliveryStatus::Leased => ChannelOutboxDeliveryStatusDto::Leased,
+        ChannelOutboxDeliveryStatus::Delivered => ChannelOutboxDeliveryStatusDto::Delivered,
+        ChannelOutboxDeliveryStatus::Failed => ChannelOutboxDeliveryStatusDto::Failed,
+    }
+}
+
+fn to_channel_outbox_attempt_status_dto(
+    status: ChannelOutboxAttemptStatus,
+) -> ChannelOutboxAttemptStatusDto {
+    match status {
+        ChannelOutboxAttemptStatus::Leased => ChannelOutboxAttemptStatusDto::Leased,
+        ChannelOutboxAttemptStatus::Delivered => ChannelOutboxAttemptStatusDto::Delivered,
+        ChannelOutboxAttemptStatus::RetryableFailed => {
+            ChannelOutboxAttemptStatusDto::RetryableFailed
+        }
+        ChannelOutboxAttemptStatus::TerminalFailed => ChannelOutboxAttemptStatusDto::TerminalFailed,
+        ChannelOutboxAttemptStatus::StaleRejected => ChannelOutboxAttemptStatusDto::StaleRejected,
     }
 }
 
@@ -6115,6 +6393,17 @@ fn to_stream_event_view(event: RuntimeEvent) -> StreamEventDto {
 
 fn internal(err: anyhow::Error) -> KernelError {
     KernelError::Internal(format!("{err:#}"))
+}
+
+fn channel_outbox_report_error(err: anyhow::Error) -> KernelError {
+    let message = err.to_string();
+    if message.contains("not found") {
+        KernelError::NotFound(message)
+    } else if message.contains("mismatch") || message.contains("does not belong") {
+        KernelError::BadRequest(message)
+    } else {
+        internal(err)
+    }
 }
 
 const MAX_PROVIDER_METADATA_BYTES: usize = 16 * 1024;
@@ -7102,6 +7391,24 @@ fn stream_peer_ref_for_session_peer(channel_id: &str, session_peer_id: &str) -> 
     session_peer_id.to_string()
 }
 
+fn delivery_route_for_session_peer(
+    channel_id: &str,
+    session_peer_id: &str,
+) -> (String, Option<String>) {
+    match parse_session_key_scope(channel_id, session_peer_id) {
+        Some(SessionKeyScope::Direct { sender_ref }) => (sender_ref, None),
+        Some(SessionKeyScope::Conversation {
+            conversation_ref, ..
+        }) => (conversation_ref, None),
+        Some(SessionKeyScope::Thread {
+            conversation_ref,
+            thread_ref,
+            ..
+        }) => (conversation_ref, Some(thread_ref)),
+        None => (session_peer_id.to_string(), None),
+    }
+}
+
 fn parse_session_key_scope(channel_id: &str, session_peer_id: &str) -> Option<SessionKeyScope> {
     let direct_prefix = format!("channel:{channel_id}:direct:");
     if let Some(sender_ref) = session_peer_id.strip_prefix(&direct_prefix) {
@@ -7149,9 +7456,16 @@ fn draft_action_error(relative_path: &str, err: anyhow::Error) -> KernelError {
     }
 }
 
-fn parse_channel_send_intent(
-    value: &serde_json::Value,
-) -> Result<(String, String, String), String> {
+#[derive(Debug, Clone)]
+struct ChannelSendIntent {
+    channel_id: String,
+    conversation_ref: String,
+    thread_ref: Option<String>,
+    reply_to_ref: Option<String>,
+    content: String,
+}
+
+fn parse_channel_send_intent(value: &serde_json::Value) -> Result<ChannelSendIntent, String> {
     let channel_id = value
         .get("channel_id")
         .and_then(|raw| raw.as_str())
@@ -7164,6 +7478,18 @@ fn parse_channel_send_intent(
         .map(str::trim)
         .filter(|raw| !raw.is_empty())
         .ok_or_else(|| "channel.send broker output missing conversation_ref".to_string())?;
+    let thread_ref = value
+        .get("thread_ref")
+        .and_then(|raw| raw.as_str())
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(str::to_string);
+    let reply_to_ref = value
+        .get("reply_to_ref")
+        .and_then(|raw| raw.as_str())
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(str::to_string);
     let content = value
         .get("content")
         .and_then(|raw| raw.as_str())
@@ -7172,11 +7498,13 @@ fn parse_channel_send_intent(
         return Err("channel.send broker output missing content".to_string());
     }
 
-    Ok((
-        channel_id.to_string(),
-        conversation_ref.to_string(),
-        content.to_string(),
-    ))
+    Ok(ChannelSendIntent {
+        channel_id: channel_id.to_string(),
+        conversation_ref: conversation_ref.to_string(),
+        thread_ref,
+        reply_to_ref,
+        content: content.to_string(),
+    })
 }
 
 fn summarize_capability_output(
@@ -7195,7 +7523,7 @@ fn summarize_capability_output(
         Capability::ChannelSend => json!({
             "channel_id": output.get("channel_id"),
             "conversation_ref": output.get("conversation_ref"),
-            "message_ids": output.get("message_ids"),
+            "delivery_id": output.get("delivery_id"),
         }),
         _ => json!({
             "type": json_value_type(output),
@@ -7212,58 +7540,6 @@ fn json_value_type(value: &serde_json::Value) -> &'static str {
         serde_json::Value::Array(_) => "array",
         serde_json::Value::Object(_) => "object",
     }
-}
-
-fn split_text_chunks(content: &str, max_len: usize) -> Vec<String> {
-    if content.is_empty() {
-        return vec![String::new()];
-    }
-    if content.len() <= max_len {
-        return vec![content.to_string()];
-    }
-
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-
-    for line in content.lines() {
-        let additional = if current.is_empty() {
-            line.len()
-        } else {
-            line.len() + 1
-        };
-        if !current.is_empty() && current.len() + additional > max_len {
-            chunks.push(std::mem::take(&mut current));
-        }
-
-        if line.len() > max_len {
-            let mut slice = line;
-            while slice.len() > max_len {
-                let mut split_at = max_len;
-                while !slice.is_char_boundary(split_at) {
-                    split_at -= 1;
-                }
-                chunks.push(slice[..split_at].to_string());
-                slice = &slice[split_at..];
-            }
-            if !slice.is_empty() {
-                if !current.is_empty() {
-                    current.push('\n');
-                }
-                current.push_str(slice);
-            }
-            continue;
-        }
-
-        if !current.is_empty() {
-            current.push('\n');
-        }
-        current.push_str(line);
-    }
-
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
 }
 
 fn generate_pairing_code() -> String {
@@ -7403,6 +7679,9 @@ fn session_turn_status_for_error_code(error_code: &str) -> SessionTurnStatus {
 struct ChannelStreamContext {
     channel_id: String,
     peer_id: String,
+    conversation_ref: String,
+    thread_ref: Option<String>,
+    reply_to_ref: Option<String>,
     session_id: Uuid,
     turn_id: Uuid,
 }
@@ -8317,26 +8596,21 @@ impl Kernel {
             }
 
             if !artifacts.saw_error && !artifacts.assistant_text.trim().is_empty() {
-                let message_id = self
-                    .channel_state
-                    .insert_outbound_message(&stream_context.channel_id, &stream_context.peer_id)
-                    .await
-                    .map_err(internal)?;
-                self.audit
-                    .append(
-                        "channel.outbound.recorded",
-                        Some(session.session_id),
-                        Some("kernel".to_string()),
-                        json!({
-                            "channel_id": stream_context.channel_id,
-                            "peer_id": stream_context.peer_id,
-                            "message_id": message_id,
-                            "turn_id": turn_id,
-                            "content_len": artifacts.assistant_text.len(),
-                        }),
-                    )
-                    .await
-                    .map_err(internal)?;
+                let source_id = turn_id.to_string();
+                self.enqueue_channel_delivery(
+                    ChannelDeliveryRoute {
+                        channel_id: &stream_context.channel_id,
+                        conversation_ref: &stream_context.conversation_ref,
+                        thread_ref: stream_context.thread_ref.as_deref(),
+                        reply_to_ref: stream_context.reply_to_ref.as_deref(),
+                    },
+                    Some(session.session_id),
+                    Some(turn_id),
+                    Some("session_turn"),
+                    Some(&source_id),
+                    &artifacts.assistant_text,
+                )
+                .await?;
             }
         }
 
@@ -8962,9 +9236,30 @@ impl Kernel {
             return Ok(None);
         }
 
+        let (conversation_ref, thread_ref) =
+            delivery_route_for_session_peer(channel_id, session_peer_id);
+        let reply_to_ref = match self
+            .channel_state
+            .get_turn(turn_id)
+            .await
+            .map_err(internal)?
+            .filter(|turn| turn.channel_id == channel_id)
+        {
+            Some(turn) => self
+                .channel_state
+                .get_inbound_event(channel_id, &turn.inbound_event_id)
+                .await
+                .map_err(internal)?
+                .and_then(|event| event.message_ref),
+            None => None,
+        };
+
         Ok(Some(ChannelStreamContext {
             channel_id: channel_id.to_string(),
             peer_id: stream_peer_ref_for_session_peer(channel_id, session_peer_id),
+            conversation_ref,
+            thread_ref,
+            reply_to_ref,
             session_id,
             turn_id,
         }))
@@ -9304,64 +9599,80 @@ impl Kernel {
         format!("{channel_id}:{session_key}")
     }
 
-    pub(super) async fn emit_channel_message(
+    pub(super) async fn enqueue_channel_delivery(
         &self,
-        channel_id: &str,
-        peer_id: &str,
+        route: ChannelDeliveryRoute<'_>,
         session_id: Option<Uuid>,
         turn_id: Option<Uuid>,
+        source_kind: Option<&str>,
+        source_id: Option<&str>,
         content: &str,
-    ) -> Result<Vec<Uuid>, KernelError> {
+    ) -> Result<Uuid, KernelError> {
+        let channel_id = route.channel_id.trim();
+        let conversation_ref = route.conversation_ref.trim();
+        if channel_id.is_empty() || conversation_ref.is_empty() {
+            return Err(KernelError::BadRequest(
+                "channel_id and conversation_ref are required".to_string(),
+            ));
+        }
+        if content.trim().is_empty() {
+            return Err(KernelError::BadRequest(
+                "outbox delivery content is required".to_string(),
+            ));
+        }
         self.require_active_channel_binding(channel_id).await?;
-        let mut message_ids = Vec::new();
 
-        for chunk in split_text_chunks(content, 3500) {
-            let message_id = self
-                .channel_state
-                .insert_outbound_message(channel_id, peer_id)
-                .await
-                .map_err(internal)?;
-            message_ids.push(message_id);
-            self.append_channel_stream_event(ChannelStreamEventInsert {
-                channel_id,
-                peer_id,
+        let thread_ref = route
+            .thread_ref
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        let reply_to_ref = route
+            .reply_to_ref
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        let source_kind = source_kind.map(str::trim).filter(|raw| !raw.is_empty());
+        let source_id = source_id.map(str::trim).filter(|raw| !raw.is_empty());
+        let delivery = self
+            .channel_outbox
+            .enqueue_delivery(NewChannelDelivery {
+                route: ChannelDeliveryRoute {
+                    channel_id,
+                    conversation_ref,
+                    thread_ref,
+                    reply_to_ref,
+                },
                 session_id,
                 turn_id,
-                kind: ChannelStreamEventKind::MessageDelta,
-                lane: Some(ChannelStreamLane::Answer),
-                code: None,
-                text: Some(&chunk),
+                source_kind,
+                source_id,
+                content: ChannelDeliveryContent {
+                    text: content.to_string(),
+                },
             })
-            .await?;
-            self.audit
-                .append(
-                    "channel.outbound.queued",
-                    None,
-                    Some("kernel".to_string()),
-                    json!({
-                        "channel_id": channel_id,
-                        "peer_id": peer_id,
-                        "message_id": message_id,
-                        "content_len": chunk.len(),
-                        "turn_id": turn_id,
-                    }),
-                )
-                .await
-                .map_err(internal)?;
-        }
+            .await
+            .map_err(internal)?;
 
-        self.append_channel_stream_event(ChannelStreamEventInsert {
-            channel_id,
-            peer_id,
-            session_id,
-            turn_id,
-            kind: ChannelStreamEventKind::Done,
-            lane: None,
-            code: None,
-            text: None,
-        })
-        .await?;
-        Ok(message_ids)
+        self.audit
+            .append(
+                "channel.outbox.created",
+                session_id,
+                Some("kernel".to_string()),
+                json!({
+                    "channel_id": delivery.channel_id,
+                    "conversation_ref": delivery.conversation_ref,
+                    "thread_ref": delivery.thread_ref,
+                    "reply_to_ref": delivery.reply_to_ref,
+                    "delivery_id": delivery.delivery_id,
+                    "turn_id": turn_id,
+                    "source_kind": delivery.source_kind,
+                    "source_id": delivery.source_id,
+                    "content_len": delivery.content.text.len(),
+                }),
+            )
+            .await
+            .map_err(internal)?;
+
+        Ok(delivery.delivery_id)
     }
 
     async fn ensure_channel_turn_worker(&self, channel_id: &str, session_key: &str) {
@@ -11096,22 +11407,31 @@ impl Kernel {
                     Ok(value) => {
                         if capability == Capability::ChannelSend {
                             match parse_channel_send_intent(&value) {
-                                Ok((channel_id, peer_id, content)) => {
+                                Ok(intent) => {
+                                    let source_id = turn_id.to_string();
                                     match self
-                                        .emit_channel_message(
-                                            &channel_id,
-                                            &peer_id,
+                                        .enqueue_channel_delivery(
+                                            ChannelDeliveryRoute {
+                                                channel_id: &intent.channel_id,
+                                                conversation_ref: &intent.conversation_ref,
+                                                thread_ref: intent.thread_ref.as_deref(),
+                                                reply_to_ref: intent.reply_to_ref.as_deref(),
+                                            },
                                             Some(session_id),
                                             Some(turn_id),
-                                            &content,
+                                            Some("session_turn"),
+                                            Some(&source_id),
+                                            &intent.content,
                                         )
                                         .await
                                     {
-                                        Ok(queued_message_ids) => {
+                                        Ok(delivery_id) => {
                                             output = json!({
-                                                "channel_id": channel_id,
-                                                "conversation_ref": peer_id,
-                                                "message_ids": queued_message_ids,
+                                                "channel_id": intent.channel_id,
+                                                "conversation_ref": intent.conversation_ref,
+                                                "thread_ref": intent.thread_ref,
+                                                "reply_to_ref": intent.reply_to_ref,
+                                                "delivery_id": delivery_id,
                                             });
                                             allowed = true;
                                         }

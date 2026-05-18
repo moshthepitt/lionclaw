@@ -16,22 +16,23 @@ use crate::{
         AuditQueryParams, AuditQueryResponse, ChannelAttachmentFinalizeRequest,
         ChannelAttachmentFinalizeResponse, ChannelAttachmentStageResponse, ChannelGrantResponse,
         ChannelGrantRevokeRequest, ChannelGrantRevokeResponse, ChannelInboundRequest,
-        ChannelInboundResponse, ChannelListResponse, ChannelPairingApproveRequest,
-        ChannelPairingBlockRequest, ChannelPairingBlockResponse, ChannelPairingClaimRequest,
-        ChannelPairingClaimResponse, ChannelPairingInviteRequest, ChannelPairingInviteResponse,
-        ChannelPairingListParams, ChannelPairingListResponse, ChannelStreamAckRequest,
-        ChannelStreamAckResponse, ChannelStreamPullRequest, ChannelStreamPullResponse,
-        ContinuityDraftActionRequest, ContinuityDraftDiscardResponse, ContinuityDraftListRequest,
-        ContinuityDraftListResponse, ContinuityDraftPromoteResponse, ContinuityGetResponse,
-        ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse, ContinuityPathRequest,
-        ContinuityProposalActionResponse, ContinuityProposalListResponse, ContinuitySearchRequest,
-        ContinuitySearchResponse, ContinuityStatusResponse, DaemonInfoResponse, JobCreateRequest,
-        JobCreateResponse, JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest,
-        JobRemoveResponse, JobRunsRequest, JobRunsResponse, JobTickResponse, JobToggleResponse,
-        PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeRequest, PolicyRevokeResponse,
-        SessionActionRequest, SessionActionResponse, SessionHistoryRequest, SessionHistoryResponse,
-        SessionLatestQuery, SessionLatestResponse, SessionOpenRequest, SessionOpenResponse,
-        SessionTurnRequest, SessionTurnResponse,
+        ChannelInboundResponse, ChannelListResponse, ChannelOutboxPullRequest,
+        ChannelOutboxPullResponse, ChannelOutboxReportRequest, ChannelOutboxReportResponse,
+        ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
+        ChannelPairingClaimRequest, ChannelPairingClaimResponse, ChannelPairingInviteRequest,
+        ChannelPairingInviteResponse, ChannelPairingListParams, ChannelPairingListResponse,
+        ChannelStreamAckRequest, ChannelStreamAckResponse, ChannelStreamPullRequest,
+        ChannelStreamPullResponse, ContinuityDraftActionRequest, ContinuityDraftDiscardResponse,
+        ContinuityDraftListRequest, ContinuityDraftListResponse, ContinuityDraftPromoteResponse,
+        ContinuityGetResponse, ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse,
+        ContinuityPathRequest, ContinuityProposalActionResponse, ContinuityProposalListResponse,
+        ContinuitySearchRequest, ContinuitySearchResponse, ContinuityStatusResponse,
+        DaemonInfoResponse, JobCreateRequest, JobCreateResponse, JobGetResponse, JobListResponse,
+        JobManualRunResponse, JobRefRequest, JobRemoveResponse, JobRunsRequest, JobRunsResponse,
+        JobTickResponse, JobToggleResponse, PolicyGrantRequest, PolicyGrantResponse,
+        PolicyRevokeRequest, PolicyRevokeResponse, SessionActionRequest, SessionActionResponse,
+        SessionHistoryRequest, SessionHistoryResponse, SessionLatestQuery, SessionLatestResponse,
+        SessionOpenRequest, SessionOpenResponse, SessionTurnRequest, SessionTurnResponse,
     },
     kernel::{
         channel_attachments::{MAX_CHANNEL_ATTACHMENT_BYTES, MAX_CHANNEL_EVENT_ATTACHMENT_BYTES},
@@ -86,6 +87,8 @@ pub fn build_router(kernel: Arc<Kernel>, daemon_info: DaemonInfoResponse) -> Rou
         )
         .route("/v0/channels/stream/pull", post(channel_stream_pull))
         .route("/v0/channels/stream/ack", post(channel_stream_ack))
+        .route("/v0/channels/outbox/pull", post(channel_outbox_pull))
+        .route("/v0/channels/outbox/report", post(channel_outbox_report))
         .route("/v0/policy/grant", post(grant_policy))
         .route("/v0/policy/revoke", post(revoke_policy))
         .route("/v0/jobs/create", post(create_job))
@@ -328,6 +331,22 @@ async fn channel_stream_ack(
     Json(req): Json<ChannelStreamAckRequest>,
 ) -> Result<Json<ChannelStreamAckResponse>, ApiError> {
     let result = state.kernel.ack_channel_stream(req).await?;
+    Ok(Json(result))
+}
+
+async fn channel_outbox_pull(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelOutboxPullRequest>,
+) -> Result<Json<ChannelOutboxPullResponse>, ApiError> {
+    let result = state.kernel.pull_channel_outbox(req).await?;
+    Ok(Json(result))
+}
+
+async fn channel_outbox_report(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelOutboxReportRequest>,
+) -> Result<Json<ChannelOutboxReportResponse>, ApiError> {
+    let result = state.kernel.report_channel_outbox(req).await?;
     Ok(Json(result))
 }
 
