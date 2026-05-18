@@ -185,6 +185,7 @@ class TelegramWorker:
                 delivery.conversation_ref,
                 delivery.content.text,
                 delivery.reply_to_ref,
+                delivery.thread_ref,
             )
         except Exception as err:
             logger.exception(

@@ -858,6 +858,8 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
         .pull_channel_outbox(ChannelOutboxPullRequest {
             channel_id: "terminal".to_string(),
             worker_id: "scheduler-test".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
             limit: Some(20),
             lease_ms: Some(120_000),
         })
@@ -967,6 +969,8 @@ async fn scheduled_job_failure_delivers_summary_and_dead_letters() {
         .pull_channel_outbox(ChannelOutboxPullRequest {
             channel_id: "terminal".to_string(),
             worker_id: "scheduler-failure-test".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
             limit: Some(20),
             lease_ms: Some(120_000),
         })

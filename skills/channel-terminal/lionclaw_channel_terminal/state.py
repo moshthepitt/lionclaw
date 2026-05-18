@@ -271,6 +271,32 @@ class ChannelViewState:
                 self.active_turn_id = None
                 self.restored_running_turn = False
 
+    def apply_outbox_delivery(self, delivery: object) -> None:
+        if getattr(delivery, "conversation_ref") != self.peer_id:
+            return
+
+        session_id = getattr(delivery, "session_id", None)
+        if session_id is not None and self.active_session_id is None:
+            self.active_session_id = session_id
+
+        content = getattr(delivery, "content")
+        text = getattr(content, "text", "")
+        turn_id = getattr(delivery, "turn_id", None)
+        if turn_id is None:
+            if text:
+                self.activity_lines.append(f"[message] {text}")
+            return
+
+        turn = self._ensure_turn(turn_id)
+        turn.answer_text = text
+        turn.status = "completed"
+        turn.error_text = None
+        turn.restored_running = False
+        self.pending_submission = False
+        self.restored_running_turn = False
+        if turn_id == self.active_turn_id:
+            self.active_turn_id = None
+
     def set_pairing_state(
         self,
         status: PeerStatus,

@@ -356,7 +356,10 @@ External channel skills integrate over HTTP:
 6. `POST /v0/channels/outbox/pull` atomically leases due outbound deliveries.
    Deliveries carry `conversation_ref`, optional `thread_ref`, optional
    `reply_to_ref`, `content`, and a stable `delivery_id`. Each pull creates an
-   `attempt_id`; workers perform one provider send attempt per lease.
+   `attempt_id`; workers perform one provider send attempt per lease. Pulls may
+   optionally scope to a `conversation_ref` / `thread_ref` so interactive
+   per-peer workers, such as the terminal channel, do not lease another peer's
+   delivery.
 7. `POST /v0/channels/outbox/report` records provider outcomes. `delivered`
    stores provider receipt data, `retryable_failed` returns the delivery to
    kernel-owned exponential backoff, and `terminal_failed` closes it. Stale
@@ -427,6 +430,11 @@ is carried by `session_key` and the session row. Channel session keys are grant
 scoped: direct sessions include the sender, conversation sessions include the
 conversation and sender, and thread sessions include the conversation, thread,
 and sender.
+
+Outbox `content` is provider-neutral JSON with `text`, a `format_hint`
+(`plain`, `markdown`, or `html`), and an `attachments` array. Outbound
+attachments are schema-ready and remain text-only for shipped workers until
+runtime/draft file delivery is enabled.
 
 ## Session Continuity
 

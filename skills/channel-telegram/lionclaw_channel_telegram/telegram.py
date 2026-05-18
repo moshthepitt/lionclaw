@@ -22,7 +22,11 @@ class TelegramTransport(Protocol):
     async def get_updates(self, offset: int, timeout_seconds: int) -> list[Update]: ...
 
     async def send_message(
-        self, conversation_ref: str, text: str, reply_to_ref: str | None = None
+        self,
+        conversation_ref: str,
+        text: str,
+        reply_to_ref: str | None = None,
+        thread_ref: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def send_typing(self, peer_id: str) -> None: ...
@@ -39,12 +43,17 @@ class AiogramTelegramTransport:
         return await self._bot.get_updates(offset=offset, timeout=timeout_seconds)
 
     async def send_message(
-        self, conversation_ref: str, text: str, reply_to_ref: str | None = None
+        self,
+        conversation_ref: str,
+        text: str,
+        reply_to_ref: str | None = None,
+        thread_ref: str | None = None,
     ) -> dict[str, Any]:
         message = await self._bot.send_message(
             chat_id=_coerce_chat_id(conversation_ref),
             text=text,
             reply_to_message_id=_coerce_message_id(reply_to_ref),
+            message_thread_id=_coerce_message_id(thread_ref),
         )
         return {
             "message_id": message.message_id,

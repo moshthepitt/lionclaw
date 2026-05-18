@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -25,8 +25,18 @@ class StreamEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class OutboxAttachment:
+    attachment_id: str
+    path: str
+    filename: str | None = None
+    mime_type: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
 class OutboxContent:
     text: str
+    format_hint: str = "markdown"
+    attachments: list[OutboxAttachment] = field(default_factory=list)
 
 
 @dataclass(slots=True, frozen=True)
@@ -150,6 +160,9 @@ class LionClawApi:
             content = item.get("content")
             if not isinstance(content, dict) or not isinstance(content.get("text"), str):
                 raise RuntimeError("outbox delivery missing content.text")
+            attachments = content.get("attachments", [])
+            if not isinstance(attachments, list):
+                raise RuntimeError("outbox delivery content.attachments must be an array")
             parsed.append(
                 OutboxDelivery(
                     delivery_id=item["delivery_id"],
@@ -157,7 +170,19 @@ class LionClawApi:
                     conversation_ref=item["conversation_ref"],
                     thread_ref=item.get("thread_ref"),
                     reply_to_ref=item.get("reply_to_ref"),
-                    content=OutboxContent(text=content["text"]),
+                    content=OutboxContent(
+                        text=content["text"],
+                        format_hint=content.get("format_hint") or "markdown",
+                        attachments=[
+                            OutboxAttachment(
+                                attachment_id=attachment["attachment_id"],
+                                path=attachment["path"],
+                                filename=attachment.get("filename"),
+                                mime_type=attachment.get("mime_type"),
+                            )
+                            for attachment in attachments
+                        ],
+                    ),
                 )
             )
         return parsed

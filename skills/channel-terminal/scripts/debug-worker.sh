@@ -236,6 +236,50 @@ ack_stream() {
   lionclaw_post '/v0/channels/stream/ack' "$request" >/dev/null
 }
 
+pull_outbox() {
+  local request
+  request="$(jq -nc \
+    --arg channel_id "$LIONCLAW_CHANNEL_ID" \
+    --arg worker_id "$LIONCLAW_CONSUMER_ID" \
+    --arg conversation_ref "$LIONCLAW_PEER_ID" \
+    '{
+      channel_id: $channel_id,
+      worker_id: $worker_id,
+      conversation_ref: $conversation_ref,
+      limit: 10,
+      lease_ms: 120000
+    }'
+  )"
+
+  lionclaw_post '/v0/channels/outbox/pull' "$request"
+}
+
+report_outbox_delivered() {
+  local delivery_id="$1"
+  local attempt_id="$2"
+  local request
+
+  request="$(jq -nc \
+    --arg channel_id "$LIONCLAW_CHANNEL_ID" \
+    --arg worker_id "$LIONCLAW_CONSUMER_ID" \
+    --arg delivery_id "$delivery_id" \
+    --arg attempt_id "$attempt_id" \
+    '{
+      channel_id: $channel_id,
+      worker_id: $worker_id,
+      delivery_id: $delivery_id,
+      attempt_id: $attempt_id,
+      outcome: "delivered",
+      provider_receipt: {
+        provider: "terminal-debug",
+        rendered: true
+      }
+    }'
+  )"
+
+  lionclaw_post '/v0/channels/outbox/report' "$request" >/dev/null
+}
+
 print_answer_delta() {
   local content="$1"
   local line
@@ -352,11 +396,51 @@ flush_stream_once() {
   return 0
 }
 
+flush_outbox_once() {
+  local outbox_json
+
+  outbox_json="$(pull_outbox)" || {
+    echo "warning: failed to pull channel outbox" >&2
+    return 1
+  }
+
+  if ! jq -e '.deliveries | type == "array"' >/dev/null <<<"$outbox_json"; then
+    echo "warning: invalid channel outbox response: $(jq -c '.' <<<"$outbox_json")" >&2
+    return 1
+  fi
+
+  while IFS= read -r delivery; do
+    local delivery_id
+    local attempt_id
+    local conversation_ref
+    local text
+
+    delivery_id="$(jq -r '.delivery_id' <<<"$delivery")"
+    attempt_id="$(jq -r '.attempt_id' <<<"$delivery")"
+    conversation_ref="$(jq -r '.conversation_ref' <<<"$delivery")"
+    text="$(jq -r '.content.text // empty' <<<"$delivery")"
+
+    if [[ "$conversation_ref" != "$LIONCLAW_PEER_ID" ]]; then
+      echo "warning: terminal outbox delivery for peer '$conversation_ref' reached '$LIONCLAW_PEER_ID'" >&2
+      continue
+    fi
+
+    if [[ -n "$text" ]]; then
+      print_answer_delta "$text"
+    fi
+    report_outbox_delivered "$delivery_id" "$attempt_id" || {
+      echo "warning: failed to report channel outbox delivery $delivery_id" >&2
+      return 1
+    }
+  done < <(jq -c '.deliveries[]?' <<<"$outbox_json")
+}
+
 stream_loop() {
   while true; do
     if ! flush_stream_once; then
       sleep "$LIONCLAW_STREAM_RETRY_SECS"
     fi
+    flush_outbox_once || sleep "$LIONCLAW_STREAM_RETRY_SECS"
   done
 }
 

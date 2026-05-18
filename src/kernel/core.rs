@@ -10,7 +10,7 @@ use std::{
 };
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, Transaction};
 use tokio::{
@@ -27,23 +27,24 @@ use crate::contracts::{
     ChannelAttachmentFinalizeResponse, ChannelAttachmentStageResponse, ChannelAttachmentStatus,
     ChannelBindingView, ChannelGrantResponse, ChannelGrantRevokeRequest,
     ChannelGrantRevokeResponse, ChannelGrantView, ChannelInboundOutcome, ChannelInboundRequest,
-    ChannelInboundResponse, ChannelListResponse, ChannelOutboxAttemptStatusDto,
-    ChannelOutboxContentDto, ChannelOutboxDeliveryStatusDto, ChannelOutboxDeliveryView,
-    ChannelOutboxPullRequest, ChannelOutboxPullResponse, ChannelOutboxReportOutcomeDto,
-    ChannelOutboxReportRequest, ChannelOutboxReportResponse, ChannelPairingApproveRequest,
-    ChannelPairingBlockRequest, ChannelPairingBlockResponse, ChannelPairingClaimOutcome,
-    ChannelPairingClaimRequest, ChannelPairingClaimResponse, ChannelPairingInviteRequest,
-    ChannelPairingInviteResponse, ChannelPairingListResponse, ChannelPairingStatus,
-    ChannelPairingView, ChannelRoutingProfile, ChannelStreamAckRequest, ChannelStreamAckResponse,
-    ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamPullResponse, ChannelTrigger,
-    ContinuityDraftActionRequest, ContinuityDraftDiscardResponse, ContinuityDraftListRequest,
-    ContinuityDraftListResponse, ContinuityDraftPromoteResponse, ContinuityDraftView,
-    ContinuityGetResponse, ContinuityMemoryProposalView, ContinuityOpenLoopActionResponse,
-    ContinuityOpenLoopListResponse, ContinuityOpenLoopView, ContinuityPathRequest,
-    ContinuityProposalActionResponse, ContinuityProposalListResponse, ContinuitySearchMatchView,
-    ContinuitySearchRequest, ContinuitySearchResponse, ContinuityStatusResponse, JobCreateRequest,
-    JobCreateResponse, JobDeliveryTargetDto, JobGetResponse, JobListResponse, JobManualRunResponse,
-    JobRefRequest, JobRemoveResponse, JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto,
+    ChannelInboundResponse, ChannelListResponse, ChannelOutboxAttachmentDto,
+    ChannelOutboxAttemptStatusDto, ChannelOutboxContentDto, ChannelOutboxDeliveryStatusDto,
+    ChannelOutboxDeliveryView, ChannelOutboxPullRequest, ChannelOutboxPullResponse,
+    ChannelOutboxReportOutcomeDto, ChannelOutboxReportRequest, ChannelOutboxReportResponse,
+    ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
+    ChannelPairingClaimOutcome, ChannelPairingClaimRequest, ChannelPairingClaimResponse,
+    ChannelPairingInviteRequest, ChannelPairingInviteResponse, ChannelPairingListResponse,
+    ChannelPairingStatus, ChannelPairingView, ChannelRoutingProfile, ChannelStreamAckRequest,
+    ChannelStreamAckResponse, ChannelStreamEventView, ChannelStreamPullRequest,
+    ChannelStreamPullResponse, ChannelTrigger, ContinuityDraftActionRequest,
+    ContinuityDraftDiscardResponse, ContinuityDraftListRequest, ContinuityDraftListResponse,
+    ContinuityDraftPromoteResponse, ContinuityDraftView, ContinuityGetResponse,
+    ContinuityMemoryProposalView, ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse,
+    ContinuityOpenLoopView, ContinuityPathRequest, ContinuityProposalActionResponse,
+    ContinuityProposalListResponse, ContinuitySearchMatchView, ContinuitySearchRequest,
+    ContinuitySearchResponse, ContinuityStatusResponse, JobCreateRequest, JobCreateResponse,
+    JobDeliveryTargetDto, JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest,
+    JobRemoveResponse, JobRunView, JobRunsRequest, JobRunsResponse, JobScheduleDto,
     JobTickResponse, JobToggleResponse, JobView, PolicyGrantRequest, PolicyGrantResponse,
     PolicyRevokeResponse, SchedulerJobDeliveryStatusDto, SchedulerJobRunStatusDto,
     SchedulerJobTriggerKindDto, SessionActionKind, SessionActionRequest, SessionActionResponse,
@@ -2949,6 +2950,8 @@ impl Kernel {
 
         let channel_id = req.channel_id.trim().to_string();
         let worker_id = req.worker_id.trim().to_string();
+        let conversation_ref = trim_optional_string(req.conversation_ref);
+        let thread_ref = trim_optional_string(req.thread_ref);
         self.require_active_channel_binding(&channel_id).await?;
         let limit = req
             .limit
@@ -2963,6 +2966,8 @@ impl Kernel {
             .pull_due(ChannelOutboxPull {
                 channel_id: channel_id.clone(),
                 worker_id: worker_id.clone(),
+                conversation_ref,
+                thread_ref,
                 limit,
                 lease_ms,
             })
@@ -2975,14 +2980,15 @@ impl Kernel {
                     "channel.outbox.leased",
                     lease.delivery.session_id,
                     Some("api".to_string()),
-                    json!({
-                        "channel_id": lease.delivery.channel_id,
-                        "delivery_id": lease.delivery.delivery_id,
-                        "attempt_id": lease.attempt_id,
-                        "worker_id": &worker_id,
-                        "attempt_count": lease.delivery.attempt_count,
-                        "lease_expires_at": lease.lease_expires_at,
-                    }),
+                    channel_outbox_audit_details(
+                        &lease.delivery,
+                        ChannelOutboxAuditDetails {
+                            attempt_id: Some(lease.attempt_id),
+                            worker_id: Some(&worker_id),
+                            lease_expires_at: Some(lease.lease_expires_at),
+                            ..ChannelOutboxAuditDetails::default()
+                        },
+                    ),
                 )
                 .await
                 .map_err(internal)?;
@@ -3013,12 +3019,16 @@ impl Kernel {
             "provider_receipt",
             MAX_CHANNEL_OUTBOX_RECEIPT_JSON_BYTES,
         )?;
+        let provider_receipt = req.provider_receipt;
+        let audit_provider_receipt = provider_receipt.clone();
         let error_code = trim_optional_string(req.error_code);
         let error_text = trim_optional_limited_string(
             req.error_text,
             "error_text",
             MAX_CHANNEL_OUTBOX_ERROR_TEXT_BYTES,
         )?;
+        let audit_error_code = error_code.clone();
+        let audit_error_text = error_text.clone();
         let outcome = match req.outcome {
             ChannelOutboxReportOutcomeDto::Delivered => ChannelOutboxReportOutcome::Delivered,
             ChannelOutboxReportOutcomeDto::RetryableFailed => {
@@ -3042,7 +3052,7 @@ impl Kernel {
                 channel_id,
                 worker_id: worker_id.clone(),
                 outcome,
-                provider_receipt: req.provider_receipt,
+                provider_receipt,
                 error_code,
                 error_text,
             })
@@ -3064,16 +3074,37 @@ impl Kernel {
                 audit_event,
                 result.delivery.session_id,
                 Some("api".to_string()),
-                json!({
-                    "channel_id": result.delivery.channel_id,
-                    "delivery_id": result.delivery.delivery_id,
-                    "attempt_id": req.attempt_id,
-                    "worker_id": worker_id,
-                    "accepted": result.accepted,
-                    "status": result.delivery.status.as_str(),
-                    "attempt_status": result.attempt_status.as_str(),
-                    "error_code": result.delivery.last_error_code,
-                }),
+                channel_outbox_audit_details(
+                    &result.delivery,
+                    ChannelOutboxAuditDetails {
+                        attempt_id: Some(req.attempt_id),
+                        worker_id: Some(&worker_id),
+                        accepted: Some(result.accepted),
+                        attempt_status: Some(result.attempt_status),
+                        provider_receipt: audit_provider_receipt
+                            .as_ref()
+                            .or(result.delivery.provider_receipt.as_ref()),
+                        error_code: audit_error_code
+                            .as_deref()
+                            .or(result.delivery.last_error_code.as_deref())
+                            .or_else(|| {
+                                (!result.accepted
+                                    && result.attempt_status
+                                        == ChannelOutboxAttemptStatus::StaleRejected)
+                                    .then_some("stale_report")
+                            }),
+                        error_text: audit_error_text
+                            .as_deref()
+                            .or(result.delivery.last_error_text.as_deref())
+                            .or_else(|| {
+                                (!result.accepted
+                                    && result.attempt_status
+                                        == ChannelOutboxAttemptStatus::StaleRejected)
+                                    .then_some("stale outbox report rejected")
+                            }),
+                        ..ChannelOutboxAuditDetails::default()
+                    },
+                ),
             )
             .await
             .map_err(internal)?;
@@ -6301,6 +6332,49 @@ fn validate_optional_json_size(
     Ok(())
 }
 
+#[derive(Default)]
+struct ChannelOutboxAuditDetails<'a> {
+    attempt_id: Option<Uuid>,
+    worker_id: Option<&'a str>,
+    accepted: Option<bool>,
+    attempt_status: Option<ChannelOutboxAttemptStatus>,
+    lease_expires_at: Option<DateTime<Utc>>,
+    provider_receipt: Option<&'a Value>,
+    error_code: Option<&'a str>,
+    error_text: Option<&'a str>,
+}
+
+fn channel_outbox_audit_details(
+    delivery: &ChannelDeliveryRecord,
+    details: ChannelOutboxAuditDetails<'_>,
+) -> Value {
+    json!({
+        "channel_id": &delivery.channel_id,
+        "delivery_id": delivery.delivery_id,
+        "attempt_id": details.attempt_id,
+        "worker_id": details.worker_id,
+        "conversation_ref": &delivery.conversation_ref,
+        "thread_ref": &delivery.thread_ref,
+        "reply_to_ref": &delivery.reply_to_ref,
+        "session_id": delivery.session_id,
+        "turn_id": delivery.turn_id,
+        "source_kind": &delivery.source_kind,
+        "source_id": &delivery.source_id,
+        "status": delivery.status.as_str(),
+        "attempt_status": details.attempt_status.map(ChannelOutboxAttemptStatus::as_str),
+        "accepted": details.accepted,
+        "attempt_count": delivery.attempt_count,
+        "lease_expires_at": details.lease_expires_at,
+        "next_attempt_at": delivery.next_attempt_at,
+        "provider_receipt": details.provider_receipt,
+        "error_code": details.error_code,
+        "error_text": details.error_text,
+        "content_format_hint": &delivery.content.format_hint,
+        "content_attachment_count": delivery.content.attachments.len(),
+        "content_text_len": delivery.content.text.len(),
+    })
+}
+
 fn to_channel_outbox_delivery_view(lease: ChannelDeliveryLease) -> ChannelOutboxDeliveryView {
     ChannelOutboxDeliveryView {
         delivery_id: lease.delivery.delivery_id,
@@ -6313,6 +6387,19 @@ fn to_channel_outbox_delivery_view(lease: ChannelDeliveryLease) -> ChannelOutbox
         turn_id: lease.delivery.turn_id,
         content: ChannelOutboxContentDto {
             text: lease.delivery.content.text,
+            format_hint: lease.delivery.content.format_hint,
+            attachments: lease
+                .delivery
+                .content
+                .attachments
+                .into_iter()
+                .map(|attachment| ChannelOutboxAttachmentDto {
+                    attachment_id: attachment.attachment_id,
+                    path: attachment.path,
+                    filename: attachment.filename,
+                    mime_type: attachment.mime_type,
+                })
+                .collect(),
         },
         attempt_count: lease.delivery.attempt_count,
         lease_expires_at: lease.lease_expires_at,
@@ -9650,6 +9737,8 @@ impl Kernel {
                 source_id,
                 content: ChannelDeliveryContent {
                     text: content.to_string(),
+                    format_hint: "markdown".to_string(),
+                    attachments: Vec::new(),
                 },
             })
             .await
@@ -9660,17 +9749,7 @@ impl Kernel {
                 "channel.outbox.created",
                 session_id,
                 Some("kernel".to_string()),
-                json!({
-                    "channel_id": delivery.channel_id,
-                    "conversation_ref": delivery.conversation_ref,
-                    "thread_ref": delivery.thread_ref,
-                    "reply_to_ref": delivery.reply_to_ref,
-                    "delivery_id": delivery.delivery_id,
-                    "turn_id": turn_id,
-                    "source_kind": delivery.source_kind,
-                    "source_id": delivery.source_id,
-                    "content_len": delivery.content.text.len(),
-                }),
+                channel_outbox_audit_details(&delivery, ChannelOutboxAuditDetails::default()),
             )
             .await
             .map_err(internal)?;

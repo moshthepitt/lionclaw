@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS channel_outbox_messages (
 CREATE INDEX IF NOT EXISTS idx_channel_outbox_due
     ON channel_outbox_messages(channel_id, status, next_attempt_at_ms, created_at_ms);
 
+CREATE INDEX IF NOT EXISTS idx_channel_outbox_conversation_due
+    ON channel_outbox_messages(channel_id, conversation_ref, status, next_attempt_at_ms, created_at_ms);
+
 CREATE INDEX IF NOT EXISTS idx_channel_outbox_lease_expiry
     ON channel_outbox_messages(channel_id, status, lease_expires_at_ms);
 
