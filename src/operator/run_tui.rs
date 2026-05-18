@@ -1681,13 +1681,7 @@ fn render_instances(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
     let content = render_panel_shell(frame, area, "Transcript", app.focus == Focus::Transcript);
     if let SelectedInstanceState::Blocked { blocker, .. } = &app.selected {
-        let text = Text::from(vec![
-            Line::styled(&blocker.title, Style::default().fg(PANEL_ERROR)),
-            Line::raw(""),
-            Line::raw(&blocker.detail),
-            Line::raw(""),
-            Line::raw(&blocker.suggestion),
-        ]);
+        let text = Text::from(launch_blocker_lines(blocker));
         frame.render_widget(
             Paragraph::new(text).wrap(Wrap { trim: false }),
             content.inner(Margin {
@@ -1777,6 +1771,27 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
     }
 }
 
+fn launch_blocker_lines(blocker: &LaunchBlocker) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::styled(blocker.title.clone(), Style::default().fg(PANEL_ERROR)),
+        Line::raw(""),
+    ];
+    lines.extend(multiline_prefixed_lines(
+        "",
+        "",
+        Style::default().fg(Color::White),
+        &blocker.detail,
+    ));
+    lines.push(Line::raw(""));
+    lines.extend(multiline_prefixed_lines(
+        "",
+        "",
+        Style::default().fg(Color::White),
+        &blocker.suggestion,
+    ));
+    lines
+}
+
 pub(crate) fn transcript_render_lines(lines: &[TranscriptLine]) -> Vec<Line<'static>> {
     let mut rendered = Vec::new();
     for (index, line) in lines.iter().enumerate() {
@@ -1800,7 +1815,8 @@ pub(crate) fn transcript_render_lines(lines: &[TranscriptLine]) -> Vec<Line<'sta
             TranscriptLineKind::Error => ("error", Style::default().fg(PANEL_ERROR)),
         };
         rendered.push(Line::styled(role.to_string(), style));
-        rendered.extend(split_render_line(
+        rendered.extend(multiline_prefixed_lines(
+            "",
             "",
             Style::default().fg(Color::White),
             &line.text,
@@ -1835,14 +1851,28 @@ fn render_transcript_scrollbar(
     frame.render_stateful_widget(scrollbar, area, &mut state);
 }
 
-fn split_render_line(prefix: &str, style: Style, text: &str) -> Vec<Line<'static>> {
+fn multiline_prefixed_lines(
+    first_prefix: &str,
+    continuation_prefix: &str,
+    prefix_style: Style,
+    text: &str,
+) -> Vec<Line<'static>> {
     if text.is_empty() {
-        return vec![Line::from(vec![Span::styled(prefix.to_string(), style)])];
+        return vec![Line::from(vec![Span::styled(
+            first_prefix.to_string(),
+            prefix_style,
+        )])];
     }
     text.lines()
-        .map(|line| {
+        .enumerate()
+        .map(|(index, line)| {
+            let prefix = if index == 0 {
+                first_prefix
+            } else {
+                continuation_prefix
+            };
             Line::from(vec![
-                Span::styled(prefix.to_string(), style),
+                Span::styled(prefix.to_string(), prefix_style),
                 Span::raw(line.to_string()),
             ])
         })
@@ -2033,7 +2063,7 @@ fn render_activity_inspector(frame: &mut Frame<'_>, content: Rect, app: &Console
         }
         lines.push(Line::raw(""));
         for item in &app.activity.items {
-            lines.push(activity_item_line(item));
+            lines.extend(activity_item_lines(item));
         }
     }
 
@@ -2264,7 +2294,7 @@ fn kv_arrow_line(left: &'static str, middle: &'static str, right: &str) -> Line<
     ])
 }
 
-fn activity_item_line(item: &ActivityItem) -> Line<'static> {
+fn activity_item_lines(item: &ActivityItem) -> Vec<Line<'static>> {
     let (icon, style) = match item.kind {
         ActivityItemKind::Done => ("✓", Style::default().fg(PANEL_READY)),
         ActivityItemKind::Command => ("→", Style::default().fg(PANEL_BORDER)),
@@ -2272,10 +2302,7 @@ fn activity_item_line(item: &ActivityItem) -> Line<'static> {
         ActivityItemKind::Status => ("→", Style::default().fg(PANEL_MUTED)),
         ActivityItemKind::Error => ("!", Style::default().fg(PANEL_ERROR)),
     };
-    Line::from(vec![
-        Span::styled(format!("{icon}  "), style),
-        Span::raw(item.text.clone()),
-    ])
+    multiline_prefixed_lines(&format!("{icon}  "), "   ", style, &item.text)
 }
 
 fn check_line(label: &'static str) -> Line<'static> {
@@ -2602,6 +2629,47 @@ mod tests {
         assert!(rendered.contains("Transcript"));
         assert!(rendered.contains("Launch blocked for main"));
         assert!(rendered.contains("missing runtime"));
+    }
+
+    #[test]
+    fn launch_blocker_rendering_preserves_embedded_newlines() {
+        let mut app = blocked_test_app();
+        let summary = app.selected.summary().clone();
+        app.selected = SelectedInstanceState::Blocked {
+            summary,
+            blocker: LaunchBlocker::for_instance(
+                "main",
+                "no default runtime configured for instance \"main\"\nRun:\n  lionclaw configure --runtime codex",
+            ),
+        };
+        app.focus = Focus::Transcript;
+
+        let rendered = render_to_text(&mut app, 120, 30);
+
+        assert!(rendered.contains("no default runtime configured"));
+        assert!(rendered.contains("\"main\""));
+        assert!(rendered.contains("Run:"));
+        assert!(rendered.contains("lionclaw configure --runtime codex"));
+        assert!(!rendered.contains("\"main\"Run:"));
+    }
+
+    #[test]
+    fn activity_items_render_multiline_text_with_continuation_indent() {
+        let lines = activity_item_lines(&ActivityItem {
+            kind: ActivityItemKind::Command,
+            text: "ran cargo test\nexit 0".to_string(),
+        });
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered, vec!["→  ran cargo test", "   exit 0"]);
     }
 
     #[tokio::test]
