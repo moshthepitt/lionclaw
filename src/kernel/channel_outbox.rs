@@ -379,15 +379,17 @@ impl ChannelOutboxStore {
             let attempt_status = if attempt.status == ChannelOutboxAttemptStatus::Leased {
                 self.finish_attempt(
                     &mut tx,
-                    report.attempt_id,
-                    ChannelOutboxAttemptStatus::StaleRejected,
-                    report.provider_receipt.as_ref(),
-                    report.error_code.as_deref().or(Some("stale_report")),
-                    report
-                        .error_text
-                        .as_deref()
-                        .or(Some("stale outbox report rejected")),
-                    now,
+                    ChannelOutboxAttemptFinish {
+                        attempt_id: report.attempt_id,
+                        status: ChannelOutboxAttemptStatus::StaleRejected,
+                        provider_receipt: report.provider_receipt.as_ref(),
+                        error_code: report.error_code.as_deref().or(Some("stale_report")),
+                        error_text: report
+                            .error_text
+                            .as_deref()
+                            .or(Some("stale outbox report rejected")),
+                        finished_at_ms: now,
+                    },
                 )
                 .await?;
                 ChannelOutboxAttemptStatus::StaleRejected
@@ -427,12 +429,14 @@ impl ChannelOutboxStore {
                 .context("failed to mark channel outbox delivery delivered")?;
                 self.finish_attempt(
                     &mut tx,
-                    report.attempt_id,
-                    ChannelOutboxAttemptStatus::Delivered,
-                    report.provider_receipt.as_ref(),
-                    None,
-                    None,
-                    now,
+                    ChannelOutboxAttemptFinish {
+                        attempt_id: report.attempt_id,
+                        status: ChannelOutboxAttemptStatus::Delivered,
+                        provider_receipt: report.provider_receipt.as_ref(),
+                        error_code: None,
+                        error_text: None,
+                        finished_at_ms: now,
+                    },
                 )
                 .await?;
             }
@@ -455,12 +459,14 @@ impl ChannelOutboxStore {
                 .context("failed to reschedule channel outbox delivery")?;
                 self.finish_attempt(
                     &mut tx,
-                    report.attempt_id,
-                    ChannelOutboxAttemptStatus::RetryableFailed,
-                    report.provider_receipt.as_ref(),
-                    report.error_code.as_deref(),
-                    report.error_text.as_deref(),
-                    now,
+                    ChannelOutboxAttemptFinish {
+                        attempt_id: report.attempt_id,
+                        status: ChannelOutboxAttemptStatus::RetryableFailed,
+                        provider_receipt: report.provider_receipt.as_ref(),
+                        error_code: report.error_code.as_deref(),
+                        error_text: report.error_text.as_deref(),
+                        finished_at_ms: now,
+                    },
                 )
                 .await?;
             }
@@ -481,12 +487,14 @@ impl ChannelOutboxStore {
                 .context("failed to mark channel outbox delivery failed")?;
                 self.finish_attempt(
                     &mut tx,
-                    report.attempt_id,
-                    ChannelOutboxAttemptStatus::TerminalFailed,
-                    report.provider_receipt.as_ref(),
-                    report.error_code.as_deref(),
-                    report.error_text.as_deref(),
-                    now,
+                    ChannelOutboxAttemptFinish {
+                        attempt_id: report.attempt_id,
+                        status: ChannelOutboxAttemptStatus::TerminalFailed,
+                        provider_receipt: report.provider_receipt.as_ref(),
+                        error_code: report.error_code.as_deref(),
+                        error_text: report.error_text.as_deref(),
+                        finished_at_ms: now,
+                    },
                 )
                 .await?;
             }
@@ -562,25 +570,20 @@ impl ChannelOutboxStore {
     async fn finish_attempt(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
-        attempt_id: Uuid,
-        status: ChannelOutboxAttemptStatus,
-        provider_receipt: Option<&Value>,
-        error_code: Option<&str>,
-        error_text: Option<&str>,
-        finished_at_ms: i64,
+        finish: ChannelOutboxAttemptFinish<'_>,
     ) -> Result<()> {
-        let provider_receipt_json = encode_optional_json(provider_receipt)?;
+        let provider_receipt_json = encode_optional_json(finish.provider_receipt)?;
         sqlx::query(
             "UPDATE channel_outbox_attempts \
              SET status = ?2, provider_receipt_json = ?3, error_code = ?4, error_text = ?5, finished_at_ms = ?6 \
              WHERE attempt_id = ?1",
         )
-        .bind(attempt_id.to_string())
-        .bind(status.as_str())
+        .bind(finish.attempt_id.to_string())
+        .bind(finish.status.as_str())
         .bind(provider_receipt_json.as_deref())
-        .bind(error_code)
-        .bind(error_text)
-        .bind(finished_at_ms)
+        .bind(finish.error_code)
+        .bind(finish.error_text)
+        .bind(finish.finished_at_ms)
         .execute(&mut **tx)
         .await
         .context("failed to finish channel outbox attempt")?;
@@ -594,6 +597,15 @@ struct ChannelOutboxAttemptRecord {
     channel_id: String,
     worker_id: String,
     status: ChannelOutboxAttemptStatus,
+}
+
+struct ChannelOutboxAttemptFinish<'a> {
+    attempt_id: Uuid,
+    status: ChannelOutboxAttemptStatus,
+    provider_receipt: Option<&'a Value>,
+    error_code: Option<&'a str>,
+    error_text: Option<&'a str>,
+    finished_at_ms: i64,
 }
 
 fn retry_delay_ms(attempt_count: u32) -> i64 {
