@@ -94,8 +94,8 @@ Expected on a TTY:
   runtime event spam
 - the inspector shows selected instance details, and `Ctrl+O` toggles runtime
   activity details
-- the composer accepts printable characters such as `?`; `F1` opens help and
-  `Tab` visibly moves focus
+- the composer accepts printable characters such as `?`; `Tab` visibly moves
+  focus, and `Ctrl+D` exits when idle
 
 For the plain fallback:
 

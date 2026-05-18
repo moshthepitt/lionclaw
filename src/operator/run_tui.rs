@@ -33,9 +33,9 @@ use uuid::Uuid;
 
 use crate::{
     contracts::{
-        ContinuityDraftListRequest, SessionActionKind, SessionActionRequest, SessionHistoryRequest,
-        SessionTurnRequest, SessionTurnResponse, SessionTurnStatus, SessionTurnView,
-        StreamEventDto, StreamEventKindDto, StreamLaneDto,
+        SessionActionKind, SessionActionRequest, SessionHistoryRequest, SessionTurnRequest,
+        SessionTurnResponse, SessionTurnStatus, SessionTurnView, StreamEventDto,
+        StreamEventKindDto, StreamLaneDto,
     },
     home::LionClawHome,
     kernel::{
@@ -76,7 +76,6 @@ const COMPOSER_MAX_HEIGHT: u16 = 12;
 const COMPOSER_CHROME_HEIGHT: u16 = 4;
 const LOCAL_CLI_CHANNEL_ID: &str = "local-cli";
 const PROJECT_SESSION_LIMIT: usize = 5;
-const PROJECT_DRAFT_LIMIT: usize = 5;
 const ACTIVITY_ERROR_MARKERS: &[&str] = &["error", "failed", "denied"];
 const ACTIVITY_DONE_MARKERS: &[&str] = &[
     "completed",
@@ -521,23 +520,6 @@ impl ProjectSessionItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ProjectDraftItem {
-    relative_path: String,
-    size_bytes: u64,
-    media_type: String,
-}
-
-impl ProjectDraftItem {
-    fn detail(&self) -> String {
-        format!(
-            "{} {}",
-            compact_media_type(&self.media_type),
-            compact_byte_count(self.size_bytes)
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 enum ProjectObjectSection<T> {
     Ready(Vec<T>),
     Empty(String),
@@ -558,31 +540,102 @@ impl<T> ProjectObjectSection<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProjectObjects {
     sessions: ProjectObjectSection<ProjectSessionItem>,
-    drafts: ProjectObjectSection<ProjectDraftItem>,
 }
 
 impl Default for ProjectObjects {
     fn default() -> Self {
         Self {
             sessions: ProjectObjectSection::Empty("No sessions yet".to_string()),
-            drafts: ProjectObjectSection::Empty("No drafts yet".to_string()),
         }
     }
 }
 
 impl ProjectObjects {
     fn unavailable(message: impl Into<String>) -> Self {
-        let message = message.into();
         Self {
-            sessions: ProjectObjectSection::Unavailable(message.clone()),
-            drafts: ProjectObjectSection::Unavailable(message),
+            sessions: ProjectObjectSection::Unavailable(message.into()),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectSelection {
+    Instance(usize),
+    Session(Uuid),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeyHint {
+    key: &'static str,
+    label: &'static str,
+    description: &'static str,
+}
+
+impl KeyHint {
+    const fn new(key: &'static str, label: &'static str, description: &'static str) -> Self {
+        Self {
+            key,
+            label,
+            description,
+        }
+    }
+}
+
+const FOOTER_KEY_HINTS: &[KeyHint] = &[
+    KeyHint::new("F1", "Help", "open help"),
+    KeyHint::new("Ctrl+P", "Palette", "open command palette"),
+    KeyHint::new("Tab", "Focus", "move focus"),
+    KeyHint::new("Ctrl+C", "Interrupt", "interrupt active turn"),
+    KeyHint::new("Ctrl+D", "Exit", "exit when idle"),
+];
+
+const HELP_GLOBAL_KEY_HINTS: &[KeyHint] = &[
+    KeyHint::new("F1", "Help", "open help"),
+    KeyHint::new("Ctrl+P", "Palette", "open command palette"),
+    KeyHint::new("Tab", "Next focus", "move focus to the next pane"),
+    KeyHint::new(
+        "Shift+Tab",
+        "Previous focus",
+        "move focus to the previous pane",
+    ),
+    KeyHint::new(
+        "Ctrl+C",
+        "Interrupt",
+        "interrupt an active turn; confirm exit when idle",
+    ),
+    KeyHint::new("Ctrl+D", "Exit", "exit when idle"),
+];
+
+const HELP_CONTEXT_KEY_HINTS: &[KeyHint] = &[
+    KeyHint::new(
+        "Enter",
+        "Submit / Open",
+        "submit the composer or activate a project item",
+    ),
+    KeyHint::new("Ctrl+O", "Activity", "toggle the activity inspector"),
+    KeyHint::new("Shift+Enter", "Newline", "insert a composer newline"),
+    KeyHint::new("Alt+Enter", "Newline", "insert a composer newline"),
+    KeyHint::new(
+        "Up / Down",
+        "Move",
+        "scroll the focused pane or move the project cursor",
+    ),
+    KeyHint::new(
+        "PageUp / PageDown",
+        "Page",
+        "scroll the focused pane by a page",
+    ),
+    KeyHint::new(
+        "Home / End",
+        "Bounds",
+        "jump to the top or bottom of a scrollable pane",
+    ),
+    KeyHint::new("Esc", "Cancel", "close overlays or clear the composer"),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Focus {
-    Instances,
+    Project,
     Transcript,
     Composer,
     Inspectors,
@@ -591,7 +644,7 @@ pub(crate) enum Focus {
 impl Focus {
     fn label(self) -> &'static str {
         match self {
-            Self::Instances => "instances",
+            Self::Project => "project",
             Self::Transcript => "transcript",
             Self::Composer => "composer",
             Self::Inspectors => "inspector",
@@ -600,18 +653,18 @@ impl Focus {
 
     fn next(self, project_mode: bool) -> Self {
         match (self, project_mode) {
-            (Self::Instances, _) => Self::Transcript,
+            (Self::Project, _) => Self::Transcript,
             (Self::Transcript, _) => Self::Composer,
             (Self::Composer, _) => Self::Inspectors,
-            (Self::Inspectors, true) => Self::Instances,
+            (Self::Inspectors, true) => Self::Project,
             (Self::Inspectors, false) => Self::Transcript,
         }
     }
 
     fn previous(self, project_mode: bool) -> Self {
         match (self, project_mode) {
-            (Self::Instances, _) => Self::Inspectors,
-            (Self::Transcript, true) => Self::Instances,
+            (Self::Project, _) => Self::Inspectors,
+            (Self::Transcript, true) => Self::Project,
             (Self::Transcript, false) => Self::Inspectors,
             (Self::Composer, _) => Self::Transcript,
             (Self::Inspectors, _) => Self::Composer,
@@ -625,6 +678,7 @@ enum Overlay {
     Palette,
     ExitConfirm,
     InstanceSwitchConfirm { target_index: usize },
+    SessionSwitchConfirm { session_id: Uuid },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -724,6 +778,7 @@ pub(crate) struct ConsoleApp {
     selected_index: usize,
     selected: SelectedInstanceState,
     project_objects: ProjectObjects,
+    project_cursor: ProjectSelection,
     project_list_state: ListState,
     continue_last_session: bool,
     timeout_override: Option<RuntimeTurnTimeouts>,
@@ -766,14 +821,11 @@ impl ConsoleApp {
             selected_index,
             selected,
             project_objects,
+            project_cursor: ProjectSelection::Instance(selected_index),
             project_list_state: ListState::default(),
             continue_last_session: invocation.continue_last_session,
             timeout_override: invocation.timeout_override,
-            focus: if target.project_root.is_some() {
-                Focus::Instances
-            } else {
-                Focus::Composer
-            },
+            focus: Focus::Composer,
             overlay: None,
             composer: ConsoleComposer::new(),
             transcript: Vec::new(),
@@ -797,6 +849,75 @@ impl ConsoleApp {
 
     fn active(&self) -> bool {
         self.active_turn.is_some()
+    }
+
+    fn project_selections(&self) -> Vec<ProjectSelection> {
+        let mut selections = (0..self.instances.len())
+            .map(ProjectSelection::Instance)
+            .collect::<Vec<_>>();
+        if let ProjectObjectSection::Ready(sessions) = &self.project_objects.sessions {
+            selections.extend(
+                sessions
+                    .iter()
+                    .map(|session| ProjectSelection::Session(session.session_id)),
+            );
+        }
+        selections
+    }
+
+    fn project_cursor_label(&self) -> String {
+        match self.project_cursor {
+            ProjectSelection::Instance(index) => self
+                .instances
+                .get(index)
+                .map(|instance| format!("instance {}", instance.display_name()))
+                .unwrap_or_else(|| "project item".to_string()),
+            ProjectSelection::Session(session_id) => self
+                .project_session(session_id)
+                .map(|session| format!("session {}", session.label()))
+                .unwrap_or_else(|| format!("session {}", short_session_id(session_id))),
+        }
+    }
+
+    fn ensure_project_cursor(&mut self) {
+        let selections = self.project_selections();
+        if selections.contains(&self.project_cursor) {
+            return;
+        }
+        let fallback_index = self
+            .selected_index
+            .min(self.instances.len().saturating_sub(1));
+        self.project_cursor = ProjectSelection::Instance(fallback_index);
+    }
+
+    fn move_project_cursor(&mut self, delta: isize) {
+        let selections = self.project_selections();
+        if selections.is_empty() {
+            return;
+        }
+        let current = selections
+            .iter()
+            .position(|selection| *selection == self.project_cursor)
+            .unwrap_or_else(|| {
+                selections
+                    .iter()
+                    .position(|selection| {
+                        *selection == ProjectSelection::Instance(self.selected_index)
+                    })
+                    .unwrap_or(0)
+            });
+        let next = if delta < 0 {
+            current.saturating_sub((-delta) as usize)
+        } else {
+            current
+                .saturating_add(delta as usize)
+                .min(selections.len() - 1)
+        };
+        let Some(selection) = selections.get(next).copied() else {
+            return;
+        };
+        self.project_cursor = selection;
+        self.status = format!("project: {}", self.project_cursor_label());
     }
 
     fn scroll_transcript_up(&mut self, amount: usize) {
@@ -910,12 +1031,24 @@ impl ConsoleApp {
         }
     }
 
+    async fn activate_project_cursor(&mut self) {
+        self.ensure_project_cursor();
+        match self.project_cursor {
+            ProjectSelection::Instance(index) => self.request_instance_switch(index),
+            ProjectSelection::Session(session_id) => self.request_session_switch(session_id).await,
+        }
+    }
+
     fn request_instance_switch(&mut self, next_index: usize) {
         if self.active() {
             self.status = "finish the active turn before switching instances".to_string();
             return;
         }
-        if next_index >= self.instances.len() || next_index == self.selected_index {
+        if next_index >= self.instances.len() {
+            return;
+        }
+        if next_index == self.selected_index {
+            self.status = format!("already on {}", self.selected_name());
             return;
         }
 
@@ -930,6 +1063,32 @@ impl ConsoleApp {
         self.status = format!("confirm switch to {target_name}");
     }
 
+    async fn request_session_switch(&mut self, session_id: Uuid) {
+        if self.active() {
+            self.status = "finish the active turn before switching sessions".to_string();
+            return;
+        }
+        let Some(ready) = self.ready_instance() else {
+            self.status = "launch is blocked for the selected instance".to_string();
+            return;
+        };
+        if ready.session_id == session_id {
+            self.status = "already on this session".to_string();
+            return;
+        }
+        if self.project_session(session_id).is_none() {
+            self.status = "session is no longer available".to_string();
+            self.ensure_project_cursor();
+            return;
+        }
+        if !self.composer.text().trim().is_empty() {
+            self.overlay = Some(Overlay::SessionSwitchConfirm { session_id });
+            self.status = "confirm session switch".to_string();
+            return;
+        }
+        self.switch_selected_session(session_id, false).await;
+    }
+
     async fn switch_selected_confirmed(&mut self, next_index: usize) {
         if self.active() {
             self.status = "finish the active turn before switching instances".to_string();
@@ -940,6 +1099,7 @@ impl ConsoleApp {
         }
 
         self.selected_index = next_index;
+        self.project_cursor = ProjectSelection::Instance(next_index);
         let summary = self
             .instances
             .get(next_index)
@@ -966,8 +1126,54 @@ impl ConsoleApp {
         self.load_selected_history().await;
     }
 
+    async fn switch_selected_session(&mut self, session_id: Uuid, clear_composer: bool) {
+        if self.active() {
+            self.status = "finish the active turn before switching sessions".to_string();
+            return;
+        }
+        let Some(session) = self.project_session(session_id).cloned() else {
+            self.status = "session is no longer available".to_string();
+            self.ensure_project_cursor();
+            return;
+        };
+        let SelectedInstanceState::Ready(ready) = &mut self.selected else {
+            self.status = "launch is blocked for the selected instance".to_string();
+            return;
+        };
+        if ready.session_id == session_id {
+            self.status = "already on this session".to_string();
+            return;
+        }
+
+        ready.session_id = session_id;
+        if clear_composer {
+            self.composer.clear();
+        }
+        self.transcript.clear();
+        self.transcript_scroll.reset_top();
+        self.activity = ActivitySummary::new();
+        self.activity_scroll.reset_tail();
+        self.inspector_mode = InspectorMode::Instance;
+        self.refresh_project_objects().await;
+        self.project_cursor = ProjectSelection::Session(session_id);
+        self.load_selected_history().await;
+        self.status = format!("selected session {}", session.label());
+    }
+
     async fn refresh_project_objects(&mut self) {
         self.project_objects = load_project_objects(&self.selected).await;
+        self.ensure_project_cursor();
+    }
+
+    fn project_session(&self, session_id: Uuid) -> Option<&ProjectSessionItem> {
+        match &self.project_objects.sessions {
+            ProjectObjectSection::Ready(sessions) => sessions
+                .iter()
+                .find(|session| session.session_id == session_id),
+            ProjectObjectSection::Empty(_)
+            | ProjectObjectSection::Unavailable(_)
+            | ProjectObjectSection::Error(_) => None,
+        }
     }
 
     async fn load_selected_history(&mut self) {
@@ -1311,7 +1517,6 @@ async fn load_project_objects(selected: &SelectedInstanceState) -> ProjectObject
 
     ProjectObjects {
         sessions: load_project_sessions(ready).await,
-        drafts: load_project_drafts(ready).await,
     }
 }
 
@@ -1358,31 +1563,6 @@ fn project_session_items(
     }
     items.truncate(PROJECT_SESSION_LIMIT);
     items
-}
-
-async fn load_project_drafts(ready: &ReadyInstance) -> ProjectObjectSection<ProjectDraftItem> {
-    match ready
-        .kernel
-        .list_continuity_drafts(ContinuityDraftListRequest {
-            runtime_id: Some(ready.runtime_id.clone()),
-        })
-        .await
-    {
-        Ok(response) => ProjectObjectSection::ready(
-            response
-                .drafts
-                .into_iter()
-                .take(PROJECT_DRAFT_LIMIT)
-                .map(|draft| ProjectDraftItem {
-                    relative_path: draft.relative_path,
-                    size_bytes: draft.size_bytes,
-                    media_type: draft.media_type,
-                })
-                .collect(),
-            "No drafts yet",
-        ),
-        Err(err) => ProjectObjectSection::Error(format!("Drafts unavailable: {err}")),
-    }
 }
 
 async fn try_open_selected_instance(
@@ -1700,6 +1880,7 @@ pub(crate) async fn run_launch_blocker(blocker: LaunchBlocker) -> Result<()> {
         selected_index: 0,
         selected: SelectedInstanceState::Blocked { summary, blocker },
         project_objects: ProjectObjects::unavailable("No configured instances"),
+        project_cursor: ProjectSelection::Instance(0),
         project_list_state: ListState::default(),
         continue_last_session: false,
         timeout_override: None,
@@ -1739,10 +1920,11 @@ pub(crate) async fn run_project_launch_blocker(
         selected_index: 0,
         selected: SelectedInstanceState::Blocked { summary, blocker },
         project_objects: ProjectObjects::unavailable("No configured instances"),
+        project_cursor: ProjectSelection::Instance(0),
         project_list_state: ListState::default(),
         continue_last_session: false,
         timeout_override: None,
-        focus: Focus::Instances,
+        focus: Focus::Composer,
         overlay: None,
         composer: ConsoleComposer::new(),
         transcript: Vec::new(),
@@ -1876,8 +2058,11 @@ async fn handle_key(
             app.composer.clear();
             app.status = "composer cleared".to_string();
         }
+        (KeyCode::Enter, _) if app.focus == Focus::Project => {
+            app.activate_project_cursor().await;
+        }
         (KeyCode::Enter, _) => app.submit_composer(backend_tx),
-        (KeyCode::Char('d'), KeyModifiers::CONTROL) | (KeyCode::F(10), _) => {
+        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
             if app.active() {
                 app.status = "finish the active turn before exiting".to_string();
             } else {
@@ -1898,13 +2083,11 @@ async fn handle_key(
                 app.overlay = Some(Overlay::ExitConfirm);
             }
         }
-        (KeyCode::Up, _) if app.focus == Focus::Instances => {
-            let next = app.selected_index.saturating_sub(1);
-            app.request_instance_switch(next);
+        (KeyCode::Up, _) if app.focus == Focus::Project => {
+            app.move_project_cursor(-1);
         }
-        (KeyCode::Down, _) if app.focus == Focus::Instances => {
-            let next = app.selected_index.saturating_add(1);
-            app.request_instance_switch(next);
+        (KeyCode::Down, _) if app.focus == Focus::Project => {
+            app.move_project_cursor(1);
         }
         (KeyCode::Up, _) if app.focus == Focus::Transcript => {
             app.scroll_transcript_up(1);
@@ -1997,6 +2180,19 @@ async fn handle_overlay_key(app: &mut ConsoleApp, key: KeyEvent) {
             | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 app.overlay = None;
                 app.status = "instance switch cancelled".to_string();
+            }
+            _ => {}
+        },
+        Some(Overlay::SessionSwitchConfirm { session_id }) => match (key.code, key.modifiers) {
+            (KeyCode::Char('y'), KeyModifiers::NONE) => {
+                app.overlay = None;
+                app.switch_selected_session(session_id, true).await;
+            }
+            (KeyCode::Esc | KeyCode::Enter, _)
+            | (KeyCode::Char('n'), KeyModifiers::NONE)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                app.overlay = None;
+                app.status = "session switch cancelled".to_string();
             }
             _ => {}
         },
@@ -2128,74 +2324,94 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
     }
 }
 
-fn project_list_items(app: &ConsoleApp, width: usize) -> (Vec<ListItem<'static>>, Option<usize>) {
-    let mut items = Vec::new();
-    let mut selected_row = None;
+struct ProjectListRow {
+    item: ListItem<'static>,
+    selection: Option<ProjectSelection>,
+}
 
-    items.push(ListItem::new(Line::styled(
+fn project_list_rows(app: &ConsoleApp, width: usize) -> Vec<ProjectListRow> {
+    let mut rows = Vec::new();
+
+    rows.push(project_list_heading(
         "Instances",
         Style::default().fg(Color::White),
-    )));
-    items.push(ListItem::new(Line::raw("")));
+    ));
+    rows.push(project_list_spacer());
 
     for (index, instance) in app.instances.iter().enumerate() {
-        let selected = index == app.selected_index;
-        if selected {
-            selected_row = Some(items.len());
-        }
-        items.push(ListItem::new(instance_project_line(
-            instance,
-            selected,
-            app.selected.is_ready(),
-            width,
-        )));
+        rows.push(project_list_selection_row(
+            instance_project_line(
+                instance,
+                index == app.selected_index,
+                app.selected.is_ready(),
+                width,
+            ),
+            ProjectSelection::Instance(index),
+        ));
     }
 
-    items.push(ListItem::new(Line::raw("")));
-    items.push(ListItem::new(Line::styled(
+    rows.push(project_list_spacer());
+    rows.push(project_list_heading(
         "─".repeat(width),
         Style::default().fg(PANEL_MUTED),
-    )));
-    items.push(ListItem::new(Line::raw("")));
-    items.push(ListItem::new(Line::styled(
+    ));
+    rows.push(project_list_spacer());
+    rows.push(project_list_heading(
         "Sessions",
         Style::default().fg(Color::White),
-    )));
-    items.push(ListItem::new(Line::raw("")));
-    push_project_section_items(
-        &mut items,
-        &app.project_objects.sessions,
-        |session| project_object_line(&session.label(), &session.detail(), false, width),
-        width,
-    );
+    ));
+    rows.push(project_list_spacer());
+    push_project_session_rows(&mut rows, &app.project_objects.sessions, width);
 
-    items.push(ListItem::new(Line::raw("")));
-    items.push(ListItem::new(Line::styled(
-        "Drafts",
-        Style::default().fg(Color::White),
-    )));
-    items.push(ListItem::new(Line::raw("")));
-    push_project_section_items(
-        &mut items,
-        &app.project_objects.drafts,
-        |draft| project_object_line(&draft.relative_path, &draft.detail(), false, width),
-        width,
-    );
+    rows
+}
 
-    (items, selected_row)
+fn project_list_heading(text: impl Into<String>, style: Style) -> ProjectListRow {
+    ProjectListRow {
+        item: ListItem::new(Line::styled(text.into(), style)),
+        selection: None,
+    }
+}
+
+fn project_list_static_row(line: Line<'static>) -> ProjectListRow {
+    ProjectListRow {
+        item: ListItem::new(line),
+        selection: None,
+    }
+}
+
+fn project_list_spacer() -> ProjectListRow {
+    ProjectListRow {
+        item: ListItem::new(Line::raw("")),
+        selection: None,
+    }
+}
+
+fn project_list_selection_row(line: Line<'static>, selection: ProjectSelection) -> ProjectListRow {
+    ProjectListRow {
+        item: ListItem::new(line),
+        selection: Some(selection),
+    }
+}
+
+fn project_list_selected_row(
+    rows: &[ProjectListRow],
+    selection: ProjectSelection,
+) -> Option<usize> {
+    rows.iter().position(|row| row.selection == Some(selection))
 }
 
 fn instance_project_line(
     instance: &InstanceSummary,
-    selected: bool,
+    active: bool,
     selected_ready: bool,
     width: usize,
 ) -> Line<'static> {
-    let selected_blocked = selected && !selected_ready;
+    let selected_blocked = active && !selected_ready;
     let blocked = instance.work_root_finding.is_some() || selected_blocked;
     let icon = if blocked {
         "!"
-    } else if selected && selected_ready {
+    } else if active && selected_ready {
         "●"
     } else {
         "○"
@@ -2222,24 +2438,32 @@ fn instance_project_line(
     Line::styled(row, instance_row_style(state))
 }
 
-fn push_project_section_items<T>(
-    items: &mut Vec<ListItem<'static>>,
-    section: &ProjectObjectSection<T>,
-    mut item_line: impl FnMut(&T) -> Line<'static>,
+fn push_project_session_rows(
+    rows: &mut Vec<ProjectListRow>,
+    section: &ProjectObjectSection<ProjectSessionItem>,
     width: usize,
 ) {
     match section {
-        ProjectObjectSection::Ready(section_items) => {
-            for item in section_items {
-                items.push(ListItem::new(item_line(item)));
+        ProjectObjectSection::Ready(sessions) => {
+            for session in sessions {
+                rows.push(project_list_selection_row(
+                    session_project_line(session, width),
+                    ProjectSelection::Session(session.session_id),
+                ));
             }
         }
         ProjectObjectSection::Empty(message)
         | ProjectObjectSection::Unavailable(message)
         | ProjectObjectSection::Error(message) => {
-            items.push(ListItem::new(project_object_line(message, "", true, width)));
+            rows.push(project_list_static_row(project_object_line(
+                message, "", true, width,
+            )));
         }
     }
+}
+
+fn session_project_line(session: &ProjectSessionItem, width: usize) -> Line<'static> {
+    project_object_line(&session.label(), &session.detail(), false, width)
 }
 
 fn project_object_line(name: &str, detail: &str, muted: bool, width: usize) -> Line<'static> {
@@ -2261,13 +2485,16 @@ fn project_object_line(name: &str, detail: &str, muted: bool, width: usize) -> L
 }
 
 fn render_instances(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
-    let content = render_panel_shell(frame, area, "Project", app.focus == Focus::Instances);
+    let content = render_panel_shell(frame, area, "Project", app.focus == Focus::Project);
     if content.width < 8 || content.height < 2 {
         return;
     }
 
-    let (items, selected_row) = project_list_items(app, content.width as usize);
+    app.ensure_project_cursor();
+    let rows = project_list_rows(app, content.width as usize);
+    let selected_row = project_list_selected_row(&rows, app.project_cursor);
     app.project_list_state.select(selected_row);
+    let items = rows.into_iter().map(|row| row.item).collect::<Vec<_>>();
     let list = List::new(items).highlight_style(Style::default().bg(PANEL_SELECTED));
     frame.render_stateful_widget(list, content, &mut app.project_list_state);
 }
@@ -2640,6 +2867,10 @@ fn multiline_prefixed_lines(
 
 fn render_inspector(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
     let title = match app.inspector_mode {
+        InspectorMode::Instance if app.focus == Focus::Project => match app.project_cursor {
+            ProjectSelection::Instance(_) => "Inspector  Instance",
+            ProjectSelection::Session(_) => "Inspector  Session",
+        },
         InspectorMode::Instance => "Inspector  Instance",
         InspectorMode::Activity => "Inspector  Activity",
     };
@@ -2649,9 +2880,128 @@ fn render_inspector(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
     }
 
     match app.inspector_mode {
+        InspectorMode::Instance if app.focus == Focus::Project => {
+            render_project_cursor_inspector(frame, content, app)
+        }
         InspectorMode::Instance => render_instance_inspector(frame, content, app),
         InspectorMode::Activity => render_activity_inspector(frame, content, app),
     }
+}
+
+fn render_project_cursor_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp) {
+    match app.project_cursor {
+        ProjectSelection::Instance(index) => {
+            let Some(instance) = app.instances.get(index) else {
+                render_inspector_lines(
+                    frame,
+                    content,
+                    vec![Line::styled(
+                        "Project item is no longer available.",
+                        Style::default().fg(PANEL_MUTED),
+                    )],
+                );
+                return;
+            };
+            let active = index == app.selected_index;
+            let blocked =
+                instance.work_root_finding.is_some() || (active && !app.selected.is_ready());
+            let state = if blocked {
+                "blocked"
+            } else if instance.work_root.is_some() {
+                "ready"
+            } else {
+                "idle"
+            };
+            let icon = if blocked {
+                "!"
+            } else if active {
+                "●"
+            } else {
+                "○"
+            };
+            let mut lines = vec![
+                section_line(icon, if active { "Active" } else { "Instance" }),
+                Line::raw(""),
+                kv_line("instance", instance.display_name()),
+                kv_line("state", state),
+            ];
+            if let Some(runtime) = instance.default_runtime.as_deref() {
+                lines.push(kv_line("runtime", runtime));
+            }
+            if instance.is_default {
+                lines.push(kv_line("default", "yes"));
+            }
+            if let Some(work_root) = instance.work_root.as_ref() {
+                lines.push(kv_line("work root", &work_root.display().to_string()));
+            }
+            if let Some(reason) = instance.work_root_finding.as_deref() {
+                lines.push(kv_line("reason", reason));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                if active {
+                    "Current runtime context."
+                } else {
+                    "Enter asks before switching context."
+                },
+                Style::default().fg(PANEL_MUTED),
+            ));
+            render_inspector_lines(frame, content, lines);
+        }
+        ProjectSelection::Session(session_id) => {
+            let Some(session) = app.project_session(session_id) else {
+                render_inspector_lines(
+                    frame,
+                    content,
+                    vec![Line::styled(
+                        "Session is no longer available.",
+                        Style::default().fg(PANEL_MUTED),
+                    )],
+                );
+                return;
+            };
+            let mut lines = vec![
+                section_line(if session.current { "●" } else { "◷" }, "Session"),
+                Line::raw(""),
+                kv_line("session", &short_session_id(session.session_id)),
+                kv_line(
+                    "state",
+                    if session.current {
+                        "current"
+                    } else {
+                        "available"
+                    },
+                ),
+                kv_line("turns", &session.detail()),
+                Line::raw(""),
+                Line::styled(
+                    if session.current {
+                        "Current conversation for this instance."
+                    } else {
+                        "Enter opens this conversation."
+                    },
+                    Style::default().fg(PANEL_MUTED),
+                ),
+            ];
+            if !session.current {
+                lines.push(Line::styled(
+                    "Composer text is preserved unless you confirm clearing it.",
+                    Style::default().fg(PANEL_MUTED),
+                ));
+            }
+            render_inspector_lines(frame, content, lines);
+        }
+    }
+}
+
+fn render_inspector_lines(frame: &mut Frame<'_>, content: Rect, lines: Vec<Line<'static>>) {
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        content.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        }),
+    );
 }
 
 fn render_instance_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp) {
@@ -2691,7 +3041,6 @@ fn render_instance_inspector(frame: &mut Frame<'_>, content: Rect, app: &Console
         Line::raw(""),
         kv_arrow_line("/workspace", "repo", &boundary.workspace),
         kv_arrow_line("/runtime", "session", "private"),
-        kv_arrow_line("/drafts", "", "private"),
         kv_arrow_line("/lionclaw/skills", "", "ro"),
         Line::raw(""),
         section_line("◎", "Network"),
@@ -2841,7 +3190,7 @@ fn render_activity_inspector(frame: &mut Frame<'_>, content: Rect, app: &mut Con
     render_vertical_scrollbar(frame, scrollbar_area, rendered_line_count, scroll);
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, _app: &ConsoleApp) {
+fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
@@ -2851,20 +3200,17 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, _app: &ConsoleApp) {
     if area.height < 3 || area.width < 4 {
         return;
     }
-    let line = Line::from(vec![
-        key_span("F1"),
-        Span::raw(" Help     "),
-        key_span("Ctrl+P"),
-        Span::raw(" Palette     "),
-        key_span("Ctrl+O"),
-        Span::raw(" Activity     "),
-        key_span("Tab"),
-        Span::raw(" Focus     "),
-        key_span("Ctrl+C"),
-        Span::raw(" Interrupt     "),
-        key_span("F10"),
-        Span::raw(" Exit"),
-    ]);
+    let mut spans = footer_hint_spans(FOOTER_KEY_HINTS);
+    if app.focus == Focus::Project {
+        spans.push(Span::raw("  "));
+        spans.push(key_span("Enter"));
+        spans.push(Span::raw(match app.project_cursor {
+            ProjectSelection::Instance(index) if index == app.selected_index => " Current",
+            ProjectSelection::Instance(_) => " Switch",
+            ProjectSelection::Session(_) => " Open",
+        }));
+    }
+    let line = Line::from(spans);
     frame.render_widget(
         Paragraph::new(line),
         Rect {
@@ -3025,6 +3371,38 @@ fn key_span(key: &'static str) -> Span<'static> {
     )
 }
 
+fn footer_hint_spans(hints: &[KeyHint]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for hint in hints {
+        if !spans.is_empty() {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(key_span(hint.key));
+        spans.push(Span::raw(" "));
+        spans.push(Span::raw(hint.label));
+    }
+    spans
+}
+
+fn help_overlay_lines() -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    push_help_section(&mut lines, "Global", HELP_GLOBAL_KEY_HINTS);
+    lines.push(Line::raw(""));
+    push_help_section(&mut lines, "Context", HELP_CONTEXT_KEY_HINTS);
+    lines
+}
+
+fn push_help_section(lines: &mut Vec<Line<'static>>, title: &'static str, hints: &[KeyHint]) {
+    lines.push(section_line("▣", title));
+    for hint in hints {
+        lines.push(Line::from(vec![
+            key_span(hint.key),
+            Span::raw("  "),
+            Span::raw(hint.description),
+        ]));
+    }
+}
+
 fn truncate_to(value: &str, width: usize) -> String {
     value.chars().take(width).collect()
 }
@@ -3094,51 +3472,11 @@ fn turn_count_label(turn_count: u64) -> String {
     }
 }
 
-fn compact_media_type(media_type: &str) -> &'static str {
-    match media_type {
-        "text/markdown" => "md",
-        "text/plain" => "txt",
-        "text/csv" => "csv",
-        "application/json" => "json",
-        "text/html" => "html",
-        "application/pdf" => "pdf",
-        "image/png" => "png",
-        "image/jpeg" => "jpg",
-        "image/svg+xml" => "svg",
-        _ => "file",
-    }
-}
-
-fn compact_byte_count(size_bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = KIB * 1024;
-    if size_bytes < KIB {
-        format!("{size_bytes} B")
-    } else if size_bytes < MIB {
-        format!("{} KiB", size_bytes / KIB)
-    } else {
-        format!("{} MiB", size_bytes / MIB)
-    }
-}
-
 fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp, overlay: Overlay) {
     let popup = centered_rect(70, 55, area);
     frame.render_widget(Clear, popup);
     let (title, lines) = match overlay {
-        Overlay::Help => (
-            " Help ",
-            vec![
-                Line::from("F1 help"),
-                Line::from("Ctrl+P command palette"),
-                Line::from("Ctrl+O toggle activity inspector"),
-                Line::from("Tab / Shift+Tab move focus"),
-                Line::from("Enter submit prompt or /lionclaw command"),
-                Line::from("Shift+Enter or Alt+Enter insert newline"),
-                Line::from("Up / Down ask to switch instances when project pane has focus"),
-                Line::from("Ctrl+D or F10 exit when idle"),
-                Line::from("Esc closes this overlay"),
-            ],
-        ),
+        Overlay::Help => (" Help ", help_overlay_lines()),
         Overlay::Palette => (
             " Command Palette ",
             vec![
@@ -3169,12 +3507,21 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp, overlay: 
                         "Switch from {} to {target_name}?",
                         app.selected_name()
                     )),
-                    Line::from("This changes the active runtime context, transcript, composer, activity, and drafts."),
+                    Line::from("This changes the active runtime context, transcript, composer, and activity."),
                     Line::from("Press y to switch."),
                     Line::from("Press Esc to stay on the current instance."),
                 ],
             )
         }
+        Overlay::SessionSwitchConfirm { session_id } => (
+            " Switch Session ",
+            vec![
+                Line::from(format!("Open session {}?", short_session_id(session_id))),
+                Line::from("This clears the current composer text and loads that transcript."),
+                Line::from("Press y to switch."),
+                Line::from("Press Esc to stay on the current session."),
+            ],
+        ),
     };
     let paragraph = Paragraph::new(lines)
         .block(Block::default().title(title).borders(Borders::ALL))
@@ -3217,7 +3564,6 @@ mod tests {
     use super::*;
     use crate::{
         contracts::{SessionHistoryPolicy, SessionOpenRequest, TrustTier},
-        home::runtime_project_drafts_dir_from_parts,
         kernel::KernelOptions,
     };
     use ratatui::backend::TestBackend;
@@ -3543,6 +3889,7 @@ mod tests {
                 blocker: LaunchBlocker::for_instance("main", "missing runtime"),
             },
             project_objects: ProjectObjects::unavailable("Launch blocked"),
+            project_cursor: ProjectSelection::Instance(0),
             project_list_state: ListState::default(),
             continue_last_session: false,
             timeout_override: None,
@@ -3665,6 +4012,7 @@ mod tests {
                 peer_id: "local-project".to_string(),
             })),
             project_objects: ProjectObjects::default(),
+            project_cursor: ProjectSelection::Instance(0),
             project_list_state: ListState::default(),
             continue_last_session: false,
             timeout_override: None,
@@ -3700,8 +4048,12 @@ mod tests {
         assert!(rendered.contains("Boundary"));
         assert!(rendered.contains("Ask through the selected runtime"));
         assert!(!rendered.contains("runtime controls pass through"));
-        assert!(rendered.contains("Ctrl+O"));
+        assert!(rendered.contains("F1"));
+        assert!(rendered.contains("Help"));
         assert!(rendered.contains("Ctrl+P"));
+        assert!(rendered.contains("Ctrl+D"));
+        assert!(!rendered.contains("Ctrl+O"));
+        assert!(!rendered.contains("F10"));
         assert_eq!(rendered.lines().count(), 50);
     }
 
@@ -3843,20 +4195,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_objects_load_real_sessions_and_drafts() {
+    async fn project_console_starts_with_composer_focused() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = crate::operator::target::init_project(temp_dir.path()).expect("init");
+        let target = crate::operator::target::resolve_target(
+            &crate::operator::target::TargetSelection {
+                home: None,
+                project: Some(project.project_root),
+                instance: None,
+            },
+            crate::operator::target::WorkRootRequirement::Optional,
+        )
+        .expect("resolve target");
+
+        let app = ConsoleApp::load(RunConsoleInvocation {
+            target: &target,
+            requested_runtime: None,
+            continue_last_session: false,
+            timeout_override: None,
+        })
+        .await
+        .expect("console");
+
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.project_cursor, ProjectSelection::Instance(0));
+    }
+
+    #[tokio::test]
+    async fn project_objects_load_real_sessions() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let workspace_root = temp_dir.path().join("workspace");
         let runtime_root = temp_dir.path().join("runtime");
         let project_root = temp_dir.path().join("project");
-        let draft_path = runtime_project_drafts_dir_from_parts(
-            &runtime_root,
-            "codex",
-            "main",
-            Some(project_root.as_path()),
-        )
-        .join("report.md");
-        std::fs::create_dir_all(draft_path.parent().expect("draft parent")).expect("draft dirs");
-        std::fs::write(&draft_path, "# Report\n").expect("draft");
         let kernel = Kernel::new_with_options(
             &temp_dir.path().join("lionclaw.db"),
             KernelOptions {
@@ -3914,13 +4284,73 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, session.session_id);
         assert!(sessions[0].current);
+    }
 
-        let ProjectObjectSection::Ready(drafts) = objects.drafts else {
-            panic!("expected drafts");
-        };
-        assert_eq!(drafts.len(), 1);
-        assert_eq!(drafts[0].relative_path, "report.md");
-        assert_eq!(drafts[0].media_type, "text/markdown");
+    #[tokio::test]
+    async fn project_session_activation_switches_selected_session() {
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let (mut app, current_session_id, next_session_id) = ready_project_session_app().await;
+        app.project_cursor = ProjectSelection::Session(next_session_id);
+        app.focus = Focus::Project;
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &backend_tx,
+        )
+        .await;
+
+        let ready = app.ready_instance().expect("ready instance");
+        assert_eq!(ready.session_id, next_session_id);
+        assert_ne!(ready.session_id, current_session_id);
+        assert_eq!(
+            app.project_cursor,
+            ProjectSelection::Session(next_session_id)
+        );
+        assert!(app.overlay.is_none());
+        assert!(app.status.contains(&short_session_id(next_session_id)));
+    }
+
+    #[tokio::test]
+    async fn project_session_activation_confirms_before_clearing_composer() {
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let (mut app, current_session_id, next_session_id) = ready_project_session_app().await;
+        app.project_cursor = ProjectSelection::Session(next_session_id);
+        app.focus = Focus::Project;
+        app.composer = ConsoleComposer::from_text("unsent prompt");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &backend_tx,
+        )
+        .await;
+
+        assert_eq!(
+            app.ready_instance().expect("ready instance").session_id,
+            current_session_id
+        );
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::SessionSwitchConfirm {
+                session_id: next_session_id
+            })
+        );
+        assert_eq!(app.composer.text(), "unsent prompt");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &backend_tx,
+        )
+        .await;
+
+        assert_eq!(
+            app.ready_instance().expect("ready instance").session_id,
+            next_session_id
+        );
+        assert!(app.overlay.is_none());
+        assert_eq!(app.composer.text(), "");
     }
 
     #[test]
@@ -3955,6 +4385,19 @@ mod tests {
             handle_key(
                 &mut app,
                 KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &backend_tx,
+            )
+            .await;
+        });
+
+        assert_eq!(app.selected_index, 0);
+        assert_eq!(app.project_cursor, ProjectSelection::Instance(1));
+        assert!(app.overlay.is_none());
+
+        runtime.block_on(async {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                 &backend_tx,
             )
             .await;
@@ -4013,6 +4456,36 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_d_exits_and_f10_is_not_bound() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let mut app = blocked_test_app();
+
+        runtime.block_on(async {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+                &backend_tx,
+            )
+            .await;
+        });
+        assert!(!app.should_quit);
+
+        runtime.block_on(async {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                &backend_tx,
+            )
+            .await;
+        });
+        assert!(app.should_quit);
+    }
+
+    #[test]
     fn question_mark_is_printable_and_f1_opens_help() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4035,7 +4508,7 @@ mod tests {
         assert!(composer_app.overlay.is_none());
 
         let mut nav_app = blocked_test_app();
-        nav_app.focus = Focus::Instances;
+        nav_app.focus = Focus::Project;
         runtime.block_on(async {
             handle_key(
                 &mut nav_app,
@@ -4153,6 +4626,96 @@ mod tests {
         assert!(rendered.contains("▶ Transcript"));
     }
 
+    async fn ready_project_session_app() -> (ConsoleApp, Uuid, Uuid) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace_root = temp_dir.path().join("workspace");
+        let runtime_root = temp_dir.path().join("runtime");
+        let project_root = temp_dir.path().join("project");
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions {
+                workspace_root: Some(workspace_root),
+                runtime_root: Some(runtime_root),
+                project_workspace_root: Some(project_root.clone()),
+                workspace_name: Some("main".to_string()),
+                default_runtime_id: Some("codex".to_string()),
+                ..KernelOptions::default()
+            },
+        )
+        .await
+        .expect("kernel");
+        let peer_id = "local-project".to_string();
+        let first_session = kernel
+            .open_session(SessionOpenRequest {
+                channel_id: LOCAL_CLI_CHANNEL_ID.to_string(),
+                peer_id: peer_id.clone(),
+                trust_tier: TrustTier::Main,
+                history_policy: Some(SessionHistoryPolicy::Interactive),
+            })
+            .await
+            .expect("first session");
+        let next_session = kernel
+            .open_session(SessionOpenRequest {
+                channel_id: LOCAL_CLI_CHANNEL_ID.to_string(),
+                peer_id: peer_id.clone(),
+                trust_tier: TrustTier::Main,
+                history_policy: Some(SessionHistoryPolicy::Interactive),
+            })
+            .await
+            .expect("next session");
+        let summary = InstanceSummary {
+            name: Some("main".to_string()),
+            is_default: true,
+            home: temp_dir.path().join("instances/main"),
+            work_root: Some(project_root.clone()),
+            work_root_finding: None,
+            shared_work_root_count: 0,
+            default_runtime: Some("codex".to_string()),
+        };
+        let selected = SelectedInstanceState::Ready(Box::new(ReadyInstance {
+            summary: summary.clone(),
+            runtime_id: "codex".to_string(),
+            runtime_kind: "codex".to_string(),
+            runtime_override: None,
+            boundary: BoundarySummary {
+                workspace: "rw".to_string(),
+                network: "none".to_string(),
+                secrets: "off".to_string(),
+                timeout: "2h".to_string(),
+                preset: "test".to_string(),
+            },
+            kernel,
+            session_id: first_session.session_id,
+            peer_id,
+        }));
+        let project_objects = load_project_objects(&selected).await;
+        let app = ConsoleApp {
+            project_root: Some(project_root),
+            instances: vec![summary],
+            selected_index: 0,
+            selected,
+            project_objects,
+            project_cursor: ProjectSelection::Instance(0),
+            project_list_state: ListState::default(),
+            continue_last_session: false,
+            timeout_override: None,
+            focus: Focus::Composer,
+            overlay: None,
+            composer: ConsoleComposer::new(),
+            transcript: Vec::new(),
+            transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
+            activity: ActivitySummary::new(),
+            activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
+            inspector_mode: InspectorMode::Instance,
+            status: "idle".to_string(),
+            active_turn: None,
+            active_turn_cancel: None,
+            saw_ready_instance: true,
+            should_quit: false,
+        };
+        (app, first_session.session_id, next_session.session_id)
+    }
+
     fn blocked_test_app() -> ConsoleApp {
         let main = InstanceSummary {
             name: Some("main".to_string()),
@@ -4181,10 +4744,11 @@ mod tests {
                 blocker: LaunchBlocker::for_instance("main", "blocked"),
             },
             project_objects: ProjectObjects::unavailable("Launch blocked"),
+            project_cursor: ProjectSelection::Instance(0),
             project_list_state: ListState::default(),
             continue_last_session: false,
             timeout_override: None,
-            focus: Focus::Instances,
+            focus: Focus::Project,
             overlay: None,
             composer: ConsoleComposer::new(),
             transcript: Vec::new(),
@@ -4238,6 +4802,7 @@ mod tests {
                 peer_id: "local-project".to_string(),
             })),
             project_objects: ProjectObjects::default(),
+            project_cursor: ProjectSelection::Instance(0),
             project_list_state: ListState::default(),
             continue_last_session: false,
             timeout_override: None,

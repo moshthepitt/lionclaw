@@ -108,9 +108,10 @@ lionclaw run
 In a terminal, `run` opens the operator console. Use `lionclaw run --plain`
 for the line-oriented interactive path.
 
-Inside the console, use `F1` for help, `Ctrl+P` for the command palette,
-`Ctrl+O` for activity details, `Tab` to move focus, `Ctrl+C` to interrupt an
-active turn, and `F10` to exit when idle.
+Inside the console, `Tab` and `Shift+Tab` move focus, `Enter` activates the
+focused item, `Ctrl+P` opens the command palette, `Ctrl+O` toggles activity
+details, `Ctrl+C` interrupts an active turn, and `Ctrl+D` exits when idle.
+`F1` also opens help on terminals that pass function keys through.
 
 For Codex, use a logged-in Codex CLI and run LionClaw where the `podman`
 executable is available. If `run` reports a missing runtime image, build or
