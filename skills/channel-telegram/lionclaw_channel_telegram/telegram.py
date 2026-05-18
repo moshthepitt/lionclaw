@@ -105,7 +105,7 @@ TelegramInboundEvent = TelegramInboundUpdate | TelegramPairingClaim
 class TelegramTransport(Protocol):
     async def close(self) -> None: ...
 
-    async def bot_identity(self) -> TelegramBotIdentity: ...
+    async def bot_identity(self, *, refresh: bool = False) -> TelegramBotIdentity: ...
 
     async def get_updates(self, offset: int, timeout_seconds: int) -> list[Update]: ...
 
@@ -140,8 +140,8 @@ class AiogramTelegramTransport:
     async def close(self) -> None:
         await self._bot.session.close()
 
-    async def bot_identity(self) -> TelegramBotIdentity:
-        if self._bot_identity is None:
+    async def bot_identity(self, *, refresh: bool = False) -> TelegramBotIdentity:
+        if refresh or self._bot_identity is None:
             me = await self._bot.get_me()
             self._bot_identity = TelegramBotIdentity(
                 user_id=me.id, username=me.username

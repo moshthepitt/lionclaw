@@ -1331,6 +1331,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
             )
 
+            await worker.process_updates()
             await worker.report_health()
 
         self.assertEqual(len(api.health_reports), 1)
@@ -1340,6 +1341,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             [check.code for check in checks],
             [
                 "telegram.bot_identity",
+                "telegram.polling",
                 "telegram.update_lag",
                 "telegram.delivery_errors",
             ],
@@ -1377,6 +1379,50 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(delivery_errors.status, "warning")
         self.assertEqual(delivery_errors.details["retryable_failed"], 1)
         self.assertEqual(delivery_errors.details["terminal_failed"], 0)
+
+    async def test_get_updates_failure_is_reported_in_worker_health(self) -> None:
+        api = FakeLionClawApi()
+        telegram = FakeTelegramTransport(get_updates_error=RuntimeError("webhook set"))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker.process_updates()
+            await worker.report_health()
+
+        self.assertEqual(api.health_reports[0][0], "error")
+        checks_by_code = {check.code: check for check in api.health_reports[0][1]}
+        polling = checks_by_code["telegram.polling"]
+        self.assertEqual(polling.status, "error")
+        self.assertEqual(polling.message, "getUpdates failed")
+        self.assertIn("webhook set", polling.details["error"])
+
+    async def test_health_uses_fresh_bot_identity_check(self) -> None:
+        api = FakeLionClawApi()
+        telegram = FakeTelegramTransport(
+            bot_identity_refresh_error=RuntimeError("token revoked")
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker.report_health()
+
+        checks_by_code = {check.code: check for check in api.health_reports[0][1]}
+        self.assertEqual(checks_by_code["telegram.bot_identity"].status, "error")
+        self.assertIn(
+            "token revoked", checks_by_code["telegram.bot_identity"].details["error"]
+        )
 
     async def test_stale_outbox_report_is_not_retried_as_success(self) -> None:
         api = FakeLionClawApi(
@@ -1675,7 +1721,9 @@ class FakeTelegramTransport:
         updates: list[Update] | None = None,
         fail_send_message: bool = False,
         fail_download: bool = False,
+        get_updates_error: Exception | None = None,
         bot_identity_error: Exception | None = None,
+        bot_identity_refresh_error: Exception | None = None,
         downloaded_content: bytes = b"file",
     ) -> None:
         self.updates = list(updates or [])
@@ -1688,18 +1736,24 @@ class FakeTelegramTransport:
         self.downloaded_attachment_ids: list[str] = []
         self.fail_send_message = fail_send_message
         self.fail_download = fail_download
+        self.get_updates_error = get_updates_error
         self.bot_identity_error = bot_identity_error
+        self.bot_identity_refresh_error = bot_identity_refresh_error
         self.downloaded_content = downloaded_content
 
     async def close(self) -> None:
         pass
 
-    async def bot_identity(self) -> TelegramBotIdentity:
+    async def bot_identity(self, *, refresh: bool = False) -> TelegramBotIdentity:
+        if refresh and self.bot_identity_refresh_error is not None:
+            raise self.bot_identity_refresh_error
         if self.bot_identity_error is not None:
             raise self.bot_identity_error
         return BOT
 
     async def get_updates(self, offset: int, timeout_seconds: int) -> list[Update]:
+        if self.get_updates_error is not None:
+            raise self.get_updates_error
         return list(self.updates)
 
     async def download_attachment(

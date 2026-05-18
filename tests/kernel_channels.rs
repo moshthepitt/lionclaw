@@ -117,7 +117,7 @@ async fn channel_health_report_accepts_configured_channel_and_audits_check_codes
     install_and_bind_channel(&env, "telegram", "channel-health-skill").await;
     let kernel = env.kernel().await;
     let observed_at =
-        chrono::DateTime::<Utc>::from_timestamp_millis(1_800_000_000_000).expect("observed_at");
+        chrono::DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000).expect("observed_at");
 
     let response = kernel
         .report_channel_health(ChannelHealthReportRequest {
@@ -197,7 +197,7 @@ async fn worker_can_submit_channel_health_report_over_http() {
     });
 
     let observed_at =
-        chrono::DateTime::<Utc>::from_timestamp_millis(1_800_000_000_000).expect("observed_at");
+        chrono::DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000).expect("observed_at");
     let response = reqwest::Client::new()
         .post(format!("http://{bind_addr}/v0/channels/health/report"))
         .json(&ChannelHealthReportRequest {
@@ -253,11 +253,51 @@ async fn channel_health_report_rejects_unconfigured_channel() {
 }
 
 #[tokio::test]
+async fn channel_health_report_rejects_far_future_observed_at() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "telegram", "channel-health-future-skill").await;
+    let kernel = env.kernel().await;
+
+    let err = kernel
+        .report_channel_health(ChannelHealthReportRequest {
+            channel_id: "telegram".to_string(),
+            reporter_id: "telegram:worker".to_string(),
+            status: ChannelHealthStatus::Ok,
+            checks: Vec::new(),
+            observed_at: Utc::now() + ChronoDuration::minutes(5),
+        })
+        .await
+        .expect_err("future health reports must be rejected");
+
+    assert!(err.to_string().contains("observed_at cannot be more than"));
+}
+
+#[tokio::test]
+async fn channel_health_report_rejects_oversized_reporter_id() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "telegram", "channel-health-reporter-skill").await;
+    let kernel = env.kernel().await;
+
+    let err = kernel
+        .report_channel_health(ChannelHealthReportRequest {
+            channel_id: "telegram".to_string(),
+            reporter_id: "w".repeat(257),
+            status: ChannelHealthStatus::Ok,
+            checks: Vec::new(),
+            observed_at: Utc::now(),
+        })
+        .await
+        .expect_err("oversized reporter id must be rejected");
+
+    assert!(err.to_string().contains("reporter_id exceeds"));
+}
+
+#[tokio::test]
 async fn channel_health_selects_latest_report_by_observed_time() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "telegram", "channel-health-latest-skill").await;
     let kernel = env.kernel().await;
-    let latest_observed_at = chrono::DateTime::<Utc>::from_timestamp_millis(1_800_000_000_000)
+    let latest_observed_at = chrono::DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000)
         .expect("latest observed_at");
     let older_observed_at = latest_observed_at - ChronoDuration::minutes(15);
 
@@ -301,6 +341,65 @@ async fn channel_health_selects_latest_report_by_observed_time() {
     assert_eq!(report.observed_at, latest_observed_at);
     assert_eq!(report.status, ChannelHealthStatus::Ok);
     assert_eq!(report.checks[0].message, "latest report");
+}
+
+#[tokio::test]
+async fn channel_health_ignores_far_future_report_when_selecting_latest() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "telegram", "channel-health-valid-latest-skill").await;
+    let kernel = env.kernel().await;
+    let valid_observed_at = chrono::DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000)
+        .expect("valid observed_at");
+
+    kernel
+        .report_channel_health(ChannelHealthReportRequest {
+            channel_id: "telegram".to_string(),
+            reporter_id: "telegram:worker".to_string(),
+            status: ChannelHealthStatus::Ok,
+            checks: vec![ChannelHealthCheck {
+                code: "telegram.polling".to_string(),
+                status: ChannelHealthStatus::Ok,
+                message: "valid report".to_string(),
+                details: serde_json::json!({}),
+            }],
+            observed_at: valid_observed_at,
+        })
+        .await
+        .expect("submit valid report");
+
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    let future_observed_at = Utc::now() + ChronoDuration::minutes(30);
+    let checks_json = serde_json::to_string(&vec![ChannelHealthCheck {
+        code: "telegram.polling".to_string(),
+        status: ChannelHealthStatus::Error,
+        message: "poison report".to_string(),
+        details: serde_json::json!({}),
+    }])
+    .expect("health checks json");
+    sqlx::query(
+        "INSERT INTO channel_health_reports \
+         (report_id, channel_id, reporter_id, status, checks_json, observed_at_ms, created_at_ms) \
+         VALUES (?1, 'telegram', 'telegram:bad-clock', 'error', ?2, ?3, ?4)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(checks_json)
+    .bind(lionclaw::kernel::db::datetime_to_ms(future_observed_at))
+    .bind(lionclaw::kernel::db::datetime_to_ms(Utc::now()))
+    .execute(&pool)
+    .await
+    .expect("insert future health report");
+
+    let health = kernel
+        .get_channel_health("telegram")
+        .await
+        .expect("channel health");
+    let latest_report = health.latest_report.expect("latest valid report");
+    assert_eq!(latest_report.observed_at, valid_observed_at);
+    assert_eq!(latest_report.checks[0].message, "valid report");
+
+    let future_report = health.future_report.expect("future report");
+    assert_eq!(future_report.reporter_id, "telegram:bad-clock");
+    assert_eq!(future_report.checks[0].message, "poison report");
 }
 
 #[tokio::test]

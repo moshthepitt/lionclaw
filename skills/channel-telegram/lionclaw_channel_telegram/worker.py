@@ -52,6 +52,7 @@ ACTIVE_TURN_TYPING_TTL_SECONDS = 300.0
 TYPING_REFRESH_SECONDS = 4.0
 MAX_TYPING_FAILURES = 3
 MIN_HEALTH_REPORT_INTERVAL_SECONDS = 1.0
+POLLING_IN_FLIGHT_GRACE_SECONDS = 10.0
 
 
 @dataclass(slots=True, frozen=True)
@@ -98,19 +99,32 @@ class TelegramWorker:
         self._typing_deadlines: dict[tuple[str, str | None], float] = {}
         self._typing_routes: dict[str, TypingTarget] = {}
         self._typing_failures: dict[tuple[str, str | None], int] = {}
+        self._poll_in_flight_started_at: float | None = None
+        self._last_poll_success_observed_at: float | None = None
+        self._last_poll_failure_observed_at: float | None = None
+        self._last_poll_error: str | None = None
+        self._last_poll_update_count: int | None = None
         self._last_update_id: int | None = None
         self._last_update_observed_at: float | None = None
         self._delivery_failure_counts: dict[str, int] = {}
 
     async def process_updates(self) -> None:
+        self._poll_in_flight_started_at = _loop_time()
         try:
             updates = await self.telegram.get_updates(
                 offset=self.offset,
                 timeout_seconds=self.config.telegram_poll_timeout_secs,
             )
+        except Exception as err:
+            self._record_poll_failure(err)
+            logger.exception("telegram getUpdates request failed")
+            return
+
+        self._record_poll_success(len(updates))
+        try:
             bot_identity = await self.telegram.bot_identity()
         except Exception:
-            logger.exception("telegram getUpdates request failed")
+            logger.exception("telegram getMe request failed")
             return
 
         for update in updates:
@@ -587,13 +601,14 @@ class TelegramWorker:
 
     async def _health_checks(self) -> list[HealthCheck]:
         checks = [await self._bot_identity_health_check()]
+        checks.append(self._polling_health_check())
         checks.append(self._update_lag_health_check())
         checks.append(self._delivery_errors_health_check())
         return checks
 
     async def _bot_identity_health_check(self) -> HealthCheck:
         try:
-            identity = await self.telegram.bot_identity()
+            identity = await self.telegram.bot_identity(refresh=True)
         except Exception as err:
             logger.exception("telegram bot identity health check failed")
             return HealthCheck(
@@ -616,8 +631,76 @@ class TelegramWorker:
             details={"bot_id": identity.user_id, "username": identity.username},
         )
 
+    def _polling_health_check(self) -> HealthCheck:
+        details: dict[str, object] = {
+            "offset": self.offset,
+            "poll_timeout_seconds": self.config.telegram_poll_timeout_secs,
+        }
+        if self._last_poll_success_observed_at is not None:
+            details["last_success_age_seconds"] = max(
+                0, int(_loop_time() - self._last_poll_success_observed_at)
+            )
+            details["last_update_count"] = self._last_poll_update_count or 0
+
+        if self._last_poll_error is not None:
+            if self._last_poll_failure_observed_at is not None:
+                details["last_failure_age_seconds"] = max(
+                    0, int(_loop_time() - self._last_poll_failure_observed_at)
+                )
+            details["error"] = self._last_poll_error
+            return HealthCheck(
+                code="telegram.polling",
+                status="error",
+                message="getUpdates failed",
+                details=details,
+            )
+
+        if self._poll_in_flight_started_at is not None:
+            in_flight_age_seconds = max(
+                0, int(_loop_time() - self._poll_in_flight_started_at)
+            )
+            details["in_flight_age_seconds"] = in_flight_age_seconds
+            max_expected_age = (
+                self.config.telegram_poll_timeout_secs + POLLING_IN_FLIGHT_GRACE_SECONDS
+            )
+            if in_flight_age_seconds > max_expected_age:
+                return HealthCheck(
+                    code="telegram.polling",
+                    status="warning",
+                    message="getUpdates request has exceeded its timeout window",
+                    details=details,
+                )
+            return HealthCheck(
+                code="telegram.polling",
+                status="ok",
+                message="getUpdates request is in flight",
+                details=details,
+            )
+
+        if self._last_poll_success_observed_at is None:
+            return HealthCheck(
+                code="telegram.polling",
+                status="warning",
+                message="getUpdates has not completed yet",
+                details=details,
+            )
+
+        return HealthCheck(
+            code="telegram.polling",
+            status="ok",
+            message="getUpdates succeeded",
+            details=details,
+        )
+
     def _update_lag_health_check(self) -> HealthCheck:
         details: dict[str, object] = {"offset": self.offset}
+        if self._last_poll_success_observed_at is None:
+            return HealthCheck(
+                code="telegram.update_lag",
+                status="warning",
+                message="no successful getUpdates poll completed yet",
+                details=details,
+            )
         if self._last_update_id is None or self._last_update_observed_at is None:
             return HealthCheck(
                 code="telegram.update_lag",
@@ -666,6 +749,17 @@ class TelegramWorker:
         self._delivery_failure_counts[error_code] = (
             self._delivery_failure_counts.get(error_code, 0) + 1
         )
+
+    def _record_poll_success(self, update_count: int) -> None:
+        self._poll_in_flight_started_at = None
+        self._last_poll_success_observed_at = _loop_time()
+        self._last_poll_update_count = update_count
+        self._last_poll_error = None
+
+    def _record_poll_failure(self, err: Exception) -> None:
+        self._poll_in_flight_started_at = None
+        self._last_poll_failure_observed_at = _loop_time()
+        self._last_poll_error = f"{type(err).__name__}: {err}"
 
 
 def _classify_send_failure(err: Exception) -> tuple[str, str]:

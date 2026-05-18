@@ -371,7 +371,9 @@ External channel skills integrate over HTTP:
    checks with stable `code`, `status`, `message`, and JSON `details`. Provider
    reachability checks stay in channel workers; the kernel validates and stores
    normalized samples, audits `channel.health.reported`, and never treats health
-   reports as authority to start, stop, or repair workers.
+   reports as authority to start, stop, or repair workers. Reports with
+   oversized identities or timestamps more than two minutes in the future are
+   rejected; stored far-future reports are excluded from latest-health selection.
 9. `POST /v0/channels/stream/ack` advances only the progress stream cursor.
 10. Pairing invite/claim, approve/block, and grant revoke endpoints manage
    channel trust. Invite tokens are returned once, stored only as hashes, and
@@ -453,7 +455,9 @@ Doctor reads the latest report per channel, along with kernel-visible pending
 pairings and outbox status, to explain channel state without calling provider
 APIs or mutating local state. Background channel reports older than ten minutes
 are stale doctor warnings; interactive channels can report opportunistically
-without a stale threshold.
+without a stale threshold. Doctor also warns on impossible future report
+timestamps found in stored state without treating those reports as current
+worker health.
 
 ## Session Continuity
 

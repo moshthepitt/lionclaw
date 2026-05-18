@@ -87,7 +87,8 @@ use super::{
         ChannelStreamEventRecord, ChannelTurnRecord, ChannelTurnStatus, NewChannelHealthReport,
         NewChannelInboundEvent, NewChannelTurn, OperatorPairingUpsert,
         StreamMessageLane as ChannelStreamLane, TokenPairingCreate,
-        PAIRING_CLAIM_POLICY_OPERATOR_APPROVAL, PAIRING_CLAIM_POLICY_TOKEN_CLAIM,
+        CHANNEL_HEALTH_OBSERVED_AT_FUTURE_SKEW_SECONDS, PAIRING_CLAIM_POLICY_OPERATOR_APPROVAL,
+        PAIRING_CLAIM_POLICY_TOKEN_CLAIM,
     },
     continuity::{
         ActiveContinuitySnapshot, ContinuityArtifact, ContinuityEvent, ContinuityLayout,
@@ -147,6 +148,7 @@ const MAX_CHANNEL_OUTBOX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 const MAX_CHANNEL_OUTBOX_RECEIPT_JSON_BYTES: usize = 64 * 1024;
 const MAX_CHANNEL_OUTBOX_ERROR_TEXT_BYTES: usize = 4096;
 const MAX_CHANNEL_HEALTH_CHECKS_PER_REPORT: usize = 128;
+const MAX_CHANNEL_HEALTH_REPORTER_ID_BYTES: usize = 256;
 const MAX_CHANNEL_HEALTH_CHECK_CODE_BYTES: usize = 128;
 const MAX_CHANNEL_HEALTH_CHECK_MESSAGE_BYTES: usize = 4096;
 const MAX_CHANNEL_HEALTH_CHECK_DETAILS_JSON_BYTES: usize = 64 * 1024;
@@ -6794,6 +6796,18 @@ fn validate_channel_health_report(
 ) -> Result<ValidatedChannelHealthReport, KernelError> {
     let channel_id = trim_required(req.channel_id, "channel_id")?;
     let reporter_id = trim_required(req.reporter_id, "reporter_id")?;
+    if reporter_id.len() > MAX_CHANNEL_HEALTH_REPORTER_ID_BYTES {
+        return Err(KernelError::BadRequest(format!(
+            "reporter_id exceeds {MAX_CHANNEL_HEALTH_REPORTER_ID_BYTES} bytes"
+        )));
+    }
+    let future_cutoff =
+        Utc::now() + ChronoDuration::seconds(CHANNEL_HEALTH_OBSERVED_AT_FUTURE_SKEW_SECONDS);
+    if req.observed_at > future_cutoff {
+        return Err(KernelError::BadRequest(format!(
+            "observed_at cannot be more than {CHANNEL_HEALTH_OBSERVED_AT_FUTURE_SKEW_SECONDS} seconds in the future"
+        )));
+    }
     if req.checks.len() > MAX_CHANNEL_HEALTH_CHECKS_PER_REPORT {
         return Err(KernelError::BadRequest(format!(
             "checks exceeds {MAX_CHANNEL_HEALTH_CHECKS_PER_REPORT} per report"

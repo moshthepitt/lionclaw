@@ -96,6 +96,6 @@ LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
 - Runtime selection comes from the selected instance's default runtime; workers do not send `runtime_id` in inbound requests.
 - The worker stores Telegram offset in `$LIONCLAW_HOME/runtime/channels/$LIONCLAW_CHANNEL_ID/telegram.offset` by default.
 - The worker reports health every 60 seconds by default, configurable with
-  `LIONCLAW_HEALTH_REPORT_INTERVAL_SECS`. Checks cover Telegram `getMe`, update
-  polling progress, and delivery failures observed by the current worker
-  process.
+  `LIONCLAW_HEALTH_REPORT_INTERVAL_SECS`. Checks cover a fresh Telegram
+  `getMe`, `getUpdates` polling failures or hangs, update lag, and delivery
+  failures observed by the current worker process.
