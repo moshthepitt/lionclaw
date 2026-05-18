@@ -224,7 +224,7 @@ async fn channel_peer_must_be_approved_before_inbound_turn_executes() {
         Some("msg-1002")
     );
     assert!(outbox.deliveries[0].content.text.contains("[mock]"));
-    assert_eq!(outbox.deliveries[0].content.format_hint, "markdown");
+    assert_eq!(outbox.deliveries[0].content.format_hint, "plain");
     assert!(outbox.deliveries[0].content.attachments.is_empty());
     let delivery_id = outbox.deliveries[0].delivery_id;
     let attempt_id = outbox.deliveries[0].attempt_id;
@@ -262,7 +262,7 @@ async fn channel_peer_must_be_approved_before_inbound_turn_executes() {
     assert_eq!(created.details["conversation_ref"], "peer-local");
     assert_eq!(created.details["reply_to_ref"], "msg-1002");
     assert_eq!(created.details["turn_id"], queued_turn_id.to_string());
-    assert_eq!(created.details["content_format_hint"], "markdown");
+    assert_eq!(created.details["content_format_hint"], "plain");
     assert_eq!(created.details["content_attachment_count"], 0);
 
     let leased_audit = kernel
@@ -793,6 +793,104 @@ async fn channel_turn_with_runtime_artifact_outside_runtime_root_fails_turn() {
         })
         .await
         .expect("pull artifact outbox");
+    assert!(outbox.deliveries.is_empty());
+}
+
+#[tokio::test]
+async fn channel_turn_with_runtime_artifact_rejects_symlinked_outbox_root() {
+    use std::os::unix::fs::symlink;
+
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "telegram", "channel-outbox-artifact-symlink-skill").await;
+    let artifact_source_dir = env.home().runtime_dir().join("generated-test-artifacts");
+    tokio::fs::create_dir_all(&artifact_source_dir)
+        .await
+        .expect("create artifact source dir");
+    let artifact_source = artifact_source_dir.join("generated-image.png");
+    tokio::fs::write(&artifact_source, b"png bytes")
+        .await
+        .expect("write artifact source");
+
+    let outside = env.temp_dir().join("outside-channel-outbox");
+    tokio::fs::create_dir_all(&outside)
+        .await
+        .expect("create outside channel outbox target");
+    symlink(&outside, env.home().runtime_dir().join("channel-outbox"))
+        .expect("symlink channel outbox root");
+
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("artifact-only".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            workspace_name: Some("main".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+    kernel
+        .register_runtime_adapter(
+            "artifact-only",
+            std::sync::Arc::new(ArtifactOnlyAdapter {
+                path: artifact_source.clone(),
+            }),
+        )
+        .await;
+
+    create_pending_pairing(
+        &kernel,
+        "telegram",
+        "telegram:user:artifact-symlink",
+        "artifact-symlink-pairing",
+    )
+    .await;
+    approve_pairing(&kernel, "telegram", "telegram:user:artifact-symlink").await;
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "telegram",
+            "artifact-symlink-request",
+            "telegram:user:artifact-symlink",
+            "telegram:user:artifact-symlink",
+            None,
+            "generate an image through symlinked outbox root",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue artifact turn");
+    let queued_turn_id = queued.turn_id.expect("queued turn id");
+    wait_for_stream_events(&kernel, "telegram", "artifact-symlink-stream", |events| {
+        events.iter().any(|event| {
+            event.turn_id == Some(queued_turn_id)
+                && event.kind == StreamEventKindDto::Error
+                && event
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("runtime storage path"))
+        }) && events.iter().any(|event| {
+            event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::Done
+        })
+    })
+    .await;
+
+    let leaked = outside
+        .join(queued_turn_id.to_string())
+        .join("generated-image.png");
+    assert!(
+        !tokio::fs::try_exists(&leaked)
+            .await
+            .expect("check leaked artifact path"),
+        "runtime artifact copy must not follow symlinked channel-outbox root"
+    );
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "telegram".to_string(),
+            worker_id: "artifact-symlink-worker".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(1),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull artifact symlink outbox");
     assert!(outbox.deliveries.is_empty());
 }
 
@@ -3631,7 +3729,7 @@ async fn channel_attachment_projection_rejects_symlinked_parent() {
                 && turn
                     .error_text
                     .as_deref()
-                    .is_some_and(|text| text.contains("attachment storage path"))
+                    .is_some_and(|text| text.contains("runtime storage path"))
         },
         "symlinked projection parent failure",
     )

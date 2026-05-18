@@ -20,7 +20,9 @@ from aiogram.types import (
 
 TELEGRAM_TEXT_LIMIT = 4000
 TELEGRAM_CAPTION_LIMIT = 1024
-PAIRING_TOKEN_RE = re.compile(r"(?:^|\s)(lc_[A-Za-z0-9_-]{8,128})(?:\s|$)")
+PAIRING_START_RE = re.compile(
+    r"^/(?:start|startgroup)(?:@[A-Za-z0-9_]+)?\s+(lc_[A-Za-z0-9_-]{8,128})\s*$"
+)
 TELEGRAM_PARSE_ERROR_RE = re.compile(
     r"can't parse entities|parse entities|entity", re.I
 )
@@ -544,22 +546,17 @@ def _content_text(message: Message) -> str | None:
 def _extract_pairing_token(text: str | None) -> str | None:
     if text is None:
         return None
-    start_match = re.match(
-        r"^/start(?:@[A-Za-z0-9_]+)?\s+(lc_[A-Za-z0-9_-]{8,128})\s*$", text
-    )
-    if start_match is not None:
-        return start_match.group(1)
-    match = PAIRING_TOKEN_RE.search(text)
+    match = PAIRING_START_RE.match(text)
     return match.group(1) if match is not None else None
 
 
 def _trigger(message: Message, bot_identity: TelegramBotIdentity | None) -> str:
     if _is_private(message):
         return "dm"
-    if _is_reply_to_bot(message, bot_identity):
-        return "reply_to_bot"
     if _has_bot_mention(message, bot_identity):
         return "mention"
+    if _is_reply_to_bot(message, bot_identity):
+        return "reply_to_bot"
     if _thread_ref(message) is not None:
         return "thread_continuation"
     return "none"
@@ -838,10 +835,17 @@ def _format_telegram_text_chunks(
         return []
     if format_hint.casefold() != "markdown":
         return [TelegramTextChunk(plain_text=chunk) for chunk in chunks]
-    return [
+    formatted = [
         TelegramTextChunk(plain_text=chunk, html_text=_markdown_to_telegram_html(chunk))
         for chunk in chunks
     ]
+    if all(
+        chunk.html_text is not None
+        and _utf16_len(chunk.html_text) <= TELEGRAM_TEXT_LIMIT
+        for chunk in formatted
+    ):
+        return formatted
+    return [TelegramTextChunk(plain_text=chunk) for chunk in chunks]
 
 
 def _markdown_to_telegram_html(markdown: str) -> str:
