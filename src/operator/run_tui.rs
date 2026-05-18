@@ -7,15 +7,16 @@ use std::{
 use anyhow::{anyhow, Result};
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Margin, Rect},
+    layout::{Constraint, Direction, Layout, Margin, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
@@ -475,6 +476,10 @@ impl ConsoleComposer {
         self.input.input(key)
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        self.input.input(mouse)
+    }
+
     fn insert_str(&mut self, text: &str) -> bool {
         self.input.insert_str(text)
     }
@@ -506,6 +511,38 @@ impl ConsoleComposer {
     }
 }
 
+#[derive(Default)]
+struct ConsoleLayout {
+    instances: Option<Rect>,
+    transcript: Option<Rect>,
+    inspectors: Option<Rect>,
+    composer: Option<Rect>,
+}
+
+impl ConsoleLayout {
+    fn focus_at(&self, column: u16, row: u16) -> Option<Focus> {
+        let position = Position { x: column, y: row };
+        [
+            (self.instances, Focus::Instances),
+            (self.transcript, Focus::Transcript),
+            (self.inspectors, Focus::Inspectors),
+            (self.composer, Focus::Composer),
+        ]
+        .into_iter()
+        .find_map(|(area, focus)| area.filter(|area| area.contains(position)).map(|_| focus))
+    }
+
+    fn point_in_transcript(&self, column: u16, row: u16) -> bool {
+        self.transcript
+            .is_some_and(|area| area.contains(Position { x: column, y: row }))
+    }
+
+    fn point_in_composer(&self, column: u16, row: u16) -> bool {
+        self.composer
+            .is_some_and(|area| area.contains(Position { x: column, y: row }))
+    }
+}
+
 pub(crate) struct ConsoleApp {
     project_root: Option<PathBuf>,
     instances: Vec<InstanceSummary>,
@@ -514,6 +551,7 @@ pub(crate) struct ConsoleApp {
     continue_last_session: bool,
     timeout_override: Option<RuntimeTurnTimeouts>,
     focus: Focus,
+    layout: ConsoleLayout,
     overlay: Option<Overlay>,
     composer: ConsoleComposer,
     transcript: Vec<TranscriptLine>,
@@ -558,6 +596,7 @@ impl ConsoleApp {
             } else {
                 Focus::Composer
             },
+            layout: ConsoleLayout::default(),
             overlay: None,
             composer: ConsoleComposer::new(),
             transcript: Vec::new(),
@@ -1362,6 +1401,7 @@ pub(crate) async fn run_launch_blocker(blocker: LaunchBlocker) -> Result<()> {
         continue_last_session: false,
         timeout_override: None,
         focus: Focus::Composer,
+        layout: ConsoleLayout::default(),
         overlay: None,
         composer: ConsoleComposer::new(),
         transcript: Vec::new(),
@@ -1400,6 +1440,7 @@ pub(crate) async fn run_project_launch_blocker(
         continue_last_session: false,
         timeout_override: None,
         focus: Focus::Instances,
+        layout: ConsoleLayout::default(),
         overlay: None,
         composer: ConsoleComposer::new(),
         transcript: Vec::new(),
@@ -1437,7 +1478,12 @@ type ConsoleTerminal = Terminal<CrosstermBackend<Stdout>>;
 fn enter_terminal() -> Result<ConsoleTerminal> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     Terminal::new(backend).map_err(Into::into)
 }
@@ -1447,6 +1493,7 @@ fn leave_terminal(mut terminal: ConsoleTerminal) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
+        DisableMouseCapture,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -1490,6 +1537,35 @@ async fn handle_terminal_event(
             let char_count = text.chars().count();
             app.composer.insert_str(&text);
             app.status = format!("pasted {char_count} characters");
+        }
+        Event::Mouse(mouse) => {
+            handle_mouse_event(app, mouse);
+        }
+        _ => {}
+    }
+}
+
+fn handle_mouse_event(app: &mut ConsoleApp, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(focus) = app.layout.focus_at(mouse.column, mouse.row) {
+                app.focus = focus;
+                app.status = format!("focus: {}", focus.label());
+            }
+        }
+        MouseEventKind::ScrollUp if app.layout.point_in_transcript(mouse.column, mouse.row) => {
+            app.focus = Focus::Transcript;
+            app.scroll_transcript_up(3);
+        }
+        MouseEventKind::ScrollDown if app.layout.point_in_transcript(mouse.column, mouse.row) => {
+            app.focus = Focus::Transcript;
+            app.scroll_transcript_down(3);
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            if app.layout.point_in_composer(mouse.column, mouse.row) =>
+        {
+            app.focus = Focus::Composer;
+            app.composer.handle_mouse(mouse);
         }
         _ => {}
     }
@@ -1631,6 +1707,11 @@ pub(crate) fn render_app(frame: &mut Frame<'_>, app: &mut ConsoleApp) {
         return;
     };
 
+    app.layout = ConsoleLayout {
+        composer: Some(*composer_area),
+        ..ConsoleLayout::default()
+    };
+
     render_header(frame, *header_area, app);
     render_body(frame, *body_area, app);
     render_composer(frame, *composer_area, app);
@@ -1705,9 +1786,13 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
             ])
             .split(area);
         let [instances_area, _, transcript_area, _, inspector_area] = chunks.as_ref() else {
+            app.layout.transcript = Some(area);
             render_transcript(frame, area, app);
             return;
         };
+        app.layout.instances = Some(*instances_area);
+        app.layout.transcript = Some(*transcript_area);
+        app.layout.inspectors = Some(*inspector_area);
         render_instances(frame, *instances_area, app);
         render_transcript(frame, *transcript_area, app);
         render_inspector(frame, *inspector_area, app);
@@ -1721,9 +1806,12 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
             ])
             .split(area);
         let [transcript_area, _, inspector_area] = chunks.as_ref() else {
+            app.layout.transcript = Some(area);
             render_transcript(frame, area, app);
             return;
         };
+        app.layout.transcript = Some(*transcript_area);
+        app.layout.inspectors = Some(*inspector_area);
         render_transcript(frame, *transcript_area, app);
         render_inspector(frame, *inspector_area, app);
     }
@@ -2890,6 +2978,7 @@ mod tests {
             continue_last_session: false,
             timeout_override: None,
             focus: Focus::Transcript,
+            layout: ConsoleLayout::default(),
             overlay: None,
             composer: ConsoleComposer::new(),
             transcript: Vec::new(),
@@ -3010,6 +3099,7 @@ mod tests {
             continue_last_session: false,
             timeout_override: None,
             focus: Focus::Composer,
+            layout: ConsoleLayout::default(),
             overlay: None,
             composer: ConsoleComposer::new(),
             transcript: vec![
@@ -3065,6 +3155,50 @@ mod tests {
         assert!(rendered.contains("visible-line-39"));
         assert!(rendered.contains("^"));
         assert!(rendered.contains("v"));
+    }
+
+    #[tokio::test]
+    async fn mouse_scroll_and_click_move_focus_without_tab() {
+        let body = (0..40)
+            .map(|index| format!("visible-line-{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app =
+            ready_test_app(vec![TranscriptLine::new(TranscriptLineKind::Answer, body)]).await;
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        render_to_text(&mut app, 100, 24);
+        let transcript_area = app.layout.transcript.expect("transcript area");
+
+        app.focus = Focus::Composer;
+        handle_terminal_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: transcript_area.x.saturating_add(1),
+                row: transcript_area.y.saturating_add(1),
+                modifiers: KeyModifiers::empty(),
+            }),
+            &backend_tx,
+        )
+        .await;
+
+        assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(app.transcript_scroll, 3);
+
+        let composer_area = app.layout.composer.expect("composer area");
+        handle_terminal_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: composer_area.x.saturating_add(1),
+                row: composer_area.y.saturating_add(1),
+                modifiers: KeyModifiers::empty(),
+            }),
+            &backend_tx,
+        )
+        .await;
+
+        assert_eq!(app.focus, Focus::Composer);
     }
 
     #[tokio::test]
@@ -3327,6 +3461,7 @@ mod tests {
             continue_last_session: false,
             timeout_override: None,
             focus: Focus::Instances,
+            layout: ConsoleLayout::default(),
             overlay: None,
             composer: ConsoleComposer::new(),
             transcript: Vec::new(),
@@ -3382,6 +3517,7 @@ mod tests {
             continue_last_session: false,
             timeout_override: None,
             focus: Focus::Composer,
+            layout: ConsoleLayout::default(),
             overlay: None,
             composer: ConsoleComposer::new(),
             transcript,
