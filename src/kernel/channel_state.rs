@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::Value;
 use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
@@ -16,6 +16,7 @@ use crate::{
 
 pub(crate) const PAIRING_CLAIM_POLICY_OPERATOR_APPROVAL: &str = "operator_approval";
 pub(crate) const PAIRING_CLAIM_POLICY_TOKEN_CLAIM: &str = "token_claim";
+pub(crate) const CHANNEL_HEALTH_OBSERVED_AT_FUTURE_SKEW_SECONDS: i64 = 2 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelGrantStatus {
@@ -298,6 +299,7 @@ pub struct ChannelHealthRecord {
     pub latest_inbound_at: Option<DateTime<Utc>>,
     pub latest_outbound_at: Option<DateTime<Utc>>,
     pub latest_report: Option<ChannelHealthReportRecord>,
+    pub future_report: Option<ChannelHealthReportRecord>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1867,17 +1869,48 @@ impl ChannelStateStore {
         &self,
         channel_id: &str,
     ) -> Result<Option<ChannelHealthReportRecord>> {
+        self.latest_health_report_before_or_at(channel_id, channel_health_future_cutoff_ms())
+            .await
+    }
+
+    async fn latest_health_report_before_or_at(
+        &self,
+        channel_id: &str,
+        cutoff_ms: i64,
+    ) -> Result<Option<ChannelHealthReportRecord>> {
         let row = sqlx::query(
             "SELECT report_id, channel_id, reporter_id, status, checks_json, observed_at_ms, created_at_ms \
              FROM channel_health_reports \
-             WHERE channel_id = ?1 \
+             WHERE channel_id = ?1 AND observed_at_ms <= ?2 \
              ORDER BY observed_at_ms DESC, created_at_ms DESC, report_id DESC \
              LIMIT 1",
         )
         .bind(channel_id)
+        .bind(cutoff_ms)
         .fetch_optional(&self.pool)
         .await
         .context("failed to query latest channel health report")?;
+
+        row.map(map_health_report_row).transpose()
+    }
+
+    async fn latest_future_health_report_after(
+        &self,
+        channel_id: &str,
+        cutoff_ms: i64,
+    ) -> Result<Option<ChannelHealthReportRecord>> {
+        let row = sqlx::query(
+            "SELECT report_id, channel_id, reporter_id, status, checks_json, observed_at_ms, created_at_ms \
+             FROM channel_health_reports \
+             WHERE channel_id = ?1 AND observed_at_ms > ?2 \
+             ORDER BY observed_at_ms DESC, created_at_ms DESC, report_id DESC \
+             LIMIT 1",
+        )
+        .bind(channel_id)
+        .bind(cutoff_ms)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query future channel health report")?;
 
         row.map(map_health_report_row).transpose()
     }
@@ -1990,7 +2023,13 @@ impl ChannelStateStore {
                     .ok_or_else(|| anyhow!("invalid latest_outbound_at_ms '{value}'"))
             })
             .transpose()?;
-        let latest_report = self.latest_health_report(channel_id).await?;
+        let health_cutoff_ms = channel_health_future_cutoff_ms();
+        let latest_report = self
+            .latest_health_report_before_or_at(channel_id, health_cutoff_ms)
+            .await?;
+        let future_report = self
+            .latest_future_health_report_after(channel_id, health_cutoff_ms)
+            .await?;
 
         Ok(ChannelHealthRecord {
             channel_id: channel_id.to_string(),
@@ -2002,8 +2041,15 @@ impl ChannelStateStore {
             latest_inbound_at,
             latest_outbound_at,
             latest_report,
+            future_report,
         })
     }
+}
+
+fn channel_health_future_cutoff_ms() -> i64 {
+    datetime_to_ms(
+        Utc::now() + ChronoDuration::seconds(CHANNEL_HEALTH_OBSERVED_AT_FUTURE_SKEW_SECONDS),
+    )
 }
 
 fn map_health_report_row(row: SqliteRow) -> Result<ChannelHealthReportRecord> {

@@ -1215,6 +1215,25 @@ fn inspect_channel_worker_health(
     findings: &mut Vec<DoctorFinding>,
     observations: &mut Vec<DoctorObservation>,
 ) {
+    if let Some(future_report) = health.future_report.as_ref() {
+        findings.push(
+            DoctorFinding::warning(
+                FindingKind::Channel,
+                format!(
+                    "channel \"{}\" worker health report timestamp is in the future",
+                    channel.id
+                ),
+                format!("channel {} worker health", channel.id),
+                format!(
+                    "stored health report from {} is {} in the future",
+                    future_report.reporter_id,
+                    format_age(report_future_by(future_report))
+                ),
+            )
+            .with_inspect(commands.selected("logs")),
+        );
+    }
+
     let Some(report) = health.latest_report.as_ref() else {
         findings.push(
             DoctorFinding::warning(
@@ -1324,6 +1343,14 @@ fn inspect_channel_worker_health(
 fn report_age(report: &ChannelHealthReportRecord) -> Duration {
     Utc::now()
         .signed_duration_since(report.observed_at)
+        .to_std()
+        .unwrap_or(Duration::ZERO)
+}
+
+fn report_future_by(report: &ChannelHealthReportRecord) -> Duration {
+    report
+        .observed_at
+        .signed_duration_since(Utc::now())
         .to_std()
         .unwrap_or(Duration::ZERO)
 }
@@ -2393,6 +2420,48 @@ mod tests {
             observation.subject.as_ref()
                 == "channel \"telegram\" health check telegram.bot_identity"
                 && observation.observed.as_ref() == "ok: getMe succeeded"
+        }));
+    }
+
+    #[tokio::test]
+    async fn doctor_warns_on_future_channel_health_report_timestamp() {
+        let (_temp_dir, home, commands, config, pool) =
+            doctor_channel_fixture("telegram", ChannelLaunchMode::Background).await;
+        insert_doctor_health_report(
+            &pool,
+            "telegram",
+            "telegram:worker",
+            ChannelHealthStatus::Ok,
+            Utc::now() + chrono::Duration::minutes(30),
+            vec![crate::contracts::ChannelHealthCheck {
+                code: "telegram.bot_identity".to_string(),
+                status: ChannelHealthStatus::Ok,
+                message: "getMe succeeded".to_string(),
+                details: serde_json::json!({}),
+            }],
+        )
+        .await;
+        let mut findings = Vec::new();
+        let mut observations = Vec::new();
+
+        inspect_channels(
+            &home,
+            "direct-home",
+            &commands,
+            &config,
+            &mut findings,
+            &mut observations,
+        )
+        .await;
+
+        assert!(findings.iter().any(|finding| {
+            finding.subject.as_ref()
+                == "channel \"telegram\" worker health report timestamp is in the future"
+                && finding
+                    .observed
+                    .as_ref()
+                    .contains("stored health report from telegram:worker is")
+                && finding.observed.as_ref().contains("in the future")
         }));
     }
 
