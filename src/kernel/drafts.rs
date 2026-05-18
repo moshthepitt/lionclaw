@@ -141,7 +141,7 @@ fn normalize_relative_path(path: &str) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-fn media_type_for_path(path: &Path) -> String {
+pub(crate) fn media_type_for_path(path: &Path) -> String {
     match path
         .extension()
         .and_then(|value| value.to_str())

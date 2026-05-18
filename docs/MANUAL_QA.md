@@ -202,6 +202,10 @@ Expected when credentials are available:
   behavior from Channels v2
 - a photo, document, voice, or video attachment reaches the runtime under
   `/attachments/...`
+- a runtime-generated image is returned to Telegram as a native media
+  attachment, even when the runtime final text is empty
+- Markdown in runtime answers renders as Telegram formatting, and local
+  workspace links are shown as labels rather than broken Telegram links
 - a retryable Telegram delivery failure survives worker restart and is retried
   through the outbox lease/report flow
 

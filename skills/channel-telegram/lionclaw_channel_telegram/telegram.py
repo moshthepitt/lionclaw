@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -7,10 +8,16 @@ from typing import Any, Protocol, Sequence
 
 from aiogram import Bot
 from aiogram.enums import ChatAction
-from aiogram.types import FSInputFile, Message, MessageEntity, ReplyParameters, Update
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import FSInputFile, LinkPreviewOptions, Message, MessageEntity, ReplyParameters, Update
 
 TELEGRAM_TEXT_LIMIT = 4000
+TELEGRAM_CAPTION_LIMIT = 1024
 PAIRING_TOKEN_RE = re.compile(r"(?:^|\s)(lc_[A-Za-z0-9_-]{8,128})(?:\s|$)")
+TELEGRAM_PARSE_ERROR_RE = re.compile(r"can't parse entities|parse entities|entity", re.I)
+LOCAL_LINK_RE = re.compile(r"^(?:/|file:|\.{0,2}/|[A-Za-z]:[\\/])")
+SUPPORTED_LINK_RE = re.compile(r"^(?:https?://|tg://|mailto:)", re.I)
+FILE_REFERENCE_RE = re.compile(r"^[A-Za-z0-9_.@-]+\.[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 class TelegramReferenceError(ValueError):
@@ -75,6 +82,12 @@ class TelegramOutboundAttachment:
     mime_type: str | None = None
 
 
+@dataclass(slots=True, frozen=True)
+class TelegramTextChunk:
+    plain_text: str
+    html_text: str | None = None
+
+
 TelegramInboundEvent = TelegramInboundUpdate | TelegramPairingClaim
 
 
@@ -97,10 +110,15 @@ class TelegramTransport(Protocol):
         text: str,
         reply_to_ref: str | None = None,
         thread_ref: str | None = None,
+        format_hint: str = "markdown",
         attachments: Sequence[TelegramOutboundAttachment] = (),
     ) -> dict[str, Any]: ...
 
-    async def send_typing(self, peer_id: str) -> None: ...
+    async def send_typing(
+        self,
+        conversation_ref: str,
+        thread_ref: str | None = None,
+    ) -> None: ...
 
 
 class AiogramTelegramTransport:
@@ -161,29 +179,40 @@ class AiogramTelegramTransport:
         text: str,
         reply_to_ref: str | None = None,
         thread_ref: str | None = None,
+        format_hint: str = "markdown",
         attachments: Sequence[TelegramOutboundAttachment] = (),
     ) -> dict[str, Any]:
         chat_id = _coerce_chat_id(conversation_ref)
         reply_parameters = _reply_parameters(reply_to_ref)
         message_thread_id = _coerce_thread_id(thread_ref, omit_general=True)
         sent_messages: list[dict[str, Any]] = []
+        text_chunks = _format_telegram_text_chunks(text, format_hint)
+        caption_chunk: TelegramTextChunk | None = None
+        if (
+            attachments
+            and len(text_chunks) == 1
+            and _utf16_len(text_chunks[0].plain_text) <= TELEGRAM_CAPTION_LIMIT
+        ):
+            caption_chunk = text_chunks[0]
+            text_chunks = []
 
-        for chunk in _split_telegram_text(text):
-            message = await self._bot.send_message(
+        for chunk in text_chunks:
+            message = await self._send_text_chunk(
                 chat_id=chat_id,
-                text=chunk,
+                chunk=chunk,
                 reply_parameters=reply_parameters,
                 message_thread_id=message_thread_id,
             )
             sent_messages.append(_message_receipt(message))
             reply_parameters = _reply_parameters(str(message.message_id))
 
-        for attachment in attachments:
+        for index, attachment in enumerate(attachments):
             message = await self._send_attachment(
                 chat_id=chat_id,
                 attachment=attachment,
                 reply_parameters=reply_parameters,
                 message_thread_id=message_thread_id,
+                caption=caption_chunk if index == 0 else None,
             )
             sent_messages.append(_message_receipt(message))
             reply_parameters = _reply_parameters(str(message.message_id))
@@ -204,6 +233,32 @@ class AiogramTelegramTransport:
             "messages": sent_messages,
         }
 
+    async def _send_text_chunk(
+        self,
+        *,
+        chat_id: int | str,
+        chunk: TelegramTextChunk,
+        reply_parameters: ReplyParameters | None,
+        message_thread_id: int | None,
+    ) -> Message:
+        params: dict[str, Any] = {
+            "chat_id": chat_id,
+            "reply_parameters": reply_parameters,
+            "message_thread_id": message_thread_id,
+            "link_preview_options": LinkPreviewOptions(is_disabled=True),
+        }
+        if chunk.html_text is not None:
+            try:
+                return await self._bot.send_message(
+                    text=chunk.html_text,
+                    parse_mode="HTML",
+                    **params,
+                )
+            except TelegramBadRequest as err:
+                if not _is_parse_error(err):
+                    raise
+        return await self._bot.send_message(text=chunk.plain_text, **params)
+
     async def _send_attachment(
         self,
         *,
@@ -211,6 +266,7 @@ class AiogramTelegramTransport:
         attachment: TelegramOutboundAttachment,
         reply_parameters: ReplyParameters | None,
         message_thread_id: int | None,
+        caption: TelegramTextChunk | None = None,
     ) -> Message:
         path = Path(attachment.path)
         file = FSInputFile(path, filename=attachment.filename or path.name)
@@ -220,20 +276,67 @@ class AiogramTelegramTransport:
             "message_thread_id": message_thread_id,
         }
         mime_type = attachment.mime_type or ""
+        await self._send_upload_action(chat_id, mime_type, message_thread_id)
+        if caption is not None and caption.html_text is not None:
+            try:
+                return await self._send_attachment_once(
+                    file=file,
+                    mime_type=mime_type,
+                    params={
+                        **common,
+                        "caption": caption.html_text,
+                        "parse_mode": "HTML",
+                    },
+                )
+            except TelegramBadRequest as err:
+                if not _is_parse_error(err):
+                    raise
+        params = common
+        if caption is not None:
+            params = {**common, "caption": caption.plain_text}
+        return await self._send_attachment_once(file=file, mime_type=mime_type, params=params)
+
+    async def _send_attachment_once(
+        self,
+        *,
+        file: FSInputFile,
+        mime_type: str,
+        params: dict[str, Any],
+    ) -> Message:
         if mime_type.startswith("image/"):
-            return await self._bot.send_photo(photo=file, **common)
+            return await self._bot.send_photo(photo=file, **params)
         if mime_type.startswith("video/"):
-            return await self._bot.send_video(video=file, **common)
+            return await self._bot.send_video(video=file, **params)
         if mime_type.startswith("audio/"):
             if mime_type == "audio/ogg":
-                return await self._bot.send_voice(voice=file, **common)
-            return await self._bot.send_audio(audio=file, **common)
-        return await self._bot.send_document(document=file, **common)
+                return await self._bot.send_voice(voice=file, **params)
+            return await self._bot.send_audio(audio=file, **params)
+        return await self._bot.send_document(document=file, **params)
 
-    async def send_typing(self, peer_id: str) -> None:
+    async def _send_upload_action(
+        self,
+        chat_id: int | str,
+        mime_type: str,
+        message_thread_id: int | None,
+    ) -> None:
+        try:
+            await self._bot.send_chat_action(
+                chat_id=chat_id,
+                action=_chat_action_for_mime_type(mime_type),
+                message_thread_id=message_thread_id,
+            )
+        except Exception:
+            pass
+
+    async def send_typing(
+        self,
+        conversation_ref: str,
+        thread_ref: str | None = None,
+    ) -> None:
         await self._bot.send_chat_action(
-            chat_id=_coerce_chat_id(peer_id),
+            chat_id=_coerce_chat_id(conversation_ref),
             action=ChatAction.TYPING,
+            message_thread_id=_coerce_thread_id(thread_ref, omit_general=False),
         )
 
 
@@ -695,6 +798,98 @@ def _attachment(
     )
 
 
+def _format_telegram_text_chunks(text: str, format_hint: str) -> list[TelegramTextChunk]:
+    chunks = _split_telegram_text(text)
+    if not chunks:
+        return []
+    if format_hint.casefold() != "markdown":
+        return [
+            TelegramTextChunk(plain_text=chunk, html_text=html.escape(chunk))
+            for chunk in chunks
+        ]
+    return [
+        TelegramTextChunk(plain_text=chunk, html_text=_markdown_to_telegram_html(chunk))
+        for chunk in chunks
+    ]
+
+
+def _markdown_to_telegram_html(markdown: str) -> str:
+    lines = markdown.splitlines(keepends=True)
+    rendered: list[str] = []
+    code_lines: list[str] = []
+    in_code_block = False
+
+    for line in lines:
+        if line.lstrip().startswith(("```", "~~~")):
+            if in_code_block:
+                rendered.append(f"<pre><code>{html.escape(''.join(code_lines))}</code></pre>")
+                code_lines = []
+                in_code_block = False
+            else:
+                in_code_block = True
+            continue
+        if in_code_block:
+            code_lines.append(line)
+            continue
+        rendered.append(_markdown_inline_to_html(line))
+
+    if in_code_block:
+        rendered.append(f"<pre><code>{html.escape(''.join(code_lines))}</code></pre>")
+
+    return "".join(rendered)
+
+
+def _markdown_inline_to_html(text: str) -> str:
+    output: list[str] = []
+    index = 0
+    while index < len(text):
+        if text[index] == "`":
+            end = text.find("`", index + 1)
+            if end != -1:
+                output.append(f"<code>{html.escape(text[index + 1:end])}</code>")
+                index = end + 1
+                continue
+        if text.startswith("**", index):
+            end = text.find("**", index + 2)
+            if end != -1:
+                output.append(f"<b>{_markdown_inline_to_html(text[index + 2:end])}</b>")
+                index = end + 2
+                continue
+        if text[index] == "[":
+            link = _parse_markdown_link(text, index)
+            if link is not None:
+                label, href, next_index = link
+                output.append(_render_telegram_link(label, href))
+                index = next_index
+                continue
+        output.append(html.escape(text[index]))
+        index += 1
+    return "".join(output)
+
+
+def _parse_markdown_link(text: str, index: int) -> tuple[str, str, int] | None:
+    label_end = text.find("]", index + 1)
+    if label_end == -1 or label_end + 1 >= len(text) or text[label_end + 1] != "(":
+        return None
+    href_end = text.find(")", label_end + 2)
+    if href_end == -1:
+        return None
+    label = text[index + 1:label_end]
+    href = text[label_end + 2:href_end].strip()
+    return label, href, href_end + 1
+
+
+def _render_telegram_link(label: str, href: str) -> str:
+    label_html = _markdown_inline_to_html(label)
+    if SUPPORTED_LINK_RE.match(href):
+        return f'<a href="{html.escape(href, quote=True)}">{label_html}</a>'
+    if LOCAL_LINK_RE.match(href) or not href:
+        if FILE_REFERENCE_RE.match(label.strip()):
+            return f"<code>{html.escape(label.strip())}</code>"
+        return label_html
+    return label_html
+
+
 def _split_telegram_text(text: str) -> list[str]:
     if not text:
         return []
@@ -724,3 +919,17 @@ def _find_text_cut(text: str, max_utf16_units: int) -> int:
 
 def _utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
+
+
+def _is_parse_error(err: TelegramBadRequest) -> bool:
+    return TELEGRAM_PARSE_ERROR_RE.search(str(err)) is not None
+
+
+def _chat_action_for_mime_type(mime_type: str) -> str:
+    if mime_type.startswith("image/"):
+        return ChatAction.UPLOAD_PHOTO
+    if mime_type.startswith("video/"):
+        return ChatAction.UPLOAD_VIDEO
+    if mime_type.startswith("audio/"):
+        return ChatAction.UPLOAD_DOCUMENT
+    return ChatAction.UPLOAD_DOCUMENT

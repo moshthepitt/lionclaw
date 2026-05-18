@@ -433,8 +433,12 @@ and sender.
 
 Outbox `content` is provider-neutral JSON with `text`, a `format_hint`
 (`plain`, `markdown`, or `html`), and an `attachments` array. Outbound
-attachments are schema-ready and remain text-only for shipped workers until
-runtime/draft file delivery is enabled.
+attachments are durable file descriptors copied into LionClaw-owned runtime
+outbox storage before delivery is leased. Runtime adapters can emit typed
+artifacts; the kernel converts those artifacts into outbox attachments without
+requiring channel workers to know runtime-private storage layouts. Providers
+choose native delivery methods from MIME type and report delivery outcomes
+through the same lease/report flow as text messages.
 
 ## Session Continuity
 

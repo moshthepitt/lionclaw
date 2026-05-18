@@ -44,8 +44,22 @@ EXPECTED_INBOUND_OUTCOMES = {
     "blocked",
     "trigger_ignored",
 }
-TYPING_STATUS_CODES = {"queue.started", "runtime.started"}
+TYPING_STATUS_CODES = {"queue.started", "runtime.started", "runtime.artifact"}
 MAX_ATTACHMENT_STAGE_BYTES = 25 * 1024 * 1024
+INITIAL_TYPING_TTL_SECONDS = 8.0
+ACTIVE_TURN_TYPING_TTL_SECONDS = 300.0
+TYPING_REFRESH_SECONDS = 4.0
+MAX_TYPING_FAILURES = 3
+
+
+@dataclass(slots=True, frozen=True)
+class TypingTarget:
+    conversation_ref: str
+    thread_ref: str | None = None
+
+    @property
+    def key(self) -> tuple[str, str | None]:
+        return (self.conversation_ref, self.thread_ref)
 
 
 @dataclass(slots=True)
@@ -78,6 +92,10 @@ class TelegramWorker:
         self.telegram = telegram
         self.offset_store = offset_store
         self.offset = offset_store.load()
+        self._typing_targets: dict[tuple[str, str | None], TypingTarget] = {}
+        self._typing_deadlines: dict[tuple[str, str | None], float] = {}
+        self._typing_routes: dict[str, TypingTarget] = {}
+        self._typing_failures: dict[tuple[str, str | None], int] = {}
 
     async def process_updates(self) -> None:
         try:
@@ -135,11 +153,42 @@ class TelegramWorker:
             await self._process_outbox_delivery(delivery)
 
     async def run_forever(self) -> None:
+        tasks = [
+            asyncio.create_task(self._run_update_loop(), name="telegram-updates"),
+            asyncio.create_task(self._run_stream_loop(), name="lionclaw-stream"),
+            asyncio.create_task(self._run_outbox_loop(), name="lionclaw-outbox"),
+            asyncio.create_task(self._run_typing_loop(), name="telegram-typing"),
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._typing_targets.clear()
+            self._typing_deadlines.clear()
+            self._typing_routes.clear()
+            self._typing_failures.clear()
+
+    async def _run_update_loop(self) -> None:
         while True:
             await self.process_updates()
+            await asyncio.sleep(self.config.telegram_loop_delay_secs)
+
+    async def _run_stream_loop(self) -> None:
+        while True:
             await self.flush_stream()
+            await asyncio.sleep(self.config.telegram_loop_delay_secs)
+
+    async def _run_outbox_loop(self) -> None:
+        while True:
             await self.flush_outbox()
             await asyncio.sleep(self.config.telegram_loop_delay_secs)
+
+    async def _run_typing_loop(self) -> None:
+        while True:
+            await asyncio.sleep(TYPING_REFRESH_SECONDS)
+            await self.refresh_typing()
 
     async def _claim_pairing(self, claim: TelegramPairingClaim) -> bool:
         try:
@@ -183,8 +232,23 @@ class TelegramWorker:
             return False
         if response.outcome == "pending_approval":
             await self._notify_pending_approval(update, response.pairing_code)
+        if response.outcome == "queued":
+            self._remember_typing_route(update)
+            await self._start_typing(
+                update.conversation_ref,
+                thread_ref=update.thread_ref,
+                ttl_seconds=INITIAL_TYPING_TTL_SECONDS,
+            )
         if response.outcome == "waiting_for_attachments":
-            return await self._stage_attachments(update)
+            staged = await self._stage_attachments(update)
+            if staged:
+                self._remember_typing_route(update)
+                await self._start_typing(
+                    update.conversation_ref,
+                    thread_ref=update.thread_ref,
+                    ttl_seconds=INITIAL_TYPING_TTL_SECONDS,
+                )
+            return staged
         return True
 
     async def _notify_pending_approval(
@@ -292,21 +356,22 @@ class TelegramWorker:
 
     async def _process_stream_event(self, event: StreamEvent) -> bool:
         if event.kind == "message_delta":
+            self._extend_typing(
+                event.peer_id,
+                ttl_seconds=ACTIVE_TURN_TYPING_TTL_SECONDS,
+            )
             return True
 
         if event.kind == "status":
             if event.code in TYPING_STATUS_CODES:
-                try:
-                    await self.telegram.send_typing(event.peer_id)
-                except Exception:
-                    logger.exception(
-                        "telegram sendChatAction request failed for peer_id=%s",
-                        event.peer_id,
-                    )
-                    return False
+                await self._start_typing(
+                    event.peer_id,
+                    ttl_seconds=ACTIVE_TURN_TYPING_TTL_SECONDS,
+                )
             return True
 
         if event.kind == "error":
+            self._stop_typing(event.peer_id)
             logger.error(
                 "lionclaw stream error for peer_id=%s turn_id=%s: %s",
                 event.peer_id,
@@ -316,13 +381,97 @@ class TelegramWorker:
             return True
 
         if event.kind == "turn_completed":
+            self._stop_typing(event.peer_id)
             return True
 
         if event.kind == "done":
+            self._stop_typing(event.peer_id)
             return True
 
         logger.error("lionclaw stream contained unknown event kind '%s'", event.kind)
         return True
+
+    async def refresh_typing(self) -> None:
+        now = _loop_time()
+        active_targets = [
+            self._typing_targets[key]
+            for key, deadline in self._typing_deadlines.items()
+            if deadline > now
+        ]
+        expired_keys = [
+            key
+            for key, deadline in self._typing_deadlines.items()
+            if deadline <= now
+        ]
+        for key in expired_keys:
+            self._typing_targets.pop(key, None)
+            self._typing_deadlines.pop(key, None)
+            self._typing_failures.pop(key, None)
+        for target in active_targets:
+            await self._send_typing(target)
+
+    async def _start_typing(
+        self,
+        conversation_ref: str,
+        *,
+        thread_ref: str | None = None,
+        ttl_seconds: float,
+    ) -> None:
+        target = self._target_for_ref(conversation_ref, thread_ref=thread_ref)
+        self._extend_target_typing(target, ttl_seconds=ttl_seconds)
+        await self._send_typing(target)
+
+    def _extend_typing(self, peer_id: str, *, ttl_seconds: float) -> None:
+        target = self._target_for_ref(peer_id)
+        self._extend_target_typing(target, ttl_seconds=ttl_seconds)
+
+    def _extend_target_typing(self, target: TypingTarget, *, ttl_seconds: float) -> None:
+        if not target.conversation_ref:
+            return
+        self._typing_targets[target.key] = target
+        deadline = _loop_time() + ttl_seconds
+        self._typing_deadlines[target.key] = max(
+            deadline,
+            self._typing_deadlines.get(target.key, 0.0),
+        )
+
+    def _stop_typing(self, peer_id: str) -> None:
+        target = self._target_for_ref(peer_id)
+        self._typing_targets.pop(target.key, None)
+        self._typing_deadlines.pop(target.key, None)
+        self._typing_failures.pop(target.key, None)
+
+    async def _send_typing(self, target: TypingTarget) -> None:
+        try:
+            await self.telegram.send_typing(target.conversation_ref, target.thread_ref)
+            self._typing_failures.pop(target.key, None)
+        except Exception:
+            failures = self._typing_failures.get(target.key, 0) + 1
+            self._typing_failures[target.key] = failures
+            if failures >= MAX_TYPING_FAILURES:
+                self._typing_targets.pop(target.key, None)
+                self._typing_deadlines.pop(target.key, None)
+            logger.exception(
+                "telegram sendChatAction request failed for conversation_ref=%s thread_ref=%s",
+                target.conversation_ref,
+                target.thread_ref,
+            )
+
+    def _remember_typing_route(self, update: TelegramInboundUpdate) -> None:
+        target = TypingTarget(update.conversation_ref, update.thread_ref)
+        self._typing_routes[update.conversation_ref] = target
+        if update.provider_metadata.get("chat_type") == "private":
+            self._typing_routes[update.sender_ref] = target
+
+    def _target_for_ref(
+        self,
+        conversation_ref: str,
+        *,
+        thread_ref: str | None = None,
+    ) -> TypingTarget:
+        if thread_ref is not None:
+            return TypingTarget(conversation_ref, thread_ref)
+        return self._typing_routes.get(conversation_ref) or TypingTarget(conversation_ref)
 
     async def _process_outbox_delivery(self, delivery: OutboxDelivery) -> None:
         try:
@@ -331,6 +480,7 @@ class TelegramWorker:
                 delivery.content.text,
                 delivery.reply_to_ref,
                 delivery.thread_ref,
+                format_hint=delivery.content.format_hint,
                 attachments=[
                     TelegramOutboundAttachment(
                         path=attachment.path,
@@ -444,6 +594,10 @@ def _pairing_claim_reply(outcome: str) -> str:
     if outcome == "scope_mismatch":
         return "That pairing link is not valid for this chat."
     return "That pairing link is invalid."
+
+
+def _loop_time() -> float:
+    return asyncio.get_running_loop().time()
 
 
 async def run() -> None:

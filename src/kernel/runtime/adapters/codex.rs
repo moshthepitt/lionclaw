@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::kernel::runtime::{
     spawn_interactive, ExecutionOutput, ExecutionRequest, ExecutionSession, NetworkMode,
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthKind, RuntimeCapabilityResult,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact, RuntimeAuthKind, RuntimeCapabilityResult,
     RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender,
     RuntimeMessageLane, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeSessionHandle,
     RuntimeSessionStartInput, RuntimeTurnMode, RuntimeTurnResult,
@@ -582,6 +582,10 @@ struct CodexAppServerClient<T> {
     started_thread_turns: HashMap<String, String>,
     completed_context_compaction_threads: HashSet<String>,
     unmatched_context_compaction_completed: bool,
+    emitted_artifact_ids: HashSet<String>,
+    answer_delta_item_id: Option<String>,
+    answer_stream_has_text: bool,
+    answer_stream_ends_with_newline: bool,
 }
 
 impl<T> CodexAppServerClient<T>
@@ -600,6 +604,10 @@ where
             started_thread_turns: HashMap::new(),
             completed_context_compaction_threads: HashSet::new(),
             unmatched_context_compaction_completed: false,
+            emitted_artifact_ids: HashSet::new(),
+            answer_delta_item_id: None,
+            answer_stream_has_text: false,
+            answer_stream_ends_with_newline: false,
         }
     }
 
@@ -955,9 +963,19 @@ where
         }
 
         let Some(method) = message.get("method").and_then(Value::as_str) else {
+            if let Some(artifact) =
+                self.generated_artifact_for_message(None, &message, thread_state)?
+            {
+                drop(events.send(RuntimeEvent::Artifact { artifact }));
+            }
             return Ok(());
         };
         let params = message.get("params").unwrap_or(&Value::Null);
+        if let Some(artifact) =
+            self.generated_artifact_for_message(Some(method), params, thread_state)?
+        {
+            drop(events.send(RuntimeEvent::Artifact { artifact }));
+        }
         match method {
             "thread/started" => {
                 if let Some(thread_id) = extract_app_server_thread_id(params) {
@@ -975,6 +993,7 @@ where
                 }));
             }
             "turn/started" => {
+                self.reset_answer_stream_state();
                 if let (Some(thread_id), Some(turn_id)) = (
                     extract_app_server_thread_id(params),
                     extract_app_server_turn_id(params),
@@ -987,6 +1006,7 @@ where
                 }));
             }
             "turn/completed" => {
+                self.reset_answer_stream_state();
                 if let Some(message) = completed_turn_error_text(params) {
                     self.remember_turn_failure(params, message);
                 } else {
@@ -1007,10 +1027,18 @@ where
             }
             "item/agentMessage/delta" => {
                 if let Some(text) = app_server_text(params, &["delta", "text", "content"]) {
+                    let item_id = app_server_item_id(params);
+                    if self.should_separate_answer_item(item_id.as_deref(), &text) {
+                        drop(events.send(RuntimeEvent::MessageDelta {
+                            lane: RuntimeMessageLane::Answer,
+                            text: "\n\n".to_string(),
+                        }));
+                    }
                     drop(events.send(RuntimeEvent::MessageDelta {
                         lane: RuntimeMessageLane::Answer,
-                        text,
+                        text: text.clone(),
                     }));
+                    self.remember_answer_delta(item_id, &text);
                 }
             }
             "item/agentReasoning/delta" | "item/agentReasoningRawContent/delta" => {
@@ -1046,6 +1074,56 @@ where
         Ok(())
     }
 
+    fn generated_artifact_for_message(
+        &mut self,
+        method: Option<&str>,
+        message: &Value,
+        thread_state: &CodexThreadState,
+    ) -> Result<Option<RuntimeArtifact>> {
+        let Some(payload) = codex_generated_image_payload(method, message) else {
+            return Ok(None);
+        };
+
+        let Some(call_id) = codex_generated_image_call_id(payload) else {
+            return Ok(None);
+        };
+        let thread_id = extract_app_server_thread_id(payload)
+            .or_else(|| extract_app_server_thread_id(message))
+            .or_else(|| thread_state.current_thread_id().ok().flatten());
+        let Some(thread_id) = thread_id else {
+            return Ok(None);
+        };
+        let Some(runtime_state_root) = thread_state.runtime_state_root()? else {
+            return Ok(None);
+        };
+
+        let artifact_id = format!("codex:image:{thread_id}:{call_id}");
+        if !self.emitted_artifact_ids.insert(artifact_id.clone()) {
+            return Ok(None);
+        }
+        let filename = format!("{call_id}.png");
+        let path = codex_generated_image_path(payload, &runtime_state_root).unwrap_or_else(|| {
+            runtime_state_root
+                .join("home")
+                .join(".codex")
+                .join("generated_images")
+                .join(&thread_id)
+                .join(&filename)
+        });
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+            .unwrap_or(filename);
+
+        Ok(Some(RuntimeArtifact {
+            artifact_id,
+            path,
+            filename: Some(filename),
+            mime_type: Some("image/png".to_string()),
+        }))
+    }
+
     fn record_app_server_item(&mut self, method: &str, params: &Value) -> Option<String> {
         match (method, app_server_item_type(params)) {
             ("item/started", Some("contextCompaction")) => {
@@ -1062,6 +1140,35 @@ where
             (_, Some(_)) => describe_app_server_item(params),
             (_, None) => None,
         }
+    }
+
+    fn should_separate_answer_item(&self, item_id: Option<&str>, text: &str) -> bool {
+        if text.is_empty()
+            || !self.answer_stream_has_text
+            || self.answer_stream_ends_with_newline
+            || text.starts_with('\n')
+        {
+            return false;
+        }
+        match (self.answer_delta_item_id.as_deref(), item_id) {
+            (Some(previous), Some(current)) => previous != current,
+            _ => false,
+        }
+    }
+
+    fn remember_answer_delta(&mut self, item_id: Option<String>, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.answer_delta_item_id = item_id.or_else(|| self.answer_delta_item_id.take());
+        self.answer_stream_has_text = true;
+        self.answer_stream_ends_with_newline = text.ends_with('\n');
+    }
+
+    fn reset_answer_stream_state(&mut self) {
+        self.answer_delta_item_id = None;
+        self.answer_stream_has_text = false;
+        self.answer_stream_ends_with_newline = false;
     }
 
     async fn respond_to_server_request(&mut self, message: &Value) -> Result<()> {
@@ -1288,6 +1395,92 @@ fn app_server_item_type(params: &Value) -> Option<&str> {
     item.get("type").and_then(Value::as_str)
 }
 
+fn app_server_item_id(params: &Value) -> Option<String> {
+    params
+        .get("itemId")
+        .or_else(|| params.get("item_id"))
+        .or_else(|| params.pointer("/item/id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|item_id| !item_id.is_empty())
+        .map(str::to_string)
+}
+
+fn codex_generated_image_payload<'a>(
+    method: Option<&'a str>,
+    message: &'a Value,
+) -> Option<&'a Value> {
+    if let Some(("image_generation_end", payload)) = app_server_event_payload(method, message) {
+        return Some(payload);
+    }
+
+    let item = message.get("item").unwrap_or(message);
+    let item_type = item.get("type").and_then(Value::as_str);
+    if matches!(method, Some("item/completed" | "item/updated"))
+        && matches!(item_type, Some("imageGeneration" | "image_generation_call"))
+    {
+        return Some(item);
+    }
+
+    if method.is_none() && message.get("type").and_then(Value::as_str) == Some("response_item") {
+        let payload = message.get("payload")?;
+        if payload.get("type").and_then(Value::as_str) == Some("image_generation_call") {
+            return Some(payload);
+        }
+    }
+
+    None
+}
+
+fn codex_generated_image_call_id(payload: &Value) -> Option<String> {
+    payload
+        .get("call_id")
+        .or_else(|| payload.get("callId"))
+        .or_else(|| payload.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn codex_generated_image_path(payload: &Value, runtime_state_root: &Path) -> Option<PathBuf> {
+    let raw = payload
+        .get("saved_path")
+        .or_else(|| payload.get("savedPath"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let path = Path::new(raw);
+    if let Ok(container_relative) = path.strip_prefix("/runtime") {
+        return Some(runtime_state_root.join(container_relative));
+    }
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        Some(runtime_state_root.join(path))
+    }
+}
+
+fn app_server_event_payload<'a>(
+    method: Option<&'a str>,
+    message: &'a Value,
+) -> Option<(&'a str, &'a Value)> {
+    let message_type = message.get("type").and_then(Value::as_str);
+    if matches!(method, Some("event_msg" | "event"))
+        || matches!(message_type, Some("event_msg" | "event"))
+    {
+        let payload = message.get("payload").unwrap_or(message);
+        return payload
+            .get("type")
+            .and_then(Value::as_str)
+            .map(|kind| (kind, payload));
+    }
+    if method == Some("image_generation_end") || message_type == Some("image_generation_end") {
+        return Some(("image_generation_end", message));
+    }
+    None
+}
+
 fn app_server_text(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .filter_map(|key| value.get(*key))
@@ -1491,6 +1684,28 @@ impl CodexThreadState {
         }
         drop(sessions);
         Ok(())
+    }
+
+    fn current_thread_id(&self) -> Result<Option<String>> {
+        Ok(self
+            .sessions
+            .read()
+            .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
+            .get(&self.runtime_session_id)
+            .ok_or_else(|| anyhow!("runtime session '{}' not found", self.runtime_session_id))?
+            .thread_id
+            .clone())
+    }
+
+    fn runtime_state_root(&self) -> Result<Option<PathBuf>> {
+        Ok(self
+            .sessions
+            .read()
+            .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
+            .get(&self.runtime_session_id)
+            .ok_or_else(|| anyhow!("runtime session '{}' not found", self.runtime_session_id))?
+            .runtime_state_root
+            .clone())
     }
 
     fn persist_thread_id(&self, thread_id: &str) -> Result<()> {
@@ -1967,6 +2182,178 @@ mod tests {
         );
 
         adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_separates_distinct_agent_message_items() {
+        let (adapter, handle, thread_state) = start_codex_test_session(None).await;
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {"turn": {"id": "turn_1"}}}),
+            json!({"method": "item/agentMessage/delta", "params": {"threadId": "thr_1", "turnId": "turn_1", "itemId": "msg_1", "delta": "First."}}),
+            json!({"method": "item/agentMessage/delta", "params": {"threadId": "thr_1", "turnId": "turn_1", "itemId": "msg_2", "delta": "Second."}}),
+            json!({"method": "turn/completed", "params": {"threadId": "thr_1", "turnId": "turn_1"}}),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = client
+            .request("turn/start", json!({}), &event_tx, &thread_state)
+            .await
+            .expect("turn start");
+        client
+            .wait_for_turn_completed(
+                super::extract_app_server_turn_id(&response).as_deref(),
+                Some("thr_1"),
+                None,
+                &event_tx,
+                &thread_state,
+                None,
+            )
+            .await
+            .expect("turn completed");
+
+        let text = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text,
+                } => Some(text),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "First.\n\nSecond.");
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    async fn assert_image_generation_event_emits_runtime_artifact(event_message: Value) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let generated_dir = runtime_state_root
+            .join("home")
+            .join(".codex")
+            .join("generated_images")
+            .join("thr_1");
+        std::fs::create_dir_all(&generated_dir).expect("create generated image dir");
+        std::fs::write(generated_dir.join("ig_1.png"), b"png").expect("write generated image");
+        let (adapter, handle, thread_state) =
+            start_codex_test_session(Some(runtime_state_root.clone())).await;
+        thread_state
+            .persist_thread_id("thr_1")
+            .expect("persist thread id");
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {"turn": {"id": "turn_1"}}}),
+            event_message,
+            json!({"method": "turn/completed", "params": {"threadId": "thr_1", "turnId": "turn_1"}}),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = client
+            .request("turn/start", json!({}), &event_tx, &thread_state)
+            .await
+            .expect("turn start");
+        client
+            .wait_for_turn_completed(
+                super::extract_app_server_turn_id(&response).as_deref(),
+                Some("thr_1"),
+                None,
+                &event_tx,
+                &thread_state,
+                None,
+            )
+            .await
+            .expect("turn completed");
+
+        let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        let artifact = events
+            .iter()
+            .find_map(|event| match event {
+                RuntimeEvent::Artifact { artifact } => Some(artifact),
+                _ => None,
+            })
+            .expect("image artifact event");
+        assert_eq!(artifact.artifact_id, "codex:image:thr_1:ig_1");
+        assert_eq!(artifact.filename.as_deref(), Some("ig_1.png"));
+        assert_eq!(artifact.mime_type.as_deref(), Some("image/png"));
+        assert_eq!(artifact.path, generated_dir.join("ig_1.png"));
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_method_image_generation_event_emits_runtime_artifact() {
+        assert_image_generation_event_emits_runtime_artifact(json!({
+            "method": "event_msg",
+            "params": {
+                "payload": {
+                    "type": "image_generation_end",
+                    "call_id": "ig_1",
+                    "status": "generating"
+                }
+            }
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_top_level_image_generation_event_emits_runtime_artifact() {
+        assert_image_generation_event_emits_runtime_artifact(json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "image_generation_end",
+                "call_id": "ig_1",
+                "status": "generating",
+                "result": "base64 omitted"
+            }
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_image_generation_saved_path_maps_runtime_root() {
+        assert_image_generation_event_emits_runtime_artifact(json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "image_generation_end",
+                "call_id": "ig_1",
+                "status": "generating",
+                "saved_path": "/runtime/home/.codex/generated_images/thr_1/ig_1.png",
+                "result": "base64 omitted"
+            }
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_image_generation_item_emits_runtime_artifact() {
+        assert_image_generation_event_emits_runtime_artifact(json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "item": {
+                    "type": "imageGeneration",
+                    "id": "ig_1",
+                    "status": "completed"
+                }
+            }
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_response_item_image_generation_emits_runtime_artifact() {
+        assert_image_generation_event_emits_runtime_artifact(json!({
+            "type": "response_item",
+            "payload": {
+                "type": "image_generation_call",
+                "id": "ig_1",
+                "status": "generating",
+                "result": "base64 omitted"
+            }
+        }))
+        .await;
     }
 
     #[tokio::test]

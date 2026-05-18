@@ -82,8 +82,14 @@ LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
 - The worker defaults `consumer_id` to `telegram:<channel_id>` and `start_mode=resume`, so unacked progress events are replayed after worker restart.
 - Telegram delivery is outbox-driven: typing comes from progress streams, final
   answers come from durable outbox leases, no reasoning lane delivery.
-- Outbound text is sent as plain text and chunked to Telegram's message limits.
-  Topic `thread_ref` and `reply_to_ref` are converted back into Telegram
+- Outbound text is normalized to Telegram-safe HTML with plain-text fallback,
+  chunked to Telegram's message limits, and sent with link previews disabled so
+  local workspace paths do not become broken Telegram links.
+- Outbox attachments are sent as native Telegram media where possible
+  (`sendPhoto`, `sendVideo`, `sendAudio`/`sendVoice`) and fall back to
+  documents by MIME type. Short text on media deliveries is used as the first
+  attachment caption.
+- Topic `thread_ref` and `reply_to_ref` are converted back into Telegram
   delivery parameters, and each outbox lease is reported with its `attempt_id`.
 - Runtime selection comes from the selected instance's default runtime; workers do not send `runtime_id` in inbound requests.
 - The worker stores Telegram offset in `$LIONCLAW_HOME/runtime/channels/$LIONCLAW_CHANNEL_ID/telegram.offset` by default.
