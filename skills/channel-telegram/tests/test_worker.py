@@ -5,6 +5,7 @@ import contextlib
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
@@ -16,6 +17,8 @@ from lionclaw_channel_telegram.api import (
     AttachmentFinalizeResponse,
     AttachmentMissingReport,
     AttachmentStageResponse,
+    HealthCheck,
+    HealthReportResponse,
     InboundResponse,
     LionClawApi,
     OutboxAttachment,
@@ -43,6 +46,7 @@ from lionclaw_channel_telegram.worker import (
     OffsetStore,
     TelegramWorker,
     _classify_send_failure,
+    _overall_health_status,
 )
 
 BOT = TelegramBotIdentity(user_id=99, username="lionclaw_bot")
@@ -721,6 +725,64 @@ class LionClawApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deliveries[0].content.attachments[0].path, "/tmp/a.txt")
         await api.close()
 
+    async def test_report_health_uses_channel_health_endpoint(self) -> None:
+        captured: dict[str, object] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured["path"] = request.url.path
+            captured["payload"] = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={
+                    "accepted": True,
+                    "channel_id": "telegram",
+                    "observed_at": "2026-05-18T17:00:00Z",
+                },
+            )
+
+        client = httpx.AsyncClient(
+            base_url="http://127.0.0.1:8979",
+            transport=httpx.MockTransport(handler),
+        )
+        api = build_api(client)
+
+        response = await api.report_health(
+            "warning",
+            [
+                HealthCheck(
+                    code="telegram.delivery_errors",
+                    status="warning",
+                    message="1 delivery failure observed",
+                    details={"retryable_failed": 1, "terminal_failed": 0},
+                )
+            ],
+            observed_at=datetime(2026, 5, 18, 17, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertTrue(response.accepted)
+        self.assertEqual(captured["path"], "/v0/channels/health/report")
+        self.assertEqual(
+            captured["payload"],
+            {
+                "channel_id": "telegram",
+                "reporter_id": "telegram:telegram",
+                "status": "warning",
+                "checks": [
+                    {
+                        "code": "telegram.delivery_errors",
+                        "status": "warning",
+                        "message": "1 delivery failure observed",
+                        "details": {
+                            "retryable_failed": 1,
+                            "terminal_failed": 0,
+                        },
+                    }
+                ],
+                "observed_at": "2026-05-18T17:00:00+00:00",
+            },
+        )
+        await api.close()
+
 
 class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_process_updates_routes_pairing_and_inbound_and_persists_offset(
@@ -1258,6 +1320,64 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(api.outbox_reports[0][2], "retryable_failed")
         self.assertEqual(api.outbox_reports[0][4], "telegram.send_failed")
 
+    async def test_report_health_submits_provider_checks(self) -> None:
+        api = FakeLionClawApi()
+        telegram = FakeTelegramTransport()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.report_health()
+
+        self.assertEqual(len(api.health_reports), 1)
+        status, checks = api.health_reports[0]
+        self.assertEqual(status, "ok")
+        self.assertEqual(
+            [check.code for check in checks],
+            [
+                "telegram.bot_identity",
+                "telegram.update_lag",
+                "telegram.delivery_errors",
+            ],
+        )
+        self.assertTrue(all(check.status == "ok" for check in checks))
+        self.assertEqual(checks[0].details["bot_id"], BOT.user_id)
+
+    async def test_delivery_failure_is_reported_in_worker_health(self) -> None:
+        api = FakeLionClawApi(
+            outbox_deliveries=[
+                OutboxDelivery(
+                    delivery_id="delivery-1",
+                    attempt_id="attempt-1",
+                    conversation_ref="telegram:user:77",
+                    content=OutboxContent(text="final answer"),
+                )
+            ]
+        )
+        telegram = FakeTelegramTransport(fail_send_message=True)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker.flush_outbox()
+            await worker.report_health()
+
+        self.assertEqual(api.health_reports[0][0], "warning")
+        checks_by_code = {check.code: check for check in api.health_reports[0][1]}
+        delivery_errors = checks_by_code["telegram.delivery_errors"]
+        self.assertEqual(delivery_errors.status, "warning")
+        self.assertEqual(delivery_errors.details["retryable_failed"], 1)
+        self.assertEqual(delivery_errors.details["terminal_failed"], 0)
+
     async def test_stale_outbox_report_is_not_retried_as_success(self) -> None:
         api = FakeLionClawApi(
             outbox_deliveries=[
@@ -1299,6 +1419,26 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outcome, "terminal_failed")
         self.assertEqual(error_code, "telegram.invalid_ref")
+
+    async def test_bot_identity_failure_makes_worker_health_error(self) -> None:
+        api = FakeLionClawApi()
+        telegram = FakeTelegramTransport(
+            bot_identity_error=RuntimeError("unauthorized")
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker.report_health()
+
+        self.assertEqual(api.health_reports[0][0], "error")
+        checks_by_code = {check.code: check for check in api.health_reports[0][1]}
+        self.assertEqual(checks_by_code["telegram.bot_identity"].status, "error")
 
 
 class TelegramDeliveryHelperTests(unittest.TestCase):
@@ -1357,6 +1497,26 @@ class TelegramDeliveryHelperTests(unittest.TestCase):
             rendered, "<pre><code>&lt;b&gt;literal&lt;/b&gt;\n</code></pre>"
         )
 
+    def test_overall_health_status_uses_most_severe_check(self) -> None:
+        self.assertEqual(
+            _overall_health_status(
+                [
+                    HealthCheck("a", "ok", "ok"),
+                    HealthCheck("b", "warning", "warn"),
+                ]
+            ),
+            "warning",
+        )
+        self.assertEqual(
+            _overall_health_status(
+                [
+                    HealthCheck("a", "warning", "warn"),
+                    HealthCheck("b", "error", "error"),
+                ]
+            ),
+            "error",
+        )
+
 
 def build_api(client: httpx.AsyncClient) -> LionClawApi:
     return LionClawApi(
@@ -1381,6 +1541,7 @@ def build_config(runtime_dir: Path) -> WorkerConfig:
         consumer_id="telegram:telegram",
         telegram_poll_timeout_secs=25,
         telegram_loop_delay_secs=0.0,
+        health_report_interval_secs=60.0,
         runtime_dir=runtime_dir,
         telegram_offset_file=runtime_dir / "telegram.offset",
     )
@@ -1423,6 +1584,7 @@ class FakeLionClawApi:
                 str | None,
             ]
         ] = []
+        self.health_reports: list[tuple[str, list[HealthCheck]]] = []
 
     async def send_inbound(self, update: TelegramInboundUpdate) -> InboundResponse:
         self.sent_inbound.append(update)
@@ -1465,6 +1627,18 @@ class FakeLionClawApi:
     async def pull_outbox(self) -> list[OutboxDelivery]:
         return list(self.outbox_deliveries)
 
+    async def report_health(
+        self,
+        status: str,
+        checks: list[HealthCheck],
+    ) -> HealthReportResponse:
+        self.health_reports.append((status, list(checks)))
+        return HealthReportResponse(
+            accepted=True,
+            channel_id="telegram",
+            observed_at="2026-05-18T17:00:00Z",
+        )
+
     async def report_outbox(
         self,
         delivery: OutboxDelivery,
@@ -1501,6 +1675,7 @@ class FakeTelegramTransport:
         updates: list[Update] | None = None,
         fail_send_message: bool = False,
         fail_download: bool = False,
+        bot_identity_error: Exception | None = None,
         downloaded_content: bytes = b"file",
     ) -> None:
         self.updates = list(updates or [])
@@ -1513,12 +1688,15 @@ class FakeTelegramTransport:
         self.downloaded_attachment_ids: list[str] = []
         self.fail_send_message = fail_send_message
         self.fail_download = fail_download
+        self.bot_identity_error = bot_identity_error
         self.downloaded_content = downloaded_content
 
     async def close(self) -> None:
         pass
 
     async def bot_identity(self) -> TelegramBotIdentity:
+        if self.bot_identity_error is not None:
+            raise self.bot_identity_error
         return BOT
 
     async def get_updates(self, offset: int, timeout_seconds: int) -> list[Update]:

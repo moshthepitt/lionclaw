@@ -2,14 +2,19 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::Utc;
 use serde::Deserialize;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 use crate::{
     applied::{compute_daemon_fingerprint, AppliedState},
+    contracts::ChannelHealthStatus,
     home::{runtime_project_partition_key, LionClawHome},
+    kernel::channel_state::{ChannelHealthRecord, ChannelHealthReportRecord, ChannelStateStore},
     kernel::skills::validate_skill_alias,
     operator::{
         channel_env::validate_channel_env_contract,
@@ -36,6 +41,7 @@ use crate::{
 
 const UNRESOLVED_WORK_ROOT_NOTE: &str =
     "choose the intended work root; doctor cannot infer a safe path";
+const STALE_BACKGROUND_CHANNEL_HEALTH_AFTER: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindingSeverity {
@@ -253,6 +259,35 @@ impl DoctorFinding {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorObservation {
+    pub subject: Box<str>,
+    pub target: Box<str>,
+    pub observed: Box<str>,
+    pub inspect: Box<str>,
+}
+
+impl DoctorObservation {
+    fn new(
+        subject: impl Into<String>,
+        target: impl Into<String>,
+        observed: impl Into<String>,
+    ) -> Self {
+        let target = target.into();
+        Self {
+            subject: into_boxed_str(subject),
+            inspect: default_inspect_command(&target),
+            target: target.into_boxed_str(),
+            observed: into_boxed_str(observed),
+        }
+    }
+
+    fn with_inspect(mut self, command: impl Into<String>) -> Self {
+        self.inspect = command.into().into_boxed_str();
+        self
+    }
+}
+
 fn into_boxed_str(value: impl Into<String>) -> Box<str> {
     value.into().into_boxed_str()
 }
@@ -273,6 +308,7 @@ fn target_looks_like_path(target: &str) -> bool {
 pub struct DoctorReport {
     pub findings: Vec<DoctorFinding>,
     pub next_command: Option<Box<str>>,
+    pub observations: Vec<DoctorObservation>,
 }
 
 impl DoctorReport {
@@ -284,7 +320,8 @@ impl DoctorReport {
 
     pub fn render(&self) -> String {
         let error_count = self.severity_count(FindingSeverity::Error);
-        let non_error_count = self.findings.len().saturating_sub(error_count);
+        let advisory_count =
+            self.findings.len().saturating_sub(error_count) + self.observations.len();
         let mut output = String::new();
 
         if error_count > 0 {
@@ -295,7 +332,7 @@ impl DoctorReport {
             if let Some(next_command) = self.next_command.as_deref() {
                 output.push_str(&format!("next: {next_command}\n"));
             }
-            if non_error_count == 0 {
+            if advisory_count == 0 {
                 return output;
             }
             output.push_str("note: non-error findings below are advisory\n\n");
@@ -320,6 +357,13 @@ impl DoctorReport {
             }
             output.push('\n');
         }
+        for observation in &self.observations {
+            output.push_str(&format!("info: {}\n", observation.subject));
+            output.push_str(&format!("target: {}\n", observation.target));
+            output.push_str(&format!("observed: {}\n", observation.observed));
+            output.push_str(&format!("inspect: {}\n", observation.inspect));
+            output.push('\n');
+        }
         output
     }
 
@@ -340,6 +384,11 @@ impl DoctorReport {
 
     fn set_next_command(&mut self, command: impl Into<String>) {
         self.next_command = Some(command.into().into_boxed_str());
+    }
+
+    fn extend_report(&mut self, report: DoctorReport) {
+        self.findings.extend(report.findings);
+        self.observations.extend(report.observations);
     }
 }
 
@@ -563,10 +612,7 @@ async fn inspect_project<M: UnitManager>(
             .get(&name)
             .cloned()
             .unwrap_or_else(|| instance_home_path(project_root, &name));
-        inspect_instance(Some(project_root), &name, &home, manager)
-            .await
-            .into_iter()
-            .for_each(|finding| report.push(finding));
+        report.extend_report(inspect_instance(Some(project_root), &name, &home, manager).await);
     }
 
     report.extend(inspect_project_units(project_root, &instances)?);
@@ -660,13 +706,11 @@ fn project_has_no_instances_finding(project_root: &Path, repair_instance: &str) 
 }
 
 async fn inspect_direct_home<M: UnitManager>(home: &Path, manager: &M) -> Result<DoctorReport> {
-    let mut report = DoctorReport::default();
     let name = "direct-home";
+    let mut report = DoctorReport::default();
     let commands = DoctorCommands::for_target(None, name, home);
     report.set_next_command(commands.run());
-    for finding in inspect_instance(None, name, home, manager).await {
-        report.push(finding);
-    }
+    report.extend_report(inspect_instance(None, name, home, manager).await);
     Ok(report)
 }
 
@@ -675,12 +719,19 @@ async fn inspect_instance<M: UnitManager>(
     name: &str,
     home: &Path,
     manager: &M,
-) -> Vec<DoctorFinding> {
+) -> DoctorReport {
     let mut findings = Vec::new();
+    let mut observations = Vec::new();
     let commands = DoctorCommands::for_target(project_root, name, home);
     let home = match inspect_home_path(name, home, &commands, &mut findings) {
         Some(home) => home,
-        None => return findings,
+        None => {
+            return DoctorReport {
+                findings,
+                observations,
+                ..DoctorReport::default()
+            };
+        }
     };
     let work_root = inspect_instance_work_root(project_root, name, &home, &commands, &mut findings);
 
@@ -698,12 +749,24 @@ async fn inspect_instance<M: UnitManager>(
                 .with_inspect(commands.selected("status"))
                 .with_repair(commands.selected("configure --runtime codex")),
             );
-            return findings;
+            return DoctorReport {
+                findings,
+                observations,
+                ..DoctorReport::default()
+            };
         }
     };
 
     inspect_runtime_config(name, &commands, &config, &mut findings);
-    inspect_channels(&lion_home, name, &commands, &config, &mut findings);
+    inspect_channels(
+        &lion_home,
+        name,
+        &commands,
+        &config,
+        &mut findings,
+        &mut observations,
+    )
+    .await;
     inspect_configured_bind(
         &lion_home,
         name,
@@ -716,7 +779,11 @@ async fn inspect_instance<M: UnitManager>(
     .await;
     inspect_expected_units(&lion_home, name, &commands, &config, manager, &mut findings).await;
     inspect_owned_stale_units(&lion_home, name, &commands, &config, manager, &mut findings).await;
-    findings
+    DoctorReport {
+        findings,
+        observations,
+        ..DoctorReport::default()
+    }
 }
 
 fn inspect_home_path(
@@ -1031,13 +1098,34 @@ fn podman_blocks_runtime_configure_finding(
     .with_repair(repair_command)
 }
 
-fn inspect_channels(
+async fn inspect_channels(
     home: &LionClawHome,
     name: &str,
     commands: &DoctorCommands,
     config: &OperatorConfig,
     findings: &mut Vec<DoctorFinding>,
+    observations: &mut Vec<DoctorObservation>,
 ) {
+    let health_store = if config.channels.is_empty() {
+        None
+    } else {
+        match open_channel_state_read_only(home).await {
+            Ok(store) => Some(store),
+            Err(err) => {
+                findings.push(
+                    DoctorFinding::warning(
+                        FindingKind::Channel,
+                        format!("channel state cannot be inspected for instance \"{name}\""),
+                        home.db_path().display().to_string(),
+                        err.to_string(),
+                    )
+                    .with_inspect(commands.selected("status")),
+                );
+                None
+            }
+        }
+    };
+
     for channel in &config.channels {
         if let Err(err) = validate_channel_id(&channel.id) {
             findings.push(DoctorFinding::error(
@@ -1135,6 +1223,254 @@ fn inspect_channels(
                 )),
             );
         }
+
+        if let Some(store) = health_store.as_ref() {
+            inspect_channel_health_state(store, name, commands, channel, findings, observations)
+                .await;
+        }
+    }
+}
+
+async fn open_channel_state_read_only(home: &LionClawHome) -> Result<ChannelStateStore> {
+    let db_path = home.db_path();
+    if !db_path.exists() {
+        bail!("{} does not exist", db_path.display());
+    }
+    let options = SqliteConnectOptions::new()
+        .filename(&db_path)
+        .read_only(true)
+        .create_if_missing(false)
+        .foreign_keys(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .with_context(|| format!("failed to open {} read-only", db_path.display()))?;
+    Ok(ChannelStateStore::new(pool))
+}
+
+async fn inspect_channel_health_state(
+    store: &ChannelStateStore,
+    instance: &str,
+    commands: &DoctorCommands,
+    channel: &ManagedChannelConfig,
+    findings: &mut Vec<DoctorFinding>,
+    observations: &mut Vec<DoctorObservation>,
+) {
+    let health = match store.channel_health(&channel.id).await {
+        Ok(health) => health,
+        Err(err) => {
+            findings.push(
+                DoctorFinding::warning(
+                    FindingKind::Channel,
+                    format!("channel \"{}\" health state cannot be read", channel.id),
+                    format!("instance {instance} channel {} health", channel.id),
+                    err.to_string(),
+                )
+                .with_inspect(commands.selected("status")),
+            );
+            return;
+        }
+    };
+
+    inspect_channel_kernel_state(commands, channel, &health, findings);
+    inspect_channel_worker_health(commands, channel, &health, findings, observations);
+}
+
+fn inspect_channel_kernel_state(
+    commands: &DoctorCommands,
+    channel: &ManagedChannelConfig,
+    health: &ChannelHealthRecord,
+    findings: &mut Vec<DoctorFinding>,
+) {
+    if health.pending_pairing_count > 0 {
+        findings.push(
+            DoctorFinding::warning(
+                FindingKind::Channel,
+                format!("channel \"{}\" has pending pairings", channel.id),
+                format!("channel {} pairings", channel.id),
+                format!(
+                    "{} pending pairing {}",
+                    health.pending_pairing_count,
+                    plural(health.pending_pairing_count, "request", "requests")
+                ),
+            )
+            .with_inspect(commands.selected(&format!(
+                "channel pairing list {}",
+                shell_quote_arg(&channel.id)
+            ))),
+        );
+    }
+
+    if health.pending_outbox_count > 0 {
+        findings.push(
+            DoctorFinding::warning(
+                FindingKind::Channel,
+                format!("channel \"{}\" has pending outbox messages", channel.id),
+                format!("channel {} outbox", channel.id),
+                format!(
+                    "{} pending outbox {}",
+                    health.pending_outbox_count,
+                    plural(health.pending_outbox_count, "message", "messages")
+                ),
+            )
+            .with_inspect(commands.selected("logs")),
+        );
+    }
+
+    if health.failed_outbox_count > 0 {
+        findings.push(
+            DoctorFinding::error(
+                FindingKind::Channel,
+                format!("channel \"{}\" has failed outbox messages", channel.id),
+                format!("channel {} outbox", channel.id),
+                format!(
+                    "{} failed outbox {}",
+                    health.failed_outbox_count,
+                    plural(health.failed_outbox_count, "message", "messages")
+                ),
+            )
+            .with_inspect(commands.selected("logs")),
+        );
+    }
+}
+
+fn inspect_channel_worker_health(
+    commands: &DoctorCommands,
+    channel: &ManagedChannelConfig,
+    health: &ChannelHealthRecord,
+    findings: &mut Vec<DoctorFinding>,
+    observations: &mut Vec<DoctorObservation>,
+) {
+    let Some(report) = health.latest_report.as_ref() else {
+        findings.push(
+            DoctorFinding::warning(
+                FindingKind::Channel,
+                format!("channel \"{}\" has no worker health report", channel.id),
+                format!("channel {} worker health", channel.id),
+                "no health report received from channel worker yet",
+            )
+            .with_inspect(commands.selected("logs")),
+        );
+        return;
+    };
+
+    let age = report_age(report);
+    if channel.launch_mode == ChannelLaunchMode::Background
+        && age > STALE_BACKGROUND_CHANNEL_HEALTH_AFTER
+    {
+        findings.push(
+            DoctorFinding::warning(
+                FindingKind::Channel,
+                format!("channel \"{}\" worker health report is stale", channel.id),
+                format!("channel {} worker health", channel.id),
+                format!(
+                    "latest health report from {} is {} old",
+                    report.reporter_id,
+                    format_age(age)
+                ),
+            )
+            .with_inspect(commands.selected("logs")),
+        );
+    }
+
+    let summary = format!(
+        "{} report from {} observed {} ago",
+        report.status.as_str(),
+        report.reporter_id,
+        format_age(age)
+    );
+    match report.status {
+        ChannelHealthStatus::Ok => observations.push(
+            DoctorObservation::new(
+                format!("channel \"{}\" worker health", channel.id),
+                format!("channel {} worker health", channel.id),
+                summary,
+            )
+            .with_inspect(commands.selected("logs")),
+        ),
+        ChannelHealthStatus::Warning => findings.push(
+            DoctorFinding::warning(
+                FindingKind::Channel,
+                format!("channel \"{}\" worker health is warning", channel.id),
+                format!("channel {} worker health", channel.id),
+                summary,
+            )
+            .with_inspect(commands.selected("logs")),
+        ),
+        ChannelHealthStatus::Error => findings.push(
+            DoctorFinding::error(
+                FindingKind::Channel,
+                format!("channel \"{}\" worker health is error", channel.id),
+                format!("channel {} worker health", channel.id),
+                summary,
+            )
+            .with_inspect(commands.selected("logs")),
+        ),
+    }
+
+    for check in &report.checks {
+        let observed = format!("{}: {}", check.status.as_str(), check.message);
+        match check.status {
+            ChannelHealthStatus::Ok => observations.push(
+                DoctorObservation::new(
+                    format!("channel \"{}\" health check {}", channel.id, check.code),
+                    format!("channel {} health check {}", channel.id, check.code),
+                    observed,
+                )
+                .with_inspect(commands.selected("logs")),
+            ),
+            ChannelHealthStatus::Warning => findings.push(
+                DoctorFinding::warning(
+                    FindingKind::Channel,
+                    format!(
+                        "channel \"{}\" health check {} is warning",
+                        channel.id, check.code
+                    ),
+                    format!("channel {} health check {}", channel.id, check.code),
+                    observed,
+                )
+                .with_inspect(commands.selected("logs")),
+            ),
+            ChannelHealthStatus::Error => findings.push(
+                DoctorFinding::error(
+                    FindingKind::Channel,
+                    format!(
+                        "channel \"{}\" health check {} is error",
+                        channel.id, check.code
+                    ),
+                    format!("channel {} health check {}", channel.id, check.code),
+                    observed,
+                )
+                .with_inspect(commands.selected("logs")),
+            ),
+        }
+    }
+}
+
+fn report_age(report: &ChannelHealthReportRecord) -> Duration {
+    Utc::now()
+        .signed_duration_since(report.observed_at)
+        .to_std()
+        .unwrap_or(Duration::ZERO)
+}
+
+fn format_age(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs >= 60 * 60 {
+        return format!("{}h", secs / (60 * 60));
+    }
+    if secs >= 60 {
+        return format!("{}m", secs / 60);
+    }
+    format!("{secs}s")
+}
+
+fn plural<'a>(count: u64, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 {
+        singular
+    } else {
+        plural
     }
 }
 
@@ -2022,6 +2358,117 @@ mod tests {
         config.save(home).await.expect("save config");
     }
 
+    async fn doctor_channel_fixture(
+        channel_id: &str,
+        launch_mode: ChannelLaunchMode,
+    ) -> (
+        tempfile::TempDir,
+        LionClawHome,
+        DoctorCommands,
+        OperatorConfig,
+        sqlx::SqlitePool,
+    ) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        home.ensure_base_dirs().await.expect("base dirs");
+        home.ensure_home_id().await.expect("home id");
+        write_doctor_channel_skill(&home, channel_id, "telegram-skill", launch_mode);
+        let mut config = OperatorConfig::default();
+        config.upsert_channel(ManagedChannelConfig {
+            id: channel_id.to_string(),
+            skill: "telegram-skill".to_string(),
+            launch_mode,
+            worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
+            required_env: Vec::new(),
+        });
+        let db = crate::kernel::db::Db::connect_file(&home.db_path())
+            .await
+            .expect("connect db");
+        let home_root = home.root();
+        let commands = DoctorCommands::for_target(None, "direct-home", &home_root);
+        (temp_dir, home, commands, config, db.pool())
+    }
+
+    fn write_doctor_channel_skill(
+        home: &LionClawHome,
+        channel_id: &str,
+        skill_alias: &str,
+        launch_mode: ChannelLaunchMode,
+    ) {
+        let skill_dir = home.skills_dir().join(skill_alias);
+        fs::create_dir_all(skill_dir.join("scripts")).expect("create skill scripts");
+        fs::write(
+            skill_dir.join("lionclaw.toml"),
+            format!(
+                "version = 1\n[channel]\nid = \"{channel_id}\"\nlaunch = \"{}\"\nworker = \"scripts/worker\"\nenv = []\n",
+                launch_mode.as_str()
+            ),
+        )
+        .expect("write channel metadata");
+        let worker = skill_dir.join("scripts/worker");
+        fs::write(&worker, "#!/usr/bin/env bash\n").expect("write worker");
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("chmod worker");
+    }
+
+    async fn insert_doctor_health_report(
+        pool: &sqlx::SqlitePool,
+        channel_id: &str,
+        reporter_id: &str,
+        status: ChannelHealthStatus,
+        observed_at: chrono::DateTime<Utc>,
+        checks: Vec<crate::contracts::ChannelHealthCheck>,
+    ) {
+        sqlx::query(
+            "INSERT INTO channel_health_reports \
+             (report_id, channel_id, reporter_id, status, checks_json, observed_at_ms, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(channel_id)
+        .bind(reporter_id)
+        .bind(status.as_str())
+        .bind(serde_json::to_string(&checks).expect("encode checks"))
+        .bind(crate::kernel::db::datetime_to_ms(observed_at))
+        .bind(crate::kernel::db::datetime_to_ms(Utc::now()))
+        .execute(pool)
+        .await
+        .expect("insert health report");
+    }
+
+    async fn insert_pending_pairing(pool: &sqlx::SqlitePool, channel_id: &str) {
+        let now = crate::kernel::db::datetime_to_ms(Utc::now());
+        sqlx::query(
+            "INSERT INTO channel_pairing_requests \
+             (pairing_id, channel_id, code_hash, claim_policy, sender_ref, conversation_ref, thread_ref, requested_profile, status, label, max_claims, claim_count, created_at_ms, expires_at_ms, claimed_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, ?3, 'operator_approval', ?4, NULL, NULL, 'direct', 'pending', NULL, 1, 0, ?5, NULL, NULL, ?5)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(channel_id)
+        .bind(format!("hash-{}", uuid::Uuid::new_v4()))
+        .bind("telegram:user:1")
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert pending pairing");
+    }
+
+    async fn insert_outbox_message(pool: &sqlx::SqlitePool, channel_id: &str, status: &str) {
+        let now = crate::kernel::db::datetime_to_ms(Utc::now());
+        sqlx::query(
+            "INSERT INTO channel_outbox_messages \
+             (delivery_id, channel_id, conversation_ref, status, content_json, attempt_count, next_attempt_at_ms, created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, 'telegram:chat:1', ?3, ?4, 0, ?5, ?5, ?5)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(channel_id)
+        .bind(status)
+        .bind(r#"{"text":"hello","format_hint":"plain","attachments":[]}"#)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert outbox message");
+    }
+
     fn raw_daemon_fingerprint(home: &LionClawHome, config: &OperatorConfig) -> String {
         let applied_state =
             AppliedState::from_home_read_only(home, config).expect("read applied state");
@@ -2034,6 +2481,141 @@ mod tests {
         expected_daemon_fingerprint(home, config, &applied_state)
             .await
             .expect("daemon fingerprint")
+    }
+
+    #[tokio::test]
+    async fn doctor_warns_when_channel_has_no_worker_health_report() {
+        let (_temp_dir, home, commands, config, _pool) =
+            doctor_channel_fixture("telegram", ChannelLaunchMode::Background).await;
+        let mut findings = Vec::new();
+        let mut observations = Vec::new();
+
+        inspect_channels(
+            &home,
+            "direct-home",
+            &commands,
+            &config,
+            &mut findings,
+            &mut observations,
+        )
+        .await;
+
+        assert!(findings.iter().any(|finding| {
+            finding.subject.as_ref() == "channel \"telegram\" has no worker health report"
+                && finding.observed.as_ref() == "no health report received from channel worker yet"
+        }));
+        assert!(observations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn doctor_warns_on_stale_background_channel_health_report() {
+        let (_temp_dir, home, commands, config, pool) =
+            doctor_channel_fixture("telegram", ChannelLaunchMode::Background).await;
+        insert_doctor_health_report(
+            &pool,
+            "telegram",
+            "telegram:worker",
+            ChannelHealthStatus::Ok,
+            Utc::now() - chrono::Duration::minutes(11),
+            vec![crate::contracts::ChannelHealthCheck {
+                code: "telegram.bot_identity".to_string(),
+                status: ChannelHealthStatus::Ok,
+                message: "getMe succeeded".to_string(),
+                details: serde_json::json!({}),
+            }],
+        )
+        .await;
+        let mut findings = Vec::new();
+        let mut observations = Vec::new();
+
+        inspect_channels(
+            &home,
+            "direct-home",
+            &commands,
+            &config,
+            &mut findings,
+            &mut observations,
+        )
+        .await;
+
+        assert!(findings.iter().any(|finding| {
+            finding.subject.as_ref() == "channel \"telegram\" worker health report is stale"
+                && finding
+                    .observed
+                    .as_ref()
+                    .contains("latest health report from telegram:worker is 11m old")
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.subject.as_ref()
+                == "channel \"telegram\" health check telegram.bot_identity"
+                && observation.observed.as_ref() == "ok: getMe succeeded"
+        }));
+    }
+
+    #[tokio::test]
+    async fn doctor_surfaces_channel_kernel_state_and_worker_health_checks() {
+        let (_temp_dir, home, commands, config, pool) =
+            doctor_channel_fixture("telegram", ChannelLaunchMode::Background).await;
+        insert_pending_pairing(&pool, "telegram").await;
+        insert_outbox_message(&pool, "telegram", "pending").await;
+        insert_outbox_message(&pool, "telegram", "failed").await;
+        insert_doctor_health_report(
+            &pool,
+            "telegram",
+            "telegram:worker",
+            ChannelHealthStatus::Ok,
+            Utc::now(),
+            vec![
+                crate::contracts::ChannelHealthCheck {
+                    code: "telegram.bot_identity".to_string(),
+                    status: ChannelHealthStatus::Ok,
+                    message: "getMe succeeded".to_string(),
+                    details: serde_json::json!({"bot_id": 99}),
+                },
+                crate::contracts::ChannelHealthCheck {
+                    code: "telegram.delivery_errors".to_string(),
+                    status: ChannelHealthStatus::Warning,
+                    message: "one retryable send failure".to_string(),
+                    details: serde_json::json!({"retryable": 1}),
+                },
+            ],
+        )
+        .await;
+        let mut findings = Vec::new();
+        let mut observations = Vec::new();
+
+        inspect_channels(
+            &home,
+            "direct-home",
+            &commands,
+            &config,
+            &mut findings,
+            &mut observations,
+        )
+        .await;
+
+        assert!(findings.iter().any(|finding| {
+            finding.subject.as_ref() == "channel \"telegram\" has pending pairings"
+                && finding.observed.as_ref() == "1 pending pairing request"
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.subject.as_ref() == "channel \"telegram\" has pending outbox messages"
+                && finding.observed.as_ref() == "1 pending outbox message"
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.subject.as_ref() == "channel \"telegram\" has failed outbox messages"
+                && finding.observed.as_ref() == "1 failed outbox message"
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.subject.as_ref()
+                == "channel \"telegram\" health check telegram.delivery_errors is warning"
+                && finding.observed.as_ref() == "warning: one retryable send failure"
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.subject.as_ref()
+                == "channel \"telegram\" health check telegram.bot_identity"
+                && observation.observed.as_ref() == "ok: getMe succeeded"
+        }));
     }
 
     fn daemon_info(

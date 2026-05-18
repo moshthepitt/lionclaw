@@ -289,6 +289,7 @@ with the CLI.
 - `POST /v0/channels/stream/ack`
 - `POST /v0/channels/outbox/pull`
 - `POST /v0/channels/outbox/report`
+- `POST /v0/channels/health/report`
 
 ### Job
 
@@ -364,8 +365,15 @@ External channel skills integrate over HTTP:
    stores provider receipt data, `retryable_failed` returns the delivery to
    kernel-owned exponential backoff, and `terminal_failed` closes it. Stale
    reports are recorded as rejected and never overwrite the current attempt.
-8. `POST /v0/channels/stream/ack` advances only the progress stream cursor.
-9. Pairing invite/claim, approve/block, and grant revoke endpoints manage
+8. `POST /v0/channels/health/report` appends a worker health sample for a
+   configured channel. The worker sends `channel_id`, `reporter_id`, overall
+   `status` (`ok`, `warning`, or `error`), `observed_at`, and provider-specific
+   checks with stable `code`, `status`, `message`, and JSON `details`. Provider
+   reachability checks stay in channel workers; the kernel validates and stores
+   normalized samples, audits `channel.health.reported`, and never treats health
+   reports as authority to start, stop, or repair workers.
+9. `POST /v0/channels/stream/ack` advances only the progress stream cursor.
+10. Pairing invite/claim, approve/block, and grant revoke endpoints manage
    channel trust. Invite tokens are returned once, stored only as hashes, and
    claimed through worker-submitted provider facts.
    Blocking a sender scope also closes matching pending operator-approval
@@ -439,6 +447,13 @@ artifacts; the kernel converts those artifacts into outbox attachments without
 requiring channel workers to know runtime-private storage layouts. Providers
 choose native delivery methods from MIME type and report delivery outcomes
 through the same lease/report flow as text messages.
+
+Channel health reports are append-only rows in `channel_health_reports`.
+Doctor reads the latest report per channel, along with kernel-visible pending
+pairings and outbox status, to explain channel state without calling provider
+APIs or mutating local state. Background channel reports older than ten minutes
+are stale doctor warnings; interactive channels can report opportunistically
+without a stale threshold.
 
 ## Session Continuity
 

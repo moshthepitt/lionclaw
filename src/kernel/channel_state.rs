@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use crate::{
     contracts::{
-        ChannelAttachmentDescriptor, ChannelPairingStatus, ChannelRoutingProfile, ChannelTrigger,
-        TrustTier,
+        ChannelAttachmentDescriptor, ChannelHealthCheck, ChannelHealthStatus, ChannelPairingStatus,
+        ChannelRoutingProfile, ChannelTrigger, TrustTier,
     },
     kernel::db::{datetime_to_ms, ms_to_datetime, now_ms},
 };
@@ -105,6 +105,26 @@ pub struct ChannelInboundEventRecord {
     pub provider_metadata: Value,
     pub received_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelHealthReportRecord {
+    pub report_id: Uuid,
+    pub channel_id: String,
+    pub reporter_id: String,
+    pub status: ChannelHealthStatus,
+    pub checks: Vec<ChannelHealthCheck>,
+    pub observed_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NewChannelHealthReport<'a> {
+    pub channel_id: &'a str,
+    pub reporter_id: &'a str,
+    pub status: ChannelHealthStatus,
+    pub checks: &'a [ChannelHealthCheck],
+    pub observed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -273,8 +293,11 @@ pub struct ChannelHealthRecord {
     pub pending_pairing_count: u64,
     pub approved_grant_count: u64,
     pub blocked_grant_count: u64,
+    pub pending_outbox_count: u64,
+    pub failed_outbox_count: u64,
     pub latest_inbound_at: Option<DateTime<Utc>>,
     pub latest_outbound_at: Option<DateTime<Utc>>,
+    pub latest_report: Option<ChannelHealthReportRecord>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1790,6 +1813,75 @@ impl ChannelStateStore {
         Ok(row.get::<i64, _>("has_pending") != 0)
     }
 
+    pub(crate) async fn insert_health_report_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        report: NewChannelHealthReport<'_>,
+    ) -> Result<ChannelHealthReportRecord> {
+        let report_id = Uuid::new_v4();
+        let checks_json = serde_json::to_string(report.checks)
+            .context("failed to encode channel health checks")?;
+        let observed_at_ms = datetime_to_ms(report.observed_at);
+        let created_at_ms = now_ms();
+
+        sqlx::query(
+            "INSERT INTO channel_health_reports \
+             (report_id, channel_id, reporter_id, status, checks_json, observed_at_ms, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(report_id.to_string())
+        .bind(report.channel_id)
+        .bind(report.reporter_id)
+        .bind(report.status.as_str())
+        .bind(checks_json)
+        .bind(observed_at_ms)
+        .bind(created_at_ms)
+        .execute(&mut **tx)
+        .await
+        .context("failed to insert channel health report")?;
+
+        self.get_health_report_in_tx(tx, report_id)
+            .await?
+            .ok_or_else(|| anyhow!("channel health report disappeared after insert"))
+    }
+
+    async fn get_health_report_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        report_id: Uuid,
+    ) -> Result<Option<ChannelHealthReportRecord>> {
+        let row = sqlx::query(
+            "SELECT report_id, channel_id, reporter_id, status, checks_json, observed_at_ms, created_at_ms \
+             FROM channel_health_reports \
+             WHERE report_id = ?1",
+        )
+        .bind(report_id.to_string())
+        .fetch_optional(&mut **tx)
+        .await
+        .context("failed to query channel health report")?;
+
+        row.map(map_health_report_row).transpose()
+    }
+
+    pub async fn latest_health_report(
+        &self,
+        channel_id: &str,
+    ) -> Result<Option<ChannelHealthReportRecord>> {
+        let row = sqlx::query(
+            "SELECT report_id, channel_id, reporter_id, status, checks_json, observed_at_ms, created_at_ms \
+             FROM channel_health_reports \
+             WHERE channel_id = ?1 \
+             ORDER BY observed_at_ms DESC, created_at_ms DESC, report_id DESC \
+             LIMIT 1",
+        )
+        .bind(channel_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query latest channel health report")?;
+
+        row.map(map_health_report_row).transpose()
+    }
+
     pub async fn channel_health(&self, channel_id: &str) -> Result<ChannelHealthRecord> {
         let pairing_counts = sqlx::query(
             "SELECT status, COUNT(*) AS count \
@@ -1812,6 +1904,17 @@ impl ChannelStateStore {
         .fetch_all(&self.pool)
         .await
         .context("failed to query channel grant counts")?;
+
+        let outbox_counts = sqlx::query(
+            "SELECT status, COUNT(*) AS count \
+             FROM channel_outbox_messages \
+             WHERE channel_id = ?1 AND status IN ('pending', 'failed') \
+             GROUP BY status",
+        )
+        .bind(channel_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to query channel outbox counts")?;
 
         let latest_inbound_row = sqlx::query(
             "SELECT MAX(created_at_ms) AS latest_inbound_at_ms \
@@ -1836,6 +1939,8 @@ impl ChannelStateStore {
         let mut pending_pairing_count = 0_u64;
         let mut approved_grant_count = 0_u64;
         let mut blocked_grant_count = 0_u64;
+        let mut pending_outbox_count = 0_u64;
+        let mut failed_outbox_count = 0_u64;
 
         for row in pairing_counts {
             let status: String = row.get("status");
@@ -1859,6 +1964,18 @@ impl ChannelStateStore {
             }
         }
 
+        for row in outbox_counts {
+            let status: String = row.get("status");
+            let count_raw: i64 = row.get("count");
+            let count = u64::try_from(count_raw)
+                .with_context(|| format!("invalid channel outbox count '{count_raw}'"))?;
+            match status.as_str() {
+                "pending" => pending_outbox_count = count,
+                "failed" => failed_outbox_count = count,
+                _ => {}
+            }
+        }
+
         let latest_inbound_at = latest_inbound_row
             .get::<Option<i64>, _>("latest_inbound_at_ms")
             .map(|value| {
@@ -1873,16 +1990,48 @@ impl ChannelStateStore {
                     .ok_or_else(|| anyhow!("invalid latest_outbound_at_ms '{value}'"))
             })
             .transpose()?;
+        let latest_report = self.latest_health_report(channel_id).await?;
 
         Ok(ChannelHealthRecord {
             channel_id: channel_id.to_string(),
             pending_pairing_count,
             approved_grant_count,
             blocked_grant_count,
+            pending_outbox_count,
+            failed_outbox_count,
             latest_inbound_at,
             latest_outbound_at,
+            latest_report,
         })
     }
+}
+
+fn map_health_report_row(row: SqliteRow) -> Result<ChannelHealthReportRecord> {
+    let report_id_raw: String = row.get("report_id");
+    let status_raw: String = row.get("status");
+    let checks_raw: String = row.get("checks_json");
+    let observed_at_ms: i64 = row.get("observed_at_ms");
+    let created_at_ms: i64 = row.get("created_at_ms");
+    let report_id = Uuid::parse_str(&report_id_raw)
+        .with_context(|| format!("invalid channel health report_id '{report_id_raw}'"))?;
+    let status = ChannelHealthStatus::from_str(&status_raw)
+        .map_err(|err| anyhow!("invalid channel health report status: {err}"))?;
+    let checks = serde_json::from_str::<Vec<ChannelHealthCheck>>(&checks_raw)
+        .with_context(|| format!("invalid channel health checks_json '{checks_raw}'"))?;
+    let observed_at = ms_to_datetime(observed_at_ms)
+        .ok_or_else(|| anyhow!("invalid observed_at_ms '{observed_at_ms}'"))?;
+    let created_at = ms_to_datetime(created_at_ms)
+        .ok_or_else(|| anyhow!("invalid created_at_ms '{created_at_ms}'"))?;
+
+    Ok(ChannelHealthReportRecord {
+        report_id,
+        channel_id: row.get("channel_id"),
+        reporter_id: row.get("reporter_id"),
+        status,
+        checks,
+        observed_at,
+        created_at,
+    })
 }
 
 fn map_pairing_row(row: SqliteRow) -> Result<ChannelPairingRequestRecord> {
