@@ -97,7 +97,11 @@ lionclaw run
 For Codex, use a logged-in Codex CLI and run LionClaw where the `podman`
 executable is available. If `run` reports a missing runtime image, build or
 provide the image named in the error. The bundled image definition lives at
-`containers/runtime/Containerfile`.
+`containers/runtime/Containerfile`. That default image is intentionally
+useful for everyday assistant work: it includes Codex, OpenCode, git, ripgrep,
+curl, jq, Python, archive helpers, PDF text tools, and ffmpeg/ffprobe for
+basic media inspection without bundling browsers, SDKs, OCR language packs, or
+local model weights.
 
 `doctor` checks setup and prints the next run command when setup is no longer
 blocked. `run` checks launch. Use `lionclaw --help` and subcommand `--help`

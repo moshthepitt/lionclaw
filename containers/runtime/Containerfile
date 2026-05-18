@@ -7,12 +7,30 @@ ARG CODEX_VERSION=0.130.0
 ARG OPENCODE_VERSION=1.4.6
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         bash \
         ca-certificates \
+        curl \
+        ffmpeg \
+        file \
         git \
+        jq \
+        less \
+        lsof \
         openssh-client \
+        poppler-utils \
+        procps \
+        python3 \
+        python3-pip \
+        python3-venv \
         ripgrep \
+        tini \
+        tree \
+        unzip \
+        xz-utils \
+        zip \
+        zstd \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g \
@@ -23,3 +41,4 @@ RUN useradd --create-home --shell /bin/bash lionclaw
 
 USER lionclaw
 WORKDIR /workspace
+ENTRYPOINT ["/usr/bin/tini", "--"]
