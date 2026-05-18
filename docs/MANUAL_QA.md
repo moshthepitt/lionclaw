@@ -173,6 +173,8 @@ Expected:
 - scoped grant approval is explicit
 - the channel response comes from the configured runtime
 - `lionclaw logs -f` can inspect the selected instance without raw HTTP
+- `doctor` surfaces channel pairing/outbox state and worker health without
+  contacting provider APIs
 
 Telegram is credential-gated manual QA. Run it only when a real bot token and
 chat flow are available; do not fake Telegram with local shims in this
@@ -190,7 +192,8 @@ Expected when credentials are available:
   `codex --version`, `opencode --version`, `python3 --version`,
   `ffprobe -version`, `file --version`, `jq --version`, and `pdftotext -v`
 - the token is stored in selected-instance private channel env
-- `doctor` does not print the token
+- `doctor` does not print the token and shows the latest Telegram worker health
+  report after the worker has submitted one
 - a DM pairing link shaped like `https://t.me/<bot_username>?start=lc_<token>`
   claims through the kernel and does not start an agent turn
 - a group invite shaped like
@@ -234,6 +237,8 @@ Expected:
 - the managed daemon is active
 - configured background workers are active
 - `doctor` reports stable `[LC-D...]` findings when there is drift
+- `doctor` warns when a configured background channel has no worker health
+  report or its latest report is more than ten minutes old
 - `doctor` does not repair, start, stop, allocate, or rewrite state
 - `down` stops only units owned by the selected instance
 
@@ -380,6 +385,8 @@ Expected:
 
 - every finding has `[LC-D...]`, severity, target, expected, and observed
 - every finding has a read-only `inspect` command
+- channel observations may include latest worker health checks, but provider
+  diagnostics remain worker-reported rather than doctor-performed
 - optional `repair` commands are explicit LionClaw or platform commands
 - warnings alone exit 0
 - errors exit 1

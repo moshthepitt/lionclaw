@@ -775,6 +775,65 @@ pub struct ChannelListResponse {
     pub bindings: Vec<ChannelBindingView>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelHealthStatus {
+    Ok,
+    Warning,
+    Error,
+}
+
+impl ChannelHealthStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
+impl FromStr for ChannelHealthStatus {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "ok" => Ok(Self::Ok),
+            "warning" => Ok(Self::Warning),
+            "error" => Ok(Self::Error),
+            other => Err(format!("invalid channel health status '{other}'")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelHealthCheck {
+    pub code: String,
+    pub status: ChannelHealthStatus,
+    pub message: String,
+    #[serde(default)]
+    pub details: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelHealthReportRequest {
+    pub channel_id: String,
+    pub reporter_id: String,
+    pub status: ChannelHealthStatus,
+    #[serde(default)]
+    pub checks: Vec<ChannelHealthCheck>,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelHealthReportResponse {
+    pub accepted: bool,
+    pub channel_id: String,
+    pub observed_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelPairingView {
     pub pairing_id: Uuid,

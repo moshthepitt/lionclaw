@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -47,6 +48,21 @@ class AttachmentMissingReport:
 @dataclass(slots=True, frozen=True)
 class AttachmentFinalizeResponse:
     outcome: str
+
+
+@dataclass(slots=True, frozen=True)
+class HealthCheck:
+    code: str
+    status: str
+    message: str
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True, frozen=True)
+class HealthReportResponse:
+    accepted: bool
+    channel_id: str
+    observed_at: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -225,6 +241,43 @@ class LionClawApi:
         )
         _raise_for_status(response)
         return AttachmentFinalizeResponse(outcome=response.json()["outcome"])
+
+    async def report_health(
+        self,
+        status: str,
+        checks: list[HealthCheck],
+        observed_at: datetime | None = None,
+    ) -> HealthReportResponse:
+        observed_at = observed_at or datetime.now(timezone.utc)
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=timezone.utc)
+        else:
+            observed_at = observed_at.astimezone(timezone.utc)
+        response = await self._client.post(
+            "/v0/channels/health/report",
+            json={
+                "channel_id": self.channel_id,
+                "reporter_id": self.consumer_id,
+                "status": status,
+                "checks": [
+                    {
+                        "code": check.code,
+                        "status": check.status,
+                        "message": check.message,
+                        "details": check.details,
+                    }
+                    for check in checks
+                ],
+                "observed_at": observed_at.isoformat(),
+            },
+        )
+        _raise_for_status(response)
+        payload = response.json()
+        return HealthReportResponse(
+            accepted=bool(payload["accepted"]),
+            channel_id=payload["channel_id"],
+            observed_at=payload["observed_at"],
+        )
 
     async def pull_stream(self) -> list[StreamEvent]:
         response = await self._client.post(
