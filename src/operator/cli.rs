@@ -47,6 +47,7 @@ use crate::{
             remove_channel, remove_skill, resolve_installed_skill_worker_entrypoint,
         },
         run::run_local,
+        run_tui::{run_console, run_launch_blocker, LaunchBlocker, RunConsoleInvocation},
         runtime::{resolve_runtime_id, validate_runtime_availability},
         runtime_integration::{
             configure_runtime_profile_with_engine_resolver, configure_runtime_required_message,
@@ -142,6 +143,8 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct RunArgs {
+    #[arg(long, help = "Use the plain line-oriented interactive path")]
+    plain: bool,
     #[arg(long)]
     continue_last_session: bool,
     #[arg(
@@ -590,7 +593,26 @@ pub async fn run() -> Result<ExitCode> {
     };
     let command = cli.command;
     let env_home = LionClawHome::from_env();
-    let resolved_target = resolve_command_target(&target_selection, &command)?;
+    let run_uses_tui = matches!(
+        &command,
+        Command::Run(args) if should_use_run_tui(
+            args,
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal()
+        )
+    );
+    let resolved_target = match if run_uses_tui {
+        resolve_target(&target_selection, WorkRootRequirement::Optional).map(Some)
+    } else {
+        resolve_command_target(&target_selection, &command)
+    } {
+        Ok(target) => target,
+        Err(err) if run_uses_tui => {
+            run_launch_blocker(LaunchBlocker::standalone(err.to_string())).await?;
+            return Ok(ExitCode::from(1));
+        }
+        Err(err) => return Err(err),
+    };
     let home = resolved_target
         .as_ref()
         .map(|target| target.instance_home.clone())
@@ -728,15 +750,32 @@ pub async fn run() -> Result<ExitCode> {
                 .as_ref()
                 .ok_or_else(|| anyhow!("run requires a resolved LionClaw target"))?;
             let timeout_override = args.timeout.map(RuntimeTurnTimeouts::with_turn_timeout);
-            run_local(
-                &target.instance_home,
-                target.require_work_root()?,
-                target.instance_name.as_deref(),
-                args.runtime,
-                args.continue_last_session,
-                timeout_override,
-            )
-            .await?;
+            if should_use_run_tui(
+                &args,
+                std::io::stdin().is_terminal(),
+                std::io::stdout().is_terminal(),
+            ) {
+                let outcome = run_console(RunConsoleInvocation {
+                    target,
+                    requested_runtime: args.runtime,
+                    continue_last_session: args.continue_last_session,
+                    timeout_override,
+                })
+                .await?;
+                if outcome.launch_blocked {
+                    return Ok(ExitCode::from(1));
+                }
+            } else {
+                run_local(
+                    &target.instance_home,
+                    target.require_work_root()?,
+                    target.instance_name.as_deref(),
+                    args.runtime,
+                    args.continue_last_session,
+                    timeout_override,
+                )
+                .await?;
+            }
         }
         Command::Up(args) => {
             let manager = SystemdUserUnitManager;
@@ -1437,6 +1476,10 @@ pub async fn run() -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+fn should_use_run_tui(args: &RunArgs, stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
+    !args.plain && stdin_is_terminal && stdout_is_terminal
 }
 
 fn resolve_command_target(
@@ -2379,6 +2422,7 @@ mod tests {
             (
                 "run",
                 Command::Run(RunArgs {
+                    plain: false,
                     continue_last_session: false,
                     timeout: None,
                     runtime: None,
@@ -2462,6 +2506,7 @@ mod tests {
             instance: Some("reviewer".to_string()),
         };
         let command = Command::Run(RunArgs {
+            plain: false,
             continue_last_session: false,
             timeout: None,
             runtime: None,
@@ -2482,6 +2527,27 @@ mod tests {
             target.require_work_root().expect("run requires work root"),
             reviewer.work_root.as_path()
         );
+    }
+
+    #[test]
+    fn run_tui_selection_requires_tty_and_honors_plain() {
+        let tui_args = RunArgs {
+            plain: false,
+            continue_last_session: false,
+            timeout: None,
+            runtime: None,
+        };
+        let plain_args = RunArgs {
+            plain: true,
+            continue_last_session: false,
+            timeout: None,
+            runtime: None,
+        };
+
+        assert!(should_use_run_tui(&tui_args, true, true));
+        assert!(!should_use_run_tui(&tui_args, false, true));
+        assert!(!should_use_run_tui(&tui_args, true, false));
+        assert!(!should_use_run_tui(&plain_args, true, true));
     }
 
     #[test]
