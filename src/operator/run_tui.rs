@@ -7,16 +7,15 @@ use std::{
 use anyhow::{anyhow, Result};
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-        MouseEventKind,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Margin, Position, Rect},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
@@ -55,7 +54,10 @@ use crate::{
     runtime_timeouts::RuntimeTurnTimeouts,
 };
 
-use crate::kernel::runtime::{execution::planner::resolve_execution_preset, ExecutionPlanPurpose};
+use crate::kernel::runtime::{
+    append_streamed_text_boundary, append_streamed_text_delta,
+    execution::planner::resolve_execution_preset, ExecutionPlanPurpose,
+};
 
 const EVENT_POLL: Duration = Duration::from_millis(50);
 const HISTORY_LIMIT: usize = 24;
@@ -281,6 +283,9 @@ impl ActivitySummary {
     }
 
     fn record_stream_event(&mut self, event: &StreamEventDto) {
+        if event.kind == StreamEventKindDto::MessageBoundary {
+            return;
+        }
         self.event_count = self.event_count.saturating_add(1);
         match (&event.kind, &event.lane, event.text.as_deref()) {
             (StreamEventKindDto::MessageDelta, Some(StreamLaneDto::Reasoning), Some(text)) => {
@@ -476,10 +481,6 @@ impl ConsoleComposer {
         self.input.input(key)
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
-        self.input.input(mouse)
-    }
-
     fn insert_str(&mut self, text: &str) -> bool {
         self.input.insert_str(text)
     }
@@ -511,38 +512,6 @@ impl ConsoleComposer {
     }
 }
 
-#[derive(Default)]
-struct ConsoleLayout {
-    instances: Option<Rect>,
-    transcript: Option<Rect>,
-    inspectors: Option<Rect>,
-    composer: Option<Rect>,
-}
-
-impl ConsoleLayout {
-    fn focus_at(&self, column: u16, row: u16) -> Option<Focus> {
-        let position = Position { x: column, y: row };
-        [
-            (self.instances, Focus::Instances),
-            (self.transcript, Focus::Transcript),
-            (self.inspectors, Focus::Inspectors),
-            (self.composer, Focus::Composer),
-        ]
-        .into_iter()
-        .find_map(|(area, focus)| area.filter(|area| area.contains(position)).map(|_| focus))
-    }
-
-    fn point_in_transcript(&self, column: u16, row: u16) -> bool {
-        self.transcript
-            .is_some_and(|area| area.contains(Position { x: column, y: row }))
-    }
-
-    fn point_in_composer(&self, column: u16, row: u16) -> bool {
-        self.composer
-            .is_some_and(|area| area.contains(Position { x: column, y: row }))
-    }
-}
-
 pub(crate) struct ConsoleApp {
     project_root: Option<PathBuf>,
     instances: Vec<InstanceSummary>,
@@ -551,7 +520,6 @@ pub(crate) struct ConsoleApp {
     continue_last_session: bool,
     timeout_override: Option<RuntimeTurnTimeouts>,
     focus: Focus,
-    layout: ConsoleLayout,
     overlay: Option<Overlay>,
     composer: ConsoleComposer,
     transcript: Vec<TranscriptLine>,
@@ -596,7 +564,6 @@ impl ConsoleApp {
             } else {
                 Focus::Composer
             },
-            layout: ConsoleLayout::default(),
             overlay: None,
             composer: ConsoleComposer::new(),
             transcript: Vec::new(),
@@ -1330,10 +1297,14 @@ fn push_stream_event(
         (StreamEventKindDto::MessageDelta, Some(StreamLaneDto::Answer), Some(text)) => {
             append_transcript_delta(transcript, TranscriptLineKind::Answer, text);
         }
+        (StreamEventKindDto::MessageBoundary, Some(StreamLaneDto::Answer), _) => {
+            append_transcript_boundary(transcript, TranscriptLineKind::Answer);
+        }
         (StreamEventKindDto::TurnCompleted, _, _)
         | (StreamEventKindDto::Done, _, _)
         | (_, _, None)
         | (StreamEventKindDto::MessageDelta, Some(StreamLaneDto::Reasoning), Some(_))
+        | (StreamEventKindDto::MessageBoundary, _, _)
         | (StreamEventKindDto::Status, _, Some(_))
         | (StreamEventKindDto::Error, _, Some(_)) => {}
         (_, _, Some(_)) => {}
@@ -1355,27 +1326,16 @@ fn append_transcript_delta(
 }
 
 fn append_delta_text(existing: &mut String, delta: &str) {
-    if needs_delta_separator(existing, delta) {
-        existing.push(' ');
+    append_streamed_text_delta(existing, delta);
+}
+
+fn append_transcript_boundary(transcript: &mut [TranscriptLine], kind: TranscriptLineKind) {
+    let Some(last) = transcript.last_mut() else {
+        return;
+    };
+    if last.kind == kind {
+        append_streamed_text_boundary(&mut last.text);
     }
-    existing.push_str(delta);
-}
-
-fn needs_delta_separator(existing: &str, delta: &str) -> bool {
-    let Some(previous) = existing.chars().last() else {
-        return false;
-    };
-    let Some(next) = delta.chars().next() else {
-        return false;
-    };
-    matches!(previous, '.' | '!' | '?' | ':' | ';' | ',')
-        && !previous.is_whitespace()
-        && !next.is_whitespace()
-        && starts_sentence_like(next)
-}
-
-fn starts_sentence_like(ch: char) -> bool {
-    ch.is_uppercase() || matches!(ch, '"' | '\'' | '`' | '*' | '(' | '[' | '{')
 }
 
 pub(crate) async fn run_console(invocation: RunConsoleInvocation<'_>) -> Result<RunConsoleOutcome> {
@@ -1401,7 +1361,6 @@ pub(crate) async fn run_launch_blocker(blocker: LaunchBlocker) -> Result<()> {
         continue_last_session: false,
         timeout_override: None,
         focus: Focus::Composer,
-        layout: ConsoleLayout::default(),
         overlay: None,
         composer: ConsoleComposer::new(),
         transcript: Vec::new(),
@@ -1440,7 +1399,6 @@ pub(crate) async fn run_project_launch_blocker(
         continue_last_session: false,
         timeout_override: None,
         focus: Focus::Instances,
-        layout: ConsoleLayout::default(),
         overlay: None,
         composer: ConsoleComposer::new(),
         transcript: Vec::new(),
@@ -1478,12 +1436,7 @@ type ConsoleTerminal = Terminal<CrosstermBackend<Stdout>>;
 fn enter_terminal() -> Result<ConsoleTerminal> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableMouseCapture
-    )?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     Terminal::new(backend).map_err(Into::into)
 }
@@ -1493,7 +1446,6 @@ fn leave_terminal(mut terminal: ConsoleTerminal) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
-        DisableMouseCapture,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -1537,35 +1489,6 @@ async fn handle_terminal_event(
             let char_count = text.chars().count();
             app.composer.insert_str(&text);
             app.status = format!("pasted {char_count} characters");
-        }
-        Event::Mouse(mouse) => {
-            handle_mouse_event(app, mouse);
-        }
-        _ => {}
-    }
-}
-
-fn handle_mouse_event(app: &mut ConsoleApp, mouse: MouseEvent) {
-    match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(focus) = app.layout.focus_at(mouse.column, mouse.row) {
-                app.focus = focus;
-                app.status = format!("focus: {}", focus.label());
-            }
-        }
-        MouseEventKind::ScrollUp if app.layout.point_in_transcript(mouse.column, mouse.row) => {
-            app.focus = Focus::Transcript;
-            app.scroll_transcript_up(3);
-        }
-        MouseEventKind::ScrollDown if app.layout.point_in_transcript(mouse.column, mouse.row) => {
-            app.focus = Focus::Transcript;
-            app.scroll_transcript_down(3);
-        }
-        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-            if app.layout.point_in_composer(mouse.column, mouse.row) =>
-        {
-            app.focus = Focus::Composer;
-            app.composer.handle_mouse(mouse);
         }
         _ => {}
     }
@@ -1707,11 +1630,6 @@ pub(crate) fn render_app(frame: &mut Frame<'_>, app: &mut ConsoleApp) {
         return;
     };
 
-    app.layout = ConsoleLayout {
-        composer: Some(*composer_area),
-        ..ConsoleLayout::default()
-    };
-
     render_header(frame, *header_area, app);
     render_body(frame, *body_area, app);
     render_composer(frame, *composer_area, app);
@@ -1786,13 +1704,9 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
             ])
             .split(area);
         let [instances_area, _, transcript_area, _, inspector_area] = chunks.as_ref() else {
-            app.layout.transcript = Some(area);
             render_transcript(frame, area, app);
             return;
         };
-        app.layout.instances = Some(*instances_area);
-        app.layout.transcript = Some(*transcript_area);
-        app.layout.inspectors = Some(*inspector_area);
         render_instances(frame, *instances_area, app);
         render_transcript(frame, *transcript_area, app);
         render_inspector(frame, *inspector_area, app);
@@ -1806,12 +1720,9 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
             ])
             .split(area);
         let [transcript_area, _, inspector_area] = chunks.as_ref() else {
-            app.layout.transcript = Some(area);
             render_transcript(frame, area, app);
             return;
         };
-        app.layout.transcript = Some(*transcript_area);
-        app.layout.inspectors = Some(*inspector_area);
         render_transcript(frame, *transcript_area, app);
         render_inspector(frame, *inspector_area, app);
     }
@@ -2090,6 +2001,7 @@ fn transcript_markdown_lines(text: &str) -> Vec<Line<'static>> {
         .lines
         .into_iter()
         .map(owned_transcript_line)
+        .filter(|line| !is_rendered_code_fence_marker(line))
         .collect::<Vec<_>>();
 
     if lines.is_empty() {
@@ -2097,6 +2009,28 @@ fn transcript_markdown_lines(text: &str) -> Vec<Line<'static>> {
     } else {
         lines
     }
+}
+
+fn is_rendered_code_fence_marker(line: &Line<'_>) -> bool {
+    let mut spans = line.spans.iter();
+    let Some(span) = spans.next() else {
+        return false;
+    };
+    if spans.next().is_some() {
+        return false;
+    }
+    let text = span.content.trim();
+    text == "```"
+        || text
+            .strip_prefix("```")
+            .is_some_and(is_markdown_info_string)
+}
+
+fn is_markdown_info_string(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '+' | '#'))
 }
 
 fn markdown_with_preserved_line_breaks(text: &str) -> String {
@@ -2108,6 +2042,9 @@ fn markdown_with_preserved_line_breaks(text: &str) -> String {
             .strip_suffix('\n')
             .map_or((segment, false), |line| (line, true));
         let fence_line = is_markdown_fence_line(line);
+        if fence_line && !in_fenced_code {
+            ensure_markdown_blank_line(&mut output);
+        }
         let preserve_soft_break = !in_fenced_code && !fence_line && !line.trim().is_empty();
 
         output.push_str(line);
@@ -2124,6 +2061,17 @@ fn markdown_with_preserved_line_breaks(text: &str) -> String {
     }
 
     output
+}
+
+fn ensure_markdown_blank_line(output: &mut String) {
+    if output.is_empty() || output.ends_with("\n\n") {
+        return;
+    }
+    if output.ends_with('\n') {
+        output.push('\n');
+    } else {
+        output.push_str("\n\n");
+    }
 }
 
 fn is_markdown_fence_line(line: &str) -> bool {
@@ -2861,6 +2809,53 @@ mod tests {
     }
 
     #[test]
+    fn answer_boundaries_preserve_streamed_message_blocks() {
+        let mut transcript = Vec::new();
+        let mut activity = ActivitySummary::new();
+        activity.start();
+
+        push_stream_event(
+            &mut transcript,
+            &mut activity,
+            &StreamEventDto {
+                kind: StreamEventKindDto::MessageDelta,
+                lane: Some(StreamLaneDto::Answer),
+                code: None,
+                text: Some("I'll inspect the docs first.".to_string()),
+            },
+        );
+        push_stream_event(
+            &mut transcript,
+            &mut activity,
+            &StreamEventDto {
+                kind: StreamEventKindDto::MessageBoundary,
+                lane: Some(StreamLaneDto::Answer),
+                code: None,
+                text: None,
+            },
+        );
+        push_stream_event(
+            &mut transcript,
+            &mut activity,
+            &StreamEventDto {
+                kind: StreamEventKindDto::MessageDelta,
+                lane: Some(StreamLaneDto::Answer),
+                code: None,
+                text: Some("**Project**".to_string()),
+            },
+        );
+
+        assert_eq!(
+            transcript,
+            vec![TranscriptLine::new(
+                TranscriptLineKind::Answer,
+                "I'll inspect the docs first.\n\n**Project**",
+            )]
+        );
+        assert_eq!(activity.event_count, 2);
+    }
+
+    #[test]
     fn activity_classification_accepts_runtime_neutral_summaries() {
         let mut activity = ActivitySummary::new();
         activity.start();
@@ -2941,6 +2936,21 @@ mod tests {
     }
 
     #[test]
+    fn transcript_rendering_handles_markdown_code_fences() {
+        let lines = transcript_render_lines(&[TranscriptLine::new(
+            TranscriptLineKind::Answer,
+            "Core product idea:\n```text\nRecord now -> transcribe later\n```\nNext step.",
+        )]);
+        let rendered = rendered_line_strings(&lines);
+
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("Record now -> transcribe later")));
+        assert!(rendered.iter().all(|line| !line.contains("```")));
+        assert!(rendered.iter().all(|line| line.trim() != "text"));
+    }
+
+    #[test]
     fn runtime_slash_commands_remain_passthrough_controls() {
         match classify_input("/compact now") {
             ClassifiedInput::RuntimeControl(control) => {
@@ -2978,7 +2988,6 @@ mod tests {
             continue_last_session: false,
             timeout_override: None,
             focus: Focus::Transcript,
-            layout: ConsoleLayout::default(),
             overlay: None,
             composer: ConsoleComposer::new(),
             transcript: Vec::new(),
@@ -3099,7 +3108,6 @@ mod tests {
             continue_last_session: false,
             timeout_override: None,
             focus: Focus::Composer,
-            layout: ConsoleLayout::default(),
             overlay: None,
             composer: ConsoleComposer::new(),
             transcript: vec![
@@ -3155,50 +3163,6 @@ mod tests {
         assert!(rendered.contains("visible-line-39"));
         assert!(rendered.contains("^"));
         assert!(rendered.contains("v"));
-    }
-
-    #[tokio::test]
-    async fn mouse_scroll_and_click_move_focus_without_tab() {
-        let body = (0..40)
-            .map(|index| format!("visible-line-{index:02}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut app =
-            ready_test_app(vec![TranscriptLine::new(TranscriptLineKind::Answer, body)]).await;
-        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
-        render_to_text(&mut app, 100, 24);
-        let transcript_area = app.layout.transcript.expect("transcript area");
-
-        app.focus = Focus::Composer;
-        handle_terminal_event(
-            &mut app,
-            Event::Mouse(MouseEvent {
-                kind: MouseEventKind::ScrollDown,
-                column: transcript_area.x.saturating_add(1),
-                row: transcript_area.y.saturating_add(1),
-                modifiers: KeyModifiers::empty(),
-            }),
-            &backend_tx,
-        )
-        .await;
-
-        assert_eq!(app.focus, Focus::Transcript);
-        assert_eq!(app.transcript_scroll, 3);
-
-        let composer_area = app.layout.composer.expect("composer area");
-        handle_terminal_event(
-            &mut app,
-            Event::Mouse(MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: composer_area.x.saturating_add(1),
-                row: composer_area.y.saturating_add(1),
-                modifiers: KeyModifiers::empty(),
-            }),
-            &backend_tx,
-        )
-        .await;
-
-        assert_eq!(app.focus, Focus::Composer);
     }
 
     #[tokio::test]
@@ -3461,7 +3425,6 @@ mod tests {
             continue_last_session: false,
             timeout_override: None,
             focus: Focus::Instances,
-            layout: ConsoleLayout::default(),
             overlay: None,
             composer: ConsoleComposer::new(),
             transcript: Vec::new(),
@@ -3517,7 +3480,6 @@ mod tests {
             continue_last_session: false,
             timeout_override: None,
             focus: Focus::Composer,
-            layout: ConsoleLayout::default(),
             overlay: None,
             composer: ConsoleComposer::new(),
             transcript,
