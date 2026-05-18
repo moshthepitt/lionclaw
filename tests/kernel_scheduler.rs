@@ -14,10 +14,11 @@ use chrono::{Duration as ChronoDuration, Utc};
 use lionclaw::{
     applied::AppliedState,
     contracts::{
-        ChannelInboundRequest, ChannelPairingApproveRequest, ChannelStreamPullRequest,
-        ChannelStreamStartMode, ChannelTrigger, JobCreateRequest, JobRefRequest, JobRunsRequest,
-        SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest,
-        SessionTurnRequest, StreamEventKindDto, TrustTier,
+        ChannelInboundRequest, ChannelOutboxPullRequest, ChannelOutboxReportOutcomeDto,
+        ChannelOutboxReportRequest, ChannelPairingApproveRequest, ChannelTrigger, JobCreateRequest,
+        JobRefRequest, JobRunsRequest, SchedulerJobDeliveryStatusDto, SessionHistoryPolicy,
+        SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest, SessionTurnRequest,
+        TrustTier,
     },
     home::LionClawHome,
     kernel::{
@@ -801,7 +802,9 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
             allow_capabilities: vec!["fs.read".to_string()],
             delivery: Some(lionclaw::contracts::JobDeliveryTargetDto {
                 channel_id: "terminal".to_string(),
-                peer_id: "alice".to_string(),
+                conversation_ref: "alice".to_string(),
+                thread_ref: None,
+                reply_to_ref: None,
             }),
             retry_attempts: Some(0),
         })
@@ -851,24 +854,20 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
         seed_session.session_id
     );
 
-    let stream = kernel
-        .pull_channel_stream(ChannelStreamPullRequest {
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
             channel_id: "terminal".to_string(),
-            consumer_id: "scheduler-test".to_string(),
-            start_mode: Some(ChannelStreamStartMode::Resume),
-            start_after_sequence: None,
+            worker_id: "scheduler-test".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
             limit: Some(20),
-            wait_ms: Some(0),
+            lease_ms: Some(120_000),
         })
         .await
-        .expect("pull terminal stream");
-    assert!(stream.events.iter().any(|event| {
-        event.kind == StreamEventKindDto::MessageDelta
-            && event
-                .text
-                .as_deref()
-                .is_some_and(|text| text.contains("[mock]"))
-    }));
+        .expect("pull terminal outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    assert_eq!(outbox.deliveries[0].conversation_ref, "alice");
+    assert!(outbox.deliveries[0].content.text.contains("[mock]"));
 
     let interactive = kernel
         .open_session(SessionOpenRequest {
@@ -927,7 +926,9 @@ async fn scheduled_job_failure_delivers_summary_and_dead_letters() {
             allow_capabilities: Vec::new(),
             delivery: Some(lionclaw::contracts::JobDeliveryTargetDto {
                 channel_id: "terminal".to_string(),
-                peer_id: "bob".to_string(),
+                conversation_ref: "bob".to_string(),
+                thread_ref: None,
+                reply_to_ref: None,
             }),
             retry_attempts: Some(0),
         })
@@ -961,27 +962,51 @@ async fn scheduled_job_failure_delivers_summary_and_dead_letters() {
     );
     assert_eq!(
         runs[0].delivery_status,
-        Some(lionclaw::contracts::SchedulerJobDeliveryStatusDto::Delivered)
+        Some(SchedulerJobDeliveryStatusDto::Pending)
     );
 
-    let stream = kernel
-        .pull_channel_stream(ChannelStreamPullRequest {
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
             channel_id: "terminal".to_string(),
-            consumer_id: "scheduler-failure-test".to_string(),
-            start_mode: Some(ChannelStreamStartMode::Resume),
-            start_after_sequence: None,
+            worker_id: "scheduler-failure-test".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
             limit: Some(20),
-            wait_ms: Some(0),
+            lease_ms: Some(120_000),
         })
         .await
-        .expect("pull failure delivery stream");
-    assert!(stream.events.iter().any(|event| {
-        event.kind == StreamEventKindDto::MessageDelta
-            && event
-                .text
-                .as_deref()
-                .is_some_and(|text| text.contains("Scheduled job 'failing brief' failed"))
-    }));
+        .expect("pull failure delivery outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    assert!(outbox.deliveries[0]
+        .content
+        .text
+        .contains("Scheduled job 'failing brief' failed"));
+
+    kernel
+        .report_channel_outbox(ChannelOutboxReportRequest {
+            delivery_id: outbox.deliveries[0].delivery_id,
+            attempt_id: outbox.deliveries[0].attempt_id,
+            channel_id: "terminal".to_string(),
+            worker_id: "scheduler-failure-test".to_string(),
+            outcome: ChannelOutboxReportOutcomeDto::Delivered,
+            provider_receipt: Some(serde_json::json!({"message_id": "provider-1"})),
+            error_code: None,
+            error_text: None,
+        })
+        .await
+        .expect("report delivered scheduler failure outbox");
+    let runs = kernel
+        .list_job_runs(JobRunsRequest {
+            job_id: created.job.job_id,
+            limit: Some(5),
+        })
+        .await
+        .expect("list failing runs after outbox report")
+        .runs;
+    assert_eq!(
+        runs[0].delivery_status,
+        Some(SchedulerJobDeliveryStatusDto::Delivered)
+    );
 }
 
 #[tokio::test]

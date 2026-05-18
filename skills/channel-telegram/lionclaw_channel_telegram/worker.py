@@ -2,10 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
-from lionclaw_channel_telegram.api import LionClawApi, StreamEvent
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramEntityTooLarge,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramNotFound,
+    TelegramRetryAfter,
+    TelegramServerError,
+    TelegramUnauthorizedError,
+)
+
+from lionclaw_channel_telegram.api import LionClawApi, OutboxDelivery, StreamEvent
 from lionclaw_channel_telegram.config import WorkerConfig
 from lionclaw_channel_telegram.telegram import (
     AiogramTelegramTransport,
@@ -44,39 +55,6 @@ class OffsetStore:
         self.path.write_text(str(offset), encoding="utf-8")
 
 
-@dataclass(slots=True)
-class PendingTurns:
-    answer_buffers: dict[tuple[str, str], str] = field(default_factory=dict)
-    active_turns: set[tuple[str, str]] = field(default_factory=set)
-
-    def append_answer(self, peer_id: str, turn_id: str, text: str) -> None:
-        key = (peer_id, turn_id)
-        self.answer_buffers[key] = self.answer_buffers.get(key, "") + text
-        self.active_turns.add(key)
-
-    def replace_answer(self, peer_id: str, turn_id: str, text: str) -> None:
-        key = (peer_id, turn_id)
-        self.answer_buffers[key] = text
-        self.active_turns.add(key)
-
-    def has_turn(self, peer_id: str, turn_id: str) -> bool:
-        return (peer_id, turn_id) in self.active_turns
-
-    def final_text(self, peer_id: str, turn_id: str) -> str | None:
-        key = (peer_id, turn_id)
-        if key not in self.active_turns:
-            return None
-        return self.answer_buffers.get(key, "") or None
-
-    def clear(self, peer_id: str, turn_id: str) -> None:
-        key = (peer_id, turn_id)
-        self.active_turns.discard(key)
-        self.answer_buffers.pop(key, None)
-
-    def has_pending(self) -> bool:
-        return bool(self.active_turns)
-
-
 class TelegramWorker:
     def __init__(
         self,
@@ -90,7 +68,6 @@ class TelegramWorker:
         self.telegram = telegram
         self.offset_store = offset_store
         self.offset = offset_store.load()
-        self.pending_turns = PendingTurns()
 
     async def process_updates(self) -> None:
         try:
@@ -117,29 +94,37 @@ class TelegramWorker:
             logger.exception("lionclaw stream pull request failed")
             return
 
-        last_safe_sequence: int | None = None
-        stop_processing = False
+        last_sequence: int | None = None
 
         for event in events:
             if not await self._process_stream_event(event):
-                stop_processing = True
                 break
-            if not self.pending_turns.has_pending():
-                last_safe_sequence = event.sequence
+            last_sequence = event.sequence
 
-        if not stop_processing and last_safe_sequence is not None:
+        if last_sequence is not None:
             try:
-                await self.lionclaw_api.ack_stream(last_safe_sequence)
+                await self.lionclaw_api.ack_stream(last_sequence)
             except Exception:
                 logger.exception(
                     "lionclaw stream ack failed through sequence %s",
-                    last_safe_sequence,
+                    last_sequence,
                 )
+
+    async def flush_outbox(self) -> None:
+        try:
+            deliveries = await self.lionclaw_api.pull_outbox()
+        except Exception:
+            logger.exception("lionclaw outbox pull request failed")
+            return
+
+        for delivery in deliveries:
+            await self._process_outbox_delivery(delivery)
 
     async def run_forever(self) -> None:
         while True:
             await self.process_updates()
             await self.flush_stream()
+            await self.flush_outbox()
             await asyncio.sleep(self.config.telegram_loop_delay_secs)
 
     async def _submit_inbound(self, update: TelegramTextUpdate) -> bool:
@@ -162,8 +147,6 @@ class TelegramWorker:
 
     async def _process_stream_event(self, event: StreamEvent) -> bool:
         if event.kind == "message_delta":
-            if event.lane == "answer":
-                self.pending_turns.append_answer(event.peer_id, event.turn_id, event.text)
             return True
 
         if event.kind == "status":
@@ -188,29 +171,112 @@ class TelegramWorker:
             return True
 
         if event.kind == "turn_completed":
-            self.pending_turns.replace_answer(event.peer_id, event.turn_id, event.text)
             return True
 
         if event.kind == "done":
-            if not self.pending_turns.has_turn(event.peer_id, event.turn_id):
-                return True
-            final_text = self.pending_turns.final_text(event.peer_id, event.turn_id)
-            if final_text is None:
-                self.pending_turns.clear(event.peer_id, event.turn_id)
-                return True
-            try:
-                await self.telegram.send_message(event.peer_id, final_text)
-            except Exception:
-                logger.exception(
-                    "telegram sendMessage request failed for peer_id=%s",
-                    event.peer_id,
-                )
-                return False
-            self.pending_turns.clear(event.peer_id, event.turn_id)
             return True
 
         logger.error("lionclaw stream contained unknown event kind '%s'", event.kind)
         return True
+
+    async def _process_outbox_delivery(self, delivery: OutboxDelivery) -> None:
+        try:
+            receipt = await self.telegram.send_message(
+                delivery.conversation_ref,
+                delivery.content.text,
+                delivery.reply_to_ref,
+                delivery.thread_ref,
+            )
+        except Exception as err:
+            logger.exception(
+                "telegram sendMessage request failed for delivery_id=%s conversation_ref=%s",
+                delivery.delivery_id,
+                delivery.conversation_ref,
+            )
+            outcome, error_code = _classify_send_failure(err)
+            await self._report_outbox_with_retry(
+                delivery,
+                outcome,
+                error_code=error_code,
+                error_text=str(err),
+            )
+            return
+
+        await self._report_outbox_with_retry(
+            delivery,
+            "delivered",
+            provider_receipt=receipt,
+        )
+
+    async def _report_outbox_with_retry(
+        self,
+        delivery: OutboxDelivery,
+        outcome: str,
+        *,
+        provider_receipt: dict[str, object] | None = None,
+        error_code: str | None = None,
+        error_text: str | None = None,
+    ) -> None:
+        for attempt_no in range(1, 4):
+            if await self._report_outbox_once(
+                delivery,
+                outcome,
+                provider_receipt=provider_receipt,
+                error_code=error_code,
+                error_text=error_text,
+            ):
+                return
+            await asyncio.sleep(0.25 * attempt_no)
+
+    async def _report_outbox_once(
+        self,
+        delivery: OutboxDelivery,
+        outcome: str,
+        *,
+        provider_receipt: dict[str, object] | None = None,
+        error_code: str | None = None,
+        error_text: str | None = None,
+    ) -> bool:
+        try:
+            response = await self.lionclaw_api.report_outbox(
+                delivery,
+                outcome,
+                provider_receipt=provider_receipt,
+                error_code=error_code,
+                error_text=error_text,
+            )
+        except Exception:
+            logger.exception(
+                "lionclaw outbox report failed for delivery_id=%s outcome=%s",
+                delivery.delivery_id,
+                outcome,
+            )
+            return False
+        if not response.accepted:
+            logger.warning(
+                "lionclaw rejected stale outbox report for delivery_id=%s status=%s attempt_status=%s",
+                delivery.delivery_id,
+                response.status,
+                response.attempt_status,
+            )
+        return True
+
+
+def _classify_send_failure(err: Exception) -> tuple[str, str]:
+    if isinstance(
+        err,
+        (
+            TelegramBadRequest,
+            TelegramEntityTooLarge,
+            TelegramForbiddenError,
+            TelegramNotFound,
+            TelegramUnauthorizedError,
+        ),
+    ):
+        return "terminal_failed", "telegram.send_rejected"
+    if isinstance(err, (TelegramNetworkError, TelegramRetryAfter, TelegramServerError)):
+        return "retryable_failed", "telegram.send_retryable"
+    return "retryable_failed", "telegram.send_failed"
 
 
 async def run() -> None:

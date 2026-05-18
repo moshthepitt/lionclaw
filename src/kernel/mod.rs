@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod capability_broker;
 pub mod channel_attachments;
+pub mod channel_outbox;
 pub mod channel_state;
 pub mod continuity;
 pub mod continuity_fs;
