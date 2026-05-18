@@ -9750,7 +9750,7 @@ impl Kernel {
                     break;
                 };
 
-                self.process_queued_channel_turn(turn).await;
+                Box::pin(self.process_queued_channel_turn(turn)).await;
             }
 
             self.channel_turn_workers.write().await.remove(&worker_key);
