@@ -496,7 +496,7 @@ impl ConsoleApp {
                 .await
                 .map(|response| response.session_id)
                 .map_err(|err| err.to_string());
-            let _ = backend_tx.send(BackendEvent::SessionReset(result));
+            drop(backend_tx.send(BackendEvent::SessionReset(result)));
         }));
     }
 
@@ -592,7 +592,7 @@ fn resolve_console_instances(
         let summary = InstanceSummary {
             name: target.instance_name.clone(),
             is_default: false,
-            home: target.instance_home.root().to_path_buf(),
+            home: target.instance_home.root(),
             work_root: inspection.work_root,
             work_root_finding: inspection.finding,
             shared_work_root_count: 0,
@@ -826,7 +826,9 @@ async fn run_stream_future<F>(
                 if is_answer_delta(&event) {
                     *answer_seen = true;
                 }
-                let _ = backend_tx.send(BackendEvent::Stream(event));
+                if backend_tx.send(BackendEvent::Stream(event)).is_err() {
+                    return;
+                }
             }
         }
     };
@@ -835,7 +837,9 @@ async fn run_stream_future<F>(
         if is_answer_delta(&event) {
             *answer_seen = true;
         }
-        let _ = backend_tx.send(BackendEvent::Stream(event));
+        if backend_tx.send(BackendEvent::Stream(event)).is_err() {
+            return;
+        }
     }
 
     let result = result
@@ -844,7 +848,7 @@ async fn run_stream_future<F>(
             answer_seen: *answer_seen,
         })
         .map_err(|err| err.to_string());
-    let _ = backend_tx.send(BackendEvent::TurnFinished(result));
+    drop(backend_tx.send(BackendEvent::TurnFinished(result)));
 }
 
 fn is_answer_delta(event: &StreamEventDto) -> bool {
@@ -1021,8 +1025,10 @@ async fn handle_key(
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             if app.active() {
                 if let Some(cancel_tx) = app.active_turn_cancel.take() {
-                    let _ = cancel_tx.send("turn interrupted from operator console".to_string());
-                    app.status = "interrupt requested".to_string();
+                    match cancel_tx.send("turn interrupted from operator console".to_string()) {
+                        Ok(()) => app.status = "interrupt requested".to_string(),
+                        Err(_) => app.status = "interrupt already completed".to_string(),
+                    }
                 } else {
                     app.status = "interrupt already requested".to_string();
                 }
@@ -1076,10 +1082,14 @@ pub(crate) fn render_app(frame: &mut Frame<'_>, app: &ConsoleApp) {
         ])
         .split(area);
 
-    render_header(frame, chunks[0], app);
-    render_body(frame, chunks[1], app);
-    render_composer(frame, chunks[2], app);
-    render_footer(frame, chunks[3], app);
+    let [header_area, body_area, composer_area, footer_area] = chunks.as_ref() else {
+        return;
+    };
+
+    render_header(frame, *header_area, app);
+    render_body(frame, *body_area, app);
+    render_composer(frame, *composer_area, app);
+    render_footer(frame, *footer_area, app);
 
     if let Some(overlay) = app.overlay {
         render_overlay(frame, area, app, overlay);
@@ -1144,8 +1154,12 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(30), Constraint::Min(20)])
             .split(area);
-        render_instances(frame, chunks[0], app);
-        render_main_panes(frame, chunks[1], app);
+        let [instances_area, main_area] = chunks.as_ref() else {
+            render_main_panes(frame, area, app);
+            return;
+        };
+        render_instances(frame, *instances_area, app);
+        render_main_panes(frame, *main_area, app);
     } else {
         render_main_panes(frame, area, app);
     }
@@ -1198,8 +1212,11 @@ fn render_main_panes(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(8), Constraint::Length(7)])
         .split(area);
-    render_transcript(frame, chunks[0], app);
-    render_inspectors(frame, chunks[1], app);
+    let [transcript_area, inspectors_area] = chunks.as_ref() else {
+        return;
+    };
+    render_transcript(frame, *transcript_area, app);
+    render_inspectors(frame, *inspectors_area, app);
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
@@ -1397,6 +1414,9 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_y) / 2),
         ])
         .split(area);
+    let [_, vertical_area, _] = vertical.as_ref() else {
+        return area;
+    };
     let horizontal = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -1404,8 +1424,11 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage(percent_x),
             Constraint::Percentage((100 - percent_x) / 2),
         ])
-        .split(vertical[1]);
-    horizontal[1].inner(Margin {
+        .split(*vertical_area);
+    let [_, horizontal_area, _] = horizontal.as_ref() else {
+        return area;
+    };
+    horizontal_area.inner(Margin {
         vertical: 0,
         horizontal: 1,
     })
