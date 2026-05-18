@@ -3,7 +3,7 @@ import unittest
 
 import httpx
 
-from lionclaw_channel_terminal.api import LionClawApi, PeerState
+from lionclaw_channel_terminal.api import LionClawApi, OutboxContent, OutboxDelivery, PeerState
 
 
 class TerminalApiTests(unittest.IsolatedAsyncioTestCase):
@@ -253,6 +253,130 @@ class TerminalApiTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await first.close()
             await second.close()
+
+    async def test_pull_outbox_scopes_to_terminal_peer_and_parses_content(self):
+        captured: dict[str, object] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured["path"] = request.url.path
+            captured["payload"] = json.loads(request.content.decode())
+            return httpx.Response(
+                200,
+                json={
+                    "deliveries": [
+                        {
+                            "delivery_id": "delivery-1",
+                            "attempt_id": "attempt-1",
+                            "channel_id": "terminal",
+                            "conversation_ref": "mosh",
+                            "session_id": "session-1",
+                            "turn_id": "turn-1",
+                            "content": {
+                                "text": "final answer",
+                                "format_hint": "markdown",
+                                "attachments": [
+                                    {
+                                        "attachment_id": "out-1",
+                                        "path": "/drafts/result.pdf",
+                                        "filename": "result.pdf",
+                                        "mime_type": "application/pdf",
+                                    }
+                                ],
+                            },
+                            "attempt_count": 1,
+                            "lease_expires_at": "2026-05-18T12:00:00Z",
+                            "created_at": "2026-05-18T11:59:00Z",
+                        }
+                    ]
+                },
+            )
+
+        api = LionClawApi(
+            base_url="http://lionclaw.test",
+            channel_id="terminal",
+            peer_id="mosh",
+            consumer_id="interactive:test",
+            start_mode="tail",
+            stream_limit=50,
+            stream_wait_ms=0,
+        )
+        await api._client.aclose()
+        api._client = httpx.AsyncClient(
+            base_url=api.base_url,
+            transport=httpx.MockTransport(handler),
+        )
+
+        try:
+            deliveries = await api.pull_outbox(limit=5, lease_ms=60_000)
+
+            self.assertEqual(captured["path"], "/v0/channels/outbox/pull")
+            self.assertEqual(
+                captured["payload"],
+                {
+                    "channel_id": "terminal",
+                    "worker_id": "interactive:test",
+                    "conversation_ref": "mosh",
+                    "limit": 5,
+                    "lease_ms": 60000,
+                },
+            )
+            self.assertEqual(deliveries[0].content.text, "final answer")
+            self.assertEqual(deliveries[0].content.format_hint, "markdown")
+            self.assertEqual(deliveries[0].content.attachments[0].path, "/drafts/result.pdf")
+        finally:
+            await api.close()
+
+    async def test_report_outbox_posts_terminal_receipt(self):
+        captured: dict[str, object] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured["path"] = request.url.path
+            captured["payload"] = json.loads(request.content.decode())
+            return httpx.Response(
+                200,
+                json={
+                    "delivery_id": "delivery-1",
+                    "attempt_id": "attempt-1",
+                    "accepted": True,
+                    "status": "delivered",
+                    "attempt_status": "delivered",
+                },
+            )
+
+        api = LionClawApi(
+            base_url="http://lionclaw.test",
+            channel_id="terminal",
+            peer_id="mosh",
+            consumer_id="interactive:test",
+            start_mode="tail",
+            stream_limit=50,
+            stream_wait_ms=0,
+        )
+        await api._client.aclose()
+        api._client = httpx.AsyncClient(
+            base_url=api.base_url,
+            transport=httpx.MockTransport(handler),
+        )
+
+        try:
+            response = await api.report_outbox(
+                OutboxDelivery(
+                    delivery_id="delivery-1",
+                    attempt_id="attempt-1",
+                    channel_id="terminal",
+                    conversation_ref="mosh",
+                    content=OutboxContent(text="final answer"),
+                ),
+                "delivered",
+                provider_receipt={"provider": "terminal", "rendered": True},
+            )
+
+            self.assertTrue(response.accepted)
+            self.assertEqual(captured["path"], "/v0/channels/outbox/report")
+            self.assertEqual(captured["payload"]["worker_id"], "interactive:test")
+            self.assertEqual(captured["payload"]["provider_receipt"]["rendered"], True)
+        finally:
+            await api.close()
 
 
 def _event_prefix(event_id: str) -> str:

@@ -17,6 +17,20 @@ pub(crate) const MAX_CHANNEL_OUTBOX_PULL_LIMIT: usize = 100;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelDeliveryContent {
     pub text: String,
+    #[serde(default = "default_channel_delivery_format_hint")]
+    pub format_hint: String,
+    #[serde(default)]
+    pub attachments: Vec<ChannelDeliveryAttachment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelDeliveryAttachment {
+    pub attachment_id: String,
+    pub path: String,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +131,8 @@ pub struct NewChannelDelivery<'a> {
 pub struct ChannelOutboxPull {
     pub channel_id: String,
     pub worker_id: String,
+    pub conversation_ref: Option<String>,
+    pub thread_ref: Option<String>,
     pub limit: usize,
     pub lease_ms: u64,
 }
@@ -252,6 +268,8 @@ impl ChannelOutboxStore {
             "SELECT delivery_id, current_attempt_id \
              FROM channel_outbox_messages \
              WHERE channel_id = ?1 \
+               AND (?4 IS NULL OR conversation_ref = ?4) \
+               AND (?5 IS NULL OR thread_ref = ?5) \
                AND ( \
                  (status = 'pending' AND next_attempt_at_ms <= ?2) OR \
                  (status = 'leased' AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms <= ?2) \
@@ -262,6 +280,8 @@ impl ChannelOutboxStore {
         .bind(&pull.channel_id)
         .bind(now)
         .bind(i64::try_from(pull.limit).context("invalid channel outbox pull limit")?)
+        .bind(pull.conversation_ref.as_deref())
+        .bind(pull.thread_ref.as_deref())
         .fetch_all(&mut *tx)
         .await
         .context("failed to select due channel outbox deliveries")?;
@@ -613,6 +633,10 @@ fn retry_delay_ms(attempt_count: u32) -> i64 {
     let exponent = attempt_count.saturating_sub(1).min(10);
     let delay = Duration::from_secs(60).saturating_mul(1_u32 << exponent);
     i64::try_from(delay.min(Duration::from_secs(15 * 60)).as_millis()).unwrap_or(900_000)
+}
+
+fn default_channel_delivery_format_hint() -> String {
+    "markdown".to_string()
 }
 
 fn encode_optional_json(value: Option<&Value>) -> Result<Option<String>> {

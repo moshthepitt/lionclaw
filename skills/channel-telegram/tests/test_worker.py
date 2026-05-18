@@ -195,8 +195,13 @@ class LionClawApiTests(unittest.IsolatedAsyncioTestCase):
                             "delivery_id": "delivery-1",
                             "attempt_id": "attempt-1",
                             "conversation_ref": "123",
+                            "thread_ref": "77",
                             "reply_to_ref": "55",
-                            "content": {"text": "hello"},
+                            "content": {
+                                "text": "hello",
+                                "format_hint": "markdown",
+                                "attachments": [],
+                            },
                         }
                     ]
                 },
@@ -230,6 +235,7 @@ class LionClawApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(deliveries[0].delivery_id, "delivery-1")
         self.assertEqual(deliveries[0].content.text, "hello")
+        self.assertEqual(deliveries[0].thread_ref, "77")
         await api.close()
 
 
@@ -336,6 +342,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                     delivery_id="delivery-1",
                     attempt_id="attempt-1",
                     conversation_ref="peer-1",
+                    thread_ref="topic-1",
                     reply_to_ref="42",
                     content=OutboxContent(text="final answer"),
                 )
@@ -352,7 +359,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
             await worker.flush_outbox()
 
-        self.assertEqual(telegram.sent_messages, [("peer-1", "final answer", "42")])
+        self.assertEqual(telegram.sent_messages, [("peer-1", "final answer", "42", "topic-1")])
         self.assertEqual(
             api.outbox_reports,
             [
@@ -485,7 +492,7 @@ class FakeTelegramTransport:
         fail_send_message: bool = False,
     ) -> None:
         self.updates = list(updates or [])
-        self.sent_messages: list[tuple[str, str, str | None]] = []
+        self.sent_messages: list[tuple[str, str, str | None, str | None]] = []
         self.typing_peers: list[str] = []
         self.fail_send_message = fail_send_message
 
@@ -493,11 +500,15 @@ class FakeTelegramTransport:
         return list(self.updates)
 
     async def send_message(
-        self, conversation_ref: str, text: str, reply_to_ref: str | None = None
+        self,
+        conversation_ref: str,
+        text: str,
+        reply_to_ref: str | None = None,
+        thread_ref: str | None = None,
     ) -> dict[str, object]:
         if self.fail_send_message:
             raise RuntimeError("send failed")
-        self.sent_messages.append((conversation_ref, text, reply_to_ref))
+        self.sent_messages.append((conversation_ref, text, reply_to_ref, thread_ref))
         return {"message_id": 101, "chat_id": conversation_ref}
 
     async def send_typing(self, peer_id: str) -> None:

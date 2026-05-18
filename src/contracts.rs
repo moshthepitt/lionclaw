@@ -1190,6 +1190,24 @@ pub struct ChannelStreamAckResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelOutboxContentDto {
     pub text: String,
+    #[serde(default = "default_channel_outbox_format_hint")]
+    pub format_hint: String,
+    #[serde(default)]
+    pub attachments: Vec<ChannelOutboxAttachmentDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxAttachmentDto {
+    pub attachment_id: String,
+    pub path: String,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+}
+
+fn default_channel_outbox_format_hint() -> String {
+    "markdown".to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1223,6 +1241,10 @@ pub enum ChannelOutboxReportOutcomeDto {
 pub struct ChannelOutboxPullRequest {
     pub channel_id: String,
     pub worker_id: String,
+    #[serde(default)]
+    pub conversation_ref: Option<String>,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
