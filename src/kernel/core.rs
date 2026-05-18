@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, Transaction};
 use tokio::{
     io::AsyncWriteExt,
-    sync::{Mutex, Notify, RwLock},
+    sync::{oneshot, Mutex, Notify, RwLock},
     time::{sleep, timeout, Instant},
 };
 use tracing::warn;
@@ -997,6 +997,26 @@ impl Kernel {
             .await
     }
 
+    pub async fn run_session_action_streaming_cancellable(
+        &self,
+        session_id: Uuid,
+        action: SessionActionKind,
+        runtime_id_override: Option<String>,
+        sink: RuntimeEventSink,
+        cancel_rx: oneshot::Receiver<String>,
+    ) -> Result<SessionTurnResponse, KernelError> {
+        self.run_session_action_with_options(
+            session_id,
+            action,
+            SessionActionExecutionOptions::api_cancellable(
+                runtime_id_override,
+                Some(sink),
+                cancel_rx,
+            ),
+        )
+        .await
+    }
+
     pub async fn session_action(
         &self,
         req: SessionActionRequest,
@@ -1226,6 +1246,7 @@ impl Kernel {
             mut prepared_turn,
             history_before_sequence_no,
             sink,
+            cancel_rx,
             emit_channel_stream_done,
             audit_actor,
         } = options;
@@ -1290,6 +1311,7 @@ impl Kernel {
                     emit_channel_stream_done,
                     audit_actor,
                     runtime_control_origin: RuntimeControlOrigin::SessionTurn,
+                    cancel_rx,
                 }
             }
             SessionActionKind::RetryLastTurn => {
@@ -1323,6 +1345,7 @@ impl Kernel {
                     emit_channel_stream_done,
                     audit_actor,
                     runtime_control_origin: RuntimeControlOrigin::SessionTurn,
+                    cancel_rx,
                 }
             }
             SessionActionKind::ResetSession => {
@@ -1360,6 +1383,16 @@ impl Kernel {
         sink: RuntimeEventSink,
     ) -> Result<SessionTurnResponse, KernelError> {
         self.turn_session_with_sink(req, Some(sink)).await
+    }
+
+    pub async fn turn_session_streaming_cancellable(
+        &self,
+        req: SessionTurnRequest,
+        sink: RuntimeEventSink,
+        cancel_rx: oneshot::Receiver<String>,
+    ) -> Result<SessionTurnResponse, KernelError> {
+        self.turn_session_with_options(req, Some(sink), Some(cancel_rx))
+            .await
     }
 
     pub async fn list_channels(&self) -> Result<ChannelListResponse, KernelError> {
@@ -4914,6 +4947,7 @@ impl Kernel {
                 emit_channel_stream_done: true,
                 audit_actor: "scheduler".to_string(),
                 runtime_control_origin: RuntimeControlOrigin::SessionTurn,
+                cancel_rx: None,
             },
         )
         .await
@@ -8186,6 +8220,7 @@ struct RuntimeTurnExecution<'a> {
     input: RuntimeTurnInput,
     stream_context: Option<ChannelStreamContext>,
     event_sink: Option<RuntimeEventSink>,
+    cancel_rx: Option<oneshot::Receiver<String>>,
 }
 
 struct RuntimeControlTurnExecution<'a> {
@@ -8200,6 +8235,7 @@ struct RuntimeControlTurnExecution<'a> {
     input: RuntimeControlInput,
     stream_context: Option<ChannelStreamContext>,
     event_sink: Option<RuntimeEventSink>,
+    cancel_rx: Option<oneshot::Receiver<String>>,
 }
 
 struct CollectedRuntimeControl {
@@ -8220,6 +8256,7 @@ struct RuntimeControlSessionExecution<'a> {
     channel_stream_context: Option<ChannelStreamContext>,
     emit_channel_stream_done: bool,
     sink: Option<RuntimeEventSink>,
+    cancel_rx: Option<oneshot::Receiver<String>>,
     audit_actor: String,
 }
 
@@ -8248,6 +8285,7 @@ struct SessionTurnExecution {
     emit_channel_stream_done: bool,
     audit_actor: String,
     runtime_control_origin: RuntimeControlOrigin,
+    cancel_rx: Option<oneshot::Receiver<String>>,
 }
 
 struct SessionActionExecutionOptions {
@@ -8256,6 +8294,7 @@ struct SessionActionExecutionOptions {
     prepared_turn: Option<SessionTurnRecord>,
     history_before_sequence_no: Option<u64>,
     sink: Option<RuntimeEventSink>,
+    cancel_rx: Option<oneshot::Receiver<String>>,
     emit_channel_stream_done: bool,
     audit_actor: String,
 }
@@ -8268,6 +8307,24 @@ impl SessionActionExecutionOptions {
             prepared_turn: None,
             history_before_sequence_no: None,
             sink,
+            cancel_rx: None,
+            emit_channel_stream_done: true,
+            audit_actor: "api".to_string(),
+        }
+    }
+
+    fn api_cancellable(
+        runtime_id_override: Option<String>,
+        sink: Option<RuntimeEventSink>,
+        cancel_rx: oneshot::Receiver<String>,
+    ) -> Self {
+        Self {
+            turn_id: Uuid::new_v4(),
+            runtime_id_override,
+            prepared_turn: None,
+            history_before_sequence_no: None,
+            sink,
+            cancel_rx: Some(cancel_rx),
             emit_channel_stream_done: true,
             audit_actor: "api".to_string(),
         }
@@ -8281,6 +8338,7 @@ impl SessionActionExecutionOptions {
             prepared_turn: Some(prepared_turn),
             history_before_sequence_no: Some(history_before_sequence_no),
             sink: None,
+            cancel_rx: None,
             emit_channel_stream_done: false,
             audit_actor: "kernel".to_string(),
         }
@@ -8409,9 +8467,8 @@ struct RuntimeTurnAbortExecution<'a> {
     stream_context: &'a Option<ChannelStreamContext>,
     event_sink: &'a Option<RuntimeEventSink>,
     events: Vec<RuntimeEvent>,
-    timeout_ms: u64,
+    abort: RuntimeAbort,
     reason: String,
-    timeout_kind: &'a str,
 }
 
 struct RuntimeControlAbortExecution<'a> {
@@ -8424,9 +8481,50 @@ struct RuntimeControlAbortExecution<'a> {
     stream_context: &'a Option<ChannelStreamContext>,
     event_sink: &'a Option<RuntimeEventSink>,
     events: Vec<RuntimeEvent>,
-    timeout_ms: u64,
+    abort: RuntimeAbort,
     reason: String,
-    timeout_kind: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuntimeAbort {
+    Timeout {
+        timeout_ms: u64,
+        timeout_kind: &'static str,
+    },
+    Cancelled,
+}
+
+impl RuntimeAbort {
+    fn status(self) -> SessionTurnStatus {
+        match self {
+            Self::Timeout { .. } => SessionTurnStatus::TimedOut,
+            Self::Cancelled => SessionTurnStatus::Cancelled,
+        }
+    }
+
+    fn error_code(self) -> &'static str {
+        match self {
+            Self::Timeout { .. } => "runtime.timeout",
+            Self::Cancelled => "runtime.cancelled",
+        }
+    }
+
+    fn audit_event(self, subject: &str) -> String {
+        match self {
+            Self::Timeout { .. } => format!("runtime.{subject}.timeout"),
+            Self::Cancelled => format!("runtime.{subject}.cancelled"),
+        }
+    }
+}
+
+async fn wait_for_runtime_cancel(cancel_rx: Option<oneshot::Receiver<String>>) -> String {
+    match cancel_rx {
+        Some(rx) => match rx.await {
+            Ok(reason) => reason,
+            Err(_) => std::future::pending::<String>().await,
+        },
+        None => std::future::pending::<String>().await,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -8449,6 +8547,15 @@ impl Kernel {
         &self,
         req: SessionTurnRequest,
         sink: Option<RuntimeEventSink>,
+    ) -> Result<SessionTurnResponse, KernelError> {
+        self.turn_session_with_options(req, sink, None).await
+    }
+
+    async fn turn_session_with_options(
+        &self,
+        req: SessionTurnRequest,
+        sink: Option<RuntimeEventSink>,
+        cancel_rx: Option<oneshot::Receiver<String>>,
     ) -> Result<SessionTurnResponse, KernelError> {
         if req.user_text.trim().is_empty() {
             return Err(KernelError::BadRequest("user_text is required".to_string()));
@@ -8477,6 +8584,7 @@ impl Kernel {
                 emit_channel_stream_done: true,
                 audit_actor: "api".to_string(),
                 runtime_control_origin: RuntimeControlOrigin::SessionTurn,
+                cancel_rx,
             },
         )
         .await
@@ -8515,6 +8623,7 @@ impl Kernel {
             emit_channel_stream_done,
             audit_actor,
             runtime_control_origin,
+            cancel_rx,
         } = execution;
         let mut kind = kind;
         let mut display_user_text = display_user_text;
@@ -8712,6 +8821,7 @@ impl Kernel {
                     channel_stream_context: channel_stream_context.clone(),
                     emit_channel_stream_done,
                     sink,
+                    cancel_rx,
                     audit_actor,
                 })
                 .await;
@@ -8757,6 +8867,7 @@ impl Kernel {
                 },
                 stream_context: channel_stream_context.clone(),
                 event_sink: sink.clone(),
+                cancel_rx,
             })
             .await;
 
@@ -9078,6 +9189,7 @@ impl Kernel {
             channel_stream_context,
             emit_channel_stream_done,
             sink,
+            cancel_rx,
             audit_actor,
         } = execution;
         let channel_stream_finalizer = ChannelStreamFinalizer {
@@ -9121,6 +9233,7 @@ impl Kernel {
                 },
                 stream_context: channel_stream_context.clone(),
                 event_sink: sink.clone(),
+                cancel_rx,
             })
             .await;
 
@@ -10506,6 +10619,7 @@ impl Kernel {
                     emit_channel_stream_done: false,
                     audit_actor: "kernel".to_string(),
                     runtime_control_origin: RuntimeControlOrigin::ChannelInbound,
+                    cancel_rx: None,
                 },
             )
             .await;
@@ -11068,6 +11182,7 @@ impl Kernel {
             input,
             stream_context,
             event_sink,
+            cancel_rx,
         } = execution;
         let idle_timeout_ms = idle_timeout.as_millis() as u64;
         let hard_timeout_ms = hard_timeout.as_millis() as u64;
@@ -11143,6 +11258,8 @@ impl Kernel {
         tokio::pin!(idle_sleep);
         let hard_sleep = sleep(hard_timeout);
         tokio::pin!(hard_sleep);
+        let cancel_signal = wait_for_runtime_cancel(cancel_rx);
+        tokio::pin!(cancel_signal);
         let mut events = Vec::new();
         let mut checkpoints = AssistantCheckpointState::default();
         let mut event_rx_open = true;
@@ -11314,9 +11431,11 @@ impl Kernel {
                             stream_context: &stream_context,
                             event_sink: &event_sink,
                             events: events.clone(),
-                            timeout_ms: idle_timeout_ms,
+                            abort: RuntimeAbort::Timeout {
+                                timeout_ms: idle_timeout_ms,
+                                timeout_kind: "idle",
+                            },
                             reason,
-                            timeout_kind: "idle",
                         })
                         .await;
                 }
@@ -11336,9 +11455,28 @@ impl Kernel {
                             stream_context: &stream_context,
                             event_sink: &event_sink,
                             events: events.clone(),
-                            timeout_ms: hard_timeout_ms,
+                            abort: RuntimeAbort::Timeout {
+                                timeout_ms: hard_timeout_ms,
+                                timeout_kind: "hard",
+                            },
                             reason,
-                            timeout_kind: "hard",
+                        })
+                        .await;
+                }
+                reason = &mut cancel_signal => {
+                    return self
+                        .abort_runtime_turn(RuntimeTurnAbortExecution {
+                            adapter: adapter.as_ref(),
+                            handle,
+                            turn_id,
+                            session_id,
+                            runtime_id,
+                            turn_task: &mut turn_task,
+                            stream_context: &stream_context,
+                            event_sink: &event_sink,
+                            events: events.clone(),
+                            abort: RuntimeAbort::Cancelled,
+                            reason,
                         })
                         .await;
                 }
@@ -11362,6 +11500,7 @@ impl Kernel {
             input,
             stream_context,
             event_sink,
+            cancel_rx,
         } = execution;
         let idle_timeout_ms = idle_timeout.as_millis() as u64;
         let hard_timeout_ms = hard_timeout.as_millis() as u64;
@@ -11416,6 +11555,8 @@ impl Kernel {
         tokio::pin!(idle_sleep);
         let hard_sleep = sleep(hard_timeout);
         tokio::pin!(hard_sleep);
+        let cancel_signal = wait_for_runtime_cancel(cancel_rx);
+        tokio::pin!(cancel_signal);
         let mut events = Vec::new();
         let mut checkpoints = AssistantCheckpointState::default();
         let mut event_rx_open = true;
@@ -11574,9 +11715,11 @@ impl Kernel {
                             stream_context: &stream_context,
                             event_sink: &event_sink,
                             events: events.clone(),
-                            timeout_ms: idle_timeout_ms,
+                            abort: RuntimeAbort::Timeout {
+                                timeout_ms: idle_timeout_ms,
+                                timeout_kind: "idle",
+                            },
                             reason,
-                            timeout_kind: "idle",
                         })
                         .await;
                 }
@@ -11596,9 +11739,28 @@ impl Kernel {
                             stream_context: &stream_context,
                             event_sink: &event_sink,
                             events: events.clone(),
-                            timeout_ms: hard_timeout_ms,
+                            abort: RuntimeAbort::Timeout {
+                                timeout_ms: hard_timeout_ms,
+                                timeout_kind: "hard",
+                            },
                             reason,
-                            timeout_kind: "hard",
+                        })
+                        .await;
+                }
+                reason = &mut cancel_signal => {
+                    return self
+                        .abort_runtime_control(RuntimeControlAbortExecution {
+                            adapter: adapter.as_ref(),
+                            handle,
+                            turn_id,
+                            session_id,
+                            runtime_id,
+                            control_task: &mut control_task,
+                            stream_context: &stream_context,
+                            event_sink: &event_sink,
+                            events: events.clone(),
+                            abort: RuntimeAbort::Cancelled,
+                            reason,
                         })
                         .await;
                 }
@@ -11620,10 +11782,11 @@ impl Kernel {
             stream_context,
             event_sink,
             mut events,
-            timeout_ms,
+            abort,
             reason,
-            timeout_kind,
         } = execution;
+        let status = abort.status();
+        let error_code = abort.error_code();
         if let Err(cancel_err) = adapter.cancel(handle, Some(reason.clone())).await {
             self.audit
                 .append(
@@ -11639,8 +11802,8 @@ impl Kernel {
                 .await
                 .map_err(|err| FailedRuntimeTurn {
                     events: events.clone(),
-                    status: SessionTurnStatus::TimedOut,
-                    error_code: "runtime.timeout".to_string(),
+                    status,
+                    error_code: error_code.to_string(),
                     error_text: err.to_string(),
                 })?;
         }
@@ -11650,21 +11813,31 @@ impl Kernel {
 
         self.audit
             .append(
-                "runtime.control.timeout",
+                &abort.audit_event("control"),
                 Some(session_id),
                 Some("kernel".to_string()),
-                json!({
-                    "runtime_id": runtime_id,
-                    "runtime_session_id": handle.runtime_session_id,
-                    "timeout_ms": timeout_ms,
-                    "timeout_kind": timeout_kind,
-                }),
+                match abort {
+                    RuntimeAbort::Timeout {
+                        timeout_ms,
+                        timeout_kind,
+                    } => json!({
+                        "runtime_id": runtime_id,
+                        "runtime_session_id": handle.runtime_session_id,
+                        "timeout_ms": timeout_ms,
+                        "timeout_kind": timeout_kind,
+                    }),
+                    RuntimeAbort::Cancelled => json!({
+                        "runtime_id": runtime_id,
+                        "runtime_session_id": handle.runtime_session_id,
+                        "reason": reason.clone(),
+                    }),
+                },
             )
             .await
             .map_err(|err| FailedRuntimeTurn {
                 events: events.clone(),
-                status: SessionTurnStatus::TimedOut,
-                error_code: "runtime.timeout".to_string(),
+                status,
+                error_code: error_code.to_string(),
                 error_text: err.to_string(),
             })?;
         let mut checkpoints = AssistantCheckpointState::default();
@@ -11673,7 +11846,7 @@ impl Kernel {
             stream_context,
             event_sink,
             RuntimeEvent::Error {
-                code: Some("runtime.timeout".to_string()),
+                code: Some(error_code.to_string()),
                 text: reason.clone(),
             },
             &mut events,
@@ -11683,8 +11856,8 @@ impl Kernel {
 
         Err(FailedRuntimeTurn {
             events,
-            status: SessionTurnStatus::TimedOut,
-            error_code: "runtime.timeout".to_string(),
+            status,
+            error_code: error_code.to_string(),
             error_text: reason,
         })
     }
@@ -11703,10 +11876,11 @@ impl Kernel {
             stream_context,
             event_sink,
             mut events,
-            timeout_ms,
+            abort,
             reason,
-            timeout_kind,
         } = execution;
+        let status = abort.status();
+        let error_code = abort.error_code();
         if let Err(cancel_err) = adapter.cancel(handle, Some(reason.clone())).await {
             self.audit
                 .append(
@@ -11722,8 +11896,8 @@ impl Kernel {
                 .await
                 .map_err(|err| FailedRuntimeTurn {
                     events: events.clone(),
-                    status: SessionTurnStatus::TimedOut,
-                    error_code: "runtime.timeout".to_string(),
+                    status,
+                    error_code: error_code.to_string(),
                     error_text: err.to_string(),
                 })?;
         }
@@ -11733,21 +11907,31 @@ impl Kernel {
 
         self.audit
             .append(
-                "runtime.turn.timeout",
+                &abort.audit_event("turn"),
                 Some(session_id),
                 Some("kernel".to_string()),
-                json!({
-                    "runtime_id": runtime_id,
-                    "runtime_session_id": handle.runtime_session_id,
-                    "timeout_ms": timeout_ms,
-                    "timeout_kind": timeout_kind,
-                }),
+                match abort {
+                    RuntimeAbort::Timeout {
+                        timeout_ms,
+                        timeout_kind,
+                    } => json!({
+                        "runtime_id": runtime_id,
+                        "runtime_session_id": handle.runtime_session_id,
+                        "timeout_ms": timeout_ms,
+                        "timeout_kind": timeout_kind,
+                    }),
+                    RuntimeAbort::Cancelled => json!({
+                        "runtime_id": runtime_id,
+                        "runtime_session_id": handle.runtime_session_id,
+                        "reason": reason.clone(),
+                    }),
+                },
             )
             .await
             .map_err(|err| FailedRuntimeTurn {
                 events: events.clone(),
-                status: SessionTurnStatus::TimedOut,
-                error_code: "runtime.timeout".to_string(),
+                status,
+                error_code: error_code.to_string(),
                 error_text: err.to_string(),
             })?;
         let mut checkpoints = AssistantCheckpointState::default();
@@ -11756,7 +11940,7 @@ impl Kernel {
             stream_context,
             event_sink,
             RuntimeEvent::Error {
-                code: Some("runtime.timeout".to_string()),
+                code: Some(error_code.to_string()),
                 text: reason.clone(),
             },
             &mut events,
@@ -11766,8 +11950,8 @@ impl Kernel {
 
         Err(FailedRuntimeTurn {
             events,
-            status: SessionTurnStatus::TimedOut,
-            error_code: "runtime.timeout".to_string(),
+            status,
+            error_code: error_code.to_string(),
             error_text: reason,
         })
     }
