@@ -76,7 +76,7 @@ use super::{
         ChannelOutboxAttemptStatus, ChannelOutboxDeliveryStatus, ChannelOutboxPull,
         ChannelOutboxReport, ChannelOutboxReportOutcome, ChannelOutboxStore, NewChannelDelivery,
         DEFAULT_CHANNEL_OUTBOX_LEASE_MS, DEFAULT_CHANNEL_OUTBOX_PULL_LIMIT,
-        MAX_CHANNEL_OUTBOX_PULL_LIMIT,
+        MAX_CHANNEL_OUTBOX_LEASE_MS, MAX_CHANNEL_OUTBOX_PULL_LIMIT,
     },
     channel_state::{
         ChannelGrantRecord, ChannelGrantStatus, ChannelGrantUpsert, ChannelPairingRequestRecord,
@@ -2954,7 +2954,10 @@ impl Kernel {
             .limit
             .unwrap_or(DEFAULT_CHANNEL_OUTBOX_PULL_LIMIT)
             .clamp(1, MAX_CHANNEL_OUTBOX_PULL_LIMIT);
-        let lease_ms = req.lease_ms.unwrap_or(DEFAULT_CHANNEL_OUTBOX_LEASE_MS);
+        let lease_ms = req
+            .lease_ms
+            .unwrap_or(DEFAULT_CHANNEL_OUTBOX_LEASE_MS)
+            .clamp(1, MAX_CHANNEL_OUTBOX_LEASE_MS);
         let leases = self
             .channel_outbox
             .pull_due(ChannelOutboxPull {
@@ -7391,7 +7394,7 @@ fn stream_peer_ref_for_session_peer(channel_id: &str, session_peer_id: &str) -> 
     session_peer_id.to_string()
 }
 
-fn delivery_route_for_session_peer(
+fn delivery_route_for_session_key(
     channel_id: &str,
     session_peer_id: &str,
 ) -> (String, Option<String>) {
@@ -9237,7 +9240,7 @@ impl Kernel {
         }
 
         let (conversation_ref, thread_ref) =
-            delivery_route_for_session_peer(channel_id, session_peer_id);
+            delivery_route_for_session_key(channel_id, session_peer_id);
         let reply_to_ref = match self
             .channel_state
             .get_turn(turn_id)

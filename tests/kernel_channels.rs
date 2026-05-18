@@ -1,6 +1,7 @@
 mod common;
 
 use async_trait::async_trait;
+use chrono::{Duration as ChronoDuration, Utc};
 use common::{write_skill_source, TestHome};
 use lionclaw::{
     api::build_router,
@@ -364,6 +365,63 @@ async fn channel_outbox_rejects_stale_reports_and_keeps_retry_backoff_in_kernel(
         .await
         .expect("pull during backoff");
     assert!(immediate_pull.deliveries.is_empty());
+}
+
+#[tokio::test]
+async fn channel_outbox_caps_worker_requested_lease_duration() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "channel-outbox-lease-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    create_pending_pairing(
+        &kernel,
+        "local-cli",
+        "peer-lease",
+        "msg-outbox-lease-pairing",
+    )
+    .await;
+    approve_pairing(&kernel, "local-cli", "peer-lease").await;
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "local-cli",
+            "msg-outbox-lease",
+            "peer-lease",
+            "peer-lease",
+            None,
+            "hello lease cap",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("approved inbound handled");
+    let queued_turn_id = queued.turn_id.expect("queued turn id");
+    wait_for_stream_events(&kernel, "local-cli", "outbox-lease-stream", |events| {
+        events.iter().any(|event| {
+            event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::Done
+        })
+    })
+    .await;
+
+    let pulled_at = Utc::now();
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "worker-lease".to_string(),
+            limit: Some(1),
+            lease_ms: Some(24 * 60 * 60 * 1000),
+        })
+        .await
+        .expect("pull capped outbox lease");
+
+    assert_eq!(outbox.deliveries.len(), 1);
+    assert!(
+        outbox.deliveries[0].lease_expires_at <= pulled_at + ChronoDuration::minutes(16),
+        "worker-requested lease must be capped by the kernel"
+    );
 }
 
 #[tokio::test]

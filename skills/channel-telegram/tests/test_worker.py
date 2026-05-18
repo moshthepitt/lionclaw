@@ -6,12 +6,17 @@ import unittest
 from pathlib import Path
 
 import httpx
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Update
 
 from lionclaw_channel_telegram.api import LionClawApi, OutboxContent, OutboxDelivery, StreamEvent
 from lionclaw_channel_telegram.config import WorkerConfig
 from lionclaw_channel_telegram.telegram import TelegramTextUpdate, extract_text_update
-from lionclaw_channel_telegram.worker import OffsetStore, TelegramWorker
+from lionclaw_channel_telegram.worker import (
+    OffsetStore,
+    TelegramWorker,
+    _classify_send_failure,
+)
 
 
 class ExtractTextUpdateTests(unittest.TestCase):
@@ -362,7 +367,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_failed_outbox_send_reports_terminal_failure(self) -> None:
+    async def test_failed_outbox_send_reports_retryable_failure(self) -> None:
         api = FakeLionClawApi(
             outbox_deliveries=[
                 OutboxDelivery(
@@ -385,8 +390,16 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
                 await worker.flush_outbox()
 
-        self.assertEqual(api.outbox_reports[0][2], "terminal_failed")
+        self.assertEqual(api.outbox_reports[0][2], "retryable_failed")
         self.assertEqual(api.outbox_reports[0][4], "telegram.send_failed")
+
+    async def test_telegram_rejections_are_terminal_outbox_failures(self) -> None:
+        outcome, error_code = _classify_send_failure(
+            TelegramBadRequest(method=object(), message="chat not found")
+        )
+
+        self.assertEqual(outcome, "terminal_failed")
+        self.assertEqual(error_code, "telegram.send_rejected")
 
 
 def build_config(runtime_dir: Path) -> WorkerConfig:
