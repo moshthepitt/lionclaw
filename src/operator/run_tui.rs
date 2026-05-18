@@ -1250,7 +1250,7 @@ fn needs_delta_separator(existing: &str, delta: &str) -> bool {
 }
 
 fn starts_sentence_like(ch: char) -> bool {
-    ch.is_uppercase() || matches!(ch, '"' | '\'' | '`' | '(' | '[' | '{')
+    ch.is_uppercase() || matches!(ch, '"' | '\'' | '`' | '*' | '(' | '[' | '{')
 }
 
 pub(crate) async fn run_console(invocation: RunConsoleInvocation<'_>) -> Result<RunConsoleOutcome> {
@@ -1825,14 +1825,120 @@ pub(crate) fn transcript_render_lines(lines: &[TranscriptLine]) -> Vec<Line<'sta
             TranscriptLineKind::Error => ("error", Style::default().fg(PANEL_ERROR)),
         };
         rendered.push(Line::styled(role.to_string(), style));
-        rendered.extend(multiline_prefixed_lines(
-            "",
-            "",
-            Style::default().fg(Color::White),
-            &line.text,
-        ));
+        match line.kind {
+            TranscriptLineKind::Answer => rendered.extend(transcript_markdown_lines(&line.text)),
+            TranscriptLineKind::User | TranscriptLineKind::Status | TranscriptLineKind::Error => {
+                rendered.extend(multiline_prefixed_lines(
+                    "",
+                    "",
+                    Style::default().fg(Color::White),
+                    &line.text,
+                ));
+            }
+        }
     }
     rendered
+}
+
+#[derive(Clone, Copy)]
+struct TranscriptMarkdownStyleSheet;
+
+impl tui_markdown::StyleSheet for TranscriptMarkdownStyleSheet {
+    fn heading(&self, _level: u8) -> Style {
+        Style::default()
+            .fg(PANEL_BORDER)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn code(&self) -> Style {
+        Style::default().fg(PANEL_WARN)
+    }
+
+    fn link(&self) -> Style {
+        Style::default()
+            .fg(PANEL_BORDER)
+            .add_modifier(Modifier::UNDERLINED)
+    }
+
+    fn blockquote(&self) -> Style {
+        Style::default().fg(PANEL_MUTED)
+    }
+
+    fn heading_meta(&self) -> Style {
+        Style::default().fg(PANEL_MUTED)
+    }
+
+    fn metadata_block(&self) -> Style {
+        Style::default().fg(PANEL_MUTED)
+    }
+}
+
+fn transcript_markdown_lines(text: &str) -> Vec<Line<'static>> {
+    let input = markdown_with_preserved_line_breaks(text);
+    let options = tui_markdown::Options::new(TranscriptMarkdownStyleSheet);
+    let rendered = tui_markdown::from_str_with_options(&input, &options);
+    let lines = rendered
+        .lines
+        .into_iter()
+        .map(owned_transcript_line)
+        .collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        vec![Line::raw("")]
+    } else {
+        lines
+    }
+}
+
+fn markdown_with_preserved_line_breaks(text: &str) -> String {
+    let mut output = String::with_capacity(text.len() + text.matches('\n').count() * 2);
+    let mut in_fenced_code = false;
+
+    for segment in text.split_inclusive('\n') {
+        let (line, had_newline) = segment
+            .strip_suffix('\n')
+            .map_or((segment, false), |line| (line, true));
+        let fence_line = is_markdown_fence_line(line);
+        let preserve_soft_break = !in_fenced_code && !fence_line && !line.trim().is_empty();
+
+        output.push_str(line);
+        if had_newline {
+            if preserve_soft_break {
+                output.push_str("  \n");
+            } else {
+                output.push('\n');
+            }
+        }
+        if fence_line {
+            in_fenced_code = !in_fenced_code;
+        }
+    }
+
+    output
+}
+
+fn is_markdown_fence_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+fn owned_transcript_line(line: Line<'_>) -> Line<'static> {
+    let spans = line
+        .spans
+        .into_iter()
+        .map(|span| {
+            let mut style = span.style;
+            if style.fg.is_none() {
+                style.fg = Some(Color::White);
+            }
+            Span::styled(span.content.into_owned(), style)
+        })
+        .collect();
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        spans,
+    }
 }
 
 fn transcript_scroll_limit(line_count: usize, viewport_height: u16) -> usize {
@@ -2450,6 +2556,18 @@ mod tests {
     use crate::kernel::KernelOptions;
     use ratatui::backend::TestBackend;
 
+    fn rendered_line_strings(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
     #[test]
     fn stream_events_append_answers_and_summarize_runtime_activity() {
         let mut transcript = Vec::new();
@@ -2532,6 +2650,10 @@ mod tests {
         append_transcript_delta(&mut transcript, TranscriptLineKind::Answer, "\nstd.");
         append_transcript_delta(&mut transcript, TranscriptLineKind::Answer, "io::Result");
         assert!(transcript[0].text.ends_with("\nstd.io::Result"));
+
+        append_transcript_delta(&mut transcript, TranscriptLineKind::Answer, ".");
+        append_transcript_delta(&mut transcript, TranscriptLineKind::Answer, "**Report**");
+        assert!(transcript[0].text.ends_with("std.io::Result. **Report**"));
     }
 
     #[test]
@@ -2583,20 +2705,35 @@ mod tests {
             TranscriptLine::new(TranscriptLineKind::Answer, "ok"),
             TranscriptLine::new(TranscriptLineKind::Error, "failed"),
         ]);
-        let rendered = lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
+        let rendered = rendered_line_strings(&lines);
 
         assert_eq!(
             rendered,
             vec!["you", "/compact", "", "lionclaw", "ok", "", "error", "failed"]
         );
+    }
+
+    #[test]
+    fn transcript_rendering_renders_markdown_without_collapsing_stream_lines() {
+        let lines = transcript_render_lines(&[TranscriptLine::new(
+            TranscriptLineKind::Answer,
+            "opening line\n**Report**\nThis is **bold** text.",
+        )]);
+        let rendered = rendered_line_strings(&lines);
+
+        assert_eq!(
+            rendered,
+            vec!["lionclaw", "opening line", "Report", "This is bold text."]
+        );
+        assert!(rendered.iter().all(|line| !line.contains("**")));
+        assert!(lines[2]
+            .spans
+            .iter()
+            .any(|span| span.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(lines[3]
+            .spans
+            .iter()
+            .any(|span| span.style.add_modifier.contains(Modifier::BOLD)));
     }
 
     #[test]
