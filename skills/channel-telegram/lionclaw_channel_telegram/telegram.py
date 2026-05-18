@@ -110,7 +110,7 @@ class TelegramTransport(Protocol):
         text: str,
         reply_to_ref: str | None = None,
         thread_ref: str | None = None,
-        format_hint: str = "markdown",
+        format_hint: str = "plain",
         attachments: Sequence[TelegramOutboundAttachment] = (),
     ) -> dict[str, Any]: ...
 
@@ -179,7 +179,7 @@ class AiogramTelegramTransport:
         text: str,
         reply_to_ref: str | None = None,
         thread_ref: str | None = None,
-        format_hint: str = "markdown",
+        format_hint: str = "plain",
         attachments: Sequence[TelegramOutboundAttachment] = (),
     ) -> dict[str, Any]:
         chat_id = _coerce_chat_id(conversation_ref)
@@ -803,10 +803,7 @@ def _format_telegram_text_chunks(text: str, format_hint: str) -> list[TelegramTe
     if not chunks:
         return []
     if format_hint.casefold() != "markdown":
-        return [
-            TelegramTextChunk(plain_text=chunk, html_text=html.escape(chunk))
-            for chunk in chunks
-        ]
+        return [TelegramTextChunk(plain_text=chunk) for chunk in chunks]
     return [
         TelegramTextChunk(plain_text=chunk, html_text=_markdown_to_telegram_html(chunk))
         for chunk in chunks

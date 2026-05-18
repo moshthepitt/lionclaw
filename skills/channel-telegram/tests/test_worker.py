@@ -34,6 +34,7 @@ from lionclaw_channel_telegram.telegram import (
     TelegramPairingClaim,
     TelegramReferenceError,
     _coerce_thread_id,
+    _format_telegram_text_chunks,
     _markdown_to_telegram_html,
     _split_telegram_text,
     extract_inbound_event,
@@ -1082,7 +1083,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 )
             ],
         )
-        self.assertEqual(telegram.sent_format_hints, ["markdown"])
+        self.assertEqual(telegram.sent_format_hints, ["plain"])
         self.assertEqual(
             api.outbox_reports,
             [
@@ -1193,6 +1194,13 @@ class TelegramDeliveryHelperTests(unittest.TestCase):
         self.assertNotIn("/workspace/CONTEXT.md", rendered)
         self.assertNotIn("docs/adr/0001.md", rendered)
         self.assertIn('<a href="https://openai.com">OpenAI</a>', rendered)
+
+    def test_plain_rendering_does_not_enable_telegram_html_parse_mode(self) -> None:
+        chunks = _format_telegram_text_chunks("<b>literal</b>", "plain")
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].plain_text, "<b>literal</b>")
+        self.assertIsNone(chunks[0].html_text)
 
     def test_markdown_rendering_escapes_code_blocks(self) -> None:
         rendered = _markdown_to_telegram_html("```text\n<b>literal</b>\n```")
@@ -1377,7 +1385,7 @@ class FakeTelegramTransport:
         text: str,
         reply_to_ref: str | None = None,
         thread_ref: str | None = None,
-        format_hint: str = "markdown",
+        format_hint: str = "plain",
         attachments: Sequence[TelegramOutboundAttachment] = (),
     ) -> dict[str, object]:
         if self.fail_send_message:

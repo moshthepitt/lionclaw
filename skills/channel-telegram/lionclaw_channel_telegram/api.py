@@ -71,7 +71,7 @@ class OutboxAttachment:
 @dataclass(slots=True, frozen=True)
 class OutboxContent:
     text: str
-    format_hint: str = "markdown"
+    format_hint: str = "plain"
     attachments: list[OutboxAttachment] = field(default_factory=list)
 
 
@@ -298,7 +298,7 @@ class LionClawApi:
                     reply_to_ref=item.get("reply_to_ref"),
                     content=OutboxContent(
                         text=content["text"],
-                        format_hint=content.get("format_hint") or "markdown",
+                        format_hint=content.get("format_hint") or "plain",
                         attachments=[
                             OutboxAttachment(
                                 attachment_id=attachment["attachment_id"],
