@@ -2294,6 +2294,7 @@ fn render_vertical_scrollbar(frame: &mut Frame<'_>, area: Rect, line_count: usiz
     if line_count <= area.height as usize || area.width == 0 || area.height == 0 {
         return;
     }
+    let position = scrollbar_position_for_pane_offset(scroll, line_count, area.height);
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .begin_symbol(Some("^"))
         .end_symbol(Some("v"))
@@ -2301,8 +2302,22 @@ fn render_vertical_scrollbar(frame: &mut Frame<'_>, area: Rect, line_count: usiz
         .track_style(Style::default().fg(PANEL_MUTED));
     let mut state = ScrollbarState::new(line_count)
         .viewport_content_length(area.height as usize)
-        .position(scroll);
+        .position(position);
     frame.render_stateful_widget(scrollbar, area, &mut state);
+}
+
+fn scrollbar_position_for_pane_offset(
+    scroll: usize,
+    line_count: usize,
+    viewport_height: u16,
+) -> usize {
+    let max_offset = vertical_scroll_limit(line_count, viewport_height);
+    if max_offset == 0 {
+        return 0;
+    }
+    let max_position = line_count.saturating_sub(1);
+    let numerator = (scroll.min(max_offset) as u128) * (max_position as u128);
+    ((numerator + (max_offset as u128 / 2)) / max_offset as u128) as usize
 }
 
 fn multiline_prefixed_lines(
@@ -3413,6 +3428,15 @@ mod tests {
         assert!(rendered.contains("visible-line-39"));
         assert!(rendered.contains("^"));
         assert!(rendered.contains("v"));
+    }
+
+    #[test]
+    fn scrollbar_position_maps_pane_bottom_to_ratatui_bottom() {
+        assert_eq!(vertical_scroll_limit(100, 20), 80);
+        assert_eq!(scrollbar_position_for_pane_offset(0, 100, 20), 0);
+        assert_eq!(scrollbar_position_for_pane_offset(40, 100, 20), 50);
+        assert_eq!(scrollbar_position_for_pane_offset(80, 100, 20), 99);
+        assert_eq!(scrollbar_position_for_pane_offset(usize::MAX, 100, 20), 99);
     }
 
     #[tokio::test]
