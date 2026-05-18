@@ -9,12 +9,21 @@ from typing import Any, Protocol, Sequence
 from aiogram import Bot
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import FSInputFile, LinkPreviewOptions, Message, MessageEntity, ReplyParameters, Update
+from aiogram.types import (
+    FSInputFile,
+    LinkPreviewOptions,
+    Message,
+    MessageEntity,
+    ReplyParameters,
+    Update,
+)
 
 TELEGRAM_TEXT_LIMIT = 4000
 TELEGRAM_CAPTION_LIMIT = 1024
 PAIRING_TOKEN_RE = re.compile(r"(?:^|\s)(lc_[A-Za-z0-9_-]{8,128})(?:\s|$)")
-TELEGRAM_PARSE_ERROR_RE = re.compile(r"can't parse entities|parse entities|entity", re.I)
+TELEGRAM_PARSE_ERROR_RE = re.compile(
+    r"can't parse entities|parse entities|entity", re.I
+)
 LOCAL_LINK_RE = re.compile(r"^(?:/|file:|\.{0,2}/|[A-Za-z]:[\\/])")
 SUPPORTED_LINK_RE = re.compile(r"^(?:https?://|tg://|mailto:)", re.I)
 FILE_REFERENCE_RE = re.compile(r"^[A-Za-z0-9_.@-]+\.[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -132,7 +141,9 @@ class AiogramTelegramTransport:
     async def bot_identity(self) -> TelegramBotIdentity:
         if self._bot_identity is None:
             me = await self._bot.get_me()
-            self._bot_identity = TelegramBotIdentity(user_id=me.id, username=me.username)
+            self._bot_identity = TelegramBotIdentity(
+                user_id=me.id, username=me.username
+            )
         return self._bot_identity
 
     async def get_updates(self, offset: int, timeout_seconds: int) -> list[Update]:
@@ -294,7 +305,9 @@ class AiogramTelegramTransport:
         params = common
         if caption is not None:
             params = {**common, "caption": caption.plain_text}
-        return await self._send_attachment_once(file=file, mime_type=mime_type, params=params)
+        return await self._send_attachment_once(
+            file=file, mime_type=mime_type, params=params
+        )
 
     async def _send_attachment_once(
         self,
@@ -420,7 +433,9 @@ def _coerce_chat_id(peer_id: str) -> int | str:
             break
     else:
         if was_namespaced:
-            raise TelegramReferenceError(f"unsupported telegram conversation_ref '{peer_id}'")
+            raise TelegramReferenceError(
+                f"unsupported telegram conversation_ref '{peer_id}'"
+            )
     stripped = peer_id.removeprefix("-")
     if stripped.isdigit():
         return int(peer_id)
@@ -436,7 +451,9 @@ def _coerce_message_id(message_ref: str | None) -> int | None:
     if message_ref.startswith("telegram:message:"):
         message_ref = message_ref.removeprefix("telegram:message:")
     elif was_namespaced:
-        raise TelegramReferenceError(f"unsupported telegram message_ref '{message_ref}'")
+        raise TelegramReferenceError(
+            f"unsupported telegram message_ref '{message_ref}'"
+        )
     if message_ref.isdigit():
         return int(message_ref)
     if was_namespaced:
@@ -495,7 +512,11 @@ def _sender_ref(message: Message) -> str:
 
 def _thread_ref(message: Message) -> str | None:
     thread_id = message.message_thread_id
-    if thread_id is None and bool(getattr(message.chat, "is_forum", False)) and not _is_private(message):
+    if (
+        thread_id is None
+        and bool(getattr(message.chat, "is_forum", False))
+        and not _is_private(message)
+    ):
         thread_id = 1
     if thread_id is None:
         return None
@@ -523,7 +544,9 @@ def _content_text(message: Message) -> str | None:
 def _extract_pairing_token(text: str | None) -> str | None:
     if text is None:
         return None
-    start_match = re.match(r"^/start(?:@[A-Za-z0-9_]+)?\s+(lc_[A-Za-z0-9_-]{8,128})\s*$", text)
+    start_match = re.match(
+        r"^/start(?:@[A-Za-z0-9_]+)?\s+(lc_[A-Za-z0-9_-]{8,128})\s*$", text
+    )
     if start_match is not None:
         return start_match.group(1)
     match = PAIRING_TOKEN_RE.search(text)
@@ -542,7 +565,9 @@ def _trigger(message: Message, bot_identity: TelegramBotIdentity | None) -> str:
     return "none"
 
 
-def _is_reply_to_bot(message: Message, bot_identity: TelegramBotIdentity | None) -> bool:
+def _is_reply_to_bot(
+    message: Message, bot_identity: TelegramBotIdentity | None
+) -> bool:
     reply = message.reply_to_message
     if reply is None or reply.from_user is None or not reply.from_user.is_bot:
         return False
@@ -553,7 +578,9 @@ def _is_reply_to_bot(message: Message, bot_identity: TelegramBotIdentity | None)
     return _username_matches(reply.from_user.username, bot_identity.username)
 
 
-def _has_bot_mention(message: Message, bot_identity: TelegramBotIdentity | None) -> bool:
+def _has_bot_mention(
+    message: Message, bot_identity: TelegramBotIdentity | None
+) -> bool:
     if bot_identity is None:
         return False
     text = _content_text(message)
@@ -588,7 +615,9 @@ def _text_mention_targets_bot(
     if bot_identity.user_id is not None and mentioned_user_id == bot_identity.user_id:
         return True
     if bool(getattr(mentioned_user, "is_bot", False)):
-        if _username_matches(getattr(mentioned_user, "username", None), bot_identity.username):
+        if _username_matches(
+            getattr(mentioned_user, "username", None), bot_identity.username
+        ):
             return True
     return False
 
@@ -614,7 +643,10 @@ def _utf16_slice(text: str, offset: int, length: int) -> str:
 def _username_matches(candidate: str | None, bot_username: str | None) -> bool:
     if candidate is None or bot_username is None:
         return False
-    return candidate.removeprefix("@").casefold() == bot_username.removeprefix("@").casefold()
+    return (
+        candidate.removeprefix("@").casefold()
+        == bot_username.removeprefix("@").casefold()
+    )
 
 
 def _command_targets_bot(fragment: str, bot_username: str) -> bool:
@@ -798,7 +830,9 @@ def _attachment(
     )
 
 
-def _format_telegram_text_chunks(text: str, format_hint: str) -> list[TelegramTextChunk]:
+def _format_telegram_text_chunks(
+    text: str, format_hint: str
+) -> list[TelegramTextChunk]:
     chunks = _split_telegram_text(text)
     if not chunks:
         return []
@@ -819,7 +853,9 @@ def _markdown_to_telegram_html(markdown: str) -> str:
     for line in lines:
         if line.lstrip().startswith(("```", "~~~")):
             if in_code_block:
-                rendered.append(f"<pre><code>{html.escape(''.join(code_lines))}</code></pre>")
+                rendered.append(
+                    f"<pre><code>{html.escape(''.join(code_lines))}</code></pre>"
+                )
                 code_lines = []
                 in_code_block = False
             else:
@@ -871,8 +907,8 @@ def _parse_markdown_link(text: str, index: int) -> tuple[str, str, int] | None:
     href_end = text.find(")", label_end + 2)
     if href_end == -1:
         return None
-    label = text[index + 1:label_end]
-    href = text[label_end + 2:href_end].strip()
+    label = text[index + 1 : label_end]
+    href = text[label_end + 2 : href_end].strip()
     return label, href, href_end + 1
 
 

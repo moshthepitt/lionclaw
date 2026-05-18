@@ -45,7 +45,6 @@ from lionclaw_channel_telegram.worker import (
     _classify_send_failure,
 )
 
-
 BOT = TelegramBotIdentity(user_id=99, username="lionclaw_bot")
 
 
@@ -648,7 +647,9 @@ class LionClawApiTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_process_updates_routes_pairing_and_inbound_and_persists_offset(self) -> None:
+    async def test_process_updates_routes_pairing_and_inbound_and_persists_offset(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
             telegram = FakeTelegramTransport(
@@ -764,7 +765,9 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(api.finalized[0][1], [])
             self.assertEqual(telegram.typing_peers, ["telegram:chat:77"])
 
-    async def test_run_forever_flushes_outbox_while_update_poll_is_waiting(self) -> None:
+    async def test_run_forever_flushes_outbox_while_update_poll_is_waiting(
+        self,
+    ) -> None:
         api = FakeLionClawApi(
             outbox_deliveries=[
                 OutboxDelivery(
@@ -885,7 +888,9 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(api.staged_attachments, [])
             self.assertEqual(api.finalized, [])
 
-    async def test_pending_approval_notifies_with_pairing_code_without_download(self) -> None:
+    async def test_pending_approval_notifies_with_pairing_code_without_download(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi(
                 inbound_outcome="pending_approval",
@@ -1151,7 +1156,9 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api.outbox_reports), 1)
         self.assertEqual(api.outbox_reports[0][2], "delivered")
 
-    async def test_telegram_rejections_and_invalid_refs_are_terminal_outbox_failures(self) -> None:
+    async def test_telegram_rejections_and_invalid_refs_are_terminal_outbox_failures(
+        self,
+    ) -> None:
         outcome, error_code = _classify_send_failure(
             TelegramBadRequest(method=object(), message="chat not found")
         )
@@ -1181,7 +1188,9 @@ class TelegramDeliveryHelperTests(unittest.TestCase):
     def test_topic_thread_ref_preserves_general_topic_on_typing(self) -> None:
         self.assertEqual(_coerce_thread_id("telegram:topic:1", omit_general=False), 1)
 
-    def test_markdown_rendering_uses_telegram_html_and_suppresses_local_links(self) -> None:
+    def test_markdown_rendering_uses_telegram_html_and_suppresses_local_links(
+        self,
+    ) -> None:
         rendered = _markdown_to_telegram_html(
             "**Sauti Scribe Edge**\n"
             "- [CONTEXT.md](/workspace/CONTEXT.md)\n"
@@ -1205,7 +1214,9 @@ class TelegramDeliveryHelperTests(unittest.TestCase):
     def test_markdown_rendering_escapes_code_blocks(self) -> None:
         rendered = _markdown_to_telegram_html("```text\n<b>literal</b>\n```")
 
-        self.assertEqual(rendered, "<pre><code>&lt;b&gt;literal&lt;/b&gt;\n</code></pre>")
+        self.assertEqual(
+            rendered, "<pre><code>&lt;b&gt;literal&lt;/b&gt;\n</code></pre>"
+        )
 
 
 def build_api(client: httpx.AsyncClient) -> LionClawApi:
@@ -1254,8 +1265,12 @@ class FakeLionClawApi:
         self.report_accepted = report_accepted
         self.sent_inbound: list[TelegramInboundUpdate] = []
         self.claims: list[TelegramPairingClaim] = []
-        self.staged_attachments: list[tuple[TelegramInboundUpdate, TelegramInboundAttachment]] = []
-        self.finalized: list[tuple[TelegramInboundUpdate, list[AttachmentMissingReport]]] = []
+        self.staged_attachments: list[
+            tuple[TelegramInboundUpdate, TelegramInboundAttachment]
+        ] = []
+        self.finalized: list[
+            tuple[TelegramInboundUpdate, list[AttachmentMissingReport]]
+        ] = []
         self.acked_sequences: list[int] = []
         self.outbox_reports: list[
             tuple[
@@ -1286,7 +1301,9 @@ class FakeLionClawApi:
         downloaded: TelegramDownloadedAttachment,
     ) -> AttachmentStageResponse:
         self.staged_attachments.append((update, attachment))
-        return AttachmentStageResponse(status="staged", size_bytes=len(downloaded.content), sha256="00")
+        return AttachmentStageResponse(
+            status="staged", size_bytes=len(downloaded.content), sha256="00"
+        )
 
     async def finalize_attachments(
         self,
@@ -1344,9 +1361,9 @@ class FakeTelegramTransport:
         downloaded_content: bytes = b"file",
     ) -> None:
         self.updates = list(updates or [])
-        self.sent_messages: list[
-            tuple[str, str, str | None, str | None, list[str]]
-        ] = []
+        self.sent_messages: list[tuple[str, str, str | None, str | None, list[str]]] = (
+            []
+        )
         self.sent_format_hints: list[str] = []
         self.typing_peers: list[str] = []
         self.typing_calls: list[tuple[str, str | None]] = []
