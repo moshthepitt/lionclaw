@@ -9,7 +9,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.geometry import Size
 from textual.widgets import Footer, Input, Markdown, RichLog, Static
 
-from lionclaw_channel_terminal.api import LionClawApi
+from lionclaw_channel_terminal.api import LionClawApi, OutboxDelivery
 from lionclaw_channel_terminal.state import ChannelViewState, TurnState
 
 
@@ -23,6 +23,7 @@ class AppConfig:
     stream_start_mode: str
     stream_limit: int
     stream_wait_ms: int
+    outbox_loop_delay_secs: float
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -35,6 +36,7 @@ class AppConfig:
             stream_start_mode=os.environ.get("LIONCLAW_STREAM_START_MODE", "tail"),
             stream_limit=int(os.environ.get("LIONCLAW_STREAM_LIMIT", "50")),
             stream_wait_ms=int(os.environ.get("LIONCLAW_STREAM_WAIT_MS", "30000")),
+            outbox_loop_delay_secs=float(os.environ.get("LIONCLAW_OUTBOX_LOOP_DELAY_SECS", "1")),
         )
 
 
@@ -152,6 +154,7 @@ class TerminalChannelApp(App[None]):
         await self.refresh_pairing_state()
         self._render_views()
         self.run_worker(self.stream_loop(), exclusive=False, group="stream")
+        self.run_worker(self.outbox_loop(), exclusive=False, group="outbox")
         self.set_interval(2.0, self.refresh_pairing_state, pause=False)
 
     async def on_unmount(self) -> None:
@@ -364,6 +367,79 @@ class TerminalChannelApp(App[None]):
                 continue
 
             self._render_views()
+
+    async def outbox_loop(self) -> None:
+        while True:
+            try:
+                await self.flush_outbox()
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001
+                self.state.activity_lines.append(f"[error] outbox failed: {err}")
+                self._render_views()
+
+            await asyncio.sleep(self.config.outbox_loop_delay_secs)
+
+    async def flush_outbox(self) -> None:
+        deliveries = await self.api.pull_outbox()
+        for delivery in deliveries:
+            await self._deliver_outbox(delivery)
+        if deliveries:
+            self._render_views()
+
+    async def _deliver_outbox(self, delivery: OutboxDelivery) -> None:
+        if delivery.conversation_ref != self.config.peer_id:
+            await self._report_outbox_with_retry(
+                delivery,
+                "retryable_failed",
+                error_code="terminal.peer_mismatch",
+                error_text="delivery conversation_ref did not match terminal peer",
+            )
+            return
+
+        self.state.apply_outbox_delivery(delivery)
+        await self._report_outbox_with_retry(
+            delivery,
+            "delivered",
+            provider_receipt={
+                "provider": "terminal",
+                "conversation_ref": delivery.conversation_ref,
+                "turn_id": delivery.turn_id,
+                "rendered": True,
+            },
+        )
+
+    async def _report_outbox_with_retry(
+        self,
+        delivery: OutboxDelivery,
+        outcome: str,
+        *,
+        provider_receipt: dict[str, object] | None = None,
+        error_code: str | None = None,
+        error_text: str | None = None,
+    ) -> None:
+        for attempt_no in range(1, 4):
+            try:
+                response = await self.api.report_outbox(
+                    delivery,
+                    outcome,
+                    provider_receipt=provider_receipt,
+                    error_code=error_code,
+                    error_text=error_text,
+                )
+            except Exception as err:  # noqa: BLE001
+                self.state.activity_lines.append(
+                    f"[error] outbox report failed for delivery {delivery.delivery_id}: {err}"
+                )
+                await asyncio.sleep(0.25 * attempt_no)
+                continue
+
+            if not response.accepted:
+                self.state.activity_lines.append(
+                    "[status] outbox report was stale: "
+                    f"{response.status}/{response.attempt_status}"
+                )
+            return
 
     async def _push_status(self, message: str) -> None:
         self.state.activity_lines.append(f"[status] {message}")

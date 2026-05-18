@@ -233,7 +233,7 @@ cd "$PROJ_A"
   --schedule "every 1d" \
   --prompt "Reply with exactly JOB_OK and nothing else." \
   --deliver-channel terminal \
-  --deliver-peer "${USER:-local}"
+  --deliver-conversation "${USER:-local}"
 "$LIONCLAW_BIN" job ls
 "$LIONCLAW_BIN" job run qa-brief
 "$LIONCLAW_BIN" job runs qa-brief
@@ -243,7 +243,7 @@ cd "$PROJ_A"
 Expected:
 
 - manual job run succeeds
-- delivery reaches the approved channel grant/session
+- delivery is enqueued, then reaches the approved channel conversation after the worker reports provider delivery
 - job history is visible through the CLI
 
 ## Phase 8: Doctor Diagnostics

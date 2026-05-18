@@ -25,7 +25,9 @@ pub enum JobSchedule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobDeliveryTarget {
     pub channel_id: String,
-    pub peer_id: String,
+    pub conversation_ref: String,
+    pub thread_ref: Option<String>,
+    pub reply_to_ref: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1197,6 +1199,25 @@ impl JobStore {
             .context("failed to commit interrupted scheduler job run")?;
 
         Ok(Some(map_run_row(updated_run_row)?))
+    }
+
+    pub async fn update_run_delivery_status(
+        &self,
+        run_id: Uuid,
+        delivery_status: SchedulerJobDeliveryStatus,
+    ) -> Result<bool> {
+        let changed = sqlx::query(
+            "UPDATE scheduler_job_runs \
+             SET delivery_status = ?2 \
+             WHERE run_id = ?1 AND delivery_status = 'pending'",
+        )
+        .bind(run_id.to_string())
+        .bind(delivery_status.as_str())
+        .execute(&self.pool)
+        .await
+        .context("failed to update scheduler run delivery status")?;
+
+        Ok(changed.rows_affected() > 0)
     }
 
     pub async fn interrupt_running_runs(

@@ -20,7 +20,9 @@ Under the hood, the worker:
 3. long-polls `/v0/channels/stream/pull`,
 4. renders typed outbound events in separate terminal regions,
 5. starts recovery actions through `/v0/sessions/action`,
-6. advances its consumer cursor through `/v0/channels/stream/ack`.
+6. leases final answers for its local peer through `/v0/channels/outbox/pull`,
+7. reports terminal render outcomes through `/v0/channels/outbox/report`,
+8. advances its progress cursor through `/v0/channels/stream/ack`.
 
 ## Prerequisites
 
@@ -65,6 +67,7 @@ For repeated manual testing, you can use the repo helper:
 - The worker defaults to `channel_id=terminal` and `peer_id=$USER` (falling back to `$USERNAME` or `local-user`).
 - `channel attach` restores the latest `history_policy=interactive` session for that peer, renders the last 12 durable turns into the answer pane, and resumes a still-running answer stream from the last durable checkpoint when one exists.
 - The TUI lets inbound admission select the session, echoes your message with a local pending state, follows live `queue.*` / `runtime.*` stream events for the active turn, and reconciles completed turns from the kernel `turn_completed` snapshot.
+- Final answer delivery is outbox-driven: the TUI uses stream events for live progress and reasoning, but records local terminal rendering through explicit outbox delivery reports.
 - Channel-scoped stream messages without `session_id` / `turn_id` are rendered as activity only; they must not select or pin the active interactive session.
 - Slash commands are built into the TUI:
   - `/continue`

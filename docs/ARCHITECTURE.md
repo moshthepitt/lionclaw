@@ -42,7 +42,7 @@ The Rust kernel owns:
 
 - sessions and turn history
 - runtime launch plans
-- channel pairing, scoped grants, inbound queues, outbound streams
+- channel pairing, scoped grants, inbound queues, progress streams, durable outbox delivery
 - scheduler definitions and run records
 - policy grants and audit events
 - assistant-home continuity files and derived search index
@@ -89,7 +89,8 @@ Skill text can influence prompt context. It cannot grant permissions.
 - `kernel.runtime`: runtime adapter contract and registry.
 - `kernel.runtime.execution`: execution presets, plan compilation, OCI backend, and process execution.
 - `kernel.scheduler`: due-job claiming, lease coordination, retry, and dispatch.
-- `kernel.channel_state`: channel pairing requests, scoped grants, normalized inbound event admission, queued turns, outbound stream state, and transcript history.
+- `kernel.channel_state`: channel pairing requests, scoped grants, normalized inbound event admission, queued turns, progress stream state, and transcript history.
+- `kernel.channel_outbox`: durable provider-neutral delivery leases, retry state, provider receipts, and scheduler delivery projections.
 - `kernel.continuity`: assistant-home continuity files, `ACTIVE.md` projection, daily notes, artifacts, open loops, proposals, and retrieval helpers.
 - `kernel.continuity_fs`: descriptor-rooted Unix filesystem helper for assistant-home continuity.
 - `kernel.session_compactions`: persisted transcript compaction summaries and ranges.
@@ -286,6 +287,8 @@ with the CLI.
 - `POST /v0/channels/attachments/finalize`
 - `POST /v0/channels/stream/pull`
 - `POST /v0/channels/stream/ack`
+- `POST /v0/channels/outbox/pull`
+- `POST /v0/channels/outbox/report`
 
 ### Job
 
@@ -347,11 +350,22 @@ External channel skills integrate over HTTP:
    without waiting for a worker finalize call.
 4. `POST /v0/sessions/action` starts `continue_last_partial`,
    `retry_last_turn`, or `reset_session` for a channel-backed session.
-5. `POST /v0/channels/stream/pull` fetches typed outbound stream events for a
-   consumer cursor.
-6. `POST /v0/channels/stream/ack` records that a worker durably handled events
-   through a sequence.
-7. Pairing invite/claim, approve/block, and grant revoke endpoints manage
+5. `POST /v0/channels/stream/pull` fetches typed progress events for a
+   consumer cursor. Stream acknowledgment means the worker handled progress
+   events; it does not imply provider message delivery.
+6. `POST /v0/channels/outbox/pull` atomically leases due outbound deliveries.
+   Deliveries carry `conversation_ref`, optional `thread_ref`, optional
+   `reply_to_ref`, `content`, and a stable `delivery_id`. Each pull creates an
+   `attempt_id`; workers perform one provider send attempt per lease. Pulls may
+   optionally scope to a `conversation_ref` / `thread_ref` so interactive
+   per-peer workers, such as the terminal channel, do not lease another peer's
+   delivery.
+7. `POST /v0/channels/outbox/report` records provider outcomes. `delivered`
+   stores provider receipt data, `retryable_failed` returns the delivery to
+   kernel-owned exponential backoff, and `terminal_failed` closes it. Stale
+   reports are recorded as rejected and never overwrite the current attempt.
+8. `POST /v0/channels/stream/ack` advances only the progress stream cursor.
+9. Pairing invite/claim, approve/block, and grant revoke endpoints manage
    channel trust. Invite tokens are returned once, stored only as hashes, and
    claimed through worker-submitted provider facts.
    Blocking a sender scope also closes matching pending operator-approval
@@ -409,11 +423,18 @@ stream contract. Kernel-generated lifecycle codes include:
 - `runtime.timeout`
 
 Stream events produced by actual runtime turns include `session_id` and
-`turn_id`. The stream `peer_id` remains the provider-facing conversation ref for
-delivery compatibility; internal session identity is carried by `session_key`
-and the session row. Channel session keys are grant scoped: direct sessions
-include the sender, conversation sessions include the conversation and sender,
-and thread sessions include the conversation, thread, and sender.
+`turn_id`. The stream `peer_id` remains a provider-facing conversation hint for
+typing/progress only; durable outbound routing uses the outbox fields
+`conversation_ref`, `thread_ref`, and `reply_to_ref`. Internal session identity
+is carried by `session_key` and the session row. Channel session keys are grant
+scoped: direct sessions include the sender, conversation sessions include the
+conversation and sender, and thread sessions include the conversation, thread,
+and sender.
+
+Outbox `content` is provider-neutral JSON with `text`, a `format_hint`
+(`plain`, `markdown`, or `html`), and an `attachments` array. Outbound
+attachments are schema-ready and remain text-only for shipped workers until
+runtime/draft file delivery is enabled.
 
 ## Session Continuity
 
@@ -497,9 +518,10 @@ Scheduled runs open fresh synthetic sessions:
 
 Scheduled jobs invoke the selected runtime with explicit job context and the
 daemon's current runtime-visible skill set from applied filesystem state.
-Optional delivery sends the final result through the existing channel
-stream/outbox path without changing the latest interactive session for that
-peer.
+Optional delivery enqueues the final result in the channel outbox without
+changing the latest interactive session for that conversation. Scheduler run
+delivery status is `pending` after enqueue and becomes `delivered` or `failed`
+only after the provider worker reports the outbox attempt outcome.
 
 Paused jobs are skipped by normal scheduler ticks but can still be run
 manually by the operator.

@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::contracts::{JobTickResponse, SessionHistoryPolicy, SessionOpenRequest, TrustTier};
 
 use super::{
+    channel_outbox::ChannelDeliveryRoute,
     core::Kernel,
     error::KernelError,
     jobs::{
@@ -215,6 +216,7 @@ impl SchedulerEngine {
         &self,
         kernel: &Kernel,
         job: &SchedulerJobRecord,
+        run_id: Uuid,
         content: &str,
     ) -> SchedulerJobDeliveryStatus {
         let Some(delivery) = &job.delivery else {
@@ -228,11 +230,24 @@ impl SchedulerEngine {
         } else {
             content.to_string()
         };
+        let source_id = run_id.to_string();
         match kernel
-            .emit_channel_message(&delivery.channel_id, &delivery.peer_id, None, None, &text)
+            .enqueue_channel_delivery(
+                ChannelDeliveryRoute {
+                    channel_id: &delivery.channel_id,
+                    conversation_ref: &delivery.conversation_ref,
+                    thread_ref: delivery.thread_ref.as_deref(),
+                    reply_to_ref: delivery.reply_to_ref.as_deref(),
+                },
+                None,
+                None,
+                Some("scheduler_run"),
+                Some(&source_id),
+                &text,
+            )
             .await
         {
-            Ok(_) => SchedulerJobDeliveryStatus::Delivered,
+            Ok(_) => SchedulerJobDeliveryStatus::Pending,
             Err(_) => SchedulerJobDeliveryStatus::Failed,
         }
     }
@@ -259,7 +274,7 @@ impl SchedulerEngine {
         match turn_result {
             Ok(response) => {
                 let delivery_status = self
-                    .deliver_job_result(kernel, job, &response.assistant_text)
+                    .deliver_job_result(kernel, job, current_run.run_id, &response.assistant_text)
                     .await;
                 let updated_job = kernel
                     .job_store()
@@ -364,7 +379,9 @@ impl SchedulerEngine {
 
         let error_text = err.to_string();
         let failure_summary = format!("Scheduled job '{}' failed: {}", job.name, error_text);
-        let delivery_status = self.deliver_job_result(kernel, job, &failure_summary).await;
+        let delivery_status = self
+            .deliver_job_result(kernel, job, current_run.run_id, &failure_summary)
+            .await;
         let updated_job = kernel
             .job_store()
             .complete_run_failure(

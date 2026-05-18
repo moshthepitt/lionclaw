@@ -1,6 +1,7 @@
 mod common;
 
 use async_trait::async_trait;
+use chrono::{Duration as ChronoDuration, Utc};
 use common::{write_skill_source, TestHome};
 use lionclaw::{
     api::build_router,
@@ -8,14 +9,15 @@ use lionclaw::{
         ChannelAttachmentDescriptor, ChannelAttachmentFinalizeOutcome,
         ChannelAttachmentFinalizeRequest, ChannelAttachmentMissingReport,
         ChannelAttachmentStageResponse, ChannelAttachmentStatus, ChannelGrantView,
-        ChannelInboundOutcome, ChannelInboundRequest, ChannelPairingApproveRequest,
-        ChannelPairingBlockRequest, ChannelPairingBlockResponse, ChannelPairingClaimOutcome,
-        ChannelPairingClaimRequest, ChannelPairingInviteRequest, ChannelPairingStatus,
-        ChannelRoutingProfile, ChannelStreamAckRequest, ChannelStreamEventView,
-        ChannelStreamPullRequest, ChannelStreamStartMode, ChannelTrigger, DaemonInfoResponse,
-        SessionActionKind, SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest,
-        SessionLatestQuery, SessionOpenRequest, SessionTurnKind, SessionTurnRequest,
-        SessionTurnStatus, StreamEventKindDto, StreamLaneDto, TrustTier,
+        ChannelInboundOutcome, ChannelInboundRequest, ChannelOutboxDeliveryStatusDto,
+        ChannelOutboxPullRequest, ChannelOutboxReportOutcomeDto, ChannelOutboxReportRequest,
+        ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
+        ChannelPairingClaimOutcome, ChannelPairingClaimRequest, ChannelPairingInviteRequest,
+        ChannelPairingStatus, ChannelRoutingProfile, ChannelStreamAckRequest,
+        ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamStartMode, ChannelTrigger,
+        DaemonInfoResponse, SessionActionKind, SessionActionRequest, SessionHistoryPolicy,
+        SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest, SessionTurnKind,
+        SessionTurnRequest, SessionTurnStatus, StreamEventKindDto, StreamLaneDto, TrustTier,
     },
     kernel::{
         channel_attachments::{MAX_CHANNEL_ATTACHMENT_BYTES, MAX_CHANNEL_EVENT_ATTACHMENT_BYTES},
@@ -203,6 +205,518 @@ async fn channel_peer_must_be_approved_before_inbound_turn_executes() {
         .text
         .as_deref()
         .is_some_and(|text| text.contains("[mock]")));
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "channel-worker-test".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull channel outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    assert_eq!(outbox.deliveries[0].conversation_ref, "peer-local");
+    assert_eq!(
+        outbox.deliveries[0].reply_to_ref.as_deref(),
+        Some("msg-1002")
+    );
+    assert!(outbox.deliveries[0].content.text.contains("[mock]"));
+    assert_eq!(outbox.deliveries[0].content.format_hint, "markdown");
+    assert!(outbox.deliveries[0].content.attachments.is_empty());
+    let delivery_id = outbox.deliveries[0].delivery_id;
+    let attempt_id = outbox.deliveries[0].attempt_id;
+    let report = kernel
+        .report_channel_outbox(ChannelOutboxReportRequest {
+            delivery_id,
+            attempt_id,
+            channel_id: "local-cli".to_string(),
+            worker_id: "channel-worker-test".to_string(),
+            outcome: ChannelOutboxReportOutcomeDto::Delivered,
+            provider_receipt: Some(serde_json::json!({"message_ref": "provider-1"})),
+            error_code: None,
+            error_text: None,
+        })
+        .await
+        .expect("report channel outbox delivered");
+    assert!(report.accepted);
+    assert_eq!(report.status, ChannelOutboxDeliveryStatusDto::Delivered);
+
+    let created_audit = kernel
+        .query_audit(
+            None,
+            Some("channel.outbox.created".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query created audit");
+    let created = created_audit
+        .events
+        .iter()
+        .find(|event| event.details["delivery_id"] == delivery_id.to_string())
+        .expect("created audit for delivery");
+    assert_eq!(created.details["attempt_id"], serde_json::Value::Null);
+    assert_eq!(created.details["conversation_ref"], "peer-local");
+    assert_eq!(created.details["reply_to_ref"], "msg-1002");
+    assert_eq!(created.details["turn_id"], queued_turn_id.to_string());
+    assert_eq!(created.details["content_format_hint"], "markdown");
+    assert_eq!(created.details["content_attachment_count"], 0);
+
+    let leased_audit = kernel
+        .query_audit(
+            None,
+            Some("channel.outbox.leased".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query leased audit");
+    let leased = leased_audit
+        .events
+        .iter()
+        .find(|event| event.details["delivery_id"] == delivery_id.to_string())
+        .expect("leased audit for delivery");
+    assert_eq!(leased.details["attempt_id"], attempt_id.to_string());
+    assert_eq!(leased.details["conversation_ref"], "peer-local");
+    assert_eq!(leased.details["turn_id"], queued_turn_id.to_string());
+
+    let delivered_audit = kernel
+        .query_audit(
+            None,
+            Some("channel.outbox.delivered".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query delivered audit");
+    let delivered = delivered_audit
+        .events
+        .iter()
+        .find(|event| event.details["delivery_id"] == delivery_id.to_string())
+        .expect("delivered audit for delivery");
+    assert_eq!(delivered.details["attempt_id"], attempt_id.to_string());
+    assert_eq!(delivered.details["conversation_ref"], "peer-local");
+    assert_eq!(
+        delivered.details["provider_receipt"]["message_ref"],
+        "provider-1"
+    );
+    assert_eq!(delivered.details["accepted"], true);
+}
+
+#[tokio::test]
+async fn channel_outbox_rejects_stale_reports_and_keeps_retry_backoff_in_kernel() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "channel-outbox-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    let pending = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "local-cli",
+            "msg-outbox-stale-run",
+            "peer-outbox",
+            "peer-outbox",
+            None,
+            "hello outbox",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("pending inbound handled");
+    kernel
+        .approve_channel_pairing(ChannelPairingApproveRequest {
+            channel_id: "local-cli".to_string(),
+            pairing_id: None,
+            pairing_code: pending.pairing_code,
+            routing_profile: None,
+            trust_tier: Some(TrustTier::Main),
+            label: None,
+        })
+        .await
+        .expect("approve pairing");
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "local-cli",
+            "msg-outbox-stale",
+            "peer-outbox",
+            "peer-outbox",
+            None,
+            "hello outbox",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("approved inbound handled");
+    let queued_turn_id = queued.turn_id.expect("queued turn id");
+    wait_for_stream_events(&kernel, "local-cli", "outbox-stale-stream", |events| {
+        events.iter().any(|event| {
+            event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::Done
+        })
+    })
+    .await;
+
+    let first_pull = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "worker-1".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(1),
+            lease_ms: Some(1),
+        })
+        .await
+        .expect("pull first outbox lease");
+    assert_eq!(first_pull.deliveries.len(), 1);
+    sleep(Duration::from_millis(5)).await;
+    let second_pull = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "worker-2".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(1),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("re-lease expired outbox delivery");
+    assert_eq!(second_pull.deliveries.len(), 1);
+    assert_eq!(
+        second_pull.deliveries[0].delivery_id,
+        first_pull.deliveries[0].delivery_id
+    );
+    assert_eq!(second_pull.deliveries[0].attempt_count, 2);
+
+    let stale_report = kernel
+        .report_channel_outbox(ChannelOutboxReportRequest {
+            delivery_id: first_pull.deliveries[0].delivery_id,
+            attempt_id: first_pull.deliveries[0].attempt_id,
+            channel_id: "local-cli".to_string(),
+            worker_id: "worker-1".to_string(),
+            outcome: ChannelOutboxReportOutcomeDto::Delivered,
+            provider_receipt: Some(serde_json::json!({"message_ref": "late"})),
+            error_code: None,
+            error_text: None,
+        })
+        .await
+        .expect("report stale delivery");
+    assert!(!stale_report.accepted);
+    assert_eq!(stale_report.status, ChannelOutboxDeliveryStatusDto::Leased);
+    let stale_audit = kernel
+        .query_audit(
+            None,
+            Some("channel.outbox.stale_report_rejected".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query stale report audit");
+    let stale_event = stale_audit
+        .events
+        .iter()
+        .find(|event| {
+            event.details["delivery_id"] == first_pull.deliveries[0].delivery_id.to_string()
+        })
+        .expect("stale audit for delivery");
+    assert_eq!(
+        stale_event.details["attempt_id"],
+        first_pull.deliveries[0].attempt_id.to_string()
+    );
+    assert_eq!(stale_event.details["conversation_ref"], "peer-outbox");
+    assert_eq!(stale_event.details["error_code"], "stale_report");
+    assert_eq!(
+        stale_event.details["provider_receipt"]["message_ref"],
+        "late"
+    );
+
+    let retryable_report = kernel
+        .report_channel_outbox(ChannelOutboxReportRequest {
+            delivery_id: second_pull.deliveries[0].delivery_id,
+            attempt_id: second_pull.deliveries[0].attempt_id,
+            channel_id: "local-cli".to_string(),
+            worker_id: "worker-2".to_string(),
+            outcome: ChannelOutboxReportOutcomeDto::RetryableFailed,
+            provider_receipt: None,
+            error_code: Some("provider.rate_limited".to_string()),
+            error_text: Some("try later".to_string()),
+        })
+        .await
+        .expect("report retryable delivery failure");
+    assert!(retryable_report.accepted);
+    assert_eq!(
+        retryable_report.status,
+        ChannelOutboxDeliveryStatusDto::Pending
+    );
+    assert!(retryable_report.next_attempt_at.is_some());
+    let retryable_audit = kernel
+        .query_audit(
+            None,
+            Some("channel.outbox.retryable_failed".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query retryable audit");
+    let retryable_event = retryable_audit
+        .events
+        .iter()
+        .find(|event| {
+            event.details["delivery_id"] == second_pull.deliveries[0].delivery_id.to_string()
+        })
+        .expect("retryable audit for delivery");
+    assert_eq!(
+        retryable_event.details["attempt_id"],
+        second_pull.deliveries[0].attempt_id.to_string()
+    );
+    assert_eq!(retryable_event.details["conversation_ref"], "peer-outbox");
+    assert_eq!(
+        retryable_event.details["error_code"],
+        "provider.rate_limited"
+    );
+    assert_eq!(retryable_event.details["error_text"], "try later");
+    let immediate_pull = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "worker-2".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(1),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull during backoff");
+    assert!(immediate_pull.deliveries.is_empty());
+}
+
+#[tokio::test]
+async fn channel_outbox_caps_worker_requested_lease_duration() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "channel-outbox-lease-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    create_pending_pairing(
+        &kernel,
+        "local-cli",
+        "peer-lease",
+        "msg-outbox-lease-pairing",
+    )
+    .await;
+    approve_pairing(&kernel, "local-cli", "peer-lease").await;
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "local-cli",
+            "msg-outbox-lease",
+            "peer-lease",
+            "peer-lease",
+            None,
+            "hello lease cap",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("approved inbound handled");
+    let queued_turn_id = queued.turn_id.expect("queued turn id");
+    wait_for_stream_events(&kernel, "local-cli", "outbox-lease-stream", |events| {
+        events.iter().any(|event| {
+            event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::Done
+        })
+    })
+    .await;
+
+    let pulled_at = Utc::now();
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "worker-lease".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(1),
+            lease_ms: Some(24 * 60 * 60 * 1000),
+        })
+        .await
+        .expect("pull capped outbox lease");
+
+    assert_eq!(outbox.deliveries.len(), 1);
+    assert!(
+        outbox.deliveries[0].lease_expires_at <= pulled_at + ChronoDuration::minutes(16),
+        "worker-requested lease must be capped by the kernel"
+    );
+}
+
+#[tokio::test]
+async fn channel_outbox_pull_can_scope_to_conversation() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "channel-outbox-scope-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    for peer in ["peer-a", "peer-b"] {
+        let pairing_event_id = format!("msg-outbox-scope-pairing-{peer}");
+        create_pending_pairing(&kernel, "local-cli", peer, &pairing_event_id).await;
+        approve_pairing(&kernel, "local-cli", peer).await;
+        let inbound_event_id = format!("msg-outbox-scope-{peer}");
+        let queued = kernel
+            .ingest_channel_inbound(v2_text_request(
+                "local-cli",
+                &inbound_event_id,
+                peer,
+                peer,
+                None,
+                "hello scoped outbox",
+                ChannelTrigger::Dm,
+            ))
+            .await
+            .expect("approved scoped inbound handled");
+        let queued_turn_id = queued.turn_id.expect("queued turn id");
+        let consumer_id = format!("outbox-scope-{peer}");
+        wait_for_stream_events(&kernel, "local-cli", &consumer_id, |events| {
+            events.iter().any(|event| {
+                event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::Done
+            })
+        })
+        .await;
+    }
+
+    let peer_a = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "worker-peer-a".to_string(),
+            conversation_ref: Some("peer-a".to_string()),
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull peer-a outbox");
+    assert_eq!(peer_a.deliveries.len(), 1);
+    assert_eq!(peer_a.deliveries[0].conversation_ref, "peer-a");
+
+    let peer_b = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "worker-peer-b".to_string(),
+            conversation_ref: Some("peer-b".to_string()),
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull peer-b outbox");
+    assert_eq!(peer_b.deliveries.len(), 1);
+    assert_eq!(peer_b.deliveries[0].conversation_ref, "peer-b");
+}
+
+#[tokio::test]
+async fn channel_outbox_terminal_failure_records_failed_status_and_audit() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "channel-outbox-terminal-failure-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    create_pending_pairing(
+        &kernel,
+        "local-cli",
+        "peer-terminal-failure",
+        "msg-outbox-terminal-failure-pairing",
+    )
+    .await;
+    approve_pairing(&kernel, "local-cli", "peer-terminal-failure").await;
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "local-cli",
+            "msg-outbox-terminal-failure",
+            "peer-terminal-failure",
+            "peer-terminal-failure",
+            None,
+            "hello terminal failure",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("approved inbound handled");
+    let queued_turn_id = queued.turn_id.expect("queued turn id");
+    wait_for_stream_events(
+        &kernel,
+        "local-cli",
+        "outbox-terminal-failure-stream",
+        |events| {
+            events.iter().any(|event| {
+                event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::Done
+            })
+        },
+    )
+    .await;
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "worker-terminal-failure".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(1),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull terminal failure outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    let report = kernel
+        .report_channel_outbox(ChannelOutboxReportRequest {
+            delivery_id: outbox.deliveries[0].delivery_id,
+            attempt_id: outbox.deliveries[0].attempt_id,
+            channel_id: "local-cli".to_string(),
+            worker_id: "worker-terminal-failure".to_string(),
+            outcome: ChannelOutboxReportOutcomeDto::TerminalFailed,
+            provider_receipt: None,
+            error_code: Some("provider.blocked".to_string()),
+            error_text: Some("recipient blocked delivery".to_string()),
+        })
+        .await
+        .expect("report terminal outbox failure");
+
+    assert!(report.accepted);
+    assert_eq!(report.status, ChannelOutboxDeliveryStatusDto::Failed);
+    let terminal_audit = kernel
+        .query_audit(
+            None,
+            Some("channel.outbox.terminal_failed".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query terminal failure audit");
+    let terminal_event = terminal_audit
+        .events
+        .iter()
+        .find(|event| event.details["delivery_id"] == outbox.deliveries[0].delivery_id.to_string())
+        .expect("terminal failure audit for delivery");
+    assert_eq!(
+        terminal_event.details["conversation_ref"],
+        "peer-terminal-failure"
+    );
+    assert_eq!(
+        terminal_event.details["turn_id"],
+        queued_turn_id.to_string()
+    );
+    assert_eq!(terminal_event.details["error_code"], "provider.blocked");
+    assert_eq!(
+        terminal_event.details["error_text"],
+        "recipient blocked delivery"
+    );
 }
 
 #[tokio::test]
@@ -641,16 +1155,26 @@ async fn channels_v2_pending_pairing_hashes_code_and_rejects_runtime_id() {
     );
     let queued_turn_id = queued.turn_id.expect("queued turn id");
 
-    let channel_message_columns = sqlx::query("PRAGMA table_info(channel_messages)")
+    let legacy_message_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'channel_messages'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query legacy channel message table count");
+    assert_eq!(
+        legacy_message_tables, 0,
+        "legacy channel_messages table must not remain in the final schema"
+    );
+    let outbox_columns = sqlx::query("PRAGMA table_info(channel_outbox_messages)")
         .fetch_all(&pool)
         .await
-        .expect("query channel message columns")
+        .expect("query channel outbox columns")
         .into_iter()
         .map(|row| row.get::<String, _>("name"))
         .collect::<Vec<_>>();
     assert!(
-        !channel_message_columns.iter().any(|name| name == "content"),
-        "channel message records must not store message content"
+        outbox_columns.iter().any(|name| name == "content_json"),
+        "durable channel outbound content must live in the outbox"
     );
     let inbound_event_columns = sqlx::query("PRAGMA table_info(channel_inbound_events)")
         .fetch_all(&pool)
@@ -1763,6 +2287,20 @@ async fn channels_v2_migration_uses_legacy_message_id_for_event_identity() {
     .await
     .expect("query migrated channel turns");
     assert_eq!(turn_event_ids, event_ids);
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/202605140005_channel_outbox.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("run channel outbox migration");
+    let legacy_message_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'channel_messages'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query legacy channel message table count");
+    assert_eq!(legacy_message_tables, 0);
 }
 
 #[tokio::test]

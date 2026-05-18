@@ -420,6 +420,24 @@ impl ChannelStateStore {
         row.map(map_inbound_event_row).transpose()
     }
 
+    pub async fn get_inbound_event(
+        &self,
+        channel_id: &str,
+        event_id: &str,
+    ) -> Result<Option<ChannelInboundEventRecord>> {
+        let row = sqlx::query(
+            "SELECT event_id, channel_id, sender_ref, conversation_ref, thread_ref, message_ref, text, trigger, attachments_json, reply_to_ref, provider_metadata_json, received_at_ms, created_at_ms \
+             FROM channel_inbound_events WHERE channel_id = ?1 AND event_id = ?2",
+        )
+        .bind(channel_id)
+        .bind(event_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query channel inbound event")?;
+
+        row.map(map_inbound_event_row).transpose()
+    }
+
     pub(crate) async fn find_blocking_grant_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
@@ -1259,26 +1277,6 @@ impl ChannelStateStore {
         Ok(())
     }
 
-    pub async fn insert_outbound_message(&self, channel_id: &str, peer_id: &str) -> Result<Uuid> {
-        let message_id = Uuid::new_v4();
-        let now = now_ms();
-
-        sqlx::query(
-            "INSERT INTO channel_messages \
-             (message_id, channel_id, peer_id, direction, external_message_id, update_id, created_at_ms) \
-             VALUES (?1, ?2, ?3, 'outbound', NULL, NULL, ?4)",
-        )
-        .bind(message_id.to_string())
-        .bind(channel_id)
-        .bind(peer_id)
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .context("failed to queue outbound channel message")?;
-
-        Ok(message_id)
-    }
-
     pub async fn append_stream_event(
         &self,
         insert: ChannelStreamEventInsert<'_>,
@@ -1827,8 +1825,8 @@ impl ChannelStateStore {
 
         let latest_outbound_row = sqlx::query(
             "SELECT MAX(created_at_ms) AS latest_outbound_at_ms \
-             FROM channel_messages \
-             WHERE channel_id = ?1 AND direction = 'outbound'",
+             FROM channel_outbox_messages \
+             WHERE channel_id = ?1",
         )
         .bind(channel_id)
         .fetch_one(&self.pool)
