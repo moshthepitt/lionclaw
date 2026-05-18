@@ -399,9 +399,7 @@ class TelegramWorker:
             if deadline > now
         ]
         expired_keys = [
-            key
-            for key, deadline in self._typing_deadlines.items()
-            if deadline <= now
+            key for key, deadline in self._typing_deadlines.items() if deadline <= now
         ]
         for key in expired_keys:
             self._typing_targets.pop(key, None)
@@ -425,7 +423,9 @@ class TelegramWorker:
         target = self._target_for_ref(peer_id)
         self._extend_target_typing(target, ttl_seconds=ttl_seconds)
 
-    def _extend_target_typing(self, target: TypingTarget, *, ttl_seconds: float) -> None:
+    def _extend_target_typing(
+        self, target: TypingTarget, *, ttl_seconds: float
+    ) -> None:
         if not target.conversation_ref:
             return
         self._typing_targets[target.key] = target
@@ -471,7 +471,9 @@ class TelegramWorker:
     ) -> TypingTarget:
         if thread_ref is not None:
             return TypingTarget(conversation_ref, thread_ref)
-        return self._typing_routes.get(conversation_ref) or TypingTarget(conversation_ref)
+        return self._typing_routes.get(conversation_ref) or TypingTarget(
+            conversation_ref
+        )
 
     async def _process_outbox_delivery(self, delivery: OutboxDelivery) -> None:
         try:

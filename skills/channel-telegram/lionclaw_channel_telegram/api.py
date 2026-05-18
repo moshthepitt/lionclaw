@@ -266,7 +266,9 @@ class LionClawApi:
         )
         _raise_for_status(response)
 
-    async def pull_outbox(self, limit: int = 10, lease_ms: int = 120_000) -> list[OutboxDelivery]:
+    async def pull_outbox(
+        self, limit: int = 10, lease_ms: int = 120_000
+    ) -> list[OutboxDelivery]:
         response = await self._client.post(
             "/v0/channels/outbox/pull",
             json={
@@ -284,11 +286,15 @@ class LionClawApi:
         parsed: list[OutboxDelivery] = []
         for item in deliveries:
             content = item.get("content")
-            if not isinstance(content, dict) or not isinstance(content.get("text"), str):
+            if not isinstance(content, dict) or not isinstance(
+                content.get("text"), str
+            ):
                 raise RuntimeError("outbox delivery missing content.text")
             attachments = content.get("attachments", [])
             if not isinstance(attachments, list):
-                raise RuntimeError("outbox delivery content.attachments must be an array")
+                raise RuntimeError(
+                    "outbox delivery content.attachments must be an array"
+                )
             parsed.append(
                 OutboxDelivery(
                     delivery_id=item["delivery_id"],
