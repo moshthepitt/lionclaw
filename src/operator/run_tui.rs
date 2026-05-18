@@ -231,6 +231,8 @@ struct ActivitySummary {
     started_at: Option<Instant>,
     ended_at: Option<Instant>,
     items: Vec<ActivityItem>,
+    open_progress_item: Option<usize>,
+    open_progress_text: String,
 }
 
 impl ActivitySummary {
@@ -243,6 +245,8 @@ impl ActivitySummary {
             started_at: None,
             ended_at: None,
             items: Vec::new(),
+            open_progress_item: None,
+            open_progress_text: String::new(),
         }
     }
 
@@ -254,6 +258,8 @@ impl ActivitySummary {
         self.started_at = Some(Instant::now());
         self.ended_at = None;
         self.items.clear();
+        self.open_progress_item = None;
+        self.open_progress_text.clear();
     }
 
     fn complete(&mut self) {
@@ -284,18 +290,18 @@ impl ActivitySummary {
 
     fn record_stream_event(&mut self, event: &StreamEventDto) {
         if event.kind == StreamEventKindDto::MessageBoundary {
+            if event.lane == Some(StreamLaneDto::Reasoning) {
+                self.close_progress_item();
+            }
             return;
         }
         self.event_count = self.event_count.saturating_add(1);
         match (&event.kind, &event.lane, event.text.as_deref()) {
             (StreamEventKindDto::MessageDelta, Some(StreamLaneDto::Reasoning), Some(text)) => {
-                self.progress_count = self.progress_count.saturating_add(1);
-                self.push_item(
-                    ActivityItemKind::Progress,
-                    summarize_activity_text("progress", text),
-                );
+                self.record_progress_delta(text);
             }
             (StreamEventKindDto::Status, _, Some(text)) => {
+                self.close_progress_item();
                 let kind = classify_activity_status(text);
                 if kind == ActivityItemKind::Command {
                     self.command_count = self.command_count.saturating_add(1);
@@ -306,25 +312,67 @@ impl ActivitySummary {
                 self.push_item(kind, normalize_activity_text(text));
             }
             (StreamEventKindDto::Error, _, Some(text)) => {
+                self.close_progress_item();
                 self.fail();
                 self.push_item(ActivityItemKind::Error, normalize_activity_text(text));
             }
             (StreamEventKindDto::TurnCompleted | StreamEventKindDto::Done, _, _) => {
+                self.close_progress_item();
                 self.complete();
             }
             _ => {}
         }
     }
 
-    fn push_item(&mut self, kind: ActivityItemKind, text: String) {
-        if text.trim().is_empty() {
+    fn record_progress_delta(&mut self, delta: &str) {
+        if delta.trim().is_empty() {
             return;
+        }
+        if self.open_progress_item.is_none() {
+            self.progress_count = self.progress_count.saturating_add(1);
+            self.open_progress_text.clear();
+            self.open_progress_item = self.push_item(
+                ActivityItemKind::Progress,
+                summarize_activity_text("progress", ""),
+            );
+        }
+        append_progress_delta_text(&mut self.open_progress_text, delta);
+        self.refresh_open_progress_item();
+    }
+
+    fn refresh_open_progress_item(&mut self) {
+        let Some(index) = self.open_progress_item else {
+            return;
+        };
+        let Some(item) = self.items.get_mut(index) else {
+            self.close_progress_item();
+            return;
+        };
+        if item.kind != ActivityItemKind::Progress {
+            self.close_progress_item();
+            return;
+        }
+        item.text = summarize_activity_text("progress", &self.open_progress_text);
+    }
+
+    fn close_progress_item(&mut self) {
+        self.open_progress_item = None;
+        self.open_progress_text.clear();
+    }
+
+    fn push_item(&mut self, kind: ActivityItemKind, text: String) -> Option<usize> {
+        if text.trim().is_empty() {
+            return None;
         }
         self.items.push(ActivityItem { kind, text });
         let overflow = self.items.len().saturating_sub(ACTIVITY_ITEM_LIMIT);
         if overflow > 0 {
             self.items.drain(0..overflow);
+            self.open_progress_item = self
+                .open_progress_item
+                .and_then(|index| index.checked_sub(overflow));
         }
+        Some(self.items.len() - 1)
     }
 }
 
@@ -2625,6 +2673,23 @@ fn summarize_activity_text(prefix: &str, text: &str) -> String {
     format!("{prefix}: {}", truncate_to(&normalized, 80))
 }
 
+fn append_progress_delta_text(existing: &mut String, delta: &str) {
+    if needs_progress_word_separator(existing, delta) {
+        existing.push(' ');
+    }
+    append_streamed_text_delta(existing, delta);
+}
+
+fn needs_progress_word_separator(existing: &str, delta: &str) -> bool {
+    let Some(previous) = existing.chars().last() else {
+        return false;
+    };
+    let Some(next) = delta.chars().next() else {
+        return false;
+    };
+    previous.is_alphanumeric() && next.is_alphanumeric()
+}
+
 fn format_elapsed(duration: Duration) -> String {
     let seconds = duration.as_secs();
     format!("{:02}:{:02}", seconds / 60, seconds % 60)
@@ -2878,6 +2943,49 @@ mod tests {
             .items
             .iter()
             .any(|item| item.text == "opencode searched: README.md"));
+    }
+
+    #[test]
+    fn reasoning_deltas_coalesce_into_one_activity_progress_item() {
+        let mut activity = ActivitySummary::new();
+        activity.start();
+
+        for text in ["those", "next", "for", "the", "project"] {
+            activity.record_stream_event(&StreamEventDto {
+                kind: StreamEventKindDto::MessageDelta,
+                lane: Some(StreamLaneDto::Reasoning),
+                code: None,
+                text: Some(text.to_string()),
+            });
+        }
+
+        assert_eq!(activity.event_count, 5);
+        assert_eq!(activity.progress_count, 1);
+        assert_eq!(activity.items.len(), 1);
+        assert_eq!(
+            activity.items[0],
+            ActivityItem {
+                kind: ActivityItemKind::Progress,
+                text: "progress: those next for the project".to_string(),
+            }
+        );
+
+        activity.record_stream_event(&StreamEventDto {
+            kind: StreamEventKindDto::MessageBoundary,
+            lane: Some(StreamLaneDto::Reasoning),
+            code: None,
+            text: None,
+        });
+        activity.record_stream_event(&StreamEventDto {
+            kind: StreamEventKindDto::MessageDelta,
+            lane: Some(StreamLaneDto::Reasoning),
+            code: None,
+            text: Some("then report".to_string()),
+        });
+
+        assert_eq!(activity.progress_count, 2);
+        assert_eq!(activity.items.len(), 2);
+        assert_eq!(activity.items[1].text, "progress: then report");
     }
 
     #[test]
