@@ -328,9 +328,7 @@ async fn channel_send_capability_uses_session_channel_defaults() {
         details["output_summary"]["conversation_ref"].as_str(),
         Some(peer_id)
     );
-    assert!(details["output_summary"]["message_ids"]
-        .as_array()
-        .is_some_and(|entries| !entries.is_empty()));
+    assert!(details["output_summary"]["delivery_id"].as_str().is_some());
 }
 
 struct SingleCapabilityRuntimeAdapter {
