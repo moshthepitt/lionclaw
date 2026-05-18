@@ -259,6 +259,14 @@ impl RuntimeMessageLane {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeArtifact {
+    pub artifact_id: String,
+    pub path: PathBuf,
+    pub filename: Option<String>,
+    pub mime_type: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum RuntimeEvent {
     MessageDelta {
@@ -268,6 +276,9 @@ pub enum RuntimeEvent {
     Status {
         code: Option<String>,
         text: String,
+    },
+    Artifact {
+        artifact: RuntimeArtifact,
     },
     Done,
     Error {

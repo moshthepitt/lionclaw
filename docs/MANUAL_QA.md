@@ -186,9 +186,31 @@ printf 'TELEGRAM_BOT_TOKEN=...\n' > telegram.env
 
 Expected when credentials are available:
 
+- the default runtime image can run common assistant probes such as
+  `codex --version`, `opencode --version`, `python3 --version`,
+  `ffprobe -version`, `file --version`, `jq --version`, and `pdftotext -v`
 - the token is stored in selected-instance private channel env
 - `doctor` does not print the token
-- Telegram delivery works through the configured runtime after scoped grant approval
+- a DM pairing link shaped like `https://t.me/<bot_username>?start=lc_<token>`
+  claims through the kernel and does not start an agent turn
+- a group invite shaped like
+  `https://t.me/<bot_username>?startgroup=lc_<token>` claims where Telegram
+  exposes the payload to the bot
+- unknown targeted Telegram senders receive a pending approval hint and no
+  provider files are downloaded before approval
+- Telegram delivery works through the configured runtime after scoped grant
+  approval
+- a forum topic with a thread grant keeps replies in the same Telegram topic
+- a conversation grant used inside a topic follows the channel scoped-grant
+  behavior from Channels v2
+- a photo, document, voice, or video attachment reaches the runtime under
+  `/attachments/...`
+- a runtime-generated image is returned to Telegram as a native media
+  attachment, even when the runtime final text is empty
+- Markdown in runtime answers renders as Telegram formatting, and local
+  workspace links are shown as labels rather than broken Telegram links
+- a retryable Telegram delivery failure survives worker restart and is retried
+  through the outbox lease/report flow
 
 If credentials are not available, record this subphase as skipped with
 `missing Telegram bot token`.

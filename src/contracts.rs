@@ -1207,7 +1207,7 @@ pub struct ChannelOutboxAttachmentDto {
 }
 
 fn default_channel_outbox_format_hint() -> String {
-    "markdown".to_string()
+    "plain".to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1300,4 +1300,17 @@ pub struct ChannelOutboxReportResponse {
     pub attempt_status: ChannelOutboxAttemptStatusDto,
     #[serde(default)]
     pub next_attempt_at: Option<DateTime<Utc>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChannelOutboxContentDto;
+
+    #[test]
+    fn channel_outbox_content_defaults_to_plain_text() {
+        let content: ChannelOutboxContentDto =
+            serde_json::from_str(r#"{"text":"hello"}"#).expect("decode outbox content");
+
+        assert_eq!(content.format_hint, "plain");
+    }
 }
