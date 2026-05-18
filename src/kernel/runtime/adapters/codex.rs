@@ -1575,10 +1575,198 @@ fn error_notification_will_retry(params: &Value) -> bool {
 }
 
 fn describe_app_server_item(params: &Value) -> Option<String> {
+    let item = app_server_item(params);
     match app_server_item_type(params)? {
+        "agentMessage" | "reasoning" | "userMessage" | "plan" => None,
+        "commandExecution" => describe_command_execution_item(item),
+        "fileChange" => describe_file_change_item(item),
+        "webSearch" => describe_web_search_item(item),
+        "imageView" => describe_image_view_item(item),
+        "collabToolCall" => describe_collab_tool_call_item(item),
         "enteredReviewMode" => Some("codex review started".to_string()),
         "exitedReviewMode" => Some("codex review completed".to_string()),
-        other => Some(format!("codex item: {other}")),
+        other => Some(format!("codex activity: {other}")),
+    }
+}
+
+fn app_server_item(params: &Value) -> &Value {
+    params.get("item").unwrap_or(params)
+}
+
+fn describe_command_execution_item(item: &Value) -> Option<String> {
+    let command = command_execution_display(item)?;
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    let verb = command_execution_verb(status, &command);
+    let mut text = format!("codex {verb}: {command}");
+    if let Some(cwd) = item.get("cwd").and_then(Value::as_str) {
+        if !cwd.trim().is_empty() {
+            text.push_str(&format!("  cwd {}", compact_path(cwd)));
+        }
+    }
+    if let Some(exit_code) = item.get("exitCode").and_then(Value::as_i64) {
+        text.push_str(&format!("  exit {exit_code}"));
+    }
+    if let Some(duration_ms) = item.get("durationMs").and_then(Value::as_u64) {
+        text.push_str(&format!("  {}", format_millis(duration_ms)));
+    }
+    Some(text)
+}
+
+fn command_execution_verb(status: &str, command: &str) -> &'static str {
+    match status {
+        "inProgress" => "running",
+        "failed" => "failed",
+        "declined" => "declined",
+        "completed" => {
+            let first = command.split_whitespace().next().unwrap_or("");
+            match first.trim_matches('"') {
+                "rg" | "grep" => "searched",
+                "cat" | "sed" | "head" | "tail" | "nl" => "read",
+                "ls" | "find" | "git" => "inspected",
+                _ => "ran",
+            }
+        }
+        _ => "command",
+    }
+}
+
+fn command_execution_display(item: &Value) -> Option<String> {
+    item.get("command")
+        .and_then(command_value_display)
+        .or_else(|| command_actions_display(item.get("commandActions")?))
+}
+
+fn command_value_display(value: &Value) -> Option<String> {
+    match value {
+        Value::String(command) => non_empty(command),
+        Value::Array(parts) => {
+            let parts = parts
+                .iter()
+                .filter_map(Value::as_str)
+                .map(shell_word_display)
+                .collect::<Vec<_>>();
+            (!parts.is_empty()).then(|| parts.join(" "))
+        }
+        _ => None,
+    }
+}
+
+fn command_actions_display(value: &Value) -> Option<String> {
+    let actions = value.as_array()?;
+    let mut rendered = Vec::new();
+    for action in actions {
+        if let Some(command) = action
+            .get("command")
+            .or_else(|| action.get("cmd"))
+            .and_then(command_value_display)
+        {
+            rendered.push(command);
+        } else if let Some(action_type) = action.get("type").and_then(Value::as_str) {
+            rendered.push(action_type.to_string());
+        }
+    }
+    (!rendered.is_empty()).then(|| rendered.join(" && "))
+}
+
+fn describe_file_change_item(item: &Value) -> Option<String> {
+    let changes = item.get("changes").and_then(Value::as_array)?;
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    let verb = match status {
+        "inProgress" => "editing",
+        "completed" => "edited",
+        "failed" => "edit failed",
+        "declined" => "edit declined",
+        _ => "file change",
+    };
+    let paths = changes
+        .iter()
+        .filter_map(|change| change.get("path").and_then(Value::as_str))
+        .filter(|path| !path.trim().is_empty())
+        .map(compact_path)
+        .take(3)
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        Some(format!("codex {verb}: {} files", changes.len()))
+    } else {
+        let suffix = if changes.len() > paths.len() {
+            format!(" +{}", changes.len() - paths.len())
+        } else {
+            String::new()
+        };
+        Some(format!("codex {verb}: {}{}", paths.join(", "), suffix))
+    }
+}
+
+fn describe_web_search_item(item: &Value) -> Option<String> {
+    let query = item
+        .get("query")
+        .and_then(Value::as_str)
+        .or_else(|| item.pointer("/action/query").and_then(Value::as_str))
+        .or_else(|| item.pointer("/action/url").and_then(Value::as_str))
+        .or_else(|| item.pointer("/action/refId").and_then(Value::as_str))?;
+    let action = item
+        .pointer("/action/type")
+        .and_then(Value::as_str)
+        .unwrap_or("search");
+    let verb = match action {
+        "open_page" => "opened",
+        "find_in_page" => "found",
+        _ => "searched",
+    };
+    Some(format!("codex {verb}: {}", query.trim()))
+}
+
+fn describe_image_view_item(item: &Value) -> Option<String> {
+    item.get("path")
+        .and_then(Value::as_str)
+        .map(|path| format!("codex viewed: {}", compact_path(path)))
+}
+
+fn describe_collab_tool_call_item(item: &Value) -> Option<String> {
+    let tool = item.get("tool").and_then(Value::as_str)?;
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    Some(format!("codex {status}: {tool}"))
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn shell_word_display(value: &str) -> String {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '\'' | '"' | '\\' | '$' | '`'))
+    {
+        format!("{value:?}")
+    } else {
+        value.to_string()
+    }
+}
+
+fn compact_path(path: &str) -> String {
+    let path = path.trim();
+    path.strip_prefix("/workspace/")
+        .or_else(|| path.strip_prefix("./"))
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn format_millis(duration_ms: u64) -> String {
+    if duration_ms < 1_000 {
+        format!("{duration_ms}ms")
+    } else {
+        format!("{:.1}s", duration_ms as f64 / 1_000.0)
     }
 }
 
@@ -1993,6 +2181,61 @@ mod tests {
         assert_eq!(
             super::app_server_error_text(&json!({"message": "  failed \n"})),
             "failed"
+        );
+    }
+
+    #[test]
+    fn app_server_item_descriptions_render_operator_activity() {
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {
+                    "type": "commandExecution",
+                    "command": ["cargo", "test"],
+                    "cwd": "/workspace/lionclaw",
+                    "status": "completed",
+                    "exitCode": 0,
+                    "durationMs": 1234,
+                }
+            })),
+            Some("codex ran: cargo test  cwd lionclaw  exit 0  1.2s".to_string())
+        );
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {
+                    "type": "commandExecution",
+                    "command": ["rg", "operator console"],
+                    "status": "completed",
+                }
+            })),
+            Some("codex searched: rg \"operator console\"".to_string())
+        );
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {
+                    "type": "fileChange",
+                    "status": "completed",
+                    "changes": [
+                        {"path": "src/operator/run_tui.rs", "kind": "update"},
+                        {"path": "Cargo.toml", "kind": "update"}
+                    ],
+                }
+            })),
+            Some("codex edited: src/operator/run_tui.rs, Cargo.toml".to_string())
+        );
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {
+                    "type": "webSearch",
+                    "action": {"type": "search", "query": "ratatui scrollbar"}
+                }
+            })),
+            Some("codex searched: ratatui scrollbar".to_string())
+        );
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {"type": "agentMessage", "text": "hello"}
+            })),
+            None
         );
     }
 

@@ -15,7 +15,9 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+    },
     Frame, Terminal,
 };
 use tokio::{
@@ -59,6 +61,29 @@ const PANEL_READY: Color = Color::Rgb(91, 255, 112);
 const PANEL_WARN: Color = Color::Rgb(255, 198, 55);
 const PANEL_ERROR: Color = Color::Rgb(255, 82, 82);
 const ACTIVITY_ITEM_LIMIT: usize = 12;
+const DEFAULT_TRANSCRIPT_PAGE_SCROLL: usize = 8;
+const ACTIVITY_ERROR_MARKERS: &[&str] = &["error", "failed", "denied"];
+const ACTIVITY_DONE_MARKERS: &[&str] = &[
+    "completed",
+    "started",
+    "mounted",
+    "granted",
+    "compacted",
+    " edited:",
+];
+const ACTIVITY_COMMAND_MARKERS: &[&str] = &[
+    "command",
+    "exec",
+    " running:",
+    " ran:",
+    " searched:",
+    " read:",
+    " inspected:",
+    " opened:",
+    " found:",
+];
+const ACTIVITY_PROGRESS_MARKERS: &[&str] =
+    &["progress", "checking", "reading", "research", " editing:"];
 
 pub(crate) struct RunConsoleInvocation<'a> {
     pub(crate) target: &'a TargetContext,
@@ -407,7 +432,9 @@ pub(crate) struct ConsoleApp {
     overlay: Option<Overlay>,
     composer: String,
     transcript: Vec<TranscriptLine>,
-    transcript_scroll: u16,
+    transcript_scroll: usize,
+    transcript_scroll_limit: usize,
+    transcript_page_size: usize,
     activity: ActivitySummary,
     inspector_mode: InspectorMode,
     status: String,
@@ -450,6 +477,8 @@ impl ConsoleApp {
             composer: String::new(),
             transcript: Vec::new(),
             transcript_scroll: 0,
+            transcript_scroll_limit: 0,
+            transcript_page_size: DEFAULT_TRANSCRIPT_PAGE_SCROLL,
             activity: ActivitySummary::new(),
             inspector_mode: InspectorMode::Instance,
             status: "idle".to_string(),
@@ -468,6 +497,27 @@ impl ConsoleApp {
 
     fn active(&self) -> bool {
         self.active_turn.is_some()
+    }
+
+    fn scroll_transcript_up(&mut self, amount: usize) {
+        self.transcript_scroll = self.transcript_scroll.saturating_sub(amount);
+    }
+
+    fn scroll_transcript_down(&mut self, amount: usize) {
+        self.transcript_scroll = self
+            .transcript_scroll
+            .saturating_add(amount)
+            .min(self.transcript_scroll_limit);
+    }
+
+    fn set_transcript_scroll_limit(&mut self, limit: usize) {
+        self.transcript_scroll_limit = limit;
+        self.transcript_scroll = self.transcript_scroll.min(limit);
+    }
+
+    fn set_transcript_viewport(&mut self, line_count: usize, viewport_height: u16) {
+        self.transcript_page_size = usize::from(viewport_height.max(1));
+        self.set_transcript_scroll_limit(transcript_scroll_limit(line_count, viewport_height));
     }
 
     fn selected_name(&self) -> &str {
@@ -557,6 +607,8 @@ impl ConsoleApp {
         self.composer.clear();
         self.transcript.clear();
         self.transcript_scroll = 0;
+        self.transcript_scroll_limit = 0;
+        self.transcript_page_size = DEFAULT_TRANSCRIPT_PAGE_SCROLL;
         self.activity = ActivitySummary::new();
         self.inspector_mode = InspectorMode::Instance;
         self.load_selected_history().await;
@@ -1160,11 +1212,35 @@ fn append_transcript_delta(
 ) {
     if let Some(last) = transcript.last_mut() {
         if last.kind == kind {
-            last.text.push_str(text);
+            append_delta_text(&mut last.text, text);
             return;
         }
     }
     transcript.push(TranscriptLine::new(kind, text));
+}
+
+fn append_delta_text(existing: &mut String, delta: &str) {
+    if needs_delta_separator(existing, delta) {
+        existing.push(' ');
+    }
+    existing.push_str(delta);
+}
+
+fn needs_delta_separator(existing: &str, delta: &str) -> bool {
+    let Some(previous) = existing.chars().last() else {
+        return false;
+    };
+    let Some(next) = delta.chars().next() else {
+        return false;
+    };
+    matches!(previous, '.' | '!' | '?' | ':' | ';' | ',')
+        && !previous.is_whitespace()
+        && !next.is_whitespace()
+        && starts_sentence_like(next)
+}
+
+fn starts_sentence_like(ch: char) -> bool {
+    ch.is_uppercase() || matches!(ch, '"' | '\'' | '`' | '(' | '[' | '{')
 }
 
 pub(crate) async fn run_console(invocation: RunConsoleInvocation<'_>) -> Result<RunConsoleOutcome> {
@@ -1194,6 +1270,8 @@ pub(crate) async fn run_launch_blocker(blocker: LaunchBlocker) -> Result<()> {
         composer: String::new(),
         transcript: Vec::new(),
         transcript_scroll: 0,
+        transcript_scroll_limit: 0,
+        transcript_page_size: DEFAULT_TRANSCRIPT_PAGE_SCROLL,
         activity: ActivitySummary::new(),
         inspector_mode: InspectorMode::Instance,
         status: "launch blocked".to_string(),
@@ -1230,6 +1308,8 @@ pub(crate) async fn run_project_launch_blocker(
         composer: String::new(),
         transcript: Vec::new(),
         transcript_scroll: 0,
+        transcript_scroll_limit: 0,
+        transcript_page_size: DEFAULT_TRANSCRIPT_PAGE_SCROLL,
         activity: ActivitySummary::new(),
         inspector_mode: InspectorMode::Instance,
         status: "no instances configured".to_string(),
@@ -1366,11 +1446,17 @@ async fn handle_key(
             let next = app.selected_index.saturating_add(1);
             app.switch_selected(next).await;
         }
-        (KeyCode::Up, _) | (KeyCode::PageUp, _) if app.focus == Focus::Transcript => {
-            app.transcript_scroll = app.transcript_scroll.saturating_sub(1);
+        (KeyCode::Up, _) if app.focus == Focus::Transcript => {
+            app.scroll_transcript_up(1);
         }
-        (KeyCode::Down, _) | (KeyCode::PageDown, _) if app.focus == Focus::Transcript => {
-            app.transcript_scroll = app.transcript_scroll.saturating_add(1);
+        (KeyCode::PageUp, _) if app.focus == Focus::Transcript => {
+            app.scroll_transcript_up(app.transcript_page_size);
+        }
+        (KeyCode::Down, _) if app.focus == Focus::Transcript => {
+            app.scroll_transcript_down(1);
+        }
+        (KeyCode::PageDown, _) if app.focus == Focus::Transcript => {
+            app.scroll_transcript_down(app.transcript_page_size);
         }
         (KeyCode::Backspace, _) => {
             app.composer.pop();
@@ -1395,7 +1481,7 @@ fn handle_overlay_key(app: &mut ConsoleApp, key: KeyEvent) {
     }
 }
 
-pub(crate) fn render_app(frame: &mut Frame<'_>, app: &ConsoleApp) {
+pub(crate) fn render_app(frame: &mut Frame<'_>, app: &mut ConsoleApp) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1475,7 +1561,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
     );
 }
 
-fn render_body(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
+fn render_body(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
     if app.project_mode() {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -1592,7 +1678,7 @@ fn render_instances(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
     }
 }
 
-fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
+fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
     let content = render_panel_shell(frame, area, "Transcript", app.focus == Focus::Transcript);
     if let SelectedInstanceState::Blocked { blocker, .. } = &app.selected {
         let text = Text::from(vec![
@@ -1627,12 +1713,25 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
         width: content.width.saturating_sub(1),
         height: content.height.saturating_sub(activity_rows),
     };
+    if transcript_area.width == 0 || transcript_area.height == 0 {
+        app.set_transcript_viewport(0, transcript_area.height);
+        return;
+    }
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let rendered_line_count = paragraph.line_count(transcript_area.width);
+    app.set_transcript_viewport(rendered_line_count, transcript_area.height);
+    let scroll = app.transcript_scroll;
     frame.render_widget(
-        Paragraph::new(lines)
-            .scroll((app.transcript_scroll, 0))
-            .wrap(Wrap { trim: false }),
+        paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         transcript_area,
     );
+    let scrollbar_area = Rect {
+        x: content.x + content.width.saturating_sub(1),
+        y: transcript_area.y,
+        width: 1.min(content.width),
+        height: transcript_area.height,
+    };
+    render_transcript_scrollbar(frame, scrollbar_area, rendered_line_count, scroll);
     if activity_rows > 0 && content.height > activity_rows {
         let rule_y = content.y + content.height - activity_rows;
         draw_horizontal_rule(frame, content.x, rule_y, content.width, PANEL_MUTED);
@@ -1692,7 +1791,7 @@ pub(crate) fn transcript_render_lines(lines: &[TranscriptLine]) -> Vec<Line<'sta
                     .add_modifier(Modifier::BOLD),
             ),
             TranscriptLineKind::Answer => (
-                "assistant",
+                "lionclaw",
                 Style::default()
                     .fg(PANEL_BORDER)
                     .add_modifier(Modifier::BOLD),
@@ -1708,6 +1807,32 @@ pub(crate) fn transcript_render_lines(lines: &[TranscriptLine]) -> Vec<Line<'sta
         ));
     }
     rendered
+}
+
+fn transcript_scroll_limit(line_count: usize, viewport_height: u16) -> usize {
+    line_count
+        .saturating_sub(viewport_height as usize)
+        .min(u16::MAX as usize)
+}
+
+fn render_transcript_scrollbar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    line_count: usize,
+    scroll: usize,
+) {
+    if line_count <= area.height as usize || area.width == 0 || area.height == 0 {
+        return;
+    }
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(Some("^"))
+        .end_symbol(Some("v"))
+        .thumb_style(Style::default().fg(PANEL_BORDER))
+        .track_style(Style::default().fg(PANEL_MUTED));
+    let mut state = ScrollbarState::new(line_count)
+        .viewport_content_length(area.height as usize)
+        .position(scroll);
+    frame.render_stateful_widget(scrollbar, area, &mut state);
 }
 
 fn split_render_line(prefix: &str, style: Style, text: &str) -> Vec<Line<'static>> {
@@ -2175,23 +2300,21 @@ fn truncate_to(value: &str, width: usize) -> String {
 
 fn classify_activity_status(text: &str) -> ActivityItemKind {
     let lower = text.to_ascii_lowercase();
-    if lower.contains("error") || lower.contains("failed") || lower.contains("denied") {
+    if contains_any(&lower, ACTIVITY_ERROR_MARKERS) {
         ActivityItemKind::Error
-    } else if lower.contains("completed")
-        || lower.contains("started")
-        || lower.contains("mounted")
-        || lower.contains("granted")
-        || lower.contains("compacted")
-    {
+    } else if contains_any(&lower, ACTIVITY_DONE_MARKERS) {
         ActivityItemKind::Done
-    } else if lower.contains("command") || lower.contains("exec") {
+    } else if contains_any(&lower, ACTIVITY_COMMAND_MARKERS) {
         ActivityItemKind::Command
-    } else if lower.contains("progress") || lower.contains("checking") || lower.contains("reading")
-    {
+    } else if contains_any(&lower, ACTIVITY_PROGRESS_MARKERS) {
         ActivityItemKind::Progress
     } else {
         ActivityItemKind::Status
     }
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 fn normalize_activity_text(text: &str) -> String {
@@ -2322,7 +2445,7 @@ mod tests {
                 kind: StreamEventKindDto::Status,
                 lane: None,
                 code: None,
-                text: Some("codex item: commandExecution".to_string()),
+                text: Some("codex ran: cargo test".to_string()),
             },
         );
         push_stream_event(
@@ -2349,7 +2472,54 @@ mod tests {
         assert!(activity
             .items
             .iter()
-            .any(|item| item.text == "codex commandExecution"));
+            .any(|item| item.text == "codex ran: cargo test"));
+    }
+
+    #[test]
+    fn answer_deltas_repair_missing_sentence_boundary_space() {
+        let mut transcript = vec![TranscriptLine::new(
+            TranscriptLineKind::Answer,
+            "decisions.",
+        )];
+
+        append_transcript_delta(&mut transcript, TranscriptLineKind::Answer, "The markdown");
+
+        assert_eq!(
+            transcript,
+            vec![TranscriptLine::new(
+                TranscriptLineKind::Answer,
+                "decisions. The markdown",
+            )]
+        );
+
+        append_transcript_delta(&mut transcript, TranscriptLineKind::Answer, "\nstd.");
+        append_transcript_delta(&mut transcript, TranscriptLineKind::Answer, "io::Result");
+        assert!(transcript[0].text.ends_with("\nstd.io::Result"));
+    }
+
+    #[test]
+    fn activity_classification_accepts_runtime_neutral_summaries() {
+        let mut activity = ActivitySummary::new();
+        activity.start();
+        for text in [
+            "opencode searched: README.md",
+            "claude running: cargo test",
+            "runtime progress: reading docs",
+        ] {
+            activity.record_stream_event(&StreamEventDto {
+                kind: StreamEventKindDto::Status,
+                lane: None,
+                code: None,
+                text: Some(text.to_string()),
+            });
+        }
+
+        assert_eq!(activity.command_count, 2);
+        assert_eq!(activity.progress_count, 1);
+        assert!(activity
+            .items
+            .iter()
+            .any(|item| item.text == "opencode searched: README.md"));
     }
 
     #[test]
@@ -2371,16 +2541,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            vec![
-                "you",
-                "/compact",
-                "",
-                "assistant",
-                "ok",
-                "",
-                "error",
-                "failed"
-            ]
+            vec!["you", "/compact", "", "lionclaw", "ok", "", "error", "failed"]
         );
     }
 
@@ -2411,7 +2572,7 @@ mod tests {
             shared_work_root_count: 0,
             default_runtime: None,
         };
-        let app = ConsoleApp {
+        let mut app = ConsoleApp {
             project_root: Some(PathBuf::from("/tmp/project")),
             instances: vec![summary.clone()],
             selected_index: 0,
@@ -2426,6 +2587,8 @@ mod tests {
             composer: String::new(),
             transcript: Vec::new(),
             transcript_scroll: 0,
+            transcript_scroll_limit: 0,
+            transcript_page_size: DEFAULT_TRANSCRIPT_PAGE_SCROLL,
             activity: ActivitySummary::new(),
             inspector_mode: InspectorMode::Instance,
             status: "launch blocked".to_string(),
@@ -2435,7 +2598,7 @@ mod tests {
             should_quit: false,
         };
 
-        let rendered = render_to_text(&app, 100, 30);
+        let rendered = render_to_text(&mut app, 100, 30);
         assert!(rendered.contains("Transcript"));
         assert!(rendered.contains("Launch blocked for main"));
         assert!(rendered.contains("missing runtime"));
@@ -2477,7 +2640,7 @@ mod tests {
             shared_work_root_count: 0,
             default_runtime: Some("mock".to_string()),
         };
-        let app = ConsoleApp {
+        let mut app = ConsoleApp {
             project_root: Some(PathBuf::from("/workspace/lionclaw")),
             instances: vec![main.clone(), reviewer, qa],
             selected_index: 0,
@@ -2509,6 +2672,8 @@ mod tests {
                 TranscriptLine::new(TranscriptLineKind::Answer, "Summary\nLooks good overall."),
             ],
             transcript_scroll: 0,
+            transcript_scroll_limit: 0,
+            transcript_page_size: DEFAULT_TRANSCRIPT_PAGE_SCROLL,
             activity: ActivitySummary::new(),
             inspector_mode: InspectorMode::Instance,
             status: "idle".to_string(),
@@ -2518,7 +2683,7 @@ mod tests {
             should_quit: false,
         };
 
-        let rendered = render_to_text(&app, 160, 50);
+        let rendered = render_to_text(&mut app, 160, 50);
         assert!(rendered.contains("LionClaw  |  lionclaw/main"));
         assert!(rendered.contains("codex"));
         assert!(rendered.contains("net:none"));
@@ -2532,6 +2697,26 @@ mod tests {
         assert!(rendered.contains("Ctrl+O"));
         assert!(rendered.contains("Ctrl+P"));
         assert_eq!(rendered.lines().count(), 50);
+    }
+
+    #[tokio::test]
+    async fn transcript_scroll_is_bounded_to_wrapped_content_and_renders_scrollbar() {
+        let body = (0..40)
+            .map(|index| format!("visible-line-{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app =
+            ready_test_app(vec![TranscriptLine::new(TranscriptLineKind::Answer, body)]).await;
+        app.focus = Focus::Transcript;
+        app.transcript_scroll = usize::MAX;
+
+        let rendered = render_to_text(&mut app, 100, 24);
+
+        assert!(app.transcript_scroll_limit > 0);
+        assert_eq!(app.transcript_scroll, app.transcript_scroll_limit);
+        assert!(rendered.contains("visible-line-39"));
+        assert!(rendered.contains("^"));
+        assert!(rendered.contains("v"));
     }
 
     #[tokio::test]
@@ -2690,7 +2875,7 @@ mod tests {
 
         assert_eq!(app.inspector_mode, InspectorMode::Activity);
         assert_eq!(app.focus, Focus::Inspectors);
-        let rendered = render_to_text(&app, 100, 30);
+        let rendered = render_to_text(&mut app, 100, 30);
         assert!(rendered.contains("Inspector  Activity"));
     }
 
@@ -2714,7 +2899,7 @@ mod tests {
 
         assert_eq!(app.focus, Focus::Transcript);
         assert_eq!(app.status, "focus: transcript");
-        let rendered = render_to_text(&app, 100, 30);
+        let rendered = render_to_text(&mut app, 100, 30);
         assert!(rendered.contains("▶ Transcript"));
     }
 
@@ -2752,6 +2937,8 @@ mod tests {
             composer: String::new(),
             transcript: Vec::new(),
             transcript_scroll: 0,
+            transcript_scroll_limit: 0,
+            transcript_page_size: DEFAULT_TRANSCRIPT_PAGE_SCROLL,
             activity: ActivitySummary::new(),
             inspector_mode: InspectorMode::Instance,
             status: "idle".to_string(),
@@ -2762,7 +2949,62 @@ mod tests {
         }
     }
 
-    fn render_to_text(app: &ConsoleApp, width: u16, height: u16) -> String {
+    async fn ready_test_app(transcript: Vec<TranscriptLine>) -> ConsoleApp {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions::default(),
+        )
+        .await
+        .expect("kernel");
+        let main = InstanceSummary {
+            name: Some("main".to_string()),
+            is_default: true,
+            home: temp_dir.path().join("instances/main"),
+            work_root: Some(temp_dir.path().join("repo")),
+            work_root_finding: None,
+            shared_work_root_count: 0,
+            default_runtime: Some("mock".to_string()),
+        };
+        ConsoleApp {
+            project_root: None,
+            instances: vec![main.clone()],
+            selected_index: 0,
+            selected: SelectedInstanceState::Ready(Box::new(ReadyInstance {
+                summary: main,
+                runtime_id: "mock".to_string(),
+                runtime_kind: "mock".to_string(),
+                runtime_override: None,
+                boundary: BoundarySummary {
+                    workspace: "rw".to_string(),
+                    network: "none".to_string(),
+                    secrets: "off".to_string(),
+                    timeout: "2h".to_string(),
+                    preset: "test".to_string(),
+                },
+                kernel,
+                session_id: Uuid::new_v4(),
+            })),
+            continue_last_session: false,
+            timeout_override: None,
+            focus: Focus::Composer,
+            overlay: None,
+            composer: String::new(),
+            transcript,
+            transcript_scroll: 0,
+            transcript_scroll_limit: 0,
+            transcript_page_size: DEFAULT_TRANSCRIPT_PAGE_SCROLL,
+            activity: ActivitySummary::new(),
+            inspector_mode: InspectorMode::Instance,
+            status: "idle".to_string(),
+            active_turn: None,
+            active_turn_cancel: None,
+            saw_ready_instance: true,
+            should_quit: false,
+        }
+    }
+
+    fn render_to_text(app: &mut ConsoleApp, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
