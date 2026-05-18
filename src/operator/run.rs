@@ -590,6 +590,7 @@ fn render_turn_event<W: Write>(event: &StreamEventDto, output: &mut W) -> Result
             writeln!(output, "[error] {text}")?;
         }
         (StreamEventKindDto::TurnCompleted, _, _)
+        | (StreamEventKindDto::MessageBoundary, _, _)
         | (StreamEventKindDto::Done, _, _)
         | (_, _, None) => {}
         (_, _, Some(text)) => {

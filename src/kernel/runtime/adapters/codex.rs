@@ -580,12 +580,13 @@ struct CodexAppServerClient<T> {
     failed_turns: HashMap<String, String>,
     unmatched_turn_failure: Option<String>,
     started_thread_turns: HashMap<String, String>,
+    agent_message_lanes: HashMap<String, RuntimeMessageLane>,
+    active_agent_message_item_id: Option<String>,
+    active_answer_item_ids: HashSet<String>,
+    last_answer_item_id: Option<String>,
     completed_context_compaction_threads: HashSet<String>,
     unmatched_context_compaction_completed: bool,
     emitted_artifact_ids: HashSet<String>,
-    answer_delta_item_id: Option<String>,
-    answer_stream_has_text: bool,
-    answer_stream_ends_with_newline: bool,
 }
 
 impl<T> CodexAppServerClient<T>
@@ -602,12 +603,13 @@ where
             failed_turns: HashMap::new(),
             unmatched_turn_failure: None,
             started_thread_turns: HashMap::new(),
+            agent_message_lanes: HashMap::new(),
+            active_agent_message_item_id: None,
+            active_answer_item_ids: HashSet::new(),
+            last_answer_item_id: None,
             completed_context_compaction_threads: HashSet::new(),
             unmatched_context_compaction_completed: false,
             emitted_artifact_ids: HashSet::new(),
-            answer_delta_item_id: None,
-            answer_stream_has_text: false,
-            answer_stream_ends_with_newline: false,
         }
     }
 
@@ -993,7 +995,7 @@ where
                 }));
             }
             "turn/started" => {
-                self.reset_answer_stream_state();
+                self.reset_turn_message_state();
                 if let (Some(thread_id), Some(turn_id)) = (
                     extract_app_server_thread_id(params),
                     extract_app_server_turn_id(params),
@@ -1006,7 +1008,7 @@ where
                 }));
             }
             "turn/completed" => {
-                self.reset_answer_stream_state();
+                self.reset_turn_message_state();
                 if let Some(message) = completed_turn_error_text(params) {
                     self.remember_turn_failure(params, message);
                 } else {
@@ -1027,18 +1029,11 @@ where
             }
             "item/agentMessage/delta" => {
                 if let Some(text) = app_server_text(params, &["delta", "text", "content"]) {
-                    let item_id = app_server_item_id(params);
-                    if self.should_separate_answer_item(item_id.as_deref(), &text) {
-                        drop(events.send(RuntimeEvent::MessageDelta {
-                            lane: RuntimeMessageLane::Answer,
-                            text: "\n\n".to_string(),
-                        }));
+                    let lane = self.agent_message_lane(params);
+                    if lane == RuntimeMessageLane::Answer {
+                        self.record_answer_delta_boundary(params, events);
                     }
-                    drop(events.send(RuntimeEvent::MessageDelta {
-                        lane: RuntimeMessageLane::Answer,
-                        text: text.clone(),
-                    }));
-                    self.remember_answer_delta(item_id, &text);
+                    drop(events.send(RuntimeEvent::MessageDelta { lane, text }));
                 }
             }
             "item/agentReasoning/delta" | "item/agentReasoningRawContent/delta" => {
@@ -1125,6 +1120,8 @@ where
     }
 
     fn record_app_server_item(&mut self, method: &str, params: &Value) -> Option<String> {
+        self.record_agent_message_item(method, params);
+        self.record_answer_item_completion(method, params);
         match (method, app_server_item_type(params)) {
             ("item/started", Some("contextCompaction")) => {
                 Some("codex context compaction started".to_string())
@@ -1142,33 +1139,85 @@ where
         }
     }
 
-    fn should_separate_answer_item(&self, item_id: Option<&str>, text: &str) -> bool {
-        if text.is_empty()
-            || !self.answer_stream_has_text
-            || self.answer_stream_ends_with_newline
-            || text.starts_with('\n')
-        {
-            return false;
-        }
-        match (self.answer_delta_item_id.as_deref(), item_id) {
-            (Some(previous), Some(current)) => previous != current,
-            _ => false,
-        }
+    fn record_answer_delta_boundary(&mut self, params: &Value, events: &RuntimeEventSender) {
+        let Some(item_id) = self.agent_message_item_id(params) else {
+            return;
+        };
+        self.begin_answer_item(item_id, events);
     }
 
-    fn remember_answer_delta(&mut self, item_id: Option<String>, text: &str) {
-        if text.is_empty() {
+    fn record_answer_item_completion(&mut self, method: &str, params: &Value) {
+        if method != "item/completed" || app_server_item_type(params) != Some("agentMessage") {
             return;
         }
-        self.answer_delta_item_id = item_id.or_else(|| self.answer_delta_item_id.take());
-        self.answer_stream_has_text = true;
-        self.answer_stream_ends_with_newline = text.ends_with('\n');
+        let Some(item_id) = extract_app_server_item_id(params) else {
+            return;
+        };
+        if self
+            .agent_message_lanes
+            .get(&item_id)
+            .copied()
+            .unwrap_or(RuntimeMessageLane::Answer)
+            == RuntimeMessageLane::Answer
+        {
+            self.active_answer_item_ids.remove(&item_id);
+        }
+        self.agent_message_lanes.remove(&item_id);
     }
 
-    fn reset_answer_stream_state(&mut self) {
-        self.answer_delta_item_id = None;
-        self.answer_stream_has_text = false;
-        self.answer_stream_ends_with_newline = false;
+    fn begin_answer_item(&mut self, item_id: String, events: &RuntimeEventSender) {
+        if self.active_answer_item_ids.insert(item_id.clone())
+            && self
+                .last_answer_item_id
+                .as_deref()
+                .is_some_and(|last_item_id| last_item_id != item_id)
+        {
+            drop(events.send(RuntimeEvent::MessageBoundary {
+                lane: RuntimeMessageLane::Answer,
+            }));
+        }
+        self.last_answer_item_id = Some(item_id);
+    }
+
+    fn reset_turn_message_state(&mut self) {
+        self.agent_message_lanes.clear();
+        self.active_agent_message_item_id = None;
+        self.active_answer_item_ids.clear();
+        self.last_answer_item_id = None;
+    }
+
+    fn record_agent_message_item(&mut self, method: &str, params: &Value) {
+        if app_server_item_type(params) != Some("agentMessage") {
+            return;
+        }
+        let Some(item_id) = extract_app_server_item_id(params) else {
+            return;
+        };
+        match method {
+            "item/started" | "item/updated" => {
+                self.active_agent_message_item_id = Some(item_id.clone());
+                if let Some(lane) = agent_message_phase_lane(params) {
+                    self.agent_message_lanes.insert(item_id, lane);
+                }
+            }
+            "item/completed"
+                if self.active_agent_message_item_id.as_deref() == Some(item_id.as_str()) =>
+            {
+                self.active_agent_message_item_id = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn agent_message_lane(&self, params: &Value) -> RuntimeMessageLane {
+        self.agent_message_item_id(params)
+            .and_then(|item_id| self.agent_message_lanes.get(&item_id).copied())
+            .or_else(|| agent_message_phase_lane(params))
+            .unwrap_or(RuntimeMessageLane::Answer)
+    }
+
+    fn agent_message_item_id(&self, params: &Value) -> Option<String> {
+        extract_app_server_item_id(params).or_else(|| self.active_agent_message_item_id.clone())
     }
 
     async fn respond_to_server_request(&mut self, message: &Value) -> Result<()> {
@@ -1390,20 +1439,20 @@ fn extract_app_server_turn_id(value: &Value) -> Option<String> {
         .map(|turn_id| turn_id.trim().to_string())
 }
 
+fn extract_app_server_item_id(value: &Value) -> Option<String> {
+    value
+        .pointer("/item/id")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("itemId").and_then(Value::as_str))
+        .or_else(|| value.get("item_id").and_then(Value::as_str))
+        .or_else(|| value.get("id").and_then(Value::as_str))
+        .filter(|item_id| !item_id.trim().is_empty())
+        .map(|item_id| item_id.trim().to_string())
+}
+
 fn app_server_item_type(params: &Value) -> Option<&str> {
     let item = params.get("item").unwrap_or(params);
     item.get("type").and_then(Value::as_str)
-}
-
-fn app_server_item_id(params: &Value) -> Option<String> {
-    params
-        .get("itemId")
-        .or_else(|| params.get("item_id"))
-        .or_else(|| params.pointer("/item/id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|item_id| !item_id.is_empty())
-        .map(str::to_string)
 }
 
 fn codex_generated_image_payload<'a>(
@@ -1515,6 +1564,21 @@ fn app_server_event_payload<'a>(
         return Some(("image_generation_end", message));
     }
     None
+}
+
+fn agent_message_phase_lane(params: &Value) -> Option<RuntimeMessageLane> {
+    let phase = app_server_item(params)
+        .get("phase")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("phase").and_then(Value::as_str))?;
+    match phase.trim().to_ascii_lowercase().as_str() {
+        "answer" | "final" | "final_answer" | "final-answer" | "message" => {
+            Some(RuntimeMessageLane::Answer)
+        }
+        "analysis" | "commentary" | "intermediate" | "plan" | "prelude" | "progress"
+        | "reasoning" | "thinking" => Some(RuntimeMessageLane::Reasoning),
+        _ => None,
+    }
 }
 
 fn app_server_text(value: &Value, keys: &[&str]) -> Option<String> {
@@ -2237,6 +2301,131 @@ mod tests {
             })),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn app_server_agent_message_phases_choose_transcript_lane() {
+        let (_adapter, _handle, thread_state) = start_codex_test_session(None).await;
+        let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(Vec::new()));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        for message in [
+            json!({"method": "turn/started", "params": {"threadId": "thr_1", "turnId": "turn_1"}}),
+            json!({
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "id": "msg_plan",
+                        "type": "agentMessage",
+                        "phase": "prelude"
+                    }
+                }
+            }),
+            json!({"method": "item/agentMessage/delta", "params": {"itemId": "msg_plan", "delta": "I'll inspect first."}}),
+            json!({
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "id": "msg_final",
+                        "type": "agentMessage",
+                        "phase": "final_answer"
+                    }
+                }
+            }),
+            json!({"method": "item/agentMessage/delta", "params": {"itemId": "msg_final", "delta": "Final answer."}}),
+        ] {
+            client
+                .handle_message(message, &event_tx, &thread_state)
+                .await
+                .expect("handle message");
+        }
+
+        let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Reasoning,
+                text
+            } if text == "I'll inspect first."
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text
+            } if text == "Final answer."
+        )));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::MessageBoundary { .. })));
+    }
+
+    #[tokio::test]
+    async fn app_server_agent_message_items_emit_answer_boundaries() {
+        let (_adapter, _handle, thread_state) = start_codex_test_session(None).await;
+        let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(Vec::new()));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        for message in [
+            json!({"method": "turn/started", "params": {"threadId": "thr_1", "turnId": "turn_1"}}),
+            json!({
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "id": "msg_intro",
+                        "type": "agentMessage",
+                        "phase": "final_answer"
+                    }
+                }
+            }),
+            json!({"method": "item/agentMessage/delta", "params": {"itemId": "msg_intro", "delta": "Intro."}}),
+            json!({"method": "item/completed", "params": {"item": {"id": "msg_intro", "type": "agentMessage"}}}),
+            json!({
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "id": "msg_body",
+                        "type": "agentMessage",
+                        "phase": "final_answer"
+                    }
+                }
+            }),
+            json!({"method": "item/agentMessage/delta", "params": {"itemId": "msg_body", "delta": "**Project**"}}),
+        ] {
+            client
+                .handle_message(message, &event_tx, &thread_state)
+                .await
+                .expect("handle message");
+        }
+
+        let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        let message_events = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::MessageDelta { .. } | RuntimeEvent::MessageBoundary { .. }
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            message_events.as_slice(),
+            [
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: intro
+                },
+                RuntimeEvent::MessageBoundary {
+                    lane: RuntimeMessageLane::Answer
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: body
+                }
+            ] if intro == "Intro." && body == "**Project**"
+        ));
     }
 
     #[test]

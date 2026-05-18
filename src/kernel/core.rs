@@ -106,15 +106,16 @@ use super::{
     },
     policy::{Capability, PolicyStore, Scope},
     runtime::{
-        project_runtime_skills, register_builtin_runtime_adapters,
-        resolve_oci_image_compatibility_identity, skill_mount_target, EffectiveExecutionPlan,
-        ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
-        ExecutionPreset, HiddenTurnSupport, MountAccess, MountSpec, NetworkMode, RuntimeAdapter,
-        RuntimeArtifact, RuntimeCapabilityRequest, RuntimeCapabilityResult,
-        RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
-        RuntimeEvent, RuntimeExecutionProfile, RuntimeMessageLane, RuntimeProgramTurnExecution,
-        RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput,
-        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
+        append_streamed_text_boundary, append_streamed_text_delta, project_runtime_skills,
+        register_builtin_runtime_adapters, resolve_oci_image_compatibility_identity,
+        skill_mount_target, EffectiveExecutionPlan, ExecutionPlanPurpose, ExecutionPlanRequest,
+        ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset, HiddenTurnSupport, MountAccess,
+        MountSpec, NetworkMode, RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest,
+        RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlInput,
+        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeExecutionProfile,
+        RuntimeMessageLane, RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount,
+        RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
+        RuntimeTurnResult,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -5461,6 +5462,46 @@ mod tests {
         skill_dir
     }
 
+    #[test]
+    fn assistant_text_preserves_runtime_message_boundaries() {
+        let events = vec![
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: "Intro.".to_string(),
+            },
+            RuntimeEvent::MessageBoundary {
+                lane: RuntimeMessageLane::Answer,
+            },
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: "**Project**".to_string(),
+            },
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: "\nDetails".to_string(),
+            },
+            RuntimeEvent::MessageBoundary {
+                lane: RuntimeMessageLane::Reasoning,
+            },
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Reasoning,
+                text: "hidden".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            assistant_text_from_events(&events),
+            "Intro.\n\n**Project**\nDetails"
+        );
+
+        let artifacts = summarize_runtime_events(&events);
+        assert_eq!(artifacts.assistant_text, "Intro.\n\n**Project**\nDetails");
+        assert!(artifacts.event_views.iter().any(|event| {
+            event.kind == StreamEventKindDto::MessageBoundary
+                && event.lane == Some(StreamLaneDto::Answer)
+        }));
+    }
+
     #[tokio::test]
     async fn runtime_skill_mounts_use_materialized_applied_snapshot_directory() {
         let temp_dir = tempdir().expect("temp dir");
@@ -6605,6 +6646,7 @@ fn to_channel_outbox_attempt_status_dto(
 fn to_stream_event_kind_dto(kind: ChannelStreamEventKind) -> StreamEventKindDto {
     match kind {
         ChannelStreamEventKind::MessageDelta => StreamEventKindDto::MessageDelta,
+        ChannelStreamEventKind::MessageBoundary => StreamEventKindDto::MessageBoundary,
         ChannelStreamEventKind::Status => StreamEventKindDto::Status,
         ChannelStreamEventKind::Error => StreamEventKindDto::Error,
         ChannelStreamEventKind::TurnCompleted => StreamEventKindDto::TurnCompleted,
@@ -6629,6 +6671,15 @@ fn to_stream_event_view(event: RuntimeEvent) -> StreamEventDto {
             }),
             code: None,
             text: Some(text),
+        },
+        RuntimeEvent::MessageBoundary { lane } => StreamEventDto {
+            kind: StreamEventKindDto::MessageBoundary,
+            lane: Some(match lane {
+                RuntimeMessageLane::Answer => StreamLaneDto::Answer,
+                RuntimeMessageLane::Reasoning => StreamLaneDto::Reasoning,
+            }),
+            code: None,
+            text: None,
         },
         RuntimeEvent::Status { code, text } => StreamEventDto {
             kind: StreamEventKindDto::Status,
@@ -7966,16 +8017,20 @@ fn generate_pairing_token() -> String {
 }
 
 fn assistant_text_from_events(events: &[RuntimeEvent]) -> String {
-    events
-        .iter()
-        .filter_map(|event| match event {
+    let mut assistant_text = String::new();
+    for event in events {
+        match event {
             RuntimeEvent::MessageDelta {
                 lane: RuntimeMessageLane::Answer,
                 text,
-            } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect()
+            } => append_streamed_text_delta(&mut assistant_text, text),
+            RuntimeEvent::MessageBoundary {
+                lane: RuntimeMessageLane::Answer,
+            } => append_streamed_text_boundary(&mut assistant_text),
+            _ => {}
+        }
+    }
+    assistant_text
 }
 
 fn summarize_runtime_events(events: &[RuntimeEvent]) -> SessionTurnArtifacts {
@@ -7989,7 +8044,14 @@ fn summarize_runtime_events(events: &[RuntimeEvent]) -> SessionTurnArtifacts {
             text,
         } = event
         {
-            assistant_text.push_str(text);
+            append_streamed_text_delta(&mut assistant_text, text);
+        } else if matches!(
+            event,
+            RuntimeEvent::MessageBoundary {
+                lane: RuntimeMessageLane::Answer
+            }
+        ) {
+            append_streamed_text_boundary(&mut assistant_text);
         }
         if matches!(event, RuntimeEvent::Error { .. }) {
             saw_error = true;
@@ -8389,7 +8451,14 @@ impl AssistantCheckpointState {
             text,
         } = event
         {
-            self.assistant_text.push_str(text);
+            append_streamed_text_delta(&mut self.assistant_text, text);
+        } else if matches!(
+            event,
+            RuntimeEvent::MessageBoundary {
+                lane: RuntimeMessageLane::Answer
+            }
+        ) {
+            append_streamed_text_boundary(&mut self.assistant_text);
         }
     }
 
@@ -8409,6 +8478,8 @@ impl AssistantCheckpointState {
             RuntimeEvent::MessageDelta {
                 lane: RuntimeMessageLane::Answer,
                 ..
+            } | RuntimeEvent::MessageBoundary {
+                lane: RuntimeMessageLane::Answer,
             }
         ) {
             self.last_answer_sequence = sequence;
@@ -9925,6 +9996,15 @@ impl Kernel {
                 }),
                 None,
                 Some(text.as_str()),
+            ),
+            RuntimeEvent::MessageBoundary { lane } => (
+                ChannelStreamEventKind::MessageBoundary,
+                Some(match lane {
+                    RuntimeMessageLane::Answer => ChannelStreamLane::Answer,
+                    RuntimeMessageLane::Reasoning => ChannelStreamLane::Reasoning,
+                }),
+                None,
+                None,
             ),
             RuntimeEvent::Status { code, text } => (
                 ChannelStreamEventKind::Status,
