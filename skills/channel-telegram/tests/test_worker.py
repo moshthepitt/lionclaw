@@ -841,6 +841,59 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(api.finalized[0][1], [])
             self.assertEqual(telegram.typing_peers, ["telegram:chat:77"])
 
+    async def test_stage_api_failure_keeps_update_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(
+                inbound_outcome="waiting_for_attachments",
+                stage_error=RuntimeError("kernel unavailable"),
+            )
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 13,
+                            "message": {
+                                "message_id": 7,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "document": {
+                                    "file_id": "doc-file",
+                                    "file_unique_id": "doc-unique",
+                                    "file_name": "brief.txt",
+                                    "mime_type": "text/plain",
+                                    "file_size": 12,
+                                },
+                            },
+                        }
+                    )
+                ],
+                downloaded_content=b"hello",
+            )
+            offset_store = OffsetStore(Path(temp_dir) / "telegram.offset")
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=offset_store,
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker.process_updates()
+
+            self.assertEqual(
+                telegram.downloaded_attachment_ids,
+                ["telegram:update:13:attachment:document:doc-unique"],
+            )
+            self.assertEqual(len(api.staged_attachments), 1)
+            self.assertEqual(api.finalized, [])
+            self.assertEqual(worker.offset, 0)
+            self.assertFalse(offset_store.path.exists())
+
     async def test_run_forever_flushes_outbox_while_update_poll_is_waiting(
         self,
     ) -> None:
@@ -1342,6 +1395,7 @@ class FakeLionClawApi:
         inbound_pairing_code: str | None = None,
         claim_outcome: str = "approved",
         report_accepted: bool = True,
+        stage_error: Exception | None = None,
     ) -> None:
         self.stream_events = list(stream_events or [])
         self.outbox_deliveries = list(outbox_deliveries or [])
@@ -1349,6 +1403,7 @@ class FakeLionClawApi:
         self.inbound_pairing_code = inbound_pairing_code
         self.claim_outcome = claim_outcome
         self.report_accepted = report_accepted
+        self.stage_error = stage_error
         self.sent_inbound: list[TelegramInboundUpdate] = []
         self.claims: list[TelegramPairingClaim] = []
         self.staged_attachments: list[
@@ -1387,6 +1442,8 @@ class FakeLionClawApi:
         downloaded: TelegramDownloadedAttachment,
     ) -> AttachmentStageResponse:
         self.staged_attachments.append((update, attachment))
+        if self.stage_error is not None:
+            raise self.stage_error
         return AttachmentStageResponse(
             status="staged", size_bytes=len(downloaded.content), sha256="00"
         )

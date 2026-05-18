@@ -2152,11 +2152,50 @@ impl Kernel {
             .await
             .map_err(internal)?
             .ok_or_else(|| KernelError::BadRequest("attachment is not declared".to_string()))?;
-        if declared.status != ChannelAttachmentRecordStatus::Declared {
-            return Err(KernelError::Conflict(format!(
-                "attachment is already {}",
-                declared.status.as_str()
-            )));
+        match declared.status {
+            ChannelAttachmentRecordStatus::Declared => {}
+            ChannelAttachmentRecordStatus::Staged => {
+                let size_bytes = declared.size_bytes.ok_or_else(|| {
+                    KernelError::Internal("staged attachment size is missing".to_string())
+                })?;
+                let sha256 = declared.sha256.clone().ok_or_else(|| {
+                    KernelError::Internal("staged attachment sha256 is missing".to_string())
+                })?;
+                if size_bytes != staged_content.size_bytes || sha256 != staged_content.sha256 {
+                    return Err(KernelError::Conflict(
+                        "attachment is already staged with different content".to_string(),
+                    ));
+                }
+                let runtime_path = declared
+                    .filename
+                    .as_deref()
+                    .map(|filename| channel_attachment_runtime_path(&attachment_id, filename));
+                return Ok(ChannelAttachmentStageResponse {
+                    channel_id,
+                    event_id,
+                    attachment_id,
+                    status: ChannelAttachmentStatus::Staged,
+                    size_bytes,
+                    sha256,
+                    runtime_path,
+                    reason_code: None,
+                });
+            }
+            ChannelAttachmentRecordStatus::Rejected => {
+                return Ok(ChannelAttachmentStageResponse {
+                    channel_id,
+                    event_id,
+                    attachment_id,
+                    status: ChannelAttachmentStatus::Rejected,
+                    size_bytes: declared.size_bytes.unwrap_or(staged_content.size_bytes),
+                    sha256: declared
+                        .sha256
+                        .clone()
+                        .unwrap_or_else(|| staged_content.sha256.clone()),
+                    runtime_path: None,
+                    reason_code: declared.rejection_code,
+                });
+            }
         }
 
         let descriptor_metadata_mismatch = declared.kind != kind
@@ -3201,6 +3240,31 @@ impl Kernel {
             .map_err(internal)?;
         if inserted.is_none() {
             tx.rollback().await.map_err(|err| internal(err.into()))?;
+            if let Some(turn) = self
+                .channel_state
+                .get_turn_by_inbound_event(&inbound.channel_id, &inbound.event_id)
+                .await
+                .map_err(internal)?
+                .filter(|turn| turn.status == ChannelTurnStatus::WaitingForAttachments)
+            {
+                self.audit_channel_inbound(
+                    "channel.inbound.duplicate",
+                    &inbound,
+                    "waiting_for_attachments",
+                    None,
+                    Some(turn.turn_id),
+                )
+                .await?;
+                return Ok(channel_inbound_response(
+                    ChannelInboundOutcome::WaitingForAttachments,
+                    "waiting_for_attachments",
+                    None,
+                    None,
+                    Some(turn.session_id),
+                    Some(turn.turn_id),
+                    Some(turn.session_key),
+                ));
+            }
             self.audit_channel_inbound(
                 "channel.inbound.duplicate",
                 &inbound,

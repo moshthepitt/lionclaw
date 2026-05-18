@@ -3015,44 +3015,56 @@ async fn channel_attachment_stage_finalize_queues_manifest_and_runtime_mount() {
     approve_pairing(&kernel, "terminal", "peer-attach").await;
 
     let staged_content = b"hello staged attachment".to_vec();
+    let attachment_request = ChannelInboundRequest {
+        attachments: vec![
+            ChannelAttachmentDescriptor {
+                attachment_id: "att-doc".to_string(),
+                kind: "document".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                filename: Some("../report.txt".to_string()),
+                size_bytes: Some(staged_content.len() as i64),
+                provider_file_ref: "provider-doc".to_string(),
+                caption: Some("doc caption".to_string()),
+            },
+            ChannelAttachmentDescriptor {
+                attachment_id: "att-missing".to_string(),
+                kind: "image".to_string(),
+                mime_type: Some("image/png".to_string()),
+                filename: Some("missing.png".to_string()),
+                size_bytes: None,
+                provider_file_ref: "provider-missing".to_string(),
+                caption: None,
+            },
+        ],
+        ..v2_text_request(
+            "terminal",
+            "attach-1002",
+            "peer-attach",
+            "peer-attach",
+            None,
+            "please inspect attached files",
+            ChannelTrigger::Dm,
+        )
+    };
     let waiting = kernel
-        .ingest_channel_inbound(ChannelInboundRequest {
-            attachments: vec![
-                ChannelAttachmentDescriptor {
-                    attachment_id: "att-doc".to_string(),
-                    kind: "document".to_string(),
-                    mime_type: Some("text/plain".to_string()),
-                    filename: Some("../report.txt".to_string()),
-                    size_bytes: Some(staged_content.len() as i64),
-                    provider_file_ref: "provider-doc".to_string(),
-                    caption: Some("doc caption".to_string()),
-                },
-                ChannelAttachmentDescriptor {
-                    attachment_id: "att-missing".to_string(),
-                    kind: "image".to_string(),
-                    mime_type: Some("image/png".to_string()),
-                    filename: Some("missing.png".to_string()),
-                    size_bytes: None,
-                    provider_file_ref: "provider-missing".to_string(),
-                    caption: None,
-                },
-            ],
-            ..v2_text_request(
-                "terminal",
-                "attach-1002",
-                "peer-attach",
-                "peer-attach",
-                None,
-                "please inspect attached files",
-                ChannelTrigger::Dm,
-            )
-        })
+        .ingest_channel_inbound(attachment_request.clone())
         .await
         .expect("attachment turn waits");
     assert_eq!(
         waiting.outcome,
         ChannelInboundOutcome::WaitingForAttachments
     );
+    let duplicate_waiting = kernel
+        .ingest_channel_inbound(attachment_request)
+        .await
+        .expect("duplicate waiting attachment turn retries staging");
+    assert_eq!(
+        duplicate_waiting.outcome,
+        ChannelInboundOutcome::WaitingForAttachments
+    );
+    assert_eq!(duplicate_waiting.turn_id, waiting.turn_id);
+    assert_eq!(duplicate_waiting.session_id, waiting.session_id);
+    assert_eq!(duplicate_waiting.session_key, waiting.session_key);
 
     let orphan_path = env
         .home()
@@ -3094,6 +3106,24 @@ async fn channel_attachment_stage_finalize_queues_manifest_and_runtime_mount() {
     );
     assert_eq!(
         staged.runtime_path.as_deref(),
+        Some(expected_runtime_path.as_str())
+    );
+    let restaged = kernel
+        .stage_channel_attachment(ChannelAttachmentStageInput {
+            channel_id: "terminal".to_string(),
+            event_id: "attach-1002".to_string(),
+            attachment_id: "att-doc".to_string(),
+            kind: "document".to_string(),
+            filename: Some("../report.txt".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            caption: Some("doc caption".to_string()),
+            content: ChannelAttachmentStageContent::Bytes(staged_content.clone()),
+        })
+        .await
+        .expect("already staged attachment retry is idempotent");
+    assert_eq!(restaged.status, ChannelAttachmentStatus::Staged);
+    assert_eq!(
+        restaged.runtime_path.as_deref(),
         Some(expected_runtime_path.as_str())
     );
     std::fs::write(
