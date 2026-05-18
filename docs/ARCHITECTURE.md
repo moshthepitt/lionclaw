@@ -8,7 +8,9 @@ contract around that work: sessions, channels, scheduled jobs, continuity,
 runtime configuration, confinement, policy, and audit.
 
 LionClaw currently targets Unix-like systems only. The direct `lionclaw run`
-path is designed for Linux/macOS-style Unix environments. Managed background
+path is designed for Linux/macOS-style Unix environments. When attached to a
+terminal, `run` opens the project operator console; `run --plain` and
+non-terminal use keep the command on the line-oriented interactive path. Managed background
 paths, including `lionclaw up` and channel auto-start, currently use the
 systemd user manager; launchd support is a future portability item.
 
@@ -204,9 +206,14 @@ The everyday runtime layout is mount-first:
   event, present only after attachment finalization staged files for that turn
 
 For local `lionclaw run`, target resolution selects one project instance and
-uses that instance's recorded work root. The work root is mounted at
-`/workspace`. The instance home remains LionClaw's state root and is not the
-project tree or work root.
+uses that instance's recorded work root. In project mode, the operator console
+also renders the other configured project instances and can switch to another
+already-configured instance when no turn is active. Switching reads that
+instance's existing home, work root, runtime config, sessions, drafts, and
+audit scope; it does not mutate project, instance, runtime, channel, skill, or
+default configuration. The selected work root is mounted at `/workspace`. The
+instance home remains LionClaw's state root and is not the project tree or work
+root.
 
 The planner injects runtime-private environment defaults such as
 `HOME=/runtime/home`, `LIONCLAW_DRAFTS_DIR=/drafts`, and

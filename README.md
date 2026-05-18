@@ -66,9 +66,19 @@ When you run:
 lionclaw run
 ```
 
-LionClaw resolves the project, selects an instance, builds the confined runtime
-workspace, stages the local state and credentials that runtime needs, then
-launches the real agent CLI.
+LionClaw opens the project operator console when attached to a terminal. The
+console lists configured project instances, shows the selected instance's work
+root, runtime profile, boundary status, transcript, and composer, then submits
+turns through the same confined runtime flow.
+
+Use the plain line-oriented path when scripting or when a terminal UI is not
+wanted:
+
+```bash
+lionclaw run --plain
+```
+
+Non-terminal use automatically stays on the plain path.
 
 The selected runtime still does the agent work. LionClaw owns the boundary
 around it: the project it runs in, the state it sees, the mounts it receives,
@@ -93,6 +103,9 @@ Then run the configured runtime:
 ```bash
 lionclaw run
 ```
+
+In a terminal, `run` opens the operator console. Use `lionclaw run --plain`
+for the line-oriented interactive path.
 
 For Codex, use a logged-in Codex CLI and run LionClaw where the `podman`
 executable is available. If `run` reports a missing runtime image, build or

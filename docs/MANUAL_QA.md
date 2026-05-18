@@ -84,6 +84,25 @@ cd "$PROJ_A"
 "$LIONCLAW_BIN" run
 ```
 
+Expected on a TTY:
+
+- a full-screen operator console opens
+- the instance list shows the configured project instances
+- the selected instance shows its work root, runtime, boundary summary, session
+  state, transcript, and composer
+
+For the plain fallback:
+
+```bash
+printf '/lionclaw exit\n' | "$LIONCLAW_BIN" run
+"$LIONCLAW_BIN" run --plain
+```
+
+Expected:
+
+- piped non-TTY usage avoids the console
+- `--plain` uses the line-oriented prompt even on a TTY
+
 Use these prompts:
 
 ```text
