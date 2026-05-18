@@ -6,7 +6,10 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -20,6 +23,7 @@ use ratatui::{
     },
     Frame, Terminal,
 };
+use ratatui_textarea::{TextArea, WrapMode};
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
@@ -62,6 +66,9 @@ const PANEL_WARN: Color = Color::Rgb(255, 198, 55);
 const PANEL_ERROR: Color = Color::Rgb(255, 82, 82);
 const ACTIVITY_ITEM_LIMIT: usize = 12;
 const DEFAULT_TRANSCRIPT_PAGE_SCROLL: usize = 8;
+const COMPOSER_MIN_HEIGHT: u16 = 6;
+const COMPOSER_MAX_HEIGHT: u16 = 12;
+const COMPOSER_CHROME_HEIGHT: u16 = 4;
 const ACTIVITY_ERROR_MARKERS: &[&str] = &["error", "failed", "denied"];
 const ACTIVITY_DONE_MARKERS: &[&str] = &[
     "completed",
@@ -431,6 +438,74 @@ impl TranscriptLine {
     }
 }
 
+struct ConsoleComposer {
+    input: TextArea<'static>,
+}
+
+impl ConsoleComposer {
+    fn new() -> Self {
+        Self::from_text("")
+    }
+
+    fn from_text(text: &str) -> Self {
+        let mut input = TextArea::default();
+        input.set_style(Style::default().fg(Color::White));
+        input.set_cursor_line_style(Style::default());
+        input.set_cursor_style(
+            Style::default()
+                .fg(PANEL_BORDER)
+                .add_modifier(Modifier::REVERSED),
+        );
+        input.set_styled_placeholder(Line::from(vec![Span::styled(
+            "Ask through the selected runtime...",
+            Style::default().fg(PANEL_MUTED),
+        )]));
+        input.set_wrap_mode(WrapMode::WordOrGlyph);
+        if !text.is_empty() {
+            input.insert_str(text);
+        }
+        Self { input }
+    }
+
+    fn clear(&mut self) {
+        self.input.clear();
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
+        self.input.input(key)
+    }
+
+    fn insert_str(&mut self, text: &str) -> bool {
+        self.input.insert_str(text)
+    }
+
+    fn insert_newline(&mut self) {
+        self.input.insert_newline();
+    }
+
+    fn text(&self) -> String {
+        self.input.clone().into_lines().join("\n")
+    }
+
+    fn take_text(&mut self) -> String {
+        let text = self.text();
+        *self = Self::new();
+        text
+    }
+
+    fn restore_text(&mut self, text: String) {
+        *self = Self::from_text(&text);
+    }
+
+    fn line_count(&self) -> usize {
+        self.input.clone().into_lines().len()
+    }
+
+    fn widget(&self) -> &TextArea<'static> {
+        &self.input
+    }
+}
+
 pub(crate) struct ConsoleApp {
     project_root: Option<PathBuf>,
     instances: Vec<InstanceSummary>,
@@ -440,7 +515,7 @@ pub(crate) struct ConsoleApp {
     timeout_override: Option<RuntimeTurnTimeouts>,
     focus: Focus,
     overlay: Option<Overlay>,
-    composer: String,
+    composer: ConsoleComposer,
     transcript: Vec<TranscriptLine>,
     transcript_scroll: usize,
     transcript_scroll_limit: usize,
@@ -484,7 +559,7 @@ impl ConsoleApp {
                 Focus::Composer
             },
             overlay: None,
-            composer: String::new(),
+            composer: ConsoleComposer::new(),
             transcript: Vec::new(),
             transcript_scroll: 0,
             transcript_scroll_limit: 0,
@@ -528,6 +603,17 @@ impl ConsoleApp {
     fn set_transcript_viewport(&mut self, line_count: usize, viewport_height: u16) {
         self.transcript_page_size = usize::from(viewport_height.max(1));
         self.set_transcript_scroll_limit(transcript_scroll_limit(line_count, viewport_height));
+    }
+
+    fn composer_height(&self, terminal_height: u16) -> u16 {
+        let content_height = self.composer.line_count().min(usize::from(u16::MAX)) as u16;
+        let desired = content_height
+            .saturating_add(COMPOSER_CHROME_HEIGHT)
+            .clamp(COMPOSER_MIN_HEIGHT, COMPOSER_MAX_HEIGHT);
+        let available = terminal_height
+            .saturating_sub(16)
+            .clamp(COMPOSER_MIN_HEIGHT, COMPOSER_MAX_HEIGHT);
+        desired.min(available)
     }
 
     fn selected_name(&self) -> &str {
@@ -671,11 +757,11 @@ impl ConsoleApp {
             self.status = "launch is blocked for the selected instance".to_string();
             return;
         }
-        let text = std::mem::take(&mut self.composer);
+        let text = self.composer.take_text();
         match classify_input(&text) {
             ClassifiedInput::Empty => {
                 self.status = "composer is empty".to_string();
-                self.composer = text;
+                self.composer.restore_text(text);
             }
             ClassifiedInput::Prompt(prompt) => self.start_prompt_turn(prompt, backend_tx),
             ClassifiedInput::RuntimeControl(control) => {
@@ -1277,7 +1363,7 @@ pub(crate) async fn run_launch_blocker(blocker: LaunchBlocker) -> Result<()> {
         timeout_override: None,
         focus: Focus::Composer,
         overlay: None,
-        composer: String::new(),
+        composer: ConsoleComposer::new(),
         transcript: Vec::new(),
         transcript_scroll: 0,
         transcript_scroll_limit: 0,
@@ -1315,7 +1401,7 @@ pub(crate) async fn run_project_launch_blocker(
         timeout_override: None,
         focus: Focus::Instances,
         overlay: None,
-        composer: String::new(),
+        composer: ConsoleComposer::new(),
         transcript: Vec::new(),
         transcript_scroll: 0,
         transcript_scroll_limit: 0,
@@ -1351,14 +1437,18 @@ type ConsoleTerminal = Terminal<CrosstermBackend<Stdout>>;
 fn enter_terminal() -> Result<ConsoleTerminal> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     Terminal::new(backend).map_err(Into::into)
 }
 
 fn leave_terminal(mut terminal: ConsoleTerminal) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -1379,15 +1469,30 @@ async fn run_terminal_loop(
         }
 
         if event::poll(EVENT_POLL)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    handle_key(app, key, backend_tx).await;
-                }
-            }
+            handle_terminal_event(app, event::read()?, backend_tx).await;
         }
     }
 
     Ok(())
+}
+
+async fn handle_terminal_event(
+    app: &mut ConsoleApp,
+    event: Event,
+    backend_tx: &mpsc::UnboundedSender<BackendEvent>,
+) {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            handle_key(app, key, backend_tx).await;
+        }
+        Event::Paste(text) => {
+            app.focus = Focus::Composer;
+            let char_count = text.chars().count();
+            app.composer.insert_str(&text);
+            app.status = format!("pasted {char_count} characters");
+        }
+        _ => {}
+    }
 }
 
 async fn handle_key(
@@ -1397,6 +1502,12 @@ async fn handle_key(
 ) {
     if app.overlay.is_some() {
         handle_overlay_key(app, key);
+        return;
+    }
+
+    if is_composer_newline_key(key) {
+        app.focus = Focus::Composer;
+        app.composer.insert_newline();
         return;
     }
 
@@ -1422,9 +1533,6 @@ async fn handle_key(
         (KeyCode::Esc, _) => {
             app.composer.clear();
             app.status = "composer cleared".to_string();
-        }
-        (KeyCode::Enter, KeyModifiers::ALT) | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
-            app.composer.push('\n');
         }
         (KeyCode::Enter, _) => app.submit_composer(backend_tx),
         (KeyCode::Char('d'), KeyModifiers::CONTROL) | (KeyCode::F(10), _) => {
@@ -1468,16 +1576,28 @@ async fn handle_key(
         (KeyCode::PageDown, _) if app.focus == Focus::Transcript => {
             app.scroll_transcript_down(app.transcript_page_size);
         }
-        (KeyCode::Backspace, _) => {
-            app.composer.pop();
+        _ if app.focus == Focus::Composer => {
+            app.composer.handle_key(key);
         }
-        (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.composer.clear(),
-        (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+        _ if key_starts_composer(key) => {
             app.focus = Focus::Composer;
-            app.composer.push(ch);
+            app.composer.handle_key(key);
         }
         _ => {}
     }
+}
+
+fn is_composer_newline_key(key: KeyEvent) -> bool {
+    (key.code == KeyCode::Enter
+        && (key.modifiers.contains(KeyModifiers::SHIFT)
+            || key.modifiers.contains(KeyModifiers::ALT)))
+        || (key.code == KeyCode::Char('j') && key.modifiers == KeyModifiers::CONTROL)
+}
+
+fn key_starts_composer(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(_))
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
 fn handle_overlay_key(app: &mut ConsoleApp, key: KeyEvent) {
@@ -1493,6 +1613,7 @@ fn handle_overlay_key(app: &mut ConsoleApp, key: KeyEvent) {
 
 pub(crate) fn render_app(frame: &mut Frame<'_>, app: &mut ConsoleApp) {
     let area = frame.area();
+    let composer_height = app.composer_height(area.height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1500,7 +1621,7 @@ pub(crate) fn render_app(frame: &mut Frame<'_>, app: &mut ConsoleApp) {
             Constraint::Length(1),
             Constraint::Min(10),
             Constraint::Length(1),
-            Constraint::Length(6),
+            Constraint::Length(composer_height),
             Constraint::Length(1),
             Constraint::Length(3),
         ])
@@ -2107,27 +2228,22 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
         return;
     }
 
-    let prompt = if app.composer.is_empty() {
-        Line::from(vec![
-            Span::styled(">  ", Style::default().fg(PANEL_BORDER)),
-            Span::styled(
-                "Ask through the selected runtime...",
-                Style::default().fg(PANEL_MUTED),
-            ),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled(">  ", Style::default().fg(PANEL_BORDER)),
-            Span::raw(app.composer.clone()),
-        ])
-    };
     frame.render_widget(
-        Paragraph::new(prompt).wrap(Wrap { trim: false }),
+        Paragraph::new(Line::styled(">", Style::default().fg(PANEL_BORDER))),
         Rect {
             x: area.x.saturating_add(2),
             y: area.y.saturating_add(1),
-            width: area.width.saturating_sub(4),
-            height: 2,
+            width: 1,
+            height: 1,
+        },
+    );
+    frame.render_widget(
+        app.composer.widget(),
+        Rect {
+            x: area.x.saturating_add(5),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(7),
+            height: area.height.saturating_sub(4),
         },
     );
 
@@ -2490,7 +2606,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp, overlay: 
                 Line::from("Ctrl+O toggle activity inspector"),
                 Line::from("Tab / Shift+Tab move focus"),
                 Line::from("Enter submit prompt or /lionclaw command"),
-                Line::from("Alt+Enter insert newline"),
+                Line::from("Shift+Enter or Alt+Enter insert newline"),
                 Line::from("Up / Down switch instances when instance panel has focus"),
                 Line::from("Ctrl+D or F10 exit when idle"),
                 Line::from("Esc closes this overlay"),
@@ -2775,7 +2891,7 @@ mod tests {
             timeout_override: None,
             focus: Focus::Transcript,
             overlay: None,
-            composer: String::new(),
+            composer: ConsoleComposer::new(),
             transcript: Vec::new(),
             transcript_scroll: 0,
             transcript_scroll_limit: 0,
@@ -2895,7 +3011,7 @@ mod tests {
             timeout_override: None,
             focus: Focus::Composer,
             overlay: None,
-            composer: String::new(),
+            composer: ConsoleComposer::new(),
             transcript: vec![
                 TranscriptLine::new(
                     TranscriptLineKind::User,
@@ -3050,7 +3166,7 @@ mod tests {
 
         let mut composer_app = blocked_test_app();
         composer_app.focus = Focus::Composer;
-        composer_app.composer = "Is this ok".to_string();
+        composer_app.composer = ConsoleComposer::from_text("Is this ok");
         runtime.block_on(async {
             handle_key(
                 &mut composer_app,
@@ -3059,7 +3175,7 @@ mod tests {
             )
             .await;
         });
-        assert_eq!(composer_app.composer, "Is this ok?");
+        assert_eq!(composer_app.composer.text(), "Is this ok?");
         assert!(composer_app.overlay.is_none());
 
         let mut nav_app = blocked_test_app();
@@ -3072,7 +3188,7 @@ mod tests {
             )
             .await;
         });
-        assert_eq!(nav_app.composer, "?");
+        assert_eq!(nav_app.composer.text(), "?");
         assert_eq!(nav_app.focus, Focus::Composer);
         assert!(nav_app.overlay.is_none());
 
@@ -3085,6 +3201,52 @@ mod tests {
             .await;
         });
         assert_eq!(nav_app.overlay, Some(Overlay::Help));
+    }
+
+    #[test]
+    fn composer_handles_multiline_editing_and_bracketed_paste() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+        let mut app = blocked_test_app();
+
+        runtime.block_on(async {
+            handle_terminal_event(
+                &mut app,
+                Event::Paste("first line\nsecond line".to_string()),
+                &backend_tx,
+            )
+            .await;
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+                &backend_tx,
+            )
+            .await;
+            handle_terminal_event(
+                &mut app,
+                Event::Paste("third line".to_string()),
+                &backend_tx,
+            )
+            .await;
+        });
+
+        assert_eq!(app.composer.text(), "first line\nsecond line\nthird line");
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.status, "pasted 10 characters");
+    }
+
+    #[test]
+    fn composer_height_expands_for_multiline_input() {
+        let mut app = blocked_test_app();
+        app.composer = ConsoleComposer::from_text("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+
+        assert_eq!(app.composer_height(80), COMPOSER_MAX_HEIGHT);
+
+        app.composer = ConsoleComposer::new();
+        assert_eq!(app.composer_height(80), COMPOSER_MIN_HEIGHT);
     }
 
     #[test]
@@ -3166,7 +3328,7 @@ mod tests {
             timeout_override: None,
             focus: Focus::Instances,
             overlay: None,
-            composer: String::new(),
+            composer: ConsoleComposer::new(),
             transcript: Vec::new(),
             transcript_scroll: 0,
             transcript_scroll_limit: 0,
@@ -3221,7 +3383,7 @@ mod tests {
             timeout_override: None,
             focus: Focus::Composer,
             overlay: None,
-            composer: String::new(),
+            composer: ConsoleComposer::new(),
             transcript,
             transcript_scroll: 0,
             transcript_scroll_limit: 0,
