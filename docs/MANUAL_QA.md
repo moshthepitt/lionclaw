@@ -186,6 +186,9 @@ printf 'TELEGRAM_BOT_TOKEN=...\n' > telegram.env
 
 Expected when credentials are available:
 
+- the default runtime image can run common assistant probes such as
+  `codex --version`, `opencode --version`, `python3 --version`,
+  `ffprobe -version`, `file --version`, `jq --version`, and `pdftotext -v`
 - the token is stored in selected-instance private channel env
 - `doctor` does not print the token
 - a DM pairing link shaped like `https://t.me/<bot_username>?start=lc_<token>`
