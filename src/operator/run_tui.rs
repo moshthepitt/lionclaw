@@ -219,6 +219,7 @@ struct ActivitySummary {
     command_count: usize,
     progress_count: usize,
     started_at: Option<Instant>,
+    ended_at: Option<Instant>,
     items: Vec<ActivityItem>,
 }
 
@@ -230,6 +231,7 @@ impl ActivitySummary {
             command_count: 0,
             progress_count: 0,
             started_at: None,
+            ended_at: None,
             items: Vec::new(),
         }
     }
@@ -240,17 +242,20 @@ impl ActivitySummary {
         self.command_count = 0;
         self.progress_count = 0;
         self.started_at = Some(Instant::now());
+        self.ended_at = None;
         self.items.clear();
     }
 
     fn complete(&mut self) {
         if self.status != ActivityStatus::Failed {
             self.status = ActivityStatus::Complete;
+            self.ended_at.get_or_insert_with(Instant::now);
         }
     }
 
     fn fail(&mut self) {
         self.status = ActivityStatus::Failed;
+        self.ended_at.get_or_insert_with(Instant::now);
     }
 
     fn is_empty(&self) -> bool {
@@ -258,8 +263,13 @@ impl ActivitySummary {
     }
 
     fn elapsed_label(&self) -> Option<String> {
-        self.started_at
-            .map(|started_at| format_elapsed(started_at.elapsed()))
+        self.started_at.map(|started_at| {
+            let elapsed = self.ended_at.map_or_else(
+                || started_at.elapsed(),
+                |ended_at| ended_at.duration_since(started_at),
+            );
+            format_elapsed(elapsed)
+        })
     }
 
     fn record_stream_event(&mut self, event: &StreamEventDto) {
@@ -2547,6 +2557,23 @@ mod tests {
             .items
             .iter()
             .any(|item| item.text == "opencode searched: README.md"));
+    }
+
+    #[test]
+    fn activity_elapsed_label_freezes_after_terminal_status() {
+        let started_at = Instant::now() - Duration::from_secs(120);
+        let ended_at = started_at + Duration::from_secs(23);
+        let mut activity = ActivitySummary::new();
+        activity.started_at = Some(started_at);
+        activity.ended_at = Some(ended_at);
+        activity.status = ActivityStatus::Failed;
+
+        assert_eq!(activity.elapsed_label().as_deref(), Some("00:23"));
+
+        activity.start();
+
+        assert_eq!(activity.status, ActivityStatus::Running);
+        assert!(activity.ended_at.is_none());
     }
 
     #[test]
