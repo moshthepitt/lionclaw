@@ -189,6 +189,31 @@ impl SessionStore {
         row.map(map_session_row).transpose()
     }
 
+    pub async fn list_recent_by_channel_peer(
+        &self,
+        channel_id: &str,
+        peer_id: &str,
+        project_scope: &str,
+        limit: usize,
+    ) -> Result<Vec<Session>> {
+        let rows = sqlx::query(
+            "SELECT session_id, channel_id, peer_id, project_scope, trust_tier, history_policy, created_at_ms, last_activity_at_ms, turn_count \
+             FROM sessions \
+             WHERE channel_id = ?1 AND peer_id = ?2 AND project_scope = ?3 \
+             ORDER BY (last_activity_at_ms IS NOT NULL) DESC, COALESCE(last_activity_at_ms, created_at_ms) DESC, created_at_ms DESC \
+             LIMIT ?4",
+        )
+        .bind(channel_id)
+        .bind(peer_id)
+        .bind(project_scope)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to query recent sessions by channel and peer")?;
+
+        rows.into_iter().map(map_session_row).collect()
+    }
+
     pub async fn get_scoped(
         &self,
         session_id: Uuid,

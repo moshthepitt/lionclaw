@@ -887,6 +887,26 @@ impl Kernel {
         Ok(Some(to_session_open_response(session)))
     }
 
+    pub(crate) async fn list_recent_sessions(
+        &self,
+        channel_id: &str,
+        peer_id: &str,
+        limit: usize,
+    ) -> Result<Vec<super::sessions::Session>, KernelError> {
+        let channel_id = channel_id.trim();
+        let peer_id = peer_id.trim();
+        if channel_id.is_empty() || peer_id.is_empty() {
+            return Err(KernelError::BadRequest(
+                "channel_id and peer_id are required".to_string(),
+            ));
+        }
+        let limit = limit.clamp(1, 25);
+        self.sessions
+            .list_recent_by_channel_peer(channel_id, peer_id, self.session_scope(), limit)
+            .await
+            .map_err(internal)
+    }
+
     pub async fn latest_session_snapshot(
         &self,
         query: SessionLatestQuery,
