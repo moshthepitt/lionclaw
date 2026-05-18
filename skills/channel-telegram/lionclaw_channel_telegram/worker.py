@@ -5,6 +5,17 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramEntityTooLarge,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramNotFound,
+    TelegramRetryAfter,
+    TelegramServerError,
+    TelegramUnauthorizedError,
+)
+
 from lionclaw_channel_telegram.api import LionClawApi, OutboxDelivery, StreamEvent
 from lionclaw_channel_telegram.config import WorkerConfig
 from lionclaw_channel_telegram.telegram import (
@@ -181,10 +192,11 @@ class TelegramWorker:
                 delivery.delivery_id,
                 delivery.conversation_ref,
             )
-            await self._report_outbox_once(
+            outcome, error_code = _classify_send_failure(err)
+            await self._report_outbox_with_retry(
                 delivery,
-                "terminal_failed",
-                error_code="telegram.send_failed",
+                outcome,
+                error_code=error_code,
                 error_text=str(err),
             )
             return
@@ -247,6 +259,23 @@ class TelegramWorker:
                 response.attempt_status,
             )
         return True
+
+
+def _classify_send_failure(err: Exception) -> tuple[str, str]:
+    if isinstance(
+        err,
+        (
+            TelegramBadRequest,
+            TelegramEntityTooLarge,
+            TelegramForbiddenError,
+            TelegramNotFound,
+            TelegramUnauthorizedError,
+        ),
+    ):
+        return "terminal_failed", "telegram.send_rejected"
+    if isinstance(err, (TelegramNetworkError, TelegramRetryAfter, TelegramServerError)):
+        return "retryable_failed", "telegram.send_retryable"
+    return "retryable_failed", "telegram.send_failed"
 
 
 async def run() -> None:

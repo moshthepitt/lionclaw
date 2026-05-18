@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::kernel::db::{ms_to_datetime, now_ms};
 
 pub(crate) const DEFAULT_CHANNEL_OUTBOX_LEASE_MS: u64 = 120_000;
+pub(crate) const MAX_CHANNEL_OUTBOX_LEASE_MS: u64 = 15 * 60 * 1000;
 pub(crate) const DEFAULT_CHANNEL_OUTBOX_PULL_LIMIT: usize = 10;
 pub(crate) const MAX_CHANNEL_OUTBOX_PULL_LIMIT: usize = 100;
 
