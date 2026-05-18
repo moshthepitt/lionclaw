@@ -3010,6 +3010,9 @@ fn render_instance_inspector(frame: &mut Frame<'_>, content: Rect, app: &Console
         return;
     }
 
+    let SelectedInstanceState::Ready(ready) = &app.selected else {
+        return;
+    };
     let boundary = app.boundary_summary();
     let mut lines = vec![
         section_line("●", "Selected"),
@@ -3017,6 +3020,12 @@ fn render_instance_inspector(frame: &mut Frame<'_>, content: Rect, app: &Console
         kv_line("instance", app.selected_name()),
         kv_line("runtime", &app.runtime_label()),
         kv_line("kind", &app.runtime_kind_label()),
+        kv_line("session", &short_session_id(ready.session_id)),
+    ];
+    if let Some(work_root) = ready.summary.work_root.as_ref() {
+        lines.push(kv_line("work root", &work_root.display().to_string()));
+    }
+    lines.extend([
         kv_line("preset", &boundary.preset),
         Line::raw(""),
         section_line("▱", "Boundary"),
@@ -3049,7 +3058,7 @@ fn render_instance_inspector(frame: &mut Frame<'_>, content: Rect, app: &Console
         Line::raw(""),
         section_line("▣", "Audit"),
         Line::raw(""),
-    ];
+    ]);
     lines.extend([
         check_line("runtime.plan.allow"),
         check_line("runtime.started"),
@@ -3509,7 +3518,6 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp, overlay: 
         .block(Block::default().title(title).borders(Borders::ALL))
         .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, popup);
-    let _ = app;
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -4028,6 +4036,8 @@ mod tests {
         assert!(rendered.contains("Transcript"));
         assert!(rendered.contains("Inspector  Instance"));
         assert!(rendered.contains("Boundary"));
+        assert!(rendered.contains("session"));
+        assert!(rendered.contains("work root"));
         assert!(rendered.contains("Ask through the selected runtime"));
         assert!(!rendered.contains("runtime controls pass through"));
         assert!(rendered.contains("F1"));
@@ -4199,6 +4209,55 @@ mod tests {
 
         assert_eq!(app.focus, Focus::Composer);
         assert_eq!(app.project_cursor, ProjectSelection::Instance(0));
+    }
+
+    #[tokio::test]
+    async fn project_console_load_does_not_repair_or_write_config() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = crate::operator::target::init_project(temp_dir.path()).expect("init");
+        let project_config_path = project
+            .project_root
+            .join(crate::operator::target::PROJECT_DIR)
+            .join(crate::operator::target::PROJECT_FILE);
+        let instance_config_path = project.instance.home.join("config").join("instance.toml");
+        let before_project_config =
+            std::fs::read_to_string(&project_config_path).expect("project config");
+        let before_instance_config =
+            std::fs::read_to_string(&instance_config_path).expect("instance config");
+        let operator_config_path = LionClawHome::new(project.instance.home.clone()).config_path();
+        assert!(!operator_config_path.exists());
+        let target = crate::operator::target::resolve_target(
+            &crate::operator::target::TargetSelection {
+                home: None,
+                project: Some(project.project_root.clone()),
+                instance: None,
+            },
+            crate::operator::target::WorkRootRequirement::Optional,
+        )
+        .expect("resolve target");
+
+        let app = ConsoleApp::load(RunConsoleInvocation {
+            target: &target,
+            requested_runtime: None,
+            continue_last_session: false,
+            timeout_override: None,
+        })
+        .await
+        .expect("console");
+
+        assert!(!app.selected.is_ready());
+        assert_eq!(
+            std::fs::read_to_string(&project_config_path).expect("project config after"),
+            before_project_config
+        );
+        assert_eq!(
+            std::fs::read_to_string(&instance_config_path).expect("instance config after"),
+            before_instance_config
+        );
+        assert!(
+            !operator_config_path.exists(),
+            "run TUI must not create operator config while rendering a launch blocker"
+        );
     }
 
     #[tokio::test]
