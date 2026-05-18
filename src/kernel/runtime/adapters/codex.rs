@@ -1411,25 +1411,52 @@ fn codex_generated_image_payload<'a>(
     message: &'a Value,
 ) -> Option<&'a Value> {
     if let Some(("image_generation_end", payload)) = app_server_event_payload(method, message) {
-        return Some(payload);
+        if codex_generated_image_is_publishable(method, payload) {
+            return Some(payload);
+        }
     }
 
     let item = message.get("item").unwrap_or(message);
     let item_type = item.get("type").and_then(Value::as_str);
     if matches!(method, Some("item/completed" | "item/updated"))
         && matches!(item_type, Some("imageGeneration" | "image_generation_call"))
+        && codex_generated_image_is_publishable(method, item)
     {
         return Some(item);
     }
 
     if method.is_none() && message.get("type").and_then(Value::as_str) == Some("response_item") {
         let payload = message.get("payload")?;
-        if payload.get("type").and_then(Value::as_str) == Some("image_generation_call") {
+        if payload.get("type").and_then(Value::as_str) == Some("image_generation_call")
+            && codex_generated_image_is_publishable(method, payload)
+        {
             return Some(payload);
         }
     }
 
     None
+}
+
+fn codex_generated_image_is_publishable(method: Option<&str>, payload: &Value) -> bool {
+    if codex_generated_image_has_saved_path(payload) {
+        return true;
+    }
+
+    match payload
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+    {
+        Some(status) => matches!(
+            status.to_ascii_lowercase().as_str(),
+            "completed" | "complete" | "succeeded" | "success" | "done"
+        ),
+        None => {
+            method == Some("item/completed")
+                || payload.get("type").and_then(Value::as_str) == Some("image_generation_end")
+        }
+    }
 }
 
 fn codex_generated_image_call_id(payload: &Value) -> Option<String> {
@@ -1441,6 +1468,15 @@ fn codex_generated_image_call_id(payload: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn codex_generated_image_has_saved_path(payload: &Value) -> bool {
+    payload
+        .get("saved_path")
+        .or_else(|| payload.get("savedPath"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
 }
 
 fn codex_generated_image_path(payload: &Value, runtime_state_root: &Path) -> Option<PathBuf> {
@@ -2289,7 +2325,7 @@ mod tests {
                 "payload": {
                     "type": "image_generation_end",
                     "call_id": "ig_1",
-                    "status": "generating"
+                    "status": "completed"
                 }
             }
         }))
@@ -2303,7 +2339,7 @@ mod tests {
             "payload": {
                 "type": "image_generation_end",
                 "call_id": "ig_1",
-                "status": "generating",
+                "status": "completed",
                 "result": "base64 omitted"
             }
         }))
@@ -2349,11 +2385,91 @@ mod tests {
             "payload": {
                 "type": "image_generation_call",
                 "id": "ig_1",
-                "status": "generating",
+                "status": "completed",
                 "result": "base64 omitted"
             }
         }))
         .await;
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_image_generation_interim_update_does_not_dedupe_completed_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let final_image = runtime_state_root
+            .join("home")
+            .join(".codex")
+            .join("generated_images")
+            .join("thr_1")
+            .join("ig_1-final.png");
+        std::fs::create_dir_all(final_image.parent().expect("final image parent"))
+            .expect("create generated image dir");
+        std::fs::write(&final_image, b"png").expect("write final generated image");
+        let (adapter, handle, thread_state) =
+            start_codex_test_session(Some(runtime_state_root)).await;
+        thread_state
+            .persist_thread_id("thr_1")
+            .expect("persist thread id");
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {"turn": {"id": "turn_1"}}}),
+            json!({
+                "method": "item/updated",
+                "params": {
+                    "threadId": "thr_1",
+                    "turnId": "turn_1",
+                    "item": {
+                        "type": "imageGeneration",
+                        "id": "ig_1",
+                        "status": "generating"
+                    }
+                }
+            }),
+            json!({
+                "method": "item/updated",
+                "params": {
+                    "threadId": "thr_1",
+                    "turnId": "turn_1",
+                    "item": {
+                        "type": "imageGeneration",
+                        "id": "ig_1",
+                        "status": "completed",
+                        "savedPath": "/runtime/home/.codex/generated_images/thr_1/ig_1-final.png"
+                    }
+                }
+            }),
+            json!({"method": "turn/completed", "params": {"threadId": "thr_1", "turnId": "turn_1"}}),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = client
+            .request("turn/start", json!({}), &event_tx, &thread_state)
+            .await
+            .expect("turn start");
+        client
+            .wait_for_turn_completed(
+                super::extract_app_server_turn_id(&response).as_deref(),
+                Some("thr_1"),
+                None,
+                &event_tx,
+                &thread_state,
+                None,
+            )
+            .await
+            .expect("turn completed");
+
+        let artifacts = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                RuntimeEvent::Artifact { artifact } => Some(artifact),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].artifact_id, "codex:image:thr_1:ig_1");
+        assert_eq!(artifacts[0].filename.as_deref(), Some("ig_1-final.png"));
+        assert_eq!(artifacts[0].path, final_image);
+
+        adapter.close(&handle).await.expect("close");
     }
 
     #[tokio::test]

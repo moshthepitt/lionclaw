@@ -315,20 +315,13 @@ class TelegramWorker:
                     attachment,
                     downloaded,
                 )
-            except Exception as err:
+            except Exception:
                 logger.exception(
                     "lionclaw attachment stage failed for event_id=%s attachment_id=%s",
                     update.event_id,
                     attachment.attachment_id,
                 )
-                missing.append(
-                    AttachmentMissingReport(
-                        attachment_id=attachment.attachment_id,
-                        reason_code="telegram.stage_failed",
-                        reason_text=str(err),
-                    )
-                )
-                continue
+                return False
             if stage.status == "rejected":
                 logger.warning(
                     "lionclaw rejected attachment event_id=%s attachment_id=%s reason_code=%s",
