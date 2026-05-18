@@ -215,6 +215,11 @@ default configuration. The selected work root is mounted at `/workspace`. The
 instance home remains LionClaw's state root and is not the project tree or work
 root.
 
+The operator console treats the transcript as durable conversation: user prompts
+and assistant answer deltas are rendered as message blocks. Runtime status,
+reasoning, command, and progress events are summarized as activity and exposed
+through the inspector instead of being appended as transcript lines.
+
 The planner injects runtime-private environment defaults such as
 `HOME=/runtime/home`, `LIONCLAW_DRAFTS_DIR=/drafts`, and
 `LIONCLAW_SKILLS_DIR=/lionclaw/skills` when runtime-visible skills have mounted

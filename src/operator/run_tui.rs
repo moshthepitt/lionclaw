@@ -1,7 +1,7 @@
 use std::{
     io::{self, Stdout},
     path::PathBuf,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Result};
@@ -58,6 +58,7 @@ const PANEL_SELECTED: Color = Color::Rgb(0, 68, 72);
 const PANEL_READY: Color = Color::Rgb(91, 255, 112);
 const PANEL_WARN: Color = Color::Rgb(255, 198, 55);
 const PANEL_ERROR: Color = Color::Rgb(255, 82, 82);
+const ACTIVITY_ITEM_LIMIT: usize = 12;
 
 pub(crate) struct RunConsoleInvocation<'a> {
     pub(crate) target: &'a TargetContext,
@@ -132,6 +133,168 @@ struct BoundarySummary {
     preset: String,
 }
 
+impl BoundarySummary {
+    fn workspace_compact(&self) -> &str {
+        match self.workspace.as_str() {
+            "read-write" => "rw",
+            "read-only" => "ro",
+            other => other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivityStatus {
+    Idle,
+    Running,
+    Complete,
+    Failed,
+}
+
+impl ActivityStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn style(self) -> Style {
+        let fg = match self {
+            Self::Idle => PANEL_MUTED,
+            Self::Running => PANEL_WARN,
+            Self::Complete => PANEL_READY,
+            Self::Failed => PANEL_ERROR,
+        };
+        Style::default().fg(fg).add_modifier(Modifier::BOLD)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivityItemKind {
+    Done,
+    Command,
+    Progress,
+    Status,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActivityItem {
+    kind: ActivityItemKind,
+    text: String,
+}
+
+#[derive(Debug)]
+struct ActivitySummary {
+    status: ActivityStatus,
+    event_count: usize,
+    command_count: usize,
+    progress_count: usize,
+    started_at: Option<Instant>,
+    items: Vec<ActivityItem>,
+}
+
+impl ActivitySummary {
+    fn new() -> Self {
+        Self {
+            status: ActivityStatus::Idle,
+            event_count: 0,
+            command_count: 0,
+            progress_count: 0,
+            started_at: None,
+            items: Vec::new(),
+        }
+    }
+
+    fn start(&mut self) {
+        self.status = ActivityStatus::Running;
+        self.event_count = 0;
+        self.command_count = 0;
+        self.progress_count = 0;
+        self.started_at = Some(Instant::now());
+        self.items.clear();
+    }
+
+    fn complete(&mut self) {
+        if self.status != ActivityStatus::Failed {
+            self.status = ActivityStatus::Complete;
+        }
+    }
+
+    fn fail(&mut self) {
+        self.status = ActivityStatus::Failed;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.event_count == 0 && self.items.is_empty()
+    }
+
+    fn elapsed_label(&self) -> Option<String> {
+        self.started_at
+            .map(|started_at| format_elapsed(started_at.elapsed()))
+    }
+
+    fn record_stream_event(&mut self, event: &StreamEventDto) {
+        self.event_count = self.event_count.saturating_add(1);
+        match (&event.kind, &event.lane, event.text.as_deref()) {
+            (StreamEventKindDto::MessageDelta, Some(StreamLaneDto::Reasoning), Some(text)) => {
+                self.progress_count = self.progress_count.saturating_add(1);
+                self.push_item(
+                    ActivityItemKind::Progress,
+                    summarize_activity_text("progress", text),
+                );
+            }
+            (StreamEventKindDto::Status, _, Some(text)) => {
+                let kind = classify_activity_status(text);
+                if kind == ActivityItemKind::Command {
+                    self.command_count = self.command_count.saturating_add(1);
+                }
+                if kind == ActivityItemKind::Progress {
+                    self.progress_count = self.progress_count.saturating_add(1);
+                }
+                self.push_item(kind, normalize_activity_text(text));
+            }
+            (StreamEventKindDto::Error, _, Some(text)) => {
+                self.fail();
+                self.push_item(ActivityItemKind::Error, normalize_activity_text(text));
+            }
+            (StreamEventKindDto::TurnCompleted | StreamEventKindDto::Done, _, _) => {
+                self.complete();
+            }
+            _ => {}
+        }
+    }
+
+    fn push_item(&mut self, kind: ActivityItemKind, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.items.push(ActivityItem { kind, text });
+        let overflow = self.items.len().saturating_sub(ACTIVITY_ITEM_LIMIT);
+        if overflow > 0 {
+            self.items.drain(0..overflow);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InspectorMode {
+    Instance,
+    Activity,
+}
+
+impl InspectorMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Instance => "instance",
+            Self::Activity => "activity",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ReadyInstance {
     summary: InstanceSummary,
@@ -178,7 +341,7 @@ impl Focus {
             Self::Instances => "instances",
             Self::Transcript => "transcript",
             Self::Composer => "composer",
-            Self::Inspectors => "boundary",
+            Self::Inspectors => "inspector",
         }
     }
 
@@ -214,7 +377,6 @@ enum Overlay {
 pub(crate) enum TranscriptLineKind {
     User,
     Answer,
-    Reasoning,
     Status,
     Error,
 }
@@ -246,6 +408,8 @@ pub(crate) struct ConsoleApp {
     composer: String,
     transcript: Vec<TranscriptLine>,
     transcript_scroll: u16,
+    activity: ActivitySummary,
+    inspector_mode: InspectorMode,
     status: String,
     active_turn: Option<JoinHandle<()>>,
     active_turn_cancel: Option<oneshot::Sender<String>>,
@@ -286,6 +450,8 @@ impl ConsoleApp {
             composer: String::new(),
             transcript: Vec::new(),
             transcript_scroll: 0,
+            activity: ActivitySummary::new(),
+            inspector_mode: InspectorMode::Instance,
             status: "idle".to_string(),
             active_turn: None,
             active_turn_cancel: None,
@@ -316,6 +482,14 @@ impl ConsoleApp {
             .filter(|name| !name.is_empty())
             .map(ToString::to_string)
             .unwrap_or_else(|| "single".to_string())
+    }
+
+    fn context_label(&self) -> String {
+        if self.project_mode() {
+            format!("{}/{}", self.project_label(), self.selected_name())
+        } else {
+            self.selected_name().to_string()
+        }
     }
 
     fn runtime_label(&self) -> String {
@@ -383,6 +557,8 @@ impl ConsoleApp {
         self.composer.clear();
         self.transcript.clear();
         self.transcript_scroll = 0;
+        self.activity = ActivitySummary::new();
+        self.inspector_mode = InspectorMode::Instance;
         self.load_selected_history().await;
     }
 
@@ -467,6 +643,8 @@ impl ConsoleApp {
             TranscriptLineKind::User,
             prompt.clone(),
         ));
+        self.activity.start();
+        self.inspector_mode = InspectorMode::Activity;
         self.status = format!("running turn on {instance_name}");
         let (handle, cancel_tx) = spawn_streamed_turn(
             kernel,
@@ -534,6 +712,8 @@ impl ConsoleApp {
 
         self.transcript
             .push(TranscriptLine::new(TranscriptLineKind::User, label));
+        self.activity.start();
+        self.inspector_mode = InspectorMode::Activity;
         self.status = format!("running {label}");
         let (handle, cancel_tx) = spawn_streamed_turn(
             kernel,
@@ -558,6 +738,8 @@ impl ConsoleApp {
             TranscriptLineKind::User,
             "/lionclaw reset",
         ));
+        self.activity.start();
+        self.inspector_mode = InspectorMode::Activity;
         self.status = "resetting session".to_string();
         let backend_tx = backend_tx.clone();
         self.active_turn = Some(tokio::spawn(async move {
@@ -583,7 +765,7 @@ impl ConsoleApp {
     fn apply_backend_event(&mut self, event: BackendEvent) {
         match event {
             BackendEvent::Stream(event) => {
-                push_stream_event(&mut self.transcript, &event);
+                push_stream_event(&mut self.transcript, &mut self.activity, &event);
             }
             BackendEvent::TurnFinished(result) => {
                 self.active_turn = None;
@@ -596,11 +778,12 @@ impl ConsoleApp {
                                 outcome.response.assistant_text,
                             ));
                         }
+                        self.activity.complete();
                         self.status = "idle".to_string();
                     }
                     Err(message) => {
-                        self.transcript
-                            .push(TranscriptLine::new(TranscriptLineKind::Error, message));
+                        self.activity.fail();
+                        self.activity.push_item(ActivityItemKind::Error, message);
                         self.status = "turn failed".to_string();
                     }
                 }
@@ -614,15 +797,16 @@ impl ConsoleApp {
                             ready.session_id = session_id;
                         }
                         self.transcript.clear();
-                        self.transcript.push(TranscriptLine::new(
-                            TranscriptLineKind::Status,
-                            "opened a fresh session",
-                        ));
+                        self.activity.complete();
+                        self.activity.push_item(
+                            ActivityItemKind::Done,
+                            "opened a fresh session".to_string(),
+                        );
                         self.status = "idle".to_string();
                     }
                     Err(message) => {
-                        self.transcript
-                            .push(TranscriptLine::new(TranscriptLineKind::Error, message));
+                        self.activity.fail();
+                        self.activity.push_item(ActivityItemKind::Error, message);
                         self.status = "reset failed".to_string();
                     }
                 }
@@ -783,7 +967,7 @@ fn resolve_boundary_summary(
             crate::runtime_timeouts::format_duration(timeouts.hard)
         } else {
             format!(
-                "quiet {}, max {}",
+                "{}/{}",
                 crate::runtime_timeouts::format_duration(timeouts.idle),
                 crate::runtime_timeouts::format_duration(timeouts.hard)
             )
@@ -949,26 +1133,23 @@ fn is_answer_delta(event: &StreamEventDto) -> bool {
     ) && event.text.as_deref().is_some_and(|text| !text.is_empty())
 }
 
-pub(crate) fn push_stream_event(transcript: &mut Vec<TranscriptLine>, event: &StreamEventDto) {
+fn push_stream_event(
+    transcript: &mut Vec<TranscriptLine>,
+    activity: &mut ActivitySummary,
+    event: &StreamEventDto,
+) {
+    activity.record_stream_event(event);
     match (&event.kind, &event.lane, event.text.as_deref()) {
         (StreamEventKindDto::MessageDelta, Some(StreamLaneDto::Answer), Some(text)) => {
             append_transcript_delta(transcript, TranscriptLineKind::Answer, text);
         }
-        (StreamEventKindDto::MessageDelta, Some(StreamLaneDto::Reasoning), Some(text)) => {
-            append_transcript_delta(transcript, TranscriptLineKind::Reasoning, text);
-        }
-        (StreamEventKindDto::Status, _, Some(text)) => {
-            transcript.push(TranscriptLine::new(TranscriptLineKind::Status, text));
-        }
-        (StreamEventKindDto::Error, _, Some(text)) => {
-            transcript.push(TranscriptLine::new(TranscriptLineKind::Error, text));
-        }
         (StreamEventKindDto::TurnCompleted, _, _)
         | (StreamEventKindDto::Done, _, _)
-        | (_, _, None) => {}
-        (_, _, Some(text)) => {
-            transcript.push(TranscriptLine::new(TranscriptLineKind::Status, text));
-        }
+        | (_, _, None)
+        | (StreamEventKindDto::MessageDelta, Some(StreamLaneDto::Reasoning), Some(_))
+        | (StreamEventKindDto::Status, _, Some(_))
+        | (StreamEventKindDto::Error, _, Some(_)) => {}
+        (_, _, Some(_)) => {}
     }
 }
 
@@ -1013,6 +1194,8 @@ pub(crate) async fn run_launch_blocker(blocker: LaunchBlocker) -> Result<()> {
         composer: String::new(),
         transcript: Vec::new(),
         transcript_scroll: 0,
+        activity: ActivitySummary::new(),
+        inspector_mode: InspectorMode::Instance,
         status: "launch blocked".to_string(),
         active_turn: None,
         active_turn_cancel: None,
@@ -1047,6 +1230,8 @@ pub(crate) async fn run_project_launch_blocker(
         composer: String::new(),
         transcript: Vec::new(),
         transcript_scroll: 0,
+        activity: ActivitySummary::new(),
+        inspector_mode: InspectorMode::Instance,
         status: "no instances configured".to_string(),
         active_turn: None,
         active_turn_cancel: None,
@@ -1127,12 +1312,15 @@ async fn handle_key(
 
     match (key.code, key.modifiers) {
         (KeyCode::F(1), _) => app.overlay = Some(Overlay::Help),
-        (KeyCode::Char('?'), KeyModifiers::NONE)
-            if app.focus != Focus::Composer && app.composer.is_empty() =>
-        {
-            app.overlay = Some(Overlay::Help)
-        }
         (KeyCode::Char('p'), KeyModifiers::CONTROL) => app.overlay = Some(Overlay::Palette),
+        (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
+            app.inspector_mode = match app.inspector_mode {
+                InspectorMode::Instance => InspectorMode::Activity,
+                InspectorMode::Activity => InspectorMode::Instance,
+            };
+            app.focus = Focus::Inspectors;
+            app.status = format!("inspector: {}", app.inspector_mode.label());
+        }
         (KeyCode::Tab, _) => {
             app.focus = app.focus.next(app.project_mode());
             app.status = format!("focus: {}", app.focus.label());
@@ -1246,6 +1434,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
     }
 
     let boundary = app.boundary_summary();
+    let workspace = boundary.workspace_compact().to_string();
     let line = Line::from(vec![
         Span::styled(
             "LionClaw",
@@ -1253,18 +1442,15 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
                 .fg(PANEL_BORDER)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("    project: ", Style::default().fg(PANEL_MUTED)),
-        Span::styled(app.project_label(), Style::default().fg(Color::White)),
-        Span::styled("    instance: ", Style::default().fg(PANEL_BORDER)),
-        Span::styled(
-            app.selected_name().to_string(),
-            Style::default().fg(Color::White),
-        ),
-        Span::styled("    runtime: ", Style::default().fg(PANEL_BORDER)),
+        Span::styled("  |  ", Style::default().fg(PANEL_MUTED)),
+        Span::styled(app.context_label(), Style::default().fg(Color::White)),
+        Span::raw("    "),
         Span::styled(app.runtime_label(), Style::default().fg(Color::White)),
-        Span::styled("    net: ", Style::default().fg(PANEL_BORDER)),
+        Span::raw("    "),
+        Span::styled("net:", Style::default().fg(PANEL_BORDER)),
         Span::styled(boundary.network, Style::default().fg(Color::White)),
-        Span::styled("    secrets: ", Style::default().fg(PANEL_BORDER)),
+        Span::raw("    "),
+        Span::styled("secrets:", Style::default().fg(PANEL_BORDER)),
         Span::styled(
             boundary.secrets,
             Style::default().fg(if app.selected.is_ready() {
@@ -1273,9 +1459,9 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
                 PANEL_ERROR
             }),
         ),
-        Span::styled("    /workspace: ", Style::default().fg(PANEL_BORDER)),
-        Span::styled(boundary.workspace, Style::default().fg(Color::White)),
-        Span::styled("    timeout: ", Style::default().fg(PANEL_BORDER)),
+        Span::raw("    "),
+        Span::styled(workspace, Style::default().fg(Color::White)),
+        Span::raw("    "),
         Span::styled(boundary.timeout, Style::default().fg(Color::White)),
     ]);
     frame.render_widget(
@@ -1301,13 +1487,13 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
                 Constraint::Length(44),
             ])
             .split(area);
-        let [instances_area, _, transcript_area, _, boundary_area] = chunks.as_ref() else {
+        let [instances_area, _, transcript_area, _, inspector_area] = chunks.as_ref() else {
             render_transcript(frame, area, app);
             return;
         };
         render_instances(frame, *instances_area, app);
         render_transcript(frame, *transcript_area, app);
-        render_boundary(frame, *boundary_area, app);
+        render_inspector(frame, *inspector_area, app);
     } else {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -1317,24 +1503,26 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
                 Constraint::Length(44),
             ])
             .split(area);
-        let [transcript_area, _, boundary_area] = chunks.as_ref() else {
+        let [transcript_area, _, inspector_area] = chunks.as_ref() else {
             render_transcript(frame, area, app);
             return;
         };
         render_transcript(frame, *transcript_area, app);
-        render_boundary(frame, *boundary_area, app);
+        render_inspector(frame, *inspector_area, app);
     }
 }
 
 fn render_instances(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
-    let content = render_panel_shell(frame, area, "Instances", app.focus == Focus::Instances);
+    let content = render_panel_shell(frame, area, "Project", app.focus == Focus::Instances);
     if content.width < 8 || content.height < 2 {
         return;
     }
 
-    let mut row_y = content.y.saturating_add(1);
+    let mut row_y = content.y;
+    render_section_heading(frame, content, row_y, "Instances");
+    row_y = row_y.saturating_add(2);
     for (index, instance) in app.instances.iter().enumerate() {
-        if row_y >= content.y.saturating_add(content.height.saturating_sub(7)) {
+        if row_y >= content.y.saturating_add(content.height) {
             break;
         }
         let selected = index == app.selected_index;
@@ -1349,17 +1537,11 @@ fn render_instances(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
         };
         let state = if blocked {
             "blocked"
-        } else if selected && app.selected.is_ready() {
+        } else if instance.work_root.is_some() {
             "ready"
         } else {
             "idle"
         };
-        let selected_runtime = app.runtime_label();
-        let runtime = instance.default_runtime.as_deref().unwrap_or(if selected {
-            selected_runtime.as_str()
-        } else {
-            "-"
-        });
         let default_mark = if instance.is_default { " default" } else { "" };
         let shared = if instance.shared_work_root_count > 1 {
             format!(" [{}]", instance.shared_work_root_count)
@@ -1369,7 +1551,6 @@ fn render_instances(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
         let row = format_instance_row(
             icon,
             instance.display_name(),
-            runtime,
             &format!("{state}{default_mark}{shared}"),
             content.width as usize,
         );
@@ -1383,17 +1564,31 @@ fn render_instances(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
                 height: 1,
             },
         );
-        row_y = row_y.saturating_add(2);
+        row_y = row_y.saturating_add(1);
     }
 
-    if content.height > 12 {
-        let menu_top = content.y + content.height - 8;
-        draw_horizontal_rule(frame, content.x, menu_top, content.width, PANEL_MUTED);
-        render_menu_row(frame, content, menu_top + 1, "Sessions");
-        render_menu_row(frame, content, menu_top + 2, "Drafts");
-        render_menu_row(frame, content, menu_top + 3, "Audit");
-        render_menu_row(frame, content, menu_top + 4, "Boundary");
-        render_menu_row(frame, content, menu_top + 5, "Runtime");
+    if row_y.saturating_add(4) < content.y.saturating_add(content.height) {
+        row_y = row_y.saturating_add(1);
+        draw_horizontal_rule(frame, content.x, row_y, content.width, PANEL_MUTED);
+        row_y = row_y.saturating_add(2);
+        render_section_heading(frame, content, row_y, "Sessions");
+        row_y = row_y.saturating_add(2);
+        let session_state = if app.selected.is_ready() {
+            if app.continue_last_session {
+                "continued"
+            } else {
+                "current"
+            }
+        } else {
+            "blocked"
+        };
+        render_project_object_row(frame, content, row_y, "current", session_state, false);
+        row_y = row_y.saturating_add(2);
+        if row_y.saturating_add(3) < content.y.saturating_add(content.height) {
+            render_section_heading(frame, content, row_y, "Drafts");
+            row_y = row_y.saturating_add(2);
+            render_project_object_row(frame, content, row_y, "No drafts yet", "", true);
+        }
     }
 }
 
@@ -1425,7 +1620,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
     } else {
         transcript_render_lines(&app.transcript)
     };
-    let activity_rows = 2;
+    let activity_rows = if app.activity.is_empty() { 0 } else { 3 };
     let transcript_area = Rect {
         x: content.x,
         y: content.y,
@@ -1438,21 +1633,39 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
             .wrap(Wrap { trim: false }),
         transcript_area,
     );
-    if content.height > activity_rows {
+    if activity_rows > 0 && content.height > activity_rows {
         let rule_y = content.y + content.height - activity_rows;
         draw_horizontal_rule(frame, content.x, rule_y, content.width, PANEL_MUTED);
-        let activity = Line::from(vec![
-            Span::styled("runtime activity", Style::default().fg(PANEL_BORDER)),
-            Span::raw("  ▶  "),
+        let mut spans = vec![
             Span::styled(
-                if app.active() { "streaming..." } else { "idle" },
-                Style::default().fg(if app.active() {
-                    PANEL_BORDER
-                } else {
-                    PANEL_MUTED
-                }),
+                "activity",
+                Style::default()
+                    .fg(PANEL_BORDER)
+                    .add_modifier(Modifier::BOLD),
             ),
-        ]);
+            Span::raw("  ▸  "),
+            Span::styled(app.activity.status.label(), app.activity.status.style()),
+            Span::raw(format!("    {} events", app.activity.event_count)),
+        ];
+        if app.activity.command_count > 0 {
+            spans.push(Span::raw(format!(
+                "    {} commands",
+                app.activity.command_count
+            )));
+        }
+        if app.activity.progress_count > 0 {
+            spans.push(Span::raw(format!(
+                "    {} progress notes",
+                app.activity.progress_count
+            )));
+        }
+        if let Some(elapsed) = app.activity.elapsed_label() {
+            spans.push(Span::styled(
+                format!("    {elapsed}"),
+                Style::default().fg(PANEL_BORDER),
+            ));
+        }
+        let activity = Line::from(spans);
         frame.render_widget(
             Paragraph::new(activity),
             Rect {
@@ -1466,24 +1679,35 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
 }
 
 pub(crate) fn transcript_render_lines(lines: &[TranscriptLine]) -> Vec<Line<'static>> {
-    lines
-        .iter()
-        .flat_map(|line| {
-            let (prefix, style) = match line.kind {
-                TranscriptLineKind::User => (
-                    "you> ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                TranscriptLineKind::Answer => ("lionclaw> ", Style::default().fg(Color::White)),
-                TranscriptLineKind::Reasoning => ("thinking> ", Style::default().fg(Color::Blue)),
-                TranscriptLineKind::Status => ("status> ", Style::default().fg(Color::Green)),
-                TranscriptLineKind::Error => ("error> ", Style::default().fg(Color::Red)),
-            };
-            split_render_line(prefix, style, &line.text)
-        })
-        .collect()
+    let mut rendered = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            rendered.push(Line::raw(""));
+        }
+        let (role, style) = match line.kind {
+            TranscriptLineKind::User => (
+                "you",
+                Style::default()
+                    .fg(PANEL_BORDER)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            TranscriptLineKind::Answer => (
+                "assistant",
+                Style::default()
+                    .fg(PANEL_BORDER)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            TranscriptLineKind::Status => ("note", Style::default().fg(PANEL_MUTED)),
+            TranscriptLineKind::Error => ("error", Style::default().fg(PANEL_ERROR)),
+        };
+        rendered.push(Line::styled(role.to_string(), style));
+        rendered.extend(split_render_line(
+            "",
+            Style::default().fg(Color::White),
+            &line.text,
+        ));
+    }
+    rendered
 }
 
 fn split_render_line(prefix: &str, style: Style, text: &str) -> Vec<Line<'static>> {
@@ -1500,15 +1724,56 @@ fn split_render_line(prefix: &str, style: Style, text: &str) -> Vec<Line<'static
         .collect()
 }
 
-fn render_boundary(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
-    let content = render_panel_shell(frame, area, "Boundary", app.focus == Focus::Inspectors);
+fn render_inspector(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
+    let title = match app.inspector_mode {
+        InspectorMode::Instance => "Inspector  Instance",
+        InspectorMode::Activity => "Inspector  Activity",
+    };
+    let content = render_panel_shell(frame, area, title, app.focus == Focus::Inspectors);
     if content.width < 8 || content.height < 4 {
+        return;
+    }
+
+    match app.inspector_mode {
+        InspectorMode::Instance => render_instance_inspector(frame, content, app),
+        InspectorMode::Activity => render_activity_inspector(frame, content, app),
+    }
+}
+
+fn render_instance_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp) {
+    if let SelectedInstanceState::Blocked { blocker, .. } = &app.selected {
+        let text = Text::from(vec![
+            section_line("!", "Selected"),
+            Line::raw(""),
+            kv_line("instance", app.selected_name()),
+            kv_line("state", "blocked"),
+            kv_line("reason", &blocker.title),
+            Line::raw(""),
+            Line::styled(
+                "Launch guidance is shown in the transcript pane.",
+                Style::default().fg(PANEL_MUTED),
+            ),
+        ]);
+        frame.render_widget(
+            Paragraph::new(text).wrap(Wrap { trim: false }),
+            content.inner(Margin {
+                vertical: 1,
+                horizontal: 1,
+            }),
+        );
         return;
     }
 
     let boundary = app.boundary_summary();
     let mut lines = vec![
-        section_line("▱", "Mounts"),
+        section_line("●", "Selected"),
+        Line::raw(""),
+        kv_line("instance", app.selected_name()),
+        kv_line("runtime", &app.runtime_label()),
+        kv_line("kind", &app.runtime_kind_label()),
+        kv_line("preset", &boundary.preset),
+        Line::raw(""),
+        section_line("▱", "Boundary"),
         Line::raw(""),
         kv_arrow_line("/workspace", "repo", &boundary.workspace),
         kv_arrow_line("/runtime", "session", "private"),
@@ -1518,10 +1783,6 @@ fn render_boundary(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
         section_line("◎", "Network"),
         Line::raw(""),
         Line::raw(format!("  {}", boundary.network)),
-        Line::styled(
-            format!("  runtime kind {}", app.runtime_kind_label()),
-            Style::default().fg(PANEL_MUTED),
-        ),
         Line::raw(""),
         section_line("⚿", "Secrets"),
         Line::raw(""),
@@ -1544,18 +1805,11 @@ fn render_boundary(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
         section_line("▣", "Audit"),
         Line::raw(""),
     ];
-    if app.selected.is_ready() {
-        lines.extend([
-            check_line("runtime.plan.allow"),
-            check_line("runtime.started"),
-            check_line("session.turn.open"),
-        ]);
-    } else {
-        lines.extend([
-            Line::styled("  ! launch blocked", Style::default().fg(PANEL_ERROR)),
-            Line::raw(format!("  {}", app.status)),
-        ]);
-    }
+    lines.extend([
+        check_line("runtime.plan.allow"),
+        check_line("runtime.started"),
+        check_line("session.turn.open"),
+    ]);
 
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
@@ -1615,15 +1869,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
         PANEL_MUTED,
     );
     let mode = if app.active() { "running" } else { "normal" };
-    let status = Line::from(vec![
-        Span::styled(mode, Style::default().fg(PANEL_BORDER)),
-        Span::styled("   |   instance: ", Style::default().fg(PANEL_MUTED)),
-        Span::raw(app.selected_name().to_string()),
-        Span::styled(
-            "   |   runtime controls pass through",
-            Style::default().fg(PANEL_MUTED),
-        ),
-    ]);
+    let status = Line::from(vec![Span::styled(mode, Style::default().fg(PANEL_BORDER))]);
     frame.render_widget(
         Paragraph::new(status),
         Rect {
@@ -1635,7 +1881,47 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
     );
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
+fn render_activity_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp) {
+    let mut lines = Vec::new();
+    if app.activity.is_empty() {
+        lines.push(Line::styled(
+            "No runtime activity for the current turn.",
+            Style::default().fg(PANEL_MUTED),
+        ));
+    } else {
+        lines.push(Line::from(vec![
+            Span::raw("status "),
+            Span::styled(app.activity.status.label(), app.activity.status.style()),
+        ]));
+        lines.push(Line::raw(format!("events {}", app.activity.event_count)));
+        if app.activity.command_count > 0 {
+            lines.push(Line::raw(format!(
+                "commands {}",
+                app.activity.command_count
+            )));
+        }
+        if app.activity.progress_count > 0 {
+            lines.push(Line::raw(format!(
+                "progress notes {}",
+                app.activity.progress_count
+            )));
+        }
+        lines.push(Line::raw(""));
+        for item in &app.activity.items {
+            lines.push(activity_item_line(item));
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        content.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        }),
+    );
+}
+
+fn render_footer(frame: &mut Frame<'_>, area: Rect, _app: &ConsoleApp) {
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
@@ -1646,22 +1932,18 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
         return;
     }
     let line = Line::from(vec![
-        key_span("?"),
-        Span::raw(" Help     |     "),
+        key_span("F1"),
+        Span::raw(" Help     "),
         key_span("Ctrl+P"),
-        Span::raw(" Palette     |     "),
+        Span::raw(" Palette     "),
+        key_span("Ctrl+O"),
+        Span::raw(" Activity     "),
         key_span("Tab"),
-        Span::raw(" Focus     |     "),
-        key_span("Enter"),
-        Span::raw(" Submit     |     "),
+        Span::raw(" Focus     "),
         key_span("Ctrl+C"),
-        Span::raw(" Interrupt     |     "),
+        Span::raw(" Interrupt     "),
         key_span("F10"),
         Span::raw(" Exit"),
-        Span::styled(
-            format!("     {}", app.status),
-            Style::default().fg(PANEL_MUTED),
-        ),
     ]);
     frame.render_widget(
         Paragraph::new(line),
@@ -1738,14 +2020,68 @@ fn draw_horizontal_rule(frame: &mut Frame<'_>, x: u16, y: u16, width: u16, color
     );
 }
 
-fn format_instance_row(icon: &str, name: &str, runtime: &str, state: &str, width: usize) -> String {
-    let name_width = 11.min(width.saturating_sub(18)).max(4);
-    let runtime_width = 10.min(width.saturating_sub(name_width + 8)).max(3);
-    let state_width = width.saturating_sub(name_width + runtime_width + 6).max(3);
+fn render_section_heading(frame: &mut Frame<'_>, content: Rect, y: u16, label: &str) {
+    if y >= content.y + content.height {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            label.to_string(),
+            Style::default().fg(Color::White),
+        )),
+        Rect {
+            x: content.x,
+            y,
+            width: content.width,
+            height: 1,
+        },
+    );
+}
+
+fn render_project_object_row(
+    frame: &mut Frame<'_>,
+    content: Rect,
+    y: u16,
+    name: &str,
+    detail: &str,
+    muted: bool,
+) {
+    if y >= content.y + content.height {
+        return;
+    }
+    let width = content.width as usize;
+    let detail_width = 12.min(width.saturating_sub(10));
+    let name_width = width.saturating_sub(detail_width + 2).max(1);
+    let row = if detail.is_empty() {
+        format!(" {}", truncate_to(name, width.saturating_sub(1)))
+    } else {
+        format!(
+            " {:name_width$} {:>detail_width$}",
+            truncate_to(name, name_width),
+            truncate_to(detail, detail_width),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::raw(row)).style(if muted {
+            Style::default().fg(PANEL_MUTED)
+        } else {
+            Style::default().fg(Color::White)
+        }),
+        Rect {
+            x: content.x,
+            y,
+            width: content.width,
+            height: 1,
+        },
+    );
+}
+
+fn format_instance_row(icon: &str, name: &str, state: &str, width: usize) -> String {
+    let name_width = 14.min(width.saturating_sub(14)).max(4);
+    let state_width = width.saturating_sub(name_width + 5).max(3);
     let mut row = format!(
-        " {icon} {:name_width$} {:runtime_width$} {:>state_width$}",
+        " {icon} {:name_width$} {:>state_width$}",
         truncate_to(name, name_width),
-        truncate_to(runtime, runtime_width),
         truncate_to(state, state_width),
     );
     if row.chars().count() > width {
@@ -1771,26 +2107,6 @@ fn instance_row_style(selected: bool, state: &str) -> Style {
     }
 }
 
-fn render_menu_row(frame: &mut Frame<'_>, content: Rect, y: u16, label: &str) {
-    if y >= content.y + content.height {
-        return;
-    }
-    let line = format!(
-        "   {:<width$}>",
-        label,
-        width = content.width.saturating_sub(6) as usize
-    );
-    frame.render_widget(
-        Paragraph::new(Line::styled(line, Style::default().fg(Color::White))),
-        Rect {
-            x: content.x,
-            y,
-            width: content.width,
-            height: 1,
-        },
-    );
-}
-
 fn section_line(icon: &'static str, label: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{icon}  "), Style::default().fg(PANEL_BORDER)),
@@ -1800,6 +2116,13 @@ fn section_line(icon: &'static str, label: &'static str) -> Line<'static> {
                 .fg(PANEL_BORDER)
                 .add_modifier(Modifier::BOLD),
         ),
+    ])
+}
+
+fn kv_line(label: &'static str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {label:<10}"), Style::default().fg(PANEL_MUTED)),
+        Span::raw(value.to_string()),
     ])
 }
 
@@ -1813,6 +2136,20 @@ fn kv_arrow_line(left: &'static str, middle: &'static str, right: &str) -> Line<
         Span::raw(format!("  {left:<18}")),
         Span::styled("->  ", Style::default().fg(PANEL_BORDER)),
         Span::raw(target),
+    ])
+}
+
+fn activity_item_line(item: &ActivityItem) -> Line<'static> {
+    let (icon, style) = match item.kind {
+        ActivityItemKind::Done => ("✓", Style::default().fg(PANEL_READY)),
+        ActivityItemKind::Command => ("→", Style::default().fg(PANEL_BORDER)),
+        ActivityItemKind::Progress => ("•", Style::default().fg(PANEL_BORDER)),
+        ActivityItemKind::Status => ("→", Style::default().fg(PANEL_MUTED)),
+        ActivityItemKind::Error => ("!", Style::default().fg(PANEL_ERROR)),
+    };
+    Line::from(vec![
+        Span::styled(format!("{icon}  "), style),
+        Span::raw(item.text.clone()),
     ])
 }
 
@@ -1836,6 +2173,45 @@ fn truncate_to(value: &str, width: usize) -> String {
     value.chars().take(width).collect()
 }
 
+fn classify_activity_status(text: &str) -> ActivityItemKind {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("error") || lower.contains("failed") || lower.contains("denied") {
+        ActivityItemKind::Error
+    } else if lower.contains("completed")
+        || lower.contains("started")
+        || lower.contains("mounted")
+        || lower.contains("granted")
+        || lower.contains("compacted")
+    {
+        ActivityItemKind::Done
+    } else if lower.contains("command") || lower.contains("exec") {
+        ActivityItemKind::Command
+    } else if lower.contains("progress") || lower.contains("checking") || lower.contains("reading")
+    {
+        ActivityItemKind::Progress
+    } else {
+        ActivityItemKind::Status
+    }
+}
+
+fn normalize_activity_text(text: &str) -> String {
+    let trimmed = text.trim();
+    trimmed
+        .strip_prefix("codex item: ")
+        .map(|item| format!("codex {item}"))
+        .unwrap_or(trimmed.to_string())
+}
+
+fn summarize_activity_text(prefix: &str, text: &str) -> String {
+    let normalized = normalize_activity_text(text);
+    format!("{prefix}: {}", truncate_to(&normalized, 80))
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
 fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp, overlay: Overlay) {
     let popup = centered_rect(70, 55, area);
     frame.render_widget(Clear, popup);
@@ -1843,8 +2219,9 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp, overlay: 
         Overlay::Help => (
             " Help ",
             vec![
-                Line::from("? help"),
+                Line::from("F1 help"),
                 Line::from("Ctrl+P command palette"),
+                Line::from("Ctrl+O toggle activity inspector"),
                 Line::from("Tab / Shift+Tab move focus"),
                 Line::from("Enter submit prompt or /lionclaw command"),
                 Line::from("Alt+Enter insert newline"),
@@ -1914,10 +2291,13 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
-    fn stream_events_append_answer_status_and_errors() {
+    fn stream_events_append_answers_and_summarize_runtime_activity() {
         let mut transcript = Vec::new();
+        let mut activity = ActivitySummary::new();
+        activity.start();
         push_stream_event(
             &mut transcript,
+            &mut activity,
             &StreamEventDto {
                 kind: StreamEventKindDto::MessageDelta,
                 lane: Some(StreamLaneDto::Answer),
@@ -1927,6 +2307,7 @@ mod tests {
         );
         push_stream_event(
             &mut transcript,
+            &mut activity,
             &StreamEventDto {
                 kind: StreamEventKindDto::MessageDelta,
                 lane: Some(StreamLaneDto::Answer),
@@ -1936,25 +2317,43 @@ mod tests {
         );
         push_stream_event(
             &mut transcript,
+            &mut activity,
             &StreamEventDto {
                 kind: StreamEventKindDto::Status,
                 lane: None,
                 code: None,
-                text: Some("done".to_string()),
+                text: Some("codex item: commandExecution".to_string()),
+            },
+        );
+        push_stream_event(
+            &mut transcript,
+            &mut activity,
+            &StreamEventDto {
+                kind: StreamEventKindDto::MessageDelta,
+                lane: Some(StreamLaneDto::Reasoning),
+                code: None,
+                text: Some("checking project state".to_string()),
             },
         );
 
         assert_eq!(
             transcript,
-            vec![
-                TranscriptLine::new(TranscriptLineKind::Answer, "hello world"),
-                TranscriptLine::new(TranscriptLineKind::Status, "done"),
-            ]
+            vec![TranscriptLine::new(
+                TranscriptLineKind::Answer,
+                "hello world"
+            ),]
         );
+        assert_eq!(activity.event_count, 4);
+        assert_eq!(activity.command_count, 1);
+        assert_eq!(activity.progress_count, 1);
+        assert!(activity
+            .items
+            .iter()
+            .any(|item| item.text == "codex commandExecution"));
     }
 
     #[test]
-    fn transcript_rendering_preserves_routing_prefixes() {
+    fn transcript_rendering_uses_message_blocks() {
         let lines = transcript_render_lines(&[
             TranscriptLine::new(TranscriptLineKind::User, "/compact"),
             TranscriptLine::new(TranscriptLineKind::Answer, "ok"),
@@ -1972,7 +2371,16 @@ mod tests {
 
         assert_eq!(
             rendered,
-            vec!["you> /compact", "lionclaw> ok", "error> failed"]
+            vec![
+                "you",
+                "/compact",
+                "",
+                "assistant",
+                "ok",
+                "",
+                "error",
+                "failed"
+            ]
         );
     }
 
@@ -2018,6 +2426,8 @@ mod tests {
             composer: String::new(),
             transcript: Vec::new(),
             transcript_scroll: 0,
+            activity: ActivitySummary::new(),
+            inspector_mode: InspectorMode::Instance,
             status: "launch blocked".to_string(),
             active_turn: None,
             active_turn_cancel: None,
@@ -2092,7 +2502,6 @@ mod tests {
             overlay: None,
             composer: String::new(),
             transcript: vec![
-                TranscriptLine::new(TranscriptLineKind::Status, "runtime started"),
                 TranscriptLine::new(
                     TranscriptLineKind::User,
                     "Please review the changes in this branch.",
@@ -2100,6 +2509,8 @@ mod tests {
                 TranscriptLine::new(TranscriptLineKind::Answer, "Summary\nLooks good overall."),
             ],
             transcript_scroll: 0,
+            activity: ActivitySummary::new(),
+            inspector_mode: InspectorMode::Instance,
             status: "idle".to_string(),
             active_turn: None,
             active_turn_cancel: None,
@@ -2108,15 +2519,17 @@ mod tests {
         };
 
         let rendered = render_to_text(&app, 160, 50);
-        assert!(rendered.contains("LionClaw    project: lionclaw"));
-        assert!(rendered.contains("instance: main"));
-        assert!(rendered.contains("runtime: codex"));
-        assert!(rendered.contains("net: none"));
+        assert!(rendered.contains("LionClaw  |  lionclaw/main"));
+        assert!(rendered.contains("codex"));
+        assert!(rendered.contains("net:none"));
+        assert!(rendered.contains("Project"));
         assert!(rendered.contains("Instances"));
         assert!(rendered.contains("Transcript"));
+        assert!(rendered.contains("Inspector  Instance"));
         assert!(rendered.contains("Boundary"));
         assert!(rendered.contains("Ask through the selected runtime"));
-        assert!(rendered.contains("runtime controls pass through"));
+        assert!(!rendered.contains("runtime controls pass through"));
+        assert!(rendered.contains("Ctrl+O"));
         assert!(rendered.contains("Ctrl+P"));
         assert_eq!(rendered.lines().count(), 50);
     }
@@ -2211,7 +2624,7 @@ mod tests {
     }
 
     #[test]
-    fn question_mark_types_in_composer_but_opens_help_outside_composer() {
+    fn question_mark_is_printable_and_f1_opens_help() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2242,7 +2655,43 @@ mod tests {
             )
             .await;
         });
+        assert_eq!(nav_app.composer, "?");
+        assert_eq!(nav_app.focus, Focus::Composer);
+        assert!(nav_app.overlay.is_none());
+
+        runtime.block_on(async {
+            handle_key(
+                &mut nav_app,
+                KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+                &backend_tx,
+            )
+            .await;
+        });
         assert_eq!(nav_app.overlay, Some(Overlay::Help));
+    }
+
+    #[test]
+    fn ctrl_o_toggles_activity_inspector() {
+        let mut app = blocked_test_app();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+
+        runtime.block_on(async {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+                &backend_tx,
+            )
+            .await;
+        });
+
+        assert_eq!(app.inspector_mode, InspectorMode::Activity);
+        assert_eq!(app.focus, Focus::Inspectors);
+        let rendered = render_to_text(&app, 100, 30);
+        assert!(rendered.contains("Inspector  Activity"));
     }
 
     #[test]
@@ -2303,6 +2752,8 @@ mod tests {
             composer: String::new(),
             transcript: Vec::new(),
             transcript_scroll: 0,
+            activity: ActivitySummary::new(),
+            inspector_mode: InspectorMode::Instance,
             status: "idle".to_string(),
             active_turn: None,
             active_turn_cancel: None,

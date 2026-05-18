@@ -67,9 +67,10 @@ lionclaw run
 ```
 
 LionClaw opens the project operator console when attached to a terminal. The
-console lists configured project instances, shows the selected instance's work
-root, runtime profile, boundary status, transcript, and composer, then submits
-turns through the same confined runtime flow.
+console keeps the current context in the top ribbon, switchable project objects
+on the left, durable conversation in the transcript, selected details in the
+inspector, and prompt input in the composer. Runtime stream detail is summarized
+as inspectable activity instead of being mixed into the conversation.
 
 Use the plain line-oriented path when scripting or when a terminal UI is not
 wanted:
@@ -106,6 +107,10 @@ lionclaw run
 
 In a terminal, `run` opens the operator console. Use `lionclaw run --plain`
 for the line-oriented interactive path.
+
+Inside the console, use `F1` for help, `Ctrl+P` for the command palette,
+`Ctrl+O` for activity details, `Tab` to move focus, `Ctrl+C` to interrupt an
+active turn, and `F10` to exit when idle.
 
 For Codex, use a logged-in Codex CLI and run LionClaw where the `podman`
 executable is available. If `run` reports a missing runtime image, build or

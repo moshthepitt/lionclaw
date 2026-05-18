@@ -88,8 +88,14 @@ Expected on a TTY:
 
 - a full-screen operator console opens
 - the instance list shows the configured project instances
-- the selected instance shows its work root, runtime, boundary summary, session
-  state, transcript, and composer
+- the top ribbon shows the selected project instance, runtime, boundary flags,
+  and timeout
+- the transcript pane shows durable user and assistant messages without raw
+  runtime event spam
+- the inspector shows selected instance details, and `Ctrl+O` toggles runtime
+  activity details
+- the composer accepts printable characters such as `?`; `F1` opens help and
+  `Tab` visibly moves focus
 
 For the plain fallback:
 
