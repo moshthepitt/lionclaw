@@ -12,10 +12,10 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
 use tokio::{
@@ -52,6 +52,12 @@ use crate::kernel::runtime::{execution::planner::resolve_execution_preset, Execu
 
 const EVENT_POLL: Duration = Duration::from_millis(50);
 const HISTORY_LIMIT: usize = 24;
+const PANEL_BORDER: Color = Color::Rgb(0, 205, 220);
+const PANEL_MUTED: Color = Color::Rgb(128, 132, 142);
+const PANEL_SELECTED: Color = Color::Rgb(0, 68, 72);
+const PANEL_READY: Color = Color::Rgb(91, 255, 112);
+const PANEL_WARN: Color = Color::Rgb(255, 198, 55);
+const PANEL_ERROR: Color = Color::Rgb(255, 82, 82);
 
 pub(crate) struct RunConsoleInvocation<'a> {
     pub(crate) target: &'a TargetContext,
@@ -72,6 +78,7 @@ pub(crate) struct InstanceSummary {
     pub(crate) work_root: Option<PathBuf>,
     pub(crate) work_root_finding: Option<String>,
     pub(crate) shared_work_root_count: usize,
+    pub(crate) default_runtime: Option<String>,
 }
 
 impl InstanceSummary {
@@ -229,7 +236,7 @@ pub(crate) struct ConsoleApp {
 impl ConsoleApp {
     pub(crate) async fn load(invocation: RunConsoleInvocation<'_>) -> Result<Self> {
         let target = invocation.target;
-        let (project_root, instances, selected_index) = resolve_console_instances(target)?;
+        let (project_root, instances, selected_index) = resolve_console_instances(target).await?;
         let selected_summary = instances
             .get(selected_index)
             .cloned()
@@ -279,6 +286,52 @@ impl ConsoleApp {
 
     fn selected_name(&self) -> &str {
         self.selected.summary().display_name()
+    }
+
+    fn project_label(&self) -> String {
+        self.project_root
+            .as_ref()
+            .and_then(|root| root.file_name())
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "single".to_string())
+    }
+
+    fn runtime_label(&self) -> String {
+        match &self.selected {
+            SelectedInstanceState::Ready(ready) => {
+                if ready.runtime_override.is_some() {
+                    format!("{} override", ready.runtime_id)
+                } else {
+                    ready.runtime_id.clone()
+                }
+            }
+            SelectedInstanceState::Blocked { summary, .. } => summary
+                .default_runtime
+                .clone()
+                .unwrap_or_else(|| "blocked".to_string()),
+        }
+    }
+
+    fn runtime_kind_label(&self) -> String {
+        match &self.selected {
+            SelectedInstanceState::Ready(ready) => ready.runtime_kind.clone(),
+            SelectedInstanceState::Blocked { .. } => "-".to_string(),
+        }
+    }
+
+    fn boundary_summary(&self) -> BoundarySummary {
+        match &self.selected {
+            SelectedInstanceState::Ready(ready) => ready.boundary.clone(),
+            SelectedInstanceState::Blocked { .. } => BoundarySummary {
+                workspace: "blocked".to_string(),
+                network: "blocked".to_string(),
+                secrets: "blocked".to_string(),
+                timeout: "-".to_string(),
+                preset: "-".to_string(),
+            },
+        }
     }
 
     async fn switch_selected(&mut self, next_index: usize) {
@@ -558,22 +611,25 @@ impl ConsoleApp {
     }
 }
 
-fn resolve_console_instances(
+async fn resolve_console_instances(
     target: &TargetContext,
 ) -> Result<(Option<PathBuf>, Vec<InstanceSummary>, usize)> {
     if let Some(project_root) = target.project_root.as_ref() {
         let entries = list_project_instance_statuses(project_root)?;
-        let instances = entries
-            .into_iter()
-            .map(|entry| InstanceSummary {
+        let mut instances = Vec::new();
+        for entry in entries {
+            let home = entry.home;
+            let default_runtime = load_default_runtime(&home).await;
+            instances.push(InstanceSummary {
                 name: Some(entry.name),
                 is_default: entry.is_default,
-                home: entry.home,
+                home,
                 work_root: entry.work_root,
                 work_root_finding: entry.work_root_finding,
                 shared_work_root_count: entry.shared_work_root_count,
-            })
-            .collect::<Vec<_>>();
+                default_runtime,
+            });
+        }
         if instances.is_empty() {
             return Err(anyhow!(
                 "project has no instances; run lionclaw instance create main"
@@ -596,9 +652,17 @@ fn resolve_console_instances(
             work_root: inspection.work_root,
             work_root_finding: inspection.finding,
             shared_work_root_count: 0,
+            default_runtime: load_default_runtime(&target.instance_home.root()).await,
         };
         Ok((None, vec![summary], 0))
     }
+}
+
+async fn load_default_runtime(home: &std::path::Path) -> Option<String> {
+    OperatorConfig::load(&LionClawHome::new(home.to_path_buf()))
+        .await
+        .ok()
+        .and_then(|config| config.defaults.runtime)
 }
 
 async fn open_selected_instance(
@@ -691,15 +755,19 @@ fn resolve_boundary_summary(
         workspace: preset.workspace_access.as_str().to_string(),
         network: preset.network_mode.as_str().to_string(),
         secrets: if preset.mount_runtime_secrets {
-            "on".to_string()
+            "staged".to_string()
         } else {
             "off".to_string()
         },
-        timeout: format!(
-            "quiet {}, max {}",
-            crate::runtime_timeouts::format_duration(timeouts.idle),
+        timeout: if timeouts.idle == timeouts.hard {
             crate::runtime_timeouts::format_duration(timeouts.hard)
-        ),
+        } else {
+            format!(
+                "quiet {}, max {}",
+                crate::runtime_timeouts::format_duration(timeouts.idle),
+                crate::runtime_timeouts::format_duration(timeouts.hard)
+            )
+        },
         preset: preset_name,
     })
 }
@@ -911,6 +979,7 @@ pub(crate) async fn run_launch_blocker(blocker: LaunchBlocker) -> Result<()> {
         work_root: None,
         work_root_finding: Some(blocker.detail.clone()),
         shared_work_root_count: 0,
+        default_runtime: None,
     };
     let app = ConsoleApp {
         project_root: None,
@@ -1075,14 +1144,17 @@ pub(crate) fn render_app(frame: &mut Frame<'_>, app: &ConsoleApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
-            Constraint::Min(10),
-            Constraint::Length(composer_height(app)),
+            Constraint::Length(3),
             Constraint::Length(1),
+            Constraint::Min(10),
+            Constraint::Length(1),
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(3),
         ])
         .split(area);
 
-    let [header_area, body_area, composer_area, footer_area] = chunks.as_ref() else {
+    let [header_area, _, body_area, _, composer_area, _, footer_area] = chunks.as_ref() else {
         return;
     };
 
@@ -1096,167 +1168,233 @@ pub(crate) fn render_app(frame: &mut Frame<'_>, app: &ConsoleApp) {
     }
 }
 
-fn composer_height(app: &ConsoleApp) -> u16 {
-    let line_count = app.composer.lines().count().max(1) as u16;
-    line_count.saturating_add(2).clamp(3, 8)
-}
-
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
-    let (runtime, boundary) = match &app.selected {
-        SelectedInstanceState::Ready(ready) => {
-            let runtime = if ready.runtime_override.is_some() {
-                format!("{} ({}, override)", ready.runtime_id, ready.runtime_kind)
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(PANEL_MUTED));
+    frame.render_widget(block, area);
+    if area.height < 3 || area.width < 4 {
+        return;
+    }
+
+    let boundary = app.boundary_summary();
+    let line = Line::from(vec![
+        Span::styled(
+            "LionClaw",
+            Style::default()
+                .fg(PANEL_BORDER)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("    project: ", Style::default().fg(PANEL_MUTED)),
+        Span::styled(app.project_label(), Style::default().fg(Color::White)),
+        Span::styled("    instance: ", Style::default().fg(PANEL_BORDER)),
+        Span::styled(
+            app.selected_name().to_string(),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled("    runtime: ", Style::default().fg(PANEL_BORDER)),
+        Span::styled(app.runtime_label(), Style::default().fg(Color::White)),
+        Span::styled("    net: ", Style::default().fg(PANEL_BORDER)),
+        Span::styled(boundary.network, Style::default().fg(Color::White)),
+        Span::styled("    secrets: ", Style::default().fg(PANEL_BORDER)),
+        Span::styled(
+            boundary.secrets,
+            Style::default().fg(if app.selected.is_ready() {
+                PANEL_WARN
             } else {
-                format!("{} ({})", ready.runtime_id, ready.runtime_kind)
-            };
-            let boundary = format!(
-                "workspace {} | network {} | secrets {} | timeout {} | preset {}",
-                ready.boundary.workspace,
-                ready.boundary.network,
-                ready.boundary.secrets,
-                ready.boundary.timeout,
-                ready.boundary.preset
-            );
-            (runtime, boundary)
-        }
-        SelectedInstanceState::Blocked { blocker, .. } => {
-            ("blocked".to_string(), blocker.title.clone())
-        }
-    };
-    let work_root = app
-        .selected
-        .summary()
-        .work_root
-        .as_ref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "-".to_string());
-    let title = format!(" LionClaw Operator Console | {} ", app.selected_name());
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("runtime ", Style::default().fg(Color::Gray)),
-            Span::raw(runtime),
-        ]),
-        Line::from(vec![
-            Span::styled("work root ", Style::default().fg(Color::Gray)),
-            Span::raw(work_root),
-        ]),
-        Line::from(boundary),
-    ];
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().title(title).borders(Borders::ALL))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(paragraph, area);
+                PANEL_ERROR
+            }),
+        ),
+        Span::styled("    /workspace: ", Style::default().fg(PANEL_BORDER)),
+        Span::styled(boundary.workspace, Style::default().fg(Color::White)),
+        Span::styled("    timeout: ", Style::default().fg(PANEL_BORDER)),
+        Span::styled(boundary.timeout, Style::default().fg(Color::White)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line),
+        Rect {
+            x: area.x.saturating_add(2),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(4),
+            height: 1,
+        },
+    );
 }
 
 fn render_body(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
     if app.project_mode() {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(30), Constraint::Min(20)])
+            .constraints([
+                Constraint::Length(44),
+                Constraint::Length(1),
+                Constraint::Min(40),
+                Constraint::Length(1),
+                Constraint::Length(44),
+            ])
             .split(area);
-        let [instances_area, main_area] = chunks.as_ref() else {
-            render_main_panes(frame, area, app);
+        let [instances_area, _, transcript_area, _, boundary_area] = chunks.as_ref() else {
+            render_transcript(frame, area, app);
             return;
         };
         render_instances(frame, *instances_area, app);
-        render_main_panes(frame, *main_area, app);
+        render_transcript(frame, *transcript_area, app);
+        render_boundary(frame, *boundary_area, app);
     } else {
-        render_main_panes(frame, area, app);
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(40),
+                Constraint::Length(1),
+                Constraint::Length(44),
+            ])
+            .split(area);
+        let [transcript_area, _, boundary_area] = chunks.as_ref() else {
+            render_transcript(frame, area, app);
+            return;
+        };
+        render_transcript(frame, *transcript_area, app);
+        render_boundary(frame, *boundary_area, app);
     }
 }
 
 fn render_instances(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
-    let items = app
-        .instances
-        .iter()
-        .enumerate()
-        .map(|(index, instance)| {
-            let marker = if index == app.selected_index {
-                ">"
-            } else {
-                " "
-            };
-            let default = if instance.is_default { "*" } else { " " };
-            let blocked = if instance.work_root_finding.is_some() {
-                " !"
-            } else {
-                ""
-            };
-            let shared = if instance.shared_work_root_count > 1 {
-                format!(" [{}]", instance.shared_work_root_count)
-            } else {
-                String::new()
-            };
-            let line = Line::from(format!(
-                "{marker}{default} {}{blocked}{shared}",
-                instance.display_name()
-            ));
-            if index == app.selected_index {
-                ListItem::new(line.style(Style::default().fg(Color::Yellow)))
-            } else {
-                ListItem::new(line)
-            }
-        })
-        .collect::<Vec<_>>();
-    let title = if app.focus == Focus::Instances {
-        " Instances [focus] "
-    } else {
-        " Instances "
-    };
-    let list = List::new(items).block(Block::default().title(title).borders(Borders::ALL));
-    frame.render_widget(list, area);
-}
-
-fn render_main_panes(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(7)])
-        .split(area);
-    let [transcript_area, inspectors_area] = chunks.as_ref() else {
+    let content = render_panel_shell(frame, area, "Instances", app.focus == Focus::Instances);
+    if content.width < 8 || content.height < 2 {
         return;
-    };
-    render_transcript(frame, *transcript_area, app);
-    render_inspectors(frame, *inspectors_area, app);
+    }
+
+    let mut row_y = content.y.saturating_add(1);
+    for (index, instance) in app.instances.iter().enumerate() {
+        if row_y >= content.y.saturating_add(content.height.saturating_sub(7)) {
+            break;
+        }
+        let selected = index == app.selected_index;
+        let selected_blocked = selected && !app.selected.is_ready();
+        let blocked = instance.work_root_finding.is_some() || selected_blocked;
+        let icon = if blocked {
+            "!"
+        } else if selected && app.selected.is_ready() {
+            "●"
+        } else {
+            "○"
+        };
+        let state = if blocked {
+            "blocked"
+        } else if selected && app.selected.is_ready() {
+            "ready"
+        } else {
+            "idle"
+        };
+        let selected_runtime = app.runtime_label();
+        let runtime = instance.default_runtime.as_deref().unwrap_or(if selected {
+            selected_runtime.as_str()
+        } else {
+            "-"
+        });
+        let default_mark = if instance.is_default { " default" } else { "" };
+        let shared = if instance.shared_work_root_count > 1 {
+            format!(" [{}]", instance.shared_work_root_count)
+        } else {
+            String::new()
+        };
+        let row = format_instance_row(
+            icon,
+            instance.display_name(),
+            runtime,
+            &format!("{state}{default_mark}{shared}"),
+            content.width as usize,
+        );
+        let style = instance_row_style(selected, state);
+        frame.render_widget(
+            Paragraph::new(Line::raw(row)).style(style),
+            Rect {
+                x: content.x,
+                y: row_y,
+                width: content.width,
+                height: 1,
+            },
+        );
+        row_y = row_y.saturating_add(2);
+    }
+
+    if content.height > 12 {
+        let menu_top = content.y + content.height - 8;
+        draw_horizontal_rule(frame, content.x, menu_top, content.width, PANEL_MUTED);
+        render_menu_row(frame, content, menu_top + 1, "Sessions");
+        render_menu_row(frame, content, menu_top + 2, "Drafts");
+        render_menu_row(frame, content, menu_top + 3, "Audit");
+        render_menu_row(frame, content, menu_top + 4, "Boundary");
+        render_menu_row(frame, content, menu_top + 5, "Runtime");
+    }
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
-    let title = if app.focus == Focus::Transcript {
-        " Transcript [focus] "
-    } else {
-        " Transcript "
-    };
+    let content = render_panel_shell(frame, area, "Transcript", app.focus == Focus::Transcript);
     if let SelectedInstanceState::Blocked { blocker, .. } = &app.selected {
         let text = Text::from(vec![
-            Line::styled(&blocker.title, Style::default().fg(Color::Red)),
+            Line::styled(&blocker.title, Style::default().fg(PANEL_ERROR)),
             Line::raw(""),
             Line::raw(&blocker.detail),
             Line::raw(""),
             Line::raw(&blocker.suggestion),
         ]);
-        let paragraph = Paragraph::new(text)
-            .block(
-                Block::default()
-                    .title(" Launch Blocker ")
-                    .borders(Borders::ALL),
-            )
-            .wrap(Wrap { trim: false });
-        frame.render_widget(paragraph, area);
+        frame.render_widget(
+            Paragraph::new(text).wrap(Wrap { trim: false }),
+            content.inner(Margin {
+                vertical: 1,
+                horizontal: 1,
+            }),
+        );
         return;
     }
 
     let lines = if app.transcript.is_empty() {
         vec![Line::styled(
-            "No turns yet.",
-            Style::default().fg(Color::DarkGray),
+            "No turns yet. Submit a prompt from the composer.",
+            Style::default().fg(PANEL_MUTED),
         )]
     } else {
         transcript_render_lines(&app.transcript)
     };
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().title(title).borders(Borders::ALL))
-        .scroll((app.transcript_scroll, 0))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+    let activity_rows = 2;
+    let transcript_area = Rect {
+        x: content.x,
+        y: content.y,
+        width: content.width.saturating_sub(1),
+        height: content.height.saturating_sub(activity_rows),
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((app.transcript_scroll, 0))
+            .wrap(Wrap { trim: false }),
+        transcript_area,
+    );
+    if content.height > activity_rows {
+        let rule_y = content.y + content.height - activity_rows;
+        draw_horizontal_rule(frame, content.x, rule_y, content.width, PANEL_MUTED);
+        let activity = Line::from(vec![
+            Span::styled("runtime activity", Style::default().fg(PANEL_BORDER)),
+            Span::raw("  ▶  "),
+            Span::styled(
+                if app.active() { "streaming..." } else { "idle" },
+                Style::default().fg(if app.active() {
+                    PANEL_BORDER
+                } else {
+                    PANEL_MUTED
+                }),
+            ),
+        ]);
+        frame.render_widget(
+            Paragraph::new(activity),
+            Rect {
+                x: content.x,
+                y: rule_y.saturating_add(1),
+                width: content.width,
+                height: 1,
+            },
+        );
+    }
 }
 
 pub(crate) fn transcript_render_lines(lines: &[TranscriptLine]) -> Vec<Line<'static>> {
@@ -1294,73 +1432,331 @@ fn split_render_line(prefix: &str, style: Style, text: &str) -> Vec<Line<'static
         .collect()
 }
 
-fn render_inspectors(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
-    let title = if app.focus == Focus::Inspectors {
-        " Inspectors [focus] "
+fn render_boundary(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
+    let content = render_panel_shell(frame, area, "Boundary", app.focus == Focus::Inspectors);
+    if content.width < 8 || content.height < 4 {
+        return;
+    }
+
+    let boundary = app.boundary_summary();
+    let mut lines = vec![
+        section_line("▱", "Mounts"),
+        Line::raw(""),
+        kv_arrow_line("/workspace", "repo", &boundary.workspace),
+        kv_arrow_line("/runtime", "session", "private"),
+        kv_arrow_line("/drafts", "", "private"),
+        kv_arrow_line("/lionclaw/skills", "", "ro"),
+        Line::raw(""),
+        section_line("◎", "Network"),
+        Line::raw(""),
+        Line::raw(format!("  {}", boundary.network)),
+        Line::styled(
+            format!("  runtime kind {}", app.runtime_kind_label()),
+            Style::default().fg(PANEL_MUTED),
+        ),
+        Line::raw(""),
+        section_line("⚿", "Secrets"),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("  runtime auth "),
+            Span::styled(boundary.secrets.clone(), Style::default().fg(PANEL_WARN)),
+        ]),
+        Line::from(vec![
+            Span::raw("  runtime-secrets.env "),
+            Span::styled(
+                if boundary.secrets == "staged" {
+                    "not mounted"
+                } else {
+                    "off"
+                },
+                Style::default().fg(PANEL_WARN),
+            ),
+        ]),
+        Line::raw(""),
+        section_line("▣", "Audit"),
+        Line::raw(""),
+    ];
+    if app.selected.is_ready() {
+        lines.extend([
+            check_line("runtime.plan.allow"),
+            check_line("runtime.started"),
+            check_line("session.turn.open"),
+        ]);
     } else {
-        " Inspectors "
-    };
-    let lines = match &app.selected {
-        SelectedInstanceState::Ready(ready) => vec![
-            Line::from(format!("session: {}", ready.session_id)),
-            Line::from(format!(
-                "runtime: {} kind={} override={}",
-                ready.runtime_id,
-                ready.runtime_kind,
-                ready.runtime_override.as_deref().unwrap_or("-")
-            )),
-            Line::from(format!(
-                "boundary: workspace={} network={} secrets={} preset={}",
-                ready.boundary.workspace,
-                ready.boundary.network,
-                ready.boundary.secrets,
-                ready.boundary.preset
-            )),
-            Line::from("drafts: runtime-private /drafts"),
-            Line::from("audit: kernel-owned runtime plan events"),
-        ],
-        SelectedInstanceState::Blocked { blocker, .. } => vec![
-            Line::from("session: -"),
-            Line::from("runtime: blocked"),
-            Line::from(format!("blocker: {}", blocker.detail)),
-        ],
-    };
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().title(title).borders(Borders::ALL))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(paragraph, area);
+        lines.extend([
+            Line::styled("  ! launch blocked", Style::default().fg(PANEL_ERROR)),
+            Line::raw(format!("  {}", app.status)),
+        ]);
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        content.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        }),
+    );
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
-    let title = if app.focus == Focus::Composer {
-        " Composer [focus] "
+    let border_style = if app.focus == Focus::Composer {
+        Style::default().fg(PANEL_BORDER)
     } else {
-        " Composer "
+        Style::default().fg(PANEL_MUTED)
     };
-    let content = if app.composer.is_empty() {
-        Text::from(Line::styled(
-            "Enter submits. Alt+Enter inserts a newline.",
-            Style::default().fg(Color::DarkGray),
-        ))
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style),
+        area,
+    );
+    if area.width < 4 || area.height < 4 {
+        return;
+    }
+
+    let prompt = if app.composer.is_empty() {
+        Line::from(vec![
+            Span::styled(">  ", Style::default().fg(PANEL_BORDER)),
+            Span::styled(
+                "Ask through the selected runtime...",
+                Style::default().fg(PANEL_MUTED),
+            ),
+        ])
     } else {
-        Text::from(app.composer.clone())
+        Line::from(vec![
+            Span::styled(">  ", Style::default().fg(PANEL_BORDER)),
+            Span::raw(app.composer.clone()),
+        ])
     };
-    let paragraph = Paragraph::new(content)
-        .block(Block::default().title(title).borders(Borders::ALL))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+    frame.render_widget(
+        Paragraph::new(prompt).wrap(Wrap { trim: false }),
+        Rect {
+            x: area.x.saturating_add(2),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(4),
+            height: 2,
+        },
+    );
+
+    let rule_y = area.y + area.height - 3;
+    draw_horizontal_rule(
+        frame,
+        area.x.saturating_add(1),
+        rule_y,
+        area.width.saturating_sub(2),
+        PANEL_MUTED,
+    );
+    let mode = if app.active() { "running" } else { "normal" };
+    let status = Line::from(vec![
+        Span::styled(mode, Style::default().fg(PANEL_BORDER)),
+        Span::styled("   |   instance: ", Style::default().fg(PANEL_MUTED)),
+        Span::raw(app.selected_name().to_string()),
+        Span::styled(
+            "   |   runtime controls pass through",
+            Style::default().fg(PANEL_MUTED),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(status),
+        Rect {
+            x: area.x.saturating_add(2),
+            y: rule_y.saturating_add(1),
+            width: area.width.saturating_sub(4),
+            height: 1,
+        },
+    );
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
-    let active = if app.active() { "active" } else { "idle" };
-    let text = format!(
-        " {} | {} | ? help | Tab focus | Enter submit | Ctrl+D/F10 exit ",
-        active, app.status
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(PANEL_MUTED)),
+        area,
     );
-    let paragraph = Paragraph::new(text)
-        .alignment(Alignment::Left)
-        .style(Style::default().fg(Color::Gray));
-    frame.render_widget(paragraph, area);
+    if area.height < 3 || area.width < 4 {
+        return;
+    }
+    let line = Line::from(vec![
+        key_span("?"),
+        Span::raw(" Help     |     "),
+        key_span("Ctrl+P"),
+        Span::raw(" Palette     |     "),
+        key_span("Tab"),
+        Span::raw(" Focus     |     "),
+        key_span("Enter"),
+        Span::raw(" Submit     |     "),
+        key_span("Ctrl+C"),
+        Span::raw(" Interrupt     |     "),
+        key_span("F10"),
+        Span::raw(" Exit"),
+        Span::styled(
+            format!("     {}", app.status),
+            Style::default().fg(PANEL_MUTED),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line),
+        Rect {
+            x: area.x.saturating_add(2),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(4),
+            height: 1,
+        },
+    );
+}
+
+fn render_panel_shell(frame: &mut Frame<'_>, area: Rect, title: &str, focused: bool) -> Rect {
+    let _ = focused;
+    let border_style = Style::default().fg(PANEL_BORDER);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style),
+        area,
+    );
+    if area.width > 4 && area.height > 3 {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                title.to_string(),
+                Style::default()
+                    .fg(PANEL_BORDER)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Rect {
+                x: area.x.saturating_add(2),
+                y: area.y.saturating_add(1),
+                width: area.width.saturating_sub(4),
+                height: 1,
+            },
+        );
+        draw_horizontal_rule(
+            frame,
+            area.x.saturating_add(1),
+            area.y.saturating_add(2),
+            area.width.saturating_sub(2),
+            PANEL_MUTED,
+        );
+    }
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(3),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(4),
+    }
+}
+
+fn draw_horizontal_rule(frame: &mut Frame<'_>, x: u16, y: u16, width: u16, color: Color) {
+    if width == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new("─".repeat(width as usize)).style(Style::default().fg(color)),
+        Rect {
+            x,
+            y,
+            width,
+            height: 1,
+        },
+    );
+}
+
+fn format_instance_row(icon: &str, name: &str, runtime: &str, state: &str, width: usize) -> String {
+    let name_width = 11.min(width.saturating_sub(18)).max(4);
+    let runtime_width = 10.min(width.saturating_sub(name_width + 8)).max(3);
+    let state_width = width.saturating_sub(name_width + runtime_width + 6).max(3);
+    let mut row = format!(
+        " {icon} {:name_width$} {:runtime_width$} {:>state_width$}",
+        truncate_to(name, name_width),
+        truncate_to(runtime, runtime_width),
+        truncate_to(state, state_width),
+    );
+    if row.chars().count() > width {
+        row = truncate_to(&row, width);
+    }
+    while row.chars().count() < width {
+        row.push(' ');
+    }
+    row
+}
+
+fn instance_row_style(selected: bool, state: &str) -> Style {
+    let fg = match state {
+        "ready" => PANEL_READY,
+        "blocked" => PANEL_ERROR,
+        _ => Color::White,
+    };
+    let style = Style::default().fg(fg);
+    if selected {
+        style.bg(PANEL_SELECTED)
+    } else {
+        style
+    }
+}
+
+fn render_menu_row(frame: &mut Frame<'_>, content: Rect, y: u16, label: &str) {
+    if y >= content.y + content.height {
+        return;
+    }
+    let line = format!(
+        "   {:<width$}>",
+        label,
+        width = content.width.saturating_sub(6) as usize
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(line, Style::default().fg(Color::White))),
+        Rect {
+            x: content.x,
+            y,
+            width: content.width,
+            height: 1,
+        },
+    );
+}
+
+fn section_line(icon: &'static str, label: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{icon}  "), Style::default().fg(PANEL_BORDER)),
+        Span::styled(
+            label,
+            Style::default()
+                .fg(PANEL_BORDER)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn kv_arrow_line(left: &'static str, middle: &'static str, right: &str) -> Line<'static> {
+    let target = if middle.is_empty() {
+        right.to_string()
+    } else {
+        format!("{middle} {right}")
+    };
+    Line::from(vec![
+        Span::raw(format!("  {left:<18}")),
+        Span::styled("->  ", Style::default().fg(PANEL_BORDER)),
+        Span::raw(target),
+    ])
+}
+
+fn check_line(label: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  ✓ ", Style::default().fg(PANEL_READY)),
+        Span::raw(label),
+    ])
+}
+
+fn key_span(key: &'static str) -> Span<'static> {
+    Span::styled(
+        key,
+        Style::default()
+            .fg(PANEL_BORDER)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn truncate_to(value: &str, width: usize) -> String {
+    value.chars().take(width).collect()
 }
 
 fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp, overlay: Overlay) {
@@ -1437,6 +1833,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::KernelOptions;
     use ratatui::backend::TestBackend;
 
     #[test]
@@ -1527,6 +1924,7 @@ mod tests {
             work_root: None,
             work_root_finding: Some("missing runtime".to_string()),
             shared_work_root_count: 0,
+            default_runtime: None,
         };
         let app = ConsoleApp {
             project_root: Some(PathBuf::from("/tmp/project")),
@@ -1551,13 +1949,103 @@ mod tests {
         };
 
         let rendered = render_to_text(&app, 100, 30);
-        assert!(rendered.contains("Launch Blocker"));
+        assert!(rendered.contains("Transcript"));
         assert!(rendered.contains("Launch blocked for main"));
         assert!(rendered.contains("missing runtime"));
     }
 
-    #[test]
-    fn project_mode_lists_instances_and_selects_requested_instance() {
+    #[tokio::test]
+    async fn mockup_sized_layout_renders_ribbon_three_panes_composer_and_footer() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let kernel = Kernel::new_with_options(
+            &temp_dir.path().join("lionclaw.db"),
+            KernelOptions::default(),
+        )
+        .await
+        .expect("kernel");
+        let main = InstanceSummary {
+            name: Some("main".to_string()),
+            is_default: true,
+            home: temp_dir.path().join("instances/main"),
+            work_root: Some(temp_dir.path().join("repo")),
+            work_root_finding: None,
+            shared_work_root_count: 0,
+            default_runtime: Some("codex".to_string()),
+        };
+        let reviewer = InstanceSummary {
+            name: Some("reviewer".to_string()),
+            is_default: false,
+            home: temp_dir.path().join("instances/reviewer"),
+            work_root: Some(temp_dir.path().join("repo")),
+            work_root_finding: None,
+            shared_work_root_count: 2,
+            default_runtime: Some("opencode".to_string()),
+        };
+        let qa = InstanceSummary {
+            name: Some("qa".to_string()),
+            is_default: false,
+            home: temp_dir.path().join("instances/qa"),
+            work_root: None,
+            work_root_finding: Some("missing runtime".to_string()),
+            shared_work_root_count: 0,
+            default_runtime: Some("mock".to_string()),
+        };
+        let app = ConsoleApp {
+            project_root: Some(PathBuf::from("/workspace/lionclaw")),
+            instances: vec![main.clone(), reviewer, qa],
+            selected_index: 0,
+            selected: SelectedInstanceState::Ready(Box::new(ReadyInstance {
+                summary: main,
+                runtime_id: "codex".to_string(),
+                runtime_kind: "codex".to_string(),
+                runtime_override: None,
+                boundary: BoundarySummary {
+                    workspace: "rw".to_string(),
+                    network: "none".to_string(),
+                    secrets: "staged".to_string(),
+                    timeout: "2h".to_string(),
+                    preset: "everyday".to_string(),
+                },
+                kernel,
+                session_id: Uuid::new_v4(),
+            })),
+            continue_last_session: false,
+            timeout_override: None,
+            focus: Focus::Composer,
+            overlay: None,
+            composer: String::new(),
+            transcript: vec![
+                TranscriptLine::new(TranscriptLineKind::Status, "runtime started"),
+                TranscriptLine::new(
+                    TranscriptLineKind::User,
+                    "Please review the changes in this branch.",
+                ),
+                TranscriptLine::new(TranscriptLineKind::Answer, "Summary\nLooks good overall."),
+            ],
+            transcript_scroll: 0,
+            status: "idle".to_string(),
+            active_turn: None,
+            active_turn_cancel: None,
+            saw_ready_instance: true,
+            should_quit: false,
+        };
+
+        let rendered = render_to_text(&app, 160, 50);
+        assert!(rendered.contains("LionClaw    project: lionclaw"));
+        assert!(rendered.contains("instance: main"));
+        assert!(rendered.contains("runtime: codex"));
+        assert!(rendered.contains("net: none"));
+        assert!(rendered.contains("Instances"));
+        assert!(rendered.contains("Transcript"));
+        assert!(rendered.contains("Boundary"));
+        assert!(rendered.contains("Ask through the selected runtime"));
+        assert!(rendered.contains("runtime controls pass through"));
+        assert!(rendered.contains("Ctrl+P"));
+        assert_eq!(rendered.lines().count(), 50);
+    }
+
+    #[tokio::test]
+    async fn project_mode_lists_instances_and_selects_requested_instance() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let project = crate::operator::target::init_project(temp_dir.path()).expect("init");
         crate::operator::target::create_project_instance(
@@ -1578,7 +2066,7 @@ mod tests {
         .expect("resolve target");
 
         let (project_root, instances, selected_index) =
-            resolve_console_instances(&target).expect("instances");
+            resolve_console_instances(&target).await.expect("instances");
 
         assert_eq!(
             project_root.as_deref(),
@@ -1653,6 +2141,7 @@ mod tests {
             work_root: None,
             work_root_finding: Some("blocked".to_string()),
             shared_work_root_count: 0,
+            default_runtime: Some("codex".to_string()),
         };
         let reviewer = InstanceSummary {
             name: Some("reviewer".to_string()),
@@ -1661,6 +2150,7 @@ mod tests {
             work_root: None,
             work_root_finding: Some("blocked".to_string()),
             shared_work_root_count: 0,
+            default_runtime: Some("opencode".to_string()),
         };
         ConsoleApp {
             project_root: Some(PathBuf::from("/tmp/project")),
