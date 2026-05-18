@@ -110,6 +110,17 @@ impl LaunchBlocker {
             suggestion: "Run lionclaw doctor for setup guidance.".to_string(),
         }
     }
+
+    pub(crate) fn no_project_instances(project_root: &std::path::Path) -> Self {
+        Self {
+            title: "No instances configured".to_string(),
+            detail: format!(
+                "Project {} has no configured instances.",
+                project_root.display()
+            ),
+            suggestion: "Create one with: lionclaw instance create main. The run command will not create or repair configuration.".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +173,15 @@ pub(crate) enum Focus {
 }
 
 impl Focus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Instances => "instances",
+            Self::Transcript => "transcript",
+            Self::Composer => "composer",
+            Self::Inspectors => "boundary",
+        }
+    }
+
     fn next(self, project_mode: bool) -> Self {
         match (self, project_mode) {
             (Self::Instances, _) => Self::Transcript,
@@ -1002,6 +1022,40 @@ pub(crate) async fn run_launch_blocker(blocker: LaunchBlocker) -> Result<()> {
     run_console_app(app).await.map(|_| ())
 }
 
+pub(crate) async fn run_project_launch_blocker(
+    project_root: PathBuf,
+    blocker: LaunchBlocker,
+) -> Result<()> {
+    let summary = InstanceSummary {
+        name: Some("no instances".to_string()),
+        is_default: false,
+        home: PathBuf::new(),
+        work_root: None,
+        work_root_finding: Some(blocker.detail.clone()),
+        shared_work_root_count: 0,
+        default_runtime: None,
+    };
+    let app = ConsoleApp {
+        project_root: Some(project_root),
+        instances: vec![summary.clone()],
+        selected_index: 0,
+        selected: SelectedInstanceState::Blocked { summary, blocker },
+        continue_last_session: false,
+        timeout_override: None,
+        focus: Focus::Instances,
+        overlay: None,
+        composer: String::new(),
+        transcript: Vec::new(),
+        transcript_scroll: 0,
+        status: "no instances configured".to_string(),
+        active_turn: None,
+        active_turn_cancel: None,
+        saw_ready_instance: false,
+        should_quit: false,
+    };
+    run_console_app(app).await.map(|_| ())
+}
+
 async fn run_console_app(mut app: ConsoleApp) -> Result<RunConsoleOutcome> {
     let mut terminal = enter_terminal()?;
     let (backend_tx, mut backend_rx) = mpsc::unbounded_channel();
@@ -1072,10 +1126,21 @@ async fn handle_key(
     }
 
     match (key.code, key.modifiers) {
-        (KeyCode::Char('?'), KeyModifiers::NONE) => app.overlay = Some(Overlay::Help),
+        (KeyCode::F(1), _) => app.overlay = Some(Overlay::Help),
+        (KeyCode::Char('?'), KeyModifiers::NONE)
+            if app.focus != Focus::Composer && app.composer.is_empty() =>
+        {
+            app.overlay = Some(Overlay::Help)
+        }
         (KeyCode::Char('p'), KeyModifiers::CONTROL) => app.overlay = Some(Overlay::Palette),
-        (KeyCode::Tab, _) => app.focus = app.focus.next(app.project_mode()),
-        (KeyCode::BackTab, _) => app.focus = app.focus.previous(app.project_mode()),
+        (KeyCode::Tab, _) => {
+            app.focus = app.focus.next(app.project_mode());
+            app.status = format!("focus: {}", app.focus.label());
+        }
+        (KeyCode::BackTab, _) => {
+            app.focus = app.focus.previous(app.project_mode());
+            app.status = format!("focus: {}", app.focus.label());
+        }
         (KeyCode::Esc, _) => {
             app.composer.clear();
             app.status = "composer cleared".to_string();
@@ -1123,7 +1188,10 @@ async fn handle_key(
             app.composer.pop();
         }
         (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.composer.clear(),
-        (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => app.composer.push(ch),
+        (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            app.focus = Focus::Composer;
+            app.composer.push(ch);
+        }
         _ => {}
     }
 }
@@ -1607,8 +1675,11 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
 }
 
 fn render_panel_shell(frame: &mut Frame<'_>, area: Rect, title: &str, focused: bool) -> Rect {
-    let _ = focused;
-    let border_style = Style::default().fg(PANEL_BORDER);
+    let border_style = if focused {
+        Style::default().fg(PANEL_BORDER)
+    } else {
+        Style::default().fg(PANEL_MUTED)
+    };
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
@@ -1618,10 +1689,16 @@ fn render_panel_shell(frame: &mut Frame<'_>, area: Rect, title: &str, focused: b
     if area.width > 4 && area.height > 3 {
         frame.render_widget(
             Paragraph::new(Line::styled(
-                title.to_string(),
-                Style::default()
-                    .fg(PANEL_BORDER)
-                    .add_modifier(Modifier::BOLD),
+                if focused {
+                    format!("▶ {title}")
+                } else {
+                    title.to_string()
+                },
+                Style::default().fg(PANEL_BORDER).add_modifier(if focused {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
             )),
             Rect {
                 x: area.x.saturating_add(2),
@@ -2131,6 +2208,65 @@ mod tests {
         if let Some(handle) = app.active_turn.take() {
             handle.abort();
         }
+    }
+
+    #[test]
+    fn question_mark_types_in_composer_but_opens_help_outside_composer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+
+        let mut composer_app = blocked_test_app();
+        composer_app.focus = Focus::Composer;
+        composer_app.composer = "Is this ok".to_string();
+        runtime.block_on(async {
+            handle_key(
+                &mut composer_app,
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+                &backend_tx,
+            )
+            .await;
+        });
+        assert_eq!(composer_app.composer, "Is this ok?");
+        assert!(composer_app.overlay.is_none());
+
+        let mut nav_app = blocked_test_app();
+        nav_app.focus = Focus::Instances;
+        runtime.block_on(async {
+            handle_key(
+                &mut nav_app,
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+                &backend_tx,
+            )
+            .await;
+        });
+        assert_eq!(nav_app.overlay, Some(Overlay::Help));
+    }
+
+    #[test]
+    fn tab_moves_focus_and_render_marks_focused_pane() {
+        let mut app = blocked_test_app();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+
+        runtime.block_on(async {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+                &backend_tx,
+            )
+            .await;
+        });
+
+        assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(app.status, "focus: transcript");
+        let rendered = render_to_text(&app, 100, 30);
+        assert!(rendered.contains("▶ Transcript"));
     }
 
     fn blocked_test_app() -> ConsoleApp {

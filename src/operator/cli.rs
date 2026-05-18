@@ -47,7 +47,10 @@ use crate::{
             remove_channel, remove_skill, resolve_installed_skill_worker_entrypoint,
         },
         run::run_local,
-        run_tui::{run_console, run_launch_blocker, LaunchBlocker, RunConsoleInvocation},
+        run_tui::{
+            run_console, run_launch_blocker, run_project_launch_blocker, LaunchBlocker,
+            RunConsoleInvocation,
+        },
         runtime::{resolve_runtime_id, validate_runtime_availability},
         runtime_integration::{
             configure_runtime_profile_with_engine_resolver, configure_runtime_required_message,
@@ -608,7 +611,15 @@ pub async fn run() -> Result<ExitCode> {
     } {
         Ok(target) => target,
         Err(err) if run_uses_tui => {
-            run_launch_blocker(LaunchBlocker::standalone(err.to_string())).await?;
+            if let Some(project_root) = empty_project_for_tui_launch_blocker(&target_selection) {
+                run_project_launch_blocker(
+                    project_root.clone(),
+                    LaunchBlocker::no_project_instances(&project_root),
+                )
+                .await?;
+            } else {
+                run_launch_blocker(LaunchBlocker::standalone(err.to_string())).await?;
+            }
             return Ok(ExitCode::from(1));
         }
         Err(err) => return Err(err),
@@ -1480,6 +1491,15 @@ pub async fn run() -> Result<ExitCode> {
 
 fn should_use_run_tui(args: &RunArgs, stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
     !args.plain && stdin_is_terminal && stdout_is_terminal
+}
+
+fn empty_project_for_tui_launch_blocker(selection: &TargetSelection) -> Option<PathBuf> {
+    if selection.home.is_some() {
+        return None;
+    }
+    let project_root = discover_project_root(selection).ok()?;
+    let instances = list_project_instance_statuses(&project_root).ok()?;
+    instances.is_empty().then_some(project_root)
 }
 
 fn resolve_command_target(
@@ -2548,6 +2568,23 @@ mod tests {
         assert!(!should_use_run_tui(&tui_args, false, true));
         assert!(!should_use_run_tui(&tui_args, true, false));
         assert!(!should_use_run_tui(&plain_args, true, true));
+    }
+
+    #[test]
+    fn run_tui_detects_empty_project_for_launch_blocker() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        std::fs::remove_dir_all(project.instance.home).expect("remove only instance");
+        let selection = TargetSelection {
+            home: None,
+            project: Some(project.project_root.clone()),
+            instance: None,
+        };
+
+        assert_eq!(
+            empty_project_for_tui_launch_blocker(&selection).as_deref(),
+            Some(project.project_root.as_path())
+        );
     }
 
     #[test]
