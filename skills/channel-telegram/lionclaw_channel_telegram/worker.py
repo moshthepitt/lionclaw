@@ -61,6 +61,8 @@ DM_PROGRESS_THRESHOLD_SECONDS = 1.5
 GROUP_PROGRESS_THRESHOLD_SECONDS = 3.0
 PROGRESS_REFRESH_SECONDS = 0.5
 PROGRESS_EDIT_MIN_SECONDS = 1.0
+PROGRESS_DELETE_RETRY_BASE_SECONDS = 1.0
+PROGRESS_DELETE_RETRY_MAX_SECONDS = 30.0
 
 LOCAL_TELEGRAM_COMMANDS = {
     "help",
@@ -113,6 +115,19 @@ class ActiveTurn:
     terminal_text: str | None = None
 
 
+@dataclass(slots=True)
+class PendingProgressDelete:
+    turn_id: str
+    conversation_ref: str
+    message_ref: str
+    attempts: int = 0
+    next_attempt_at: float = 0.0
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.conversation_ref, self.message_ref)
+
+
 @dataclass(slots=True, frozen=True)
 class TelegramCommand:
     name: str
@@ -157,6 +172,9 @@ class TelegramWorker:
         self._typing_routes: dict[str, TypingTarget] = {}
         self._typing_failures: dict[tuple[str, str | None], int] = {}
         self._active_turns: dict[str, ActiveTurn] = {}
+        self._pending_progress_deletes: dict[tuple[str, str], PendingProgressDelete] = (
+            {}
+        )
         self._route_turns: dict[tuple[str, str | None], str] = {}
         self._route_generations: dict[tuple[str, str | None], int] = {}
         self._poll_in_flight_started_at: float | None = None
@@ -286,6 +304,7 @@ class TelegramWorker:
             self._typing_routes.clear()
             self._typing_failures.clear()
             self._active_turns.clear()
+            self._pending_progress_deletes.clear()
             self._route_turns.clear()
             self._route_generations.clear()
 
@@ -835,6 +854,7 @@ class TelegramWorker:
             )
 
     async def refresh_progress_messages(self) -> None:
+        await self._retry_pending_progress_deletes()
         for turn in list(self._active_turns.values()):
             if turn.terminal:
                 continue
@@ -916,21 +936,62 @@ class TelegramWorker:
         turn.last_edit_at = now
         return True
 
-    async def _delete_progress_message(self, turn: ActiveTurn) -> None:
-        if turn.provisional_message_ref is None or not self._is_current_generation(
-            turn
-        ):
-            return
+    async def _delete_progress_message(self, turn: ActiveTurn) -> bool:
+        if turn.provisional_message_ref is None:
+            return True
+        pending = PendingProgressDelete(
+            turn_id=turn.turn_id,
+            conversation_ref=turn.target.conversation_ref,
+            message_ref=turn.provisional_message_ref,
+        )
+        deleted = await self._delete_progress_ref(pending)
+        if deleted:
+            turn.provisional_message_ref = None
+            turn.last_rendered_text = None
+            return True
+        self._schedule_progress_delete(pending)
+        return False
+
+    async def _retry_pending_progress_deletes(self) -> None:
+        now = _loop_time()
+        for pending in list(self._pending_progress_deletes.values()):
+            if pending.next_attempt_at > now:
+                continue
+            deleted = await self._delete_progress_ref(pending)
+            if deleted:
+                self._pending_progress_deletes.pop(pending.key, None)
+            else:
+                self._schedule_progress_delete(pending)
+
+    async def _delete_progress_ref(self, pending: PendingProgressDelete) -> bool:
         try:
             await self.telegram.delete_message(
-                turn.target.conversation_ref,
-                turn.provisional_message_ref,
+                pending.conversation_ref,
+                pending.message_ref,
             )
-        except Exception:
+        except Exception as err:
+            if _is_permanent_delete_failure(err):
+                logger.warning(
+                    "telegram progress message delete abandoned for turn_id=%s: %s",
+                    pending.turn_id,
+                    err,
+                )
+                return True
             logger.exception(
                 "telegram progress message delete failed for turn_id=%s",
-                turn.turn_id,
+                pending.turn_id,
             )
+            return False
+        return True
+
+    def _schedule_progress_delete(self, pending: PendingProgressDelete) -> None:
+        queued = self._pending_progress_deletes.setdefault(pending.key, pending)
+        queued.attempts += 1
+        delay_seconds = min(
+            PROGRESS_DELETE_RETRY_MAX_SECONDS,
+            PROGRESS_DELETE_RETRY_BASE_SECONDS * (2 ** min(queued.attempts - 1, 5)),
+        )
+        queued.next_attempt_at = _loop_time() + delay_seconds
 
     def _update_progress_status(self, event: StreamEvent) -> None:
         turn = self._active_turns.get(event.turn_id)
@@ -1420,6 +1481,34 @@ def _is_permanent_edit_failure(err: Exception) -> bool:
                 "message can't be edited",
                 "message is not modified",
                 "message_id_invalid",
+                "not enough rights",
+            )
+        )
+    return False
+
+
+def _is_permanent_delete_failure(err: Exception) -> bool:
+    if isinstance(err, TelegramReferenceError):
+        return True
+    if isinstance(
+        err,
+        (
+            TelegramForbiddenError,
+            TelegramNotFound,
+            TelegramUnauthorizedError,
+        ),
+    ):
+        return True
+    if isinstance(err, TelegramBadRequest):
+        message = str(err).lower()
+        return any(
+            phrase in message
+            for phrase in (
+                "message to delete not found",
+                "message can't be deleted",
+                "message id invalid",
+                "message_id_invalid",
+                "message not found",
                 "not enough rights",
             )
         )

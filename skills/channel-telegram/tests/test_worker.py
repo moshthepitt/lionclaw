@@ -856,6 +856,39 @@ class OffsetStoreTests(unittest.TestCase):
 
 
 class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def _remember_visible_progress(
+        self,
+        worker: TelegramWorker,
+        *,
+        turn_id: str = "turn-1",
+        update_id: int = 970,
+        message_ref: str = "telegram:message:70",
+    ) -> str:
+        await worker._remember_active_turn(
+            TelegramInboundUpdate(
+                update_id=update_id,
+                event_id=f"telegram:update:{update_id}",
+                sender_ref="telegram:user:77",
+                conversation_ref="telegram:chat:77",
+                message_ref=message_ref,
+                text="slow",
+                trigger="dm",
+                provider_metadata={"chat_type": "private"},
+            ),
+            InboundResponse(
+                outcome="queued",
+                turn_id=turn_id,
+                session_id="session-1",
+                session_key="channel:telegram:direct:77",
+            ),
+        )
+        worker._active_turns[turn_id].visible_after = 0.0
+        await worker.refresh_progress_messages()
+        progress_ref = worker._active_turns[turn_id].provisional_message_ref
+        self.assertIsNotNone(progress_ref)
+        assert progress_ref is not None
+        return progress_ref
+
     async def test_process_updates_routes_pairing_and_inbound_and_persists_offset(
         self,
     ) -> None:
@@ -2067,6 +2100,84 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             [("telegram:chat:77", "telegram:message:101")],
         )
 
+    async def test_progress_delete_failure_retries_without_reopening_turn(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                delete_errors=[RuntimeError("temporary delete failure")]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            progress_ref = await self._remember_visible_progress(worker)
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker._process_outbox_delivery(
+                    OutboxDelivery(
+                        delivery_id="delivery-1",
+                        attempt_id="attempt-1",
+                        conversation_ref="telegram:chat:77",
+                        turn_id="turn-1",
+                        content=OutboxContent(text="final answer"),
+                    )
+                )
+
+            self.assertNotIn("turn-1", worker._active_turns)
+            self.assertEqual(telegram.deleted_messages, [])
+            self.assertEqual(len(worker._pending_progress_deletes), 1)
+            pending = next(iter(worker._pending_progress_deletes.values()))
+            self.assertEqual(pending.message_ref, progress_ref)
+            pending.next_attempt_at = 0.0
+
+            await worker.refresh_progress_messages()
+
+        self.assertEqual(telegram.sent_messages[-1][1], "final answer")
+        self.assertEqual(
+            telegram.deleted_messages,
+            [("telegram:chat:77", progress_ref)],
+        )
+        self.assertEqual(worker._pending_progress_deletes, {})
+
+    async def test_permanent_progress_delete_failure_is_not_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                delete_errors=[
+                    TelegramBadRequest(
+                        method=object(),
+                        message="message to delete not found",
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            await self._remember_visible_progress(worker)
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="WARNING"):
+                await worker._process_outbox_delivery(
+                    OutboxDelivery(
+                        delivery_id="delivery-1",
+                        attempt_id="attempt-1",
+                        conversation_ref="telegram:chat:77",
+                        turn_id="turn-1",
+                        content=OutboxContent(text="final answer"),
+                    )
+                )
+            await worker.refresh_progress_messages()
+
+        self.assertNotIn("turn-1", worker._active_turns)
+        self.assertEqual(telegram.deleted_messages, [])
+        self.assertEqual(worker._pending_progress_deletes, {})
+
     async def test_unscoped_outbox_delivery_does_not_delete_active_progress(
         self,
     ) -> None:
@@ -3091,6 +3202,7 @@ class FakeTelegramTransport:
         bot_identity_refresh_error: Exception | None = None,
         downloaded_content: bytes = b"file",
         edit_errors: list[Exception] | None = None,
+        delete_errors: list[Exception] | None = None,
     ) -> None:
         self.updates = list(updates or [])
         self.sent_messages: list[tuple[str, str, str | None, str | None, list[str]]] = (
@@ -3110,6 +3222,7 @@ class FakeTelegramTransport:
         self.bot_identity_refresh_error = bot_identity_refresh_error
         self.downloaded_content = downloaded_content
         self.edit_errors = list(edit_errors or [])
+        self.delete_errors = list(delete_errors or [])
 
     async def close(self) -> None:
         pass
@@ -3192,6 +3305,8 @@ class FakeTelegramTransport:
         conversation_ref: str,
         message_ref: str,
     ) -> None:
+        if self.delete_errors:
+            raise self.delete_errors.pop(0)
         self.deleted_messages.append((conversation_ref, message_ref))
 
 
