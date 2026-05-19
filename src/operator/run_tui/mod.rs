@@ -1143,13 +1143,8 @@ impl ConsoleApp {
             .iter()
             .position(|subject| *subject == self.inspector_subject)
             .unwrap_or(0);
-        let next = if delta < 0 {
-            current.saturating_sub((-delta) as usize)
-        } else {
-            current
-                .saturating_add(delta as usize)
-                .min(INSPECTOR_SUBJECTS.len().saturating_sub(1))
-        };
+        let len = INSPECTOR_SUBJECTS.len() as isize;
+        let next = (current as isize + delta).rem_euclid(len) as usize;
         self.inspector_subject = INSPECTOR_SUBJECTS
             .get(next)
             .copied()
@@ -1741,11 +1736,16 @@ async fn run_console_app(mut app: ConsoleApp) -> Result<RunConsoleOutcome> {
 type ConsoleTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 fn enter_terminal() -> Result<ConsoleTerminal> {
-    enable_raw_mode()?;
+    let mut guard = TerminalSetupGuard::enter_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(stdout, EnterAlternateScreen)?;
+    guard.entered_alternate_screen = true;
+    execute!(stdout, EnableBracketedPaste)?;
+    guard.enabled_bracketed_paste = true;
     let backend = CrosstermBackend::new(stdout);
-    Terminal::new(backend).map_err(Into::into)
+    let terminal = Terminal::new(backend)?;
+    guard.disarm();
+    Ok(terminal)
 }
 
 fn leave_terminal(mut terminal: ConsoleTerminal) -> Result<()> {
@@ -1757,6 +1757,44 @@ fn leave_terminal(mut terminal: ConsoleTerminal) -> Result<()> {
     )?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+struct TerminalSetupGuard {
+    raw_mode: bool,
+    entered_alternate_screen: bool,
+    enabled_bracketed_paste: bool,
+}
+
+impl TerminalSetupGuard {
+    fn enter_raw_mode() -> Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self {
+            raw_mode: true,
+            entered_alternate_screen: false,
+            enabled_bracketed_paste: false,
+        })
+    }
+
+    fn disarm(mut self) {
+        self.raw_mode = false;
+        self.entered_alternate_screen = false;
+        self.enabled_bracketed_paste = false;
+    }
+}
+
+impl Drop for TerminalSetupGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout();
+        if self.enabled_bracketed_paste {
+            drop(execute!(stdout, DisableBracketedPaste));
+        }
+        if self.entered_alternate_screen {
+            drop(execute!(stdout, LeaveAlternateScreen));
+        }
+        if self.raw_mode {
+            drop(disable_raw_mode());
+        }
+    }
 }
 
 async fn run_terminal_loop(

@@ -80,7 +80,7 @@ fn stream_events_append_answers_and_summarize_runtime_activity() {
 }
 
 #[test]
-fn answer_deltas_repair_missing_sentence_boundary_space() {
+fn answer_deltas_preserve_literal_stream_text() {
     let mut transcript = vec![TranscriptLine::new(
         TranscriptLineKind::Answer,
         "decisions.",
@@ -92,7 +92,7 @@ fn answer_deltas_repair_missing_sentence_boundary_space() {
         transcript,
         vec![TranscriptLine::new(
             TranscriptLineKind::Answer,
-            "decisions. The markdown",
+            "decisions.The markdown",
         )]
     );
 
@@ -102,7 +102,7 @@ fn answer_deltas_repair_missing_sentence_boundary_space() {
 
     append_transcript_delta(&mut transcript, TranscriptLineKind::Answer, ".");
     append_transcript_delta(&mut transcript, TranscriptLineKind::Answer, "**Report**");
-    assert!(transcript[0].text.ends_with("std.io::Result. **Report**"));
+    assert!(transcript[0].text.ends_with("std.io::Result.**Report**"));
 }
 
 #[test]
@@ -1291,6 +1291,26 @@ fn inspector_left_right_cycles_subjects() {
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &backend_tx,
+        )
+        .await;
+    });
+    assert_eq!(app.inspector_subject, InspectorSubject::Selection);
+
+    runtime.block_on(async {
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &backend_tx,
+        )
+        .await;
+    });
+    assert_eq!(app.inspector_subject, InspectorSubject::Audit);
+
+    runtime.block_on(async {
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
             &backend_tx,
         )
         .await;

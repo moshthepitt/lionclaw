@@ -152,6 +152,10 @@ item without sending text. The kernel uses `answer` boundaries when building
 canonical assistant text so adjacent streamed items remain separate paragraphs;
 UIs can use the same marker to render live transcript blocks without
 runtime-specific parsing.
+`message_boundary` is a stable stream event kind. Consumers that reconstruct
+plain text from `message_delta` events should ignore it; consumers that render
+conversation structure may use it as a paragraph/message-item break. Literal
+`message_delta` text is otherwise preserved as emitted by the runtime adapter.
 Channel streams also emit a kernel-owned `turn_completed` event after the turn
 record is finalized. Its `text` field is the canonical persisted assistant
 reply and lets channel UIs reconcile live deltas against durable turn state

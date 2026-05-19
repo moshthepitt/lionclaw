@@ -293,9 +293,6 @@ pub enum RuntimeEvent {
 pub type RuntimeEventSender = mpsc::UnboundedSender<RuntimeEvent>;
 
 pub fn append_streamed_text_delta(existing: &mut String, delta: &str) {
-    if needs_streamed_text_separator(existing, delta) {
-        existing.push(' ');
-    }
     existing.push_str(delta);
 }
 
@@ -308,23 +305,6 @@ pub fn append_streamed_text_boundary(existing: &mut String) {
     } else {
         existing.push_str("\n\n");
     }
-}
-
-fn needs_streamed_text_separator(existing: &str, delta: &str) -> bool {
-    let Some(previous) = existing.chars().last() else {
-        return false;
-    };
-    let Some(next) = delta.chars().next() else {
-        return false;
-    };
-    matches!(previous, '.' | '!' | '?' | ':' | ';' | ',')
-        && !previous.is_whitespace()
-        && !next.is_whitespace()
-        && starts_sentence_like(next)
-}
-
-fn starts_sentence_like(ch: char) -> bool {
-    ch.is_uppercase() || matches!(ch, '"' | '\'' | '`' | '*' | '(' | '[' | '{')
 }
 
 pub trait RuntimeProgramOutputParser: Send {

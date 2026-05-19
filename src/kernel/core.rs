@@ -5484,6 +5484,22 @@ mod tests {
 
     #[test]
     fn assistant_text_preserves_runtime_message_boundaries() {
+        let literal_events = vec![
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: "Intro.".to_string(),
+            },
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text: "**Project**".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            assistant_text_from_events(&literal_events),
+            "Intro.**Project**"
+        );
+
         let events = vec![
             RuntimeEvent::MessageDelta {
                 lane: RuntimeMessageLane::Answer,
