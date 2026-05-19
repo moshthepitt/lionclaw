@@ -516,6 +516,8 @@ def _first_supported_message(update: Update) -> tuple[Message, str, bool] | None
 
 
 def _coerce_chat_id(peer_id: str) -> int | str:
+    if not isinstance(peer_id, str):
+        raise TelegramReferenceError(f"invalid telegram conversation_ref '{peer_id}'")
     was_namespaced = peer_id.startswith("telegram:")
     for prefix in ("telegram:chat:", "telegram:user:"):
         if peer_id.startswith(prefix):
@@ -537,6 +539,8 @@ def _coerce_chat_id(peer_id: str) -> int | str:
 def _coerce_message_id(message_ref: str | None) -> int | None:
     if message_ref is None:
         return None
+    if not isinstance(message_ref, str):
+        raise TelegramReferenceError(f"invalid telegram message_ref '{message_ref}'")
     was_namespaced = message_ref.startswith("telegram:")
     if message_ref.startswith("telegram:message:"):
         message_ref = message_ref.removeprefix("telegram:message:")
@@ -561,6 +565,8 @@ def _reply_parameters(message_ref: str | None) -> ReplyParameters | None:
 def _coerce_thread_id(thread_ref: str | None, *, omit_general: bool) -> int | None:
     if thread_ref is None:
         return None
+    if not isinstance(thread_ref, str):
+        raise TelegramReferenceError(f"invalid telegram thread_ref '{thread_ref}'")
     if thread_ref.startswith("telegram:topic:"):
         thread_ref = thread_ref.removeprefix("telegram:topic:")
     if not thread_ref.isdigit():

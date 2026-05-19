@@ -39,6 +39,8 @@ from lionclaw_channel_telegram.telegram import (
     TelegramOutboundAttachment,
     TelegramPairingClaim,
     TelegramReferenceError,
+    _coerce_chat_id,
+    _coerce_message_id,
     _coerce_thread_id,
     _format_telegram_text_chunks,
     _markdown_to_telegram_html,
@@ -3072,6 +3074,16 @@ class TelegramDeliveryHelperTests(unittest.TestCase):
     def test_topic_thread_ref_preserves_general_topic_on_typing(self) -> None:
         self.assertEqual(_coerce_thread_id("telegram:topic:1", omit_general=False), 1)
 
+    def test_malformed_refs_raise_reference_error(self) -> None:
+        with self.assertRaisesRegex(TelegramReferenceError, "conversation_ref"):
+            _coerce_chat_id(77)  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(TelegramReferenceError, "message_ref"):
+            _coerce_message_id(77)  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(TelegramReferenceError, "thread_ref"):
+            _coerce_thread_id(77, omit_general=True)  # type: ignore[arg-type]
+
     def test_markdown_rendering_uses_telegram_html_and_suppresses_local_links(
         self,
     ) -> None:
@@ -3134,6 +3146,22 @@ class TelegramDeliveryHelperTests(unittest.TestCase):
 
 
 class AiogramTelegramTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_malformed_send_refs_raise_before_provider_call(self) -> None:
+        bot = RecordingAiogramBot()
+        transport = object.__new__(AiogramTelegramTransport)
+        transport._bot = bot
+        transport._bot_identity = None
+
+        with self.assertRaisesRegex(TelegramReferenceError, "thread_ref"):
+            await transport.send_message(
+                "telegram:chat:77",
+                "answer",
+                thread_ref=77,  # type: ignore[arg-type]
+            )
+
+        self.assertEqual(bot.sent_messages, [])
+        self.assertEqual(bot.sent_documents, [])
+
     async def test_markdown_attachment_text_uses_message_when_html_caption_too_long(
         self,
     ) -> None:
