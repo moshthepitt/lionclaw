@@ -20,7 +20,7 @@ impl TurnCancellation {
     }
 
     pub fn request(&self, reason: impl Into<String>) -> bool {
-        let reason = normalize_cancel_reason(reason.into());
+        let reason = normalize_cancel_reason(reason);
         self.tx.send_if_modified(|current| {
             if current.is_some() {
                 false
@@ -53,7 +53,8 @@ impl TurnCancellation {
     }
 }
 
-fn normalize_cancel_reason(reason: String) -> String {
+pub(crate) fn normalize_cancel_reason(reason: impl Into<String>) -> String {
+    let reason = reason.into();
     let reason = reason.trim();
     if reason.is_empty() {
         DEFAULT_CANCEL_REASON.to_string()

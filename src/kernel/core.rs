@@ -66,7 +66,7 @@ use crate::{
 
 use super::{
     audit::AuditLog,
-    cancellation::TurnCancellation,
+    cancellation::{normalize_cancel_reason, TurnCancellation},
     capability_broker::{CapabilityBroker, CapabilityExecutionContext},
     channel_attachments::{
         ChannelAttachmentBatchStatus, ChannelAttachmentRecord, ChannelAttachmentRecordStatus,
@@ -8395,13 +8395,7 @@ fn is_expected_terminal_status(status: SessionTurnStatus) -> bool {
 }
 
 fn action_cancel_reason(reason: Option<String>) -> String {
-    let reason = reason.unwrap_or_else(|| "turn cancellation requested".to_string());
-    let reason = reason.trim();
-    if reason.is_empty() {
-        "turn cancellation requested".to_string()
-    } else {
-        reason.chars().take(512).collect()
-    }
+    normalize_cancel_reason(reason.unwrap_or_default())
 }
 
 fn queued_terminal_from_response(response: &SessionTurnResponse) -> QueuedTurnTerminal {
@@ -10968,6 +10962,19 @@ impl Kernel {
     }
 
     async fn process_queued_channel_turn(&self, turn: ChannelTurnRecord) {
+        let turn_id = turn.turn_id;
+        let cancellation = TurnCancellation::new();
+        self.register_active_channel_turn_cancellation(&turn, cancellation.clone())
+            .await;
+        Box::pin(self.process_queued_channel_turn_inner(turn, cancellation)).await;
+        self.unregister_active_turn_cancellation(turn_id).await;
+    }
+
+    async fn process_queued_channel_turn_inner(
+        &self,
+        turn: ChannelTurnRecord,
+        cancellation: TurnCancellation,
+    ) {
         let stream_context = match self
             .channel_stream_context_for_session(
                 turn.session_id,
@@ -11091,6 +11098,7 @@ impl Kernel {
                     persisted_turn,
                     control,
                     stream_context.clone(),
+                    cancellation,
                 )
                 .await
             {
@@ -11105,16 +11113,12 @@ impl Kernel {
             return;
         }
 
-        let cancellation = TurnCancellation::new();
-        self.register_active_channel_turn_cancellation(&turn, cancellation.clone())
-            .await;
         let attachment_context = match self
             .channel_attachment_execution_context_for_turn(&turn, &persisted_turn.prompt_user_text)
             .await
         {
             Ok(context) => context,
             Err(err) => {
-                self.unregister_active_turn_cancellation(turn.turn_id).await;
                 let code = queued_turn_failure_code(&err);
                 if let Err(fail_err) = self
                     .fail_queued_turn(&turn, code, &err.to_string(), stream_context)
@@ -11153,7 +11157,6 @@ impl Kernel {
                 },
             )
             .await;
-        self.unregister_active_turn_cancellation(turn.turn_id).await;
         self.remove_channel_attachment_runtime_projection_dirs_best_effort(&projection_mounts)
             .await;
 
@@ -11189,6 +11192,7 @@ impl Kernel {
         prepared_turn: SessionTurnRecord,
         control: LionClawControlInput,
         stream_context: Option<ChannelStreamContext>,
+        cancellation: TurnCancellation,
     ) -> Result<(), KernelError> {
         self.append_audit_event_best_effort(
             "channel.lionclaw_control",
@@ -11217,6 +11221,7 @@ impl Kernel {
                     prepared_turn,
                     SessionActionKind::ContinueLastPartial,
                     stream_context,
+                    cancellation,
                 )
                 .await?;
             }
@@ -11226,6 +11231,7 @@ impl Kernel {
                     prepared_turn,
                     SessionActionKind::RetryLastTurn,
                     stream_context,
+                    cancellation,
                 )
                 .await?;
             }
@@ -11289,10 +11295,8 @@ impl Kernel {
         prepared_turn: SessionTurnRecord,
         action: SessionActionKind,
         stream_context: Option<ChannelStreamContext>,
+        cancellation: TurnCancellation,
     ) -> Result<(), KernelError> {
-        let cancellation = TurnCancellation::new();
-        self.register_active_channel_turn_cancellation(turn, cancellation.clone())
-            .await;
         let response = self
             .run_session_action_with_options(
                 turn.session_id,
@@ -11300,7 +11304,6 @@ impl Kernel {
                 SessionActionExecutionOptions::queued_channel(turn, prepared_turn, cancellation),
             )
             .await;
-        self.unregister_active_turn_cancellation(turn.turn_id).await;
         let response = response?;
 
         self.terminalize_queued_turn(
