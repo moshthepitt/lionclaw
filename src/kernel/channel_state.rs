@@ -17,6 +17,7 @@ use crate::{
 pub(crate) const PAIRING_CLAIM_POLICY_OPERATOR_APPROVAL: &str = "operator_approval";
 pub(crate) const PAIRING_CLAIM_POLICY_TOKEN_CLAIM: &str = "token_claim";
 pub(crate) const CHANNEL_HEALTH_OBSERVED_AT_FUTURE_SKEW_SECONDS: i64 = 2 * 60;
+const CHANNEL_HEALTH_REPORTS_TABLE: &str = "channel_health_reports";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelGrantStatus {
@@ -1869,8 +1870,26 @@ impl ChannelStateStore {
         &self,
         channel_id: &str,
     ) -> Result<Option<ChannelHealthReportRecord>> {
+        if !self.channel_health_reports_table_exists().await? {
+            return Ok(None);
+        }
         self.latest_health_report_before_or_at(channel_id, channel_health_future_cutoff_ms())
             .await
+    }
+
+    async fn channel_health_reports_table_exists(&self) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 AS found \
+             FROM sqlite_master \
+             WHERE type = 'table' AND name = ?1 \
+             LIMIT 1",
+        )
+        .bind(CHANNEL_HEALTH_REPORTS_TABLE)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query channel health report schema")?;
+
+        Ok(row.is_some())
     }
 
     async fn latest_health_report_before_or_at(
@@ -2023,13 +2042,17 @@ impl ChannelStateStore {
                     .ok_or_else(|| anyhow!("invalid latest_outbound_at_ms '{value}'"))
             })
             .transpose()?;
-        let health_cutoff_ms = channel_health_future_cutoff_ms();
-        let latest_report = self
-            .latest_health_report_before_or_at(channel_id, health_cutoff_ms)
-            .await?;
-        let future_report = self
-            .latest_future_health_report_after(channel_id, health_cutoff_ms)
-            .await?;
+        let (latest_report, future_report) = if self.channel_health_reports_table_exists().await? {
+            let health_cutoff_ms = channel_health_future_cutoff_ms();
+            (
+                self.latest_health_report_before_or_at(channel_id, health_cutoff_ms)
+                    .await?,
+                self.latest_future_health_report_after(channel_id, health_cutoff_ms)
+                    .await?,
+            )
+        } else {
+            (None, None)
+        };
 
         Ok(ChannelHealthRecord {
             channel_id: channel_id.to_string(),
