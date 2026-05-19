@@ -356,7 +356,7 @@ CREATE TABLE channel_turns_new (
     session_id TEXT NOT NULL,
     inbound_event_id TEXT NOT NULL,
     runtime_id TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('waiting_for_attachments', 'pending', 'running', 'completed', 'failed', 'timed_out', 'cancelled', 'interrupted')),
+    status TEXT NOT NULL CHECK (status IN ('waiting_for_attachments', 'pending', 'running', 'completed', 'failed')),
     last_error TEXT,
     answer_checkpoint_sequence INTEGER,
     queued_at_ms INTEGER NOT NULL,

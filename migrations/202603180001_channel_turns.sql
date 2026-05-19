@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS channel_turns (
     session_id TEXT NOT NULL,
     inbound_message_id TEXT NOT NULL UNIQUE,
     runtime_id TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed', 'timed_out', 'cancelled', 'interrupted')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed')),
     last_error TEXT,
     queued_at_ms INTEGER NOT NULL,
     started_at_ms INTEGER,
