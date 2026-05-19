@@ -1060,6 +1060,9 @@ class TelegramWorker:
         if turn.provisional_message_ref is not None:
             turn.status_text = "Finishing"
             await self._edit_progress_message(turn, _progress_text(turn), force=True)
+            return
+        turn.terminal = True
+        self._forget_turn(turn)
 
     def _forget_turn(self, turn: ActiveTurn) -> None:
         self._active_turns.pop(turn.turn_id, None)

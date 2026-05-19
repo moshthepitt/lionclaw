@@ -2253,6 +2253,85 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(telegram.sent_messages, [])
 
+    async def test_fast_done_forgets_turn_without_creating_stale_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(
+                inbound_turn_id="turn-1",
+                inbound_session_id="session-1",
+                inbound_session_key="channel:telegram:direct:77",
+            )
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 961,
+                            "message": {
+                                "message_id": 61,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "quick",
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+            await worker._process_stream_event(
+                StreamEvent(
+                    sequence=1,
+                    peer_id="telegram:chat:77",
+                    turn_id="turn-1",
+                    kind="turn_completed",
+                )
+            )
+            await worker._process_stream_event(
+                StreamEvent(
+                    sequence=2,
+                    peer_id="telegram:chat:77",
+                    turn_id="turn-1",
+                    kind="done",
+                )
+            )
+            await worker.refresh_progress_messages()
+            await worker._process_outbox_delivery(
+                OutboxDelivery(
+                    delivery_id="delivery-1",
+                    attempt_id="attempt-1",
+                    conversation_ref="telegram:chat:77",
+                    turn_id="turn-1",
+                    content=OutboxContent(text="final answer"),
+                )
+            )
+
+        self.assertEqual(
+            telegram.sent_messages,
+            [
+                (
+                    "telegram:chat:77",
+                    "final answer",
+                    None,
+                    None,
+                    [],
+                ),
+            ],
+        )
+        self.assertEqual(telegram.edited_messages, [])
+        self.assertEqual(telegram.deleted_messages, [])
+        self.assertEqual(worker._active_turns, {})
+        self.assertEqual(worker._route_turns, {})
+
     async def test_long_turn_creates_edits_and_deletes_one_progress_message(
         self,
     ) -> None:
