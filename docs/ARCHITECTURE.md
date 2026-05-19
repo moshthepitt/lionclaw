@@ -64,7 +64,7 @@ Instead, LionClaw constrains the runtime launch:
 - selected work root mounted at `/workspace`
 - runtime-private state mounted at `/runtime`
 - draft/output area mounted at `/drafts`
-- applied non-channel skill snapshots mounted read-only at `/lionclaw/skills/<alias>`
+- applied non-channel skills mounted read-only at `/lionclaw/skills/<alias>`
 - network mode chosen by preset
 - runtime secrets mounted only when preset allows it
 - runtime auth staged into the runtime-private home
@@ -206,7 +206,7 @@ The everyday runtime layout is mount-first:
 - `/workspace`: selected work root with preset-controlled read-only or read-write access
 - `/runtime`: runtime-private writable state root
 - `/drafts`: runtime-private draft/output area
-- `/lionclaw/skills/<alias>`: installed non-channel skill snapshot assets mounted read-only
+- `/lionclaw/skills/<alias>`: installed non-channel skill assets mounted read-only
 - `/attachments`: read-only channel attachment files for the current inbound
   event, present only after attachment finalization staged files for that turn
 
