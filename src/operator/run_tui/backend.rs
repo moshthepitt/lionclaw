@@ -86,6 +86,28 @@ pub(super) async fn load_project_objects(selected: &SelectedInstanceState) -> Pr
     }
 }
 
+pub(super) async fn load_audit_events(selected: &SelectedInstanceState) -> AuditTrail {
+    let SelectedInstanceState::Ready(ready) = selected else {
+        return AuditTrail::Unavailable("Launch blocked".to_string());
+    };
+
+    match ready
+        .kernel
+        .query_audit(Some(ready.session_id), None, None, Some(AUDIT_EVENT_LIMIT))
+        .await
+    {
+        Ok(response) if response.events.is_empty() => AuditTrail::Empty,
+        Ok(response) => AuditTrail::Ready(
+            response
+                .events
+                .into_iter()
+                .map(AuditEventItem::from_view)
+                .collect(),
+        ),
+        Err(err) => AuditTrail::Unavailable(format!("Audit unavailable: {err}")),
+    }
+}
+
 async fn load_project_sessions(ready: &ReadyInstance) -> ProjectObjectSection<ProjectSessionItem> {
     match ready
         .kernel
@@ -167,16 +189,31 @@ async fn try_open_selected_instance(
         .await
         .map_err(kernel_to_anyhow)?
         .session_id;
-    let runtime_kind = config
-        .runtime(&runtime_id)
+    let runtime = config.runtime(&runtime_id);
+    let runtime_kind = runtime
         .map(|runtime| runtime.kind().to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    let runtime_executable = runtime
+        .map(|runtime| runtime.executable().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let (runtime_model, runtime_agent) = match runtime {
+        Some(crate::operator::config::RuntimeProfileConfig::Codex { model, .. }) => {
+            (model.clone(), None)
+        }
+        Some(crate::operator::config::RuntimeProfileConfig::OpenCode { model, agent, .. }) => {
+            (model.clone(), agent.clone())
+        }
+        None => (None, None),
+    };
     let boundary = resolve_boundary_summary(&config, effective_timeouts)?;
 
     Ok(ReadyInstance {
         summary,
         runtime_id,
         runtime_kind,
+        runtime_executable,
+        runtime_model,
+        runtime_agent,
         runtime_override: requested_runtime,
         boundary,
         kernel,

@@ -33,9 +33,9 @@ use uuid::Uuid;
 
 use crate::{
     contracts::{
-        SessionActionKind, SessionActionRequest, SessionHistoryRequest, SessionTurnRequest,
-        SessionTurnResponse, SessionTurnStatus, SessionTurnView, StreamEventDto,
-        StreamEventKindDto, StreamLaneDto,
+        AuditEventView, SessionActionKind, SessionActionRequest, SessionHistoryRequest,
+        SessionTurnRequest, SessionTurnResponse, SessionTurnStatus, SessionTurnView,
+        StreamEventDto, StreamEventKindDto, StreamLaneDto,
     },
     home::LionClawHome,
     kernel::{
@@ -65,8 +65,9 @@ mod input;
 mod render;
 
 use backend::{
-    load_project_objects, open_selected_instance, push_history_turn, push_stream_event,
-    resolve_console_instances, spawn_streamed_turn, BackendEvent, StreamedSubmission,
+    load_audit_events, load_project_objects, open_selected_instance, push_history_turn,
+    push_stream_event, resolve_console_instances, spawn_streamed_turn, BackendEvent,
+    StreamedSubmission,
 };
 use input::handle_terminal_event;
 use render::{render_app, vertical_scroll_limit};
@@ -98,6 +99,7 @@ const COMPOSER_CHROME_HEIGHT: u16 = 4;
 const KV_LABEL_WIDTH: usize = 16;
 const LOCAL_CLI_CHANNEL_ID: &str = "local-cli";
 const PROJECT_SESSION_LIMIT: usize = 5;
+const AUDIT_EVENT_LIMIT: usize = 8;
 const ACTIVITY_ERROR_MARKERS: &[&str] = &["error", "failed", "denied"];
 const ACTIVITY_DONE_MARKERS: &[&str] = &[
     "completed",
@@ -496,9 +498,36 @@ impl ActivitySummary {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InspectorMode {
-    Instance,
+enum InspectorSubject {
+    Selection,
+    Runtime,
+    Boundary,
     Activity,
+    Audit,
+}
+
+const INSPECTOR_SUBJECTS: &[InspectorSubject] = &[
+    InspectorSubject::Selection,
+    InspectorSubject::Runtime,
+    InspectorSubject::Boundary,
+    InspectorSubject::Activity,
+    InspectorSubject::Audit,
+];
+
+impl InspectorSubject {
+    fn label(self, app: &ConsoleApp) -> &'static str {
+        match self {
+            Self::Selection if app.focus == Focus::Project => match app.project_cursor {
+                ProjectSelection::Instance(_) => "Instance",
+                ProjectSelection::Session(_) => "Session",
+            },
+            Self::Selection => "Instance",
+            Self::Runtime => "Runtime",
+            Self::Boundary => "Boundary",
+            Self::Activity => "Activity",
+            Self::Audit => "Audit",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -506,6 +535,9 @@ struct ReadyInstance {
     summary: InstanceSummary,
     runtime_id: String,
     runtime_kind: String,
+    runtime_executable: String,
+    runtime_model: Option<String>,
+    runtime_agent: Option<String>,
     runtime_override: Option<String>,
     boundary: BoundarySummary,
     kernel: Kernel,
@@ -598,6 +630,35 @@ impl ProjectObjects {
 enum ProjectSelection {
     Instance(usize),
     Session(Uuid),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuditEventItem {
+    event_type: String,
+    actor: Option<String>,
+    session_id: Option<Uuid>,
+    timestamp: String,
+    summary: String,
+}
+
+impl AuditEventItem {
+    fn from_view(event: AuditEventView) -> Self {
+        let summary = audit_event_summary(&event);
+        Self {
+            event_type: event.event_type,
+            actor: event.actor,
+            session_id: event.session_id,
+            timestamp: event.timestamp.format("%H:%M:%S UTC").to_string(),
+            summary,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuditTrail {
+    Empty,
+    Unavailable(String),
+    Ready(Vec<AuditEventItem>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -729,6 +790,11 @@ const HELP_CONTEXT_KEY_HINTS: &[KeyHint] = &[
         "Home / End",
         "Bounds",
         "jump to the top or bottom of a scrollable pane",
+    ),
+    KeyHint::new(
+        "Left / Right",
+        "Inspector",
+        "cycle inspector subjects while the inspector is focused",
     ),
     KeyHint::new("Esc", "Cancel", "close overlays or clear the composer"),
 ];
@@ -888,7 +954,8 @@ pub(crate) struct ConsoleApp {
     transcript_scroll: VerticalScroll,
     activity: ActivitySummary,
     activity_scroll: VerticalScroll,
-    inspector_mode: InspectorMode,
+    audit: AuditTrail,
+    inspector_subject: InspectorSubject,
     status: String,
     active_turn: Option<JoinHandle<()>>,
     active_turn_cancel: Option<oneshot::Sender<String>>,
@@ -914,6 +981,7 @@ impl ConsoleApp {
         .await;
         let saw_ready_instance = selected.is_ready();
         let project_objects = load_project_objects(&selected).await;
+        let audit = load_audit_events(&selected).await;
         let mut app = Self {
             project_root,
             instances,
@@ -931,7 +999,8 @@ impl ConsoleApp {
             transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
             activity: ActivitySummary::new(),
             activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
-            inspector_mode: InspectorMode::Instance,
+            audit,
+            inspector_subject: InspectorSubject::Selection,
             status: "idle".to_string(),
             active_turn: None,
             active_turn_cancel: None,
@@ -1059,6 +1128,33 @@ impl ConsoleApp {
     fn set_activity_viewport(&mut self, line_count: usize, viewport_height: u16) {
         self.activity_scroll
             .set_viewport(line_count, viewport_height);
+    }
+
+    fn next_inspector_subject(&mut self) {
+        self.move_inspector_subject(1);
+    }
+
+    fn previous_inspector_subject(&mut self) {
+        self.move_inspector_subject(-1);
+    }
+
+    fn move_inspector_subject(&mut self, delta: isize) {
+        let current = INSPECTOR_SUBJECTS
+            .iter()
+            .position(|subject| *subject == self.inspector_subject)
+            .unwrap_or(0);
+        let next = if delta < 0 {
+            current.saturating_sub((-delta) as usize)
+        } else {
+            current
+                .saturating_add(delta as usize)
+                .min(INSPECTOR_SUBJECTS.len().saturating_sub(1))
+        };
+        self.inspector_subject = INSPECTOR_SUBJECTS
+            .get(next)
+            .copied()
+            .unwrap_or(InspectorSubject::Selection);
+        self.status = format!("inspector: {}", self.inspector_subject.label(self));
     }
 
     fn composer_height(&self, terminal_height: u16) -> u16 {
@@ -1216,12 +1312,13 @@ impl ConsoleApp {
             self.saw_ready_instance = true;
         }
         self.refresh_project_objects().await;
+        self.refresh_audit().await;
         self.composer.clear();
         self.transcript.clear();
         self.transcript_scroll.reset_top();
         self.activity = ActivitySummary::new();
         self.activity_scroll.reset_tail();
-        self.inspector_mode = InspectorMode::Instance;
+        self.inspector_subject = InspectorSubject::Selection;
         self.load_selected_history().await;
     }
 
@@ -1252,8 +1349,9 @@ impl ConsoleApp {
         self.transcript_scroll.reset_top();
         self.activity = ActivitySummary::new();
         self.activity_scroll.reset_tail();
-        self.inspector_mode = InspectorMode::Instance;
+        self.inspector_subject = InspectorSubject::Selection;
         self.refresh_project_objects().await;
+        self.refresh_audit().await;
         self.project_cursor = ProjectSelection::Session(session_id);
         self.load_selected_history().await;
         self.status = format!("selected session {}", session.label());
@@ -1262,6 +1360,10 @@ impl ConsoleApp {
     async fn refresh_project_objects(&mut self) {
         self.project_objects = load_project_objects(&self.selected).await;
         self.ensure_project_cursor();
+    }
+
+    async fn refresh_audit(&mut self) {
+        self.audit = load_audit_events(&self.selected).await;
     }
 
     fn project_session(&self, session_id: Uuid) -> Option<&ProjectSessionItem> {
@@ -1358,7 +1460,7 @@ impl ConsoleApp {
         ));
         self.activity.start();
         self.activity_scroll.reset_tail();
-        self.inspector_mode = InspectorMode::Activity;
+        self.inspector_subject = InspectorSubject::Activity;
         self.status = format!("running turn on {instance_name}");
         let (handle, cancel_tx) = spawn_streamed_turn(
             kernel,
@@ -1428,7 +1530,7 @@ impl ConsoleApp {
             .push(TranscriptLine::new(TranscriptLineKind::User, label));
         self.activity.start();
         self.activity_scroll.reset_tail();
-        self.inspector_mode = InspectorMode::Activity;
+        self.inspector_subject = InspectorSubject::Activity;
         self.status = format!("running {label}");
         let (handle, cancel_tx) = spawn_streamed_turn(
             kernel,
@@ -1455,7 +1557,7 @@ impl ConsoleApp {
         ));
         self.activity.start();
         self.activity_scroll.reset_tail();
-        self.inspector_mode = InspectorMode::Activity;
+        self.inspector_subject = InspectorSubject::Activity;
         self.status = "resetting session".to_string();
         let backend_tx = backend_tx.clone();
         self.active_turn = Some(tokio::spawn(async move {
@@ -1497,11 +1599,13 @@ impl ConsoleApp {
                         self.activity.complete();
                         self.status = "idle".to_string();
                         self.refresh_project_objects().await;
+                        self.refresh_audit().await;
                     }
                     Err(message) => {
                         self.activity.fail();
                         self.activity.push_item(ActivityItemKind::Error, message);
                         self.status = "turn failed".to_string();
+                        self.refresh_audit().await;
                     }
                 }
             }
@@ -1521,11 +1625,13 @@ impl ConsoleApp {
                         );
                         self.status = "idle".to_string();
                         self.refresh_project_objects().await;
+                        self.refresh_audit().await;
                     }
                     Err(message) => {
                         self.activity.fail();
                         self.activity.push_item(ActivityItemKind::Error, message);
                         self.status = "reset failed".to_string();
+                        self.refresh_audit().await;
                     }
                 }
             }
@@ -1565,7 +1671,8 @@ pub(crate) async fn run_launch_blocker(blocker: LaunchBlocker) -> Result<()> {
         transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
-        inspector_mode: InspectorMode::Instance,
+        audit: AuditTrail::Unavailable("Launch blocked".to_string()),
+        inspector_subject: InspectorSubject::Selection,
         status: "launch blocked".to_string(),
         active_turn: None,
         active_turn_cancel: None,
@@ -1605,7 +1712,8 @@ pub(crate) async fn run_project_launch_blocker(
         transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
-        inspector_mode: InspectorMode::Instance,
+        audit: AuditTrail::Unavailable("No configured instances".to_string()),
+        inspector_subject: InspectorSubject::Selection,
         status: "no instances configured".to_string(),
         active_turn: None,
         active_turn_cancel: None,
@@ -1766,6 +1874,85 @@ fn turn_count_label(turn_count: u64) -> String {
         1 => "1 turn".to_string(),
         count => format!("{count} turns"),
     }
+}
+
+fn audit_event_summary(event: &AuditEventView) -> String {
+    match event.event_type.as_str() {
+        "session.open" => format_audit_summary(
+            "session opened",
+            [
+                audit_detail_string(&event.details, "channel_id"),
+                audit_detail_string(&event.details, "peer_id"),
+            ],
+        ),
+        "session.turn" => format_audit_summary(
+            "session turn recorded",
+            [
+                audit_detail_string(&event.details, "runtime_id"),
+                audit_detail_number(&event.details, "prompt_len")
+                    .map(|value| format!("{value} chars")),
+            ],
+        ),
+        "runtime.plan.allow" => format_audit_summary(
+            "runtime plan allowed",
+            [
+                audit_detail_string(&event.details, "runtime_id"),
+                audit_detail_string(&event.details, "effective_preset_name"),
+                audit_detail_string(&event.details, "network_mode")
+                    .map(|value| format!("net {value}")),
+            ],
+        ),
+        "runtime.plan.deny" => format_audit_summary(
+            "runtime plan denied",
+            [audit_detail_string(&event.details, "reason"), None, None],
+        ),
+        "runtime.turn.start" => format_audit_summary(
+            "runtime turn started",
+            [
+                audit_detail_string(&event.details, "runtime_id"),
+                None,
+                None,
+            ],
+        ),
+        "runtime.turn.finish" => format_audit_summary(
+            "runtime turn finished",
+            [
+                audit_detail_string(&event.details, "runtime_id"),
+                audit_detail_number(&event.details, "event_count")
+                    .map(|value| format!("{value} events")),
+            ],
+        ),
+        "runtime.turn.error" => format_audit_summary(
+            "runtime turn failed",
+            [
+                audit_detail_string(&event.details, "runtime_id"),
+                audit_detail_string(&event.details, "error"),
+            ],
+        ),
+        other => other.to_string(),
+    }
+}
+
+fn format_audit_summary<const N: usize>(label: &str, details: [Option<String>; N]) -> String {
+    let details = details.into_iter().flatten().collect::<Vec<_>>();
+    if details.is_empty() {
+        label.to_string()
+    } else {
+        format!("{label}: {}", details.join("  "))
+    }
+}
+
+fn audit_detail_string(details: &serde_json::Value, key: &str) -> Option<String> {
+    details
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn audit_detail_number(details: &serde_json::Value, key: &str) -> Option<u64> {
+    details.get(key).and_then(serde_json::Value::as_u64)
 }
 
 #[cfg(test)]

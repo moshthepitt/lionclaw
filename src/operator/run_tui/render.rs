@@ -661,25 +661,21 @@ fn multiline_prefixed_lines(
 }
 
 fn render_inspector(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
-    let title = match app.inspector_mode {
-        InspectorMode::Instance if app.focus == Focus::Project => match app.project_cursor {
-            ProjectSelection::Instance(_) => "Inspector  Instance",
-            ProjectSelection::Session(_) => "Inspector  Session",
-        },
-        InspectorMode::Instance => "Inspector  Instance",
-        InspectorMode::Activity => "Inspector  Activity",
-    };
-    let content = render_panel_shell(frame, area, title, app.focus == Focus::Inspectors);
+    let title = format!("Inspector  {}", app.inspector_subject.label(app));
+    let content = render_panel_shell(frame, area, &title, app.focus == Focus::Inspectors);
     if content.width < 8 || content.height < 4 {
         return;
     }
 
-    match app.inspector_mode {
-        InspectorMode::Instance if app.focus == Focus::Project => {
+    match app.inspector_subject {
+        InspectorSubject::Selection if app.focus == Focus::Project => {
             render_project_cursor_inspector(frame, content, app)
         }
-        InspectorMode::Instance => render_instance_inspector(frame, content, app),
-        InspectorMode::Activity => render_activity_inspector(frame, content, app),
+        InspectorSubject::Selection => render_instance_inspector(frame, content, app),
+        InspectorSubject::Runtime => render_runtime_inspector(frame, content, app),
+        InspectorSubject::Boundary => render_boundary_inspector(frame, content, app),
+        InspectorSubject::Activity => render_activity_inspector(frame, content, app),
+        InspectorSubject::Audit => render_audit_inspector(frame, content, app),
     }
 }
 
@@ -821,7 +817,6 @@ fn render_instance_inspector(frame: &mut Frame<'_>, content: Rect, app: &Console
     let SelectedInstanceState::Ready(ready) = &app.selected else {
         return;
     };
-    let boundary = app.boundary_summary();
     let row_width = inspector_body(content).width as usize;
     let mut lines = vec![
         section_line("●", "Selected"),
@@ -834,49 +829,75 @@ fn render_instance_inspector(frame: &mut Frame<'_>, content: Rect, app: &Console
     if let Some(work_root) = ready.summary.work_root.as_ref() {
         lines.push(kv_path_line("work root", work_root, row_width));
     }
-    lines.extend([
-        kv_line("preset", &boundary.preset),
-        kv_line("turn timeout", &boundary.turn_timeout),
-        Line::raw(""),
-        section_line("▱", "Boundary"),
-        Line::raw(""),
-    ]);
-    for row in boundary_display_rows(&boundary) {
-        lines.push(kv_line(row.label, &row.value));
-    }
-    lines.extend([
-        Line::raw(""),
-        section_line("⚿", "Secrets"),
-        Line::raw(""),
-        Line::from(vec![
-            Span::raw("  runtime auth "),
-            Span::styled(boundary.secrets.clone(), Style::default().fg(PANEL_WARN)),
-        ]),
-        Line::from(vec![
-            Span::raw("  runtime-secrets.env "),
-            Span::styled(
-                if boundary.secrets == "staged" {
-                    "not mounted"
-                } else {
-                    "off"
-                },
-                Style::default().fg(PANEL_WARN),
-            ),
-        ]),
-        Line::raw(""),
-        section_line("▣", "Audit"),
-        Line::raw(""),
-    ]);
-    lines.extend([
-        check_line("runtime.plan.allow"),
-        check_line("runtime.started"),
-        check_line("session.turn.open"),
-    ]);
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Use Left/Right in the inspector for runtime, boundary, activity, and audit details.",
+        Style::default().fg(PANEL_MUTED),
+    ));
 
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
         inspector_body(content),
     );
+}
+
+fn render_runtime_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp) {
+    let SelectedInstanceState::Ready(ready) = &app.selected else {
+        render_inspector_lines(
+            frame,
+            content,
+            vec![Line::styled(
+                "Runtime unavailable while launch is blocked.",
+                Style::default().fg(PANEL_MUTED),
+            )],
+        );
+        return;
+    };
+
+    let mut lines = vec![
+        section_line("◉", "Runtime"),
+        Line::raw(""),
+        kv_line("profile", &ready.runtime_id),
+        kv_line("kind", &ready.runtime_kind),
+        kv_line("executable", &ready.runtime_executable),
+    ];
+    if let Some(model) = ready.runtime_model.as_deref() {
+        lines.push(kv_line("model", model));
+    }
+    if let Some(agent) = ready.runtime_agent.as_deref() {
+        lines.push(kv_line("agent", agent));
+    }
+    lines.push(kv_line(
+        "selected by",
+        if ready.runtime_override.is_some() {
+            "run argument"
+        } else {
+            "instance default"
+        },
+    ));
+    lines.push(kv_line("session", &short_session_id(ready.session_id)));
+    render_inspector_lines(frame, content, lines);
+}
+
+fn render_boundary_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp) {
+    if !app.selected.is_ready() {
+        render_inspector_lines(
+            frame,
+            content,
+            vec![Line::styled(
+                "Boundary unavailable while launch is blocked.",
+                Style::default().fg(PANEL_MUTED),
+            )],
+        );
+        return;
+    }
+
+    let boundary = app.boundary_summary();
+    let mut lines = vec![section_line("▱", "Boundary"), Line::raw("")];
+    for row in boundary_display_rows(&boundary) {
+        lines.push(kv_line(row.label, &row.value));
+    }
+    render_inspector_lines(frame, content, lines);
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
@@ -984,6 +1005,27 @@ fn render_activity_inspector(frame: &mut Frame<'_>, content: Rect, app: &mut Con
         text_area,
     );
     render_vertical_scrollbar(frame, scrollbar_area, rendered_line_count, scroll);
+}
+
+fn render_audit_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp) {
+    let lines = match &app.audit {
+        AuditTrail::Ready(events) => {
+            let mut lines = vec![section_line("▣", "Recent Audit"), Line::raw("")];
+            for event in events {
+                lines.extend(audit_event_lines(event));
+            }
+            lines
+        }
+        AuditTrail::Empty => vec![Line::styled(
+            "No recent audit events for this session.",
+            Style::default().fg(PANEL_MUTED),
+        )],
+        AuditTrail::Unavailable(message) => vec![Line::styled(
+            message.clone(),
+            Style::default().fg(PANEL_MUTED),
+        )],
+    };
+    render_inspector_lines(frame, content, lines);
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
@@ -1149,8 +1191,11 @@ pub(super) fn boundary_display_rows(boundary: &BoundarySummary) -> Vec<BoundaryD
     vec![
         BoundaryDisplayRow::new("workspace", boundary.workspace_display()),
         BoundaryDisplayRow::new("network", boundary.network.clone()),
+        BoundaryDisplayRow::new("secrets", boundary.secrets.clone()),
         BoundaryDisplayRow::new("runtime home", "private"),
         BoundaryDisplayRow::new("skills", "read-only"),
+        BoundaryDisplayRow::new("preset", boundary.preset.clone()),
+        BoundaryDisplayRow::new("turn timeout", boundary.turn_timeout.clone()),
     ]
 }
 
@@ -1165,11 +1210,36 @@ pub(super) fn activity_item_lines(item: &ActivityItem) -> Vec<Line<'static>> {
     multiline_prefixed_lines(&format!("{icon}  "), "   ", style, &item.text)
 }
 
-fn check_line(label: &'static str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("  ✓ ", Style::default().fg(PANEL_READY)),
-        Span::raw(label),
-    ])
+fn audit_event_lines(event: &AuditEventItem) -> Vec<Line<'static>> {
+    let (icon, style) = audit_event_icon(&event.event_type);
+    let mut lines = multiline_prefixed_lines(
+        &format!("{icon}  "),
+        "   ",
+        style,
+        &format!("{}  {}", event.timestamp, event.summary),
+    );
+    if let Some(actor) = event.actor.as_deref() {
+        lines.push(Line::styled(
+            format!("   actor {actor}"),
+            Style::default().fg(PANEL_MUTED),
+        ));
+    }
+    if let Some(session_id) = event.session_id {
+        lines.push(Line::styled(
+            format!("   session {}", short_session_id(session_id)),
+            Style::default().fg(PANEL_MUTED),
+        ));
+    }
+    lines
+}
+
+fn audit_event_icon(event_type: &str) -> (&'static str, Style) {
+    if event_type.contains("deny") || event_type.contains("error") || event_type.contains("failed")
+    {
+        ("!", Style::default().fg(PANEL_ERROR))
+    } else {
+        ("✓", Style::default().fg(PANEL_READY))
+    }
 }
 
 fn key_span(key: &'static str) -> Span<'static> {

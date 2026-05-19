@@ -110,7 +110,8 @@ for the line-oriented interactive path.
 
 Inside the console, `Tab` and `Shift+Tab` move focus, `Enter` activates the
 focused item, `Ctrl+P` opens commands and help, `Ctrl+C` interrupts an active
-turn, and `Ctrl+D` exits when idle.
+turn, and `Ctrl+D` exits when idle. When the inspector is focused, `Left` and
+`Right` cycle instance, runtime, boundary, activity, and audit views.
 
 For Codex, use a logged-in Codex CLI and run LionClaw where the `podman`
 executable is available. If `run` reports a missing runtime image, build or

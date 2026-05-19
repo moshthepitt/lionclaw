@@ -92,7 +92,8 @@ Expected on a TTY:
   and timeout
 - the transcript pane shows durable user and assistant messages without raw
   runtime event spam
-- the inspector shows selected instance and activity details as focus changes
+- the inspector shows selected instance, runtime, boundary, activity, and
+  honest audit details; `Left`/`Right` cycle those views when it is focused
 - the composer accepts printable characters such as `?`; `Tab` visibly moves
   focus, and `Ctrl+D` exits when idle
 

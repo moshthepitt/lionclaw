@@ -337,7 +337,8 @@ fn blocked_instance_renders_launch_blocker() {
         transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
-        inspector_mode: InspectorMode::Instance,
+        audit: AuditTrail::Unavailable("not loaded".to_string()),
+        inspector_subject: InspectorSubject::Selection,
         status: "launch blocked".to_string(),
         active_turn: None,
         active_turn_cancel: None,
@@ -436,6 +437,9 @@ async fn reference_sized_layout_renders_ribbon_three_panes_composer_and_footer()
             summary: main,
             runtime_id: "codex".to_string(),
             runtime_kind: "codex".to_string(),
+            runtime_executable: "codex".to_string(),
+            runtime_model: Some("gpt-5".to_string()),
+            runtime_agent: None,
             runtime_override: None,
             boundary: BoundarySummary {
                 workspace: "rw".to_string(),
@@ -466,7 +470,8 @@ async fn reference_sized_layout_renders_ribbon_three_panes_composer_and_footer()
         transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
-        inspector_mode: InspectorMode::Instance,
+        audit: AuditTrail::Unavailable("not loaded".to_string()),
+        inspector_subject: InspectorSubject::Selection,
         status: "idle".to_string(),
         active_turn: None,
         active_turn_cancel: None,
@@ -482,20 +487,54 @@ async fn reference_sized_layout_renders_ribbon_three_panes_composer_and_footer()
     assert!(rendered.contains("Instances"));
     assert!(rendered.contains("Transcript"));
     assert!(rendered.contains("Inspector  Instance"));
-    assert!(rendered.contains("Boundary"));
     assert!(rendered.contains("session"));
     assert!(rendered.contains("work root"));
     assert!(rendered.contains("turn:2h"));
-    assert!(rendered.contains("turn timeout"));
-    assert!(rendered.contains("skills"));
-    assert!(rendered.contains("read-only"));
     assert!(!rendered.contains("/lionclaw/skills"));
+    assert!(!rendered.contains("runtime.plan.allow"));
     assert!(rendered.contains("Ask through the selected runtime"));
     assert!(!rendered.contains("runtime controls pass through"));
     assert!(rendered.contains("Ctrl+P"));
     assert!(rendered.contains("Commands"));
     assert!(rendered.contains("Ctrl+D"));
     assert_eq!(rendered.lines().count(), 50);
+}
+
+#[tokio::test]
+async fn runtime_boundary_and_audit_inspectors_render_real_context() {
+    let mut app = ready_test_app(Vec::new()).await;
+    app.focus = Focus::Inspectors;
+
+    app.inspector_subject = InspectorSubject::Runtime;
+    let runtime = render_to_text(&mut app, 120, 32);
+    assert!(runtime.contains("Inspector  Runtime"));
+    assert!(runtime.contains("profile"));
+    assert!(runtime.contains("codex"));
+    assert!(runtime.contains("executable"));
+
+    app.inspector_subject = InspectorSubject::Boundary;
+    let boundary = render_to_text(&mut app, 120, 32);
+    assert!(boundary.contains("Inspector  Boundary"));
+    assert!(boundary.contains("workspace"));
+    assert!(boundary.contains("read-write"));
+    assert!(boundary.contains("skills"));
+    assert!(boundary.contains("read-only"));
+    assert!(boundary.contains("turn timeout"));
+    assert!(!boundary.contains("runtime.plan.allow"));
+
+    app.audit = AuditTrail::Ready(vec![AuditEventItem {
+        event_type: "session.open".to_string(),
+        actor: Some("api".to_string()),
+        session_id: app.ready_instance().map(|ready| ready.session_id),
+        timestamp: "12:34:56 UTC".to_string(),
+        summary: "session opened: local-cli  local-project".to_string(),
+    }]);
+    app.inspector_subject = InspectorSubject::Audit;
+    let audit = render_to_text(&mut app, 120, 32);
+    assert!(audit.contains("Inspector  Audit"));
+    assert!(audit.contains("Recent Audit"));
+    assert!(audit.contains("session opened"));
+    assert!(audit.contains("actor api"));
 }
 
 #[tokio::test]
@@ -530,7 +569,7 @@ fn scrollbar_position_maps_pane_bottom_to_ratatui_bottom() {
 async fn activity_inspector_follows_tail_and_renders_scrollbar() {
     let mut app = ready_test_app(Vec::new()).await;
     app.focus = Focus::Inspectors;
-    app.inspector_mode = InspectorMode::Activity;
+    app.inspector_subject = InspectorSubject::Activity;
     app.activity.start();
     for index in 0..80 {
         app.activity.push_item(
@@ -553,7 +592,7 @@ async fn activity_inspector_keyboard_scroll_is_bounded() {
     let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
     let mut app = ready_test_app(Vec::new()).await;
     app.focus = Focus::Inspectors;
-    app.inspector_mode = InspectorMode::Activity;
+    app.inspector_subject = InspectorSubject::Activity;
     app.activity_scroll.limit = 30;
     app.activity_scroll.offset = 30;
     app.activity_scroll.page_size = 7;
@@ -752,6 +791,9 @@ async fn project_objects_load_real_sessions() {
         summary,
         runtime_id: "codex".to_string(),
         runtime_kind: "codex".to_string(),
+        runtime_executable: "codex".to_string(),
+        runtime_model: Some("gpt-5".to_string()),
+        runtime_agent: None,
         runtime_override: None,
         boundary: BoundarySummary {
             workspace: "rw".to_string(),
@@ -773,6 +815,21 @@ async fn project_objects_load_real_sessions() {
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].session_id, session.session_id);
     assert!(sessions[0].current);
+}
+
+#[tokio::test]
+async fn audit_loads_real_session_events() {
+    let (mut app, current_session_id, _) = ready_project_session_app().await;
+
+    app.refresh_audit().await;
+
+    let AuditTrail::Ready(events) = &app.audit else {
+        panic!("expected audit events, got {:?}", app.audit);
+    };
+    assert!(events.iter().any(|event| {
+        event.event_type == "session.open" && event.session_id == Some(current_session_id)
+    }));
+    assert!(events.iter().all(|event| !event.summary.trim().is_empty()));
 }
 
 #[tokio::test]
@@ -1026,8 +1083,11 @@ fn boundary_rows_use_product_terms() {
         vec![
             ("workspace", "read-write".to_string()),
             ("network", "off".to_string()),
+            ("secrets", "off".to_string()),
             ("runtime home", "private".to_string()),
             ("skills", "read-only".to_string()),
+            ("preset", "everyday".to_string()),
+            ("turn timeout", "30m/2h".to_string()),
         ]
     );
 }
@@ -1149,6 +1209,38 @@ fn tab_moves_focus_and_render_marks_focused_pane() {
     assert!(rendered.contains("▶ Transcript"));
 }
 
+#[test]
+fn inspector_left_right_cycles_subjects() {
+    let mut app = blocked_test_app();
+    app.focus = Focus::Inspectors;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
+
+    runtime.block_on(async {
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &backend_tx,
+        )
+        .await;
+    });
+    assert_eq!(app.inspector_subject, InspectorSubject::Runtime);
+    assert_eq!(app.status, "inspector: Runtime");
+
+    runtime.block_on(async {
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &backend_tx,
+        )
+        .await;
+    });
+    assert_eq!(app.inspector_subject, InspectorSubject::Selection);
+}
+
 async fn ready_project_session_app() -> (ConsoleApp, Uuid, Uuid) {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let workspace_root = temp_dir.path().join("workspace");
@@ -1199,6 +1291,9 @@ async fn ready_project_session_app() -> (ConsoleApp, Uuid, Uuid) {
         summary: summary.clone(),
         runtime_id: "codex".to_string(),
         runtime_kind: "codex".to_string(),
+        runtime_executable: "codex".to_string(),
+        runtime_model: Some("gpt-5".to_string()),
+        runtime_agent: None,
         runtime_override: None,
         boundary: BoundarySummary {
             workspace: "rw".to_string(),
@@ -1229,7 +1324,8 @@ async fn ready_project_session_app() -> (ConsoleApp, Uuid, Uuid) {
         transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
-        inspector_mode: InspectorMode::Instance,
+        audit: AuditTrail::Unavailable("not loaded".to_string()),
+        inspector_subject: InspectorSubject::Selection,
         status: "idle".to_string(),
         active_turn: None,
         active_turn_cancel: None,
@@ -1278,7 +1374,8 @@ fn blocked_test_app() -> ConsoleApp {
         transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
-        inspector_mode: InspectorMode::Instance,
+        audit: AuditTrail::Unavailable("not loaded".to_string()),
+        inspector_subject: InspectorSubject::Selection,
         status: "idle".to_string(),
         active_turn: None,
         active_turn_cancel: None,
@@ -1312,6 +1409,9 @@ async fn ready_test_app(transcript: Vec<TranscriptLine>) -> ConsoleApp {
             summary: main,
             runtime_id: "codex".to_string(),
             runtime_kind: "codex".to_string(),
+            runtime_executable: "codex".to_string(),
+            runtime_model: Some("gpt-5".to_string()),
+            runtime_agent: None,
             runtime_override: None,
             boundary: BoundarySummary {
                 workspace: "rw".to_string(),
@@ -1336,7 +1436,8 @@ async fn ready_test_app(transcript: Vec<TranscriptLine>) -> ConsoleApp {
         transcript_scroll: VerticalScroll::top(DEFAULT_TRANSCRIPT_PAGE_SCROLL),
         activity: ActivitySummary::new(),
         activity_scroll: VerticalScroll::tail(DEFAULT_ACTIVITY_PAGE_SCROLL),
-        inspector_mode: InspectorMode::Instance,
+        audit: AuditTrail::Unavailable("not loaded".to_string()),
+        inspector_subject: InspectorSubject::Selection,
         status: "idle".to_string(),
         active_turn: None,
         active_turn_cancel: None,

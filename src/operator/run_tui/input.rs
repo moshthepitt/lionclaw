@@ -73,33 +73,45 @@ pub(super) async fn handle_key(
         (KeyCode::End, _) if app.focus == Focus::Transcript => {
             app.scroll_transcript_to_bottom();
         }
+        (KeyCode::Left, _) if app.focus == Focus::Inspectors => {
+            app.previous_inspector_subject();
+        }
+        (KeyCode::Right, _) if app.focus == Focus::Inspectors => {
+            app.next_inspector_subject();
+        }
         (KeyCode::Up, _)
-            if app.focus == Focus::Inspectors && app.inspector_mode == InspectorMode::Activity =>
+            if app.focus == Focus::Inspectors
+                && app.inspector_subject == InspectorSubject::Activity =>
         {
             app.scroll_activity_up(1);
         }
         (KeyCode::PageUp, _)
-            if app.focus == Focus::Inspectors && app.inspector_mode == InspectorMode::Activity =>
+            if app.focus == Focus::Inspectors
+                && app.inspector_subject == InspectorSubject::Activity =>
         {
             app.scroll_activity_up(app.activity_scroll.page_size);
         }
         (KeyCode::Down, _)
-            if app.focus == Focus::Inspectors && app.inspector_mode == InspectorMode::Activity =>
+            if app.focus == Focus::Inspectors
+                && app.inspector_subject == InspectorSubject::Activity =>
         {
             app.scroll_activity_down(1);
         }
         (KeyCode::PageDown, _)
-            if app.focus == Focus::Inspectors && app.inspector_mode == InspectorMode::Activity =>
+            if app.focus == Focus::Inspectors
+                && app.inspector_subject == InspectorSubject::Activity =>
         {
             app.scroll_activity_down(app.activity_scroll.page_size);
         }
         (KeyCode::Home, _)
-            if app.focus == Focus::Inspectors && app.inspector_mode == InspectorMode::Activity =>
+            if app.focus == Focus::Inspectors
+                && app.inspector_subject == InspectorSubject::Activity =>
         {
             app.scroll_activity_to_top();
         }
         (KeyCode::End, _)
-            if app.focus == Focus::Inspectors && app.inspector_mode == InspectorMode::Activity =>
+            if app.focus == Focus::Inspectors
+                && app.inspector_subject == InspectorSubject::Activity =>
         {
             app.scroll_activity_to_bottom();
         }
