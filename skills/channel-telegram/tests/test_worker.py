@@ -836,6 +836,20 @@ class LionClawApiTests(unittest.IsolatedAsyncioTestCase):
         await api.close()
 
 
+class OffsetStoreTests(unittest.TestCase):
+    def test_save_replaces_offset_file_without_leaving_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "telegram.offset"
+            store = OffsetStore(path)
+
+            store.save(42)
+            store.save(43)
+
+            self.assertEqual(store.load(), 43)
+            self.assertEqual(path.read_text(encoding="utf-8"), "43")
+            self.assertFalse((path.parent / ".telegram.offset.tmp").exists())
+
+
 class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_process_updates_routes_pairing_and_inbound_and_persists_offset(
         self,
@@ -905,6 +919,62 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                     [],
                 ),
             )
+
+    async def test_offset_save_failure_keeps_unpersisted_update_retryable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 7,
+                            "message": {
+                                "message_id": 1,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "first",
+                            },
+                        }
+                    ),
+                    Update.model_validate(
+                        {
+                            "update_id": 8,
+                            "message": {
+                                "message_id": 2,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "second",
+                            },
+                        }
+                    ),
+                ]
+            )
+            offset_path = Path(temp_dir) / "telegram.offset"
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=FailingOffsetStore(offset_path),
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker.process_updates()
+
+            self.assertEqual(worker.offset, 0)
+            self.assertFalse(offset_path.exists())
+            self.assertEqual([update.text for update in api.sent_inbound], ["first"])
 
     async def test_waiting_for_attachments_downloads_stages_and_finalizes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2635,6 +2705,11 @@ class FakeLionClawApi:
                 "attempt_status": outcome,
             },
         )()
+
+
+class FailingOffsetStore(OffsetStore):
+    def save(self, offset: int) -> None:
+        raise RuntimeError(f"cannot persist offset {offset}")
 
 
 class FakeTelegramTransport:

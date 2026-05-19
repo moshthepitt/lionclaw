@@ -131,7 +131,9 @@ class OffsetStore:
 
     def save(self, offset: int) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(str(offset), encoding="utf-8")
+        tmp_path = self.path.with_name(f".{self.path.name}.tmp")
+        tmp_path.write_text(str(offset), encoding="utf-8")
+        tmp_path.replace(self.path)
 
 
 class TelegramWorker:
@@ -192,8 +194,16 @@ class TelegramWorker:
                     return
             self._last_update_id = update.update_id
             self._last_update_observed_at = _loop_time()
-            self.offset = update.update_id + 1
-            self.offset_store.save(self.offset)
+            next_offset = update.update_id + 1
+            try:
+                self.offset_store.save(next_offset)
+            except Exception:
+                logger.exception(
+                    "telegram offset save failed for update_id=%s",
+                    update.update_id,
+                )
+                return
+            self.offset = next_offset
 
     async def flush_stream(self) -> None:
         try:
