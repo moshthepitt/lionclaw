@@ -5248,6 +5248,107 @@ async fn channel_active_turn_cancel_stops_runtime_and_persists_cancelled_status(
 }
 
 #[tokio::test]
+async fn repeated_active_turn_cancel_returns_clear_conflict() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "repeat-cancel-skill").await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let cancel_started = Arc::new(tokio::sync::Notify::new());
+    let release_cancel = Arc::new(tokio::sync::Notify::new());
+    let cancel_calls = Arc::new(AtomicUsize::new(0));
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("blocking-cancel".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+    kernel
+        .register_runtime_adapter(
+            "blocking-cancel",
+            Arc::new(BlockingCancelAdapter {
+                started: started.clone(),
+                cancel_started: cancel_started.clone(),
+                release_cancel: release_cancel.clone(),
+                cancel_calls: cancel_calls.clone(),
+            }),
+        )
+        .await;
+
+    create_pending_pairing(
+        &kernel,
+        "terminal",
+        "peer-repeat-cancel",
+        "cancel-repeat-7801",
+    )
+    .await;
+    approve_pairing(&kernel, "terminal", "peer-repeat-cancel").await;
+    let session_key = direct_session_key("terminal", "peer-repeat-cancel");
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: session_key.clone(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open repeat-cancel session");
+
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "cancel-repeat-7802",
+            "peer-repeat-cancel",
+            "peer-repeat-cancel",
+            None,
+            "long running repeat cancel turn",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue repeat-cancel turn");
+    let turn_id = queued.turn_id.expect("queued turn id");
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("runtime should start");
+
+    kernel
+        .session_action(SessionActionRequest::CancelActiveTurn {
+            session_id: session.session_id,
+            channel_id: "terminal".to_string(),
+            session_key: session_key.clone(),
+            expected_turn_id: Some(turn_id),
+            reason: Some("operator stop".to_string()),
+        })
+        .await
+        .expect("first cancel request");
+    tokio::time::timeout(Duration::from_secs(2), cancel_started.notified())
+        .await
+        .expect("adapter cancel should start");
+
+    let repeated = kernel
+        .session_action(SessionActionRequest::CancelActiveTurn {
+            session_id: session.session_id,
+            channel_id: "terminal".to_string(),
+            session_key: session_key.clone(),
+            expected_turn_id: Some(turn_id),
+            reason: Some("operator stop again".to_string()),
+        })
+        .await
+        .expect_err("repeat active cancel should be explicit");
+    assert!(
+        matches!(repeated, KernelError::Conflict(message) if message.contains("already requested"))
+    );
+
+    release_cancel.notify_waiters();
+    wait_for_latest_turn(
+        &kernel,
+        session.session_id,
+        |turn| turn.turn_id == turn_id && turn.status == SessionTurnStatus::Cancelled,
+        "repeat-cancel turn cancellation",
+    )
+    .await;
+    assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn channel_waiting_turn_cancel_unblocks_following_pending_turn() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "terminal", "waiting-cancel-skill").await;
@@ -6953,6 +7054,13 @@ struct CancelAwareAdapter {
     cancel_reason: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
+struct BlockingCancelAdapter {
+    started: Arc<tokio::sync::Notify>,
+    cancel_started: Arc<tokio::sync::Notify>,
+    release_cancel: Arc<tokio::sync::Notify>,
+    cancel_calls: Arc<AtomicUsize>,
+}
+
 #[async_trait]
 impl RuntimeAdapter for CancelAwareAdapter {
     async fn info(&self) -> RuntimeAdapterInfo {
@@ -6998,6 +7106,60 @@ impl RuntimeAdapter for CancelAwareAdapter {
     ) -> Result<(), anyhow::Error> {
         self.cancel_calls.fetch_add(1, Ordering::SeqCst);
         *self.cancel_reason.lock().await = reason;
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for BlockingCancelAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "blocking-cancel".to_string(),
+            version: "test".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle, anyhow::Error> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("blocking-cancel:{}", input.session_id),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        _event_tx: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult, anyhow::Error> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        _event_tx: RuntimeEventSender,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn cancel(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+        self.cancel_started.notify_waiters();
+        self.release_cancel.notified().await;
         Ok(())
     }
 

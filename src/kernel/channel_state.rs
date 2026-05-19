@@ -1666,111 +1666,162 @@ impl ChannelStateStore {
         Ok(changed.rows_affected() > 0)
     }
 
-    pub async fn claim_next_pending_turn(
+    pub async fn next_claimable_pending_turn(
         &self,
         channel_id: &str,
         session_key: &str,
     ) -> Result<Option<ChannelTurnRecord>> {
-        loop {
-            let mut tx = self
-                .pool
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .context("failed to start pending channel turn claim transaction")?;
-            let row = sqlx::query(
-                "SELECT channel_turns.turn_id, channel_turns.status AS turn_status, session_turns.status AS session_status \
-                 FROM channel_turns \
-                 LEFT JOIN session_turns ON session_turns.turn_id = channel_turns.turn_id \
-                 WHERE channel_turns.channel_id = ?1 \
-                   AND channel_turns.session_key = ?2 \
-                   AND channel_turns.status IN ('waiting_for_attachments', 'pending', 'running') \
-                 ORDER BY channel_turns.queued_at_ms ASC, COALESCE(session_turns.sequence_no, 0) ASC, channel_turns.turn_id ASC \
-                 LIMIT 1",
-            )
-            .bind(channel_id)
-            .bind(session_key)
-            .fetch_optional(&mut *tx)
+        let row = sqlx::query(
+            "SELECT channel_turns.turn_id, channel_turns.status AS turn_status \
+             FROM channel_turns \
+             LEFT JOIN session_turns ON session_turns.turn_id = channel_turns.turn_id \
+             WHERE channel_turns.channel_id = ?1 \
+               AND channel_turns.session_key = ?2 \
+               AND channel_turns.status IN ('waiting_for_attachments', 'pending', 'running') \
+             ORDER BY channel_turns.queued_at_ms ASC, COALESCE(session_turns.sequence_no, 0) ASC, channel_turns.turn_id ASC \
+             LIMIT 1",
+        )
+        .bind(channel_id)
+        .bind(session_key)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to select next claimable channel turn")?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let turn_status_raw: String = row.get("turn_status");
+        let turn_status = ChannelTurnStatus::from_str(&turn_status_raw)
+            .map_err(|err| anyhow!(err))
+            .with_context(|| format!("invalid channel turn status '{turn_status_raw}'"))?;
+        if turn_status != ChannelTurnStatus::Pending {
+            return Ok(None);
+        }
+
+        let turn_id_raw: String = row.get("turn_id");
+        let turn_id = Uuid::parse_str(&turn_id_raw)
+            .with_context(|| format!("invalid claimable turn id '{turn_id_raw}'"))?;
+        self.get_turn(turn_id).await
+    }
+
+    pub async fn claim_pending_turn(&self, turn_id: Uuid) -> Result<Option<ChannelTurnRecord>> {
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
             .await
-            .context("failed to select pending channel turn")?;
+            .context("failed to start pending channel turn claim transaction")?;
+        let turn_id_raw = turn_id.to_string();
+        let row = sqlx::query(
+            "SELECT channel_turns.status AS turn_status, session_turns.status AS session_status \
+             FROM channel_turns \
+             LEFT JOIN session_turns ON session_turns.turn_id = channel_turns.turn_id \
+             WHERE channel_turns.turn_id = ?1",
+        )
+        .bind(&turn_id_raw)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("failed to select pending channel turn for claim")?;
 
-            let Some(row) = row else {
-                tx.commit()
-                    .await
-                    .context("failed to commit empty channel turn claim transaction")?;
-                return Ok(None);
-            };
-
-            let turn_id_raw: String = row.get("turn_id");
-            let turn_status_raw: String = row.get("turn_status");
-            let turn_status = ChannelTurnStatus::from_str(&turn_status_raw)
-                .map_err(|err| anyhow!(err))
-                .with_context(|| format!("invalid channel turn status '{turn_status_raw}'"))?;
-            if turn_status != ChannelTurnStatus::Pending {
-                tx.commit()
-                    .await
-                    .context("failed to commit blocked channel turn claim transaction")?;
-                return Ok(None);
-            }
-
-            let session_status: Option<String> = row.get("session_status");
-            if !matches!(
-                session_status.as_deref(),
-                Some("running") | Some("interrupted")
-            ) {
-                let finished_at_ms = now_ms();
-                sqlx::query(
-                    "UPDATE channel_turns \
-                     SET status = 'failed', last_error = ?2, finished_at_ms = ?3 \
-                     WHERE turn_id = ?1 AND status = 'pending'",
-                )
-                .bind(&turn_id_raw)
-                .bind("queued session turn is no longer runnable")
-                .bind(finished_at_ms)
-                .execute(&mut *tx)
+        let Some(row) = row else {
+            tx.commit()
                 .await
-                .context("failed to fail unrunnable pending channel turn")?;
-                tx.commit()
-                    .await
-                    .context("failed to commit unrunnable channel turn claim transaction")?;
-                continue;
-            }
+                .context("failed to commit missing channel turn claim transaction")?;
+            return Ok(None);
+        };
 
-            let started_at_ms = now_ms();
+        let turn_status_raw: String = row.get("turn_status");
+        let turn_status = ChannelTurnStatus::from_str(&turn_status_raw)
+            .map_err(|err| anyhow!(err))
+            .with_context(|| format!("invalid channel turn status '{turn_status_raw}'"))?;
+        if turn_status != ChannelTurnStatus::Pending {
+            tx.commit()
+                .await
+                .context("failed to commit raced channel turn claim transaction")?;
+            return Ok(None);
+        }
+
+        let session_status: Option<String> = row.get("session_status");
+        if !matches!(
+            session_status.as_deref(),
+            Some("running") | Some("interrupted")
+        ) {
+            let finished_at_ms = now_ms();
             sqlx::query(
-                "UPDATE session_turns \
-                 SET status = 'running', error_code = NULL, error_text = NULL, finished_at_ms = NULL \
-                 WHERE turn_id = ?1 AND status IN ('running', 'interrupted')",
-            )
-            .bind(&turn_id_raw)
-            .execute(&mut *tx)
-            .await
-            .context("failed to recover pending channel session turn")?;
-
-            let changed = sqlx::query(
                 "UPDATE channel_turns \
-                 SET status = 'running', started_at_ms = ?2, last_error = NULL, answer_checkpoint_sequence = NULL \
+                 SET status = 'failed', last_error = ?2, finished_at_ms = ?3 \
                  WHERE turn_id = ?1 AND status = 'pending'",
             )
             .bind(&turn_id_raw)
-            .bind(started_at_ms)
+            .bind("queued session turn is no longer runnable")
+            .bind(finished_at_ms)
             .execute(&mut *tx)
             .await
-            .context("failed to claim pending channel turn")?;
-
-            if changed.rows_affected() == 0 {
-                tx.commit()
-                    .await
-                    .context("failed to commit raced channel turn claim transaction")?;
-                continue;
-            }
-
+            .context("failed to fail unrunnable pending channel turn")?;
             tx.commit()
                 .await
-                .context("failed to commit channel turn claim transaction")?;
-            let turn_id = Uuid::parse_str(&turn_id_raw)
-                .with_context(|| format!("invalid claimed turn id '{turn_id_raw}'"))?;
-            return self.get_turn(turn_id).await;
+                .context("failed to commit unrunnable channel turn claim transaction")?;
+            return Ok(None);
         }
+
+        let started_at_ms = now_ms();
+        sqlx::query(
+            "UPDATE session_turns \
+             SET status = 'running', error_code = NULL, error_text = NULL, finished_at_ms = NULL \
+             WHERE turn_id = ?1 AND status IN ('running', 'interrupted')",
+        )
+        .bind(&turn_id_raw)
+        .execute(&mut *tx)
+        .await
+        .context("failed to recover pending channel session turn")?;
+
+        let changed = sqlx::query(
+            "UPDATE channel_turns \
+             SET status = 'running', started_at_ms = ?2, last_error = NULL, answer_checkpoint_sequence = NULL \
+             WHERE turn_id = ?1 AND status = 'pending'",
+        )
+        .bind(&turn_id_raw)
+        .bind(started_at_ms)
+        .execute(&mut *tx)
+        .await
+        .context("failed to claim pending channel turn")?;
+
+        tx.commit()
+            .await
+            .context("failed to commit channel turn claim transaction")?;
+
+        if changed.rows_affected() == 0 {
+            Ok(None)
+        } else {
+            self.get_turn(turn_id).await
+        }
+    }
+
+    pub(crate) async fn terminalize_unclaimed_turn(
+        &self,
+        turn_id: Uuid,
+        terminal: ChannelTurnTerminalUpdate<'_>,
+    ) -> Result<bool> {
+        let finished_at_ms = now_ms();
+        let changed = sqlx::query(
+            "UPDATE channel_turns \
+             SET status = ?2, last_error = ?3, finished_at_ms = ?4 \
+             WHERE turn_id = ?1 AND status IN ('waiting_for_attachments', 'pending')",
+        )
+        .bind(turn_id.to_string())
+        .bind(terminal.status.as_str())
+        .bind(terminal.last_error)
+        .bind(finished_at_ms)
+        .execute(&self.pool)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to terminalize unclaimed channel turn as {}",
+                terminal.status.as_str()
+            )
+        })?;
+
+        Ok(changed.rows_affected() > 0)
     }
 
     pub(crate) async fn terminalize_turn(
@@ -2361,4 +2412,65 @@ fn map_turn_row(row: SqliteRow) -> Result<ChannelTurnRecord> {
         started_at,
         finished_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn terminalize_unclaimed_turn_does_not_terminalize_running_turn() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory database");
+        sqlx::query(
+            "CREATE TABLE channel_turns (
+                turn_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                last_error TEXT,
+                finished_at_ms INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create channel_turns table");
+
+        let turn_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO channel_turns (turn_id, status, last_error, finished_at_ms)
+             VALUES (?1, 'running', NULL, NULL)",
+        )
+        .bind(turn_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("insert running turn");
+
+        let store = ChannelStateStore::new(pool.clone());
+        let terminalized = store
+            .terminalize_unclaimed_turn(
+                turn_id,
+                ChannelTurnTerminalUpdate {
+                    status: ChannelTurnStatus::Cancelled,
+                    last_error: Some("operator stop"),
+                },
+            )
+            .await
+            .expect("terminalize unclaimed turn");
+
+        let row = sqlx::query(
+            "SELECT status, last_error, finished_at_ms FROM channel_turns WHERE turn_id = ?1",
+        )
+        .bind(turn_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("select turn");
+
+        assert!(!terminalized);
+        assert_eq!(row.get::<String, _>("status"), "running");
+        assert_eq!(row.get::<Option<String>, _>("last_error"), None);
+        assert_eq!(row.get::<Option<i64>, _>("finished_at_ms"), None);
+    }
 }

@@ -1160,83 +1160,126 @@ impl Kernel {
             ));
         }
 
-        let Some(turn) = self
-            .channel_state
-            .head_open_turn_for_session(session_id, channel_id, session_key)
-            .await
-            .map_err(internal)?
-        else {
-            return Ok(SessionActionResponse {
-                session_id,
-                turn_id: None,
-            });
-        };
-
-        if let Some(expected_turn_id) = expected_turn_id {
-            if expected_turn_id != turn.turn_id {
-                return Err(KernelError::Conflict(
-                    "active turn no longer matches expected_turn_id".to_string(),
-                ));
-            }
-        }
-
         let reason = action_cancel_reason(reason);
-        self.append_audit_event_best_effort(
-            "channel.turn.cancel_requested",
-            Some(session_id),
-            "api",
-            json!({
-                "turn_id": turn.turn_id,
-                "channel_id": channel_id,
-                "session_key": session_key,
-                "reason": reason,
-            }),
-        )
-        .await;
+        let mut audited_turn_id = None;
 
-        match turn.status {
-            ChannelTurnStatus::WaitingForAttachments | ChannelTurnStatus::Pending => {
-                self.terminalize_queued_turn(
-                    &turn,
-                    QueuedTurnTerminal::Cancelled {
-                        code: "queue.cancelled".to_string(),
-                        reason,
-                    },
-                    self.channel_stream_context_for_session(
-                        turn.session_id,
-                        &turn.channel_id,
-                        &turn.session_key,
-                        turn.turn_id,
-                    )
-                    .await
-                    .ok()
-                    .flatten(),
+        loop {
+            let Some(turn) = self
+                .channel_state
+                .head_open_turn_for_session(session_id, channel_id, session_key)
+                .await
+                .map_err(internal)?
+            else {
+                return Ok(SessionActionResponse {
+                    session_id,
+                    turn_id: None,
+                });
+            };
+
+            if let Some(expected_turn_id) = expected_turn_id {
+                if expected_turn_id != turn.turn_id {
+                    return Err(KernelError::Conflict(
+                        "active turn no longer matches expected_turn_id".to_string(),
+                    ));
+                }
+            }
+
+            if audited_turn_id != Some(turn.turn_id) {
+                self.append_audit_event_best_effort(
+                    "channel.turn.cancel_requested",
+                    Some(session_id),
+                    "api",
+                    json!({
+                        "turn_id": turn.turn_id,
+                        "channel_id": channel_id,
+                        "session_key": session_key,
+                        "reason": reason,
+                    }),
                 )
-                .await?;
-                self.ensure_channel_turn_worker(&turn.channel_id, &turn.session_key)
-                    .await;
-                Ok(SessionActionResponse {
-                    session_id,
-                    turn_id: Some(turn.turn_id),
-                })
+                .await;
+                audited_turn_id = Some(turn.turn_id);
             }
-            ChannelTurnStatus::Running => {
-                self.request_active_turn_cancellation(&turn, &reason)
-                    .await?;
-                Ok(SessionActionResponse {
-                    session_id,
-                    turn_id: Some(turn.turn_id),
-                })
+
+            match turn.status {
+                ChannelTurnStatus::WaitingForAttachments | ChannelTurnStatus::Pending => {
+                    let terminalized = self
+                        .terminalize_unclaimed_queued_turn(
+                            &turn,
+                            QueuedTurnTerminal::Cancelled {
+                                code: "queue.cancelled".to_string(),
+                                reason: reason.clone(),
+                            },
+                            self.channel_stream_context_for_session(
+                                turn.session_id,
+                                &turn.channel_id,
+                                &turn.session_key,
+                                turn.turn_id,
+                            )
+                            .await
+                            .ok()
+                            .flatten(),
+                        )
+                        .await?;
+                    if !terminalized {
+                        continue;
+                    }
+                    self.ensure_channel_turn_worker(&turn.channel_id, &turn.session_key)
+                        .await;
+                    return Ok(SessionActionResponse {
+                        session_id,
+                        turn_id: Some(turn.turn_id),
+                    });
+                }
+                ChannelTurnStatus::Running => {
+                    self.request_active_turn_cancellation(&turn, &reason)
+                        .await?;
+                    return Ok(SessionActionResponse {
+                        session_id,
+                        turn_id: Some(turn.turn_id),
+                    });
+                }
+                ChannelTurnStatus::Completed
+                | ChannelTurnStatus::Failed
+                | ChannelTurnStatus::TimedOut
+                | ChannelTurnStatus::Cancelled
+                | ChannelTurnStatus::Interrupted => {
+                    return Ok(SessionActionResponse {
+                        session_id,
+                        turn_id: None,
+                    });
+                }
             }
-            ChannelTurnStatus::Completed
-            | ChannelTurnStatus::Failed
-            | ChannelTurnStatus::TimedOut
-            | ChannelTurnStatus::Cancelled
-            | ChannelTurnStatus::Interrupted => Ok(SessionActionResponse {
-                session_id,
-                turn_id: None,
-            }),
         }
+    }
+
+    async fn terminalize_unclaimed_queued_turn(
+        &self,
+        turn: &ChannelTurnRecord,
+        terminal: QueuedTurnTerminal,
+        stream_context: Option<ChannelStreamContext>,
+    ) -> Result<bool, KernelError> {
+        self.terminalize_channel_turn(
+            turn,
+            terminal,
+            stream_context,
+            ChannelTurnTerminalScope::Unclaimed,
+        )
+        .await
+    }
+
+    async fn terminalize_queued_turn(
+        &self,
+        turn: &ChannelTurnRecord,
+        terminal: QueuedTurnTerminal,
+        stream_context: Option<ChannelStreamContext>,
+    ) -> Result<bool, KernelError> {
+        self.terminalize_channel_turn(
+            turn,
+            terminal,
+            stream_context,
+            ChannelTurnTerminalScope::Open,
+        )
+        .await
     }
 
     async fn request_active_turn_cancellation(
@@ -1261,7 +1304,11 @@ impl Kernel {
             ));
         }
 
-        cancellation.cancellation.request(reason.to_string());
+        if !cancellation.cancellation.request(reason.to_string()) {
+            return Err(KernelError::Conflict(
+                "turn cancellation already requested".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -8757,6 +8804,12 @@ enum QueuedTurnTerminal {
     },
 }
 
+#[derive(Clone, Copy)]
+enum ChannelTurnTerminalScope {
+    Open,
+    Unclaimed,
+}
+
 impl QueuedTurnTerminal {
     fn status(&self) -> ChannelTurnStatus {
         match self {
@@ -10916,7 +10969,7 @@ impl Kernel {
             loop {
                 let turn = match self
                     .channel_state
-                    .claim_next_pending_turn(&channel_id, &session_key)
+                    .next_claimable_pending_turn(&channel_id, &session_key)
                     .await
                 {
                     Ok(value) => value,
@@ -10966,7 +11019,30 @@ impl Kernel {
         let cancellation = TurnCancellation::new();
         self.register_active_channel_turn_cancellation(&turn, cancellation.clone())
             .await;
-        Box::pin(self.process_queued_channel_turn_inner(turn, cancellation)).await;
+        let claimed_turn = match self.channel_state.claim_pending_turn(turn_id).await {
+            Ok(Some(claimed_turn)) => claimed_turn,
+            Ok(None) => {
+                self.unregister_active_turn_cancellation(turn_id).await;
+                return;
+            }
+            Err(err) => {
+                self.unregister_active_turn_cancellation(turn_id).await;
+                self.append_audit_event_best_effort(
+                    "channel.turn.claim_failed",
+                    Some(turn.session_id),
+                    "kernel",
+                    json!({
+                        "turn_id": turn.turn_id,
+                        "channel_id": turn.channel_id,
+                        "session_key": turn.session_key,
+                        "error": err.to_string(),
+                    }),
+                )
+                .await;
+                return;
+            }
+        };
+        Box::pin(self.process_queued_channel_turn_inner(claimed_turn, cancellation)).await;
         self.unregister_active_turn_cancellation(turn_id).await;
     }
 
@@ -11408,28 +11484,50 @@ impl Kernel {
             stream_context,
         )
         .await
+        .map(|_| ())
     }
 
-    async fn terminalize_queued_turn(
+    async fn terminalize_channel_turn(
         &self,
         turn: &ChannelTurnRecord,
         terminal: QueuedTurnTerminal,
         stream_context: Option<ChannelStreamContext>,
-    ) -> Result<(), KernelError> {
+        scope: ChannelTurnTerminalScope,
+    ) -> Result<bool, KernelError> {
         let status = terminal.status();
         let code = terminal.code().map(str::to_string);
         let message = terminal.message().to_string();
-        self.channel_state
-            .terminalize_turn(
-                turn.turn_id,
-                ChannelTurnTerminalUpdate {
-                    status,
-                    last_error: (status != ChannelTurnStatus::Completed)
-                        .then_some(message.as_str()),
-                },
-            )
-            .await
-            .map_err(internal)?;
+        let terminalized = match scope {
+            ChannelTurnTerminalScope::Open => {
+                self.channel_state
+                    .terminalize_turn(
+                        turn.turn_id,
+                        ChannelTurnTerminalUpdate {
+                            status,
+                            last_error: (status != ChannelTurnStatus::Completed)
+                                .then_some(message.as_str()),
+                        },
+                    )
+                    .await
+            }
+            ChannelTurnTerminalScope::Unclaimed => {
+                self.channel_state
+                    .terminalize_unclaimed_turn(
+                        turn.turn_id,
+                        ChannelTurnTerminalUpdate {
+                            status,
+                            last_error: (status != ChannelTurnStatus::Completed)
+                                .then_some(message.as_str()),
+                        },
+                    )
+                    .await
+            }
+        }
+        .map_err(internal)?;
+
+        if !terminalized {
+            return Ok(false);
+        }
 
         if let Some(persisted_turn) = self
             .session_turns
@@ -11510,7 +11608,7 @@ impl Kernel {
             )
             .await
             .map_err(internal)?;
-        Ok(())
+        Ok(true)
     }
 
     async fn build_prompt_envelope(
