@@ -3,7 +3,20 @@ use crate::{
     contracts::{SessionHistoryPolicy, SessionOpenRequest, TrustTier},
     kernel::KernelOptions,
 };
+#[cfg(unix)]
+use crate::{
+    kernel::runtime::{ConfinementConfig, OciConfinementConfig},
+    operator::config::{OperatorConfig, RuntimeProfileConfig},
+};
 use ratatui::backend::TestBackend;
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
+
+#[cfg(unix)]
+const TEST_DEFAULT_RUNTIME_ID: &str = "default";
+#[cfg(unix)]
+const TEST_OVERRIDE_RUNTIME_ID: &str = "override";
 
 fn rendered_line_strings(lines: &[Line<'_>]) -> Vec<String> {
     lines
@@ -328,8 +341,7 @@ fn blocked_instance_renders_launch_blocker() {
         project_objects: ProjectObjects::unavailable("Launch blocked"),
         project_cursor: ProjectSelection::Instance(0),
         project_list_state: ListState::default(),
-        continue_last_session: false,
-        timeout_override: None,
+        launch: ConsoleLaunchOptions::default(),
         focus: Focus::Transcript,
         overlay: None,
         composer: ConsoleComposer::new(),
@@ -455,8 +467,7 @@ async fn reference_sized_layout_renders_ribbon_three_panes_composer_and_footer()
         project_objects: ProjectObjects::default(),
         project_cursor: ProjectSelection::Instance(0),
         project_list_state: ListState::default(),
-        continue_last_session: false,
-        timeout_override: None,
+        launch: ConsoleLaunchOptions::default(),
         focus: Focus::Composer,
         overlay: None,
         composer: ConsoleComposer::new(),
@@ -803,6 +814,75 @@ async fn project_console_load_does_not_repair_or_write_config() {
     assert!(
         !operator_config_path.exists(),
         "run TUI must not create operator config while rendering a launch blocker"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn instance_switch_preserves_invocation_runtime_override() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let project = crate::operator::target::init_project(temp_dir.path()).expect("init");
+    let reviewer = crate::operator::target::create_project_instance(
+        &project.project_root,
+        "reviewer",
+        Some(project.project_root.as_path()),
+        false,
+    )
+    .expect("create reviewer");
+    let runtime_executable = temp_dir.path().join("runtime-stub.sh");
+    write_executable_script(&runtime_executable, "#!/usr/bin/env bash\ncat >/dev/null\n");
+    let podman = write_fake_podman(temp_dir.path());
+    save_project_runtime_config(
+        &LionClawHome::new(project.instance.home.clone()),
+        &runtime_executable,
+        &podman,
+    )
+    .await;
+    save_project_runtime_config(
+        &LionClawHome::new(reviewer.home.clone()),
+        &runtime_executable,
+        &podman,
+    )
+    .await;
+
+    let target = crate::operator::target::resolve_target(
+        &crate::operator::target::TargetSelection {
+            home: None,
+            project: Some(project.project_root),
+            instance: None,
+        },
+        crate::operator::target::WorkRootRequirement::Optional,
+    )
+    .expect("resolve target");
+    let mut app = ConsoleApp::load(RunConsoleInvocation {
+        target: &target,
+        requested_runtime: Some(TEST_OVERRIDE_RUNTIME_ID.to_string()),
+        continue_last_session: false,
+        timeout_override: None,
+    })
+    .await
+    .expect("console");
+
+    assert_eq!(
+        app.ready_instance()
+            .expect("initial ready instance")
+            .runtime_id,
+        TEST_OVERRIDE_RUNTIME_ID
+    );
+    let reviewer_index = app
+        .instances
+        .iter()
+        .position(|instance| instance.name.as_deref() == Some("reviewer"))
+        .expect("reviewer index");
+
+    app.switch_selected_confirmed(reviewer_index).await;
+
+    let ready = app.ready_instance().expect("switched ready instance");
+    assert_eq!(ready.summary.name.as_deref(), Some("reviewer"));
+    assert_eq!(ready.runtime_id, TEST_OVERRIDE_RUNTIME_ID);
+    assert_eq!(
+        ready.runtime_override.as_deref(),
+        Some(TEST_OVERRIDE_RUNTIME_ID)
     );
 }
 
@@ -1392,8 +1472,7 @@ async fn ready_project_session_app() -> (ConsoleApp, Uuid, Uuid) {
         project_objects,
         project_cursor: ProjectSelection::Instance(0),
         project_list_state: ListState::default(),
-        continue_last_session: false,
-        timeout_override: None,
+        launch: ConsoleLaunchOptions::default(),
         focus: Focus::Composer,
         overlay: None,
         composer: ConsoleComposer::new(),
@@ -1442,8 +1521,7 @@ fn blocked_test_app() -> ConsoleApp {
         project_objects: ProjectObjects::unavailable("Launch blocked"),
         project_cursor: ProjectSelection::Instance(0),
         project_list_state: ListState::default(),
-        continue_last_session: false,
-        timeout_override: None,
+        launch: ConsoleLaunchOptions::default(),
         focus: Focus::Project,
         overlay: None,
         composer: ConsoleComposer::new(),
@@ -1459,6 +1537,80 @@ fn blocked_test_app() -> ConsoleApp {
         saw_ready_instance: false,
         should_quit: false,
     }
+}
+
+#[cfg(unix)]
+async fn save_project_runtime_config(
+    home: &LionClawHome,
+    runtime_executable: &Path,
+    podman: &Path,
+) {
+    let mut config = OperatorConfig::default();
+    config.upsert_runtime(
+        TEST_DEFAULT_RUNTIME_ID.to_string(),
+        test_opencode_runtime(runtime_executable, podman),
+    );
+    config.upsert_runtime(
+        TEST_OVERRIDE_RUNTIME_ID.to_string(),
+        test_opencode_runtime(runtime_executable, podman),
+    );
+    config
+        .set_default_runtime(TEST_DEFAULT_RUNTIME_ID)
+        .expect("set default runtime");
+    home.ensure_base_dirs().await.expect("base dirs");
+    crate::workspace::bootstrap_workspace(&config.workspace_root(home))
+        .await
+        .expect("bootstrap workspace");
+    config.save(home).await.expect("save config");
+}
+
+#[cfg(unix)]
+fn test_opencode_runtime(runtime_executable: &Path, podman: &Path) -> RuntimeProfileConfig {
+    RuntimeProfileConfig::OpenCode {
+        executable: runtime_executable.display().to_string(),
+        model: None,
+        agent: None,
+        confinement: ConfinementConfig::Oci(OciConfinementConfig {
+            engine: podman.display().to_string(),
+            image: Some("ghcr.io/lionclaw/operator-console-test-runtime:latest".to_string()),
+            ..OciConfinementConfig::default()
+        }),
+    }
+}
+
+#[cfg(unix)]
+fn write_fake_podman(root: &Path) -> PathBuf {
+    let path = root.join("podman");
+    write_executable_script(
+        &path,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+
+case "${1:-}" in
+  image)
+    if [ "${2:-}" = "inspect" ]; then
+      printf 'sha256:operator-console-test-runtime\n'
+    fi
+    exit 0
+    ;;
+  run)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"#,
+    );
+    path
+}
+
+#[cfg(unix)]
+fn write_executable_script(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(path, body).expect("write script");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod script");
 }
 
 async fn ready_test_app(transcript: Vec<TranscriptLine>) -> ConsoleApp {
@@ -1504,8 +1656,7 @@ async fn ready_test_app(transcript: Vec<TranscriptLine>) -> ConsoleApp {
         project_objects: ProjectObjects::default(),
         project_cursor: ProjectSelection::Instance(0),
         project_list_state: ListState::default(),
-        continue_last_session: false,
-        timeout_override: None,
+        launch: ConsoleLaunchOptions::default(),
         focus: Focus::Composer,
         overlay: None,
         composer: ConsoleComposer::new(),

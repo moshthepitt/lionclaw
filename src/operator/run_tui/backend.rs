@@ -56,18 +56,9 @@ async fn load_default_runtime(home: &std::path::Path) -> Option<String> {
 
 pub(super) async fn open_selected_instance(
     summary: InstanceSummary,
-    requested_runtime: Option<String>,
-    continue_last_session: bool,
-    timeout_override: Option<RuntimeTurnTimeouts>,
+    launch: &ConsoleLaunchOptions,
 ) -> SelectedInstanceState {
-    match try_open_selected_instance(
-        summary.clone(),
-        requested_runtime,
-        continue_last_session,
-        timeout_override,
-    )
-    .await
-    {
+    match try_open_selected_instance(summary.clone(), launch).await {
         Ok(ready) => SelectedInstanceState::Ready(Box::new(ready)),
         Err(err) => SelectedInstanceState::Blocked {
             blocker: LaunchBlocker::for_instance(summary.display_name(), err.to_string()),
@@ -155,9 +146,7 @@ fn project_session_items(
 
 async fn try_open_selected_instance(
     summary: InstanceSummary,
-    requested_runtime: Option<String>,
-    continue_last_session: bool,
-    timeout_override: Option<RuntimeTurnTimeouts>,
+    launch: &ConsoleLaunchOptions,
 ) -> Result<ReadyInstance> {
     if let Some(finding) = summary.work_root_finding.as_deref() {
         return Err(anyhow!(finding.to_string()));
@@ -170,12 +159,14 @@ async fn try_open_selected_instance(
     let config = OperatorConfig::load(&home).await?;
     let runtime_id = resolve_run_runtime_id(
         &config,
-        requested_runtime.as_deref(),
+        launch.requested_runtime.as_deref(),
         summary.display_name(),
     )?;
     validate_runtime_launch_prerequisites(&home, &config, &runtime_id).await?;
     render_runtime_cache_for_work_root(&home, &config, &runtime_id, work_root).await?;
-    let effective_timeouts = timeout_override.unwrap_or_else(RuntimeTurnTimeouts::interactive);
+    let effective_timeouts = launch
+        .timeout_override
+        .unwrap_or_else(RuntimeTurnTimeouts::interactive);
     let kernel = open_runtime_kernel_for_work_root(
         &home,
         &config,
@@ -185,7 +176,7 @@ async fn try_open_selected_instance(
     )
     .await?;
     let peer_id = local_peer_id_for_project(work_root);
-    let session_id = resolve_repl_session(&kernel, &peer_id, continue_last_session)
+    let session_id = resolve_repl_session(&kernel, &peer_id, launch.continue_last_session)
         .await
         .map_err(kernel_to_anyhow)?
         .session_id;
@@ -214,7 +205,7 @@ async fn try_open_selected_instance(
         runtime_executable,
         runtime_model,
         runtime_agent,
-        runtime_override: requested_runtime,
+        runtime_override: launch.requested_runtime.clone(),
         boundary,
         kernel,
         session_id,

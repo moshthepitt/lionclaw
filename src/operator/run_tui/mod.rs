@@ -200,6 +200,13 @@ pub(crate) struct RunConsoleInvocation<'a> {
     pub(crate) timeout_override: Option<RuntimeTurnTimeouts>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ConsoleLaunchOptions {
+    requested_runtime: Option<String>,
+    continue_last_session: bool,
+    timeout_override: Option<RuntimeTurnTimeouts>,
+}
+
 pub(crate) struct RunConsoleOutcome {
     pub(crate) launch_blocked: bool,
 }
@@ -605,6 +612,20 @@ impl<T> ProjectObjectSection<T> {
     }
 }
 
+impl ConsoleLaunchOptions {
+    fn from_invocation(invocation: &RunConsoleInvocation<'_>) -> Self {
+        Self {
+            requested_runtime: invocation.requested_runtime.clone(),
+            continue_last_session: invocation.continue_last_session,
+            timeout_override: invocation.timeout_override,
+        }
+    }
+
+    async fn open_instance(&self, summary: InstanceSummary) -> SelectedInstanceState {
+        open_selected_instance(summary, self).await
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProjectObjects {
     sessions: ProjectObjectSection<ProjectSessionItem>,
@@ -945,8 +966,7 @@ pub(crate) struct ConsoleApp {
     project_objects: ProjectObjects,
     project_cursor: ProjectSelection,
     project_list_state: ListState,
-    continue_last_session: bool,
-    timeout_override: Option<RuntimeTurnTimeouts>,
+    launch: ConsoleLaunchOptions,
     focus: Focus,
     overlay: Option<Overlay>,
     composer: ConsoleComposer,
@@ -971,14 +991,8 @@ impl ConsoleApp {
             .get(selected_index)
             .cloned()
             .ok_or_else(|| anyhow!("console has no selected instance"))?;
-        let requested_runtime = invocation.requested_runtime;
-        let selected = open_selected_instance(
-            selected_summary,
-            requested_runtime.clone(),
-            invocation.continue_last_session,
-            invocation.timeout_override,
-        )
-        .await;
+        let launch = ConsoleLaunchOptions::from_invocation(&invocation);
+        let selected = launch.open_instance(selected_summary).await;
         let saw_ready_instance = selected.is_ready();
         let project_objects = load_project_objects(&selected).await;
         let audit = load_audit_events(&selected).await;
@@ -990,8 +1004,7 @@ impl ConsoleApp {
             project_objects,
             project_cursor: ProjectSelection::Instance(selected_index),
             project_list_state: ListState::default(),
-            continue_last_session: invocation.continue_last_session,
-            timeout_override: invocation.timeout_override,
+            launch,
             focus: Focus::Composer,
             overlay: None,
             composer: ConsoleComposer::new(),
@@ -1296,13 +1309,7 @@ impl ConsoleApp {
             .cloned()
             .unwrap_or_else(|| self.selected.summary().clone());
         self.status = format!("selected {}", summary.display_name());
-        self.selected = open_selected_instance(
-            summary,
-            None,
-            self.continue_last_session,
-            self.timeout_override,
-        )
-        .await;
+        self.selected = self.launch.open_instance(summary).await;
         if self.selected.is_ready() {
             self.saw_ready_instance = true;
         }
@@ -1657,8 +1664,7 @@ pub(crate) async fn run_launch_blocker(blocker: LaunchBlocker) -> Result<()> {
         project_objects: ProjectObjects::unavailable("No configured instances"),
         project_cursor: ProjectSelection::Instance(0),
         project_list_state: ListState::default(),
-        continue_last_session: false,
-        timeout_override: None,
+        launch: ConsoleLaunchOptions::default(),
         focus: Focus::Composer,
         overlay: None,
         composer: ConsoleComposer::new(),
@@ -1698,8 +1704,7 @@ pub(crate) async fn run_project_launch_blocker(
         project_objects: ProjectObjects::unavailable("No configured instances"),
         project_cursor: ProjectSelection::Instance(0),
         project_list_state: ListState::default(),
-        continue_last_session: false,
-        timeout_override: None,
+        launch: ConsoleLaunchOptions::default(),
         focus: Focus::Composer,
         overlay: None,
         composer: ConsoleComposer::new(),
