@@ -3,98 +3,148 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="light">
+    <meta name="color-scheme" content="dark">
     <meta
       name="description"
-      content="LionClaw runs real agent CLIs under a small trusted local core with explicit project state, runtime boundaries, channels, jobs, and diagnostics."
+      content="LionClaw gives real agent CLIs a local home in your project: sessions, state, channels, jobs, and audit."
     >
+    <meta property="og:title" content="LionClaw">
+    <meta
+      property="og:description"
+      content="Your agent should work from your side of the fence."
+    >
+    <meta property="og:type" content="website">
     <title>LionClaw</title>
     <link rel="stylesheet" href="styles.css">
   </head>
   <body>
-    <header>
-      <div class="masthead">
-        <div class="brand-lockup">
-          <p class="brand-mark">LionClaw</p>
-          <p class="brand-meta">Local agent boundary</p>
-        </div>
+    <div class="page">
+      <header class="topbar">
+        <a class="brand" href="/">LionClaw</a>
         <nav aria-label="Page">
           <a href="#start">Start</a>
-          <a href="#model">Model</a>
-          <a href="#links">Links</a>
+          <a href="#why">Why</a>
+          <a href="https://github.com/moshthepitt/lionclaw" rel="noopener noreferrer">GitHub</a>
         </nav>
-      </div>
+      </header>
 
-      <h1>LionClaw</h1>
-      <p class="lede">
-        LionClaw turns real agent CLIs into local assistants. It gives them a
-        project home, durable sessions, channels, scheduled work, and a small
-        Rust core that owns the local boundary around every run.
-      </p>
-    </header>
-
-    <main>
-      <section id="start" aria-labelledby="start-heading">
-        <p class="section-label">Start</p>
-        <h2 id="start-heading">Run the everyday path.</h2>
-        <pre><code>lionclaw project init
-lionclaw configure --runtime codex
+      <main>
+        <section class="hero" aria-labelledby="hero-heading">
+          <div class="hero-copy">
+            <p class="eyebrow">Local agent home</p>
+            <h1 id="hero-heading">Your agent should work from your side of the fence.</h1>
+            <p class="lede">
+              AI agents will read your files, remember your work, use your
+              keys, message people, and run jobs.
+            </p>
+            <p>
+              That should not all live inside someone else's platform.
+            </p>
+            <p>
+              LionClaw gives real agent CLIs a local home in your project:
+              sessions, state, channels, jobs, and audit.
+            </p>
+            <p>
+              Use Codex. Use OpenCode. Use whatever comes next. Keep the home.
+            </p>
+            <pre class="command"><code>cd /path/to/your/project
+lionclaw project init
+lionclaw doctor
 lionclaw run</code></pre>
+            <div class="actions" aria-label="Primary links">
+              <a class="button primary" href="#start">Start</a>
+              <a class="button" href="https://github.com/moshthepitt/lionclaw" rel="noopener noreferrer">GitHub</a>
+            </div>
+          </div>
 
-        <p>
-          Add channels and background operation when the assistant needs to stay
-          reachable beyond the current terminal.
-        </p>
+          <figure class="console">
+            <img
+              src="assets/operator-console-placeholder.svg"
+              alt="Placeholder image of the LionClaw project operator console"
+              width="1440"
+              height="960"
+            >
+            <figcaption><code>lionclaw run</code> opens the local project console.</figcaption>
+          </figure>
+        </section>
 
-        <pre><code>lionclaw connect terminal
-lionclaw connect telegram
-lionclaw up
-lionclaw status
-lionclaw logs -f
-lionclaw doctor</code></pre>
-      </section>
+        <section id="start" class="split" aria-labelledby="start-heading">
+          <div>
+            <p class="eyebrow">Start</p>
+            <h2 id="start-heading">Start where your work already is.</h2>
+            <p>
+              No new platform to move into. No dashboard as the source of
+              truth.
+            </p>
+            <p>
+              Run <code>doctor</code>. Fix what it reports. Then run the agent.
+            </p>
+          </div>
+          <pre class="command long"><code>git clone https://github.com/moshthepitt/lionclaw.git
+cd lionclaw
+cargo build --release
+export PATH="$PWD/target/release:$PATH"
 
-      <section id="model" aria-labelledby="model-heading">
-        <p class="section-label">Model</p>
-        <h2 id="model-heading">Small trusted core, real runtime.</h2>
-        <p>
-          Codex still runs as Codex. LionClaw controls project selection,
-          runtime launch, state layout, channels, scheduled work, and the
-          diagnostics for the boundary it owns.
-        </p>
-        <p>
-          Channels are skills outside the core. They connect transports such as
-          terminal and Telegram without turning the Rust kernel into every
-          integration.
-        </p>
-        <p>
-          <code>lionclaw doctor</code> is read-only and prints stable runbook
-          findings for project, runtime, channel, unit, and configured-bind
-          drift.
-        </p>
-      </section>
+cd /path/to/your/project
+lionclaw project init
+lionclaw doctor
+lionclaw run</code></pre>
+        </section>
 
-      <section id="links" aria-labelledby="links-heading">
-        <p class="section-label">Links</p>
-        <h2 id="links-heading">Read the source and docs.</h2>
-        <ul class="link-list">
-          <li>
-            <a href="https://github.com/moshthepitt/lionclaw" target="_blank" rel="noopener noreferrer">
-              GitHub repository
-            </a> - source, issues, and pull requests.
-          </li>
-          <li>
-            <a href="https://github.com/moshthepitt/lionclaw/blob/main/docs/ARCHITECTURE.md" target="_blank" rel="noopener noreferrer">
-              Architecture
-            </a> - trusted core, runtime boundary, channels, scheduler, audit, and API contracts.
-          </li>
-          <li>
-            <a href="https://github.com/moshthepitt/lionclaw/blob/main/docs/MANUAL_QA.md" target="_blank" rel="noopener noreferrer">
-              Manual QA
-            </a> - live acceptance checklist for behavior-changing work.
-          </li>
-        </ul>
-      </section>
-    </main>
+        <section id="why" class="point" aria-labelledby="point-heading">
+          <div class="point-head">
+            <div>
+              <p class="eyebrow">Why LionClaw</p>
+              <h2 id="point-heading">An agent is not just chat.</h2>
+            </div>
+            <div class="point-copy">
+              <p>
+                It reads files. It writes code. It remembers decisions. It can
+                use credentials. It can keep working after you leave.
+              </p>
+              <p class="point-principle">
+                That power should not need a landlord.
+              </p>
+              <p>
+                LionClaw gives it a local home.
+              </p>
+            </div>
+          </div>
+
+          <div class="claim-grid">
+            <article>
+              <h3>Your project</h3>
+              <p>It works where your code already lives.</p>
+            </article>
+            <article>
+              <h3>Your memory</h3>
+              <p>Sessions, drafts, and history stay on your machine.</p>
+            </article>
+            <article>
+              <h3>Your credentials</h3>
+              <p>Keys are handed to a run deliberately.</p>
+            </article>
+            <article>
+              <h3>Your runs</h3>
+              <p>Interactive work, background jobs, and scheduled tasks go through LionClaw.</p>
+            </article>
+            <article>
+              <h3>Your record</h3>
+              <p>Important actions leave something you can inspect later.</p>
+            </article>
+          </div>
+
+          <p class="point-close">
+            Agents will become the interface to everything. Do not let someone else own yours.
+          </p>
+        </section>
+      </main>
+
+      <footer class="site-footer">
+        <a href="https://github.com/moshthepitt/lionclaw" rel="noopener noreferrer">GitHub</a>
+        <span aria-hidden="true"> / </span>
+        <a href="https://jayanoris.com/blog/posts/2026-05-14-lionclaw.html" rel="noopener noreferrer">Why I built it</a>
+      </footer>
+    </div>
   </body>
 </html>

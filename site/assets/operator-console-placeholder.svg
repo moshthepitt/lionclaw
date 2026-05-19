@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="960" viewBox="0 0 1440 960" role="img" aria-labelledby="title desc">
+  <title id="title">LionClaw operator console placeholder</title>
+  <desc id="desc">A dark terminal-style mockup placeholder for the LionClaw project operator console.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f1712"/>
+      <stop offset="0.55" stop-color="#080b0a"/>
+      <stop offset="1" stop-color="#1a1008"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#151a18"/>
+      <stop offset="1" stop-color="#0b0f0d"/>
+    </linearGradient>
+    <pattern id="grid" width="28" height="28" patternUnits="userSpaceOnUse">
+      <path d="M28 0H0V28" fill="none" stroke="#d58b3414" stroke-width="1"/>
+    </pattern>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="1 0 0 0 0.9 0 1 0 0 0.42 0 0 1 0 0.08 0 0 0 0.8 0"/>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1440" height="960" fill="url(#bg)"/>
+  <rect width="1440" height="960" fill="url(#grid)"/>
+
+  <g opacity="0.42" fill="none" stroke="#d9933a" stroke-width="2">
+    <path d="M1170 54c-96 76-134 174-114 294"/>
+    <path d="M1230 82c-82 83-106 179-72 288"/>
+    <path d="M1088 86c-72 58-102 130-88 217"/>
+    <path d="M1300 137c-53 71-64 148-34 231"/>
+  </g>
+
+  <rect x="74" y="70" width="1292" height="820" rx="18" fill="#060807" stroke="#60401f" stroke-width="1.5"/>
+  <rect x="88" y="84" width="1264" height="792" rx="12" fill="url(#panel)" stroke="#2d261d"/>
+
+  <rect x="88" y="84" width="1264" height="58" rx="12" fill="#111611"/>
+  <rect x="88" y="132" width="1264" height="10" fill="#111611"/>
+  <circle cx="122" cy="113" r="7" fill="#df8f35"/>
+  <circle cx="148" cy="113" r="7" fill="#b46327"/>
+  <circle cx="174" cy="113" r="7" fill="#86a455"/>
+
+  <text x="214" y="119" fill="#f0ddbb" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20" font-weight="700">LIONCLAW project operator console</text>
+  <text x="966" y="119" fill="#b89b78" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">runtime: codex / boundary: local</text>
+
+  <rect x="112" y="166" width="1216" height="58" rx="8" fill="#0b100d" stroke="#3b2c1d"/>
+  <text x="136" y="202" fill="#d9943c" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">project</text>
+  <text x="236" y="202" fill="#eadfc8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">lionclaw-demo</text>
+  <text x="500" y="202" fill="#d9943c" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">instance</text>
+  <text x="620" y="202" fill="#eadfc8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">main</text>
+  <text x="786" y="202" fill="#d9943c" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">session</text>
+  <text x="900" y="202" fill="#eadfc8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">local-project</text>
+
+  <rect x="112" y="246" width="316" height="436" rx="8" fill="#0b0f0d" stroke="#372718"/>
+  <text x="136" y="282" fill="#d9943c" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Project objects</text>
+  <text x="136" y="326" fill="#eadfc8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">> instance/main</text>
+  <text x="136" y="362" fill="#a9b8aa" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">  runtime/codex</text>
+  <text x="136" y="398" fill="#a9b8aa" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">  session/latest</text>
+  <text x="136" y="434" fill="#a9b8aa" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">  channels/terminal</text>
+  <text x="136" y="470" fill="#a9b8aa" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">  audit/recent</text>
+  <path d="M136 526h250" stroke="#2e2419"/>
+  <text x="136" y="568" fill="#d9943c" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">status</text>
+  <text x="136" y="604" fill="#86a455" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">idle / ready</text>
+
+  <rect x="452" y="246" width="520" height="436" rx="8" fill="#090d0b" stroke="#372718"/>
+  <text x="476" y="282" fill="#d9943c" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Transcript</text>
+  <text x="476" y="330" fill="#e8ddc8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">$ lionclaw run</text>
+  <text x="476" y="372" fill="#a9b8aa" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">LionClaw opened the project boundary.</text>
+  <text x="476" y="410" fill="#a9b8aa" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">Runtime still does the agent work.</text>
+  <text x="476" y="448" fill="#a9b8aa" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">State, channels, jobs, and audit stay local.</text>
+  <path d="M476 512h454" stroke="#2e2419"/>
+  <text x="476" y="558" fill="#d9943c" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">placeholder</text>
+  <text x="476" y="596" fill="#e8ddc8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">Replace with real PR #83 console capture.</text>
+
+  <rect x="996" y="246" width="332" height="436" rx="8" fill="#0b0f0d" stroke="#372718"/>
+  <text x="1020" y="282" fill="#d9943c" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Inspector</text>
+  <text x="1020" y="330" fill="#e8ddc8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">workspace  rw</text>
+  <text x="1020" y="366" fill="#e8ddc8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">network    none</text>
+  <text x="1020" y="402" fill="#e8ddc8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">secrets    staged</text>
+  <text x="1020" y="438" fill="#e8ddc8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">audit      live</text>
+  <path d="M1020 496h264" stroke="#2e2419"/>
+  <text x="1020" y="540" fill="#d9943c" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">boundary</text>
+  <text x="1020" y="578" fill="#a9b8aa" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">explicit, local,</text>
+  <text x="1020" y="614" fill="#a9b8aa" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">swappable</text>
+
+  <rect x="112" y="708" width="1216" height="88" rx="8" fill="#080c0a" stroke="#372718"/>
+  <text x="136" y="744" fill="#d9943c" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">Composer</text>
+  <text x="136" y="778" fill="#e8ddc8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">Ask the runtime to work. LionClaw keeps the boundary.</text>
+
+  <rect x="112" y="818" width="1216" height="34" rx="6" fill="#111611" stroke="#2d251b"/>
+  <text x="136" y="841" fill="#b89b78" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16">Tab focus  Enter submit  Ctrl+C interrupt  /lionclaw exit</text>
+
+  <path d="M1240 748c18 17 36 35 54 54" stroke="#d9943c" stroke-width="5" stroke-linecap="round" filter="url(#glow)"/>
+  <path d="M1278 730c15 21 30 43 45 64" stroke="#d9943c" stroke-width="5" stroke-linecap="round" filter="url(#glow)"/>
+  <path d="M1308 706c11 24 22 49 33 73" stroke="#d9943c" stroke-width="5" stroke-linecap="round" filter="url(#glow)"/>
+</svg>
