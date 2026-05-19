@@ -25,10 +25,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use ratatui_textarea::{TextArea, WrapMode};
-use tokio::{
-    sync::{mpsc, oneshot},
-    task::JoinHandle,
-};
+use tokio::{sync::mpsc, task::JoinHandle};
 use uuid::Uuid;
 
 use crate::{
@@ -40,7 +37,7 @@ use crate::{
     home::LionClawHome,
     kernel::{
         input_routing::{classify_input, ClassifiedInput, LionClawControlInput},
-        Kernel,
+        Kernel, TurnCancellation,
     },
     operator::{
         config::OperatorConfig,
@@ -438,6 +435,12 @@ impl ActivitySummary {
                     self.progress_count = self.progress_count.saturating_add(1);
                 }
                 self.push_item(kind, normalize_activity_text(text));
+            }
+            (StreamEventKindDto::Error, _, Some(text))
+                if is_non_failure_terminal_code(event.code.as_deref()) =>
+            {
+                self.close_progress_item();
+                self.push_item(ActivityItemKind::Status, normalize_activity_text(text));
             }
             (StreamEventKindDto::Error, _, Some(text)) => {
                 self.close_progress_item();
@@ -978,7 +981,7 @@ pub(crate) struct ConsoleApp {
     inspector_subject: InspectorSubject,
     status: String,
     active_turn: Option<JoinHandle<()>>,
-    active_turn_cancel: Option<oneshot::Sender<String>>,
+    active_turn_cancel: Option<TurnCancellation>,
     saw_ready_instance: bool,
     should_quit: bool,
 }
@@ -1464,7 +1467,7 @@ impl ConsoleApp {
         self.activity_scroll.reset_tail();
         self.inspector_subject = InspectorSubject::Activity;
         self.status = format!("running turn on {instance_name}");
-        let (handle, cancel_tx) = spawn_streamed_turn(
+        let (handle, cancellation) = spawn_streamed_turn(
             kernel,
             session_id,
             runtime_id,
@@ -1472,7 +1475,7 @@ impl ConsoleApp {
             backend_tx.clone(),
         );
         self.active_turn = Some(handle);
-        self.active_turn_cancel = Some(cancel_tx);
+        self.active_turn_cancel = Some(cancellation);
     }
 
     fn handle_lionclaw_control(
@@ -1534,7 +1537,7 @@ impl ConsoleApp {
         self.activity_scroll.reset_tail();
         self.inspector_subject = InspectorSubject::Activity;
         self.status = format!("running {label}");
-        let (handle, cancel_tx) = spawn_streamed_turn(
+        let (handle, cancellation) = spawn_streamed_turn(
             kernel,
             session_id,
             runtime_id,
@@ -1542,7 +1545,7 @@ impl ConsoleApp {
             backend_tx.clone(),
         );
         self.active_turn = Some(handle);
-        self.active_turn_cancel = Some(cancel_tx);
+        self.active_turn_cancel = Some(cancellation);
     }
 
     fn start_reset(&mut self, backend_tx: &mpsc::UnboundedSender<BackendEvent>) {
@@ -1564,10 +1567,7 @@ impl ConsoleApp {
         let backend_tx = backend_tx.clone();
         self.active_turn = Some(tokio::spawn(async move {
             let result = kernel
-                .session_action(SessionActionRequest {
-                    session_id,
-                    action: SessionActionKind::ResetSession,
-                })
+                .session_action(SessionActionRequest::ResetSession { session_id })
                 .await
                 .map(|response| response.session_id)
                 .map_err(|err| err.to_string());
@@ -1852,6 +1852,13 @@ fn middle_elide(value: &str, width: usize) -> String {
         .rev()
         .collect::<String>();
     format!("{head}{marker}{tail}")
+}
+
+fn is_non_failure_terminal_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("runtime.cancelled" | "queue.cancelled" | "runtime.interrupted" | "queue.interrupted")
+    )
 }
 
 fn classify_activity_status(text: &str) -> ActivityItemKind {

@@ -299,8 +299,9 @@ pub(super) fn spawn_streamed_turn(
     runtime_id: String,
     submission: StreamedSubmission,
     backend_tx: mpsc::UnboundedSender<BackendEvent>,
-) -> (JoinHandle<()>, oneshot::Sender<String>) {
-    let (cancel_tx, cancel_rx) = oneshot::channel();
+) -> (JoinHandle<()>, TurnCancellation) {
+    let cancellation = TurnCancellation::new();
+    let cancellation_for_task = cancellation.clone();
     let handle = tokio::spawn(async move {
         let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
         let mut answer_seen = false;
@@ -314,8 +315,11 @@ pub(super) fn spawn_streamed_turn(
                     runtime_timeout_ms: None,
                     runtime_env_passthrough: None,
                 };
-                let turn_future =
-                    kernel.turn_session_streaming_cancellable(request, stream_tx, cancel_rx);
+                let turn_future = kernel.turn_session_streaming_cancellable(
+                    request,
+                    stream_tx,
+                    cancellation_for_task,
+                );
                 tokio::pin!(turn_future);
                 run_stream_future(
                     &mut turn_future,
@@ -331,7 +335,7 @@ pub(super) fn spawn_streamed_turn(
                     action,
                     Some(runtime_id),
                     stream_tx,
-                    cancel_rx,
+                    cancellation_for_task,
                 );
                 tokio::pin!(turn_future);
                 run_stream_future(
@@ -344,7 +348,7 @@ pub(super) fn spawn_streamed_turn(
             }
         }
     });
-    (handle, cancel_tx)
+    (handle, cancellation)
 }
 
 async fn run_stream_future<F>(

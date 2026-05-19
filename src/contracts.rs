@@ -233,10 +233,37 @@ pub enum SessionActionKind {
     ResetSession,
 }
 
+impl SessionActionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ContinueLastPartial => "continue_last_partial",
+            Self::RetryLastTurn => "retry_last_turn",
+            Self::ResetSession => "reset_session",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionActionRequest {
-    pub session_id: Uuid,
-    pub action: SessionActionKind,
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum SessionActionRequest {
+    ContinueLastPartial {
+        session_id: Uuid,
+    },
+    RetryLastTurn {
+        session_id: Uuid,
+    },
+    ResetSession {
+        session_id: Uuid,
+    },
+    CancelActiveTurn {
+        session_id: Uuid,
+        channel_id: String,
+        session_key: String,
+        #[serde(default)]
+        expected_turn_id: Option<Uuid>,
+        #[serde(default)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,7 +328,12 @@ pub struct StreamEventDto {
 pub struct SessionTurnResponse {
     pub session_id: Uuid,
     pub turn_id: Uuid,
+    pub status: SessionTurnStatus,
     pub assistant_text: String,
+    #[serde(default)]
+    pub error_code: Option<String>,
+    #[serde(default)]
+    pub error_text: Option<String>,
     pub runtime_skill_ids: Vec<String>,
     pub runtime_id: String,
     pub stream_events: Vec<StreamEventDto>,

@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, Transaction};
 use tokio::{
     io::AsyncWriteExt,
-    sync::{oneshot, Mutex, Notify, RwLock},
+    sync::{Mutex, Notify, RwLock},
     time::{sleep, timeout, Instant},
 };
 use tracing::warn;
@@ -66,6 +66,7 @@ use crate::{
 
 use super::{
     audit::AuditLog,
+    cancellation::TurnCancellation,
     capability_broker::{CapabilityBroker, CapabilityExecutionContext},
     channel_attachments::{
         ChannelAttachmentBatchStatus, ChannelAttachmentRecord, ChannelAttachmentRecordStatus,
@@ -84,8 +85,8 @@ use super::{
     channel_state::{
         ChannelGrantRecord, ChannelGrantStatus, ChannelGrantUpsert, ChannelPairingRequestRecord,
         ChannelStateStore, ChannelStreamEventInsert, ChannelStreamEventKind,
-        ChannelStreamEventRecord, ChannelTurnRecord, ChannelTurnStatus, NewChannelHealthReport,
-        NewChannelInboundEvent, NewChannelTurn, OperatorPairingUpsert,
+        ChannelStreamEventRecord, ChannelTurnRecord, ChannelTurnStatus, ChannelTurnTerminalUpdate,
+        NewChannelHealthReport, NewChannelInboundEvent, NewChannelTurn, OperatorPairingUpsert,
         StreamMessageLane as ChannelStreamLane, TokenPairingCreate,
         CHANNEL_HEALTH_OBSERVED_AT_FUTURE_SKEW_SECONDS, PAIRING_CLAIM_POLICY_OPERATOR_APPROVAL,
         PAIRING_CLAIM_POLICY_TOKEN_CLAIM,
@@ -194,6 +195,14 @@ struct ChannelAttachmentStageRejection<'a> {
 }
 
 #[derive(Clone)]
+struct ActiveTurnCancellation {
+    session_id: Uuid,
+    channel_id: String,
+    session_key: String,
+    cancellation: TurnCancellation,
+}
+
+#[derive(Clone)]
 pub struct KernelOptions {
     pub runtime_turn_idle_timeout: Duration,
     pub runtime_turn_hard_timeout: Duration,
@@ -282,6 +291,7 @@ pub struct Kernel {
     scheduler: SchedulerEngine,
     channel_stream_notifiers: Arc<RwLock<HashMap<String, Arc<Notify>>>>,
     channel_turn_workers: Arc<RwLock<HashSet<String>>>,
+    active_turn_cancellations: Arc<RwLock<HashMap<Uuid, ActiveTurnCancellation>>>,
     session_locks: Arc<RwLock<HashMap<Uuid, Arc<Mutex<()>>>>>,
     active_continuity_refresh_lock: Arc<Mutex<()>>,
     execution_planner: ExecutionPlanner,
@@ -445,6 +455,7 @@ impl Kernel {
             scheduler: SchedulerEngine::new(options.scheduler),
             channel_stream_notifiers: Arc::new(RwLock::new(HashMap::new())),
             channel_turn_workers: Arc::new(RwLock::new(HashSet::new())),
+            active_turn_cancellations: Arc::new(RwLock::new(HashMap::new())),
             session_locks: Arc::new(RwLock::new(HashMap::new())),
             active_continuity_refresh_lock: Arc::new(Mutex::new(())),
             execution_planner,
@@ -500,7 +511,7 @@ impl Kernel {
         }
         if let Err(err) = self
             .channel_state
-            .fail_running_turns("channel turn interrupted by restart")
+            .interrupt_running_turns("channel turn interrupted by restart")
             .await
         {
             warn!(
@@ -1024,16 +1035,12 @@ impl Kernel {
         action: SessionActionKind,
         runtime_id_override: Option<String>,
         sink: RuntimeEventSink,
-        cancel_rx: oneshot::Receiver<String>,
+        cancellation: TurnCancellation,
     ) -> Result<SessionTurnResponse, KernelError> {
         self.run_session_action_with_options(
             session_id,
             action,
-            SessionActionExecutionOptions::api_cancellable(
-                runtime_id_override,
-                Some(sink),
-                cancel_rx,
-            ),
+            SessionActionExecutionOptions::api(runtime_id_override, Some(sink), cancellation),
         )
         .await
     }
@@ -1042,57 +1049,243 @@ impl Kernel {
         &self,
         req: SessionActionRequest,
     ) -> Result<SessionActionResponse, KernelError> {
-        match req.action {
-            SessionActionKind::ResetSession => {
-                let session = self.get_scoped_session(req.session_id).await?;
-                self.require_session_mutation_access(&session).await?;
-                let reset = self
-                    .open_session(SessionOpenRequest {
-                        channel_id: session.channel_id,
-                        peer_id: session.peer_id,
-                        trust_tier: session.trust_tier,
-                        history_policy: Some(session.history_policy),
-                    })
-                    .await?;
-                let reset = self
-                    .sessions
-                    .touch_activity(reset.session_id)
-                    .await
-                    .map_err(internal)?
-                    .ok_or_else(|| KernelError::NotFound("session not found".to_string()))?;
-                Ok(SessionActionResponse {
-                    session_id: reset.session_id,
-                    turn_id: None,
-                })
+        match req {
+            SessionActionRequest::ResetSession { session_id } => {
+                self.reset_session(session_id).await
             }
-            SessionActionKind::ContinueLastPartial | SessionActionKind::RetryLastTurn => {
-                let session_lock = self.session_lock(req.session_id).await;
-                let guard = Arc::clone(&session_lock).lock_owned().await;
-                let (session, execution) = self
-                    .prepare_session_action_execution(
-                        req.session_id,
-                        req.action,
-                        SessionActionExecutionOptions::api(None, None),
-                    )
-                    .await?;
-                let response_session_id = session.session_id;
-                let turn_id = execution.turn_id;
-                let kernel = self.clone();
-                tokio::spawn(async move {
-                    let _guard = guard;
-                    if let Err(err) = kernel
-                        .execute_session_turn_with_attachment_cleanup(&session, execution)
-                        .await
-                    {
-                        warn!(?err, session_id = %session.session_id, turn_id = %turn_id, "session action turn failed");
-                    }
-                });
-                Ok(SessionActionResponse {
-                    session_id: response_session_id,
-                    turn_id: Some(turn_id),
-                })
+            SessionActionRequest::ContinueLastPartial { session_id } => {
+                self.spawn_session_action(session_id, SessionActionKind::ContinueLastPartial)
+                    .await
+            }
+            SessionActionRequest::RetryLastTurn { session_id } => {
+                self.spawn_session_action(session_id, SessionActionKind::RetryLastTurn)
+                    .await
+            }
+            SessionActionRequest::CancelActiveTurn {
+                session_id,
+                channel_id,
+                session_key,
+                expected_turn_id,
+                reason,
+            } => {
+                self.cancel_active_channel_turn(
+                    session_id,
+                    &channel_id,
+                    &session_key,
+                    expected_turn_id,
+                    reason,
+                )
+                .await
             }
         }
+    }
+
+    async fn reset_session(&self, session_id: Uuid) -> Result<SessionActionResponse, KernelError> {
+        let session = self.get_scoped_session(session_id).await?;
+        self.require_session_mutation_access(&session).await?;
+        let reset = self
+            .open_session(SessionOpenRequest {
+                channel_id: session.channel_id,
+                peer_id: session.peer_id,
+                trust_tier: session.trust_tier,
+                history_policy: Some(session.history_policy),
+            })
+            .await?;
+        let reset = self
+            .sessions
+            .touch_activity(reset.session_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("session not found".to_string()))?;
+        Ok(SessionActionResponse {
+            session_id: reset.session_id,
+            turn_id: None,
+        })
+    }
+
+    async fn spawn_session_action(
+        &self,
+        session_id: Uuid,
+        action: SessionActionKind,
+    ) -> Result<SessionActionResponse, KernelError> {
+        let session_lock = self.session_lock(session_id).await;
+        let guard = Arc::clone(&session_lock).lock_owned().await;
+        let cancellation = TurnCancellation::new();
+        let (session, execution) = self
+            .prepare_session_action_execution(
+                session_id,
+                action,
+                SessionActionExecutionOptions::api(None, None, cancellation.clone()),
+            )
+            .await?;
+        let response_session_id = session.session_id;
+        let turn_id = execution.turn_id;
+        let kernel = self.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            if let Err(err) = kernel
+                .execute_session_turn_with_attachment_cleanup(&session, execution)
+                .await
+            {
+                warn!(?err, session_id = %session.session_id, turn_id = %turn_id, "session action turn failed");
+            }
+        });
+        Ok(SessionActionResponse {
+            session_id: response_session_id,
+            turn_id: Some(turn_id),
+        })
+    }
+
+    async fn cancel_active_channel_turn(
+        &self,
+        session_id: Uuid,
+        channel_id: &str,
+        session_key: &str,
+        expected_turn_id: Option<Uuid>,
+        reason: Option<String>,
+    ) -> Result<SessionActionResponse, KernelError> {
+        let channel_id = channel_id.trim();
+        let session_key = session_key.trim();
+        if channel_id.is_empty() || session_key.is_empty() {
+            return Err(KernelError::BadRequest(
+                "channel_id and session_key are required".to_string(),
+            ));
+        }
+
+        let session = self.get_scoped_session(session_id).await?;
+        self.require_session_mutation_access(&session).await?;
+        if session.channel_id != channel_id || session.peer_id != session_key {
+            return Err(KernelError::NotFound(
+                "session not found for channel scope".to_string(),
+            ));
+        }
+
+        let Some(turn) = self
+            .channel_state
+            .head_open_turn_for_session(session_id, channel_id, session_key)
+            .await
+            .map_err(internal)?
+        else {
+            return Ok(SessionActionResponse {
+                session_id,
+                turn_id: None,
+            });
+        };
+
+        if let Some(expected_turn_id) = expected_turn_id {
+            if expected_turn_id != turn.turn_id {
+                return Err(KernelError::Conflict(
+                    "active turn no longer matches expected_turn_id".to_string(),
+                ));
+            }
+        }
+
+        let reason = action_cancel_reason(reason);
+        self.append_audit_event_best_effort(
+            "channel.turn.cancel_requested",
+            Some(session_id),
+            "api",
+            json!({
+                "turn_id": turn.turn_id,
+                "channel_id": channel_id,
+                "session_key": session_key,
+                "reason": reason,
+            }),
+        )
+        .await;
+
+        match turn.status {
+            ChannelTurnStatus::WaitingForAttachments | ChannelTurnStatus::Pending => {
+                self.terminalize_queued_turn(
+                    &turn,
+                    QueuedTurnTerminal::Cancelled {
+                        code: "queue.cancelled".to_string(),
+                        reason,
+                    },
+                    self.channel_stream_context_for_session(
+                        turn.session_id,
+                        &turn.channel_id,
+                        &turn.session_key,
+                        turn.turn_id,
+                    )
+                    .await
+                    .ok()
+                    .flatten(),
+                )
+                .await?;
+                self.ensure_channel_turn_worker(&turn.channel_id, &turn.session_key)
+                    .await;
+                Ok(SessionActionResponse {
+                    session_id,
+                    turn_id: Some(turn.turn_id),
+                })
+            }
+            ChannelTurnStatus::Running => {
+                self.request_active_turn_cancellation(&turn, &reason)
+                    .await?;
+                Ok(SessionActionResponse {
+                    session_id,
+                    turn_id: Some(turn.turn_id),
+                })
+            }
+            ChannelTurnStatus::Completed
+            | ChannelTurnStatus::Failed
+            | ChannelTurnStatus::TimedOut
+            | ChannelTurnStatus::Cancelled
+            | ChannelTurnStatus::Interrupted => Ok(SessionActionResponse {
+                session_id,
+                turn_id: None,
+            }),
+        }
+    }
+
+    async fn request_active_turn_cancellation(
+        &self,
+        turn: &ChannelTurnRecord,
+        reason: &str,
+    ) -> Result<(), KernelError> {
+        let cancellation = {
+            let active = self.active_turn_cancellations.read().await;
+            active.get(&turn.turn_id).cloned()
+        }
+        .ok_or_else(|| {
+            KernelError::Conflict("active channel turn is not cancellable yet".to_string())
+        })?;
+
+        if cancellation.session_id != turn.session_id
+            || cancellation.channel_id != turn.channel_id
+            || cancellation.session_key != turn.session_key
+        {
+            return Err(KernelError::Conflict(
+                "active turn cancellation scope mismatch".to_string(),
+            ));
+        }
+
+        cancellation.cancellation.request(reason.to_string());
+        Ok(())
+    }
+
+    async fn register_active_channel_turn_cancellation(
+        &self,
+        turn: &ChannelTurnRecord,
+        cancellation: TurnCancellation,
+    ) {
+        self.active_turn_cancellations.write().await.insert(
+            turn.turn_id,
+            ActiveTurnCancellation {
+                session_id: turn.session_id,
+                channel_id: turn.channel_id.clone(),
+                session_key: turn.session_key.clone(),
+                cancellation,
+            },
+        );
+    }
+
+    async fn unregister_active_turn_cancellation(&self, turn_id: Uuid) {
+        self.active_turn_cancellations
+            .write()
+            .await
+            .remove(&turn_id);
     }
 
     async fn session_lock(&self, session_id: Uuid) -> Arc<Mutex<()>> {
@@ -1234,7 +1427,7 @@ impl Kernel {
         self.run_session_action_with_options(
             session_id,
             action,
-            SessionActionExecutionOptions::api(runtime_id_override, sink),
+            SessionActionExecutionOptions::api(runtime_id_override, sink, TurnCancellation::new()),
         )
         .await
     }
@@ -1267,7 +1460,7 @@ impl Kernel {
             mut prepared_turn,
             history_before_sequence_no,
             sink,
-            cancel_rx,
+            cancellation,
             emit_channel_stream_done,
             audit_actor,
         } = options;
@@ -1332,7 +1525,7 @@ impl Kernel {
                     emit_channel_stream_done,
                     audit_actor,
                     runtime_control_origin: RuntimeControlOrigin::SessionTurn,
-                    cancel_rx,
+                    cancellation,
                 }
             }
             SessionActionKind::RetryLastTurn => {
@@ -1366,7 +1559,7 @@ impl Kernel {
                     emit_channel_stream_done,
                     audit_actor,
                     runtime_control_origin: RuntimeControlOrigin::SessionTurn,
-                    cancel_rx,
+                    cancellation,
                 }
             }
             SessionActionKind::ResetSession => {
@@ -1410,9 +1603,9 @@ impl Kernel {
         &self,
         req: SessionTurnRequest,
         sink: RuntimeEventSink,
-        cancel_rx: oneshot::Receiver<String>,
+        cancellation: TurnCancellation,
     ) -> Result<SessionTurnResponse, KernelError> {
-        self.turn_session_with_options(req, Some(sink), Some(cancel_rx))
+        self.turn_session_with_options(req, Some(sink), cancellation)
             .await
     }
 
@@ -4968,7 +5161,7 @@ impl Kernel {
                 emit_channel_stream_done: true,
                 audit_actor: "scheduler".to_string(),
                 runtime_control_origin: RuntimeControlOrigin::SessionTurn,
-                cancel_rx: None,
+                cancellation: TurnCancellation::new(),
             },
         )
         .await
@@ -8187,7 +8380,96 @@ fn session_turn_status_for_error_code(error_code: &str) -> SessionTurnStatus {
     match error_code {
         "runtime.timeout" => SessionTurnStatus::TimedOut,
         "runtime.cancelled" => SessionTurnStatus::Cancelled,
+        "queue.cancelled" => SessionTurnStatus::Cancelled,
+        "runtime.interrupted" => SessionTurnStatus::Interrupted,
+        "queue.interrupted" => SessionTurnStatus::Interrupted,
         _ => SessionTurnStatus::Failed,
+    }
+}
+
+fn is_expected_terminal_status(status: SessionTurnStatus) -> bool {
+    matches!(
+        status,
+        SessionTurnStatus::TimedOut | SessionTurnStatus::Cancelled | SessionTurnStatus::Interrupted
+    )
+}
+
+fn action_cancel_reason(reason: Option<String>) -> String {
+    let reason = reason.unwrap_or_else(|| "turn cancellation requested".to_string());
+    let reason = reason.trim();
+    if reason.is_empty() {
+        "turn cancellation requested".to_string()
+    } else {
+        reason.chars().take(512).collect()
+    }
+}
+
+fn queued_terminal_from_response(response: &SessionTurnResponse) -> QueuedTurnTerminal {
+    match response.status {
+        SessionTurnStatus::Completed => QueuedTurnTerminal::Completed {
+            runtime_id: response.runtime_id.clone(),
+            assistant_text_len: response.assistant_text.len(),
+        },
+        SessionTurnStatus::TimedOut => QueuedTurnTerminal::TimedOut {
+            message: response
+                .error_text
+                .clone()
+                .unwrap_or_else(|| "runtime timed out".to_string()),
+        },
+        SessionTurnStatus::Cancelled => QueuedTurnTerminal::Cancelled {
+            code: response
+                .error_code
+                .clone()
+                .unwrap_or_else(|| "runtime.cancelled".to_string()),
+            reason: response
+                .error_text
+                .clone()
+                .unwrap_or_else(|| "turn cancellation requested".to_string()),
+        },
+        SessionTurnStatus::Interrupted => QueuedTurnTerminal::Interrupted {
+            reason: response
+                .error_text
+                .clone()
+                .unwrap_or_else(|| "turn interrupted".to_string()),
+        },
+        SessionTurnStatus::Failed
+        | SessionTurnStatus::Running
+        | SessionTurnStatus::WaitingForAttachments => QueuedTurnTerminal::Failed {
+            code: response
+                .error_code
+                .clone()
+                .unwrap_or_else(|| "runtime.error".to_string()),
+            message: response
+                .error_text
+                .clone()
+                .unwrap_or_else(|| "turn failed".to_string()),
+        },
+    }
+}
+
+fn channel_terminal_session_status(status: ChannelTurnStatus) -> SessionTurnStatus {
+    match status {
+        ChannelTurnStatus::Completed => SessionTurnStatus::Completed,
+        ChannelTurnStatus::Failed => SessionTurnStatus::Failed,
+        ChannelTurnStatus::TimedOut => SessionTurnStatus::TimedOut,
+        ChannelTurnStatus::Cancelled => SessionTurnStatus::Cancelled,
+        ChannelTurnStatus::Interrupted => SessionTurnStatus::Interrupted,
+        ChannelTurnStatus::WaitingForAttachments
+        | ChannelTurnStatus::Pending
+        | ChannelTurnStatus::Running => SessionTurnStatus::Failed,
+    }
+}
+
+fn terminal_status_text(status: ChannelTurnStatus) -> &'static str {
+    match status {
+        ChannelTurnStatus::Completed => "turn completed",
+        ChannelTurnStatus::Failed => "turn failed",
+        ChannelTurnStatus::TimedOut => "turn timed out",
+        ChannelTurnStatus::Cancelled => "turn cancelled",
+        ChannelTurnStatus::Interrupted => "turn interrupted",
+        ChannelTurnStatus::WaitingForAttachments
+        | ChannelTurnStatus::Pending
+        | ChannelTurnStatus::Running => "turn updated",
     }
 }
 
@@ -8318,7 +8600,7 @@ struct RuntimeTurnExecution<'a> {
     input: RuntimeTurnInput,
     stream_context: Option<ChannelStreamContext>,
     event_sink: Option<RuntimeEventSink>,
-    cancel_rx: Option<oneshot::Receiver<String>>,
+    cancellation: TurnCancellation,
 }
 
 struct RuntimeControlTurnExecution<'a> {
@@ -8333,7 +8615,7 @@ struct RuntimeControlTurnExecution<'a> {
     input: RuntimeControlInput,
     stream_context: Option<ChannelStreamContext>,
     event_sink: Option<RuntimeEventSink>,
-    cancel_rx: Option<oneshot::Receiver<String>>,
+    cancellation: TurnCancellation,
 }
 
 struct CollectedRuntimeControl {
@@ -8354,7 +8636,7 @@ struct RuntimeControlSessionExecution<'a> {
     channel_stream_context: Option<ChannelStreamContext>,
     emit_channel_stream_done: bool,
     sink: Option<RuntimeEventSink>,
-    cancel_rx: Option<oneshot::Receiver<String>>,
+    cancellation: TurnCancellation,
     audit_actor: String,
 }
 
@@ -8383,7 +8665,7 @@ struct SessionTurnExecution {
     emit_channel_stream_done: bool,
     audit_actor: String,
     runtime_control_origin: RuntimeControlOrigin,
-    cancel_rx: Option<oneshot::Receiver<String>>,
+    cancellation: TurnCancellation,
 }
 
 struct SessionActionExecutionOptions {
@@ -8392,29 +8674,16 @@ struct SessionActionExecutionOptions {
     prepared_turn: Option<SessionTurnRecord>,
     history_before_sequence_no: Option<u64>,
     sink: Option<RuntimeEventSink>,
-    cancel_rx: Option<oneshot::Receiver<String>>,
+    cancellation: TurnCancellation,
     emit_channel_stream_done: bool,
     audit_actor: String,
 }
 
 impl SessionActionExecutionOptions {
-    fn api(runtime_id_override: Option<String>, sink: Option<RuntimeEventSink>) -> Self {
-        Self {
-            turn_id: Uuid::new_v4(),
-            runtime_id_override,
-            prepared_turn: None,
-            history_before_sequence_no: None,
-            sink,
-            cancel_rx: None,
-            emit_channel_stream_done: true,
-            audit_actor: "api".to_string(),
-        }
-    }
-
-    fn api_cancellable(
+    fn api(
         runtime_id_override: Option<String>,
         sink: Option<RuntimeEventSink>,
-        cancel_rx: oneshot::Receiver<String>,
+        cancellation: TurnCancellation,
     ) -> Self {
         Self {
             turn_id: Uuid::new_v4(),
@@ -8422,13 +8691,17 @@ impl SessionActionExecutionOptions {
             prepared_turn: None,
             history_before_sequence_no: None,
             sink,
-            cancel_rx: Some(cancel_rx),
+            cancellation,
             emit_channel_stream_done: true,
             audit_actor: "api".to_string(),
         }
     }
 
-    fn queued_channel(turn: &ChannelTurnRecord, prepared_turn: SessionTurnRecord) -> Self {
+    fn queued_channel(
+        turn: &ChannelTurnRecord,
+        prepared_turn: SessionTurnRecord,
+        cancellation: TurnCancellation,
+    ) -> Self {
         let history_before_sequence_no = prepared_turn.sequence_no;
         Self {
             turn_id: turn.turn_id,
@@ -8436,7 +8709,7 @@ impl SessionActionExecutionOptions {
             prepared_turn: Some(prepared_turn),
             history_before_sequence_no: Some(history_before_sequence_no),
             sink: None,
-            cancel_rx: None,
+            cancellation,
             emit_channel_stream_done: false,
             audit_actor: "kernel".to_string(),
         }
@@ -8467,6 +8740,72 @@ struct FailedSessionTurnCompletion {
 struct ChannelStreamFinalizer<'a> {
     stream_context: &'a Option<ChannelStreamContext>,
     emit_done: bool,
+}
+
+enum QueuedTurnTerminal {
+    Completed {
+        runtime_id: String,
+        assistant_text_len: usize,
+    },
+    Failed {
+        code: String,
+        message: String,
+    },
+    TimedOut {
+        message: String,
+    },
+    Cancelled {
+        code: String,
+        reason: String,
+    },
+    Interrupted {
+        reason: String,
+    },
+}
+
+impl QueuedTurnTerminal {
+    fn status(&self) -> ChannelTurnStatus {
+        match self {
+            Self::Completed { .. } => ChannelTurnStatus::Completed,
+            Self::Failed { .. } => ChannelTurnStatus::Failed,
+            Self::TimedOut { .. } => ChannelTurnStatus::TimedOut,
+            Self::Cancelled { .. } => ChannelTurnStatus::Cancelled,
+            Self::Interrupted { .. } => ChannelTurnStatus::Interrupted,
+        }
+    }
+
+    fn code(&self) -> Option<&str> {
+        match self {
+            Self::Failed { code, .. } | Self::Cancelled { code, .. } => Some(code.as_str()),
+            Self::TimedOut { .. } => Some("runtime.timeout"),
+            Self::Interrupted { .. } => Some("queue.interrupted"),
+            Self::Completed { .. } => None,
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::Completed { .. } => "turn completed",
+            Self::Failed { message, .. } | Self::TimedOut { message } => message,
+            Self::Cancelled { reason, .. } | Self::Interrupted { reason } => reason,
+        }
+    }
+
+    fn runtime_id<'a>(&'a self, turn: &'a ChannelTurnRecord) -> &'a str {
+        match self {
+            Self::Completed { runtime_id, .. } => runtime_id,
+            _ => &turn.runtime_id,
+        }
+    }
+
+    fn assistant_text_len(&self) -> Option<usize> {
+        match self {
+            Self::Completed {
+                assistant_text_len, ..
+            } => Some(*assistant_text_len),
+            _ => None,
+        }
+    }
 }
 
 const ASSISTANT_CHECKPOINT_BYTES: usize = 256;
@@ -8624,16 +8963,6 @@ impl RuntimeAbort {
     }
 }
 
-async fn wait_for_runtime_cancel(cancel_rx: Option<oneshot::Receiver<String>>) -> String {
-    match cancel_rx {
-        Some(rx) => match rx.await {
-            Ok(reason) => reason,
-            Err(_) => std::future::pending::<String>().await,
-        },
-        None => std::future::pending::<String>().await,
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 enum RuntimeSessionCloseContext {
     Turn,
@@ -8655,14 +8984,15 @@ impl Kernel {
         req: SessionTurnRequest,
         sink: Option<RuntimeEventSink>,
     ) -> Result<SessionTurnResponse, KernelError> {
-        self.turn_session_with_options(req, sink, None).await
+        self.turn_session_with_options(req, sink, TurnCancellation::new())
+            .await
     }
 
     async fn turn_session_with_options(
         &self,
         req: SessionTurnRequest,
         sink: Option<RuntimeEventSink>,
-        cancel_rx: Option<oneshot::Receiver<String>>,
+        cancellation: TurnCancellation,
     ) -> Result<SessionTurnResponse, KernelError> {
         if req.user_text.trim().is_empty() {
             return Err(KernelError::BadRequest("user_text is required".to_string()));
@@ -8691,7 +9021,7 @@ impl Kernel {
                 emit_channel_stream_done: true,
                 audit_actor: "api".to_string(),
                 runtime_control_origin: RuntimeControlOrigin::SessionTurn,
-                cancel_rx,
+                cancellation,
             },
         )
         .await
@@ -8730,7 +9060,7 @@ impl Kernel {
             emit_channel_stream_done,
             audit_actor,
             runtime_control_origin,
-            cancel_rx,
+            cancellation,
         } = execution;
         let mut kind = kind;
         let mut display_user_text = display_user_text;
@@ -8928,7 +9258,7 @@ impl Kernel {
                     channel_stream_context: channel_stream_context.clone(),
                     emit_channel_stream_done,
                     sink,
-                    cancel_rx,
+                    cancellation,
                     audit_actor,
                 })
                 .await;
@@ -8974,7 +9304,7 @@ impl Kernel {
                 },
                 stream_context: channel_stream_context.clone(),
                 event_sink: sink.clone(),
-                cancel_rx,
+                cancellation,
             })
             .await;
 
@@ -8996,22 +9326,34 @@ impl Kernel {
                 }
                 let assistant_text = assistant_text_from_events(&turn_err.events);
                 let stream_error_emitted = runtime_events_include_error(&turn_err.events);
-                self.persist_failed_session_turn(
-                    session,
-                    &persisted_turn,
-                    FailedSessionTurnCompletion {
-                        assistant_text,
-                        error_code: turn_err.error_code.clone(),
-                        error_text: turn_err.error_text.clone(),
-                        stream_error_emitted,
-                    },
-                    channel_stream_finalizer,
-                )
-                .await?;
-                return Err(kernel_error_for_turn_status(
-                    turn_err.status,
-                    turn_err.error_text,
-                ));
+                let completion = self
+                    .persist_failed_session_turn(
+                        session,
+                        &persisted_turn,
+                        FailedSessionTurnCompletion {
+                            assistant_text: assistant_text.clone(),
+                            error_code: turn_err.error_code.clone(),
+                            error_text: turn_err.error_text.clone(),
+                            stream_error_emitted,
+                        },
+                        channel_stream_finalizer,
+                    )
+                    .await?;
+                return if is_expected_terminal_status(turn_err.status) {
+                    Ok(self.failed_turn_response(
+                        session.session_id,
+                        turn_id,
+                        runtime_skill_ids,
+                        runtime_id,
+                        completion,
+                        turn_err.events,
+                    ))
+                } else {
+                    Err(kernel_error_for_turn_status(
+                        turn_err.status,
+                        turn_err.error_text,
+                    ))
+                };
             }
         };
 
@@ -9272,7 +9614,10 @@ impl Kernel {
         Ok(SessionTurnResponse {
             session_id: session.session_id,
             turn_id,
+            status: SessionTurnStatus::Completed,
             assistant_text: artifacts.assistant_text,
+            error_code: None,
+            error_text: None,
             runtime_skill_ids,
             runtime_id,
             stream_events: artifacts.event_views,
@@ -9296,7 +9641,7 @@ impl Kernel {
             channel_stream_context,
             emit_channel_stream_done,
             sink,
-            cancel_rx,
+            cancellation,
             audit_actor,
         } = execution;
         let channel_stream_finalizer = ChannelStreamFinalizer {
@@ -9340,7 +9685,7 @@ impl Kernel {
                 },
                 stream_context: channel_stream_context.clone(),
                 event_sink: sink.clone(),
-                cancel_rx,
+                cancellation,
             })
             .await;
 
@@ -9362,22 +9707,34 @@ impl Kernel {
                 }
                 let assistant_text = assistant_text_from_events(&turn_err.events);
                 let stream_error_emitted = runtime_events_include_error(&turn_err.events);
-                self.persist_failed_session_turn(
-                    session,
-                    &persisted_turn,
-                    FailedSessionTurnCompletion {
-                        assistant_text,
-                        error_code: turn_err.error_code.clone(),
-                        error_text: turn_err.error_text.clone(),
-                        stream_error_emitted,
-                    },
-                    channel_stream_finalizer,
-                )
-                .await?;
-                return Err(kernel_error_for_turn_status(
-                    turn_err.status,
-                    turn_err.error_text,
-                ));
+                let completion = self
+                    .persist_failed_session_turn(
+                        session,
+                        &persisted_turn,
+                        FailedSessionTurnCompletion {
+                            assistant_text: assistant_text.clone(),
+                            error_code: turn_err.error_code.clone(),
+                            error_text: turn_err.error_text.clone(),
+                            stream_error_emitted,
+                        },
+                        channel_stream_finalizer,
+                    )
+                    .await?;
+                return if is_expected_terminal_status(turn_err.status) {
+                    Ok(self.failed_turn_response(
+                        session.session_id,
+                        turn_id,
+                        runtime_skill_ids,
+                        runtime_id,
+                        completion,
+                        turn_err.events,
+                    ))
+                } else {
+                    Err(kernel_error_for_turn_status(
+                        turn_err.status,
+                        turn_err.error_text,
+                    ))
+                };
             }
         };
 
@@ -9559,7 +9916,10 @@ impl Kernel {
         Ok(SessionTurnResponse {
             session_id: session.session_id,
             turn_id,
+            status,
             assistant_text,
+            error_code,
+            error_text,
             runtime_skill_ids,
             runtime_id,
             stream_events: runtime_events_to_views(&runtime_events),
@@ -9572,7 +9932,7 @@ impl Kernel {
         persisted_turn: &SessionTurnRecord,
         failure: FailedSessionTurnCompletion,
         channel_stream_finalizer: ChannelStreamFinalizer<'_>,
-    ) -> Result<(), KernelError> {
+    ) -> Result<SessionTurnCompletion, KernelError> {
         let FailedSessionTurnCompletion {
             assistant_text,
             error_code,
@@ -9581,16 +9941,15 @@ impl Kernel {
         } = failure;
         let status = session_turn_status_for_error_code(&error_code);
 
+        let completion = SessionTurnCompletion {
+            status,
+            assistant_text,
+            error_code: Some(error_code.clone()),
+            error_text: Some(error_text.clone()),
+        };
+
         self.session_turns
-            .complete_turn(
-                persisted_turn.turn_id,
-                SessionTurnCompletion {
-                    status,
-                    assistant_text,
-                    error_code: Some(error_code.clone()),
-                    error_text: Some(error_text.clone()),
-                },
-            )
+            .complete_turn(persisted_turn.turn_id, completion.clone())
             .await
             .map_err(internal)?;
         self.sessions
@@ -9624,7 +9983,29 @@ impl Kernel {
         .await?;
         self.emit_channel_stream_done_if_requested(channel_stream_finalizer)
             .await?;
-        Ok(())
+        Ok(completion)
+    }
+
+    fn failed_turn_response(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+        runtime_skill_ids: Vec<String>,
+        runtime_id: String,
+        completion: SessionTurnCompletion,
+        runtime_events: Vec<RuntimeEvent>,
+    ) -> SessionTurnResponse {
+        SessionTurnResponse {
+            session_id,
+            turn_id,
+            status: completion.status,
+            assistant_text: completion.assistant_text,
+            error_code: completion.error_code,
+            error_text: completion.error_text,
+            runtime_skill_ids,
+            runtime_id,
+            stream_events: runtime_events_to_views(&runtime_events),
+        }
     }
 
     fn resolve_runtime_id(
@@ -10695,12 +11076,16 @@ impl Kernel {
             return;
         }
 
+        let cancellation = TurnCancellation::new();
+        self.register_active_channel_turn_cancellation(&turn, cancellation.clone())
+            .await;
         let attachment_context = match self
             .channel_attachment_execution_context_for_turn(&turn, &persisted_turn.prompt_user_text)
             .await
         {
             Ok(context) => context,
             Err(err) => {
+                self.unregister_active_turn_cancellation(turn.turn_id).await;
                 let code = queued_turn_failure_code(&err);
                 if let Err(fail_err) = self
                     .fail_queued_turn(&turn, code, &err.to_string(), stream_context)
@@ -10735,22 +11120,26 @@ impl Kernel {
                     emit_channel_stream_done: false,
                     audit_actor: "kernel".to_string(),
                     runtime_control_origin: RuntimeControlOrigin::ChannelInbound,
-                    cancel_rx: None,
+                    cancellation,
                 },
             )
             .await;
+        self.unregister_active_turn_cancellation(turn.turn_id).await;
         self.remove_channel_attachment_runtime_projection_dirs_best_effort(&projection_mounts)
             .await;
 
         match result {
             Ok(response) => {
-                self.complete_queued_turn(
-                    &turn,
-                    &response.runtime_id,
-                    response.assistant_text.len(),
-                    stream_context,
-                )
-                .await;
+                if let Err(err) = self
+                    .terminalize_queued_turn(
+                        &turn,
+                        queued_terminal_from_response(&response),
+                        stream_context,
+                    )
+                    .await
+                {
+                    warn!(?err, turn_id = %turn.turn_id, "failed to terminalize queued turn after execution");
+                }
             }
             Err(err) => {
                 let code = queued_turn_failure_code(&err);
@@ -10812,12 +11201,7 @@ impl Kernel {
                 .await?;
             }
             "reset" => {
-                let response = self
-                    .session_action(SessionActionRequest {
-                        session_id: session.session_id,
-                        action: SessionActionKind::ResetSession,
-                    })
-                    .await?;
+                let response = self.reset_session(session.session_id).await?;
                 let message = format!("opened a fresh session: {}", response.session_id);
                 self.emit_runtime_event(
                     &stream_context,
@@ -10877,21 +11261,25 @@ impl Kernel {
         action: SessionActionKind,
         stream_context: Option<ChannelStreamContext>,
     ) -> Result<(), KernelError> {
+        let cancellation = TurnCancellation::new();
+        self.register_active_channel_turn_cancellation(turn, cancellation.clone())
+            .await;
         let response = self
             .run_session_action_with_options(
                 turn.session_id,
                 action,
-                SessionActionExecutionOptions::queued_channel(turn, prepared_turn),
+                SessionActionExecutionOptions::queued_channel(turn, prepared_turn, cancellation),
             )
-            .await?;
+            .await;
+        self.unregister_active_turn_cancellation(turn.turn_id).await;
+        let response = response?;
 
-        self.complete_queued_turn(
+        self.terminalize_queued_turn(
             turn,
-            &response.runtime_id,
-            response.assistant_text.len(),
+            queued_terminal_from_response(&response),
             stream_context,
         )
-        .await;
+        .await?;
         Ok(())
     }
 
@@ -10957,43 +11345,19 @@ impl Kernel {
         assistant_text_len: usize,
         stream_context: Option<ChannelStreamContext>,
     ) {
-        if let Err(err) = self.channel_state.complete_turn(turn.turn_id).await {
+        if let Err(err) = self
+            .terminalize_queued_turn(
+                turn,
+                QueuedTurnTerminal::Completed {
+                    runtime_id: runtime_id.to_string(),
+                    assistant_text_len,
+                },
+                stream_context,
+            )
+            .await
+        {
             warn!(?err, turn_id = %turn.turn_id, "failed to mark queued channel turn complete");
         }
-        if let Some(stream_context) = stream_context {
-            if let Err(err) = self
-                .emit_runtime_event(
-                    &Some(stream_context.clone()),
-                    &None,
-                    RuntimeEvent::Status {
-                        code: Some("queue.completed".to_string()),
-                        text: "turn completed".to_string(),
-                    },
-                )
-                .await
-            {
-                warn!(?err, turn_id = %turn.turn_id, "failed to emit queued turn completion status");
-            }
-            if let Err(err) = self
-                .emit_runtime_event(&Some(stream_context), &None, RuntimeEvent::Done)
-                .await
-            {
-                warn!(?err, turn_id = %turn.turn_id, "failed to emit queued turn completion event");
-            }
-        }
-        self.append_audit_event_best_effort(
-            "channel.turn.completed",
-            Some(turn.session_id),
-            "kernel",
-            json!({
-                "turn_id": turn.turn_id,
-                "channel_id": turn.channel_id,
-                "session_key": turn.session_key,
-                "runtime_id": runtime_id,
-                "assistant_text_len": assistant_text_len,
-            }),
-        )
-        .await;
     }
 
     async fn fail_queued_turn(
@@ -11003,25 +11367,58 @@ impl Kernel {
         message: &str,
         stream_context: Option<ChannelStreamContext>,
     ) -> Result<(), KernelError> {
+        self.terminalize_queued_turn(
+            turn,
+            QueuedTurnTerminal::Failed {
+                code: code.to_string(),
+                message: message.to_string(),
+            },
+            stream_context,
+        )
+        .await
+    }
+
+    async fn terminalize_queued_turn(
+        &self,
+        turn: &ChannelTurnRecord,
+        terminal: QueuedTurnTerminal,
+        stream_context: Option<ChannelStreamContext>,
+    ) -> Result<(), KernelError> {
+        let status = terminal.status();
+        let code = terminal.code().map(str::to_string);
+        let message = terminal.message().to_string();
         self.channel_state
-            .fail_turn(turn.turn_id, message)
+            .terminalize_turn(
+                turn.turn_id,
+                ChannelTurnTerminalUpdate {
+                    status,
+                    last_error: (status != ChannelTurnStatus::Completed)
+                        .then_some(message.as_str()),
+                },
+            )
             .await
             .map_err(internal)?;
+
         if let Some(persisted_turn) = self
             .session_turns
             .get(turn.turn_id)
             .await
             .map_err(internal)?
         {
-            if persisted_turn.status == SessionTurnStatus::Running {
+            if matches!(
+                persisted_turn.status,
+                SessionTurnStatus::Running | SessionTurnStatus::WaitingForAttachments
+            ) && status != ChannelTurnStatus::Completed
+            {
+                let session_status = channel_terminal_session_status(status);
                 self.session_turns
                     .complete_turn(
                         turn.turn_id,
                         SessionTurnCompletion {
-                            status: SessionTurnStatus::Failed,
+                            status: session_status,
                             assistant_text: persisted_turn.assistant_text,
-                            error_code: Some(code.to_string()),
-                            error_text: Some(message.to_string()),
+                            error_code: code.clone(),
+                            error_text: Some(message.clone()),
                         },
                     )
                     .await
@@ -11032,35 +11429,56 @@ impl Kernel {
                     .map_err(internal)?;
             }
         }
-        self.audit
-            .append(
-                "channel.turn.failed",
-                Some(turn.session_id),
-                Some("kernel".to_string()),
-                json!({
-                    "turn_id": turn.turn_id,
-                    "channel_id": turn.channel_id,
-                    "session_key": turn.session_key,
-                    "runtime_id": turn.runtime_id,
-                    "error": message,
-                    "code": code,
-                }),
-            )
-            .await
-            .map_err(internal)?;
-        if code == "queue.failed" {
+
+        self.emit_runtime_event(
+            &stream_context,
+            &None,
+            RuntimeEvent::Status {
+                code: Some(status.stream_code().to_string()),
+                text: terminal_status_text(status).to_string(),
+            },
+        )
+        .await?;
+        if matches!(&terminal, QueuedTurnTerminal::Failed { code, .. } if code == "queue.failed") {
             self.emit_runtime_event(
                 &stream_context,
                 &None,
                 RuntimeEvent::Error {
-                    code: Some(code.to_string()),
-                    text: message.to_string(),
+                    code,
+                    text: message.clone(),
                 },
             )
             .await?;
         }
         self.emit_runtime_event(&stream_context, &None, RuntimeEvent::Done)
             .await?;
+
+        let mut details = json!({
+            "turn_id": turn.turn_id,
+            "channel_id": turn.channel_id,
+            "session_key": turn.session_key,
+            "runtime_id": terminal.runtime_id(turn),
+            "status": status.as_str(),
+        });
+        if let Some(code) = terminal.code() {
+            details["code"] = json!(code);
+        }
+        if status != ChannelTurnStatus::Completed {
+            details["reason"] = json!(message);
+        }
+        if let Some(assistant_text_len) = terminal.assistant_text_len() {
+            details["assistant_text_len"] = json!(assistant_text_len);
+        }
+
+        self.audit
+            .append(
+                status.terminal_audit_event(),
+                Some(turn.session_id),
+                Some("kernel".to_string()),
+                details,
+            )
+            .await
+            .map_err(internal)?;
         Ok(())
     }
 
@@ -11298,7 +11716,7 @@ impl Kernel {
             input,
             stream_context,
             event_sink,
-            cancel_rx,
+            cancellation,
         } = execution;
         let idle_timeout_ms = idle_timeout.as_millis() as u64;
         let hard_timeout_ms = hard_timeout.as_millis() as u64;
@@ -11374,7 +11792,7 @@ impl Kernel {
         tokio::pin!(idle_sleep);
         let hard_sleep = sleep(hard_timeout);
         tokio::pin!(hard_sleep);
-        let cancel_signal = wait_for_runtime_cancel(cancel_rx);
+        let cancel_signal = cancellation.cancelled();
         tokio::pin!(cancel_signal);
         let mut events = Vec::new();
         let mut checkpoints = AssistantCheckpointState::default();
@@ -11616,7 +12034,7 @@ impl Kernel {
             input,
             stream_context,
             event_sink,
-            cancel_rx,
+            cancellation,
         } = execution;
         let idle_timeout_ms = idle_timeout.as_millis() as u64;
         let hard_timeout_ms = hard_timeout.as_millis() as u64;
@@ -11671,7 +12089,7 @@ impl Kernel {
         tokio::pin!(idle_sleep);
         let hard_sleep = sleep(hard_timeout);
         tokio::pin!(hard_sleep);
-        let cancel_signal = wait_for_runtime_cancel(cancel_rx);
+        let cancel_signal = cancellation.cancelled();
         tokio::pin!(cancel_signal);
         let mut events = Vec::new();
         let mut checkpoints = AssistantCheckpointState::default();

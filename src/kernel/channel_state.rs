@@ -313,6 +313,9 @@ pub enum ChannelTurnStatus {
     Running,
     Completed,
     Failed,
+    TimedOut,
+    Cancelled,
+    Interrupted,
 }
 
 impl ChannelTurnStatus {
@@ -323,6 +326,31 @@ impl ChannelTurnStatus {
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub fn stream_code(self) -> &'static str {
+        match self {
+            Self::Completed => "queue.completed",
+            Self::Failed => "queue.failed",
+            Self::TimedOut => "queue.timed_out",
+            Self::Cancelled => "queue.cancelled",
+            Self::Interrupted => "queue.interrupted",
+            Self::WaitingForAttachments | Self::Pending | Self::Running => "queue.status",
+        }
+    }
+
+    pub fn terminal_audit_event(self) -> &'static str {
+        match self {
+            Self::Completed => "channel.turn.completed",
+            Self::Failed => "channel.turn.failed",
+            Self::TimedOut => "channel.turn.timed_out",
+            Self::Cancelled => "channel.turn.cancelled",
+            Self::Interrupted => "channel.turn.interrupted",
+            Self::WaitingForAttachments | Self::Pending | Self::Running => "channel.turn.status",
         }
     }
 }
@@ -337,6 +365,9 @@ impl FromStr for ChannelTurnStatus {
             "running" => Ok(Self::Running),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
+            "timed_out" => Ok(Self::TimedOut),
+            "cancelled" => Ok(Self::Cancelled),
+            "interrupted" => Ok(Self::Interrupted),
             other => Err(format!("invalid channel turn status '{other}'")),
         }
     }
@@ -356,6 +387,12 @@ pub struct ChannelTurnRecord {
     pub queued_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChannelTurnTerminalUpdate<'a> {
+    pub status: ChannelTurnStatus,
+    pub last_error: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -1546,6 +1583,32 @@ impl ChannelStateStore {
         row.map(map_turn_row).transpose()
     }
 
+    pub async fn head_open_turn_for_session(
+        &self,
+        session_id: Uuid,
+        channel_id: &str,
+        session_key: &str,
+    ) -> Result<Option<ChannelTurnRecord>> {
+        let row = sqlx::query(
+            "SELECT turn_id, channel_id, session_key, session_id, inbound_event_id, runtime_id, status, last_error, answer_checkpoint_sequence, queued_at_ms, started_at_ms, finished_at_ms \
+             FROM channel_turns \
+             WHERE session_id = ?1 \
+               AND channel_id = ?2 \
+               AND session_key = ?3 \
+               AND status IN ('waiting_for_attachments', 'pending', 'running') \
+             ORDER BY queued_at_ms ASC, turn_id ASC \
+             LIMIT 1",
+        )
+        .bind(session_id.to_string())
+        .bind(channel_id)
+        .bind(session_key)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query active channel turn for session")?;
+
+        row.map(map_turn_row).transpose()
+    }
+
     pub(crate) async fn get_turn_by_inbound_event_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
@@ -1710,51 +1773,45 @@ impl ChannelStateStore {
         }
     }
 
-    pub async fn complete_turn(&self, turn_id: Uuid) -> Result<bool> {
+    pub(crate) async fn terminalize_turn(
+        &self,
+        turn_id: Uuid,
+        terminal: ChannelTurnTerminalUpdate<'_>,
+    ) -> Result<bool> {
         let finished_at_ms = now_ms();
         let changed = sqlx::query(
             "UPDATE channel_turns \
-             SET status = 'completed', finished_at_ms = ?2 \
-             WHERE turn_id = ?1 AND status = 'running'",
-        )
-        .bind(turn_id.to_string())
-        .bind(finished_at_ms)
-        .execute(&self.pool)
-        .await
-        .context("failed to complete channel turn")?;
-
-        Ok(changed.rows_affected() > 0)
-    }
-
-    pub async fn fail_turn(&self, turn_id: Uuid, last_error: &str) -> Result<bool> {
-        let finished_at_ms = now_ms();
-        let changed = sqlx::query(
-            "UPDATE channel_turns \
-             SET status = 'failed', last_error = ?2, finished_at_ms = ?3 \
+             SET status = ?2, last_error = ?3, finished_at_ms = ?4 \
              WHERE turn_id = ?1 AND status IN ('waiting_for_attachments', 'pending', 'running')",
         )
         .bind(turn_id.to_string())
-        .bind(last_error)
+        .bind(terminal.status.as_str())
+        .bind(terminal.last_error)
         .bind(finished_at_ms)
         .execute(&self.pool)
         .await
-        .context("failed to fail channel turn")?;
+        .with_context(|| {
+            format!(
+                "failed to terminalize channel turn as {}",
+                terminal.status.as_str()
+            )
+        })?;
 
         Ok(changed.rows_affected() > 0)
     }
 
-    pub async fn fail_running_turns(&self, last_error: &str) -> Result<u64> {
+    pub async fn interrupt_running_turns(&self, last_error: &str) -> Result<u64> {
         let finished_at_ms = now_ms();
         let changed = sqlx::query(
             "UPDATE channel_turns \
-             SET status = 'failed', last_error = ?1, finished_at_ms = ?2 \
+             SET status = 'interrupted', last_error = ?1, finished_at_ms = ?2 \
              WHERE status = 'running'",
         )
         .bind(last_error)
         .bind(finished_at_ms)
         .execute(&self.pool)
         .await
-        .context("failed to fail stale running channel turns")?;
+        .context("failed to interrupt stale running channel turns")?;
 
         Ok(changed.rows_affected())
     }

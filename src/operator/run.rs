@@ -260,9 +260,8 @@ async fn handle_lionclaw_repl_control<W: Write + Send>(
         }
         "reset" => {
             let response = kernel
-                .session_action(SessionActionRequest {
+                .session_action(SessionActionRequest::ResetSession {
                     session_id: *session_id,
-                    action: SessionActionKind::ResetSession,
                 })
                 .await
                 .map_err(kernel_to_anyhow)?;
@@ -629,7 +628,10 @@ mod tests {
     };
     use crate::{
         config::resolve_project_workspace_root,
-        contracts::{SessionTurnResponse, StreamEventDto, StreamEventKindDto, StreamLaneDto},
+        contracts::{
+            SessionTurnResponse, SessionTurnStatus, StreamEventDto, StreamEventKindDto,
+            StreamLaneDto,
+        },
         home::{runtime_project_partition_key, LionClawHome},
         kernel::{
             db::Db,
@@ -651,7 +653,10 @@ mod tests {
             Ok(SessionTurnResponse {
                 session_id,
                 turn_id,
+                status: SessionTurnStatus::Completed,
                 assistant_text: String::new(),
+                error_code: None,
+                error_text: None,
                 runtime_skill_ids: Vec::new(),
                 runtime_id: "mock".to_string(),
                 stream_events: Vec::new(),

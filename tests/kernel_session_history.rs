@@ -73,7 +73,7 @@ async fn interactive_history_carries_partial_reply_forward() {
     )
     .await;
 
-    let err = kernel
+    let timeout = kernel
         .turn_session(SessionTurnRequest {
             session_id: session.session_id,
             user_text: "tell me something long".to_string(),
@@ -83,8 +83,8 @@ async fn interactive_history_carries_partial_reply_forward() {
             runtime_env_passthrough: None,
         })
         .await
-        .expect_err("turn should time out");
-    assert!(matches!(err, KernelError::RuntimeTimeout(_)));
+        .expect("turn should resolve as timed out");
+    assert_eq!(timeout.status, SessionTurnStatus::TimedOut);
 
     let history = kernel
         .session_history(SessionHistoryRequest {
@@ -158,7 +158,7 @@ async fn conservative_history_uses_failure_note_without_partial_text() {
     )
     .await;
 
-    let _ = kernel
+    let timeout = kernel
         .turn_session(SessionTurnRequest {
             session_id: session.session_id,
             user_text: "hidden partial".to_string(),
@@ -168,7 +168,8 @@ async fn conservative_history_uses_failure_note_without_partial_text() {
             runtime_env_passthrough: None,
         })
         .await
-        .expect_err("turn should time out");
+        .expect("turn should resolve as timed out");
+    assert_eq!(timeout.status, SessionTurnStatus::TimedOut);
 
     let _ = kernel
         .turn_session(SessionTurnRequest {
@@ -266,7 +267,7 @@ async fn continue_and_retry_actions_create_durable_turns() {
 
     let session = open_session(&kernel, "action-peer", SessionHistoryPolicy::Interactive).await;
 
-    let _ = kernel
+    let timeout = kernel
         .turn_session(SessionTurnRequest {
             session_id: session.session_id,
             user_text: "original prompt".to_string(),
@@ -276,7 +277,8 @@ async fn continue_and_retry_actions_create_durable_turns() {
             runtime_env_passthrough: None,
         })
         .await
-        .expect_err("turn should time out");
+        .expect("turn should resolve as timed out");
+    assert_eq!(timeout.status, SessionTurnStatus::TimedOut);
 
     let continue_turn = kernel
         .run_session_action(
@@ -733,7 +735,7 @@ async fn continue_requires_interactive_history_policy() {
     )
     .await;
 
-    let _ = kernel
+    let timeout = kernel
         .turn_session(SessionTurnRequest {
             session_id: session.session_id,
             user_text: "original prompt".to_string(),
@@ -743,7 +745,8 @@ async fn continue_requires_interactive_history_policy() {
             runtime_env_passthrough: None,
         })
         .await
-        .expect_err("turn should time out");
+        .expect("turn should resolve as timed out");
+    assert_eq!(timeout.status, SessionTurnStatus::TimedOut);
 
     let err = kernel
         .run_session_action(
@@ -1069,9 +1072,8 @@ async fn latest_session_snapshot_prefers_reset_session_without_turns() {
         .expect("seed completed turn");
 
     let reset = kernel
-        .session_action(lionclaw::contracts::SessionActionRequest {
+        .session_action(lionclaw::contracts::SessionActionRequest::ResetSession {
             session_id: session.session_id,
-            action: SessionActionKind::ResetSession,
         })
         .await
         .expect("reset session");

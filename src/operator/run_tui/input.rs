@@ -146,10 +146,11 @@ fn handle_global_command(app: &mut ConsoleApp, command: GlobalCommand) {
         }
         GlobalCommand::InterruptOrConfirmExit => {
             if app.active() {
-                if let Some(cancel_tx) = app.active_turn_cancel.take() {
-                    match cancel_tx.send("turn interrupted from operator console".to_string()) {
-                        Ok(()) => app.status = "interrupt requested".to_string(),
-                        Err(_) => app.status = "interrupt already completed".to_string(),
+                if let Some(cancellation) = app.active_turn_cancel.take() {
+                    if cancellation.request("turn interrupted from operator console") {
+                        app.status = "stopping turn".to_string();
+                    } else {
+                        app.status = "interrupt already requested".to_string();
                     }
                 } else {
                     app.status = "interrupt already requested".to_string();

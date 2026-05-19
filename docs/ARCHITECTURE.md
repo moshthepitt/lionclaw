@@ -138,8 +138,8 @@ For `lionclaw run <runtime>`, channel turns, or scheduled jobs:
 7. The adapter maps runtime output into typed stream events. Codex uses its
    native `app-server` JSON-RPC protocol over stdio inside the confined
    process; OpenCode uses its configured machine-readable run output.
-8. The kernel persists canonical answer text, turn status, checkpoints, audit,
-   and any continuity changes it owns.
+8. The kernel persists canonical answer text, terminal turn status, checkpoints,
+   audit, and any continuity changes it owns.
 
 Program-backed runtimes stream two message lanes:
 
@@ -159,7 +159,8 @@ conversation structure may use it as a paragraph/message-item break. Literal
 Channel streams also emit a kernel-owned `turn_completed` event after the turn
 record is finalized. Its `text` field is the canonical persisted assistant
 reply and lets channel UIs reconcile live deltas against durable turn state
-before the terminal `done` marker.
+before the terminal `done` marker. Failed, timed-out, cancelled, and interrupted
+turns publish typed status/error events followed by exactly one `done`.
 
 Configured OpenCode profiles are pinned to machine-readable JSON output so
 LionClaw receives typed events instead of a degraded plain-text stream. Codex
@@ -369,8 +370,11 @@ External channel skills integrate over HTTP:
    rows. Descriptors rejected at admission by known size policy are recorded in
    the manifest immediately; if no stageable attachments remain, the turn queues
    without waiting for a worker finalize call.
-4. `POST /v0/sessions/action` starts `continue_last_partial`,
-   `retry_last_turn`, or `reset_session` for a channel-backed session.
+4. `POST /v0/sessions/action` accepts tagged actions:
+   `continue_last_partial`, `retry_last_turn`, `reset_session`, and
+   `cancel_active_turn`. Channel cancellation is scoped by `session_id`,
+   `channel_id`, and `session_key`, and may include `expected_turn_id` as a stale
+   guard.
 5. `POST /v0/channels/stream/pull` fetches typed progress events for a
    consumer cursor. Stream acknowledgment means the worker handled progress
    events; it does not imply provider message delivery.
@@ -447,10 +451,15 @@ stream contract. Kernel-generated lifecycle codes include:
 - `queue.started`
 - `queue.completed`
 - `queue.failed`
+- `queue.timed_out`
+- `queue.cancelled`
+- `queue.interrupted`
 - `runtime.started`
 - `runtime.completed`
 - `runtime.error`
 - `runtime.timeout`
+- `runtime.cancelled`
+- `runtime.interrupted`
 
 Stream events produced by actual runtime turns include `session_id` and
 `turn_id`. The stream `peer_id` remains a provider-facing conversation hint for
@@ -512,6 +521,13 @@ not part of the inbound channel contract; the kernel resolves runtime execution
 from the instance/default runtime configuration.
 Session-key components escape `:` and `%` so provider refs such as
 `telegram:chat:-123` remain unambiguous.
+Channel turn state is terminalized independently from the session turn state so
+queue workers can distinguish `completed`, `failed`, `timed_out`, `cancelled`,
+and `interrupted` without parsing runtime text. Cancelling a waiting or pending
+channel turn finalizes it in the queue immediately. Cancelling a running channel
+turn signals the in-memory runtime cancellation token, calls the adapter's
+`cancel()` hook, persists `runtime.cancelled`, then advances the queue through
+the same terminalization path.
 Proactive pairing invites reuse `channel_pairing_requests` with
 `claim_policy = token_claim`; raw invite tokens are never stored, claim counts
 advance inside the same transaction that creates the scoped grant, and expired
