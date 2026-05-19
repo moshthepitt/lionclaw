@@ -736,6 +736,8 @@ class LionClawApiTests(unittest.IsolatedAsyncioTestCase):
                             "conversation_ref": "telegram:chat:-1001",
                             "thread_ref": "telegram:topic:77",
                             "reply_to_ref": "telegram:message:55",
+                            "session_id": "session-1",
+                            "turn_id": "turn-1",
                             "content": {
                                 "text": "hello",
                                 "format_hint": "markdown",
@@ -774,6 +776,8 @@ class LionClawApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deliveries[0].conversation_ref, "telegram:chat:-1001")
         self.assertEqual(deliveries[0].thread_ref, "telegram:topic:77")
         self.assertEqual(deliveries[0].reply_to_ref, "telegram:message:55")
+        self.assertEqual(deliveries[0].session_id, "session-1")
+        self.assertEqual(deliveries[0].turn_id, "turn-1")
         self.assertEqual(deliveries[0].content.attachments[0].path, "/tmp/a.txt")
         await api.close()
 
@@ -1903,6 +1907,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                     delivery_id="delivery-1",
                     attempt_id="attempt-1",
                     conversation_ref="telegram:chat:77",
+                    turn_id="turn-1",
                     content=OutboxContent(text="final answer"),
                 )
             )
@@ -1937,6 +1942,116 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             telegram.deleted_messages,
             [("telegram:chat:77", "telegram:message:101")],
         )
+
+    async def test_unscoped_outbox_delivery_does_not_delete_active_progress(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            await worker._remember_active_turn(
+                TelegramInboundUpdate(
+                    update_id=971,
+                    event_id="telegram:update:971",
+                    sender_ref="telegram:user:77",
+                    conversation_ref="telegram:chat:77",
+                    message_ref="telegram:message:71",
+                    text="slow",
+                    trigger="dm",
+                    provider_metadata={"chat_type": "private"},
+                ),
+                InboundResponse(
+                    outcome="queued",
+                    turn_id="turn-1",
+                    session_id="session-1",
+                    session_key="channel:telegram:direct:77",
+                ),
+            )
+            worker._active_turns["turn-1"].visible_after = 0.0
+            await worker.refresh_progress_messages()
+
+            await worker._process_outbox_delivery(
+                OutboxDelivery(
+                    delivery_id="delivery-unscoped",
+                    attempt_id="attempt-unscoped",
+                    conversation_ref="telegram:chat:77",
+                    content=OutboxContent(text="scheduled summary"),
+                )
+            )
+
+        self.assertEqual(telegram.deleted_messages, [])
+        self.assertIn("turn-1", worker._active_turns)
+        self.assertEqual(telegram.sent_messages[-1][1], "scheduled summary")
+
+    async def test_old_outbox_delivery_does_not_delete_new_active_progress(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            update = TelegramInboundUpdate(
+                update_id=972,
+                event_id="telegram:update:972",
+                sender_ref="telegram:user:77",
+                conversation_ref="telegram:chat:77",
+                message_ref="telegram:message:72",
+                text="slow",
+                trigger="dm",
+                provider_metadata={"chat_type": "private"},
+            )
+            await worker._remember_active_turn(
+                update,
+                InboundResponse(
+                    outcome="queued",
+                    turn_id="turn-1",
+                    session_id="session-1",
+                    session_key="channel:telegram:direct:77",
+                ),
+            )
+            await worker._remember_active_turn(
+                replace(
+                    update,
+                    update_id=973,
+                    event_id="telegram:update:973",
+                    message_ref="telegram:message:73",
+                    text="new slow",
+                ),
+                InboundResponse(
+                    outcome="queued",
+                    turn_id="turn-2",
+                    session_id="session-1",
+                    session_key="channel:telegram:direct:77",
+                ),
+            )
+            worker._active_turns["turn-2"].visible_after = 0.0
+            await worker.refresh_progress_messages()
+
+            await worker._process_outbox_delivery(
+                OutboxDelivery(
+                    delivery_id="delivery-old",
+                    attempt_id="attempt-old",
+                    conversation_ref="telegram:chat:77",
+                    turn_id="turn-1",
+                    content=OutboxContent(text="old final answer"),
+                )
+            )
+
+        self.assertEqual(telegram.deleted_messages, [])
+        self.assertNotIn("turn-1", worker._active_turns)
+        self.assertIn("turn-2", worker._active_turns)
+        self.assertEqual(telegram.sent_messages[-1][1], "old final answer")
 
     async def test_new_turn_supersedes_and_deletes_old_progress_message(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

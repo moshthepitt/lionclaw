@@ -108,6 +108,8 @@ class OutboxDelivery:
     content: OutboxContent
     thread_ref: str | None = None
     reply_to_ref: str | None = None
+    session_id: str | None = None
+    turn_id: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -393,6 +395,8 @@ class LionClawApi:
                     conversation_ref=item["conversation_ref"],
                     thread_ref=item.get("thread_ref"),
                     reply_to_ref=item.get("reply_to_ref"),
+                    session_id=item.get("session_id"),
+                    turn_id=item.get("turn_id"),
                     content=OutboxContent(
                         text=content["text"],
                         format_hint=content.get("format_hint") or "plain",

@@ -1023,11 +1023,16 @@ class TelegramWorker:
         )
 
     async def _complete_progress_for_delivery(self, delivery: OutboxDelivery) -> None:
-        turn = self._active_turn_for_route(
-            delivery.conversation_ref,
-            delivery.thread_ref,
-        )
+        if delivery.turn_id is None:
+            return
+        turn = self._active_turns.get(delivery.turn_id)
         if turn is None:
+            return
+        if turn.target.key != (delivery.conversation_ref, delivery.thread_ref):
+            logger.warning(
+                "outbox delivery route did not match active turn for turn_id=%s",
+                delivery.turn_id,
+            )
             return
         if turn.provisional_message_ref is not None:
             await self._delete_progress_message(turn)
