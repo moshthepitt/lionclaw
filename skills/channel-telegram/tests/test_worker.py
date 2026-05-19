@@ -605,6 +605,47 @@ class ExtractInboundEventTests(unittest.TestCase):
                 self.assertEqual(mapped.attachments[0].mime_type, mime_type)
                 self.assertEqual(mapped.attachments[0].provider_file_ref, file_ref)
 
+    def test_photo_descriptor_prefers_largest_dimensions_over_optional_file_size(
+        self,
+    ) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 301,
+                "message": {
+                    "message_id": 301,
+                    "date": 0,
+                    "chat": {"id": 42, "type": "private"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Alice"},
+                    "photo": [
+                        {
+                            "file_id": "photo-small",
+                            "file_unique_id": "photo-small-unique",
+                            "width": 64,
+                            "height": 64,
+                            "file_size": 999999,
+                        },
+                        {
+                            "file_id": "photo-large",
+                            "file_unique_id": "photo-large-unique",
+                            "width": 1280,
+                            "height": 720,
+                        },
+                    ],
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(len(mapped.attachments), 1)
+        self.assertEqual(mapped.attachments[0].provider_file_ref, "photo-large")
+        self.assertEqual(
+            mapped.attachments[0].attachment_id,
+            "telegram:update:301:attachment:photo:photo-large-unique",
+        )
+
     def test_bot_sender_is_ignored(self) -> None:
         update = Update.model_validate(
             {

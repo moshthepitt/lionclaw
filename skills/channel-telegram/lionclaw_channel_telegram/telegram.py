@@ -16,6 +16,7 @@ from aiogram.types import (
     LinkPreviewOptions,
     Message,
     MessageEntity,
+    PhotoSize,
     ReplyParameters,
     Update,
 )
@@ -815,7 +816,7 @@ def _attachments(message: Message, update_id: int) -> list[TelegramInboundAttach
     caption = message.caption
     descriptors: list[TelegramInboundAttachment] = []
     if message.photo:
-        photo = max(message.photo, key=lambda item: item.file_size or 0)
+        photo = max(message.photo, key=_photo_rank)
         descriptors.append(
             _attachment(
                 update_id,
@@ -926,6 +927,10 @@ def _attachments(message: Message, update_id: int) -> list[TelegramInboundAttach
             )
         )
     return descriptors
+
+
+def _photo_rank(photo: PhotoSize) -> tuple[int, int]:
+    return (photo.width * photo.height, photo.file_size or 0)
 
 
 def _attachment(
