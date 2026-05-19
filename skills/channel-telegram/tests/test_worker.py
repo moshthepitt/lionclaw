@@ -2053,6 +2053,53 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("turn-2", worker._active_turns)
         self.assertEqual(telegram.sent_messages[-1][1], "old final answer")
 
+    async def test_duplicate_turn_refresh_preserves_progress_message_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            update = TelegramInboundUpdate(
+                update_id=974,
+                event_id="telegram:update:974",
+                sender_ref="telegram:user:77",
+                conversation_ref="telegram:chat:77",
+                message_ref="telegram:message:74",
+                text="slow",
+                trigger="dm",
+                provider_metadata={"chat_type": "private"},
+            )
+            initial = InboundResponse(
+                outcome="queued",
+                turn_id="turn-1",
+                session_id=None,
+                session_key=None,
+            )
+            await worker._remember_active_turn(update, initial)
+            worker._active_turns["turn-1"].visible_after = 0.0
+            await worker.refresh_progress_messages()
+
+            await worker._remember_active_turn(
+                replace(update, update_id=975, event_id="telegram:update:975"),
+                InboundResponse(
+                    outcome="queued",
+                    turn_id="turn-1",
+                    session_id="session-1",
+                    session_key="channel:telegram:direct:77",
+                ),
+            )
+            await worker.refresh_progress_messages()
+
+        active = worker._active_turns["turn-1"]
+        self.assertEqual(len(telegram.sent_messages), 1)
+        self.assertEqual(active.provisional_message_ref, "telegram:message:101")
+        self.assertEqual(active.session_id, "session-1")
+        self.assertEqual(active.session_key, "channel:telegram:direct:77")
+
     async def test_new_turn_supersedes_and_deletes_old_progress_message(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()

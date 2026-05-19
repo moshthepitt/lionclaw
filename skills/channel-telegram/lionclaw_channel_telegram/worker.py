@@ -531,6 +531,14 @@ class TelegramWorker:
             return
         target = TypingTarget(update.conversation_ref, update.thread_ref)
         previous_turn_id = self._route_turns.get(target.key)
+        if previous_turn_id == response.turn_id:
+            existing = self._active_turns.get(response.turn_id)
+            if existing is not None and not existing.terminal:
+                if existing.session_id is None:
+                    existing.session_id = response.session_id
+                if existing.session_key is None:
+                    existing.session_key = response.session_key
+                return
         if previous_turn_id is not None and previous_turn_id != response.turn_id:
             previous = self._active_turns.get(previous_turn_id)
             if previous is not None:
