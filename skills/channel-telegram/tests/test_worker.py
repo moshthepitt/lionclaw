@@ -3688,6 +3688,18 @@ class TelegramDeliveryHelperTests(unittest.TestCase):
         self.assertEqual(_split_telegram_text((" " * 4001) + "answer"), ["answer"])
         self.assertEqual(_split_telegram_text(" " * 4001), [])
 
+    def test_long_answer_split_preserves_meaningful_whitespace(self) -> None:
+        text = ("x" * (TELEGRAM_TEXT_LIMIT - 5)) + "\n    indented result"
+
+        chunks = _split_telegram_text(text)
+
+        self.assertEqual("".join(chunks), text)
+        self.assertEqual(len(chunks), 2)
+        self.assertTrue(chunks[1].startswith("    indented"))
+        self.assertTrue(
+            all(_utf16_len(chunk) <= TELEGRAM_TEXT_LIMIT for chunk in chunks)
+        )
+
     def test_topic_thread_ref_omits_general_topic_on_send(self) -> None:
         self.assertEqual(_coerce_thread_id("telegram:topic:77", omit_general=True), 77)
         self.assertIsNone(_coerce_thread_id("telegram:topic:1", omit_general=True))

@@ -1206,17 +1206,19 @@ def _render_telegram_link(label: str, href: str) -> str:
 
 
 def _split_telegram_text(text: str) -> list[str]:
-    if not text:
+    if not text or not text.strip():
         return []
     chunks: list[str] = []
     remaining = text
     while _utf16_len(remaining) > TELEGRAM_TEXT_LIMIT:
         cut = _find_text_cut(remaining, TELEGRAM_TEXT_LIMIT)
-        chunk = remaining[:cut].rstrip()
-        if chunk:
+        chunk = remaining[:cut]
+        if chunk.strip():
             chunks.append(chunk)
-        remaining = remaining[cut:].lstrip()
-    if remaining:
+            remaining = remaining[cut:]
+        else:
+            remaining = remaining[cut:].lstrip()
+    if remaining.strip():
         chunks.append(remaining)
     return chunks
 
@@ -1224,13 +1226,19 @@ def _split_telegram_text(text: str) -> list[str]:
 def _find_text_cut(text: str, max_utf16_units: int) -> int:
     units = 0
     last_boundary = 0
+    line_has_content = False
     for index, char in enumerate(text):
         char_units = _utf16_len(char)
         if units + char_units > max_utf16_units:
             return last_boundary if last_boundary > 0 else index
         units += char_units
-        if char.isspace():
+        if char in "\r\n":
             last_boundary = index + 1
+            line_has_content = False
+        elif char.isspace() and line_has_content:
+            last_boundary = index + 1
+        elif not char.isspace():
+            line_has_content = True
     return len(text)
 
 
