@@ -1018,7 +1018,9 @@ def _split_telegram_text(text: str) -> list[str]:
     remaining = text
     while _utf16_len(remaining) > TELEGRAM_TEXT_LIMIT:
         cut = _find_text_cut(remaining, TELEGRAM_TEXT_LIMIT)
-        chunks.append(remaining[:cut].rstrip())
+        chunk = remaining[:cut].rstrip()
+        if chunk:
+            chunks.append(chunk)
         remaining = remaining[cut:].lstrip()
     if remaining:
         chunks.append(remaining)

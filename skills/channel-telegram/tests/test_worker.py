@@ -980,6 +980,56 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(offset_path.exists())
             self.assertEqual([update.text for update in api.sent_inbound], ["first"])
 
+    async def test_malformed_update_is_quarantined_and_offset_advances(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    MalformedTelegramUpdate(update_id=7),
+                    Update.model_validate(
+                        {
+                            "update_id": 8,
+                            "message": {
+                                "message_id": 2,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "after malformed",
+                            },
+                        }
+                    ),
+                ]
+            )
+            offset_path = Path(temp_dir) / "telegram.offset"
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(offset_path),
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker.process_updates()
+
+            self.assertEqual(worker.offset, 9)
+            self.assertEqual(offset_path.read_text(encoding="utf-8"), "9")
+            self.assertEqual(
+                [update.text for update in api.sent_inbound],
+                ["after malformed"],
+            )
+
+            await worker.report_health()
+
+            self.assertEqual(api.health_reports[0][0], "warning")
+            checks_by_code = {check.code: check for check in api.health_reports[0][1]}
+            update_extraction = checks_by_code["telegram.update_extraction"]
+            self.assertEqual(update_extraction.status, "warning")
+            self.assertEqual(update_extraction.details["malformed_updates"], 1)
+
     async def test_waiting_for_attachments_downloads_stages_and_finalizes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi(inbound_outcome="waiting_for_attachments")
@@ -2462,6 +2512,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 "telegram.bot_identity",
                 "telegram.polling",
                 "telegram.update_lag",
+                "telegram.update_extraction",
                 "telegram.delivery_errors",
             ],
         )
@@ -2614,6 +2665,10 @@ class TelegramDeliveryHelperTests(unittest.TestCase):
         self.assertEqual(chunks[0], "x" * 4000)
         self.assertEqual(chunks[1], "x")
         self.assertTrue(all(_utf16_len(chunk) <= 4000 for chunk in chunks))
+
+    def test_long_whitespace_does_not_create_empty_telegram_chunks(self) -> None:
+        self.assertEqual(_split_telegram_text((" " * 4001) + "answer"), ["answer"])
+        self.assertEqual(_split_telegram_text(" " * 4001), [])
 
     def test_topic_thread_ref_omits_general_topic_on_send(self) -> None:
         self.assertEqual(_coerce_thread_id("telegram:topic:77", omit_general=True), 77)
@@ -2872,6 +2927,15 @@ class FakeLionClawApi:
 class FailingOffsetStore(OffsetStore):
     def save(self, offset: int) -> None:
         raise RuntimeError(f"cannot persist offset {offset}")
+
+
+class MalformedTelegramUpdate:
+    def __init__(self, update_id: int) -> None:
+        self.update_id = update_id
+
+    @property
+    def message(self):
+        raise RuntimeError("malformed telegram update")
 
 
 class FakeTelegramTransport:

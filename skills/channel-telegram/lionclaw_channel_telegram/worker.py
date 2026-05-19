@@ -15,6 +15,7 @@ from aiogram.exceptions import (
     TelegramServerError,
     TelegramUnauthorizedError,
 )
+from aiogram.types import Update
 
 from lionclaw_channel_telegram.api import (
     AttachmentMissingReport,
@@ -27,7 +28,9 @@ from lionclaw_channel_telegram.api import (
 from lionclaw_channel_telegram.config import WorkerConfig
 from lionclaw_channel_telegram.telegram import (
     AiogramTelegramTransport,
+    TelegramBotIdentity,
     TelegramEntityTooLargeForStage,
+    TelegramInboundEvent,
     TelegramInboundUpdate,
     TelegramOutboundAttachment,
     TelegramPairingClaim,
@@ -163,6 +166,7 @@ class TelegramWorker:
         self._last_poll_update_count: int | None = None
         self._last_update_id: int | None = None
         self._last_update_observed_at: float | None = None
+        self._update_extraction_failure_count = 0
         self._delivery_failure_counts: dict[str, int] = {}
 
     async def process_updates(self) -> None:
@@ -185,25 +189,41 @@ class TelegramWorker:
             return
 
         for update in updates:
-            event = extract_inbound_event(update, bot_identity=bot_identity)
+            update_id = update.update_id
+            event = self._extract_provider_event(update, bot_identity)
             if event is not None:
                 if isinstance(event, TelegramPairingClaim):
                     if not await self._claim_pairing(event):
                         return
                 elif not await self._submit_inbound(event):
                     return
-            self._last_update_id = update.update_id
+            self._last_update_id = update_id
             self._last_update_observed_at = _loop_time()
-            next_offset = update.update_id + 1
+            next_offset = update_id + 1
             try:
                 self.offset_store.save(next_offset)
             except Exception:
                 logger.exception(
                     "telegram offset save failed for update_id=%s",
-                    update.update_id,
+                    update_id,
                 )
                 return
             self.offset = next_offset
+
+    def _extract_provider_event(
+        self,
+        update: Update,
+        bot_identity: TelegramBotIdentity,
+    ) -> TelegramInboundEvent | None:
+        try:
+            return extract_inbound_event(update, bot_identity=bot_identity)
+        except Exception:
+            self._update_extraction_failure_count += 1
+            logger.exception(
+                "telegram update extraction failed for update_id=%s",
+                update.update_id,
+            )
+            return None
 
     async def flush_stream(self) -> None:
         try:
@@ -1105,6 +1125,7 @@ class TelegramWorker:
         checks = [await self._bot_identity_health_check()]
         checks.append(self._polling_health_check())
         checks.append(self._update_lag_health_check())
+        checks.append(self._update_extraction_health_check())
         checks.append(self._delivery_errors_health_check())
         return checks
 
@@ -1222,6 +1243,21 @@ class TelegramWorker:
             status="ok",
             message=f"last update observed {age_seconds}s ago",
             details=details,
+        )
+
+    def _update_extraction_health_check(self) -> HealthCheck:
+        failures = self._update_extraction_failure_count
+        status = "warning" if failures else "ok"
+        message = (
+            f"{failures} malformed update(s) quarantined in this worker process"
+            if failures
+            else "no malformed updates observed in this worker process"
+        )
+        return HealthCheck(
+            code="telegram.update_extraction",
+            status=status,
+            message=message,
+            details={"malformed_updates": failures},
         )
 
     def _delivery_errors_health_check(self) -> HealthCheck:
