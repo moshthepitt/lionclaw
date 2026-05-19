@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::kernel::runtime::{
     spawn_interactive, ExecutionOutput, ExecutionRequest, ExecutionSession, NetworkMode,
-    RuntimeAdapter, RuntimeAdapterInfo, RuntimeAuthKind, RuntimeCapabilityResult,
+    RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact, RuntimeAuthKind, RuntimeCapabilityResult,
     RuntimeControlExecution, RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender,
     RuntimeMessageLane, RuntimeProgramSpec, RuntimeProgramTurnExecution, RuntimeSessionHandle,
     RuntimeSessionStartInput, RuntimeTurnMode, RuntimeTurnResult,
@@ -580,8 +580,13 @@ struct CodexAppServerClient<T> {
     failed_turns: HashMap<String, String>,
     unmatched_turn_failure: Option<String>,
     started_thread_turns: HashMap<String, String>,
+    agent_message_lanes: HashMap<String, RuntimeMessageLane>,
+    active_agent_message_item_id: Option<String>,
+    active_answer_item_ids: HashSet<String>,
+    last_answer_item_id: Option<String>,
     completed_context_compaction_threads: HashSet<String>,
     unmatched_context_compaction_completed: bool,
+    emitted_artifact_ids: HashSet<String>,
 }
 
 impl<T> CodexAppServerClient<T>
@@ -598,8 +603,13 @@ where
             failed_turns: HashMap::new(),
             unmatched_turn_failure: None,
             started_thread_turns: HashMap::new(),
+            agent_message_lanes: HashMap::new(),
+            active_agent_message_item_id: None,
+            active_answer_item_ids: HashSet::new(),
+            last_answer_item_id: None,
             completed_context_compaction_threads: HashSet::new(),
             unmatched_context_compaction_completed: false,
+            emitted_artifact_ids: HashSet::new(),
         }
     }
 
@@ -955,9 +965,19 @@ where
         }
 
         let Some(method) = message.get("method").and_then(Value::as_str) else {
+            if let Some(artifact) =
+                self.generated_artifact_for_message(None, &message, thread_state)?
+            {
+                drop(events.send(RuntimeEvent::Artifact { artifact }));
+            }
             return Ok(());
         };
         let params = message.get("params").unwrap_or(&Value::Null);
+        if let Some(artifact) =
+            self.generated_artifact_for_message(Some(method), params, thread_state)?
+        {
+            drop(events.send(RuntimeEvent::Artifact { artifact }));
+        }
         match method {
             "thread/started" => {
                 if let Some(thread_id) = extract_app_server_thread_id(params) {
@@ -975,6 +995,7 @@ where
                 }));
             }
             "turn/started" => {
+                self.reset_turn_message_state();
                 if let (Some(thread_id), Some(turn_id)) = (
                     extract_app_server_thread_id(params),
                     extract_app_server_turn_id(params),
@@ -987,6 +1008,7 @@ where
                 }));
             }
             "turn/completed" => {
+                self.reset_turn_message_state();
                 if let Some(message) = completed_turn_error_text(params) {
                     self.remember_turn_failure(params, message);
                 } else {
@@ -1007,10 +1029,11 @@ where
             }
             "item/agentMessage/delta" => {
                 if let Some(text) = app_server_text(params, &["delta", "text", "content"]) {
-                    drop(events.send(RuntimeEvent::MessageDelta {
-                        lane: RuntimeMessageLane::Answer,
-                        text,
-                    }));
+                    let lane = self.agent_message_lane(params);
+                    if lane == RuntimeMessageLane::Answer {
+                        self.record_answer_delta_boundary(params, events);
+                    }
+                    drop(events.send(RuntimeEvent::MessageDelta { lane, text }));
                 }
             }
             "item/agentReasoning/delta" | "item/agentReasoningRawContent/delta" => {
@@ -1046,7 +1069,59 @@ where
         Ok(())
     }
 
+    fn generated_artifact_for_message(
+        &mut self,
+        method: Option<&str>,
+        message: &Value,
+        thread_state: &CodexThreadState,
+    ) -> Result<Option<RuntimeArtifact>> {
+        let Some(payload) = codex_generated_image_payload(method, message) else {
+            return Ok(None);
+        };
+
+        let Some(call_id) = codex_generated_image_call_id(payload) else {
+            return Ok(None);
+        };
+        let thread_id = extract_app_server_thread_id(payload)
+            .or_else(|| extract_app_server_thread_id(message))
+            .or_else(|| thread_state.current_thread_id().ok().flatten());
+        let Some(thread_id) = thread_id else {
+            return Ok(None);
+        };
+        let Some(runtime_state_root) = thread_state.runtime_state_root()? else {
+            return Ok(None);
+        };
+
+        let artifact_id = format!("codex:image:{thread_id}:{call_id}");
+        if !self.emitted_artifact_ids.insert(artifact_id.clone()) {
+            return Ok(None);
+        }
+        let filename = format!("{call_id}.png");
+        let path = codex_generated_image_path(payload, &runtime_state_root).unwrap_or_else(|| {
+            runtime_state_root
+                .join("home")
+                .join(".codex")
+                .join("generated_images")
+                .join(&thread_id)
+                .join(&filename)
+        });
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+            .unwrap_or(filename);
+
+        Ok(Some(RuntimeArtifact {
+            artifact_id,
+            path,
+            filename: Some(filename),
+            mime_type: Some("image/png".to_string()),
+        }))
+    }
+
     fn record_app_server_item(&mut self, method: &str, params: &Value) -> Option<String> {
+        self.record_agent_message_item(method, params);
+        self.record_answer_item_completion(method, params);
         match (method, app_server_item_type(params)) {
             ("item/started", Some("contextCompaction")) => {
                 Some("codex context compaction started".to_string())
@@ -1062,6 +1137,87 @@ where
             (_, Some(_)) => describe_app_server_item(params),
             (_, None) => None,
         }
+    }
+
+    fn record_answer_delta_boundary(&mut self, params: &Value, events: &RuntimeEventSender) {
+        let Some(item_id) = self.agent_message_item_id(params) else {
+            return;
+        };
+        self.begin_answer_item(item_id, events);
+    }
+
+    fn record_answer_item_completion(&mut self, method: &str, params: &Value) {
+        if method != "item/completed" || app_server_item_type(params) != Some("agentMessage") {
+            return;
+        }
+        let Some(item_id) = extract_app_server_item_id(params) else {
+            return;
+        };
+        if self
+            .agent_message_lanes
+            .get(&item_id)
+            .copied()
+            .unwrap_or(RuntimeMessageLane::Answer)
+            == RuntimeMessageLane::Answer
+        {
+            self.active_answer_item_ids.remove(&item_id);
+        }
+        self.agent_message_lanes.remove(&item_id);
+    }
+
+    fn begin_answer_item(&mut self, item_id: String, events: &RuntimeEventSender) {
+        if self.active_answer_item_ids.insert(item_id.clone())
+            && self
+                .last_answer_item_id
+                .as_deref()
+                .is_some_and(|last_item_id| last_item_id != item_id)
+        {
+            drop(events.send(RuntimeEvent::MessageBoundary {
+                lane: RuntimeMessageLane::Answer,
+            }));
+        }
+        self.last_answer_item_id = Some(item_id);
+    }
+
+    fn reset_turn_message_state(&mut self) {
+        self.agent_message_lanes.clear();
+        self.active_agent_message_item_id = None;
+        self.active_answer_item_ids.clear();
+        self.last_answer_item_id = None;
+    }
+
+    fn record_agent_message_item(&mut self, method: &str, params: &Value) {
+        if app_server_item_type(params) != Some("agentMessage") {
+            return;
+        }
+        let Some(item_id) = extract_app_server_item_id(params) else {
+            return;
+        };
+        match method {
+            "item/started" | "item/updated" => {
+                self.active_agent_message_item_id = Some(item_id.clone());
+                if let Some(lane) = agent_message_phase_lane(params) {
+                    self.agent_message_lanes.insert(item_id, lane);
+                }
+            }
+            "item/completed"
+                if self.active_agent_message_item_id.as_deref() == Some(item_id.as_str()) =>
+            {
+                self.active_agent_message_item_id = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn agent_message_lane(&self, params: &Value) -> RuntimeMessageLane {
+        self.agent_message_item_id(params)
+            .and_then(|item_id| self.agent_message_lanes.get(&item_id).copied())
+            .or_else(|| agent_message_phase_lane(params))
+            .unwrap_or(RuntimeMessageLane::Answer)
+    }
+
+    fn agent_message_item_id(&self, params: &Value) -> Option<String> {
+        extract_app_server_item_id(params).or_else(|| self.active_agent_message_item_id.clone())
     }
 
     async fn respond_to_server_request(&mut self, message: &Value) -> Result<()> {
@@ -1283,9 +1439,146 @@ fn extract_app_server_turn_id(value: &Value) -> Option<String> {
         .map(|turn_id| turn_id.trim().to_string())
 }
 
+fn extract_app_server_item_id(value: &Value) -> Option<String> {
+    value
+        .pointer("/item/id")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("itemId").and_then(Value::as_str))
+        .or_else(|| value.get("item_id").and_then(Value::as_str))
+        .or_else(|| value.get("id").and_then(Value::as_str))
+        .filter(|item_id| !item_id.trim().is_empty())
+        .map(|item_id| item_id.trim().to_string())
+}
+
 fn app_server_item_type(params: &Value) -> Option<&str> {
     let item = params.get("item").unwrap_or(params);
     item.get("type").and_then(Value::as_str)
+}
+
+fn codex_generated_image_payload<'a>(
+    method: Option<&'a str>,
+    message: &'a Value,
+) -> Option<&'a Value> {
+    if let Some(("image_generation_end", payload)) = app_server_event_payload(method, message) {
+        if codex_generated_image_is_publishable(method, payload) {
+            return Some(payload);
+        }
+    }
+
+    let item = message.get("item").unwrap_or(message);
+    let item_type = item.get("type").and_then(Value::as_str);
+    if matches!(method, Some("item/completed" | "item/updated"))
+        && matches!(item_type, Some("imageGeneration" | "image_generation_call"))
+        && codex_generated_image_is_publishable(method, item)
+    {
+        return Some(item);
+    }
+
+    if method.is_none() && message.get("type").and_then(Value::as_str) == Some("response_item") {
+        let payload = message.get("payload")?;
+        if payload.get("type").and_then(Value::as_str) == Some("image_generation_call")
+            && codex_generated_image_is_publishable(method, payload)
+        {
+            return Some(payload);
+        }
+    }
+
+    None
+}
+
+fn codex_generated_image_is_publishable(method: Option<&str>, payload: &Value) -> bool {
+    if codex_generated_image_has_saved_path(payload) {
+        return true;
+    }
+
+    match payload
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+    {
+        Some(status) => matches!(
+            status.to_ascii_lowercase().as_str(),
+            "completed" | "complete" | "succeeded" | "success" | "done"
+        ),
+        None => {
+            method == Some("item/completed")
+                || payload.get("type").and_then(Value::as_str) == Some("image_generation_end")
+        }
+    }
+}
+
+fn codex_generated_image_call_id(payload: &Value) -> Option<String> {
+    payload
+        .get("call_id")
+        .or_else(|| payload.get("callId"))
+        .or_else(|| payload.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn codex_generated_image_has_saved_path(payload: &Value) -> bool {
+    payload
+        .get("saved_path")
+        .or_else(|| payload.get("savedPath"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn codex_generated_image_path(payload: &Value, runtime_state_root: &Path) -> Option<PathBuf> {
+    let raw = payload
+        .get("saved_path")
+        .or_else(|| payload.get("savedPath"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let path = Path::new(raw);
+    if let Ok(container_relative) = path.strip_prefix("/runtime") {
+        return Some(runtime_state_root.join(container_relative));
+    }
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        Some(runtime_state_root.join(path))
+    }
+}
+
+fn app_server_event_payload<'a>(
+    method: Option<&'a str>,
+    message: &'a Value,
+) -> Option<(&'a str, &'a Value)> {
+    let message_type = message.get("type").and_then(Value::as_str);
+    if matches!(method, Some("event_msg" | "event"))
+        || matches!(message_type, Some("event_msg" | "event"))
+    {
+        let payload = message.get("payload").unwrap_or(message);
+        return payload
+            .get("type")
+            .and_then(Value::as_str)
+            .map(|kind| (kind, payload));
+    }
+    if method == Some("image_generation_end") || message_type == Some("image_generation_end") {
+        return Some(("image_generation_end", message));
+    }
+    None
+}
+
+fn agent_message_phase_lane(params: &Value) -> Option<RuntimeMessageLane> {
+    let phase = app_server_item(params)
+        .get("phase")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("phase").and_then(Value::as_str))?;
+    match phase.trim().to_ascii_lowercase().as_str() {
+        "answer" | "final" | "final_answer" | "final-answer" | "message" => {
+            Some(RuntimeMessageLane::Answer)
+        }
+        "analysis" | "commentary" | "intermediate" | "plan" | "prelude" | "progress"
+        | "reasoning" | "thinking" => Some(RuntimeMessageLane::Reasoning),
+        _ => None,
+    }
 }
 
 fn app_server_text(value: &Value, keys: &[&str]) -> Option<String> {
@@ -1346,10 +1639,198 @@ fn error_notification_will_retry(params: &Value) -> bool {
 }
 
 fn describe_app_server_item(params: &Value) -> Option<String> {
+    let item = app_server_item(params);
     match app_server_item_type(params)? {
+        "agentMessage" | "reasoning" | "userMessage" | "plan" => None,
+        "commandExecution" => describe_command_execution_item(item),
+        "fileChange" => describe_file_change_item(item),
+        "webSearch" => describe_web_search_item(item),
+        "imageView" => describe_image_view_item(item),
+        "collabToolCall" => describe_collab_tool_call_item(item),
         "enteredReviewMode" => Some("codex review started".to_string()),
         "exitedReviewMode" => Some("codex review completed".to_string()),
-        other => Some(format!("codex item: {other}")),
+        other => Some(format!("codex activity: {other}")),
+    }
+}
+
+fn app_server_item(params: &Value) -> &Value {
+    params.get("item").unwrap_or(params)
+}
+
+fn describe_command_execution_item(item: &Value) -> Option<String> {
+    let command = command_execution_display(item)?;
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    let verb = command_execution_verb(status, &command);
+    let mut text = format!("codex {verb}: {command}");
+    if let Some(cwd) = item.get("cwd").and_then(Value::as_str) {
+        if !cwd.trim().is_empty() {
+            text.push_str(&format!("  cwd {}", compact_path(cwd)));
+        }
+    }
+    if let Some(exit_code) = item.get("exitCode").and_then(Value::as_i64) {
+        text.push_str(&format!("  exit {exit_code}"));
+    }
+    if let Some(duration_ms) = item.get("durationMs").and_then(Value::as_u64) {
+        text.push_str(&format!("  {}", format_millis(duration_ms)));
+    }
+    Some(text)
+}
+
+fn command_execution_verb(status: &str, command: &str) -> &'static str {
+    match status {
+        "inProgress" => "running",
+        "failed" => "failed",
+        "declined" => "declined",
+        "completed" => {
+            let first = command.split_whitespace().next().unwrap_or("");
+            match first.trim_matches('"') {
+                "rg" | "grep" => "searched",
+                "cat" | "sed" | "head" | "tail" | "nl" => "read",
+                "ls" | "find" | "git" => "inspected",
+                _ => "ran",
+            }
+        }
+        _ => "command",
+    }
+}
+
+fn command_execution_display(item: &Value) -> Option<String> {
+    item.get("command")
+        .and_then(command_value_display)
+        .or_else(|| command_actions_display(item.get("commandActions")?))
+}
+
+fn command_value_display(value: &Value) -> Option<String> {
+    match value {
+        Value::String(command) => non_empty(command),
+        Value::Array(parts) => {
+            let parts = parts
+                .iter()
+                .filter_map(Value::as_str)
+                .map(shell_word_display)
+                .collect::<Vec<_>>();
+            (!parts.is_empty()).then(|| parts.join(" "))
+        }
+        _ => None,
+    }
+}
+
+fn command_actions_display(value: &Value) -> Option<String> {
+    let actions = value.as_array()?;
+    let mut rendered = Vec::new();
+    for action in actions {
+        if let Some(command) = action
+            .get("command")
+            .or_else(|| action.get("cmd"))
+            .and_then(command_value_display)
+        {
+            rendered.push(command);
+        } else if let Some(action_type) = action.get("type").and_then(Value::as_str) {
+            rendered.push(action_type.to_string());
+        }
+    }
+    (!rendered.is_empty()).then(|| rendered.join(" && "))
+}
+
+fn describe_file_change_item(item: &Value) -> Option<String> {
+    let changes = item.get("changes").and_then(Value::as_array)?;
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    let verb = match status {
+        "inProgress" => "editing",
+        "completed" => "edited",
+        "failed" => "edit failed",
+        "declined" => "edit declined",
+        _ => "file change",
+    };
+    let paths = changes
+        .iter()
+        .filter_map(|change| change.get("path").and_then(Value::as_str))
+        .filter(|path| !path.trim().is_empty())
+        .map(compact_path)
+        .take(3)
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        Some(format!("codex {verb}: {} files", changes.len()))
+    } else {
+        let suffix = if changes.len() > paths.len() {
+            format!(" +{}", changes.len() - paths.len())
+        } else {
+            String::new()
+        };
+        Some(format!("codex {verb}: {}{}", paths.join(", "), suffix))
+    }
+}
+
+fn describe_web_search_item(item: &Value) -> Option<String> {
+    let query = item
+        .get("query")
+        .and_then(Value::as_str)
+        .or_else(|| item.pointer("/action/query").and_then(Value::as_str))
+        .or_else(|| item.pointer("/action/url").and_then(Value::as_str))
+        .or_else(|| item.pointer("/action/refId").and_then(Value::as_str))?;
+    let action = item
+        .pointer("/action/type")
+        .and_then(Value::as_str)
+        .unwrap_or("search");
+    let verb = match action {
+        "open_page" => "opened",
+        "find_in_page" => "found",
+        _ => "searched",
+    };
+    Some(format!("codex {verb}: {}", query.trim()))
+}
+
+fn describe_image_view_item(item: &Value) -> Option<String> {
+    item.get("path")
+        .and_then(Value::as_str)
+        .map(|path| format!("codex viewed: {}", compact_path(path)))
+}
+
+fn describe_collab_tool_call_item(item: &Value) -> Option<String> {
+    let tool = item.get("tool").and_then(Value::as_str)?;
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    Some(format!("codex {status}: {tool}"))
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn shell_word_display(value: &str) -> String {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '\'' | '"' | '\\' | '$' | '`'))
+    {
+        format!("{value:?}")
+    } else {
+        value.to_string()
+    }
+}
+
+fn compact_path(path: &str) -> String {
+    let path = path.trim();
+    path.strip_prefix("/workspace/")
+        .or_else(|| path.strip_prefix("./"))
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn format_millis(duration_ms: u64) -> String {
+    if duration_ms < 1_000 {
+        format!("{duration_ms}ms")
+    } else {
+        format!("{:.1}s", duration_ms as f64 / 1_000.0)
     }
 }
 
@@ -1493,6 +1974,28 @@ impl CodexThreadState {
         Ok(())
     }
 
+    fn current_thread_id(&self) -> Result<Option<String>> {
+        Ok(self
+            .sessions
+            .read()
+            .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
+            .get(&self.runtime_session_id)
+            .ok_or_else(|| anyhow!("runtime session '{}' not found", self.runtime_session_id))?
+            .thread_id
+            .clone())
+    }
+
+    fn runtime_state_root(&self) -> Result<Option<PathBuf>> {
+        Ok(self
+            .sessions
+            .read()
+            .map_err(|_| anyhow!("codex runtime session state lock poisoned"))?
+            .get(&self.runtime_session_id)
+            .ok_or_else(|| anyhow!("runtime session '{}' not found", self.runtime_session_id))?
+            .runtime_state_root
+            .clone())
+    }
+
     fn persist_thread_id(&self, thread_id: &str) -> Result<()> {
         let root = self
             .sessions
@@ -1577,7 +2080,8 @@ mod tests {
     };
 
     use crate::kernel::runtime::{
-        ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionOutput, NetworkMode,
+        append_streamed_text_boundary, append_streamed_text_delta, ConfinementConfig,
+        EffectiveExecutionPlan, ExecutionLimits, ExecutionOutput, NetworkMode,
         OciConfinementConfig, RuntimeAdapter, RuntimeControlExecution, RuntimeControlInput,
         RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeMessageLane,
         RuntimeSessionHandle, RuntimeSessionStartInput, WorkspaceAccess,
@@ -1707,6 +2211,23 @@ mod tests {
         }
     }
 
+    fn answer_text_from_events(events: impl IntoIterator<Item = RuntimeEvent>) -> String {
+        let mut text = String::new();
+        for event in events {
+            match event {
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: delta,
+                } => append_streamed_text_delta(&mut text, &delta),
+                RuntimeEvent::MessageBoundary {
+                    lane: RuntimeMessageLane::Answer,
+                } => append_streamed_text_boundary(&mut text),
+                _ => {}
+            }
+        }
+        text
+    }
+
     #[test]
     fn codex_app_server_program_uses_default_stdio_transport() {
         let program = build_codex_app_server_program(&CodexRuntimeConfig {
@@ -1743,6 +2264,186 @@ mod tests {
             super::app_server_error_text(&json!({"message": "  failed \n"})),
             "failed"
         );
+    }
+
+    #[test]
+    fn app_server_item_descriptions_render_operator_activity() {
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {
+                    "type": "commandExecution",
+                    "command": ["cargo", "test"],
+                    "cwd": "/workspace/lionclaw",
+                    "status": "completed",
+                    "exitCode": 0,
+                    "durationMs": 1234,
+                }
+            })),
+            Some("codex ran: cargo test  cwd lionclaw  exit 0  1.2s".to_string())
+        );
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {
+                    "type": "commandExecution",
+                    "command": ["rg", "operator console"],
+                    "status": "completed",
+                }
+            })),
+            Some("codex searched: rg \"operator console\"".to_string())
+        );
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {
+                    "type": "fileChange",
+                    "status": "completed",
+                    "changes": [
+                        {"path": "src/operator/run_tui.rs", "kind": "update"},
+                        {"path": "Cargo.toml", "kind": "update"}
+                    ],
+                }
+            })),
+            Some("codex edited: src/operator/run_tui.rs, Cargo.toml".to_string())
+        );
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {
+                    "type": "webSearch",
+                    "action": {"type": "search", "query": "ratatui scrollbar"}
+                }
+            })),
+            Some("codex searched: ratatui scrollbar".to_string())
+        );
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {"type": "agentMessage", "text": "hello"}
+            })),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn app_server_agent_message_phases_choose_transcript_lane() {
+        let (_adapter, _handle, thread_state) = start_codex_test_session(None).await;
+        let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(Vec::new()));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        for message in [
+            json!({"method": "turn/started", "params": {"threadId": "thr_1", "turnId": "turn_1"}}),
+            json!({
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "id": "msg_plan",
+                        "type": "agentMessage",
+                        "phase": "prelude"
+                    }
+                }
+            }),
+            json!({"method": "item/agentMessage/delta", "params": {"itemId": "msg_plan", "delta": "I'll inspect first."}}),
+            json!({
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "id": "msg_final",
+                        "type": "agentMessage",
+                        "phase": "final_answer"
+                    }
+                }
+            }),
+            json!({"method": "item/agentMessage/delta", "params": {"itemId": "msg_final", "delta": "Final answer."}}),
+        ] {
+            client
+                .handle_message(message, &event_tx, &thread_state)
+                .await
+                .expect("handle message");
+        }
+
+        let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Reasoning,
+                text
+            } if text == "I'll inspect first."
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text
+            } if text == "Final answer."
+        )));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::MessageBoundary { .. })));
+    }
+
+    #[tokio::test]
+    async fn app_server_agent_message_items_emit_answer_boundaries() {
+        let (_adapter, _handle, thread_state) = start_codex_test_session(None).await;
+        let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(Vec::new()));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        for message in [
+            json!({"method": "turn/started", "params": {"threadId": "thr_1", "turnId": "turn_1"}}),
+            json!({
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "id": "msg_intro",
+                        "type": "agentMessage",
+                        "phase": "final_answer"
+                    }
+                }
+            }),
+            json!({"method": "item/agentMessage/delta", "params": {"itemId": "msg_intro", "delta": "Intro."}}),
+            json!({"method": "item/completed", "params": {"item": {"id": "msg_intro", "type": "agentMessage"}}}),
+            json!({
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "id": "msg_body",
+                        "type": "agentMessage",
+                        "phase": "final_answer"
+                    }
+                }
+            }),
+            json!({"method": "item/agentMessage/delta", "params": {"itemId": "msg_body", "delta": "**Project**"}}),
+        ] {
+            client
+                .handle_message(message, &event_tx, &thread_state)
+                .await
+                .expect("handle message");
+        }
+
+        let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        let message_events = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::MessageDelta { .. } | RuntimeEvent::MessageBoundary { .. }
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            message_events.as_slice(),
+            [
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: intro
+                },
+                RuntimeEvent::MessageBoundary {
+                    lane: RuntimeMessageLane::Answer
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: body
+                }
+            ] if intro == "Intro." && body == "**Project**"
+        ));
     }
 
     #[test]
@@ -1965,6 +2666,250 @@ mod tests {
             sent[3]["params"]["sandboxPolicy"]["networkAccess"],
             "restricted"
         );
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_separates_distinct_agent_message_items() {
+        let (adapter, handle, thread_state) = start_codex_test_session(None).await;
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {"turn": {"id": "turn_1"}}}),
+            json!({"method": "item/agentMessage/delta", "params": {"threadId": "thr_1", "turnId": "turn_1", "itemId": "msg_1", "delta": "First."}}),
+            json!({"method": "item/agentMessage/delta", "params": {"threadId": "thr_1", "turnId": "turn_1", "itemId": "msg_2", "delta": "Second."}}),
+            json!({"method": "turn/completed", "params": {"threadId": "thr_1", "turnId": "turn_1"}}),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = client
+            .request("turn/start", json!({}), &event_tx, &thread_state)
+            .await
+            .expect("turn start");
+        client
+            .wait_for_turn_completed(
+                super::extract_app_server_turn_id(&response).as_deref(),
+                Some("thr_1"),
+                None,
+                &event_tx,
+                &thread_state,
+                None,
+            )
+            .await
+            .expect("turn completed");
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok());
+        assert_eq!(answer_text_from_events(events), "First.\n\nSecond.");
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    async fn assert_image_generation_event_emits_runtime_artifact(event_message: Value) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let generated_dir = runtime_state_root
+            .join("home")
+            .join(".codex")
+            .join("generated_images")
+            .join("thr_1");
+        std::fs::create_dir_all(&generated_dir).expect("create generated image dir");
+        std::fs::write(generated_dir.join("ig_1.png"), b"png").expect("write generated image");
+        let (adapter, handle, thread_state) =
+            start_codex_test_session(Some(runtime_state_root.clone())).await;
+        thread_state
+            .persist_thread_id("thr_1")
+            .expect("persist thread id");
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {"turn": {"id": "turn_1"}}}),
+            event_message,
+            json!({"method": "turn/completed", "params": {"threadId": "thr_1", "turnId": "turn_1"}}),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = client
+            .request("turn/start", json!({}), &event_tx, &thread_state)
+            .await
+            .expect("turn start");
+        client
+            .wait_for_turn_completed(
+                super::extract_app_server_turn_id(&response).as_deref(),
+                Some("thr_1"),
+                None,
+                &event_tx,
+                &thread_state,
+                None,
+            )
+            .await
+            .expect("turn completed");
+
+        let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        let artifact = events
+            .iter()
+            .find_map(|event| match event {
+                RuntimeEvent::Artifact { artifact } => Some(artifact),
+                _ => None,
+            })
+            .expect("image artifact event");
+        assert_eq!(artifact.artifact_id, "codex:image:thr_1:ig_1");
+        assert_eq!(artifact.filename.as_deref(), Some("ig_1.png"));
+        assert_eq!(artifact.mime_type.as_deref(), Some("image/png"));
+        assert_eq!(artifact.path, generated_dir.join("ig_1.png"));
+
+        adapter.close(&handle).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_method_image_generation_event_emits_runtime_artifact() {
+        assert_image_generation_event_emits_runtime_artifact(json!({
+            "method": "event_msg",
+            "params": {
+                "payload": {
+                    "type": "image_generation_end",
+                    "call_id": "ig_1",
+                    "status": "completed"
+                }
+            }
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_top_level_image_generation_event_emits_runtime_artifact() {
+        assert_image_generation_event_emits_runtime_artifact(json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "image_generation_end",
+                "call_id": "ig_1",
+                "status": "completed",
+                "result": "base64 omitted"
+            }
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_image_generation_saved_path_maps_runtime_root() {
+        assert_image_generation_event_emits_runtime_artifact(json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "image_generation_end",
+                "call_id": "ig_1",
+                "status": "generating",
+                "saved_path": "/runtime/home/.codex/generated_images/thr_1/ig_1.png",
+                "result": "base64 omitted"
+            }
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_image_generation_item_emits_runtime_artifact() {
+        assert_image_generation_event_emits_runtime_artifact(json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "item": {
+                    "type": "imageGeneration",
+                    "id": "ig_1",
+                    "status": "completed"
+                }
+            }
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_response_item_image_generation_emits_runtime_artifact() {
+        assert_image_generation_event_emits_runtime_artifact(json!({
+            "type": "response_item",
+            "payload": {
+                "type": "image_generation_call",
+                "id": "ig_1",
+                "status": "completed",
+                "result": "base64 omitted"
+            }
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_image_generation_interim_update_does_not_dedupe_completed_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let runtime_state_root = temp_dir.path().join("runtime-state");
+        let final_image = runtime_state_root
+            .join("home")
+            .join(".codex")
+            .join("generated_images")
+            .join("thr_1")
+            .join("ig_1-final.png");
+        std::fs::create_dir_all(final_image.parent().expect("final image parent"))
+            .expect("create generated image dir");
+        std::fs::write(&final_image, b"png").expect("write final generated image");
+        let (adapter, handle, thread_state) =
+            start_codex_test_session(Some(runtime_state_root)).await;
+        thread_state
+            .persist_thread_id("thr_1")
+            .expect("persist thread id");
+        let transport = FakeAppServerTransport::new(vec![
+            json!({"id": 1, "result": {"turn": {"id": "turn_1"}}}),
+            json!({
+                "method": "item/updated",
+                "params": {
+                    "threadId": "thr_1",
+                    "turnId": "turn_1",
+                    "item": {
+                        "type": "imageGeneration",
+                        "id": "ig_1",
+                        "status": "generating"
+                    }
+                }
+            }),
+            json!({
+                "method": "item/updated",
+                "params": {
+                    "threadId": "thr_1",
+                    "turnId": "turn_1",
+                    "item": {
+                        "type": "imageGeneration",
+                        "id": "ig_1",
+                        "status": "completed",
+                        "savedPath": "/runtime/home/.codex/generated_images/thr_1/ig_1-final.png"
+                    }
+                }
+            }),
+            json!({"method": "turn/completed", "params": {"threadId": "thr_1", "turnId": "turn_1"}}),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = client
+            .request("turn/start", json!({}), &event_tx, &thread_state)
+            .await
+            .expect("turn start");
+        client
+            .wait_for_turn_completed(
+                super::extract_app_server_turn_id(&response).as_deref(),
+                Some("thr_1"),
+                None,
+                &event_tx,
+                &thread_state,
+                None,
+            )
+            .await
+            .expect("turn completed");
+
+        let artifacts = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                RuntimeEvent::Artifact { artifact } => Some(artifact),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].artifact_id, "codex:image:thr_1:ig_1");
+        assert_eq!(artifacts[0].filename.as_deref(), Some("ig_1-final.png"));
+        assert_eq!(artifacts[0].path, final_image);
 
         adapter.close(&handle).await.expect("close");
     }

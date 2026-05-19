@@ -66,9 +66,20 @@ When you run:
 lionclaw run
 ```
 
-LionClaw resolves the project, selects an instance, builds the confined runtime
-workspace, stages the local state and credentials that runtime needs, then
-launches the real agent CLI.
+LionClaw opens the project operator console when attached to a terminal. The
+console keeps the current context in the top ribbon, switchable project objects
+on the left, durable conversation in the transcript, selected details in the
+inspector, and prompt input in the composer. Runtime stream detail is summarized
+as inspectable activity instead of being mixed into the conversation.
+
+Use the plain line-oriented path when scripting or when a terminal UI is not
+wanted:
+
+```bash
+lionclaw run --plain
+```
+
+Non-terminal use automatically stays on the plain path.
 
 The selected runtime still does the agent work. LionClaw owns the boundary
 around it: the project it runs in, the state it sees, the mounts it receives,
@@ -94,10 +105,22 @@ Then run the configured runtime:
 lionclaw run
 ```
 
+In a terminal, `run` opens the operator console. Use `lionclaw run --plain`
+for the line-oriented interactive path.
+
+Inside the console, `Tab` and `Shift+Tab` move focus, `Enter` activates the
+focused item, `Ctrl+P` opens commands and help, `Ctrl+C` interrupts an active
+turn, and `Ctrl+D` exits when idle. When the inspector is focused, `Left` and
+`Right` cycle instance, runtime, boundary, activity, and audit views.
+
 For Codex, use a logged-in Codex CLI and run LionClaw where the `podman`
 executable is available. If `run` reports a missing runtime image, build or
 provide the image named in the error. The bundled image definition lives at
-`containers/runtime/Containerfile`.
+`containers/runtime/Containerfile`. That default image is intentionally
+useful for everyday assistant work: it includes Codex, OpenCode, git, ripgrep,
+curl, jq, Python, archive helpers, PDF text tools, and ffmpeg/ffprobe for
+basic media inspection without bundling browsers, SDKs, OCR language packs, or
+local model weights.
 
 `doctor` checks setup and prints the next run command when setup is no longer
 blocked. `run` checks launch. Use `lionclaw --help` and subcommand `--help`

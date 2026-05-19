@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Multipart, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -9,27 +9,41 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::{
     contracts::{
-        AuditQueryParams, AuditQueryResponse, ChannelInboundRequest, ChannelInboundResponse,
-        ChannelListResponse, ChannelPeerApproveRequest, ChannelPeerBlockRequest,
-        ChannelPeerListParams, ChannelPeerListResponse, ChannelPeerResponse,
-        ChannelStreamAckRequest, ChannelStreamAckResponse, ChannelStreamPullRequest,
-        ChannelStreamPullResponse, ContinuityDraftActionRequest, ContinuityDraftDiscardResponse,
-        ContinuityDraftListRequest, ContinuityDraftListResponse, ContinuityDraftPromoteResponse,
-        ContinuityGetResponse, ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse,
-        ContinuityPathRequest, ContinuityProposalActionResponse, ContinuityProposalListResponse,
-        ContinuitySearchRequest, ContinuitySearchResponse, ContinuityStatusResponse,
-        DaemonInfoResponse, JobCreateRequest, JobCreateResponse, JobGetResponse, JobListResponse,
-        JobManualRunResponse, JobRefRequest, JobRemoveResponse, JobRunsRequest, JobRunsResponse,
-        JobTickResponse, JobToggleResponse, PolicyGrantRequest, PolicyGrantResponse,
-        PolicyRevokeRequest, PolicyRevokeResponse, SessionActionRequest, SessionActionResponse,
-        SessionHistoryRequest, SessionHistoryResponse, SessionLatestQuery, SessionLatestResponse,
-        SessionOpenRequest, SessionOpenResponse, SessionTurnRequest, SessionTurnResponse,
+        AuditQueryParams, AuditQueryResponse, ChannelAttachmentFinalizeRequest,
+        ChannelAttachmentFinalizeResponse, ChannelAttachmentStageResponse, ChannelGrantResponse,
+        ChannelGrantRevokeRequest, ChannelGrantRevokeResponse, ChannelHealthReportRequest,
+        ChannelHealthReportResponse, ChannelInboundRequest, ChannelInboundResponse,
+        ChannelListResponse, ChannelOutboxPullRequest, ChannelOutboxPullResponse,
+        ChannelOutboxReportRequest, ChannelOutboxReportResponse, ChannelPairingApproveRequest,
+        ChannelPairingBlockRequest, ChannelPairingBlockResponse, ChannelPairingClaimRequest,
+        ChannelPairingClaimResponse, ChannelPairingInviteRequest, ChannelPairingInviteResponse,
+        ChannelPairingListParams, ChannelPairingListResponse, ChannelStreamAckRequest,
+        ChannelStreamAckResponse, ChannelStreamPullRequest, ChannelStreamPullResponse,
+        ContinuityDraftActionRequest, ContinuityDraftDiscardResponse, ContinuityDraftListRequest,
+        ContinuityDraftListResponse, ContinuityDraftPromoteResponse, ContinuityGetResponse,
+        ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse, ContinuityPathRequest,
+        ContinuityProposalActionResponse, ContinuityProposalListResponse, ContinuitySearchRequest,
+        ContinuitySearchResponse, ContinuityStatusResponse, DaemonInfoResponse, JobCreateRequest,
+        JobCreateResponse, JobGetResponse, JobListResponse, JobManualRunResponse, JobRefRequest,
+        JobRemoveResponse, JobRunsRequest, JobRunsResponse, JobTickResponse, JobToggleResponse,
+        PolicyGrantRequest, PolicyGrantResponse, PolicyRevokeRequest, PolicyRevokeResponse,
+        SessionActionRequest, SessionActionResponse, SessionHistoryRequest, SessionHistoryResponse,
+        SessionLatestQuery, SessionLatestResponse, SessionOpenRequest, SessionOpenResponse,
+        SessionTurnRequest, SessionTurnResponse,
     },
-    kernel::{Kernel, KernelError},
+    kernel::{
+        channel_attachments::{MAX_CHANNEL_ATTACHMENT_BYTES, MAX_CHANNEL_EVENT_ATTACHMENT_BYTES},
+        ChannelAttachmentStageContent, ChannelAttachmentStageInput, Kernel, KernelError,
+    },
 };
+
+const CHANNEL_ATTACHMENT_STAGE_MULTIPART_OVERHEAD_BYTES: usize = 1024 * 1024;
+const CHANNEL_ATTACHMENT_STAGE_BODY_LIMIT_BYTES: usize =
+    MAX_CHANNEL_EVENT_ATTACHMENT_BYTES + CHANNEL_ATTACHMENT_STAGE_MULTIPART_OVERHEAD_BYTES;
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -52,12 +66,31 @@ pub fn build_router(kernel: Arc<Kernel>, daemon_info: DaemonInfoResponse) -> Rou
         .route("/v0/sessions/action", post(session_action))
         .route("/v0/sessions/turn", post(turn_session))
         .route("/v0/channels/list", get(list_channels))
-        .route("/v0/channels/peers", get(list_channel_peers))
-        .route("/v0/channels/peers/approve", post(approve_channel_peer))
-        .route("/v0/channels/peers/block", post(block_channel_peer))
+        .route("/v0/channels/pairing", get(list_channel_pairings))
+        .route(
+            "/v0/channels/pairing/approve",
+            post(approve_channel_pairing),
+        )
+        .route("/v0/channels/pairing/invite", post(invite_channel_pairing))
+        .route("/v0/channels/pairing/claim", post(claim_channel_pairing))
+        .route("/v0/channels/pairing/block", post(block_channel_pairing))
+        .route("/v0/channels/grants/revoke", post(revoke_channel_grant))
         .route("/v0/channels/inbound", post(channel_inbound))
+        .route(
+            "/v0/channels/attachments/stage",
+            post(stage_channel_attachment).layer(DefaultBodyLimit::max(
+                CHANNEL_ATTACHMENT_STAGE_BODY_LIMIT_BYTES,
+            )),
+        )
+        .route(
+            "/v0/channels/attachments/finalize",
+            post(finalize_channel_attachments),
+        )
         .route("/v0/channels/stream/pull", post(channel_stream_pull))
         .route("/v0/channels/stream/ack", post(channel_stream_ack))
+        .route("/v0/channels/outbox/pull", post(channel_outbox_pull))
+        .route("/v0/channels/outbox/report", post(channel_outbox_report))
+        .route("/v0/channels/health/report", post(channel_health_report))
         .route("/v0/policy/grant", post(grant_policy))
         .route("/v0/policy/revoke", post(revoke_policy))
         .route("/v0/jobs/create", post(create_job))
@@ -154,27 +187,54 @@ async fn list_channels(
     Ok(Json(result))
 }
 
-async fn list_channel_peers(
+async fn list_channel_pairings(
     State(state): State<ApiState>,
-    Query(params): Query<ChannelPeerListParams>,
-) -> Result<Json<ChannelPeerListResponse>, ApiError> {
-    let result = state.kernel.list_channel_peers(params.channel_id).await?;
+    Query(params): Query<ChannelPairingListParams>,
+) -> Result<Json<ChannelPairingListResponse>, ApiError> {
+    let result = state
+        .kernel
+        .list_channel_pairings(params.channel_id, params.status)
+        .await?;
     Ok(Json(result))
 }
 
-async fn approve_channel_peer(
+async fn approve_channel_pairing(
     State(state): State<ApiState>,
-    Json(req): Json<ChannelPeerApproveRequest>,
-) -> Result<Json<ChannelPeerResponse>, ApiError> {
-    let result = state.kernel.approve_channel_peer(req).await?;
+    Json(req): Json<ChannelPairingApproveRequest>,
+) -> Result<Json<ChannelGrantResponse>, ApiError> {
+    let result = state.kernel.approve_channel_pairing(req).await?;
     Ok(Json(result))
 }
 
-async fn block_channel_peer(
+async fn invite_channel_pairing(
     State(state): State<ApiState>,
-    Json(req): Json<ChannelPeerBlockRequest>,
-) -> Result<Json<ChannelPeerResponse>, ApiError> {
-    let result = state.kernel.block_channel_peer(req).await?;
+    Json(req): Json<ChannelPairingInviteRequest>,
+) -> Result<Json<ChannelPairingInviteResponse>, ApiError> {
+    let result = state.kernel.invite_channel_pairing(req).await?;
+    Ok(Json(result))
+}
+
+async fn claim_channel_pairing(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelPairingClaimRequest>,
+) -> Result<Json<ChannelPairingClaimResponse>, ApiError> {
+    let result = state.kernel.claim_channel_pairing(req).await?;
+    Ok(Json(result))
+}
+
+async fn block_channel_pairing(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelPairingBlockRequest>,
+) -> Result<Json<ChannelPairingBlockResponse>, ApiError> {
+    let result = state.kernel.block_channel_pairing(req).await?;
+    Ok(Json(result))
+}
+
+async fn revoke_channel_grant(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelGrantRevokeRequest>,
+) -> Result<Json<ChannelGrantRevokeResponse>, ApiError> {
+    let result = state.kernel.revoke_channel_grant(req).await?;
     Ok(Json(result))
 }
 
@@ -183,6 +243,80 @@ async fn channel_inbound(
     Json(req): Json<ChannelInboundRequest>,
 ) -> Result<Json<ChannelInboundResponse>, ApiError> {
     let result = state.kernel.ingest_channel_inbound(req).await?;
+    Ok(Json(result))
+}
+
+async fn stage_channel_attachment(
+    State(state): State<ApiState>,
+    mut multipart: Multipart,
+) -> Result<Json<ChannelAttachmentStageResponse>, ApiError> {
+    let mut channel_id = None;
+    let mut event_id = None;
+    let mut attachment_id = None;
+    let mut kind = None;
+    let mut filename = None;
+    let mut file_part_filename = None;
+    let mut mime_type = None;
+    let mut caption = None;
+    let mut content = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| ApiError::bad_request(format!("invalid multipart body: {err}")))?
+    {
+        let name = field
+            .name()
+            .ok_or_else(|| ApiError::bad_request("multipart field name is required"))?
+            .to_string();
+        match name.as_str() {
+            "channel_id" => set_multipart_text(&mut channel_id, "channel_id", field).await?,
+            "event_id" => set_multipart_text(&mut event_id, "event_id", field).await?,
+            "attachment_id" => {
+                set_multipart_text(&mut attachment_id, "attachment_id", field).await?
+            }
+            "kind" => set_multipart_text(&mut kind, "kind", field).await?,
+            "filename" => set_multipart_text(&mut filename, "filename", field).await?,
+            "mime_type" => set_multipart_text(&mut mime_type, "mime_type", field).await?,
+            "caption" => set_multipart_text(&mut caption, "caption", field).await?,
+            "file" => {
+                if content.is_some() {
+                    return Err(ApiError::bad_request("duplicate multipart field 'file'"));
+                }
+                file_part_filename = field.file_name().map(str::to_string);
+                content = Some(read_multipart_file_field(field).await?);
+            }
+            other => {
+                return Err(ApiError::bad_request(format!(
+                    "unknown multipart field '{other}'"
+                )));
+            }
+        }
+    }
+
+    let result = state
+        .kernel
+        .stage_channel_attachment(ChannelAttachmentStageInput {
+            channel_id: channel_id
+                .ok_or_else(|| ApiError::bad_request("channel_id is required"))?,
+            event_id: event_id.ok_or_else(|| ApiError::bad_request("event_id is required"))?,
+            attachment_id: attachment_id
+                .ok_or_else(|| ApiError::bad_request("attachment_id is required"))?,
+            kind: kind.ok_or_else(|| ApiError::bad_request("kind is required"))?,
+            filename: filename.or(file_part_filename),
+            mime_type,
+            caption,
+            content: content.ok_or_else(|| ApiError::bad_request("file is required"))?,
+        })
+        .await?;
+    Ok(Json(result))
+}
+
+async fn finalize_channel_attachments(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelAttachmentFinalizeRequest>,
+) -> Result<Json<ChannelAttachmentFinalizeResponse>, ApiError> {
+    let result = state.kernel.finalize_channel_attachments(req).await?;
     Ok(Json(result))
 }
 
@@ -199,6 +333,30 @@ async fn channel_stream_ack(
     Json(req): Json<ChannelStreamAckRequest>,
 ) -> Result<Json<ChannelStreamAckResponse>, ApiError> {
     let result = state.kernel.ack_channel_stream(req).await?;
+    Ok(Json(result))
+}
+
+async fn channel_outbox_pull(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelOutboxPullRequest>,
+) -> Result<Json<ChannelOutboxPullResponse>, ApiError> {
+    let result = state.kernel.pull_channel_outbox(req).await?;
+    Ok(Json(result))
+}
+
+async fn channel_outbox_report(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelOutboxReportRequest>,
+) -> Result<Json<ChannelOutboxReportResponse>, ApiError> {
+    let result = state.kernel.report_channel_outbox(req).await?;
+    Ok(Json(result))
+}
+
+async fn channel_health_report(
+    State(state): State<ApiState>,
+    Json(req): Json<ChannelHealthReportRequest>,
+) -> Result<Json<ChannelHealthReportResponse>, ApiError> {
+    let result = state.kernel.report_channel_health(req).await?;
     Ok(Json(result))
 }
 
@@ -389,6 +547,66 @@ async fn query_audit(
         .await?;
 
     Ok(Json(response))
+}
+
+async fn set_multipart_text(
+    slot: &mut Option<String>,
+    name: &str,
+    field: axum::extract::multipart::Field<'_>,
+) -> Result<(), ApiError> {
+    if slot.is_some() {
+        return Err(ApiError::bad_request(format!(
+            "duplicate multipart field '{name}'"
+        )));
+    }
+    let value = field
+        .text()
+        .await
+        .map_err(|err| ApiError::bad_request(format!("invalid multipart field '{name}': {err}")))?;
+    *slot = Some(value);
+    Ok(())
+}
+
+async fn read_multipart_file_field(
+    mut field: axum::extract::multipart::Field<'_>,
+) -> Result<ChannelAttachmentStageContent, ApiError> {
+    let mut content = Vec::new();
+    let mut hasher = Sha256::new();
+    let mut size_bytes: usize = 0;
+    let mut too_large = false;
+
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|err| ApiError::bad_request(format!("invalid multipart file field: {err}")))?
+    {
+        size_bytes = size_bytes
+            .checked_add(chunk.len())
+            .ok_or_else(|| ApiError::bad_request("multipart file field is too large"))?;
+        hasher.update(&chunk);
+
+        if too_large {
+            continue;
+        }
+        if size_bytes > MAX_CHANNEL_ATTACHMENT_BYTES {
+            too_large = true;
+            content = Vec::new();
+            continue;
+        }
+        content.extend_from_slice(&chunk);
+    }
+
+    let size_bytes = i64::try_from(size_bytes)
+        .map_err(|_| ApiError::bad_request("multipart file field is too large"))?;
+    if too_large {
+        Ok(ChannelAttachmentStageContent::RejectedByPolicy {
+            reason_code: "attachment_too_large".to_string(),
+            size_bytes,
+            sha256: hex::encode(hasher.finalize()),
+        })
+    } else {
+        Ok(ChannelAttachmentStageContent::Bytes(content))
+    }
 }
 
 #[derive(Debug)]

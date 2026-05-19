@@ -6,6 +6,9 @@ from textual.widgets import Input
 
 from lionclaw_channel_terminal.api import (
     InboundResponse,
+    OutboxContent,
+    OutboxDelivery,
+    OutboxReportResponse,
     PeerState,
     SessionActionResult,
     SessionLatestSnapshot,
@@ -60,7 +63,7 @@ class ChannelViewStateTests(unittest.TestCase):
         state.set_pairing_state(status="pending", pairing_code="123456")
         banner = state.pairing_banner("terminal", "mosh")
         self.assertIn("123456", banner)
-        self.assertIn("lionclaw channel pairing approve terminal mosh 123456", banner)
+        self.assertIn("lionclaw channel pairing approve terminal 123456", banner)
 
     def test_channel_scoped_stream_event_does_not_select_active_session(self):
         state = ChannelViewState(peer_id="mosh")
@@ -308,6 +311,40 @@ class ChannelViewStateTests(unittest.TestCase):
         self.assertIn("error> turn interrupted by kernel restart", transcript)
         self.assertFalse(state.input_disabled())
 
+    def test_outbox_delivery_reconciles_final_answer_idempotently(self):
+        state = ChannelViewState(peer_id="mosh")
+        state.begin_submit("hello")
+        state.mark_queued("turn-1", "session-1")
+        state.apply_stream_event(
+            StreamEvent(
+                sequence=1,
+                peer_id="mosh",
+                session_id="session-1",
+                turn_id="turn-1",
+                kind="message_delta",
+                lane="answer",
+                text="partial",
+            )
+        )
+
+        delivery = OutboxDelivery(
+            delivery_id="delivery-1",
+            attempt_id="attempt-1",
+            channel_id="terminal",
+            conversation_ref="mosh",
+            session_id="session-1",
+            turn_id="turn-1",
+            content=OutboxContent(text="final answer"),
+        )
+        state.apply_outbox_delivery(delivery)
+        state.apply_outbox_delivery(delivery)
+
+        transcript = state.transcript_text()
+        self.assertIn("you> hello", transcript)
+        self.assertIn("lionclaw> final answer", transcript)
+        self.assertNotIn("partial", transcript)
+        self.assertFalse(state.input_disabled())
+
 
 class _FailingApi:
     async def send_inbound(self, text: str, session_id: str | None = None) -> InboundResponse:
@@ -331,6 +368,7 @@ class _InteractiveApi(_SuccessfulApi):
         self.open_calls = 0
         self.action_calls: list[tuple[str, str]] = []
         self.fetch_latest_calls = 0
+        self.outbox_reports: list[tuple[str, str]] = []
 
     async def open_session(
         self,
@@ -362,6 +400,25 @@ class _InteractiveApi(_SuccessfulApi):
             session=None,
             turns=[],
             resume_after_sequence=None,
+        )
+
+    async def pull_outbox(self) -> list[OutboxDelivery]:
+        return []
+
+    async def report_outbox(
+        self,
+        delivery: OutboxDelivery,
+        outcome: str,
+        *,
+        provider_receipt: dict[str, object] | None = None,
+        error_code: str | None = None,
+        error_text: str | None = None,
+    ) -> OutboxReportResponse:
+        self.outbox_reports.append((delivery.delivery_id, outcome))
+        return OutboxReportResponse(
+            accepted=True,
+            status="delivered",
+            attempt_status=outcome,
         )
 
 
@@ -444,6 +501,27 @@ class _MountedApi(_PairingRefreshApi):
         return None
 
 
+class _OutboxApi(_InteractiveApi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.deliveries = [
+            OutboxDelivery(
+                delivery_id="delivery-1",
+                attempt_id="attempt-1",
+                channel_id="terminal",
+                conversation_ref="mosh",
+                session_id="session-1",
+                turn_id="turn-1",
+                content=OutboxContent(text="final answer"),
+            )
+        ]
+
+    async def pull_outbox(self) -> list[OutboxDelivery]:
+        deliveries = self.deliveries
+        self.deliveries = []
+        return deliveries
+
+
 def _make_app() -> TerminalChannelApp:
     return TerminalChannelApp(
         AppConfig(
@@ -455,7 +533,7 @@ def _make_app() -> TerminalChannelApp:
             stream_start_mode="tail",
             stream_limit=50,
             stream_wait_ms=0,
-            runtime_id=None,
+            outbox_loop_delay_secs=1,
         )
     )
 
@@ -526,15 +604,13 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
 
         async with app.run_test() as pilot:
             await pilot.pause()
-            self.assertTrue(app.query_one(Input).has_focus)
-
-            await pilot.press("tab")
-            await pilot.pause()
+            self.assertTrue(app.query_one(Input).disabled)
             self.assertFalse(app.query_one(Input).has_focus)
 
             api.peer_state = PeerState(status="approved", trust_tier="main")
             await app.refresh_pairing_state()
             await pilot.pause()
+            self.assertFalse(app.query_one(Input).disabled)
             self.assertTrue(app.query_one(Input).has_focus)
 
             await pilot.press("tab")
@@ -737,7 +813,7 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("lionclaw> restored answer", app.state.transcript_text())
         self.assertEqual(app.state.activity_text(), "[status] peer approved")
 
-    async def test_submit_text_blocks_fresh_session_when_restore_is_pending_and_fails(self):
+    async def test_submit_text_opens_interactive_session_without_blocking_on_restore(self):
         app = _make_app()
         api = _FailingRestoreApi()
         app.api = api
@@ -746,13 +822,23 @@ class TerminalChannelAppTests(unittest.IsolatedAsyncioTestCase):
 
         accepted = await app.submit_text("hello")
 
-        self.assertFalse(accepted)
-        self.assertEqual(api.fetch_latest_calls, 1)
-        self.assertEqual(api.open_calls, 0)
-        self.assertIsNone(api.sent_text)
-        self.assertIsNone(app.state.active_session_id)
-        self.assertEqual(app.state.transcript_text(), "")
-        self.assertIn("send blocked: latest session restore failed", app.state.activity_text())
+        self.assertTrue(accepted)
+        self.assertEqual(api.fetch_latest_calls, 0)
+        self.assertEqual(api.open_calls, 1)
+        self.assertEqual(api.sent_text, "hello")
+        self.assertEqual(api.sent_session_id, "session-opened")
+        self.assertEqual(app.state.active_session_id, "session-1")
+
+    async def test_flush_outbox_renders_and_reports_terminal_delivery(self):
+        app = _make_app()
+        api = _OutboxApi()
+        app.api = api
+        _disable_rendering(app)
+
+        await app.flush_outbox()
+
+        self.assertEqual(api.outbox_reports, [("delivery-1", "delivered")])
+        self.assertIn("lionclaw> final answer", app.state.transcript_text())
 
 
 if __name__ == "__main__":

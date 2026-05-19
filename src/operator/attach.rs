@@ -225,10 +225,6 @@ pub(crate) async fn prepare_channel_attach<M: UnitManager>(
         Some(&channel.worker),
     )
     .with_context(|| format!("channel '{}' worker resolution failed", channel.id))?;
-    let effective_runtime_id = match requested_runtime_id.as_deref() {
-        Some(runtime_id) => Some(applied.config.resolve_runtime_id(Some(runtime_id))?),
-        None => None,
-    };
     let peer_id = requested_peer_id
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -262,9 +258,6 @@ pub(crate) async fn prepare_channel_attach<M: UnitManager>(
     }
     for (key, value) in resolve_required_channel_env(home, &channel.id, &channel.required_env)? {
         env.insert(key, value);
-    }
-    if let Some(runtime_id) = effective_runtime_id {
-        env.insert("LIONCLAW_RUNTIME_ID".to_string(), runtime_id);
     }
 
     Ok(ChannelAttachSpec {
@@ -865,7 +858,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn prepare_channel_attach_exports_requested_runtime_when_reusing_same_home_daemon() {
+    async fn prepare_channel_attach_does_not_export_requested_runtime_to_worker() {
         let (_temp_dir, home, manager, listener) =
             seed_interactive_channel_with_reserved_bind(ChannelLaunchMode::Interactive).await;
         let config = OperatorConfig::load(&home).await.expect("load config");
@@ -911,10 +904,7 @@ mod tests {
         .expect("prepare attach");
 
         let env = spec.env.into_iter().collect::<BTreeMap<_, _>>();
-        assert_eq!(
-            env.get("LIONCLAW_RUNTIME_ID").map(String::as_str),
-            Some("codex")
-        );
+        assert!(!env.contains_key("LIONCLAW_RUNTIME_ID"));
         assert!(
             !spec.started_managed_units,
             "same-home daemon should be reused"

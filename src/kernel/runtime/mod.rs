@@ -259,15 +259,29 @@ impl RuntimeMessageLane {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeArtifact {
+    pub artifact_id: String,
+    pub path: PathBuf,
+    pub filename: Option<String>,
+    pub mime_type: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum RuntimeEvent {
     MessageDelta {
         lane: RuntimeMessageLane,
         text: String,
     },
+    MessageBoundary {
+        lane: RuntimeMessageLane,
+    },
     Status {
         code: Option<String>,
         text: String,
+    },
+    Artifact {
+        artifact: RuntimeArtifact,
     },
     Done,
     Error {
@@ -277,6 +291,21 @@ pub enum RuntimeEvent {
 }
 
 pub type RuntimeEventSender = mpsc::UnboundedSender<RuntimeEvent>;
+
+pub fn append_streamed_text_delta(existing: &mut String, delta: &str) {
+    existing.push_str(delta);
+}
+
+pub fn append_streamed_text_boundary(existing: &mut String) {
+    if existing.trim().is_empty() || existing.ends_with("\n\n") {
+        return;
+    }
+    if existing.ends_with('\n') {
+        existing.push('\n');
+    } else {
+        existing.push_str("\n\n");
+    }
+}
 
 pub trait RuntimeProgramOutputParser: Send {
     fn parse_line(&mut self, line: &str) -> Vec<RuntimeEvent>;

@@ -10,13 +10,13 @@ class WorkerConfig:
     telegram_bot_token: str
     lionclaw_base_url: str
     channel_id: str
-    runtime_id: str | None
     stream_limit: int
     stream_wait_ms: int
     stream_start_mode: str
     consumer_id: str
     telegram_poll_timeout_secs: int
     telegram_loop_delay_secs: float
+    health_report_interval_secs: float
     runtime_dir: Path
     telegram_offset_file: Path
 
@@ -39,7 +39,6 @@ class WorkerConfig:
                 "LIONCLAW_BASE_URL", "http://127.0.0.1:8979"
             ),
             channel_id=channel_id,
-            runtime_id=_optional_env("LIONCLAW_RUNTIME_ID"),
             stream_limit=_int_env("LIONCLAW_STREAM_LIMIT", 100),
             stream_wait_ms=_int_env("LIONCLAW_STREAM_WAIT_MS", 30000),
             stream_start_mode=os.environ.get("LIONCLAW_STREAM_START_MODE", "resume"),
@@ -48,6 +47,9 @@ class WorkerConfig:
             ),
             telegram_poll_timeout_secs=_int_env("TELEGRAM_POLL_TIMEOUT_SECS", 25),
             telegram_loop_delay_secs=_float_env("TELEGRAM_LOOP_DELAY_SECS", 1.0),
+            health_report_interval_secs=_float_env(
+                "LIONCLAW_HEALTH_REPORT_INTERVAL_SECS", 60.0
+            ),
             runtime_dir=runtime_dir,
             telegram_offset_file=Path(
                 os.environ.get(
@@ -63,11 +65,6 @@ def _required_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"{name} is required")
     return value
-
-
-def _optional_env(name: str) -> str | None:
-    value = os.environ.get(name, "").strip()
-    return value or None
 
 
 def _int_env(name: str, default: int) -> int:
