@@ -1,0 +1,1394 @@
+use super::*;
+
+pub(crate) fn render_app(frame: &mut Frame<'_>, app: &mut ConsoleApp) {
+    let area = frame.area();
+    let composer_height = app.composer_height(area.height);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Min(10),
+            Constraint::Length(1),
+            Constraint::Length(composer_height),
+            Constraint::Length(1),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    let [header_area, _, body_area, _, composer_area, _, footer_area] = chunks.as_ref() else {
+        return;
+    };
+
+    render_header(frame, *header_area, app);
+    render_body(frame, *body_area, app);
+    render_composer(frame, *composer_area, app);
+    render_footer(frame, *footer_area, app);
+
+    if let Some(overlay) = app.overlay {
+        render_overlay(frame, area, app, overlay);
+    }
+}
+
+fn render_header(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(PANEL_MUTED));
+    frame.render_widget(block, area);
+    if area.height < 3 || area.width < 4 {
+        return;
+    }
+
+    let boundary = app.boundary_summary();
+    let workspace = boundary.workspace_compact().to_string();
+    let line = Line::from(vec![
+        Span::styled(
+            "LionClaw",
+            Style::default()
+                .fg(PANEL_BORDER)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  |  ", Style::default().fg(PANEL_MUTED)),
+        Span::styled(app.context_label(), Style::default().fg(Color::White)),
+        Span::raw("    "),
+        Span::styled(app.runtime_label(), Style::default().fg(Color::White)),
+        Span::raw("    "),
+        Span::styled("net:", Style::default().fg(PANEL_BORDER)),
+        Span::styled(boundary.network, Style::default().fg(Color::White)),
+        Span::raw("    "),
+        Span::styled("secrets:", Style::default().fg(PANEL_BORDER)),
+        Span::styled(
+            boundary.secrets,
+            Style::default().fg(if app.selected.is_ready() {
+                PANEL_WARN
+            } else {
+                PANEL_ERROR
+            }),
+        ),
+        Span::raw("    "),
+        Span::styled(workspace, Style::default().fg(Color::White)),
+        Span::raw("    "),
+        Span::styled("turn:", Style::default().fg(PANEL_BORDER)),
+        Span::styled(boundary.turn_timeout, Style::default().fg(Color::White)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line),
+        Rect {
+            x: area.x.saturating_add(2),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(4),
+            height: 1,
+        },
+    );
+}
+
+fn render_body(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
+    if app.project_mode() {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(44),
+                Constraint::Length(1),
+                Constraint::Min(40),
+                Constraint::Length(1),
+                Constraint::Length(44),
+            ])
+            .split(area);
+        let [instances_area, _, transcript_area, _, inspector_area] = chunks.as_ref() else {
+            render_transcript(frame, area, app);
+            return;
+        };
+        render_instances(frame, *instances_area, app);
+        render_transcript(frame, *transcript_area, app);
+        render_inspector(frame, *inspector_area, app);
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(40),
+                Constraint::Length(1),
+                Constraint::Length(44),
+            ])
+            .split(area);
+        let [transcript_area, _, inspector_area] = chunks.as_ref() else {
+            render_transcript(frame, area, app);
+            return;
+        };
+        render_transcript(frame, *transcript_area, app);
+        render_inspector(frame, *inspector_area, app);
+    }
+}
+
+struct ProjectListRow {
+    item: ListItem<'static>,
+    selection: Option<ProjectSelection>,
+}
+
+fn project_list_rows(app: &ConsoleApp, width: usize) -> Vec<ProjectListRow> {
+    let mut rows = Vec::new();
+
+    rows.push(project_list_heading(
+        "Instances",
+        Style::default().fg(Color::White),
+    ));
+    rows.push(project_list_spacer());
+
+    for (index, instance) in app.instances.iter().enumerate() {
+        rows.push(project_list_selection_row(
+            instance_project_line(
+                instance,
+                index == app.selected_index,
+                app.selected.is_ready(),
+                width,
+            ),
+            ProjectSelection::Instance(index),
+        ));
+    }
+
+    rows.push(project_list_spacer());
+    rows.push(project_list_heading(
+        "─".repeat(width),
+        Style::default().fg(PANEL_MUTED),
+    ));
+    rows.push(project_list_spacer());
+    rows.push(project_list_heading(
+        "Sessions",
+        Style::default().fg(Color::White),
+    ));
+    rows.push(project_list_spacer());
+    push_project_session_rows(&mut rows, &app.project_objects.sessions, width);
+
+    rows
+}
+
+fn project_list_heading(text: impl Into<String>, style: Style) -> ProjectListRow {
+    ProjectListRow {
+        item: ListItem::new(Line::styled(text.into(), style)),
+        selection: None,
+    }
+}
+
+fn project_list_static_row(line: Line<'static>) -> ProjectListRow {
+    ProjectListRow {
+        item: ListItem::new(line),
+        selection: None,
+    }
+}
+
+fn project_list_spacer() -> ProjectListRow {
+    ProjectListRow {
+        item: ListItem::new(Line::raw("")),
+        selection: None,
+    }
+}
+
+fn project_list_selection_row(line: Line<'static>, selection: ProjectSelection) -> ProjectListRow {
+    ProjectListRow {
+        item: ListItem::new(line),
+        selection: Some(selection),
+    }
+}
+
+fn project_list_selected_row(
+    rows: &[ProjectListRow],
+    selection: ProjectSelection,
+) -> Option<usize> {
+    rows.iter().position(|row| row.selection == Some(selection))
+}
+
+fn instance_project_line(
+    instance: &InstanceSummary,
+    active: bool,
+    selected_ready: bool,
+    width: usize,
+) -> Line<'static> {
+    let selected_blocked = active && !selected_ready;
+    let blocked = instance.work_root_finding.is_some() || selected_blocked;
+    let icon = if blocked {
+        "!"
+    } else if active && selected_ready {
+        "●"
+    } else {
+        "○"
+    };
+    let state = if blocked {
+        "blocked"
+    } else if instance.work_root.is_some() {
+        "ready"
+    } else {
+        "idle"
+    };
+    let default_mark = if instance.is_default { " default" } else { "" };
+    let shared = if instance.shared_work_root_count > 1 {
+        format!(" [{}]", instance.shared_work_root_count)
+    } else {
+        String::new()
+    };
+    let row = format_instance_row(
+        icon,
+        instance.display_name(),
+        &format!("{state}{default_mark}{shared}"),
+        width,
+    );
+    Line::styled(row, instance_row_style(state))
+}
+
+fn push_project_session_rows(
+    rows: &mut Vec<ProjectListRow>,
+    section: &ProjectObjectSection<ProjectSessionItem>,
+    width: usize,
+) {
+    match section {
+        ProjectObjectSection::Ready(sessions) => {
+            for session in sessions {
+                rows.push(project_list_selection_row(
+                    session_project_line(session, width),
+                    ProjectSelection::Session(session.session_id),
+                ));
+            }
+        }
+        ProjectObjectSection::Empty(message)
+        | ProjectObjectSection::Unavailable(message)
+        | ProjectObjectSection::Error(message) => {
+            rows.push(project_list_static_row(project_object_line(
+                message, "", true, width,
+            )));
+        }
+    }
+}
+
+fn session_project_line(session: &ProjectSessionItem, width: usize) -> Line<'static> {
+    project_object_line(&session.label(), &session.detail(), false, width)
+}
+
+fn project_object_line(name: &str, detail: &str, muted: bool, width: usize) -> Line<'static> {
+    let detail_width = 12.min(width.saturating_sub(10));
+    let name_width = width.saturating_sub(detail_width + 2).max(1);
+    let row = if detail.is_empty() {
+        format!(" {}", truncate_to(name, width.saturating_sub(1)))
+    } else {
+        format!(
+            " {:name_width$} {:>detail_width$}",
+            truncate_to(name, name_width),
+            truncate_to(detail, detail_width),
+        )
+    };
+    Line::styled(
+        row,
+        Style::default().fg(if muted { PANEL_MUTED } else { Color::White }),
+    )
+}
+
+fn render_instances(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
+    let content = render_panel_shell(frame, area, "Project", app.focus == Focus::Project);
+    if content.width < 8 || content.height < 2 {
+        return;
+    }
+
+    app.ensure_project_cursor();
+    let (list_area, scrollbar_area) = split_scrollable_area(content);
+    if list_area.width == 0 || list_area.height == 0 {
+        return;
+    }
+
+    let rows = project_list_rows(app, list_area.width as usize);
+    let row_count = rows.len();
+    let selected_row = project_list_selected_row(&rows, app.project_cursor);
+    app.project_list_state.select(selected_row);
+    let items = rows.into_iter().map(|row| row.item).collect::<Vec<_>>();
+    let list = List::new(items).highlight_style(Style::default().bg(PANEL_SELECTED));
+    frame.render_stateful_widget(list, list_area, &mut app.project_list_state);
+    render_vertical_scrollbar(
+        frame,
+        scrollbar_area,
+        row_count,
+        app.project_list_state.offset(),
+    );
+}
+
+fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
+    let content = render_panel_shell(frame, area, "Transcript", app.focus == Focus::Transcript);
+    if let SelectedInstanceState::Blocked { blocker, .. } = &app.selected {
+        let text = Text::from(launch_blocker_lines(blocker));
+        frame.render_widget(
+            Paragraph::new(text).wrap(Wrap { trim: false }),
+            content.inner(Margin {
+                vertical: 1,
+                horizontal: 1,
+            }),
+        );
+        return;
+    }
+
+    let lines = if app.transcript.is_empty() {
+        vec![Line::styled(
+            "No turns yet. Submit a prompt from the composer.",
+            Style::default().fg(PANEL_MUTED),
+        )]
+    } else {
+        transcript_render_lines(&app.transcript)
+    };
+    let activity_rows = if app.activity.is_empty() { 0 } else { 3 };
+    let transcript_viewport = Rect {
+        x: content.x,
+        y: content.y,
+        width: content.width,
+        height: content.height.saturating_sub(activity_rows),
+    };
+    let (transcript_area, scrollbar_area) = split_scrollable_area(transcript_viewport);
+    if transcript_area.width == 0 || transcript_area.height == 0 {
+        app.set_transcript_viewport(0, transcript_area.height);
+        return;
+    }
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let rendered_line_count = paragraph.line_count(transcript_area.width);
+    app.set_transcript_viewport(rendered_line_count, transcript_area.height);
+    let scroll = app.transcript_scroll.offset;
+    frame.render_widget(
+        paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+        transcript_area,
+    );
+    render_vertical_scrollbar(frame, scrollbar_area, rendered_line_count, scroll);
+    if activity_rows > 0 && content.height > activity_rows {
+        let rule_y = content.y + content.height - activity_rows;
+        draw_horizontal_rule(frame, content.x, rule_y, content.width, PANEL_MUTED);
+        let mut spans = vec![
+            Span::styled(
+                "activity",
+                Style::default()
+                    .fg(PANEL_BORDER)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  ▸  "),
+            Span::styled(app.activity.status.label(), app.activity.status.style()),
+            Span::raw(format!("    {} events", app.activity.event_count)),
+        ];
+        if app.activity.command_count > 0 {
+            spans.push(Span::raw(format!(
+                "    {} commands",
+                app.activity.command_count
+            )));
+        }
+        if app.activity.progress_count > 0 {
+            spans.push(Span::raw(format!(
+                "    {} progress notes",
+                app.activity.progress_count
+            )));
+        }
+        if let Some(elapsed) = app.activity.elapsed_label() {
+            spans.push(Span::styled(
+                format!("    {elapsed}"),
+                Style::default().fg(PANEL_BORDER),
+            ));
+        }
+        let activity = Line::from(spans);
+        frame.render_widget(
+            Paragraph::new(activity),
+            Rect {
+                x: content.x,
+                y: rule_y.saturating_add(1),
+                width: content.width,
+                height: 1,
+            },
+        );
+    }
+}
+
+fn launch_blocker_lines(blocker: &LaunchBlocker) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::styled(blocker.title.clone(), Style::default().fg(PANEL_ERROR)),
+        Line::raw(""),
+    ];
+    lines.extend(multiline_prefixed_lines(
+        "",
+        "",
+        Style::default().fg(Color::White),
+        &blocker.detail,
+    ));
+    lines.push(Line::raw(""));
+    lines.extend(multiline_prefixed_lines(
+        "",
+        "",
+        Style::default().fg(Color::White),
+        &blocker.suggestion,
+    ));
+    lines
+}
+
+pub(crate) fn transcript_render_lines(lines: &[TranscriptLine]) -> Vec<Line<'static>> {
+    let mut rendered = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            rendered.push(Line::raw(""));
+        }
+        let (role, style) = match line.kind {
+            TranscriptLineKind::User => (
+                "you",
+                Style::default()
+                    .fg(PANEL_BORDER)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            TranscriptLineKind::Answer => (
+                "lionclaw",
+                Style::default()
+                    .fg(PANEL_BORDER)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            TranscriptLineKind::Status => ("note", Style::default().fg(PANEL_MUTED)),
+            TranscriptLineKind::Error => ("error", Style::default().fg(PANEL_ERROR)),
+        };
+        rendered.push(Line::styled(role.to_string(), style));
+        match line.kind {
+            TranscriptLineKind::Answer => rendered.extend(transcript_markdown_lines(&line.text)),
+            TranscriptLineKind::User | TranscriptLineKind::Status | TranscriptLineKind::Error => {
+                rendered.extend(multiline_prefixed_lines(
+                    "",
+                    "",
+                    Style::default().fg(Color::White),
+                    &line.text,
+                ));
+            }
+        }
+    }
+    rendered
+}
+
+#[derive(Clone, Copy)]
+struct TranscriptMarkdownStyleSheet;
+
+impl tui_markdown::StyleSheet for TranscriptMarkdownStyleSheet {
+    fn heading(&self, _level: u8) -> Style {
+        Style::default()
+            .fg(PANEL_BORDER)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn code(&self) -> Style {
+        Style::default().fg(PANEL_WARN)
+    }
+
+    fn link(&self) -> Style {
+        Style::default()
+            .fg(PANEL_BORDER)
+            .add_modifier(Modifier::UNDERLINED)
+    }
+
+    fn blockquote(&self) -> Style {
+        Style::default().fg(PANEL_MUTED)
+    }
+
+    fn heading_meta(&self) -> Style {
+        Style::default().fg(PANEL_MUTED)
+    }
+
+    fn metadata_block(&self) -> Style {
+        Style::default().fg(PANEL_MUTED)
+    }
+}
+
+fn transcript_markdown_lines(text: &str) -> Vec<Line<'static>> {
+    let input = markdown_with_preserved_line_breaks(text);
+    let options = tui_markdown::Options::new(TranscriptMarkdownStyleSheet);
+    let rendered = tui_markdown::from_str_with_options(&input, &options);
+    let lines = rendered
+        .lines
+        .into_iter()
+        .map(owned_transcript_line)
+        .filter(|line| !is_rendered_code_fence_marker(line))
+        .collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        vec![Line::raw("")]
+    } else {
+        lines
+    }
+}
+
+fn is_rendered_code_fence_marker(line: &Line<'_>) -> bool {
+    let mut spans = line.spans.iter();
+    let Some(span) = spans.next() else {
+        return false;
+    };
+    if spans.next().is_some() {
+        return false;
+    }
+    let text = span.content.trim();
+    text == "```"
+        || text
+            .strip_prefix("```")
+            .is_some_and(is_markdown_info_string)
+}
+
+fn is_markdown_info_string(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '+' | '#'))
+}
+
+fn markdown_with_preserved_line_breaks(text: &str) -> String {
+    let mut output = String::with_capacity(text.len() + text.matches('\n').count() * 2);
+    let mut in_fenced_code = false;
+
+    for segment in text.split_inclusive('\n') {
+        let (line, had_newline) = segment
+            .strip_suffix('\n')
+            .map_or((segment, false), |line| (line, true));
+        let fence_line = is_markdown_fence_line(line);
+        if fence_line && !in_fenced_code {
+            ensure_markdown_blank_line(&mut output);
+        }
+        let preserve_soft_break = !in_fenced_code && !fence_line && !line.trim().is_empty();
+
+        output.push_str(line);
+        if had_newline {
+            if preserve_soft_break {
+                output.push_str("  \n");
+            } else {
+                output.push('\n');
+            }
+        }
+        if fence_line {
+            in_fenced_code = !in_fenced_code;
+        }
+    }
+
+    output
+}
+
+fn ensure_markdown_blank_line(output: &mut String) {
+    if output.is_empty() || output.ends_with("\n\n") {
+        return;
+    }
+    if output.ends_with('\n') {
+        output.push('\n');
+    } else {
+        output.push_str("\n\n");
+    }
+}
+
+fn is_markdown_fence_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+fn owned_transcript_line(line: Line<'_>) -> Line<'static> {
+    let spans = line
+        .spans
+        .into_iter()
+        .map(|span| {
+            let mut style = span.style;
+            if style.fg.is_none() {
+                style.fg = Some(Color::White);
+            }
+            Span::styled(span.content.into_owned(), style)
+        })
+        .collect();
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        spans,
+    }
+}
+
+pub(super) fn vertical_scroll_limit(line_count: usize, viewport_height: u16) -> usize {
+    line_count
+        .saturating_sub(viewport_height as usize)
+        .min(u16::MAX as usize)
+}
+
+fn split_scrollable_area(area: Rect) -> (Rect, Rect) {
+    let scrollbar_width = if area.width > 0 { 1 } else { 0 };
+    let text_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width.saturating_sub(scrollbar_width),
+        height: area.height,
+    };
+    let scrollbar_area = Rect {
+        x: area.x + area.width.saturating_sub(scrollbar_width),
+        y: area.y,
+        width: scrollbar_width,
+        height: area.height,
+    };
+    (text_area, scrollbar_area)
+}
+
+fn render_vertical_scrollbar(frame: &mut Frame<'_>, area: Rect, line_count: usize, scroll: usize) {
+    if line_count <= area.height as usize || area.width == 0 || area.height == 0 {
+        return;
+    }
+    let position = scrollbar_position_for_pane_offset(scroll, line_count, area.height);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(Some("^"))
+        .end_symbol(Some("v"))
+        .thumb_style(Style::default().fg(PANEL_BORDER))
+        .track_style(Style::default().fg(PANEL_MUTED));
+    let mut state = ScrollbarState::new(line_count)
+        .viewport_content_length(area.height as usize)
+        .position(position);
+    frame.render_stateful_widget(scrollbar, area, &mut state);
+}
+
+pub(super) fn scrollbar_position_for_pane_offset(
+    scroll: usize,
+    line_count: usize,
+    viewport_height: u16,
+) -> usize {
+    let max_offset = vertical_scroll_limit(line_count, viewport_height);
+    if max_offset == 0 {
+        return 0;
+    }
+    let max_position = line_count.saturating_sub(1);
+    let numerator = (scroll.min(max_offset) as u128) * (max_position as u128);
+    ((numerator + (max_offset as u128 / 2)) / max_offset as u128) as usize
+}
+
+fn multiline_prefixed_lines(
+    first_prefix: &str,
+    continuation_prefix: &str,
+    prefix_style: Style,
+    text: &str,
+) -> Vec<Line<'static>> {
+    if text.is_empty() {
+        return vec![Line::from(vec![Span::styled(
+            first_prefix.to_string(),
+            prefix_style,
+        )])];
+    }
+    text.lines()
+        .enumerate()
+        .map(|(index, line)| {
+            let prefix = if index == 0 {
+                first_prefix
+            } else {
+                continuation_prefix
+            };
+            Line::from(vec![
+                Span::styled(prefix.to_string(), prefix_style),
+                Span::raw(line.to_string()),
+            ])
+        })
+        .collect()
+}
+
+fn render_inspector(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
+    let title = format!("Inspector  {}", app.inspector_subject.label(app));
+    let content = render_panel_shell(frame, area, &title, app.focus == Focus::Inspectors);
+    if content.width < 8 || content.height < 4 {
+        return;
+    }
+
+    match app.inspector_subject {
+        InspectorSubject::Selection if app.focus == Focus::Project => {
+            render_project_cursor_inspector(frame, content, app)
+        }
+        InspectorSubject::Selection => render_instance_inspector(frame, content, app),
+        InspectorSubject::Runtime => render_runtime_inspector(frame, content, app),
+        InspectorSubject::Boundary => render_boundary_inspector(frame, content, app),
+        InspectorSubject::Activity => render_activity_inspector(frame, content, app),
+        InspectorSubject::Audit => render_audit_inspector(frame, content, app),
+    }
+}
+
+fn render_project_cursor_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp) {
+    let row_width = inspector_body(content).width as usize;
+    match app.project_cursor {
+        ProjectSelection::Instance(index) => {
+            let Some(instance) = app.instances.get(index) else {
+                render_inspector_lines(
+                    frame,
+                    content,
+                    vec![Line::styled(
+                        "Project item is no longer available.",
+                        Style::default().fg(PANEL_MUTED),
+                    )],
+                );
+                return;
+            };
+            let active = index == app.selected_index;
+            let blocked =
+                instance.work_root_finding.is_some() || (active && !app.selected.is_ready());
+            let state = if blocked {
+                "blocked"
+            } else if instance.work_root.is_some() {
+                "ready"
+            } else {
+                "idle"
+            };
+            let icon = if blocked {
+                "!"
+            } else if active {
+                "●"
+            } else {
+                "○"
+            };
+            let mut lines = vec![
+                section_line(icon, if active { "Active" } else { "Instance" }),
+                Line::raw(""),
+                kv_line("instance", instance.display_name()),
+                kv_line("state", state),
+            ];
+            if let Some(runtime) = instance.default_runtime.as_deref() {
+                lines.push(kv_line("runtime", runtime));
+            }
+            if instance.is_default {
+                lines.push(kv_line("default", "yes"));
+            }
+            if let Some(work_root) = instance.work_root.as_ref() {
+                lines.push(kv_path_line("work root", work_root, row_width));
+            }
+            if let Some(reason) = instance.work_root_finding.as_deref() {
+                lines.push(kv_line("reason", reason));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                if active {
+                    "Current runtime context."
+                } else {
+                    "Enter asks before switching context."
+                },
+                Style::default().fg(PANEL_MUTED),
+            ));
+            render_inspector_lines(frame, content, lines);
+        }
+        ProjectSelection::Session(session_id) => {
+            let Some(session) = app.project_session(session_id) else {
+                render_inspector_lines(
+                    frame,
+                    content,
+                    vec![Line::styled(
+                        "Session is no longer available.",
+                        Style::default().fg(PANEL_MUTED),
+                    )],
+                );
+                return;
+            };
+            let mut lines = vec![
+                section_line(if session.current { "●" } else { "◷" }, "Session"),
+                Line::raw(""),
+                kv_line("session", &short_session_id(session.session_id)),
+                kv_line(
+                    "state",
+                    if session.current {
+                        "current"
+                    } else {
+                        "available"
+                    },
+                ),
+                kv_line("turns", &session.detail()),
+                Line::raw(""),
+                Line::styled(
+                    if session.current {
+                        "Current conversation for this instance."
+                    } else {
+                        "Enter opens this conversation."
+                    },
+                    Style::default().fg(PANEL_MUTED),
+                ),
+            ];
+            if !session.current {
+                lines.push(Line::styled(
+                    "Composer text is preserved unless you confirm clearing it.",
+                    Style::default().fg(PANEL_MUTED),
+                ));
+            }
+            render_inspector_lines(frame, content, lines);
+        }
+    }
+}
+
+fn render_inspector_lines(frame: &mut Frame<'_>, content: Rect, lines: Vec<Line<'static>>) {
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        inspector_body(content),
+    );
+}
+
+fn render_instance_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp) {
+    if let SelectedInstanceState::Blocked { blocker, .. } = &app.selected {
+        let text = Text::from(vec![
+            section_line("!", "Selected"),
+            Line::raw(""),
+            kv_line("instance", app.selected_name()),
+            kv_line("state", "blocked"),
+            kv_line("reason", &blocker.title),
+            Line::raw(""),
+            Line::styled(
+                "Launch guidance is shown in the transcript pane.",
+                Style::default().fg(PANEL_MUTED),
+            ),
+        ]);
+        frame.render_widget(
+            Paragraph::new(text).wrap(Wrap { trim: false }),
+            inspector_body(content),
+        );
+        return;
+    }
+
+    let SelectedInstanceState::Ready(ready) = &app.selected else {
+        return;
+    };
+    let row_width = inspector_body(content).width as usize;
+    let mut lines = vec![
+        section_line("●", "Selected"),
+        Line::raw(""),
+        kv_line("instance", app.selected_name()),
+        kv_line("runtime", &app.runtime_label()),
+        kv_line("kind", &app.runtime_kind_label()),
+        kv_line("session", &short_session_id(ready.session_id)),
+    ];
+    if let Some(work_root) = ready.summary.work_root.as_ref() {
+        lines.push(kv_path_line("work root", work_root, row_width));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Use Left/Right in the inspector for runtime, boundary, activity, and audit details.",
+        Style::default().fg(PANEL_MUTED),
+    ));
+
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        inspector_body(content),
+    );
+}
+
+fn render_runtime_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp) {
+    let SelectedInstanceState::Ready(ready) = &app.selected else {
+        render_inspector_lines(
+            frame,
+            content,
+            vec![Line::styled(
+                "Runtime unavailable while launch is blocked.",
+                Style::default().fg(PANEL_MUTED),
+            )],
+        );
+        return;
+    };
+
+    let mut lines = vec![
+        section_line("◉", "Runtime"),
+        Line::raw(""),
+        kv_line("profile", &ready.runtime_id),
+        kv_line("kind", &ready.runtime_kind),
+        kv_line("executable", &ready.runtime_executable),
+    ];
+    if let Some(model) = ready.runtime_model.as_deref() {
+        lines.push(kv_line("model", model));
+    }
+    if let Some(agent) = ready.runtime_agent.as_deref() {
+        lines.push(kv_line("agent", agent));
+    }
+    lines.push(kv_line(
+        "selected by",
+        if ready.runtime_override.is_some() {
+            "run argument"
+        } else {
+            "instance default"
+        },
+    ));
+    lines.push(kv_line("session", &short_session_id(ready.session_id)));
+    render_inspector_lines(frame, content, lines);
+}
+
+fn render_boundary_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp) {
+    if !app.selected.is_ready() {
+        render_inspector_lines(
+            frame,
+            content,
+            vec![Line::styled(
+                "Boundary unavailable while launch is blocked.",
+                Style::default().fg(PANEL_MUTED),
+            )],
+        );
+        return;
+    }
+
+    let boundary = app.boundary_summary();
+    let mut lines = vec![section_line("▱", "Boundary"), Line::raw("")];
+    for row in boundary_display_rows(&boundary) {
+        lines.push(kv_line(row.label, &row.value));
+    }
+    render_inspector_lines(frame, content, lines);
+}
+
+fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
+    let border_style = if app.focus == Focus::Composer {
+        Style::default().fg(PANEL_BORDER)
+    } else {
+        Style::default().fg(PANEL_MUTED)
+    };
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style),
+        area,
+    );
+    if area.width < 4 || area.height < 4 {
+        return;
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::styled(">", Style::default().fg(PANEL_BORDER))),
+        Rect {
+            x: area.x.saturating_add(2),
+            y: area.y.saturating_add(1),
+            width: 1,
+            height: 1,
+        },
+    );
+    frame.render_widget(
+        app.composer.widget(),
+        Rect {
+            x: area.x.saturating_add(5),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(7),
+            height: area.height.saturating_sub(4),
+        },
+    );
+
+    let rule_y = area.y + area.height - 3;
+    draw_horizontal_rule(
+        frame,
+        area.x.saturating_add(1),
+        rule_y,
+        area.width.saturating_sub(2),
+        PANEL_MUTED,
+    );
+    let mode = if app.active() { "running" } else { "normal" };
+    let status = Line::from(vec![Span::styled(mode, Style::default().fg(PANEL_BORDER))]);
+    frame.render_widget(
+        Paragraph::new(status),
+        Rect {
+            x: area.x.saturating_add(2),
+            y: rule_y.saturating_add(1),
+            width: area.width.saturating_sub(4),
+            height: 1,
+        },
+    );
+}
+
+fn render_activity_inspector(frame: &mut Frame<'_>, content: Rect, app: &mut ConsoleApp) {
+    let mut lines = Vec::new();
+    if app.activity.is_empty() {
+        lines.push(Line::styled(
+            "No runtime activity for the current turn.",
+            Style::default().fg(PANEL_MUTED),
+        ));
+    } else {
+        lines.push(Line::from(vec![
+            Span::raw("status "),
+            Span::styled(app.activity.status.label(), app.activity.status.style()),
+        ]));
+        lines.push(Line::raw(format!("events {}", app.activity.event_count)));
+        if app.activity.command_count > 0 {
+            lines.push(Line::raw(format!(
+                "commands {}",
+                app.activity.command_count
+            )));
+        }
+        if app.activity.progress_count > 0 {
+            lines.push(Line::raw(format!(
+                "progress notes {}",
+                app.activity.progress_count
+            )));
+        }
+        lines.push(Line::raw(""));
+        for item in &app.activity.items {
+            lines.extend(activity_item_lines(item));
+        }
+    }
+
+    let viewport = content.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let (text_area, scrollbar_area) = split_scrollable_area(viewport);
+    if text_area.width == 0 || text_area.height == 0 {
+        app.set_activity_viewport(0, text_area.height);
+        return;
+    }
+    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    let rendered_line_count = paragraph.line_count(text_area.width);
+    app.set_activity_viewport(rendered_line_count, text_area.height);
+    let scroll = app.activity_scroll.offset;
+    frame.render_widget(
+        paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+        text_area,
+    );
+    render_vertical_scrollbar(frame, scrollbar_area, rendered_line_count, scroll);
+}
+
+fn render_audit_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp) {
+    let lines = match &app.audit {
+        AuditTrail::Ready(events) => {
+            let mut lines = vec![section_line("▣", "Recent Audit"), Line::raw("")];
+            for event in events {
+                lines.extend(audit_event_lines(event));
+            }
+            lines
+        }
+        AuditTrail::Empty => vec![Line::styled(
+            "No recent audit events for this session.",
+            Style::default().fg(PANEL_MUTED),
+        )],
+        AuditTrail::Unavailable(message) => vec![Line::styled(
+            message.clone(),
+            Style::default().fg(PANEL_MUTED),
+        )],
+    };
+    render_inspector_lines(frame, content, lines);
+}
+
+fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(PANEL_MUTED)),
+        area,
+    );
+    if area.height < 3 || area.width < 4 {
+        return;
+    }
+    let mut spans = footer_hint_spans();
+    if app.focus == Focus::Project {
+        spans.push(Span::raw("  "));
+        spans.push(key_span("Enter"));
+        spans.push(Span::raw(match app.project_cursor {
+            ProjectSelection::Instance(index) if index == app.selected_index => " Current",
+            ProjectSelection::Instance(_) => " Switch",
+            ProjectSelection::Session(_) => " Open",
+        }));
+    }
+    let line = Line::from(spans);
+    frame.render_widget(
+        Paragraph::new(line),
+        Rect {
+            x: area.x.saturating_add(2),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(4),
+            height: 1,
+        },
+    );
+}
+
+fn inspector_body(content: Rect) -> Rect {
+    content.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    })
+}
+
+fn render_panel_shell(frame: &mut Frame<'_>, area: Rect, title: &str, focused: bool) -> Rect {
+    let border_style = if focused {
+        Style::default().fg(PANEL_BORDER)
+    } else {
+        Style::default().fg(PANEL_MUTED)
+    };
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style),
+        area,
+    );
+    if area.width > 4 && area.height > 3 {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                if focused {
+                    format!("▶ {title}")
+                } else {
+                    title.to_string()
+                },
+                Style::default().fg(PANEL_BORDER).add_modifier(if focused {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+            )),
+            Rect {
+                x: area.x.saturating_add(2),
+                y: area.y.saturating_add(1),
+                width: area.width.saturating_sub(4),
+                height: 1,
+            },
+        );
+        draw_horizontal_rule(
+            frame,
+            area.x.saturating_add(1),
+            area.y.saturating_add(2),
+            area.width.saturating_sub(2),
+            PANEL_MUTED,
+        );
+    }
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(3),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(4),
+    }
+}
+
+fn draw_horizontal_rule(frame: &mut Frame<'_>, x: u16, y: u16, width: u16, color: Color) {
+    if width == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new("─".repeat(width as usize)).style(Style::default().fg(color)),
+        Rect {
+            x,
+            y,
+            width,
+            height: 1,
+        },
+    );
+}
+
+fn format_instance_row(icon: &str, name: &str, state: &str, width: usize) -> String {
+    let name_width = 14.min(width.saturating_sub(14)).max(4);
+    let state_width = width.saturating_sub(name_width + 5).max(3);
+    let mut row = format!(
+        " {icon} {:name_width$} {:>state_width$}",
+        truncate_to(name, name_width),
+        truncate_to(state, state_width),
+    );
+    if row.chars().count() > width {
+        row = truncate_to(&row, width);
+    }
+    while row.chars().count() < width {
+        row.push(' ');
+    }
+    row
+}
+
+fn instance_row_style(state: &str) -> Style {
+    let fg = match state {
+        "ready" => PANEL_READY,
+        "blocked" => PANEL_ERROR,
+        _ => Color::White,
+    };
+    Style::default().fg(fg)
+}
+
+fn section_line(icon: &'static str, label: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{icon}  "), Style::default().fg(PANEL_BORDER)),
+        Span::styled(
+            label,
+            Style::default()
+                .fg(PANEL_BORDER)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn kv_line(label: &'static str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {label:<KV_LABEL_WIDTH$}"),
+            Style::default().fg(PANEL_MUTED),
+        ),
+        Span::raw(value.to_string()),
+    ])
+}
+
+fn kv_path_line(label: &'static str, path: &Path, row_width: usize) -> Line<'static> {
+    let value_width = row_width.saturating_sub(KV_LABEL_WIDTH + 2);
+    kv_line(
+        label,
+        &middle_elide(&path.display().to_string(), value_width),
+    )
+}
+
+pub(super) fn boundary_display_rows(boundary: &BoundarySummary) -> Vec<BoundaryDisplayRow> {
+    vec![
+        BoundaryDisplayRow::new("workspace", boundary.workspace_display()),
+        BoundaryDisplayRow::new("network", boundary.network.clone()),
+        BoundaryDisplayRow::new("secrets", boundary.secrets.clone()),
+        BoundaryDisplayRow::new("runtime home", "private"),
+        BoundaryDisplayRow::new("skills", "read-only"),
+        BoundaryDisplayRow::new("preset", boundary.preset.clone()),
+        BoundaryDisplayRow::new("turn timeout", boundary.turn_timeout.clone()),
+    ]
+}
+
+pub(super) fn activity_item_lines(item: &ActivityItem) -> Vec<Line<'static>> {
+    let (icon, style) = match item.kind {
+        ActivityItemKind::Done => ("✓", Style::default().fg(PANEL_READY)),
+        ActivityItemKind::Command => ("→", Style::default().fg(PANEL_BORDER)),
+        ActivityItemKind::Progress => ("•", Style::default().fg(PANEL_BORDER)),
+        ActivityItemKind::Status => ("→", Style::default().fg(PANEL_MUTED)),
+        ActivityItemKind::Error => ("!", Style::default().fg(PANEL_ERROR)),
+    };
+    multiline_prefixed_lines(&format!("{icon}  "), "   ", style, &item.text)
+}
+
+fn audit_event_lines(event: &AuditEventItem) -> Vec<Line<'static>> {
+    let (icon, style) = audit_event_icon(&event.event_type);
+    let mut lines = multiline_prefixed_lines(
+        &format!("{icon}  "),
+        "   ",
+        style,
+        &format!("{}  {}", event.timestamp, event.summary),
+    );
+    if let Some(actor) = event.actor.as_deref() {
+        lines.push(Line::styled(
+            format!("   actor {actor}"),
+            Style::default().fg(PANEL_MUTED),
+        ));
+    }
+    if let Some(session_id) = event.session_id {
+        lines.push(Line::styled(
+            format!("   session {}", short_session_id(session_id)),
+            Style::default().fg(PANEL_MUTED),
+        ));
+    }
+    lines
+}
+
+fn audit_event_icon(event_type: &str) -> (&'static str, Style) {
+    if event_type.contains("deny") || event_type.contains("error") || event_type.contains("failed")
+    {
+        ("!", Style::default().fg(PANEL_ERROR))
+    } else {
+        ("✓", Style::default().fg(PANEL_READY))
+    }
+}
+
+fn key_span(key: &'static str) -> Span<'static> {
+    Span::styled(
+        key,
+        Style::default()
+            .fg(PANEL_BORDER)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+pub(super) fn footer_hint_spans() -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for binding in GLOBAL_KEY_BINDINGS
+        .iter()
+        .filter(|binding| binding.show_in_footer)
+    {
+        if !spans.is_empty() {
+            spans.push(Span::raw("   "));
+        }
+        let hint = binding.hint;
+        spans.push(key_span(hint.key));
+        spans.push(Span::raw(" "));
+        spans.push(Span::raw(hint.label));
+    }
+    spans
+}
+
+fn help_overlay_lines() -> Vec<Line<'static>> {
+    let mut lines = vec![
+        section_line("▣", "LionClaw"),
+        Line::from("/lionclaw continue"),
+        Line::from("/lionclaw retry"),
+        Line::from("/lionclaw reset"),
+        Line::from("/lionclaw exit"),
+        Line::raw(""),
+    ];
+    push_global_help_section(&mut lines);
+    lines.push(Line::raw(""));
+    push_help_section(&mut lines, "Context", HELP_CONTEXT_KEY_HINTS);
+    lines
+}
+
+fn push_global_help_section(lines: &mut Vec<Line<'static>>) {
+    lines.push(section_line("▣", "Global"));
+    for binding in GLOBAL_KEY_BINDINGS {
+        push_help_hint(lines, binding.hint);
+    }
+}
+
+fn push_help_section(lines: &mut Vec<Line<'static>>, title: &'static str, hints: &[KeyHint]) {
+    lines.push(section_line("▣", title));
+    for hint in hints {
+        push_help_hint(lines, *hint);
+    }
+}
+
+fn push_help_hint(lines: &mut Vec<Line<'static>>, hint: KeyHint) {
+    lines.push(Line::from(vec![
+        key_span(hint.key),
+        Span::raw("  "),
+        Span::raw(hint.description),
+    ]));
+}
+
+fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp, overlay: Overlay) {
+    let popup = centered_rect(70, 55, area);
+    frame.render_widget(Clear, popup);
+    let (title, lines) = match overlay {
+        Overlay::Help => (" Commands ", help_overlay_lines()),
+        Overlay::ExitConfirm => (
+            " Exit ",
+            vec![
+                Line::from("Press y to exit."),
+                Line::from("Press Esc to return to the console."),
+            ],
+        ),
+        Overlay::InstanceSwitchConfirm { target_index } => {
+            let target_name = app
+                .instances
+                .get(target_index)
+                .map(InstanceSummary::display_name)
+                .unwrap_or("selected instance");
+            (
+                " Switch Instance ",
+                vec![
+                    Line::from(format!(
+                        "Switch from {} to {target_name}?",
+                        app.selected_name()
+                    )),
+                    Line::from("This changes the active runtime context, transcript, composer, and activity."),
+                    Line::from("Press y to switch."),
+                    Line::from("Press Esc to stay on the current instance."),
+                ],
+            )
+        }
+        Overlay::SessionSwitchConfirm { session_id } => (
+            " Switch Session ",
+            vec![
+                Line::from(format!("Open session {}?", short_session_id(session_id))),
+                Line::from("This clears the current composer text and loads that transcript."),
+                Line::from("Press y to switch."),
+                Line::from("Press Esc to stay on the current session."),
+            ],
+        ),
+    };
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().title(title).borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, popup);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    let [_, vertical_area, _] = vertical.as_ref() else {
+        return area;
+    };
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(*vertical_area);
+    let [_, horizontal_area, _] = horizontal.as_ref() else {
+        return area;
+    };
+    horizontal_area.inner(Margin {
+        vertical: 0,
+        horizontal: 1,
+    })
+}

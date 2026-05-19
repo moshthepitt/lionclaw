@@ -84,6 +84,31 @@ cd "$PROJ_A"
 "$LIONCLAW_BIN" run
 ```
 
+Expected on a TTY:
+
+- a full-screen operator console opens
+- the instance list shows the configured project instances
+- the top ribbon shows the selected project instance, runtime, boundary flags,
+  and timeout
+- the transcript pane shows durable user and assistant messages without raw
+  runtime event spam
+- the inspector shows selected instance, runtime, boundary, activity, and
+  honest audit details; `Left`/`Right` cycle those views when it is focused
+- the composer accepts printable characters such as `?`; `Tab` visibly moves
+  focus, and `Ctrl+D` exits when idle
+
+For the plain fallback:
+
+```bash
+printf '/lionclaw exit\n' | "$LIONCLAW_BIN" run
+"$LIONCLAW_BIN" run --plain
+```
+
+Expected:
+
+- piped non-TTY usage avoids the console
+- `--plain` uses the line-oriented prompt even on a TTY
+
 Use these prompts:
 
 ```text

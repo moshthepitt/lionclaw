@@ -266,6 +266,7 @@ impl StreamLaneDto {
 #[serde(rename_all = "snake_case")]
 pub enum StreamEventKindDto {
     MessageDelta,
+    MessageBoundary,
     Status,
     Error,
     TurnCompleted,
@@ -276,6 +277,7 @@ impl StreamEventKindDto {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::MessageDelta => "message_delta",
+            Self::MessageBoundary => "message_boundary",
             Self::Status => "status",
             Self::Error => "error",
             Self::TurnCompleted => "turn_completed",

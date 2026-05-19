@@ -78,13 +78,13 @@ pub(crate) async fn run_local_with_io<R: BufRead + Send, W: Write + Send>(
     .await
 }
 
-struct RunLocalInvocation<'a> {
-    home: &'a LionClawHome,
-    work_root: &'a Path,
-    instance_name: Option<&'a str>,
-    requested_runtime: Option<String>,
-    continue_last_session: bool,
-    timeout_override: Option<RuntimeTurnTimeouts>,
+pub(crate) struct RunLocalInvocation<'a> {
+    pub(crate) home: &'a LionClawHome,
+    pub(crate) work_root: &'a Path,
+    pub(crate) instance_name: Option<&'a str>,
+    pub(crate) requested_runtime: Option<String>,
+    pub(crate) continue_last_session: bool,
+    pub(crate) timeout_override: Option<RuntimeTurnTimeouts>,
 }
 
 async fn run_local_with_io_and_timeouts<R: BufRead + Send, W: Write + Send>(
@@ -135,7 +135,7 @@ async fn run_local_with_io_and_timeouts<R: BufRead + Send, W: Write + Send>(
     .await
 }
 
-fn resolve_run_runtime_id(
+pub(crate) fn resolve_run_runtime_id(
     config: &crate::operator::config::OperatorConfig,
     requested_runtime: Option<&str>,
     instance_name: &str,
@@ -290,7 +290,7 @@ fn local_user_id() -> String {
         .unwrap_or_else(|| "local-user".to_string())
 }
 
-fn local_peer_id_for_project(project_root: &Path) -> String {
+pub(crate) fn local_peer_id_for_project(project_root: &Path) -> String {
     format!(
         "{}@project:{}",
         local_user_id(),
@@ -298,11 +298,11 @@ fn local_peer_id_for_project(project_root: &Path) -> String {
     )
 }
 
-fn kernel_to_anyhow(err: crate::kernel::KernelError) -> anyhow::Error {
+pub(crate) fn kernel_to_anyhow(err: crate::kernel::KernelError) -> anyhow::Error {
     anyhow!(err.to_string())
 }
 
-async fn resolve_repl_session(
+pub(crate) async fn resolve_repl_session(
     kernel: &Kernel,
     peer_id: &str,
     continue_last_session: bool,
@@ -395,7 +395,7 @@ fn render_session_history_turn<W: Write>(turn: &SessionTurnView, output: &mut W)
     Ok(())
 }
 
-fn partial_history_marker(status: SessionTurnStatus) -> &'static str {
+pub(crate) fn partial_history_marker(status: SessionTurnStatus) -> &'static str {
     match status {
         SessionTurnStatus::TimedOut => {
             "[partial] previous assistant reply timed out before completion"
@@ -590,6 +590,7 @@ fn render_turn_event<W: Write>(event: &StreamEventDto, output: &mut W) -> Result
             writeln!(output, "[error] {text}")?;
         }
         (StreamEventKindDto::TurnCompleted, _, _)
+        | (StreamEventKindDto::MessageBoundary, _, _)
         | (StreamEventKindDto::Done, _, _)
         | (_, _, None) => {}
         (_, _, Some(text)) => {

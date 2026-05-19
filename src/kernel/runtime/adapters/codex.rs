@@ -580,12 +580,13 @@ struct CodexAppServerClient<T> {
     failed_turns: HashMap<String, String>,
     unmatched_turn_failure: Option<String>,
     started_thread_turns: HashMap<String, String>,
+    agent_message_lanes: HashMap<String, RuntimeMessageLane>,
+    active_agent_message_item_id: Option<String>,
+    active_answer_item_ids: HashSet<String>,
+    last_answer_item_id: Option<String>,
     completed_context_compaction_threads: HashSet<String>,
     unmatched_context_compaction_completed: bool,
     emitted_artifact_ids: HashSet<String>,
-    answer_delta_item_id: Option<String>,
-    answer_stream_has_text: bool,
-    answer_stream_ends_with_newline: bool,
 }
 
 impl<T> CodexAppServerClient<T>
@@ -602,12 +603,13 @@ where
             failed_turns: HashMap::new(),
             unmatched_turn_failure: None,
             started_thread_turns: HashMap::new(),
+            agent_message_lanes: HashMap::new(),
+            active_agent_message_item_id: None,
+            active_answer_item_ids: HashSet::new(),
+            last_answer_item_id: None,
             completed_context_compaction_threads: HashSet::new(),
             unmatched_context_compaction_completed: false,
             emitted_artifact_ids: HashSet::new(),
-            answer_delta_item_id: None,
-            answer_stream_has_text: false,
-            answer_stream_ends_with_newline: false,
         }
     }
 
@@ -993,7 +995,7 @@ where
                 }));
             }
             "turn/started" => {
-                self.reset_answer_stream_state();
+                self.reset_turn_message_state();
                 if let (Some(thread_id), Some(turn_id)) = (
                     extract_app_server_thread_id(params),
                     extract_app_server_turn_id(params),
@@ -1006,7 +1008,7 @@ where
                 }));
             }
             "turn/completed" => {
-                self.reset_answer_stream_state();
+                self.reset_turn_message_state();
                 if let Some(message) = completed_turn_error_text(params) {
                     self.remember_turn_failure(params, message);
                 } else {
@@ -1027,18 +1029,11 @@ where
             }
             "item/agentMessage/delta" => {
                 if let Some(text) = app_server_text(params, &["delta", "text", "content"]) {
-                    let item_id = app_server_item_id(params);
-                    if self.should_separate_answer_item(item_id.as_deref(), &text) {
-                        drop(events.send(RuntimeEvent::MessageDelta {
-                            lane: RuntimeMessageLane::Answer,
-                            text: "\n\n".to_string(),
-                        }));
+                    let lane = self.agent_message_lane(params);
+                    if lane == RuntimeMessageLane::Answer {
+                        self.record_answer_delta_boundary(params, events);
                     }
-                    drop(events.send(RuntimeEvent::MessageDelta {
-                        lane: RuntimeMessageLane::Answer,
-                        text: text.clone(),
-                    }));
-                    self.remember_answer_delta(item_id, &text);
+                    drop(events.send(RuntimeEvent::MessageDelta { lane, text }));
                 }
             }
             "item/agentReasoning/delta" | "item/agentReasoningRawContent/delta" => {
@@ -1125,6 +1120,8 @@ where
     }
 
     fn record_app_server_item(&mut self, method: &str, params: &Value) -> Option<String> {
+        self.record_agent_message_item(method, params);
+        self.record_answer_item_completion(method, params);
         match (method, app_server_item_type(params)) {
             ("item/started", Some("contextCompaction")) => {
                 Some("codex context compaction started".to_string())
@@ -1142,33 +1139,85 @@ where
         }
     }
 
-    fn should_separate_answer_item(&self, item_id: Option<&str>, text: &str) -> bool {
-        if text.is_empty()
-            || !self.answer_stream_has_text
-            || self.answer_stream_ends_with_newline
-            || text.starts_with('\n')
-        {
-            return false;
-        }
-        match (self.answer_delta_item_id.as_deref(), item_id) {
-            (Some(previous), Some(current)) => previous != current,
-            _ => false,
-        }
+    fn record_answer_delta_boundary(&mut self, params: &Value, events: &RuntimeEventSender) {
+        let Some(item_id) = self.agent_message_item_id(params) else {
+            return;
+        };
+        self.begin_answer_item(item_id, events);
     }
 
-    fn remember_answer_delta(&mut self, item_id: Option<String>, text: &str) {
-        if text.is_empty() {
+    fn record_answer_item_completion(&mut self, method: &str, params: &Value) {
+        if method != "item/completed" || app_server_item_type(params) != Some("agentMessage") {
             return;
         }
-        self.answer_delta_item_id = item_id.or_else(|| self.answer_delta_item_id.take());
-        self.answer_stream_has_text = true;
-        self.answer_stream_ends_with_newline = text.ends_with('\n');
+        let Some(item_id) = extract_app_server_item_id(params) else {
+            return;
+        };
+        if self
+            .agent_message_lanes
+            .get(&item_id)
+            .copied()
+            .unwrap_or(RuntimeMessageLane::Answer)
+            == RuntimeMessageLane::Answer
+        {
+            self.active_answer_item_ids.remove(&item_id);
+        }
+        self.agent_message_lanes.remove(&item_id);
     }
 
-    fn reset_answer_stream_state(&mut self) {
-        self.answer_delta_item_id = None;
-        self.answer_stream_has_text = false;
-        self.answer_stream_ends_with_newline = false;
+    fn begin_answer_item(&mut self, item_id: String, events: &RuntimeEventSender) {
+        if self.active_answer_item_ids.insert(item_id.clone())
+            && self
+                .last_answer_item_id
+                .as_deref()
+                .is_some_and(|last_item_id| last_item_id != item_id)
+        {
+            drop(events.send(RuntimeEvent::MessageBoundary {
+                lane: RuntimeMessageLane::Answer,
+            }));
+        }
+        self.last_answer_item_id = Some(item_id);
+    }
+
+    fn reset_turn_message_state(&mut self) {
+        self.agent_message_lanes.clear();
+        self.active_agent_message_item_id = None;
+        self.active_answer_item_ids.clear();
+        self.last_answer_item_id = None;
+    }
+
+    fn record_agent_message_item(&mut self, method: &str, params: &Value) {
+        if app_server_item_type(params) != Some("agentMessage") {
+            return;
+        }
+        let Some(item_id) = extract_app_server_item_id(params) else {
+            return;
+        };
+        match method {
+            "item/started" | "item/updated" => {
+                self.active_agent_message_item_id = Some(item_id.clone());
+                if let Some(lane) = agent_message_phase_lane(params) {
+                    self.agent_message_lanes.insert(item_id, lane);
+                }
+            }
+            "item/completed"
+                if self.active_agent_message_item_id.as_deref() == Some(item_id.as_str()) =>
+            {
+                self.active_agent_message_item_id = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn agent_message_lane(&self, params: &Value) -> RuntimeMessageLane {
+        self.agent_message_item_id(params)
+            .and_then(|item_id| self.agent_message_lanes.get(&item_id).copied())
+            .or_else(|| agent_message_phase_lane(params))
+            .unwrap_or(RuntimeMessageLane::Answer)
+    }
+
+    fn agent_message_item_id(&self, params: &Value) -> Option<String> {
+        extract_app_server_item_id(params).or_else(|| self.active_agent_message_item_id.clone())
     }
 
     async fn respond_to_server_request(&mut self, message: &Value) -> Result<()> {
@@ -1390,20 +1439,20 @@ fn extract_app_server_turn_id(value: &Value) -> Option<String> {
         .map(|turn_id| turn_id.trim().to_string())
 }
 
+fn extract_app_server_item_id(value: &Value) -> Option<String> {
+    value
+        .pointer("/item/id")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("itemId").and_then(Value::as_str))
+        .or_else(|| value.get("item_id").and_then(Value::as_str))
+        .or_else(|| value.get("id").and_then(Value::as_str))
+        .filter(|item_id| !item_id.trim().is_empty())
+        .map(|item_id| item_id.trim().to_string())
+}
+
 fn app_server_item_type(params: &Value) -> Option<&str> {
     let item = params.get("item").unwrap_or(params);
     item.get("type").and_then(Value::as_str)
-}
-
-fn app_server_item_id(params: &Value) -> Option<String> {
-    params
-        .get("itemId")
-        .or_else(|| params.get("item_id"))
-        .or_else(|| params.pointer("/item/id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|item_id| !item_id.is_empty())
-        .map(str::to_string)
 }
 
 fn codex_generated_image_payload<'a>(
@@ -1517,6 +1566,21 @@ fn app_server_event_payload<'a>(
     None
 }
 
+fn agent_message_phase_lane(params: &Value) -> Option<RuntimeMessageLane> {
+    let phase = app_server_item(params)
+        .get("phase")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("phase").and_then(Value::as_str))?;
+    match phase.trim().to_ascii_lowercase().as_str() {
+        "answer" | "final" | "final_answer" | "final-answer" | "message" => {
+            Some(RuntimeMessageLane::Answer)
+        }
+        "analysis" | "commentary" | "intermediate" | "plan" | "prelude" | "progress"
+        | "reasoning" | "thinking" => Some(RuntimeMessageLane::Reasoning),
+        _ => None,
+    }
+}
+
 fn app_server_text(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .filter_map(|key| value.get(*key))
@@ -1575,10 +1639,198 @@ fn error_notification_will_retry(params: &Value) -> bool {
 }
 
 fn describe_app_server_item(params: &Value) -> Option<String> {
+    let item = app_server_item(params);
     match app_server_item_type(params)? {
+        "agentMessage" | "reasoning" | "userMessage" | "plan" => None,
+        "commandExecution" => describe_command_execution_item(item),
+        "fileChange" => describe_file_change_item(item),
+        "webSearch" => describe_web_search_item(item),
+        "imageView" => describe_image_view_item(item),
+        "collabToolCall" => describe_collab_tool_call_item(item),
         "enteredReviewMode" => Some("codex review started".to_string()),
         "exitedReviewMode" => Some("codex review completed".to_string()),
-        other => Some(format!("codex item: {other}")),
+        other => Some(format!("codex activity: {other}")),
+    }
+}
+
+fn app_server_item(params: &Value) -> &Value {
+    params.get("item").unwrap_or(params)
+}
+
+fn describe_command_execution_item(item: &Value) -> Option<String> {
+    let command = command_execution_display(item)?;
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    let verb = command_execution_verb(status, &command);
+    let mut text = format!("codex {verb}: {command}");
+    if let Some(cwd) = item.get("cwd").and_then(Value::as_str) {
+        if !cwd.trim().is_empty() {
+            text.push_str(&format!("  cwd {}", compact_path(cwd)));
+        }
+    }
+    if let Some(exit_code) = item.get("exitCode").and_then(Value::as_i64) {
+        text.push_str(&format!("  exit {exit_code}"));
+    }
+    if let Some(duration_ms) = item.get("durationMs").and_then(Value::as_u64) {
+        text.push_str(&format!("  {}", format_millis(duration_ms)));
+    }
+    Some(text)
+}
+
+fn command_execution_verb(status: &str, command: &str) -> &'static str {
+    match status {
+        "inProgress" => "running",
+        "failed" => "failed",
+        "declined" => "declined",
+        "completed" => {
+            let first = command.split_whitespace().next().unwrap_or("");
+            match first.trim_matches('"') {
+                "rg" | "grep" => "searched",
+                "cat" | "sed" | "head" | "tail" | "nl" => "read",
+                "ls" | "find" | "git" => "inspected",
+                _ => "ran",
+            }
+        }
+        _ => "command",
+    }
+}
+
+fn command_execution_display(item: &Value) -> Option<String> {
+    item.get("command")
+        .and_then(command_value_display)
+        .or_else(|| command_actions_display(item.get("commandActions")?))
+}
+
+fn command_value_display(value: &Value) -> Option<String> {
+    match value {
+        Value::String(command) => non_empty(command),
+        Value::Array(parts) => {
+            let parts = parts
+                .iter()
+                .filter_map(Value::as_str)
+                .map(shell_word_display)
+                .collect::<Vec<_>>();
+            (!parts.is_empty()).then(|| parts.join(" "))
+        }
+        _ => None,
+    }
+}
+
+fn command_actions_display(value: &Value) -> Option<String> {
+    let actions = value.as_array()?;
+    let mut rendered = Vec::new();
+    for action in actions {
+        if let Some(command) = action
+            .get("command")
+            .or_else(|| action.get("cmd"))
+            .and_then(command_value_display)
+        {
+            rendered.push(command);
+        } else if let Some(action_type) = action.get("type").and_then(Value::as_str) {
+            rendered.push(action_type.to_string());
+        }
+    }
+    (!rendered.is_empty()).then(|| rendered.join(" && "))
+}
+
+fn describe_file_change_item(item: &Value) -> Option<String> {
+    let changes = item.get("changes").and_then(Value::as_array)?;
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    let verb = match status {
+        "inProgress" => "editing",
+        "completed" => "edited",
+        "failed" => "edit failed",
+        "declined" => "edit declined",
+        _ => "file change",
+    };
+    let paths = changes
+        .iter()
+        .filter_map(|change| change.get("path").and_then(Value::as_str))
+        .filter(|path| !path.trim().is_empty())
+        .map(compact_path)
+        .take(3)
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        Some(format!("codex {verb}: {} files", changes.len()))
+    } else {
+        let suffix = if changes.len() > paths.len() {
+            format!(" +{}", changes.len() - paths.len())
+        } else {
+            String::new()
+        };
+        Some(format!("codex {verb}: {}{}", paths.join(", "), suffix))
+    }
+}
+
+fn describe_web_search_item(item: &Value) -> Option<String> {
+    let query = item
+        .get("query")
+        .and_then(Value::as_str)
+        .or_else(|| item.pointer("/action/query").and_then(Value::as_str))
+        .or_else(|| item.pointer("/action/url").and_then(Value::as_str))
+        .or_else(|| item.pointer("/action/refId").and_then(Value::as_str))?;
+    let action = item
+        .pointer("/action/type")
+        .and_then(Value::as_str)
+        .unwrap_or("search");
+    let verb = match action {
+        "open_page" => "opened",
+        "find_in_page" => "found",
+        _ => "searched",
+    };
+    Some(format!("codex {verb}: {}", query.trim()))
+}
+
+fn describe_image_view_item(item: &Value) -> Option<String> {
+    item.get("path")
+        .and_then(Value::as_str)
+        .map(|path| format!("codex viewed: {}", compact_path(path)))
+}
+
+fn describe_collab_tool_call_item(item: &Value) -> Option<String> {
+    let tool = item.get("tool").and_then(Value::as_str)?;
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    Some(format!("codex {status}: {tool}"))
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn shell_word_display(value: &str) -> String {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '\'' | '"' | '\\' | '$' | '`'))
+    {
+        format!("{value:?}")
+    } else {
+        value.to_string()
+    }
+}
+
+fn compact_path(path: &str) -> String {
+    let path = path.trim();
+    path.strip_prefix("/workspace/")
+        .or_else(|| path.strip_prefix("./"))
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn format_millis(duration_ms: u64) -> String {
+    if duration_ms < 1_000 {
+        format!("{duration_ms}ms")
+    } else {
+        format!("{:.1}s", duration_ms as f64 / 1_000.0)
     }
 }
 
@@ -1828,7 +2080,8 @@ mod tests {
     };
 
     use crate::kernel::runtime::{
-        ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionOutput, NetworkMode,
+        append_streamed_text_boundary, append_streamed_text_delta, ConfinementConfig,
+        EffectiveExecutionPlan, ExecutionLimits, ExecutionOutput, NetworkMode,
         OciConfinementConfig, RuntimeAdapter, RuntimeControlExecution, RuntimeControlInput,
         RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeMessageLane,
         RuntimeSessionHandle, RuntimeSessionStartInput, WorkspaceAccess,
@@ -1958,6 +2211,23 @@ mod tests {
         }
     }
 
+    fn answer_text_from_events(events: impl IntoIterator<Item = RuntimeEvent>) -> String {
+        let mut text = String::new();
+        for event in events {
+            match event {
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: delta,
+                } => append_streamed_text_delta(&mut text, &delta),
+                RuntimeEvent::MessageBoundary {
+                    lane: RuntimeMessageLane::Answer,
+                } => append_streamed_text_boundary(&mut text),
+                _ => {}
+            }
+        }
+        text
+    }
+
     #[test]
     fn codex_app_server_program_uses_default_stdio_transport() {
         let program = build_codex_app_server_program(&CodexRuntimeConfig {
@@ -1994,6 +2264,186 @@ mod tests {
             super::app_server_error_text(&json!({"message": "  failed \n"})),
             "failed"
         );
+    }
+
+    #[test]
+    fn app_server_item_descriptions_render_operator_activity() {
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {
+                    "type": "commandExecution",
+                    "command": ["cargo", "test"],
+                    "cwd": "/workspace/lionclaw",
+                    "status": "completed",
+                    "exitCode": 0,
+                    "durationMs": 1234,
+                }
+            })),
+            Some("codex ran: cargo test  cwd lionclaw  exit 0  1.2s".to_string())
+        );
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {
+                    "type": "commandExecution",
+                    "command": ["rg", "operator console"],
+                    "status": "completed",
+                }
+            })),
+            Some("codex searched: rg \"operator console\"".to_string())
+        );
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {
+                    "type": "fileChange",
+                    "status": "completed",
+                    "changes": [
+                        {"path": "src/operator/run_tui.rs", "kind": "update"},
+                        {"path": "Cargo.toml", "kind": "update"}
+                    ],
+                }
+            })),
+            Some("codex edited: src/operator/run_tui.rs, Cargo.toml".to_string())
+        );
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {
+                    "type": "webSearch",
+                    "action": {"type": "search", "query": "ratatui scrollbar"}
+                }
+            })),
+            Some("codex searched: ratatui scrollbar".to_string())
+        );
+        assert_eq!(
+            super::describe_app_server_item(&json!({
+                "item": {"type": "agentMessage", "text": "hello"}
+            })),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn app_server_agent_message_phases_choose_transcript_lane() {
+        let (_adapter, _handle, thread_state) = start_codex_test_session(None).await;
+        let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(Vec::new()));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        for message in [
+            json!({"method": "turn/started", "params": {"threadId": "thr_1", "turnId": "turn_1"}}),
+            json!({
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "id": "msg_plan",
+                        "type": "agentMessage",
+                        "phase": "prelude"
+                    }
+                }
+            }),
+            json!({"method": "item/agentMessage/delta", "params": {"itemId": "msg_plan", "delta": "I'll inspect first."}}),
+            json!({
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "id": "msg_final",
+                        "type": "agentMessage",
+                        "phase": "final_answer"
+                    }
+                }
+            }),
+            json!({"method": "item/agentMessage/delta", "params": {"itemId": "msg_final", "delta": "Final answer."}}),
+        ] {
+            client
+                .handle_message(message, &event_tx, &thread_state)
+                .await
+                .expect("handle message");
+        }
+
+        let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Reasoning,
+                text
+            } if text == "I'll inspect first."
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta {
+                lane: RuntimeMessageLane::Answer,
+                text
+            } if text == "Final answer."
+        )));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::MessageBoundary { .. })));
+    }
+
+    #[tokio::test]
+    async fn app_server_agent_message_items_emit_answer_boundaries() {
+        let (_adapter, _handle, thread_state) = start_codex_test_session(None).await;
+        let mut client = CodexAppServerClient::new(FakeAppServerTransport::new(Vec::new()));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        for message in [
+            json!({"method": "turn/started", "params": {"threadId": "thr_1", "turnId": "turn_1"}}),
+            json!({
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "id": "msg_intro",
+                        "type": "agentMessage",
+                        "phase": "final_answer"
+                    }
+                }
+            }),
+            json!({"method": "item/agentMessage/delta", "params": {"itemId": "msg_intro", "delta": "Intro."}}),
+            json!({"method": "item/completed", "params": {"item": {"id": "msg_intro", "type": "agentMessage"}}}),
+            json!({
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "id": "msg_body",
+                        "type": "agentMessage",
+                        "phase": "final_answer"
+                    }
+                }
+            }),
+            json!({"method": "item/agentMessage/delta", "params": {"itemId": "msg_body", "delta": "**Project**"}}),
+        ] {
+            client
+                .handle_message(message, &event_tx, &thread_state)
+                .await
+                .expect("handle message");
+        }
+
+        let events: Vec<RuntimeEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        let message_events = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::MessageDelta { .. } | RuntimeEvent::MessageBoundary { .. }
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            message_events.as_slice(),
+            [
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: intro
+                },
+                RuntimeEvent::MessageBoundary {
+                    lane: RuntimeMessageLane::Answer
+                },
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: body
+                }
+            ] if intro == "Intro." && body == "**Project**"
+        ));
     }
 
     #[test]
@@ -2248,16 +2698,8 @@ mod tests {
             .await
             .expect("turn completed");
 
-        let text = std::iter::from_fn(|| event_rx.try_recv().ok())
-            .filter_map(|event| match event {
-                RuntimeEvent::MessageDelta {
-                    lane: RuntimeMessageLane::Answer,
-                    text,
-                } => Some(text),
-                _ => None,
-            })
-            .collect::<String>();
-        assert_eq!(text, "First.\n\nSecond.");
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok());
+        assert_eq!(answer_text_from_events(events), "First.\n\nSecond.");
 
         adapter.close(&handle).await.expect("close");
     }

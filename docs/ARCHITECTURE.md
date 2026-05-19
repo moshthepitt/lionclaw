@@ -8,7 +8,9 @@ contract around that work: sessions, channels, scheduled jobs, continuity,
 runtime configuration, confinement, policy, and audit.
 
 LionClaw currently targets Unix-like systems only. The direct `lionclaw run`
-path is designed for Linux/macOS-style Unix environments. Managed background
+path is designed for Linux/macOS-style Unix environments. When attached to a
+terminal, `run` opens the project operator console; `run --plain` and
+non-terminal use keep the command on the line-oriented interactive path. Managed background
 paths, including `lionclaw up` and channel auto-start, currently use the
 systemd user manager; launchd support is a future portability item.
 
@@ -62,7 +64,7 @@ Instead, LionClaw constrains the runtime launch:
 - selected work root mounted at `/workspace`
 - runtime-private state mounted at `/runtime`
 - draft/output area mounted at `/drafts`
-- applied non-channel skill snapshots mounted read-only at `/lionclaw/skills/<alias>`
+- applied non-channel skills mounted read-only at `/lionclaw/skills/<alias>`
 - network mode chosen by preset
 - runtime secrets mounted only when preset allows it
 - runtime auth staged into the runtime-private home
@@ -144,7 +146,16 @@ Program-backed runtimes stream two message lanes:
 - `answer`: canonical assistant reply text persisted into turn history
 - `reasoning`: optional live thought/progress text that channels may render or ignore
 
-Only `answer` is treated as the durable assistant reply.
+Only `answer` is treated as the durable assistant reply. Adapters may also emit
+`message_boundary` for either lane when a runtime starts a new semantic message
+item without sending text. The kernel uses `answer` boundaries when building
+canonical assistant text so adjacent streamed items remain separate paragraphs;
+UIs can use the same marker to render live transcript blocks without
+runtime-specific parsing.
+`message_boundary` is a stable stream event kind. Consumers that reconstruct
+plain text from `message_delta` events should ignore it; consumers that render
+conversation structure may use it as a paragraph/message-item break. Literal
+`message_delta` text is otherwise preserved as emitted by the runtime adapter.
 Channel streams also emit a kernel-owned `turn_completed` event after the turn
 record is finalized. Its `text` field is the canonical persisted assistant
 reply and lets channel UIs reconcile live deltas against durable turn state
@@ -199,14 +210,23 @@ The everyday runtime layout is mount-first:
 - `/workspace`: selected work root with preset-controlled read-only or read-write access
 - `/runtime`: runtime-private writable state root
 - `/drafts`: runtime-private draft/output area
-- `/lionclaw/skills/<alias>`: installed non-channel skill snapshot assets mounted read-only
+- `/lionclaw/skills/<alias>`: installed non-channel skill assets mounted read-only
 - `/attachments`: read-only channel attachment files for the current inbound
   event, present only after attachment finalization staged files for that turn
 
 For local `lionclaw run`, target resolution selects one project instance and
-uses that instance's recorded work root. The work root is mounted at
-`/workspace`. The instance home remains LionClaw's state root and is not the
-project tree or work root.
+uses that instance's recorded work root. In project mode, the operator console
+also renders the other configured project instances and can switch to another
+already-configured instance when no turn is active. Switching reads that
+instance's existing home, work root, runtime config, sessions, and audit scope;
+it does not mutate project, instance, runtime, channel, skill, or default
+configuration. The selected work root is mounted at `/workspace`. The instance
+home remains LionClaw's state root and is not the project tree or work root.
+
+The operator console treats the transcript as durable conversation: user prompts
+and assistant answer deltas are rendered as message blocks. Runtime status,
+reasoning, command, and progress events are summarized as activity and exposed
+through the inspector instead of being appended as transcript lines.
 
 The planner injects runtime-private environment defaults such as
 `HOME=/runtime/home`, `LIONCLAW_DRAFTS_DIR=/drafts`, and

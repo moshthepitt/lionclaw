@@ -229,6 +229,7 @@ pub struct ChannelStreamEventInsert<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelStreamEventKind {
     MessageDelta,
+    MessageBoundary,
     Status,
     Error,
     TurnCompleted,
@@ -239,6 +240,7 @@ impl ChannelStreamEventKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::MessageDelta => "message_delta",
+            Self::MessageBoundary => "message_boundary",
             Self::Status => "status",
             Self::Error => "error",
             Self::TurnCompleted => "turn_completed",
@@ -253,6 +255,7 @@ impl FromStr for ChannelStreamEventKind {
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         match value {
             "message_delta" => Ok(Self::MessageDelta),
+            "message_boundary" => Ok(Self::MessageBoundary),
             "status" => Ok(Self::Status),
             "error" => Ok(Self::Error),
             "turn_completed" => Ok(Self::TurnCompleted),
