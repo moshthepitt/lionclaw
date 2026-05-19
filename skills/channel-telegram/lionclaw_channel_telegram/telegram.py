@@ -55,6 +55,18 @@ class TelegramReferenceError(ValueError):
     pass
 
 
+class TelegramPartialSendError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        receipt: dict[str, Any],
+        cause: Exception,
+    ) -> None:
+        super().__init__(str(cause))
+        self.receipt = receipt
+        self.cause = cause
+
+
 @dataclass(slots=True, frozen=True)
 class TelegramInboundAttachment:
     attachment_id: str
@@ -145,6 +157,7 @@ class TelegramTransport(Protocol):
         thread_ref: str | None = None,
         format_hint: str = "plain",
         attachments: Sequence[TelegramOutboundAttachment] = (),
+        resume_receipt: dict[str, Any] | None = None,
     ) -> dict[str, Any]: ...
 
     async def send_typing(
@@ -247,11 +260,15 @@ class AiogramTelegramTransport:
         thread_ref: str | None = None,
         format_hint: str = "plain",
         attachments: Sequence[TelegramOutboundAttachment] = (),
+        resume_receipt: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         chat_id = _coerce_chat_id(conversation_ref)
         reply_parameters = _reply_parameters(reply_to_ref)
         message_thread_id = _coerce_thread_id(thread_ref, omit_general=True)
-        sent_messages: list[dict[str, Any]] = []
+        sent_messages = _receipt_messages(resume_receipt)
+        resume_count = len(sent_messages)
+        if sent_messages:
+            reply_parameters = _reply_parameters(str(sent_messages[-1]["message_id"]))
         text_chunks = _format_telegram_text_chunks(text, format_hint)
         caption_chunk: TelegramTextChunk | None = None
         if (
@@ -262,42 +279,54 @@ class AiogramTelegramTransport:
             caption_chunk = text_chunks[0]
             text_chunks = []
 
-        for chunk in text_chunks:
-            message = await self._send_text_chunk(
-                chat_id=chat_id,
-                chunk=chunk,
-                reply_parameters=reply_parameters,
-                message_thread_id=message_thread_id,
-            )
-            sent_messages.append(_message_receipt(message))
-            reply_parameters = _reply_parameters(str(message.message_id))
+        operation_index = 0
+        try:
+            for chunk in text_chunks:
+                if operation_index < resume_count:
+                    operation_index += 1
+                    continue
+                message = await self._send_text_chunk(
+                    chat_id=chat_id,
+                    chunk=chunk,
+                    reply_parameters=reply_parameters,
+                    message_thread_id=message_thread_id,
+                )
+                sent_messages.append(_message_receipt(message))
+                reply_parameters = _reply_parameters(str(message.message_id))
+                operation_index += 1
 
-        for index, attachment in enumerate(attachments):
-            message = await self._send_attachment(
-                chat_id=chat_id,
-                attachment=attachment,
-                reply_parameters=reply_parameters,
-                message_thread_id=message_thread_id,
-                caption=caption_chunk if index == 0 else None,
-            )
-            sent_messages.append(_message_receipt(message))
-            reply_parameters = _reply_parameters(str(message.message_id))
+            for index, attachment in enumerate(attachments):
+                if operation_index < resume_count:
+                    operation_index += 1
+                    continue
+                message = await self._send_attachment(
+                    chat_id=chat_id,
+                    attachment=attachment,
+                    reply_parameters=reply_parameters,
+                    message_thread_id=message_thread_id,
+                    caption=caption_chunk if index == 0 else None,
+                )
+                sent_messages.append(_message_receipt(message))
+                reply_parameters = _reply_parameters(str(message.message_id))
+                operation_index += 1
 
-        if not sent_messages:
-            message = await self._bot.send_message(
-                chat_id=chat_id,
-                text=" ",
-                reply_parameters=reply_parameters,
-                message_thread_id=message_thread_id,
-            )
-            sent_messages.append(_message_receipt(message))
+            if not sent_messages:
+                message = await self._bot.send_message(
+                    chat_id=chat_id,
+                    text=" ",
+                    reply_parameters=reply_parameters,
+                    message_thread_id=message_thread_id,
+                )
+                sent_messages.append(_message_receipt(message))
+        except Exception as err:
+            if sent_messages:
+                raise TelegramPartialSendError(
+                    receipt=_receipt_from_messages(sent_messages),
+                    cause=err,
+                ) from err
+            raise
 
-        last = sent_messages[-1]
-        return {
-            "message_id": last["message_id"],
-            "chat_id": last["chat_id"],
-            "messages": sent_messages,
-        }
+        return _receipt_from_messages(sent_messages)
 
     async def _send_text_chunk(
         self,
@@ -598,6 +627,36 @@ def _message_receipt(message: Message) -> dict[str, Any]:
     return {
         "message_id": message.message_id,
         "chat_id": str(message.chat.id),
+    }
+
+
+def _receipt_messages(receipt: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if receipt is None:
+        return []
+    messages = receipt.get("messages")
+    if not isinstance(messages, list):
+        messages = [receipt]
+    parsed: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("message_id") is None or message.get("chat_id") is None:
+            continue
+        parsed.append(
+            {
+                "message_id": message["message_id"],
+                "chat_id": message["chat_id"],
+            }
+        )
+    return parsed
+
+
+def _receipt_from_messages(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    last = messages[-1]
+    return {
+        "message_id": last["message_id"],
+        "chat_id": last["chat_id"],
+        "messages": messages,
     }
 
 

@@ -41,6 +41,7 @@ from lionclaw_channel_telegram.telegram import (
     TelegramInboundUpdate,
     TelegramOutboundAttachment,
     TelegramPairingClaim,
+    TelegramPartialSendError,
     TelegramReferenceError,
     _coerce_chat_id,
     _coerce_message_id,
@@ -51,8 +52,9 @@ from lionclaw_channel_telegram.telegram import (
     extract_inbound_event,
 )
 from lionclaw_channel_telegram.worker import (
-    MAX_DELIVERED_OUTBOX_RECEIPTS,
+    MAX_OUTBOX_RECEIPTS,
     OffsetStore,
+    OutboxReceiptRecord,
     OutboxReceiptStore,
     TelegramWorker,
     _classify_send_failure,
@@ -972,10 +974,32 @@ class OutboxReceiptStoreTests(unittest.TestCase):
             path = Path(temp_dir) / "telegram.outbox-receipts.json"
             store = OutboxReceiptStore(path)
 
-            store.save({"delivery-1": {"message_id": 101}})
-            store.save({"delivery-2": {"message_id": 102}})
+            store.save(
+                {
+                    "delivery-1": OutboxReceiptRecord(
+                        status="delivered",
+                        provider_receipt={"message_id": 101},
+                    )
+                }
+            )
+            store.save(
+                {
+                    "delivery-2": OutboxReceiptRecord(
+                        status="partial",
+                        provider_receipt={"message_id": 102},
+                    )
+                }
+            )
 
-            self.assertEqual(store.load(), {"delivery-2": {"message_id": 102}})
+            self.assertEqual(
+                store.load(),
+                {
+                    "delivery-2": OutboxReceiptRecord(
+                        status="partial",
+                        provider_receipt={"message_id": 102},
+                    )
+                },
+            )
             self.assertFalse(
                 (path.parent / ".telegram.outbox-receipts.json.tmp").exists()
             )
@@ -986,9 +1010,16 @@ class OutboxReceiptStoreTests(unittest.TestCase):
             path.write_text(
                 json.dumps(
                     {
-                        "delivery-1": {"message_id": 101},
+                        "delivery-1": {
+                            "status": "delivered",
+                            "provider_receipt": {"message_id": 101},
+                        },
                         "delivery-2": "bad",
-                        3: {"message_id": 103},
+                        "delivery-3": {
+                            "status": "unknown",
+                            "provider_receipt": {"message_id": 103},
+                        },
+                        "delivery-4": {"message_id": 104, "chat_id": "77"},
                     }
                 ),
                 encoding="utf-8",
@@ -997,8 +1028,14 @@ class OutboxReceiptStoreTests(unittest.TestCase):
             self.assertEqual(
                 OutboxReceiptStore(path).load(),
                 {
-                    "delivery-1": {"message_id": 101},
-                    "3": {"message_id": 103},
+                    "delivery-1": OutboxReceiptRecord(
+                        status="delivered",
+                        provider_receipt={"message_id": 101},
+                    ),
+                    "delivery-4": OutboxReceiptRecord(
+                        status="delivered",
+                        provider_receipt={"message_id": 104, "chat_id": "77"},
+                    ),
                 },
             )
 
@@ -1008,8 +1045,11 @@ class OutboxReceiptStoreTests(unittest.TestCase):
             path.write_text(
                 json.dumps(
                     {
-                        f"delivery-{index}": {"message_id": index}
-                        for index in range(MAX_DELIVERED_OUTBOX_RECEIPTS + 1)
+                        f"delivery-{index}": {
+                            "status": "delivered",
+                            "provider_receipt": {"message_id": index},
+                        }
+                        for index in range(MAX_OUTBOX_RECEIPTS + 1)
                     }
                 ),
                 encoding="utf-8",
@@ -1017,9 +1057,9 @@ class OutboxReceiptStoreTests(unittest.TestCase):
 
             receipts = OutboxReceiptStore(path).load()
 
-            self.assertEqual(len(receipts), MAX_DELIVERED_OUTBOX_RECEIPTS)
+            self.assertEqual(len(receipts), MAX_OUTBOX_RECEIPTS)
             self.assertNotIn("delivery-0", receipts)
-            self.assertIn(f"delivery-{MAX_DELIVERED_OUTBOX_RECEIPTS}", receipts)
+            self.assertIn(f"delivery-{MAX_OUTBOX_RECEIPTS}", receipts)
 
 
 class WorkerConfigTests(unittest.TestCase):
@@ -3238,6 +3278,69 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(receipt_store.load(), {})
 
+    async def test_partial_outbox_receipt_resumes_after_retryable_send_failure(
+        self,
+    ) -> None:
+        partial_receipt = {
+            "message_id": 101,
+            "chat_id": "telegram:user:77",
+            "messages": [{"message_id": 101, "chat_id": "telegram:user:77"}],
+        }
+        delivery = OutboxDelivery(
+            delivery_id="delivery-1",
+            attempt_id="attempt-1",
+            conversation_ref="telegram:user:77",
+            content=OutboxContent(text="final answer"),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            receipt_store = OutboxReceiptStore(
+                Path(temp_dir) / "telegram.outbox-receipts.json"
+            )
+            first_api = FakeLionClawApi()
+            first_telegram = FakeTelegramTransport(
+                partial_send_error=RuntimeError("connection reset"),
+                partial_send_receipt=partial_receipt,
+            )
+            first_worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=first_api,
+                telegram=first_telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                outbox_receipt_store=receipt_store,
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await first_worker._process_outbox_delivery(delivery)
+
+            self.assertEqual(first_api.outbox_reports[0][2], "retryable_failed")
+            self.assertEqual(
+                receipt_store.load(),
+                {
+                    "delivery-1": OutboxReceiptRecord(
+                        status="partial",
+                        provider_receipt=partial_receipt,
+                    )
+                },
+            )
+
+            second_api = FakeLionClawApi()
+            second_telegram = FakeTelegramTransport()
+            second_worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=second_api,
+                telegram=second_telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                outbox_receipt_store=receipt_store,
+            )
+
+            await second_worker._process_outbox_delivery(
+                replace(delivery, attempt_id="attempt-2")
+            )
+
+            self.assertEqual(second_telegram.resume_receipts, [partial_receipt])
+            self.assertEqual(second_api.outbox_reports[0][2], "delivered")
+            self.assertEqual(receipt_store.load(), {})
+
     async def test_failed_outbox_send_reports_retryable_failure(self) -> None:
         api = FakeLionClawApi(
             outbox_deliveries=[
@@ -3592,6 +3695,55 @@ class AiogramTelegramTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(bot.sent_documents), 1)
         self.assertEqual(bot.sent_documents[0]["chat_id"], 77)
 
+    async def test_resume_receipt_skips_already_sent_text_chunks(self) -> None:
+        bot = RecordingAiogramBot()
+        bot._next_message_id = 101
+        transport = object.__new__(AiogramTelegramTransport)
+        transport._bot = bot
+        transport._bot_identity = None
+
+        receipt = await transport.send_message(
+            "telegram:chat:77",
+            "x" * (TELEGRAM_TEXT_LIMIT + 1),
+            resume_receipt={
+                "message_id": 101,
+                "chat_id": "77",
+                "messages": [{"message_id": 101, "chat_id": "77"}],
+            },
+        )
+
+        self.assertEqual(len(bot.sent_messages), 1)
+        self.assertEqual(bot.sent_messages[0]["text"], "x")
+        reply = bot.sent_messages[0]["reply_parameters"]
+        self.assertEqual(reply.message_id, 101)
+        self.assertEqual(receipt["message_id"], 102)
+        self.assertEqual(len(receipt["messages"]), 2)
+
+    async def test_partial_send_error_carries_resume_receipt(self) -> None:
+        bot = RecordingAiogramBot(
+            send_message_errors=[None, RuntimeError("network dropped")]
+        )
+        transport = object.__new__(AiogramTelegramTransport)
+        transport._bot = bot
+        transport._bot_identity = None
+
+        with self.assertRaises(TelegramPartialSendError) as raised:
+            await transport.send_message(
+                "telegram:chat:77",
+                "x" * (TELEGRAM_TEXT_LIMIT + 1),
+            )
+
+        self.assertEqual(len(bot.sent_messages), 1)
+        self.assertEqual(
+            raised.exception.receipt,
+            {
+                "message_id": 101,
+                "chat_id": "77",
+                "messages": [{"message_id": 101, "chat_id": "77"}],
+            },
+        )
+        self.assertIsInstance(raised.exception.cause, RuntimeError)
+
     async def test_native_photo_bad_request_falls_back_to_document(self) -> None:
         bot = RecordingAiogramBot(
             send_photo_error=TelegramBadRequest(
@@ -3837,7 +3989,12 @@ class RecordingAiogramMessage:
 
 
 class RecordingAiogramBot:
-    def __init__(self, *, send_photo_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        send_photo_error: Exception | None = None,
+        send_message_errors: list[Exception | None] | None = None,
+    ) -> None:
         self._next_message_id = 100
         self.sent_messages: list[dict[str, object]] = []
         self.photo_attempts: list[dict[str, object]] = []
@@ -3848,8 +4005,13 @@ class RecordingAiogramBot:
         self.sent_documents: list[dict[str, object]] = []
         self.sent_chat_actions: list[dict[str, object]] = []
         self.send_photo_error = send_photo_error
+        self.send_message_errors = list(send_message_errors or [])
 
     async def send_message(self, **params) -> RecordingAiogramMessage:
+        if self.send_message_errors:
+            error = self.send_message_errors.pop(0)
+            if error is not None:
+                raise error
         self.sent_messages.append(dict(params))
         return self._message_for(params["chat_id"])
 
@@ -3921,11 +4083,14 @@ class FakeTelegramTransport:
         downloaded_content: bytes = b"file",
         edit_errors: list[Exception] | None = None,
         delete_errors: list[Exception] | None = None,
+        partial_send_error: Exception | None = None,
+        partial_send_receipt: dict[str, object] | None = None,
     ) -> None:
         self.updates = list(updates or [])
         self.sent_messages: list[tuple[str, str, str | None, str | None, list[str]]] = (
             []
         )
+        self.resume_receipts: list[dict[str, object] | None] = []
         self.edited_messages: list[tuple[str, str, str]] = []
         self.deleted_messages: list[tuple[str, str]] = []
         self.commands_configured = False
@@ -3941,6 +4106,8 @@ class FakeTelegramTransport:
         self.downloaded_content = downloaded_content
         self.edit_errors = list(edit_errors or [])
         self.delete_errors = list(delete_errors or [])
+        self.partial_send_error = partial_send_error
+        self.partial_send_receipt = partial_send_receipt
 
     async def close(self) -> None:
         pass
@@ -3983,9 +4150,21 @@ class FakeTelegramTransport:
         thread_ref: str | None = None,
         format_hint: str = "plain",
         attachments: Sequence[TelegramOutboundAttachment] = (),
+        resume_receipt: dict[str, object] | None = None,
     ) -> dict[str, object]:
+        self.resume_receipts.append(resume_receipt)
         if self.fail_send_message:
             raise RuntimeError("send failed")
+        if self.partial_send_error is not None:
+            raise TelegramPartialSendError(
+                receipt=self.partial_send_receipt
+                or {
+                    "message_id": 101,
+                    "chat_id": conversation_ref,
+                    "messages": [{"message_id": 101, "chat_id": conversation_ref}],
+                },
+                cause=self.partial_send_error,
+            )
         self.sent_format_hints.append(format_hint)
         self.sent_messages.append(
             (

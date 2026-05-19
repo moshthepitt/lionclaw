@@ -35,6 +35,7 @@ from lionclaw_channel_telegram.telegram import (
     TelegramInboundUpdate,
     TelegramOutboundAttachment,
     TelegramPairingClaim,
+    TelegramPartialSendError,
     TelegramReferenceError,
     TelegramTransport,
     extract_inbound_event,
@@ -65,7 +66,8 @@ PROGRESS_EDIT_MIN_SECONDS = 1.0
 PROGRESS_DELETE_RETRY_BASE_SECONDS = 1.0
 PROGRESS_DELETE_RETRY_MAX_SECONDS = 30.0
 COMPACT_STATUS_TEXT_LIMIT = 96
-MAX_DELIVERED_OUTBOX_RECEIPTS = 256
+MAX_OUTBOX_RECEIPTS = 256
+OUTBOX_RECEIPT_STATUSES = {"delivered", "partial"}
 
 LOCAL_TELEGRAM_COMMANDS = {
     "help",
@@ -158,11 +160,25 @@ class OffsetStore:
         tmp_path.replace(self.path)
 
 
+@dataclass(slots=True, frozen=True)
+class OutboxReceiptRecord:
+    status: str
+    provider_receipt: dict[str, object]
+
+    def to_json(self) -> dict[str, object]:
+        if self.status not in OUTBOX_RECEIPT_STATUSES:
+            raise ValueError(f"invalid outbox receipt status '{self.status}'")
+        return {
+            "status": self.status,
+            "provider_receipt": self.provider_receipt,
+        }
+
+
 @dataclass(slots=True)
 class OutboxReceiptStore:
     path: Path
 
-    def load(self) -> dict[str, dict[str, object]]:
+    def load(self) -> dict[str, OutboxReceiptRecord]:
         if not self.path.exists():
             return {}
         try:
@@ -173,22 +189,51 @@ class OutboxReceiptStore:
         if not isinstance(raw, dict):
             logger.warning("telegram outbox receipt store ignored non-object payload")
             return {}
-        receipts: dict[str, dict[str, object]] = {}
-        for delivery_id, receipt in raw.items():
-            if isinstance(delivery_id, str) and isinstance(receipt, dict):
-                receipts[delivery_id] = dict(receipt)
-        while len(receipts) > MAX_DELIVERED_OUTBOX_RECEIPTS:
+        receipts: dict[str, OutboxReceiptRecord] = {}
+        for delivery_id, value in raw.items():
+            if not isinstance(delivery_id, str):
+                continue
+            record = _coerce_outbox_receipt_record(value)
+            if record is not None:
+                receipts[delivery_id] = record
+        while len(receipts) > MAX_OUTBOX_RECEIPTS:
             receipts.pop(next(iter(receipts)))
         return receipts
 
-    def save(self, receipts: dict[str, dict[str, object]]) -> None:
+    def save(self, receipts: dict[str, OutboxReceiptRecord]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.path.with_name(f".{self.path.name}.tmp")
         tmp_path.write_text(
-            json.dumps(receipts, sort_keys=True),
+            json.dumps(
+                {
+                    delivery_id: record.to_json()
+                    for delivery_id, record in receipts.items()
+                },
+                sort_keys=True,
+            ),
             encoding="utf-8",
         )
         tmp_path.replace(self.path)
+
+
+def _coerce_outbox_receipt_record(value: object) -> OutboxReceiptRecord | None:
+    if not isinstance(value, dict):
+        return None
+
+    status = value.get("status")
+    provider_receipt = value.get("provider_receipt")
+    if isinstance(status, str) and isinstance(provider_receipt, dict):
+        if status in OUTBOX_RECEIPT_STATUSES:
+            return OutboxReceiptRecord(
+                status=status,
+                provider_receipt=dict(provider_receipt),
+            )
+        return None
+
+    if value.get("message_id") is not None and value.get("chat_id") is not None:
+        return OutboxReceiptRecord(status="delivered", provider_receipt=dict(value))
+
+    return None
 
 
 class TelegramWorker:
@@ -206,7 +251,7 @@ class TelegramWorker:
         self.offset_store = offset_store
         self.offset = offset_store.load()
         self.outbox_receipt_store = outbox_receipt_store
-        self._delivered_outbox_receipts = (
+        self._outbox_receipts = (
             outbox_receipt_store.load() if outbox_receipt_store is not None else {}
         )
         self._typing_targets: dict[tuple[str, str | None], TypingTarget] = {}
@@ -349,7 +394,7 @@ class TelegramWorker:
             self._pending_progress_deletes.clear()
             self._route_turns.clear()
             self._route_generations.clear()
-            self._delivered_outbox_receipts.clear()
+            self._outbox_receipts.clear()
 
     async def _run_update_loop(self) -> None:
         while True:
@@ -1139,16 +1184,16 @@ class TelegramWorker:
         return self._target_for_ref(event.peer_id)
 
     async def _process_outbox_delivery(self, delivery: OutboxDelivery) -> None:
-        cached_receipt = self._delivered_outbox_receipts.get(delivery.delivery_id)
-        if cached_receipt is not None:
+        receipt_record = self._outbox_receipts.get(delivery.delivery_id)
+        if receipt_record is not None and receipt_record.status == "delivered":
             await self._complete_progress_for_delivery(delivery)
             accepted = await self._report_outbox_with_retry(
                 delivery,
                 "delivered",
-                provider_receipt=cached_receipt,
+                provider_receipt=receipt_record.provider_receipt,
             )
             if accepted:
-                self._forget_delivered_outbox_receipt(delivery.delivery_id)
+                self._forget_outbox_receipt(delivery.delivery_id)
             return
 
         try:
@@ -1166,25 +1211,24 @@ class TelegramWorker:
                     )
                     for attachment in delivery.content.attachments
                 ],
+                resume_receipt=(
+                    receipt_record.provider_receipt
+                    if receipt_record is not None and receipt_record.status == "partial"
+                    else None
+                ),
             )
-        except Exception as err:
-            logger.exception(
-                "telegram sendMessage request failed for delivery_id=%s "
-                "conversation_ref=%s",
-                delivery.delivery_id,
-                delivery.conversation_ref,
-            )
-            outcome, error_code = _classify_send_failure(err)
-            self._record_delivery_failure(outcome, error_code)
-            await self._report_outbox_with_retry(
+        except TelegramPartialSendError as err:
+            await self._handle_outbox_send_failure(
                 delivery,
-                outcome,
-                error_code=error_code,
-                error_text=str(err),
+                err.cause,
+                partial_receipt=err.receipt,
             )
             return
+        except Exception as err:
+            await self._handle_outbox_send_failure(delivery, err)
+            return
 
-        self._remember_delivered_outbox_receipt(delivery.delivery_id, receipt)
+        self._remember_outbox_receipt(delivery.delivery_id, "delivered", receipt)
         await self._complete_progress_for_delivery(delivery)
         accepted = await self._report_outbox_with_retry(
             delivery,
@@ -1192,29 +1236,61 @@ class TelegramWorker:
             provider_receipt=receipt,
         )
         if accepted:
-            self._forget_delivered_outbox_receipt(delivery.delivery_id)
+            self._forget_outbox_receipt(delivery.delivery_id)
 
-    def _remember_delivered_outbox_receipt(
+    async def _handle_outbox_send_failure(
+        self,
+        delivery: OutboxDelivery,
+        err: Exception,
+        *,
+        partial_receipt: dict[str, object] | None = None,
+    ) -> None:
+        logger.exception(
+            "telegram sendMessage request failed for delivery_id=%s "
+            "conversation_ref=%s",
+            delivery.delivery_id,
+            delivery.conversation_ref,
+        )
+        outcome, error_code = _classify_send_failure(err)
+        self._record_delivery_failure(outcome, error_code)
+        if partial_receipt is not None and outcome == "retryable_failed":
+            self._remember_outbox_receipt(
+                delivery.delivery_id,
+                "partial",
+                partial_receipt,
+            )
+        elif outcome == "terminal_failed":
+            self._forget_outbox_receipt(delivery.delivery_id)
+        await self._report_outbox_with_retry(
+            delivery,
+            outcome,
+            error_code=error_code,
+            error_text=str(err),
+        )
+
+    def _remember_outbox_receipt(
         self,
         delivery_id: str,
+        status: str,
         receipt: dict[str, object],
     ) -> None:
-        self._delivered_outbox_receipts[delivery_id] = dict(receipt)
-        while len(self._delivered_outbox_receipts) > MAX_DELIVERED_OUTBOX_RECEIPTS:
-            self._delivered_outbox_receipts.pop(
-                next(iter(self._delivered_outbox_receipts))
-            )
-        self._save_delivered_outbox_receipts()
+        self._outbox_receipts[delivery_id] = OutboxReceiptRecord(
+            status=status,
+            provider_receipt=dict(receipt),
+        )
+        while len(self._outbox_receipts) > MAX_OUTBOX_RECEIPTS:
+            self._outbox_receipts.pop(next(iter(self._outbox_receipts)))
+        self._save_outbox_receipts()
 
-    def _forget_delivered_outbox_receipt(self, delivery_id: str) -> None:
-        if self._delivered_outbox_receipts.pop(delivery_id, None) is not None:
-            self._save_delivered_outbox_receipts()
+    def _forget_outbox_receipt(self, delivery_id: str) -> None:
+        if self._outbox_receipts.pop(delivery_id, None) is not None:
+            self._save_outbox_receipts()
 
-    def _save_delivered_outbox_receipts(self) -> None:
+    def _save_outbox_receipts(self) -> None:
         if self.outbox_receipt_store is None:
             return
         try:
-            self.outbox_receipt_store.save(self._delivered_outbox_receipts)
+            self.outbox_receipt_store.save(self._outbox_receipts)
         except Exception:
             logger.exception("telegram outbox receipt store save failed")
 
