@@ -1958,12 +1958,16 @@ impl ChannelStateStore {
         .context("failed to query channel grant counts")?;
 
         let outbox_counts = sqlx::query(
-            "SELECT status, COUNT(*) AS count \
+            "SELECT CASE WHEN status = 'failed' THEN 'failed' ELSE 'pending' END AS status, \
+                    COUNT(*) AS count \
              FROM channel_outbox_messages \
-             WHERE channel_id = ?1 AND status IN ('pending', 'failed') \
-             GROUP BY status",
+             WHERE channel_id = ?1 \
+               AND (status IN ('pending', 'failed') \
+                    OR (status = 'leased' AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms <= ?2)) \
+             GROUP BY CASE WHEN status = 'failed' THEN 'failed' ELSE 'pending' END",
         )
         .bind(channel_id)
+        .bind(now_ms())
         .fetch_all(&self.pool)
         .await
         .context("failed to query channel outbox counts")?;

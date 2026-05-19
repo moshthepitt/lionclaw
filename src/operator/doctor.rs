@@ -2343,6 +2343,27 @@ mod tests {
         .expect("insert outbox message");
     }
 
+    async fn insert_expired_leased_outbox_message(pool: &sqlx::SqlitePool, channel_id: &str) {
+        let now = crate::kernel::db::datetime_to_ms(Utc::now());
+        let expired_at =
+            crate::kernel::db::datetime_to_ms(Utc::now() - chrono::Duration::minutes(1));
+        sqlx::query(
+            "INSERT INTO channel_outbox_messages \
+             (delivery_id, channel_id, conversation_ref, status, content_json, attempt_count, \
+              next_attempt_at_ms, lease_owner, lease_expires_at_ms, current_attempt_id, created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, 'telegram:chat:1', 'leased', ?3, 1, ?4, 'telegram:worker', ?5, ?6, ?4, ?4)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(channel_id)
+        .bind(r#"{"text":"hello","format_hint":"plain","attachments":[]}"#)
+        .bind(now)
+        .bind(expired_at)
+        .bind(uuid::Uuid::new_v4().to_string())
+        .execute(pool)
+        .await
+        .expect("insert expired leased outbox message");
+    }
+
     fn raw_daemon_fingerprint(home: &LionClawHome, config: &OperatorConfig) -> String {
         let applied_state =
             AppliedState::from_home_read_only(home, config).expect("read applied state");
@@ -2442,6 +2463,30 @@ mod tests {
             finding.subject.as_ref() == "channel \"telegram\" has no worker health report"
         }));
         assert!(observations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn doctor_counts_expired_leased_outbox_messages_as_pending() {
+        let (_temp_dir, home, commands, config, pool) =
+            doctor_channel_fixture("telegram", ChannelLaunchMode::Background).await;
+        insert_expired_leased_outbox_message(&pool, "telegram").await;
+        let mut findings = Vec::new();
+        let mut observations = Vec::new();
+
+        inspect_channels(
+            &home,
+            "direct-home",
+            &commands,
+            &config,
+            &mut findings,
+            &mut observations,
+        )
+        .await;
+
+        assert!(findings.iter().any(|finding| {
+            finding.subject.as_ref() == "channel \"telegram\" has pending outbox messages"
+                && finding.observed.as_ref() == "1 pending outbox message"
+        }));
     }
 
     #[tokio::test]
