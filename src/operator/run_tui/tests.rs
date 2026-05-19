@@ -327,6 +327,73 @@ fn transcript_rendering_handles_markdown_code_fences() {
 }
 
 #[test]
+fn transcript_markdown_keeps_renderer_accents_in_lionclaw_palette() {
+    let lines = transcript_render_lines(&[TranscriptLine::new(
+        TranscriptLineKind::Answer,
+        "1. Read [the docs](https://example.com)\n2. Keep **important** words readable.\n```rust\nfn main() {}\n```",
+    )]);
+
+    let spans = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .collect::<Vec<_>>();
+
+    assert!(spans.iter().all(|span| !matches!(
+        span.style.fg,
+        Some(Color::Blue | Color::LightBlue | Color::Cyan | Color::LightCyan)
+    )));
+
+    let url = spans
+        .iter()
+        .find(|span| span.content.as_ref() == "https://example.com")
+        .expect("rendered link URL");
+    assert_eq!(url.style.fg, Some(PANEL_BORDER));
+    assert!(url.style.add_modifier.contains(Modifier::UNDERLINED));
+
+    let important = spans
+        .iter()
+        .find(|span| span.content.as_ref() == "important")
+        .expect("rendered strong text");
+    assert_eq!(important.style.fg, Some(PANEL_TEXT));
+    assert!(important.style.add_modifier.contains(Modifier::BOLD));
+
+    let code = spans
+        .iter()
+        .find(|span| span.content.as_ref() == "fn main() {}")
+        .expect("rendered fenced code");
+    assert_ne!(code.style.fg, Some(Color::Rgb(150, 181, 180)));
+    assert_ne!(code.style.fg, Some(Color::Rgb(143, 161, 179)));
+}
+
+#[tokio::test]
+async fn rendered_markdown_transcript_stays_inside_run_tui_palette() {
+    let mut app = ready_test_app(vec![TranscriptLine::new(
+        TranscriptLineKind::Answer,
+        "1. Read [the docs](https://example.com)\n2. Keep **important** words readable.\n```rust\nfn main() {}\n```",
+    )])
+    .await;
+    app.focus = Focus::Transcript;
+
+    let colors = render_to_foreground_colors(&mut app, 120, 32);
+    let unexpected = colors
+        .into_iter()
+        .filter(|color| !is_run_tui_palette_foreground(*color))
+        .collect::<Vec<_>>();
+
+    assert!(
+        unexpected.is_empty(),
+        "unexpected TUI colors: {unexpected:?}"
+    );
+}
+
+fn is_run_tui_palette_foreground(color: Color) -> bool {
+    matches!(
+        color,
+        Color::Reset | Color::DarkGray | Color::Gray | PANEL_BORDER | PANEL_READY | PANEL_ERROR
+    )
+}
+
+#[test]
 fn runtime_slash_commands_remain_passthrough_controls() {
     match classify_input("/compact now") {
         ClassifiedInput::RuntimeControl(control) => {
@@ -1715,4 +1782,23 @@ fn render_to_text(app: &mut ConsoleApp, width: u16, height: u16) -> String {
         text.push('\n');
     }
     text
+}
+
+fn render_to_foreground_colors(app: &mut ConsoleApp, width: u16, height: u16) -> Vec<Color> {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_app(frame, app))
+        .expect("render");
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area;
+    let mut colors = Vec::new();
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            colors.push(buffer[(x, y)].fg);
+        }
+    }
+    colors.sort_by_key(|color| format!("{color:?}"));
+    colors.dedup();
+    colors
 }

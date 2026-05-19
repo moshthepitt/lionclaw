@@ -2,6 +2,7 @@ use super::*;
 
 pub(crate) fn render_app(frame: &mut Frame<'_>, app: &mut ConsoleApp) {
     let area = frame.area();
+
     let composer_height = app.composer_height(area.height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -33,7 +34,8 @@ pub(crate) fn render_app(frame: &mut Frame<'_>, app: &mut ConsoleApp) {
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(PANEL_MUTED));
+        .border_style(Style::default().fg(PANEL_LINE))
+        .style(Style::default().bg(PANEL_BG));
     frame.render_widget(block, area);
     if area.height < 3 || area.width < 4 {
         return;
@@ -48,15 +50,15 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
                 .fg(PANEL_BORDER)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  |  ", Style::default().fg(PANEL_MUTED)),
-        Span::styled(app.context_label(), Style::default().fg(Color::White)),
+        Span::styled("  |  ", Style::default().fg(PANEL_LINE)),
+        Span::styled(app.context_label(), Style::default().fg(PANEL_TEXT)),
         Span::raw("    "),
-        Span::styled(app.runtime_label(), Style::default().fg(Color::White)),
+        Span::styled(app.runtime_label(), Style::default().fg(PANEL_TEXT)),
         Span::raw("    "),
-        Span::styled("net:", Style::default().fg(PANEL_BORDER)),
-        Span::styled(boundary.network, Style::default().fg(Color::White)),
+        Span::styled("net:", Style::default().fg(PANEL_MUTED)),
+        Span::styled(boundary.network, Style::default().fg(PANEL_READY)),
         Span::raw("    "),
-        Span::styled("secrets:", Style::default().fg(PANEL_BORDER)),
+        Span::styled("secrets:", Style::default().fg(PANEL_MUTED)),
         Span::styled(
             boundary.secrets,
             Style::default().fg(if app.selected.is_ready() {
@@ -66,13 +68,13 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
             }),
         ),
         Span::raw("    "),
-        Span::styled(workspace, Style::default().fg(Color::White)),
+        Span::styled(workspace, Style::default().fg(PANEL_TEXT)),
         Span::raw("    "),
-        Span::styled("turn:", Style::default().fg(PANEL_BORDER)),
-        Span::styled(boundary.turn_timeout, Style::default().fg(Color::White)),
+        Span::styled("turn:", Style::default().fg(PANEL_MUTED)),
+        Span::styled(boundary.turn_timeout, Style::default().fg(PANEL_TEXT)),
     ]);
     frame.render_widget(
-        Paragraph::new(line),
+        Paragraph::new(line).style(Style::default().bg(PANEL_BG)),
         Rect {
             x: area.x.saturating_add(2),
             y: area.y.saturating_add(1),
@@ -129,7 +131,7 @@ fn project_list_rows(app: &ConsoleApp, width: usize) -> Vec<ProjectListRow> {
 
     rows.push(project_list_heading(
         "Instances",
-        Style::default().fg(Color::White),
+        Style::default().fg(PANEL_INK),
     ));
     rows.push(project_list_spacer());
 
@@ -148,12 +150,12 @@ fn project_list_rows(app: &ConsoleApp, width: usize) -> Vec<ProjectListRow> {
     rows.push(project_list_spacer());
     rows.push(project_list_heading(
         "─".repeat(width),
-        Style::default().fg(PANEL_MUTED),
+        Style::default().fg(PANEL_LINE),
     ));
     rows.push(project_list_spacer());
     rows.push(project_list_heading(
         "Sessions",
-        Style::default().fg(Color::White),
+        Style::default().fg(PANEL_INK),
     ));
     rows.push(project_list_spacer());
     push_project_session_rows(&mut rows, &app.project_objects.sessions, width);
@@ -275,7 +277,7 @@ fn project_object_line(name: &str, detail: &str, muted: bool, width: usize) -> L
     };
     Line::styled(
         row,
-        Style::default().fg(if muted { PANEL_MUTED } else { Color::White }),
+        Style::default().fg(if muted { PANEL_MUTED } else { PANEL_TEXT }),
     )
 }
 
@@ -296,7 +298,9 @@ fn render_instances(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
     let selected_row = project_list_selected_row(&rows, app.project_cursor);
     app.project_list_state.select(selected_row);
     let items = rows.into_iter().map(|row| row.item).collect::<Vec<_>>();
-    let list = List::new(items).highlight_style(Style::default().bg(PANEL_SELECTED));
+    let list = List::new(items)
+        .style(Style::default().bg(PANEL_BG))
+        .highlight_style(Style::default().fg(PANEL_BORDER).bg(PANEL_SELECTED));
     frame.render_stateful_widget(list, list_area, &mut app.project_list_state);
     render_vertical_scrollbar(
         frame,
@@ -311,7 +315,9 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
     if let SelectedInstanceState::Blocked { blocker, .. } = &app.selected {
         let text = Text::from(launch_blocker_lines(blocker));
         frame.render_widget(
-            Paragraph::new(text).wrap(Wrap { trim: false }),
+            Paragraph::new(text)
+                .style(Style::default().fg(PANEL_TEXT).bg(PANEL_BG))
+                .wrap(Wrap { trim: false }),
             content.inner(Margin {
                 vertical: 1,
                 horizontal: 1,
@@ -345,13 +351,15 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
     app.set_transcript_viewport(rendered_line_count, transcript_area.height);
     let scroll = app.transcript_scroll.offset;
     frame.render_widget(
-        paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+        paragraph
+            .style(Style::default().fg(PANEL_TEXT).bg(PANEL_BG))
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         transcript_area,
     );
     render_vertical_scrollbar(frame, scrollbar_area, rendered_line_count, scroll);
     if activity_rows > 0 && content.height > activity_rows {
         let rule_y = content.y + content.height - activity_rows;
-        draw_horizontal_rule(frame, content.x, rule_y, content.width, PANEL_MUTED);
+        draw_horizontal_rule(frame, content.x, rule_y, content.width, PANEL_LINE);
         let mut spans = vec![
             Span::styled(
                 "activity",
@@ -383,7 +391,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
         }
         let activity = Line::from(spans);
         frame.render_widget(
-            Paragraph::new(activity),
+            Paragraph::new(activity).style(Style::default().fg(PANEL_TEXT).bg(PANEL_BG)),
             Rect {
                 x: content.x,
                 y: rule_y.saturating_add(1),
@@ -402,14 +410,14 @@ fn launch_blocker_lines(blocker: &LaunchBlocker) -> Vec<Line<'static>> {
     lines.extend(multiline_prefixed_lines(
         "",
         "",
-        Style::default().fg(Color::White),
+        Style::default().fg(PANEL_TEXT),
         &blocker.detail,
     ));
     lines.push(Line::raw(""));
     lines.extend(multiline_prefixed_lines(
         "",
         "",
-        Style::default().fg(Color::White),
+        Style::default().fg(PANEL_TEXT),
         &blocker.suggestion,
     ));
     lines
@@ -444,7 +452,7 @@ pub(crate) fn transcript_render_lines(lines: &[TranscriptLine]) -> Vec<Line<'sta
                 rendered.extend(multiline_prefixed_lines(
                     "",
                     "",
-                    Style::default().fg(Color::White),
+                    Style::default().fg(PANEL_TEXT),
                     &line.text,
                 ));
             }
@@ -577,10 +585,7 @@ fn owned_transcript_line(line: Line<'_>) -> Line<'static> {
         .spans
         .into_iter()
         .map(|span| {
-            let mut style = span.style;
-            if style.fg.is_none() {
-                style.fg = Some(Color::White);
-            }
+            let style = normalize_transcript_markdown_style(span.style);
             Span::styled(span.content.into_owned(), style)
         })
         .collect();
@@ -589,6 +594,25 @@ fn owned_transcript_line(line: Line<'_>) -> Line<'static> {
         alignment: line.alignment,
         spans,
     }
+}
+
+fn normalize_transcript_markdown_style(mut style: Style) -> Style {
+    if style.fg.is_none() {
+        style.fg = Some(PANEL_TEXT);
+    }
+
+    if matches!(
+        style.fg,
+        Some(Color::Blue | Color::LightBlue | Color::Cyan | Color::LightCyan)
+    ) {
+        style.fg = Some(if style.add_modifier.contains(Modifier::UNDERLINED) {
+            PANEL_BORDER
+        } else {
+            PANEL_TEXT
+        });
+    }
+
+    style
 }
 
 pub(super) fn vertical_scroll_limit(line_count: usize, viewport_height: u16) -> usize {
@@ -623,7 +647,7 @@ fn render_vertical_scrollbar(frame: &mut Frame<'_>, area: Rect, line_count: usiz
         .begin_symbol(Some("^"))
         .end_symbol(Some("v"))
         .thumb_style(Style::default().fg(PANEL_BORDER))
-        .track_style(Style::default().fg(PANEL_MUTED));
+        .track_style(Style::default().fg(PANEL_LINE));
     let mut state = ScrollbarState::new(line_count)
         .viewport_content_length(area.height as usize)
         .position(position);
@@ -666,7 +690,7 @@ fn multiline_prefixed_lines(
             };
             Line::from(vec![
                 Span::styled(prefix.to_string(), prefix_style),
-                Span::raw(line.to_string()),
+                Span::styled(line.to_string(), Style::default().fg(PANEL_TEXT)),
             ])
         })
         .collect()
@@ -800,7 +824,9 @@ fn render_project_cursor_inspector(frame: &mut Frame<'_>, content: Rect, app: &C
 
 fn render_inspector_lines(frame: &mut Frame<'_>, content: Rect, lines: Vec<Line<'static>>) {
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .style(Style::default().fg(PANEL_TEXT).bg(PANEL_BG))
+            .wrap(Wrap { trim: false }),
         inspector_body(content),
     );
 }
@@ -820,7 +846,9 @@ fn render_instance_inspector(frame: &mut Frame<'_>, content: Rect, app: &Console
             ),
         ]);
         frame.render_widget(
-            Paragraph::new(text).wrap(Wrap { trim: false }),
+            Paragraph::new(text)
+                .style(Style::default().fg(PANEL_TEXT).bg(PANEL_BG))
+                .wrap(Wrap { trim: false }),
             inspector_body(content),
         );
         return;
@@ -848,7 +876,9 @@ fn render_instance_inspector(frame: &mut Frame<'_>, content: Rect, app: &Console
     ));
 
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .style(Style::default().fg(PANEL_TEXT).bg(PANEL_BG))
+            .wrap(Wrap { trim: false }),
         inspector_body(content),
     );
 }
@@ -916,12 +946,13 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
     let border_style = if app.focus == Focus::Composer {
         Style::default().fg(PANEL_BORDER)
     } else {
-        Style::default().fg(PANEL_MUTED)
+        Style::default().fg(PANEL_LINE)
     };
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(border_style),
+            .border_style(border_style)
+            .style(Style::default().bg(PANEL_BG)),
         area,
     );
     if area.width < 4 || area.height < 4 {
@@ -929,7 +960,8 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
     }
 
     frame.render_widget(
-        Paragraph::new(Line::styled(">", Style::default().fg(PANEL_BORDER))),
+        Paragraph::new(Line::styled(">", Style::default().fg(PANEL_BORDER)))
+            .style(Style::default().bg(PANEL_BG)),
         Rect {
             x: area.x.saturating_add(2),
             y: area.y.saturating_add(1),
@@ -953,12 +985,19 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
         area.x.saturating_add(1),
         rule_y,
         area.width.saturating_sub(2),
-        PANEL_MUTED,
+        PANEL_LINE,
     );
     let mode = if app.active() { "running" } else { "normal" };
-    let status = Line::from(vec![Span::styled(mode, Style::default().fg(PANEL_BORDER))]);
+    let mode_style = if app.active() {
+        Style::default()
+            .fg(PANEL_BORDER)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(PANEL_MUTED)
+    };
+    let status = Line::from(vec![Span::styled(mode, mode_style)]);
     frame.render_widget(
-        Paragraph::new(status),
+        Paragraph::new(status).style(Style::default().bg(PANEL_BG)),
         Rect {
             x: area.x.saturating_add(2),
             y: rule_y.saturating_add(1),
@@ -1013,7 +1052,9 @@ fn render_activity_inspector(frame: &mut Frame<'_>, content: Rect, app: &mut Con
     app.set_activity_viewport(rendered_line_count, text_area.height);
     let scroll = app.activity_scroll.offset;
     frame.render_widget(
-        paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+        paragraph
+            .style(Style::default().fg(PANEL_TEXT).bg(PANEL_BG))
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         text_area,
     );
     render_vertical_scrollbar(frame, scrollbar_area, rendered_line_count, scroll);
@@ -1044,7 +1085,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(PANEL_MUTED)),
+            .border_style(Style::default().fg(PANEL_LINE))
+            .style(Style::default().bg(PANEL_BG)),
         area,
     );
     if area.height < 3 || area.width < 4 {
@@ -1054,15 +1096,18 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
     if app.focus == Focus::Project {
         spans.push(Span::raw("  "));
         spans.push(key_span("Enter"));
-        spans.push(Span::raw(match app.project_cursor {
-            ProjectSelection::Instance(index) if index == app.selected_index => " Current",
-            ProjectSelection::Instance(_) => " Switch",
-            ProjectSelection::Session(_) => " Open",
-        }));
+        spans.push(Span::styled(
+            match app.project_cursor {
+                ProjectSelection::Instance(index) if index == app.selected_index => " Current",
+                ProjectSelection::Instance(_) => " Switch",
+                ProjectSelection::Session(_) => " Open",
+            },
+            Style::default().fg(PANEL_TEXT),
+        ));
     }
     let line = Line::from(spans);
     frame.render_widget(
-        Paragraph::new(line),
+        Paragraph::new(line).style(Style::default().bg(PANEL_BG)),
         Rect {
             x: area.x.saturating_add(2),
             y: area.y.saturating_add(1),
@@ -1083,15 +1128,23 @@ fn render_panel_shell(frame: &mut Frame<'_>, area: Rect, title: &str, focused: b
     let border_style = if focused {
         Style::default().fg(PANEL_BORDER)
     } else {
-        Style::default().fg(PANEL_MUTED)
+        Style::default().fg(PANEL_LINE)
     };
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(border_style),
+            .border_style(border_style)
+            .style(Style::default().bg(PANEL_BG)),
         area,
     );
-    if area.width > 4 && area.height > 3 {
+    if area.width > 12 && area.height > 3 {
+        let title_style = if focused {
+            Style::default()
+                .fg(PANEL_BORDER)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(PANEL_MUTED)
+        };
         frame.render_widget(
             Paragraph::new(Line::styled(
                 if focused {
@@ -1099,12 +1152,9 @@ fn render_panel_shell(frame: &mut Frame<'_>, area: Rect, title: &str, focused: b
                 } else {
                     title.to_string()
                 },
-                Style::default().fg(PANEL_BORDER).add_modifier(if focused {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
-            )),
+                title_style,
+            ))
+            .style(Style::default().bg(PANEL_BG)),
             Rect {
                 x: area.x.saturating_add(2),
                 y: area.y.saturating_add(1),
@@ -1117,14 +1167,20 @@ fn render_panel_shell(frame: &mut Frame<'_>, area: Rect, title: &str, focused: b
             area.x.saturating_add(1),
             area.y.saturating_add(2),
             area.width.saturating_sub(2),
-            PANEL_MUTED,
+            PANEL_LINE,
         );
+        return Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(3),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(4),
+        };
     }
     Rect {
         x: area.x.saturating_add(1),
-        y: area.y.saturating_add(3),
+        y: area.y.saturating_add(1),
         width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(4),
+        height: area.height.saturating_sub(2),
     }
 }
 
@@ -1133,7 +1189,7 @@ fn draw_horizontal_rule(frame: &mut Frame<'_>, x: u16, y: u16, width: u16, color
         return;
     }
     frame.render_widget(
-        Paragraph::new("─".repeat(width as usize)).style(Style::default().fg(color)),
+        Paragraph::new("─".repeat(width as usize)).style(Style::default().fg(color).bg(PANEL_BG)),
         Rect {
             x,
             y,
@@ -1164,7 +1220,7 @@ fn instance_row_style(state: &str) -> Style {
     let fg = match state {
         "ready" => PANEL_READY,
         "blocked" => PANEL_ERROR,
-        _ => Color::White,
+        _ => PANEL_TEXT,
     };
     Style::default().fg(fg)
 }
@@ -1187,7 +1243,7 @@ fn kv_line(label: &'static str, value: &str) -> Line<'static> {
             format!("  {label:<KV_LABEL_WIDTH$}"),
             Style::default().fg(PANEL_MUTED),
         ),
-        Span::raw(value.to_string()),
+        Span::styled(value.to_string(), Style::default().fg(PANEL_TEXT)),
     ])
 }
 
@@ -1275,7 +1331,7 @@ pub(super) fn footer_hint_spans() -> Vec<Span<'static>> {
         let hint = binding.hint;
         spans.push(key_span(hint.key));
         spans.push(Span::raw(" "));
-        spans.push(Span::raw(hint.label));
+        spans.push(Span::styled(hint.label, Style::default().fg(PANEL_TEXT)));
     }
     spans
 }
@@ -1313,7 +1369,7 @@ fn push_help_hint(lines: &mut Vec<Line<'static>>, hint: KeyHint) {
     lines.push(Line::from(vec![
         key_span(hint.key),
         Span::raw("  "),
-        Span::raw(hint.description),
+        Span::styled(hint.description, Style::default().fg(PANEL_TEXT)),
     ]));
 }
 
@@ -1358,8 +1414,14 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp, overlay: 
             ],
         ),
     };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(PANEL_BORDER))
+        .style(Style::default().bg(PANEL_BG));
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().title(title).borders(Borders::ALL))
+        .style(Style::default().fg(PANEL_TEXT).bg(PANEL_BG))
+        .block(block)
         .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, popup);
 }
