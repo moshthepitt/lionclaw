@@ -3442,7 +3442,7 @@ fn boundary_display_rows(boundary: &BoundarySummary) -> Vec<BoundaryDisplayRow> 
         BoundaryDisplayRow::new("workspace", boundary.workspace_display()),
         BoundaryDisplayRow::new("network", boundary.network.clone()),
         BoundaryDisplayRow::new("runtime home", "private"),
-        BoundaryDisplayRow::new("skills snapshots", "read-only"),
+        BoundaryDisplayRow::new("skills", "read-only"),
     ]
 }
 
@@ -4188,7 +4188,7 @@ mod tests {
         assert!(rendered.contains("work root"));
         assert!(rendered.contains("turn:2h"));
         assert!(rendered.contains("turn timeout"));
-        assert!(rendered.contains("skills snapshots"));
+        assert!(rendered.contains("skills"));
         assert!(rendered.contains("read-only"));
         assert!(!rendered.contains("/lionclaw/skills"));
         assert!(rendered.contains("Ask through the selected runtime"));
@@ -4729,7 +4729,7 @@ mod tests {
                 ("workspace", "read-write".to_string()),
                 ("network", "off".to_string()),
                 ("runtime home", "private".to_string()),
-                ("skills snapshots", "read-only".to_string()),
+                ("skills", "read-only".to_string()),
             ]
         );
     }
