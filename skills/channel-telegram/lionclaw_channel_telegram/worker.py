@@ -19,6 +19,7 @@ from aiogram.exceptions import (
 from lionclaw_channel_telegram.api import (
     AttachmentMissingReport,
     HealthCheck,
+    InboundResponse,
     LionClawApi,
     OutboxDelivery,
     StreamEvent,
@@ -491,7 +492,11 @@ class TelegramWorker:
                 update.update_id,
             )
 
-    def _remember_active_turn(self, update, response) -> None:
+    def _remember_active_turn(
+        self,
+        update: TelegramInboundUpdate,
+        response: InboundResponse,
+    ) -> None:
         if response.turn_id is None:
             return
         target = TypingTarget(update.conversation_ref, update.thread_ref)
@@ -904,9 +909,7 @@ class TelegramWorker:
             return
         turn.status_text = "Finishing"
         if turn.provisional_message_ref is not None:
-            await self._delete_progress_message(turn)
-        turn.terminal = True
-        self._forget_turn(turn)
+            await self._edit_progress_message(turn, _progress_text(turn), force=True)
 
     async def _finalize_progress_done(self, event: StreamEvent) -> None:
         turn = self._active_turns.get(event.turn_id)
@@ -916,9 +919,8 @@ class TelegramWorker:
             await self._terminalize_progress(event, turn.terminal_text)
             return
         if turn.provisional_message_ref is not None:
-            await self._delete_progress_message(turn)
-        turn.terminal = True
-        self._forget_turn(turn)
+            turn.status_text = "Finishing"
+            await self._edit_progress_message(turn, _progress_text(turn), force=True)
 
     def _forget_turn(self, turn: ActiveTurn) -> None:
         self._active_turns.pop(turn.turn_id, None)
@@ -980,11 +982,24 @@ class TelegramWorker:
             )
             return
 
+        await self._complete_progress_for_delivery(delivery)
         await self._report_outbox_with_retry(
             delivery,
             "delivered",
             provider_receipt=receipt,
         )
+
+    async def _complete_progress_for_delivery(self, delivery: OutboxDelivery) -> None:
+        turn = self._active_turn_for_route(
+            delivery.conversation_ref,
+            delivery.thread_ref,
+        )
+        if turn is None:
+            return
+        if turn.provisional_message_ref is not None:
+            await self._delete_progress_message(turn)
+        turn.terminal = True
+        self._forget_turn(turn)
 
     async def _report_outbox_with_retry(
         self,

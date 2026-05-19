@@ -1595,6 +1595,15 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                     kind="turn_completed",
                 )
             )
+            self.assertEqual(telegram.deleted_messages, [])
+            await worker._process_outbox_delivery(
+                OutboxDelivery(
+                    delivery_id="delivery-1",
+                    attempt_id="attempt-1",
+                    conversation_ref="telegram:chat:77",
+                    content=OutboxContent(text="final answer"),
+                )
+            )
 
         self.assertEqual(
             telegram.sent_messages,
@@ -1605,12 +1614,22 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                     "telegram:message:7",
                     None,
                     [],
-                )
+                ),
+                (
+                    "telegram:chat:77",
+                    "final answer",
+                    None,
+                    None,
+                    [],
+                ),
             ],
         )
         self.assertEqual(
             telegram.edited_messages,
-            [("telegram:chat:77", "telegram:message:101", "Working...")],
+            [
+                ("telegram:chat:77", "telegram:message:101", "Working..."),
+                ("telegram:chat:77", "telegram:message:101", "Finishing..."),
+            ],
         )
         self.assertEqual(
             telegram.deleted_messages,
