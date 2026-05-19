@@ -9,11 +9,14 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use cron::Schedule;
+use uuid::Uuid;
 
 use crate::{
     contracts::{
+        ChannelGrantView, ChannelPairingInviteRequest, ChannelPairingListResponse,
+        ChannelPairingStatus, ChannelPairingView, ChannelRoutingProfile,
         ContinuityDraftActionRequest, ContinuityDraftListRequest, ContinuityPathRequest,
         ContinuitySearchRequest, JobCreateRequest, JobRefRequest, JobRunsRequest, JobScheduleDto,
         TrustTier,
@@ -40,8 +43,8 @@ use crate::{
         },
         reconcile::{
             add_channel, add_skill, open_kernel, open_runtime_kernel_for_work_root,
-            pairing_approve, pairing_block, pairing_list, remove_channel, remove_skill,
-            resolve_installed_skill_worker_entrypoint,
+            pairing_approve, pairing_block, pairing_invite, pairing_list, pairing_revoke,
+            remove_channel, remove_skill, resolve_installed_skill_worker_entrypoint,
         },
         run::run_local,
         runtime::{resolve_runtime_id, validate_runtime_availability},
@@ -391,8 +394,10 @@ struct ChannelAttachArgs {
 #[derive(Debug, Subcommand)]
 enum ChannelPairingCommand {
     List(PairingListArgs),
+    Invite(PairingInviteArgs),
     Approve(PairingApproveArgs),
     Block(PairingBlockArgs),
+    Revoke(PairingRevokeArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -451,15 +456,37 @@ enum ContinuityProposalCommand {
 struct PairingListArgs {
     #[arg(long)]
     channel_id: Option<String>,
+    #[arg(long)]
+    status: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct PairingApproveArgs {
     channel_id: String,
-    peer_id: String,
-    pairing_code: String,
+    pairing: String,
+    #[arg(long)]
+    label: Option<String>,
+    #[arg(long = "routing-profile")]
+    routing_profile: Option<String>,
     #[arg(long, default_value = "main")]
     trust_tier: String,
+}
+
+#[derive(Debug, Args)]
+struct PairingInviteArgs {
+    channel_id: String,
+    #[arg(long = "scope")]
+    scope: String,
+    #[arg(long)]
+    label: Option<String>,
+    #[arg(long = "conversation-ref")]
+    conversation_ref: Option<String>,
+    #[arg(long = "thread-ref")]
+    thread_ref: Option<String>,
+    #[arg(long = "expires-in", value_parser = parse_runtime_timeout)]
+    expires_in: Option<Duration>,
+    #[arg(long = "max-claims")]
+    max_claims: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -476,9 +503,31 @@ struct ContinuityDraftPathArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("block_target")
+        .required(true)
+        .args(["sender_ref", "pairing_id"])
+))]
 struct PairingBlockArgs {
     channel_id: String,
-    peer_id: String,
+    #[arg(value_name = "SENDER_REF")]
+    sender_ref: Option<String>,
+    #[arg(long = "pairing-id")]
+    pairing_id: Option<Uuid>,
+    #[arg(long = "conversation-ref")]
+    conversation_ref: Option<String>,
+    #[arg(long = "thread-ref")]
+    thread_ref: Option<String>,
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct PairingRevokeArgs {
+    channel_id: String,
+    grant_id: Uuid,
+    #[arg(long)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -498,8 +547,12 @@ struct JobAddArgs {
     allow_capabilities: Vec<String>,
     #[arg(long = "deliver-channel")]
     deliver_channel: Option<String>,
-    #[arg(long = "deliver-peer")]
-    deliver_peer: Option<String>,
+    #[arg(long = "deliver-conversation")]
+    deliver_conversation: Option<String>,
+    #[arg(long = "deliver-thread")]
+    deliver_thread: Option<String>,
+    #[arg(long = "deliver-reply-to")]
+    deliver_reply_to: Option<String>,
     #[arg(long = "retry-attempts")]
     retry_attempts: Option<u32>,
 }
@@ -945,38 +998,103 @@ pub async fn run() -> Result<ExitCode> {
             }
             ChannelCommand::Pairing { command } => match command {
                 ChannelPairingCommand::List(args) => {
-                    for peer in pairing_list(&home, args.channel_id).await? {
-                        println!(
-                            "channel={} peer={} status={} trust={} code={}",
-                            peer.channel_id,
-                            peer.peer_id,
-                            peer.status,
-                            peer.trust_tier.as_str(),
-                            peer.pairing_code.as_deref().unwrap_or("-"),
-                        );
-                    }
+                    let status = args
+                        .status
+                        .as_deref()
+                        .map(ChannelPairingStatus::from_str)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?;
+                    let response = pairing_list(&home, args.channel_id, status).await?;
+                    print!("{}", render_channel_pairing_list(&response));
+                }
+                ChannelPairingCommand::Invite(args) => {
+                    let requested_profile =
+                        ChannelRoutingProfile::from_str(&args.scope).map_err(anyhow::Error::msg)?;
+                    let expires_in_ms = args
+                        .expires_in
+                        .map(|duration| {
+                            u64::try_from(duration.as_millis())
+                                .context("expires-in is too large to represent")
+                        })
+                        .transpose()?;
+                    let invite = pairing_invite(
+                        &home,
+                        ChannelPairingInviteRequest {
+                            channel_id: args.channel_id,
+                            requested_profile,
+                            label: args.label,
+                            conversation_ref: args.conversation_ref,
+                            thread_ref: args.thread_ref,
+                            expires_in_ms,
+                            max_claims: args.max_claims,
+                        },
+                    )
+                    .await?;
+                    println!("Pairing token: {}", invite.token);
+                    println!("Expires: {}", invite.expires_at.to_rfc3339());
+                    println!("Claims: {}", invite.max_claims);
                 }
                 ChannelPairingCommand::Approve(args) => {
                     let trust_tier =
                         TrustTier::from_str(&args.trust_tier).map_err(anyhow::Error::msg)?;
-                    let peer = pairing_approve(
+                    let routing_profile = args
+                        .routing_profile
+                        .as_deref()
+                        .map(ChannelRoutingProfile::from_str)
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?;
+                    let grant = pairing_approve(
                         &home,
                         args.channel_id,
-                        args.peer_id,
-                        args.pairing_code,
+                        args.pairing,
+                        routing_profile,
                         trust_tier,
+                        args.label,
                     )
                     .await?;
                     println!(
-                        "approved {}:{} ({})",
-                        peer.peer.channel_id,
-                        peer.peer.peer_id,
-                        peer.peer.trust_tier.as_str()
+                        "approved channel={} grant={} profile={} trust={}",
+                        grant.grant.channel_id,
+                        grant.grant.grant_id,
+                        grant.grant.routing_profile.as_str(),
+                        grant.grant.trust_tier.as_str()
                     );
                 }
                 ChannelPairingCommand::Block(args) => {
-                    let peer = pairing_block(&home, args.channel_id, args.peer_id).await?;
-                    println!("blocked {}:{}", peer.peer.channel_id, peer.peer.peer_id);
+                    let channel_id = args.channel_id;
+                    let blocked = pairing_block(
+                        &home,
+                        channel_id.clone(),
+                        args.sender_ref,
+                        args.pairing_id,
+                        args.conversation_ref,
+                        args.thread_ref,
+                        args.reason,
+                    )
+                    .await?;
+                    if let Some(grant) = blocked.grant {
+                        println!(
+                            "blocked channel={} grant={} profile={} pairings={}",
+                            grant.channel_id,
+                            grant.grant_id,
+                            grant.routing_profile.as_str(),
+                            blocked.blocked_pairing_ids.len()
+                        );
+                    } else {
+                        println!(
+                            "blocked channel={} pairings={}",
+                            channel_id,
+                            blocked.blocked_pairing_ids.len()
+                        );
+                    }
+                }
+                ChannelPairingCommand::Revoke(args) => {
+                    let revoked =
+                        pairing_revoke(&home, args.channel_id, args.grant_id, args.reason).await?;
+                    println!(
+                        "revoked grant={} revoked={}",
+                        revoked.grant_id, revoked.revoked
+                    );
                 }
             },
         },
@@ -1173,17 +1291,21 @@ pub async fn run() -> Result<ExitCode> {
                         let kernel = open_kernel(&home, &config, None).await?;
                         let prompt_text = load_job_prompt(args.prompt, args.prompt_file).await?;
                         let schedule = parse_job_schedule_spec(&args.schedule, args.tz.as_deref())?;
-                        let delivery = match (args.deliver_channel, args.deliver_peer) {
-                            (None, None) => None,
-                            (Some(channel_id), Some(peer_id)) => {
+                        let has_delivery_detail =
+                            args.deliver_thread.is_some() || args.deliver_reply_to.is_some();
+                        let delivery = match (args.deliver_channel, args.deliver_conversation) {
+                            (None, None) if !has_delivery_detail => None,
+                            (Some(channel_id), Some(conversation_ref)) => {
                                 Some(crate::contracts::JobDeliveryTargetDto {
                                     channel_id,
-                                    peer_id,
+                                    conversation_ref,
+                                    thread_ref: args.deliver_thread,
+                                    reply_to_ref: args.deliver_reply_to,
                                 })
                             }
                             _ => {
                                 return Err(anyhow!(
-                                        "--deliver-channel and --deliver-peer must be provided together"
+                                        "--deliver-channel and --deliver-conversation are required for delivery"
                                     ));
                             }
                         };
@@ -1242,7 +1364,7 @@ pub async fn run() -> Result<ExitCode> {
                         println!(
                             "delivery={}",
                             job.delivery
-                                .map(|value| format!("{}:{}", value.channel_id, value.peer_id))
+                                .map(format_job_delivery)
                                 .unwrap_or_else(|| "-".to_string())
                         );
                     }
@@ -1566,6 +1688,56 @@ fn channel_pairing_list_command(home: &LionClawHome, channel_id: &str) -> String
     )
 }
 
+fn render_channel_pairing_list(response: &ChannelPairingListResponse) -> String {
+    let mut lines = response
+        .pairings
+        .iter()
+        .map(render_channel_pairing)
+        .collect::<Vec<_>>();
+    lines.extend(response.grants.iter().map(render_channel_grant));
+
+    if lines.is_empty() {
+        String::new()
+    } else {
+        let mut output = lines.join("\n");
+        output.push('\n');
+        output
+    }
+}
+
+fn render_channel_pairing(pairing: &ChannelPairingView) -> String {
+    format!(
+        "channel={} pairing={} status={} profile={} sender={} conversation={} thread={} label={}",
+        pairing.channel_id,
+        pairing.pairing_id,
+        pairing.status.as_str(),
+        pairing.requested_profile.as_str(),
+        optional_value(pairing.sender_ref.as_deref()),
+        optional_value(pairing.conversation_ref.as_deref()),
+        optional_value(pairing.thread_ref.as_deref()),
+        optional_value(pairing.label.as_deref()),
+    )
+}
+
+fn render_channel_grant(grant: &ChannelGrantView) -> String {
+    format!(
+        "channel={} grant={} status={} profile={} trust={} sender={} conversation={} thread={} label={}",
+        grant.channel_id,
+        grant.grant_id,
+        grant.status,
+        grant.routing_profile.as_str(),
+        grant.trust_tier.as_str(),
+        optional_value(grant.sender_ref.as_deref()),
+        optional_value(grant.conversation_ref.as_deref()),
+        optional_value(grant.thread_ref.as_deref()),
+        optional_value(grant.label.as_deref()),
+    )
+}
+
+fn optional_value(value: Option<&str>) -> &str {
+    value.unwrap_or("-")
+}
+
 fn validate_channel_list_all_target(selection: &TargetSelection) -> Result<()> {
     if selection.home.is_some() {
         return Err(anyhow!(
@@ -1820,6 +1992,17 @@ async fn load_job_prompt(prompt: Option<String>, prompt_file: Option<String>) ->
 
 fn parse_job_id(raw: &str) -> Result<uuid::Uuid> {
     uuid::Uuid::parse_str(raw.trim()).map_err(|_| anyhow!("invalid job id '{raw}'"))
+}
+
+fn format_job_delivery(delivery: crate::contracts::JobDeliveryTargetDto) -> String {
+    let mut parts = vec![delivery.channel_id, delivery.conversation_ref];
+    if let Some(thread_ref) = delivery.thread_ref {
+        parts.push(thread_ref);
+    }
+    if let Some(reply_to_ref) = delivery.reply_to_ref {
+        parts.push(format!("reply_to={reply_to_ref}"));
+    }
+    parts.join(":")
 }
 
 fn parse_job_schedule_spec(raw: &str, timezone: Option<&str>) -> Result<JobScheduleDto> {
@@ -2312,6 +2495,146 @@ mod tests {
         assert!(command.contains(&home.root().display().to_string()));
         assert!(command.contains("channel pairing list --channel-id telegram"));
         assert!(!command.starts_with("lionclaw channel pairing"));
+    }
+
+    #[test]
+    fn channel_pairing_invite_parses_scope_limits_and_bindings() {
+        let cli = Cli::try_parse_from([
+            "lionclaw",
+            "channel",
+            "pairing",
+            "invite",
+            "telegram",
+            "--scope",
+            "thread",
+            "--conversation-ref",
+            "chat-1",
+            "--thread-ref",
+            "topic-42",
+            "--expires-in",
+            "5m",
+            "--max-claims",
+            "3",
+            "--label",
+            "reviewers",
+        ])
+        .expect("parse pairing invite");
+
+        match cli.command {
+            Command::Channel {
+                command:
+                    ChannelCommand::Pairing {
+                        command: ChannelPairingCommand::Invite(args),
+                    },
+            } => {
+                assert_eq!(args.channel_id, "telegram");
+                assert_eq!(args.scope, "thread");
+                assert_eq!(args.conversation_ref.as_deref(), Some("chat-1"));
+                assert_eq!(args.thread_ref.as_deref(), Some("topic-42"));
+                assert_eq!(args.expires_in, Some(std::time::Duration::from_secs(300)));
+                assert_eq!(args.max_claims, Some(3));
+                assert_eq!(args.label.as_deref(), Some("reviewers"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_pairing_block_keeps_uuid_shaped_sender_ref_positional() {
+        let sender_ref = Uuid::new_v4().to_string();
+        let cli = Cli::try_parse_from([
+            "lionclaw",
+            "channel",
+            "pairing",
+            "block",
+            "terminal",
+            sender_ref.as_str(),
+        ])
+        .expect("parse sender ref block");
+
+        match cli.command {
+            Command::Channel {
+                command:
+                    ChannelCommand::Pairing {
+                        command: ChannelPairingCommand::Block(args),
+                    },
+            } => {
+                assert_eq!(args.channel_id, "terminal");
+                assert_eq!(args.sender_ref.as_deref(), Some(sender_ref.as_str()));
+                assert!(args.pairing_id.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_pairing_block_accepts_explicit_pairing_id() {
+        let pairing_id = Uuid::new_v4();
+        let pairing_id_raw = pairing_id.to_string();
+        let cli = Cli::try_parse_from([
+            "lionclaw",
+            "channel",
+            "pairing",
+            "block",
+            "terminal",
+            "--pairing-id",
+            pairing_id_raw.as_str(),
+        ])
+        .expect("parse pairing id block");
+
+        match cli.command {
+            Command::Channel {
+                command:
+                    ChannelCommand::Pairing {
+                        command: ChannelPairingCommand::Block(args),
+                    },
+            } => {
+                assert_eq!(args.channel_id, "terminal");
+                assert!(args.sender_ref.is_none());
+                assert_eq!(args.pairing_id, Some(pairing_id));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_channel_pairing_list_includes_grants() {
+        let pairing_id = Uuid::new_v4();
+        let grant_id = Uuid::new_v4();
+        let now = Utc::now();
+        let output = render_channel_pairing_list(&ChannelPairingListResponse {
+            pairings: vec![ChannelPairingView {
+                pairing_id,
+                channel_id: "terminal".to_string(),
+                sender_ref: Some("alice".to_string()),
+                conversation_ref: Some("chat-1".to_string()),
+                thread_ref: None,
+                requested_profile: ChannelRoutingProfile::Conversation,
+                status: ChannelPairingStatus::Pending,
+                label: Some("Alice".to_string()),
+                created_at: now,
+                expires_at: None,
+            }],
+            grants: vec![ChannelGrantView {
+                grant_id,
+                channel_id: "terminal".to_string(),
+                sender_ref: Some("alice".to_string()),
+                conversation_ref: Some("chat-1".to_string()),
+                thread_ref: None,
+                routing_profile: ChannelRoutingProfile::Conversation,
+                trust_tier: TrustTier::Main,
+                status: "approved".to_string(),
+                label: Some("Alice".to_string()),
+                created_at: now,
+                updated_at: now,
+                revoked_at: None,
+            }],
+        });
+
+        assert!(output.contains(&format!("pairing={pairing_id}")));
+        assert!(output.contains(&format!("grant={grant_id}")));
+        assert!(output.contains("status=approved"));
+        assert!(output.contains("trust=main"));
     }
 
     #[tokio::test]

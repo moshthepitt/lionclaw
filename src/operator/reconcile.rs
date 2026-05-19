@@ -3,11 +3,18 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
+use uuid::Uuid;
 
 use crate::{
     applied::{compute_daemon_fingerprint, AppliedState},
-    contracts::{ChannelPeerApproveRequest, ChannelPeerResponse, TrustTier},
+    contracts::{
+        ChannelGrantResponse, ChannelGrantRevokeRequest, ChannelGrantRevokeResponse,
+        ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
+        ChannelPairingInviteRequest, ChannelPairingInviteResponse, ChannelPairingListResponse,
+        ChannelPairingStatus, ChannelRoutingProfile, TrustTier,
+    },
     home::{runtime_project_partition_key, LionClawHome},
     kernel::{skills::validate_skill_alias, Kernel, KernelOptions, RuntimeExecutionPolicy},
     operator::{
@@ -309,12 +316,27 @@ pub async fn up_for_work_root<M: UnitManager>(
 }
 
 fn allocate_auto_bind() -> Result<String> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .context("failed to allocate an automatic loopback bind")?;
-    let addr = listener
-        .local_addr()
-        .context("failed to read automatic bind address")?;
-    Ok(format!("127.0.0.1:{}", addr.port()))
+    static ALLOCATED_AUTO_BIND_PORTS: OnceLock<Mutex<BTreeSet<u16>>> = OnceLock::new();
+
+    let allocated_ports = ALLOCATED_AUTO_BIND_PORTS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    for _ in 0..64 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .context("failed to allocate an automatic loopback bind")?;
+        let port = listener
+            .local_addr()
+            .context("failed to read automatic bind address")?
+            .port();
+        let mut allocated_ports = allocated_ports
+            .lock()
+            .map_err(|_| anyhow!("automatic bind port registry lock poisoned"))?;
+        if allocated_ports.insert(port) {
+            return Ok(format!("127.0.0.1:{port}"));
+        }
+    }
+
+    Err(anyhow!(
+        "failed to allocate a unique automatic loopback bind after repeated attempts"
+    ))
 }
 
 async fn ensure_managed_bind_configured(
@@ -354,50 +376,102 @@ pub async fn logs<M: UnitManager>(
 pub async fn pairing_list(
     home: &LionClawHome,
     channel_id: Option<String>,
-) -> Result<Vec<crate::contracts::ChannelPeerView>> {
+    status: Option<ChannelPairingStatus>,
+) -> Result<ChannelPairingListResponse> {
     let config = OperatorConfig::load(home).await?;
     let kernel = open_kernel(home, &config, None).await?;
-    let peers = kernel
-        .list_channel_peers(channel_id)
+    kernel
+        .list_channel_pairings(channel_id, status)
         .await
-        .map_err(to_anyhow)?;
-    Ok(peers.peers)
+        .map_err(to_anyhow)
 }
 
 pub async fn pairing_approve(
     home: &LionClawHome,
     channel_id: String,
-    peer_id: String,
-    pairing_code: String,
+    pairing: String,
+    routing_profile: Option<ChannelRoutingProfile>,
     trust_tier: TrustTier,
-) -> Result<ChannelPeerResponse> {
+    label: Option<String>,
+) -> Result<ChannelGrantResponse> {
     let config = OperatorConfig::load(home).await?;
     let kernel = open_kernel(home, &config, None).await?;
+    let (pairing_id, pairing_code) = pairing_approve_lookup(pairing);
     kernel
-        .approve_channel_peer(ChannelPeerApproveRequest {
+        .approve_channel_pairing(ChannelPairingApproveRequest {
             channel_id,
-            peer_id,
+            pairing_id,
             pairing_code,
+            routing_profile,
             trust_tier: Some(trust_tier),
+            label,
         })
         .await
         .map_err(to_anyhow)
 }
 
+pub async fn pairing_invite(
+    home: &LionClawHome,
+    req: ChannelPairingInviteRequest,
+) -> Result<ChannelPairingInviteResponse> {
+    let config = OperatorConfig::load(home).await?;
+    let kernel = open_kernel(home, &config, None).await?;
+    kernel.invite_channel_pairing(req).await.map_err(to_anyhow)
+}
+
 pub async fn pairing_block(
     home: &LionClawHome,
     channel_id: String,
-    peer_id: String,
-) -> Result<ChannelPeerResponse> {
+    sender_ref: Option<String>,
+    pairing_id: Option<Uuid>,
+    conversation_ref: Option<String>,
+    thread_ref: Option<String>,
+    reason: Option<String>,
+) -> Result<ChannelPairingBlockResponse> {
     let config = OperatorConfig::load(home).await?;
     let kernel = open_kernel(home, &config, None).await?;
     kernel
-        .block_channel_peer(crate::contracts::ChannelPeerBlockRequest {
+        .block_channel_pairing(ChannelPairingBlockRequest {
             channel_id,
-            peer_id,
+            pairing_id,
+            sender_ref: non_empty_trimmed(sender_ref),
+            conversation_ref,
+            thread_ref,
+            reason,
         })
         .await
         .map_err(to_anyhow)
+}
+
+pub async fn pairing_revoke(
+    home: &LionClawHome,
+    channel_id: String,
+    grant_id: Uuid,
+    reason: Option<String>,
+) -> Result<ChannelGrantRevokeResponse> {
+    let config = OperatorConfig::load(home).await?;
+    let kernel = open_kernel(home, &config, None).await?;
+    kernel
+        .revoke_channel_grant(ChannelGrantRevokeRequest {
+            channel_id,
+            grant_id,
+            reason,
+        })
+        .await
+        .map_err(to_anyhow)
+}
+
+fn pairing_approve_lookup(raw: String) -> (Option<Uuid>, Option<String>) {
+    let trimmed = raw.trim();
+    match Uuid::parse_str(trimmed) {
+        Ok(pairing_id) => (Some(pairing_id), None),
+        Err(_) => (None, Some(trimmed.to_string())),
+    }
+}
+
+fn non_empty_trimmed(raw: Option<String>) -> Option<String> {
+    raw.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn to_anyhow(err: crate::kernel::KernelError) -> anyhow::Error {

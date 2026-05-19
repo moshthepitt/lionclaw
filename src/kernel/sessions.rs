@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
+use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -65,6 +65,39 @@ impl SessionStore {
             .ok_or_else(|| anyhow!("session disappeared immediately after insert"))
     }
 
+    pub(crate) async fn open_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        channel_id: String,
+        peer_id: String,
+        project_scope: String,
+        trust_tier: TrustTier,
+        history_policy: SessionHistoryPolicy,
+    ) -> Result<Session> {
+        let session_id = Uuid::new_v4();
+        let created_at_ms = now_ms();
+
+        sqlx::query(
+            "INSERT INTO sessions \
+             (session_id, channel_id, peer_id, project_scope, trust_tier, history_policy, created_at_ms, last_turn_at_ms, last_activity_at_ms, turn_count) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, 0)",
+        )
+        .bind(session_id.to_string())
+        .bind(&channel_id)
+        .bind(&peer_id)
+        .bind(&project_scope)
+        .bind(trust_tier.as_str())
+        .bind(history_policy.as_str())
+        .bind(created_at_ms)
+        .execute(&mut **tx)
+        .await
+        .context("failed to insert session")?;
+
+        self.get_in_tx(tx, session_id)
+            .await?
+            .ok_or_else(|| anyhow!("session disappeared immediately after transactional insert"))
+    }
+
     pub async fn get(&self, session_id: Uuid) -> Result<Option<Session>> {
         let row = sqlx::query(
             "SELECT session_id, channel_id, peer_id, project_scope, trust_tier, history_policy, created_at_ms, last_activity_at_ms, turn_count \
@@ -73,6 +106,24 @@ impl SessionStore {
         )
         .bind(session_id.to_string())
         .fetch_optional(&self.pool)
+        .await
+        .context("failed to query session")?;
+
+        row.map(map_session_row).transpose()
+    }
+
+    pub(crate) async fn get_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        session_id: Uuid,
+    ) -> Result<Option<Session>> {
+        let row = sqlx::query(
+            "SELECT session_id, channel_id, peer_id, project_scope, trust_tier, history_policy, created_at_ms, last_activity_at_ms, turn_count \
+             FROM sessions \
+             WHERE session_id = ?1",
+        )
+        .bind(session_id.to_string())
+        .fetch_optional(&mut **tx)
         .await
         .context("failed to query session")?;
 
@@ -108,6 +159,30 @@ impl SessionStore {
         .bind(project_scope)
         .bind(history_policy.map(SessionHistoryPolicy::as_str))
         .fetch_optional(&self.pool)
+        .await
+        .context("failed to query latest session by channel and peer")?;
+
+        row.map(map_session_row).transpose()
+    }
+
+    pub(crate) async fn find_latest_by_channel_peer_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        channel_id: &str,
+        peer_id: &str,
+        project_scope: &str,
+    ) -> Result<Option<Session>> {
+        let row = sqlx::query(
+            "SELECT session_id, channel_id, peer_id, project_scope, trust_tier, history_policy, created_at_ms, last_activity_at_ms, turn_count \
+             FROM sessions \
+             WHERE channel_id = ?1 AND peer_id = ?2 AND project_scope = ?3 \
+             ORDER BY (last_activity_at_ms IS NOT NULL) DESC, COALESCE(last_activity_at_ms, created_at_ms) DESC, created_at_ms DESC \
+             LIMIT 1",
+        )
+        .bind(channel_id)
+        .bind(peer_id)
+        .bind(project_scope)
+        .fetch_optional(&mut **tx)
         .await
         .context("failed to query latest session by channel and peer")?;
 

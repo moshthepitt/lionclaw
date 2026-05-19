@@ -1,15 +1,20 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    ffi::OsStr,
     fmt,
-    path::{Path, PathBuf},
+    io::ErrorKind,
+    path::{Component, Path, PathBuf},
     str::FromStr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
-use chrono::{DateTime, Utc};
-use serde_json::json;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use sqlx::{Sqlite, Transaction};
 use tokio::{
+    io::AsyncWriteExt,
     sync::{Mutex, Notify, RwLock},
     time::{sleep, timeout, Instant},
 };
@@ -17,11 +22,22 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::contracts::{
-    AuditEventView, AuditQueryResponse, ChannelBindingView, ChannelInboundOutcome,
-    ChannelInboundRequest, ChannelInboundResponse, ChannelListResponse, ChannelPeerApproveRequest,
-    ChannelPeerBlockRequest, ChannelPeerListResponse, ChannelPeerResponse, ChannelPeerView,
-    ChannelStreamAckRequest, ChannelStreamAckResponse, ChannelStreamEventView,
-    ChannelStreamPullRequest, ChannelStreamPullResponse, ContinuityDraftActionRequest,
+    AuditEventView, AuditQueryResponse, ChannelAttachmentDescriptor,
+    ChannelAttachmentFinalizeOutcome, ChannelAttachmentFinalizeRequest,
+    ChannelAttachmentFinalizeResponse, ChannelAttachmentStageResponse, ChannelAttachmentStatus,
+    ChannelBindingView, ChannelGrantResponse, ChannelGrantRevokeRequest,
+    ChannelGrantRevokeResponse, ChannelGrantView, ChannelHealthCheck, ChannelHealthReportRequest,
+    ChannelHealthReportResponse, ChannelHealthStatus, ChannelInboundOutcome, ChannelInboundRequest,
+    ChannelInboundResponse, ChannelListResponse, ChannelOutboxAttachmentDto,
+    ChannelOutboxAttemptStatusDto, ChannelOutboxContentDto, ChannelOutboxDeliveryStatusDto,
+    ChannelOutboxDeliveryView, ChannelOutboxPullRequest, ChannelOutboxPullResponse,
+    ChannelOutboxReportOutcomeDto, ChannelOutboxReportRequest, ChannelOutboxReportResponse,
+    ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
+    ChannelPairingClaimOutcome, ChannelPairingClaimRequest, ChannelPairingClaimResponse,
+    ChannelPairingInviteRequest, ChannelPairingInviteResponse, ChannelPairingListResponse,
+    ChannelPairingStatus, ChannelPairingView, ChannelRoutingProfile, ChannelStreamAckRequest,
+    ChannelStreamAckResponse, ChannelStreamEventView, ChannelStreamPullRequest,
+    ChannelStreamPullResponse, ChannelTrigger, ContinuityDraftActionRequest,
     ContinuityDraftDiscardResponse, ContinuityDraftListRequest, ContinuityDraftListResponse,
     ContinuityDraftPromoteResponse, ContinuityDraftView, ContinuityGetResponse,
     ContinuityMemoryProposalView, ContinuityOpenLoopActionResponse, ContinuityOpenLoopListResponse,
@@ -51,9 +67,28 @@ use crate::{
 use super::{
     audit::AuditLog,
     capability_broker::{CapabilityBroker, CapabilityExecutionContext},
+    channel_attachments::{
+        ChannelAttachmentBatchStatus, ChannelAttachmentRecord, ChannelAttachmentRecordStatus,
+        ChannelAttachmentStore, DeclareAttachmentRejection, RejectAttachmentUpdate,
+        StageAttachmentUpdate, MAX_CHANNEL_ATTACHMENTS_PER_EVENT, MAX_CHANNEL_ATTACHMENT_BYTES,
+        MAX_CHANNEL_EVENT_ATTACHMENT_BYTES,
+    },
+    channel_outbox::{
+        ChannelDeliveryAttachment, ChannelDeliveryContent, ChannelDeliveryLease,
+        ChannelDeliveryRecord, ChannelDeliveryRoute, ChannelOutboxAttemptStatus,
+        ChannelOutboxDeliveryStatus, ChannelOutboxPull, ChannelOutboxReport,
+        ChannelOutboxReportOutcome, ChannelOutboxStore, NewChannelDelivery,
+        DEFAULT_CHANNEL_OUTBOX_LEASE_MS, DEFAULT_CHANNEL_OUTBOX_PULL_LIMIT,
+        MAX_CHANNEL_OUTBOX_LEASE_MS, MAX_CHANNEL_OUTBOX_PULL_LIMIT,
+    },
     channel_state::{
-        ChannelPeerStatus, ChannelStateStore, ChannelStreamEventInsert, ChannelStreamEventKind,
-        ChannelStreamEventRecord, ChannelTurnRecord, StreamMessageLane as ChannelStreamLane,
+        ChannelGrantRecord, ChannelGrantStatus, ChannelGrantUpsert, ChannelPairingRequestRecord,
+        ChannelStateStore, ChannelStreamEventInsert, ChannelStreamEventKind,
+        ChannelStreamEventRecord, ChannelTurnRecord, ChannelTurnStatus, NewChannelHealthReport,
+        NewChannelInboundEvent, NewChannelTurn, OperatorPairingUpsert,
+        StreamMessageLane as ChannelStreamLane, TokenPairingCreate,
+        CHANNEL_HEALTH_OBSERVED_AT_FUTURE_SKEW_SECONDS, PAIRING_CLAIM_POLICY_OPERATOR_APPROVAL,
+        PAIRING_CLAIM_POLICY_TOKEN_CLAIM,
     },
     continuity::{
         ActiveContinuitySnapshot, ContinuityArtifact, ContinuityEvent, ContinuityLayout,
@@ -75,11 +110,11 @@ use super::{
         resolve_oci_image_compatibility_identity, skill_mount_target, EffectiveExecutionPlan,
         ExecutionPlanPurpose, ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig,
         ExecutionPreset, HiddenTurnSupport, MountAccess, MountSpec, NetworkMode, RuntimeAdapter,
-        RuntimeCapabilityRequest, RuntimeCapabilityResult, RuntimeControlExecution,
-        RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent,
-        RuntimeExecutionProfile, RuntimeMessageLane, RuntimeProgramTurnExecution, RuntimeRegistry,
-        RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
-        RuntimeTurnMode, RuntimeTurnResult,
+        RuntimeArtifact, RuntimeCapabilityRequest, RuntimeCapabilityResult,
+        RuntimeControlExecution, RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome,
+        RuntimeEvent, RuntimeExecutionProfile, RuntimeMessageLane, RuntimeProgramTurnExecution,
+        RuntimeRegistry, RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput,
+        RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -98,6 +133,64 @@ use super::{
 
 const ACTIVE_GLOBAL_SLICE_LIMIT: usize = 5;
 const HIDDEN_COMPACTION_TURN_TIMEOUT: Duration = Duration::from_secs(30);
+const STALE_CHANNEL_ATTACHMENT_BATCH_AFTER: Duration = Duration::from_secs(60 * 60);
+const STALE_CHANNEL_ATTACHMENT_TEMP_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+const STALE_CHANNEL_ATTACHMENT_PROJECTION_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+const CHANNEL_ATTACHMENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+const CHANNEL_ATTACHMENT_NOT_STAGED: &str = "not_staged";
+const CHANNEL_ATTACHMENT_TOO_LARGE: &str = "attachment_too_large";
+const CHANNEL_ATTACHMENT_EVENT_TOO_LARGE: &str = "event_attachments_too_large";
+const CHANNEL_ATTACHMENT_PROJECTIONS_DIR: &str = "attachment-projections";
+const CHANNEL_ATTACHMENT_MOUNT_TARGET: &str = "/attachments";
+const CHANNEL_OUTBOX_ARTIFACTS_DIR: &str = "channel-outbox";
+const MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY: usize = 10;
+const MAX_CHANNEL_OUTBOX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
+const MAX_CHANNEL_OUTBOX_RECEIPT_JSON_BYTES: usize = 64 * 1024;
+const MAX_CHANNEL_OUTBOX_ERROR_TEXT_BYTES: usize = 4096;
+const MAX_CHANNEL_HEALTH_CHECKS_PER_REPORT: usize = 128;
+const MAX_CHANNEL_HEALTH_REPORTER_ID_BYTES: usize = 256;
+const MAX_CHANNEL_HEALTH_CHECK_CODE_BYTES: usize = 128;
+const MAX_CHANNEL_HEALTH_CHECK_MESSAGE_BYTES: usize = 4096;
+const MAX_CHANNEL_HEALTH_CHECK_DETAILS_JSON_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone)]
+pub enum ChannelAttachmentStageContent {
+    Bytes(Vec<u8>),
+    RejectedByPolicy {
+        reason_code: String,
+        size_bytes: i64,
+        sha256: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelAttachmentStageInput {
+    pub channel_id: String,
+    pub event_id: String,
+    pub attachment_id: String,
+    pub kind: String,
+    pub filename: Option<String>,
+    pub mime_type: Option<String>,
+    pub caption: Option<String>,
+    pub content: ChannelAttachmentStageContent,
+}
+
+#[derive(Debug, Clone)]
+struct StagedAttachmentContent {
+    content: Option<Vec<u8>>,
+    size_bytes: i64,
+    sha256: String,
+    policy_rejection_code: Option<String>,
+}
+
+struct ChannelAttachmentStageRejection<'a> {
+    channel_id: &'a str,
+    event_id: &'a str,
+    attachment_id: &'a str,
+    size_bytes: i64,
+    sha256: &'a str,
+    reason_code: &'a str,
+}
 
 #[derive(Clone)]
 pub struct KernelOptions {
@@ -181,6 +274,8 @@ pub struct Kernel {
     jobs: JobStore,
     runtime: RuntimeRegistry,
     channel_state: ChannelStateStore,
+    channel_outbox: ChannelOutboxStore,
+    channel_attachments: ChannelAttachmentStore,
     audit: AuditLog,
     capability_broker: CapabilityBroker,
     scheduler: SchedulerEngine,
@@ -200,17 +295,6 @@ pub struct Kernel {
     applied_state: AppliedState,
     continuity: Option<ContinuityLayout>,
     hidden_compaction_turn_timeout: Duration,
-}
-
-#[derive(Debug, Clone)]
-pub struct InboundChannelText {
-    pub channel_id: String,
-    pub peer_id: String,
-    pub text: String,
-    pub session_id: Option<Uuid>,
-    pub runtime_id: Option<String>,
-    pub update_id: Option<i64>,
-    pub external_message_id: Option<String>,
 }
 
 impl Kernel {
@@ -353,6 +437,8 @@ impl Kernel {
             jobs: JobStore::new(pool.clone()),
             runtime,
             channel_state: ChannelStateStore::new(pool.clone()),
+            channel_outbox: ChannelOutboxStore::new(pool.clone()),
+            channel_attachments: ChannelAttachmentStore::new(pool.clone()),
             audit: AuditLog::new(pool),
             capability_broker,
             scheduler: SchedulerEngine::new(options.scheduler),
@@ -389,7 +475,11 @@ impl Kernel {
             }
         }
         let reason = "turn interrupted by kernel restart";
-        if let Ok(interrupted_turns) = self.session_turns.interrupt_running_turns(reason).await {
+        if let Ok(interrupted_turns) = self
+            .session_turns
+            .interrupt_running_turns_without_pending_channel_turns(reason)
+            .await
+        {
             for turn in &interrupted_turns {
                 if let Err(err) = self.sessions.record_turn(turn.session_id).await {
                     warn!(?err, session_id = %turn.session_id, "failed to touch interrupted session");
@@ -417,6 +507,13 @@ impl Kernel {
                 "failed to reconcile running channel turns during bootstrap"
             );
         }
+        if let Err(err) = self.reconcile_stale_channel_attachments().await {
+            warn!(
+                ?err,
+                "failed to reconcile stale channel attachments during bootstrap"
+            );
+        }
+        self.ensure_pending_channel_turn_workers().await;
         if let Err(err) = self
             .jobs
             .interrupt_running_runs("scheduled job interrupted by kernel restart")
@@ -429,6 +526,274 @@ impl Kernel {
         }
         if let Err(err) = self.refresh_active_continuity().await {
             warn!(?err, "failed to refresh active continuity during bootstrap");
+        }
+    }
+
+    pub async fn reconcile_stale_channel_attachments(&self) -> Result<(), KernelError> {
+        self.cleanup_stale_channel_attachment_temp_uploads().await?;
+        self.cleanup_stale_channel_attachment_runtime_projections()
+            .await?;
+        self.finalize_stale_channel_attachment_batches().await
+    }
+
+    pub async fn run_channel_attachment_maintenance_loop(self: Arc<Self>) {
+        loop {
+            sleep(CHANNEL_ATTACHMENT_MAINTENANCE_INTERVAL).await;
+            if let Err(err) = self.reconcile_stale_channel_attachments().await {
+                warn!(?err, "failed to reconcile stale channel attachments");
+            }
+        }
+    }
+
+    async fn finalize_stale_channel_attachment_batches(&self) -> Result<(), KernelError> {
+        let threshold_ms = Utc::now()
+            .timestamp_millis()
+            .saturating_sub(STALE_CHANNEL_ATTACHMENT_BATCH_AFTER.as_millis() as i64);
+        let batches = self
+            .channel_attachments
+            .stale_waiting_batches(threshold_ms)
+            .await
+            .map_err(internal)?;
+        for (channel_id, event_id) in batches {
+            if let Err(err) = self
+                .finalize_channel_attachments(ChannelAttachmentFinalizeRequest {
+                    channel_id: channel_id.clone(),
+                    event_id: event_id.clone(),
+                    worker_id: "kernel-stale-attachment-cleanup".to_string(),
+                    missing: Vec::new(),
+                })
+                .await
+            {
+                warn!(?err, %channel_id, %event_id, "failed to finalize stale channel attachment batch");
+            }
+        }
+        Ok(())
+    }
+
+    async fn cleanup_stale_channel_attachment_temp_uploads(&self) -> Result<(), KernelError> {
+        let Some(runtime_root) = self.runtime_root.as_ref() else {
+            return Ok(());
+        };
+        let channels_root = runtime_root.join("channels");
+        if !tokio::fs::try_exists(&channels_root)
+            .await
+            .map_err(|err| internal(err.into()))?
+        {
+            return Ok(());
+        }
+        ensure_existing_directory_is_safe(&channels_root).await?;
+
+        let cutoff = SystemTime::now()
+            .checked_sub(STALE_CHANNEL_ATTACHMENT_TEMP_AFTER)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let mut stack = vec![channels_root];
+        while let Some(dir) = stack.pop() {
+            let mut entries = match tokio::fs::read_dir(&dir).await {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(internal(err.into())),
+            };
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|err| internal(err.into()))?
+            {
+                let path = entry.path();
+                let metadata = match tokio::fs::symlink_metadata(&path).await {
+                    Ok(metadata) => metadata,
+                    Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                    Err(err) => return Err(internal(err.into())),
+                };
+                if metadata.file_type().is_symlink() {
+                    continue;
+                }
+                if metadata.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !metadata.is_file() || !is_channel_attachment_temp_upload(&path) {
+                    continue;
+                }
+                let stale = metadata
+                    .modified()
+                    .ok()
+                    .is_some_and(|modified| modified < cutoff);
+                if stale {
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == ErrorKind::NotFound => {}
+                        Err(err) => return Err(internal(err.into())),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn cleanup_stale_channel_attachment_runtime_projections(
+        &self,
+    ) -> Result<(), KernelError> {
+        let Some(runtime_root) = self.runtime_root.as_ref() else {
+            return Ok(());
+        };
+        let channels_root = runtime_root.join("channels");
+        if !tokio::fs::try_exists(&channels_root)
+            .await
+            .map_err(|err| internal(err.into()))?
+        {
+            return Ok(());
+        }
+        ensure_existing_directory_is_safe(&channels_root).await?;
+
+        let cutoff = SystemTime::now()
+            .checked_sub(STALE_CHANNEL_ATTACHMENT_PROJECTION_AFTER)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let mut channel_entries = tokio::fs::read_dir(&channels_root)
+            .await
+            .map_err(|err| internal(err.into()))?;
+        while let Some(channel_entry) = channel_entries
+            .next_entry()
+            .await
+            .map_err(|err| internal(err.into()))?
+        {
+            let channel_dir = channel_entry.path();
+            let Ok(channel_metadata) = tokio::fs::symlink_metadata(&channel_dir).await else {
+                continue;
+            };
+            if channel_metadata.file_type().is_symlink() || !channel_metadata.is_dir() {
+                continue;
+            }
+
+            let projections_root = channel_dir.join(CHANNEL_ATTACHMENT_PROJECTIONS_DIR);
+            let projections_metadata = match tokio::fs::symlink_metadata(&projections_root).await {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(internal(err.into())),
+            };
+            if projections_metadata.file_type().is_symlink() || !projections_metadata.is_dir() {
+                continue;
+            }
+
+            let mut event_entries = tokio::fs::read_dir(&projections_root)
+                .await
+                .map_err(|err| internal(err.into()))?;
+            while let Some(event_entry) = event_entries
+                .next_entry()
+                .await
+                .map_err(|err| internal(err.into()))?
+            {
+                let event_dir = event_entry.path();
+                let Ok(event_metadata) = tokio::fs::symlink_metadata(&event_dir).await else {
+                    continue;
+                };
+                if event_metadata.file_type().is_symlink() || !event_metadata.is_dir() {
+                    continue;
+                }
+
+                let mut projection_entries = tokio::fs::read_dir(&event_dir)
+                    .await
+                    .map_err(|err| internal(err.into()))?;
+                while let Some(projection_entry) = projection_entries
+                    .next_entry()
+                    .await
+                    .map_err(|err| internal(err.into()))?
+                {
+                    let projection_dir = projection_entry.path();
+                    let Ok(projection_metadata) =
+                        tokio::fs::symlink_metadata(&projection_dir).await
+                    else {
+                        continue;
+                    };
+                    if projection_metadata.file_type().is_symlink() || !projection_metadata.is_dir()
+                    {
+                        continue;
+                    }
+                    let stale = projection_metadata
+                        .modified()
+                        .ok()
+                        .is_some_and(|modified| modified < cutoff);
+                    if stale {
+                        if let Err(err) = self
+                            .remove_channel_attachment_runtime_projection(&projection_dir)
+                            .await
+                        {
+                            warn!(
+                                ?err,
+                                path = %projection_dir.display(),
+                                "failed to remove stale channel attachment runtime projection"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn remove_channel_attachment_runtime_projection(
+        &self,
+        projection_dir: &Path,
+    ) -> Result<(), KernelError> {
+        let Some(runtime_root) = self.runtime_root.as_ref() else {
+            return Ok(());
+        };
+
+        let metadata = match tokio::fs::symlink_metadata(projection_dir).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(internal(err.into())),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(KernelError::Conflict(format!(
+                "channel attachment runtime projection '{}' is not a regular directory",
+                projection_dir.display()
+            )));
+        }
+
+        let runtime_root = tokio::fs::canonicalize(runtime_root).await.map_err(|err| {
+            KernelError::Internal(format!(
+                "failed to resolve runtime root '{}': {err}",
+                runtime_root.display()
+            ))
+        })?;
+        let projection_dir = tokio::fs::canonicalize(projection_dir)
+            .await
+            .map_err(|err| {
+                KernelError::Internal(format!(
+                    "failed to resolve channel attachment runtime projection '{}': {err}",
+                    projection_dir.display()
+                ))
+            })?;
+        if !is_channel_attachment_runtime_projection_path(&runtime_root, &projection_dir) {
+            return Err(KernelError::Conflict(format!(
+                "channel attachment runtime projection '{}' is outside the projection namespace",
+                projection_dir.display()
+            )));
+        }
+
+        match tokio::fs::remove_dir_all(&projection_dir).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(internal(err.into())),
+        }
+    }
+
+    async fn remove_channel_attachment_runtime_projection_dirs_best_effort(
+        &self,
+        projection_dirs: &[PathBuf],
+    ) {
+        for projection_dir in projection_dirs {
+            if let Err(err) = self
+                .remove_channel_attachment_runtime_projection(projection_dir)
+                .await
+            {
+                warn!(
+                    ?err,
+                    path = %projection_dir.display(),
+                    "failed to remove channel attachment runtime projection"
+                );
+            }
         }
     }
 
@@ -579,13 +944,24 @@ impl Kernel {
                         .map_err(internal)?
                     {
                         Some(sequence.saturating_sub(1))
-                    } else {
+                    } else if self
+                        .channel_state
+                        .first_stream_sequence_for_turn(
+                            &channel_turn.channel_id,
+                            channel_turn.turn_id,
+                        )
+                        .await
+                        .map_err(internal)?
+                        .is_some()
+                    {
                         Some(
                             self.channel_state
                                 .current_stream_head(&channel_turn.channel_id)
                                 .await
                                 .map_err(internal)?,
                         )
+                    } else {
+                        None
                     }
                 }
                 _ => None,
@@ -663,7 +1039,10 @@ impl Kernel {
                 let kernel = self.clone();
                 tokio::spawn(async move {
                     let _guard = guard;
-                    if let Err(err) = kernel.execute_session_turn(&session, execution).await {
+                    if let Err(err) = kernel
+                        .execute_session_turn_with_attachment_cleanup(&session, execution)
+                        .await
+                    {
                         warn!(?err, session_id = %session.session_id, turn_id = %turn_id, "session action turn failed");
                     }
                 });
@@ -703,13 +1082,13 @@ impl Kernel {
     async fn resolve_session_open_trust_tier(
         &self,
         channel_id: &str,
-        peer_id: &str,
+        session_peer_id: &str,
         fallback: TrustTier,
     ) -> Result<TrustTier, KernelError> {
         if self.applied_channel(channel_id).is_none() {
             return Ok(fallback);
         }
-        self.require_channel_peer_approved(channel_id, peer_id)
+        self.require_channel_session_peer_approved(channel_id, session_peer_id)
             .await
     }
 
@@ -721,32 +1100,87 @@ impl Kernel {
             return Ok(());
         }
 
-        self.require_channel_peer_approved(&session.channel_id, &session.peer_id)
+        self.require_channel_session_peer_approved(&session.channel_id, &session.peer_id)
             .await?;
         Ok(())
     }
 
-    async fn require_channel_peer_approved(
+    async fn require_channel_session_peer_approved(
         &self,
         channel_id: &str,
-        peer_id: &str,
+        session_peer_id: &str,
     ) -> Result<TrustTier, KernelError> {
         self.require_active_channel_binding(channel_id).await?;
-        let peer = self
-            .channel_state
-            .get_peer(channel_id, peer_id)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| KernelError::BadRequest("channel peer is not approved".to_string()))?;
-        match peer.status {
-            ChannelPeerStatus::Approved => Ok(peer.trust_tier),
-            ChannelPeerStatus::Pending => Err(KernelError::BadRequest(
-                "channel peer is pending approval".to_string(),
-            )),
-            ChannelPeerStatus::Blocked => {
-                Err(KernelError::Conflict("channel peer is blocked".to_string()))
+        if let Some(scope) = parse_session_key_scope(channel_id, session_peer_id) {
+            return self
+                .require_channel_grant_scope_approved(channel_id, scope)
+                .await;
+        }
+
+        Err(KernelError::BadRequest(
+            "channel session_key is not scoped to an approved grant".to_string(),
+        ))
+    }
+
+    async fn require_channel_grant_scope_approved(
+        &self,
+        channel_id: &str,
+        scope: SessionKeyScope,
+    ) -> Result<TrustTier, KernelError> {
+        let blocked = self
+            .find_channel_session_blocking_grant(channel_id, &scope)
+            .await?;
+        if blocked.is_some() {
+            return Err(KernelError::Conflict(
+                "channel grant is blocked".to_string(),
+            ));
+        }
+
+        let approved = self
+            .get_channel_session_grant(
+                channel_id,
+                exact_session_grant_lookup(&scope),
+                ChannelGrantStatus::Approved,
+            )
+            .await?
+            .ok_or_else(|| KernelError::BadRequest("channel grant is not approved".to_string()))?;
+
+        Ok(approved.trust_tier)
+    }
+
+    async fn find_channel_session_blocking_grant(
+        &self,
+        channel_id: &str,
+        scope: &SessionKeyScope,
+    ) -> Result<Option<ChannelGrantRecord>, KernelError> {
+        for lookup in blocking_session_grant_lookups(scope) {
+            if let Some(grant) = self
+                .get_channel_session_grant(channel_id, lookup, ChannelGrantStatus::Blocked)
+                .await?
+            {
+                return Ok(Some(grant));
             }
         }
+        Ok(None)
+    }
+
+    async fn get_channel_session_grant(
+        &self,
+        channel_id: &str,
+        lookup: ChannelSessionGrantLookup<'_>,
+        status: ChannelGrantStatus,
+    ) -> Result<Option<ChannelGrantRecord>, KernelError> {
+        self.channel_state
+            .get_grant_by_scope(
+                channel_id,
+                lookup.sender_ref,
+                lookup.conversation_ref,
+                lookup.thread_ref,
+                lookup.routing_profile,
+                status,
+            )
+            .await
+            .map_err(internal)
     }
 
     async fn run_session_action_with_sink(
@@ -776,7 +1210,8 @@ impl Kernel {
             .prepare_session_action_execution(session_id, action, options)
             .await?;
 
-        self.execute_session_turn(&session, execution).await
+        self.execute_session_turn_with_attachment_cleanup(&session, execution)
+            .await
     }
 
     async fn prepare_session_action_execution(
@@ -788,6 +1223,8 @@ impl Kernel {
         let SessionActionExecutionOptions {
             turn_id,
             runtime_id_override,
+            mut prepared_turn,
+            history_before_sequence_no,
             sink,
             emit_channel_stream_done,
             audit_actor,
@@ -795,9 +1232,10 @@ impl Kernel {
         let session = self.get_scoped_session(session_id).await?;
         self.require_session_mutation_access(&session).await?;
 
-        let latest_turn = load_repaired_turns(
+        let latest_turn = load_repaired_turns_before_sequence(
             &self.session_turns,
             session_id,
+            history_before_sequence_no,
             1,
             TranscriptMode::Prompt(session.history_policy),
         )
@@ -821,18 +1259,32 @@ impl Kernel {
                     ));
                 }
 
+                let prompt_user_text = "Continue your previous assistant reply from where it stopped. Do not restart from the beginning unless necessary.".to_string();
+                let attachment_context = self
+                    .channel_attachment_execution_context_for_session_action_source(
+                        &latest_turn,
+                        &prompt_user_text,
+                    )
+                    .await?;
+                let display_user_text = prepared_turn
+                    .as_ref()
+                    .map(|turn| turn.display_user_text.clone())
+                    .unwrap_or_else(|| "/lionclaw continue".to_string());
                 SessionTurnExecution {
                     turn_id,
                     kind: SessionTurnKind::Continue,
-                    display_user_text: "/lionclaw continue".to_string(),
-                    prompt_user_text: "Continue your previous assistant reply from where it stopped. Do not restart from the beginning unless necessary.".to_string(),
+                    display_user_text,
+                    prompt_user_text,
+                    runtime_prompt_user_text: attachment_context.runtime_prompt_user_text,
+                    attachment_source_turn_id: attachment_context.attachment_source_turn_id,
+                    prepared_turn: prepared_turn.take(),
                     requested_runtime_id: Some(
-                        runtime_id_override
-                            .unwrap_or_else(|| latest_turn.runtime_id.clone()),
+                        runtime_id_override.unwrap_or_else(|| latest_turn.runtime_id.clone()),
                     ),
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
                     runtime_env_passthrough: None,
+                    extra_mounts: attachment_context.extra_mounts,
                     default_policy_scope: Scope::Session(session_id),
                     sink,
                     emit_channel_stream_done,
@@ -840,23 +1292,39 @@ impl Kernel {
                     runtime_control_origin: RuntimeControlOrigin::SessionTurn,
                 }
             }
-            SessionActionKind::RetryLastTurn => SessionTurnExecution {
-                turn_id,
-                kind: SessionTurnKind::Retry,
-                display_user_text: "/lionclaw retry".to_string(),
-                prompt_user_text: latest_turn.prompt_user_text,
-                requested_runtime_id: Some(
-                    runtime_id_override.unwrap_or_else(|| latest_turn.runtime_id.clone()),
-                ),
-                runtime_working_dir: None,
-                runtime_timeout_ms: None,
-                runtime_env_passthrough: None,
-                default_policy_scope: Scope::Session(session_id),
-                sink,
-                emit_channel_stream_done,
-                audit_actor,
-                runtime_control_origin: RuntimeControlOrigin::SessionTurn,
-            },
+            SessionActionKind::RetryLastTurn => {
+                let attachment_context = self
+                    .channel_attachment_execution_context_for_session_action_source(
+                        &latest_turn,
+                        &latest_turn.prompt_user_text,
+                    )
+                    .await?;
+                let display_user_text = prepared_turn
+                    .as_ref()
+                    .map(|turn| turn.display_user_text.clone())
+                    .unwrap_or_else(|| "/lionclaw retry".to_string());
+                SessionTurnExecution {
+                    turn_id,
+                    kind: SessionTurnKind::Retry,
+                    display_user_text,
+                    prompt_user_text: latest_turn.prompt_user_text,
+                    runtime_prompt_user_text: attachment_context.runtime_prompt_user_text,
+                    attachment_source_turn_id: attachment_context.attachment_source_turn_id,
+                    prepared_turn: prepared_turn.take(),
+                    requested_runtime_id: Some(
+                        runtime_id_override.unwrap_or_else(|| latest_turn.runtime_id.clone()),
+                    ),
+                    runtime_working_dir: None,
+                    runtime_timeout_ms: None,
+                    runtime_env_passthrough: None,
+                    extra_mounts: attachment_context.extra_mounts,
+                    default_policy_scope: Scope::Session(session_id),
+                    sink,
+                    emit_channel_stream_done,
+                    audit_actor,
+                    runtime_control_origin: RuntimeControlOrigin::SessionTurn,
+                }
+            }
             SessionActionKind::ResetSession => {
                 return Err(KernelError::BadRequest(
                     "reset_session does not execute a follow-up turn".to_string(),
@@ -865,6 +1333,18 @@ impl Kernel {
         };
 
         Ok((session, execution))
+    }
+
+    async fn execute_session_turn_with_attachment_cleanup(
+        &self,
+        session: &super::sessions::Session,
+        execution: SessionTurnExecution,
+    ) -> Result<SessionTurnResponse, KernelError> {
+        let projection_mounts = channel_attachment_projection_dirs(&execution.extra_mounts);
+        let result = self.execute_session_turn(session, execution).await;
+        self.remove_channel_attachment_runtime_projection_dirs_best_effort(&projection_mounts)
+            .await;
+        result
     }
 
     pub async fn turn_session(
@@ -894,148 +1374,684 @@ impl Kernel {
         Ok(ChannelListResponse { bindings })
     }
 
-    pub async fn list_channel_peers(
+    pub async fn list_channel_pairings(
         &self,
         channel_id: Option<String>,
-    ) -> Result<ChannelPeerListResponse, KernelError> {
-        let peers = self
+        status: Option<ChannelPairingStatus>,
+    ) -> Result<ChannelPairingListResponse, KernelError> {
+        let pairings = self
             .channel_state
-            .list_peers(channel_id.as_deref())
+            .list_pairing_requests(channel_id.as_deref(), status)
             .await
             .map_err(internal)?
             .into_iter()
-            .map(to_channel_peer_view)
-            .collect::<Vec<_>>();
+            .map(to_channel_pairing_view)
+            .collect();
+        let grants = self
+            .channel_state
+            .list_grants(channel_id.as_deref())
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(to_channel_grant_view)
+            .collect();
 
-        Ok(ChannelPeerListResponse { peers })
+        Ok(ChannelPairingListResponse { pairings, grants })
     }
 
-    pub async fn approve_channel_peer(
+    pub async fn invite_channel_pairing(
         &self,
-        req: ChannelPeerApproveRequest,
-    ) -> Result<ChannelPeerResponse, KernelError> {
-        if req.channel_id.trim().is_empty()
-            || req.peer_id.trim().is_empty()
-            || req.pairing_code.trim().is_empty()
-        {
-            return Err(KernelError::BadRequest(
-                "channel_id, peer_id and pairing_code are required".to_string(),
-            ));
+        req: ChannelPairingInviteRequest,
+    ) -> Result<ChannelPairingInviteResponse, KernelError> {
+        let invite = validate_channel_pairing_invite(req)?;
+        self.require_active_channel_binding(&invite.channel_id)
+            .await?;
+
+        let token = generate_pairing_token();
+        let token_hash = hash_pairing_code(&token);
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let pairing = self
+            .channel_state
+            .create_token_pairing_in_tx(
+                &mut tx,
+                TokenPairingCreate {
+                    channel_id: &invite.channel_id,
+                    code_hash: &token_hash,
+                    conversation_ref: invite.conversation_ref.as_deref(),
+                    thread_ref: invite.thread_ref.as_deref(),
+                    requested_profile: invite.requested_profile,
+                    label: invite.label.as_deref(),
+                    max_claims: invite.max_claims,
+                    expires_at: invite.expires_at,
+                },
+            )
+            .await
+            .map_err(internal)?;
+        self.audit
+            .append_in_tx(
+                &mut tx,
+                "channel.pairing.invite_created",
+                None,
+                Some("api".to_string()),
+                json!({
+                    "channel_id": pairing.channel_id,
+                    "pairing_id": pairing.pairing_id,
+                    "requested_profile": pairing.requested_profile.as_str(),
+                    "sender_ref": pairing.sender_ref,
+                    "conversation_ref": pairing.conversation_ref,
+                    "thread_ref": pairing.thread_ref,
+                    "max_claims": pairing.max_claims,
+                    "expires_at": pairing.expires_at,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+
+        Ok(ChannelPairingInviteResponse {
+            pairing_id: pairing.pairing_id,
+            channel_id: pairing.channel_id,
+            token,
+            requested_profile: pairing.requested_profile,
+            expires_at: invite.expires_at,
+            max_claims: invite.max_claims,
+        })
+    }
+
+    pub async fn claim_channel_pairing(
+        &self,
+        req: ChannelPairingClaimRequest,
+    ) -> Result<ChannelPairingClaimResponse, KernelError> {
+        let claim = validate_channel_pairing_claim(req)?;
+        self.require_active_channel_binding(&claim.channel_id)
+            .await?;
+
+        let token_hash = hash_pairing_code(&claim.token);
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let pairing = self
+            .channel_state
+            .get_pairing_request_by_code_hash_in_tx(&mut tx, &claim.channel_id, &token_hash)
+            .await
+            .map_err(internal)?;
+        let Some(pairing) =
+            pairing.filter(|pairing| pairing.claim_policy == PAIRING_CLAIM_POLICY_TOKEN_CLAIM)
+        else {
+            return self
+                .finish_pairing_claim(
+                    tx,
+                    &claim,
+                    None,
+                    None,
+                    ChannelPairingClaimOutcome::InvalidToken,
+                    "invalid_token",
+                )
+                .await;
+        };
+
+        if pairing.status == ChannelPairingStatus::Blocked {
+            return self
+                .finish_pairing_claim(
+                    tx,
+                    &claim,
+                    Some(&pairing),
+                    None,
+                    ChannelPairingClaimOutcome::InvalidToken,
+                    "invalid_token",
+                )
+                .await;
         }
 
-        let channel_id = req.channel_id.trim().to_string();
-        let peer_id = req.peer_id.trim().to_string();
-        let pairing_code = req.pairing_code.trim().to_string();
-        let trust_tier = req.trust_tier.unwrap_or(TrustTier::Main);
+        if pairing.status == ChannelPairingStatus::Expired
+            || pairing
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= Utc::now())
+        {
+            if pairing.status == ChannelPairingStatus::Pending {
+                self.channel_state
+                    .mark_pairing_status_in_tx(
+                        &mut tx,
+                        pairing.pairing_id,
+                        ChannelPairingStatus::Expired,
+                        None,
+                    )
+                    .await
+                    .map_err(internal)?;
+            }
+            return self
+                .finish_pairing_claim(
+                    tx,
+                    &claim,
+                    Some(&pairing),
+                    None,
+                    ChannelPairingClaimOutcome::Expired,
+                    "expired_token",
+                )
+                .await;
+        }
+
+        if pairing.status != ChannelPairingStatus::Pending
+            || pairing.claim_count >= pairing.max_claims
+        {
+            return self
+                .finish_pairing_claim(
+                    tx,
+                    &claim,
+                    Some(&pairing),
+                    None,
+                    ChannelPairingClaimOutcome::AlreadyClaimed,
+                    "already_claimed",
+                )
+                .await;
+        }
+
+        let grant_scope = match grant_scope_from_token_claim(&pairing, &claim) {
+            Ok(scope) => scope,
+            Err(reason_code) => {
+                return self
+                    .finish_pairing_claim(
+                        tx,
+                        &claim,
+                        Some(&pairing),
+                        None,
+                        ChannelPairingClaimOutcome::ScopeMismatch,
+                        reason_code,
+                    )
+                    .await;
+            }
+        };
+
+        let blocking_grant = self
+            .channel_state
+            .find_blocking_grant_for_scope_in_tx(
+                &mut tx,
+                &claim.channel_id,
+                grant_scope.sender_ref.as_deref(),
+                grant_scope.conversation_ref.as_deref(),
+                grant_scope.thread_ref.as_deref(),
+                pairing.requested_profile,
+            )
+            .await
+            .map_err(internal)?;
+        if let Some(blocking_grant) = blocking_grant {
+            return self
+                .finish_pairing_claim(
+                    tx,
+                    &claim,
+                    Some(&pairing),
+                    Some(blocking_grant.grant_id),
+                    ChannelPairingClaimOutcome::ScopeMismatch,
+                    "scope_blocked",
+                )
+                .await;
+        }
+
+        let existing_grant = self
+            .channel_state
+            .get_grant_by_scope_in_tx(
+                &mut tx,
+                &claim.channel_id,
+                grant_scope.sender_ref.as_deref(),
+                grant_scope.conversation_ref.as_deref(),
+                grant_scope.thread_ref.as_deref(),
+                pairing.requested_profile,
+            )
+            .await
+            .map_err(internal)?;
+        if let Some(existing_grant) = existing_grant {
+            if let Some((outcome, reason_code)) =
+                existing_token_claim_grant_outcome(existing_grant.status)
+            {
+                return self
+                    .finish_pairing_claim(
+                        tx,
+                        &claim,
+                        Some(&pairing),
+                        Some(existing_grant.grant_id),
+                        outcome,
+                        reason_code,
+                    )
+                    .await;
+            }
+        }
+
+        let claimed = self
+            .channel_state
+            .increment_pairing_claim_count_in_tx(&mut tx, pairing.pairing_id)
+            .await
+            .map_err(internal)?;
+        if claimed.is_none() {
+            return self
+                .finish_pairing_claim(
+                    tx,
+                    &claim,
+                    Some(&pairing),
+                    None,
+                    ChannelPairingClaimOutcome::AlreadyClaimed,
+                    "already_claimed",
+                )
+                .await;
+        }
+
+        let grant = self
+            .channel_state
+            .insert_or_update_grant_in_tx(
+                &mut tx,
+                ChannelGrantUpsert {
+                    channel_id: &claim.channel_id,
+                    sender_ref: grant_scope.sender_ref.as_deref(),
+                    conversation_ref: grant_scope.conversation_ref.as_deref(),
+                    thread_ref: grant_scope.thread_ref.as_deref(),
+                    routing_profile: pairing.requested_profile,
+                    trust_tier: TrustTier::Main,
+                    status: ChannelGrantStatus::Approved,
+                    label: pairing.label.as_deref(),
+                },
+            )
+            .await
+            .map_err(internal)?;
+        let response = self
+            .finish_pairing_claim(
+                tx,
+                &claim,
+                Some(&pairing),
+                Some(grant.grant_id),
+                ChannelPairingClaimOutcome::Approved,
+                "approved",
+            )
+            .await?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "channel.pairing.claim_approved",
+            None,
+            "kernel",
+            json!({
+                "channel_id": claim.channel_id,
+                "grant_id": grant.grant_id,
+                "pairing_id": pairing.pairing_id,
+            }),
+        )
+        .await;
+
+        Ok(response)
+    }
+
+    pub async fn approve_channel_pairing(
+        &self,
+        req: ChannelPairingApproveRequest,
+    ) -> Result<ChannelGrantResponse, KernelError> {
+        let channel_id = trim_required(req.channel_id, "channel_id")?;
+        let pairing_id = req.pairing_id;
+        let pairing_code = req
+            .pairing_code
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let lookup = match (pairing_id, pairing_code) {
+            (Some(pairing_id), None) => PairingLookup::Id(pairing_id),
+            (None, Some(pairing_code)) => PairingLookup::Code(pairing_code),
+            _ => {
+                return Err(KernelError::BadRequest(
+                    "exactly one of pairing_id or pairing_code is required".to_string(),
+                ));
+            }
+        };
+        self.require_active_channel_binding(&channel_id).await?;
 
         let mut tx = self
             .channel_state
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|err| internal(err.into()))?;
-        let peer = self
-            .channel_state
-            .get_peer_in_tx(&mut tx, &channel_id, &peer_id)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| KernelError::NotFound("channel peer not found".to_string()))?;
+        let pairing = match lookup {
+            PairingLookup::Id(pairing_id) => self
+                .channel_state
+                .get_pairing_request_by_id_in_tx(&mut tx, pairing_id)
+                .await
+                .map_err(internal)?,
+            PairingLookup::Code(pairing_code) => {
+                let code_hash = hash_pairing_code(&pairing_code);
+                self.channel_state
+                    .get_pairing_request_by_code_hash_in_tx(&mut tx, &channel_id, &code_hash)
+                    .await
+                    .map_err(internal)?
+            }
+        }
+        .ok_or_else(|| KernelError::NotFound("channel pairing request not found".to_string()))?;
 
-        if peer.pairing_code != pairing_code {
-            return Err(KernelError::BadRequest("invalid pairing_code".to_string()));
+        if pairing.channel_id != channel_id {
+            return Err(KernelError::BadRequest(
+                "pairing request does not belong to channel_id".to_string(),
+            ));
+        }
+        if pairing.claim_policy != PAIRING_CLAIM_POLICY_OPERATOR_APPROVAL {
+            return Err(KernelError::Conflict(
+                "pairing request is not pending operator approval".to_string(),
+            ));
+        }
+        if pairing.status != ChannelPairingStatus::Pending {
+            return Err(KernelError::Conflict(format!(
+                "pairing request is {}",
+                pairing.status.as_str()
+            )));
         }
 
-        let approved = self
+        let routing_profile = req.routing_profile.unwrap_or(pairing.requested_profile);
+        let grant_scope = grant_scope_from_pairing(&pairing, routing_profile)?;
+        let trust_tier = req.trust_tier.unwrap_or(TrustTier::Main);
+        let label = req
+            .label
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        let grant = self
             .channel_state
-            .approve_peer_in_tx(&mut tx, &channel_id, &peer_id, trust_tier)
+            .insert_or_update_grant_in_tx(
+                &mut tx,
+                ChannelGrantUpsert {
+                    channel_id: &channel_id,
+                    sender_ref: grant_scope.sender_ref.as_deref(),
+                    conversation_ref: grant_scope.conversation_ref.as_deref(),
+                    thread_ref: grant_scope.thread_ref.as_deref(),
+                    routing_profile,
+                    trust_tier,
+                    status: ChannelGrantStatus::Approved,
+                    label,
+                },
+            )
             .await
-            .map_err(internal)?
-            .ok_or_else(|| KernelError::NotFound("channel peer not found".to_string()))?;
-
+            .map_err(internal)?;
+        self.channel_state
+            .mark_pairing_status_in_tx(
+                &mut tx,
+                pairing.pairing_id,
+                ChannelPairingStatus::Approved,
+                label,
+            )
+            .await
+            .map_err(internal)?;
         self.audit
             .append_in_tx(
                 &mut tx,
-                "channel.peer.approved",
+                "channel.grant.approved",
                 None,
                 Some("api".to_string()),
                 json!({
-                    "channel_id": approved.channel_id,
-                    "peer_id": approved.peer_id,
-                    "trust_tier": approved.trust_tier.as_str(),
+                    "channel_id": channel_id,
+                    "event_id": null,
+                    "sender_ref": grant.sender_ref,
+                    "conversation_ref": grant.conversation_ref,
+                    "thread_ref": grant.thread_ref,
+                    "reason_code": "operator_approved",
+                    "grant_id": grant.grant_id,
+                    "pairing_id": pairing.pairing_id,
+                    "routing_profile": grant.routing_profile.as_str(),
+                    "trust_tier": grant.trust_tier.as_str(),
                 }),
             )
             .await
             .map_err(internal)?;
         tx.commit().await.map_err(|err| internal(err.into()))?;
         self.refresh_active_continuity_after_commit_best_effort(
-            "channel.peer.approved",
+            "channel.grant.approved",
             None,
             "api",
             json!({
-                "channel_id": approved.channel_id,
-                "peer_id": approved.peer_id,
-                "trust_tier": approved.trust_tier.as_str(),
+                "channel_id": channel_id,
+                "grant_id": grant.grant_id,
+                "pairing_id": pairing.pairing_id,
             }),
         )
         .await;
 
-        Ok(ChannelPeerResponse {
-            peer: to_channel_peer_view(approved),
+        Ok(ChannelGrantResponse {
+            grant: to_channel_grant_view(grant),
         })
     }
 
-    pub async fn block_channel_peer(
+    pub async fn block_channel_pairing(
         &self,
-        req: ChannelPeerBlockRequest,
-    ) -> Result<ChannelPeerResponse, KernelError> {
-        if req.channel_id.trim().is_empty() || req.peer_id.trim().is_empty() {
-            return Err(KernelError::BadRequest(
-                "channel_id and peer_id are required".to_string(),
-            ));
-        }
-
-        let channel_id = req.channel_id.trim().to_string();
-        let peer_id = req.peer_id.trim().to_string();
+        req: ChannelPairingBlockRequest,
+    ) -> Result<ChannelPairingBlockResponse, KernelError> {
+        let channel_id = trim_required(req.channel_id, "channel_id")?;
+        self.require_active_channel_binding(&channel_id).await?;
         let mut tx = self
             .channel_state
             .pool()
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|err| internal(err.into()))?;
-        let blocked = self
-            .channel_state
-            .block_peer_in_tx(&mut tx, &channel_id, &peer_id)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| KernelError::NotFound("channel peer not found".to_string()))?;
 
+        let (pairing_id, routing_profile, grant_scope) = if let Some(pairing_id) = req.pairing_id {
+            let pairing = self
+                .channel_state
+                .get_pairing_request_by_id_in_tx(&mut tx, pairing_id)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| {
+                    KernelError::NotFound("channel pairing request not found".to_string())
+                })?;
+            if pairing.channel_id != channel_id {
+                return Err(KernelError::BadRequest(
+                    "pairing request does not belong to channel_id".to_string(),
+                ));
+            }
+            if pairing.claim_policy == PAIRING_CLAIM_POLICY_TOKEN_CLAIM {
+                if pairing.status != ChannelPairingStatus::Pending {
+                    return Err(KernelError::Conflict(format!(
+                        "pairing request is {}",
+                        pairing.status.as_str()
+                    )));
+                }
+                self.channel_state
+                    .mark_pairing_status_in_tx(
+                        &mut tx,
+                        pairing.pairing_id,
+                        ChannelPairingStatus::Blocked,
+                        None,
+                    )
+                    .await
+                    .map_err(internal)?;
+                return self
+                    .finish_channel_pairing_block(
+                        tx,
+                        ChannelPairingBlockCommit {
+                            channel_id: &channel_id,
+                            grant: None,
+                            pairing_id: Some(pairing.pairing_id),
+                            blocked_pairing_ids: vec![pairing.pairing_id],
+                            reason: req.reason,
+                            event_type: "channel.pairing.blocked",
+                        },
+                    )
+                    .await;
+            }
+            let grant_scope = grant_scope_from_pairing(&pairing, pairing.requested_profile)?;
+            (
+                Some(pairing.pairing_id),
+                pairing.requested_profile,
+                grant_scope,
+            )
+        } else {
+            let grant_scope = GrantScope {
+                sender_ref: trim_optional(req.sender_ref),
+                conversation_ref: trim_optional(req.conversation_ref),
+                thread_ref: trim_optional(req.thread_ref),
+            };
+            let routing_profile = infer_block_profile(
+                grant_scope.sender_ref.as_deref(),
+                grant_scope.conversation_ref.as_deref(),
+                grant_scope.thread_ref.as_deref(),
+            )?;
+            (None, routing_profile, grant_scope)
+        };
+
+        let grant = self
+            .channel_state
+            .insert_or_update_grant_in_tx(
+                &mut tx,
+                ChannelGrantUpsert {
+                    channel_id: &channel_id,
+                    sender_ref: grant_scope.sender_ref.as_deref(),
+                    conversation_ref: grant_scope.conversation_ref.as_deref(),
+                    thread_ref: grant_scope.thread_ref.as_deref(),
+                    routing_profile,
+                    trust_tier: TrustTier::Untrusted,
+                    status: ChannelGrantStatus::Blocked,
+                    label: None,
+                },
+            )
+            .await
+            .map_err(internal)?;
+        let blocked_pairing_ids = if let Some(pairing_id) = pairing_id {
+            self.channel_state
+                .mark_pairing_status_in_tx(&mut tx, pairing_id, ChannelPairingStatus::Blocked, None)
+                .await
+                .map_err(internal)?;
+            vec![pairing_id]
+        } else {
+            self.channel_state
+                .mark_matching_pending_pairings_blocked_in_tx(
+                    &mut tx,
+                    &channel_id,
+                    grant_scope.sender_ref.as_deref(),
+                    grant_scope.conversation_ref.as_deref(),
+                    grant_scope.thread_ref.as_deref(),
+                    routing_profile,
+                )
+                .await
+                .map_err(internal)?
+        };
+        self.finish_channel_pairing_block(
+            tx,
+            ChannelPairingBlockCommit {
+                channel_id: &channel_id,
+                grant: Some(grant),
+                pairing_id,
+                blocked_pairing_ids,
+                reason: req.reason,
+                event_type: "channel.grant.blocked",
+            },
+        )
+        .await
+    }
+
+    async fn finish_channel_pairing_block(
+        &self,
+        mut tx: Transaction<'_, Sqlite>,
+        blocked: ChannelPairingBlockCommit<'_>,
+    ) -> Result<ChannelPairingBlockResponse, KernelError> {
+        let reason_code = blocked
+            .reason
+            .unwrap_or_else(|| "operator_blocked".to_string());
+        let grant_id = blocked.grant.as_ref().map(|grant| grant.grant_id);
+        let routing_profile = blocked
+            .grant
+            .as_ref()
+            .map(|grant| grant.routing_profile.as_str().to_string());
         self.audit
             .append_in_tx(
                 &mut tx,
-                "channel.peer.blocked",
+                blocked.event_type,
                 None,
                 Some("api".to_string()),
                 json!({
                     "channel_id": blocked.channel_id,
-                    "peer_id": blocked.peer_id,
+                    "event_id": null,
+                    "sender_ref": blocked.grant.as_ref().and_then(|grant| grant.sender_ref.as_deref()),
+                    "conversation_ref": blocked.grant.as_ref().and_then(|grant| grant.conversation_ref.as_deref()),
+                    "thread_ref": blocked.grant.as_ref().and_then(|grant| grant.thread_ref.as_deref()),
+                    "reason_code": reason_code,
+                    "grant_id": grant_id,
+                    "pairing_id": blocked.pairing_id,
+                    "pairing_ids": blocked.blocked_pairing_ids.clone(),
+                    "routing_profile": routing_profile,
                 }),
             )
             .await
             .map_err(internal)?;
         tx.commit().await.map_err(|err| internal(err.into()))?;
         self.refresh_active_continuity_after_commit_best_effort(
-            "channel.peer.blocked",
+            blocked.event_type,
             None,
             "api",
             json!({
                 "channel_id": blocked.channel_id,
-                "peer_id": blocked.peer_id,
+                "grant_id": grant_id,
+                "pairing_id": blocked.pairing_id,
+                "pairing_ids": blocked.blocked_pairing_ids,
             }),
         )
         .await;
 
-        Ok(ChannelPeerResponse {
-            peer: to_channel_peer_view(blocked),
+        Ok(ChannelPairingBlockResponse {
+            grant: blocked.grant.map(to_channel_grant_view),
+            blocked_pairing_ids: blocked.blocked_pairing_ids,
+        })
+    }
+
+    pub async fn revoke_channel_grant(
+        &self,
+        req: ChannelGrantRevokeRequest,
+    ) -> Result<ChannelGrantRevokeResponse, KernelError> {
+        let channel_id = trim_required(req.channel_id, "channel_id")?;
+        self.require_active_channel_binding(&channel_id).await?;
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let revoked = self
+            .channel_state
+            .revoke_grant_in_tx(&mut tx, &channel_id, req.grant_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("channel grant not found".to_string()))?;
+        self.audit
+            .append_in_tx(
+                &mut tx,
+                "channel.grant.revoked",
+                None,
+                Some("api".to_string()),
+                json!({
+                    "channel_id": channel_id,
+                    "event_id": null,
+                    "sender_ref": revoked.sender_ref,
+                    "conversation_ref": revoked.conversation_ref,
+                    "thread_ref": revoked.thread_ref,
+                    "reason_code": req.reason.unwrap_or_else(|| "operator_revoked".to_string()),
+                    "grant_id": revoked.grant_id,
+                    "routing_profile": revoked.routing_profile.as_str(),
+                }),
+            )
+            .await
+            .map_err(internal)?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        self.refresh_active_continuity_after_commit_best_effort(
+            "channel.grant.revoked",
+            None,
+            "api",
+            json!({
+                "channel_id": channel_id,
+                "grant_id": revoked.grant_id,
+            }),
+        )
+        .await;
+
+        Ok(ChannelGrantRevokeResponse {
+            grant_id: req.grant_id,
+            revoked: true,
         })
     }
 
@@ -1043,16 +2059,834 @@ impl Kernel {
         &self,
         req: ChannelInboundRequest,
     ) -> Result<ChannelInboundResponse, KernelError> {
-        self.process_inbound_channel_text(InboundChannelText {
-            channel_id: req.channel_id,
-            peer_id: req.peer_id,
-            text: req.text,
-            session_id: req.session_id,
-            runtime_id: req.runtime_id,
-            update_id: req.update_id,
-            external_message_id: req.external_message_id,
+        self.process_channel_inbound(req).await
+    }
+
+    pub async fn stage_channel_attachment(
+        &self,
+        input: ChannelAttachmentStageInput,
+    ) -> Result<ChannelAttachmentStageResponse, KernelError> {
+        let channel_id = trim_required(input.channel_id, "channel_id")?;
+        let event_id = trim_required(input.event_id, "event_id")?;
+        let attachment_id = trim_required(input.attachment_id, "attachment_id")?;
+        let kind = trim_required(input.kind, "kind")?;
+        let incoming_filename = trim_optional(input.filename);
+        let incoming_mime_type = trim_optional(input.mime_type);
+        let incoming_caption = trim_optional(input.caption);
+        let staged_content = match input.content {
+            ChannelAttachmentStageContent::Bytes(content) => {
+                let size_bytes = i64::try_from(content.len()).map_err(|_| {
+                    KernelError::BadRequest("attachment content is too large".to_string())
+                })?;
+                let sha256 = sha256_hex(&content);
+                StagedAttachmentContent {
+                    content: Some(content),
+                    size_bytes,
+                    sha256,
+                    policy_rejection_code: None,
+                }
+            }
+            ChannelAttachmentStageContent::RejectedByPolicy {
+                reason_code,
+                size_bytes,
+                sha256,
+            } => {
+                if size_bytes < 0 {
+                    return Err(KernelError::BadRequest(
+                        "attachment content size cannot be negative".to_string(),
+                    ));
+                }
+                StagedAttachmentContent {
+                    content: None,
+                    size_bytes,
+                    sha256: trim_required(sha256, "sha256")?,
+                    policy_rejection_code: Some(trim_required(reason_code, "reason_code")?),
+                }
+            }
+        };
+
+        self.require_active_channel_binding(&channel_id).await?;
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let turn = self
+            .channel_state
+            .get_turn_by_inbound_event_in_tx(&mut tx, &channel_id, &event_id)
+            .await
+            .map_err(internal)?;
+        let Some(turn) = turn else {
+            let inbound_exists = self
+                .channel_state
+                .get_inbound_event_in_tx(&mut tx, &channel_id, &event_id)
+                .await
+                .map_err(internal)?
+                .is_some();
+            if inbound_exists {
+                return Err(KernelError::Conflict(
+                    "channel inbound event is not waiting for attachments".to_string(),
+                ));
+            }
+            return Err(KernelError::NotFound(
+                "channel inbound event not found".to_string(),
+            ));
+        };
+        if turn.status != ChannelTurnStatus::WaitingForAttachments {
+            return Err(KernelError::Conflict(
+                "channel inbound event is not waiting for attachments".to_string(),
+            ));
+        }
+
+        let batch = self
+            .channel_attachments
+            .get_batch_in_tx(&mut tx, &channel_id, &event_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                KernelError::NotFound("channel attachment batch not found".to_string())
+            })?;
+        if batch.status != ChannelAttachmentBatchStatus::Waiting {
+            return Err(KernelError::Conflict(
+                "channel attachment batch is already finalized".to_string(),
+            ));
+        }
+
+        let declared = self
+            .channel_attachments
+            .get_attachment_in_tx(&mut tx, &channel_id, &event_id, &attachment_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::BadRequest("attachment is not declared".to_string()))?;
+        match declared.status {
+            ChannelAttachmentRecordStatus::Declared => {}
+            ChannelAttachmentRecordStatus::Staged => {
+                let size_bytes = declared.size_bytes.ok_or_else(|| {
+                    KernelError::Internal("staged attachment size is missing".to_string())
+                })?;
+                let sha256 = declared.sha256.clone().ok_or_else(|| {
+                    KernelError::Internal("staged attachment sha256 is missing".to_string())
+                })?;
+                if size_bytes != staged_content.size_bytes || sha256 != staged_content.sha256 {
+                    return Err(KernelError::Conflict(
+                        "attachment is already staged with different content".to_string(),
+                    ));
+                }
+                let runtime_path = declared
+                    .filename
+                    .as_deref()
+                    .map(|filename| channel_attachment_runtime_path(&attachment_id, filename));
+                return Ok(ChannelAttachmentStageResponse {
+                    channel_id,
+                    event_id,
+                    attachment_id,
+                    status: ChannelAttachmentStatus::Staged,
+                    size_bytes,
+                    sha256,
+                    runtime_path,
+                    reason_code: None,
+                });
+            }
+            ChannelAttachmentRecordStatus::Rejected => {
+                return Ok(ChannelAttachmentStageResponse {
+                    channel_id,
+                    event_id,
+                    attachment_id,
+                    status: ChannelAttachmentStatus::Rejected,
+                    size_bytes: declared.size_bytes.unwrap_or(staged_content.size_bytes),
+                    sha256: declared
+                        .sha256
+                        .clone()
+                        .unwrap_or_else(|| staged_content.sha256.clone()),
+                    runtime_path: None,
+                    reason_code: declared.rejection_code,
+                });
+            }
+        }
+
+        let descriptor_metadata_mismatch = declared.kind != kind
+            || declared.mime_type.as_deref().is_some_and(|expected| {
+                incoming_mime_type
+                    .as_deref()
+                    .is_some_and(|actual| actual != expected)
+            })
+            || declared.filename.as_deref().is_some_and(|expected| {
+                incoming_filename
+                    .as_deref()
+                    .is_some_and(|actual| actual != expected)
+            });
+        let descriptor_size_mismatch = declared
+            .size_bytes
+            .is_some_and(|expected| expected != staged_content.size_bytes);
+
+        let rejection_reason_code = if descriptor_metadata_mismatch {
+            Some("descriptor_mismatch")
+        } else if let Some(reason_code) = staged_content.policy_rejection_code.as_deref() {
+            Some(reason_code)
+        } else if descriptor_size_mismatch {
+            Some("descriptor_mismatch")
+        } else {
+            None
+        };
+
+        if let Some(reason_code) = rejection_reason_code {
+            let response = self
+                .reject_channel_attachment_stage_in_tx(
+                    &mut tx,
+                    ChannelAttachmentStageRejection {
+                        channel_id: &channel_id,
+                        event_id: &event_id,
+                        attachment_id: &attachment_id,
+                        size_bytes: staged_content.size_bytes,
+                        sha256: &staged_content.sha256,
+                        reason_code,
+                    },
+                )
+                .await?;
+            tx.commit().await.map_err(|err| internal(err.into()))?;
+            return Ok(response);
+        }
+
+        let content = staged_content.content.ok_or_else(|| {
+            KernelError::Internal("stageable attachment content is missing".to_string())
+        })?;
+        if content.len() > MAX_CHANNEL_ATTACHMENT_BYTES {
+            let response = self
+                .reject_channel_attachment_stage_in_tx(
+                    &mut tx,
+                    ChannelAttachmentStageRejection {
+                        channel_id: &channel_id,
+                        event_id: &event_id,
+                        attachment_id: &attachment_id,
+                        size_bytes: staged_content.size_bytes,
+                        sha256: &staged_content.sha256,
+                        reason_code: CHANNEL_ATTACHMENT_TOO_LARGE,
+                    },
+                )
+                .await?;
+            tx.commit().await.map_err(|err| internal(err.into()))?;
+            return Ok(response);
+        }
+
+        let staged_bytes = self
+            .channel_attachments
+            .staged_size_for_event_in_tx(&mut tx, &channel_id, &event_id)
+            .await
+            .map_err(internal)?;
+        if staged_bytes.saturating_add(staged_content.size_bytes)
+            > MAX_CHANNEL_EVENT_ATTACHMENT_BYTES as i64
+        {
+            let response = self
+                .reject_channel_attachment_stage_in_tx(
+                    &mut tx,
+                    ChannelAttachmentStageRejection {
+                        channel_id: &channel_id,
+                        event_id: &event_id,
+                        attachment_id: &attachment_id,
+                        size_bytes: staged_content.size_bytes,
+                        sha256: &staged_content.sha256,
+                        reason_code: CHANNEL_ATTACHMENT_EVENT_TOO_LARGE,
+                    },
+                )
+                .await?;
+            tx.commit().await.map_err(|err| internal(err.into()))?;
+            return Ok(response);
+        }
+
+        let filename = sanitize_channel_attachment_filename(
+            incoming_filename
+                .as_deref()
+                .or(declared.filename.as_deref()),
+        );
+        let mime_type = incoming_mime_type.or(declared.mime_type);
+        let caption = incoming_caption.or(declared.caption);
+        let storage_attachment_id = channel_attachment_storage_component(&attachment_id);
+        let event_dir = self
+            .ensure_channel_attachment_event_dir(&channel_id, &event_id)
+            .await?;
+        let attachment_dir =
+            ensure_safe_child_directory(&event_dir, &[storage_attachment_id.as_str()]).await?;
+        let final_path = attachment_dir.join(&filename);
+        match tokio::fs::symlink_metadata(&final_path).await {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(KernelError::Conflict(
+                        "attachment content path is not a regular file".to_string(),
+                    ));
+                }
+                tokio::fs::remove_file(&final_path).await.map_err(|err| {
+                    KernelError::Internal(format!(
+                        "failed to remove orphaned staged attachment file: {err}"
+                    ))
+                })?;
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(KernelError::Internal(format!(
+                    "failed to inspect staged attachment path: {err}"
+                )));
+            }
+        }
+
+        let temp_path = attachment_dir.join(format!(".upload-{}.tmp", Uuid::new_v4()));
+        let write_result = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+                .await?;
+            file.write_all(&content).await?;
+            file.sync_all().await?;
+            drop(file);
+            tokio::fs::rename(&temp_path, &final_path).await
+        }
+        .await;
+        if let Err(err) = write_result {
+            remove_file_best_effort(&temp_path).await;
+            return Err(KernelError::Internal(format!(
+                "failed to stage channel attachment file: {err}"
+            )));
+        }
+
+        let storage_path = match tokio::fs::canonicalize(&final_path).await {
+            Ok(path) => path,
+            Err(err) => {
+                remove_file_best_effort(&final_path).await;
+                return Err(KernelError::Internal(format!(
+                    "failed to resolve staged channel attachment path: {err}"
+                )));
+            }
+        };
+        ensure_staged_attachment_file_is_safe(&storage_path).await?;
+        let event_dir = match tokio::fs::canonicalize(&event_dir).await {
+            Ok(path) => path,
+            Err(err) => {
+                remove_file_best_effort(&storage_path).await;
+                return Err(KernelError::Internal(format!(
+                    "failed to resolve channel attachment event directory '{}': {err}",
+                    event_dir.display()
+                )));
+            }
+        };
+        if !storage_path.starts_with(&event_dir) {
+            remove_file_best_effort(&storage_path).await;
+            return Err(KernelError::Conflict(format!(
+                "staged attachment path '{}' is outside its event directory",
+                storage_path.display()
+            )));
+        }
+        let storage_path_string = storage_path.to_string_lossy().into_owned();
+        let staged = self
+            .channel_attachments
+            .stage_attachment_in_tx(
+                &mut tx,
+                StageAttachmentUpdate {
+                    channel_id: &channel_id,
+                    event_id: &event_id,
+                    attachment_id: &attachment_id,
+                    filename: Some(&filename),
+                    mime_type: mime_type.as_deref(),
+                    caption: caption.as_deref(),
+                    size_bytes: staged_content.size_bytes,
+                    sha256: &staged_content.sha256,
+                    storage_path: &storage_path_string,
+                },
+            )
+            .await
+            .map_err(internal)?;
+        if !staged {
+            remove_file_best_effort(&storage_path).await;
+            return Err(KernelError::Conflict(
+                "attachment is no longer stageable".to_string(),
+            ));
+        }
+        if let Err(err) = tx.commit().await {
+            remove_file_best_effort(&storage_path).await;
+            return Err(internal(err.into()));
+        }
+
+        let runtime_path = channel_attachment_runtime_path(&attachment_id, &filename);
+        Ok(ChannelAttachmentStageResponse {
+            channel_id,
+            event_id,
+            attachment_id,
+            status: ChannelAttachmentStatus::Staged,
+            size_bytes: staged_content.size_bytes,
+            sha256: staged_content.sha256,
+            runtime_path: Some(runtime_path),
+            reason_code: None,
         })
+    }
+
+    pub async fn finalize_channel_attachments(
+        &self,
+        req: ChannelAttachmentFinalizeRequest,
+    ) -> Result<ChannelAttachmentFinalizeResponse, KernelError> {
+        let channel_id = trim_required(req.channel_id, "channel_id")?;
+        let event_id = trim_required(req.event_id, "event_id")?;
+        let worker_id = trim_required(req.worker_id, "worker_id")?;
+        self.require_active_channel_binding(&channel_id).await?;
+
+        let mut missing = Vec::with_capacity(req.missing.len());
+        let mut missing_ids = HashSet::with_capacity(req.missing.len());
+        for report in req.missing {
+            let attachment_id = trim_required(report.attachment_id, "missing.attachment_id")?;
+            let reason_code = trim_required(report.reason_code, "missing.reason_code")?;
+            if !missing_ids.insert(attachment_id.clone()) {
+                return Err(KernelError::BadRequest(format!(
+                    "duplicate missing attachment_id '{attachment_id}'"
+                )));
+            }
+            missing.push((attachment_id, reason_code));
+        }
+
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let batch = self
+            .channel_attachments
+            .get_batch_in_tx(&mut tx, &channel_id, &event_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                KernelError::NotFound("channel attachment batch not found".to_string())
+            })?;
+        let turn = self
+            .channel_state
+            .get_turn_by_inbound_event_in_tx(&mut tx, &channel_id, &event_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("channel turn not found".to_string()))?;
+
+        if batch.status == ChannelAttachmentBatchStatus::Finalized {
+            tx.rollback().await.map_err(|err| internal(err.into()))?;
+            return Ok(channel_attachment_finalize_response(
+                channel_id,
+                event_id,
+                ChannelAttachmentFinalizeOutcome::AlreadyFinalized,
+                Some(turn.session_id),
+                Some(turn.turn_id),
+            ));
+        }
+        if turn.status != ChannelTurnStatus::WaitingForAttachments {
+            tx.rollback().await.map_err(|err| internal(err.into()))?;
+            return Ok(channel_attachment_finalize_response(
+                channel_id,
+                event_id,
+                ChannelAttachmentFinalizeOutcome::NotReady,
+                Some(turn.session_id),
+                Some(turn.turn_id),
+            ));
+        }
+
+        let persisted_turn = self
+            .session_turns
+            .get_in_tx(&mut tx, turn.turn_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| KernelError::NotFound("session turn not found".to_string()))?;
+        if persisted_turn.status != SessionTurnStatus::WaitingForAttachments {
+            tx.rollback().await.map_err(|err| internal(err.into()))?;
+            return Ok(channel_attachment_finalize_response(
+                channel_id,
+                event_id,
+                ChannelAttachmentFinalizeOutcome::NotReady,
+                Some(turn.session_id),
+                Some(turn.turn_id),
+            ));
+        }
+
+        let attachments = self
+            .channel_attachments
+            .list_event_attachments_in_tx(&mut tx, &channel_id, &event_id)
+            .await
+            .map_err(internal)?;
+        for (attachment_id, reason_code) in &missing {
+            let attachment = attachments
+                .iter()
+                .find(|attachment| attachment.attachment_id == *attachment_id)
+                .ok_or_else(|| {
+                    KernelError::BadRequest(format!(
+                        "missing attachment '{attachment_id}' is not declared"
+                    ))
+                })?;
+            if attachment.status == ChannelAttachmentRecordStatus::Staged {
+                return Err(KernelError::Conflict(format!(
+                    "missing attachment '{attachment_id}' is already staged"
+                )));
+            }
+            self.channel_attachments
+                .reject_attachment_in_tx(
+                    &mut tx,
+                    RejectAttachmentUpdate {
+                        channel_id: &channel_id,
+                        event_id: &event_id,
+                        attachment_id,
+                        rejection_code: reason_code,
+                    },
+                )
+                .await
+                .map_err(internal)?;
+        }
+
+        self.channel_attachments
+            .reject_unstaged_in_tx(
+                &mut tx,
+                &channel_id,
+                &event_id,
+                CHANNEL_ATTACHMENT_NOT_STAGED,
+            )
+            .await
+            .map_err(internal)?;
+        let finalized_attachments = self
+            .channel_attachments
+            .list_event_attachments_in_tx(&mut tx, &channel_id, &event_id)
+            .await
+            .map_err(internal)?;
+
+        self.session_turns
+            .mark_waiting_for_attachments_ready_in_tx(&mut tx, turn.turn_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                KernelError::Conflict("session turn is no longer waiting".to_string())
+            })?;
+        if !self
+            .channel_state
+            .mark_waiting_turn_pending_in_tx(&mut tx, turn.turn_id)
+            .await
+            .map_err(internal)?
+        {
+            return Err(KernelError::Conflict(
+                "channel turn is no longer waiting".to_string(),
+            ));
+        }
+        if !self
+            .channel_attachments
+            .finalize_batch_in_tx(&mut tx, &channel_id, &event_id)
+            .await
+            .map_err(internal)?
+        {
+            return Err(KernelError::Conflict(
+                "channel attachment batch is already finalized".to_string(),
+            ));
+        }
+
+        let staged_count = finalized_attachments
+            .iter()
+            .filter(|attachment| attachment.status == ChannelAttachmentRecordStatus::Staged)
+            .count();
+        let rejected_count = finalized_attachments
+            .iter()
+            .filter(|attachment| attachment.status == ChannelAttachmentRecordStatus::Rejected)
+            .count();
+        self.audit
+            .append_in_tx(
+                &mut tx,
+                "channel.attachments.finalized",
+                Some(turn.session_id),
+                Some(worker_id.clone()),
+                json!({
+                    "channel_id": &channel_id,
+                    "event_id": &event_id,
+                    "turn_id": turn.turn_id,
+                    "session_id": turn.session_id,
+                    "worker_id": &worker_id,
+                    "staged_count": staged_count,
+                    "rejected_count": rejected_count,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+
+        self.emit_queued_channel_turn_status(
+            turn.session_id,
+            &turn.channel_id,
+            &turn.session_key,
+            turn.turn_id,
+        )
+        .await;
+        self.ensure_channel_turn_worker(&turn.channel_id, &turn.session_key)
+            .await;
+
+        Ok(channel_attachment_finalize_response(
+            channel_id,
+            event_id,
+            ChannelAttachmentFinalizeOutcome::Queued,
+            Some(turn.session_id),
+            Some(turn.turn_id),
+        ))
+    }
+
+    async fn reject_channel_attachment_stage_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        rejection: ChannelAttachmentStageRejection<'_>,
+    ) -> Result<ChannelAttachmentStageResponse, KernelError> {
+        self.channel_attachments
+            .reject_attachment_in_tx(
+                tx,
+                RejectAttachmentUpdate {
+                    channel_id: rejection.channel_id,
+                    event_id: rejection.event_id,
+                    attachment_id: rejection.attachment_id,
+                    rejection_code: rejection.reason_code,
+                },
+            )
+            .await
+            .map_err(internal)?;
+
+        Ok(ChannelAttachmentStageResponse {
+            channel_id: rejection.channel_id.to_string(),
+            event_id: rejection.event_id.to_string(),
+            attachment_id: rejection.attachment_id.to_string(),
+            status: ChannelAttachmentStatus::Rejected,
+            size_bytes: rejection.size_bytes,
+            sha256: rejection.sha256.to_string(),
+            runtime_path: None,
+            reason_code: Some(rejection.reason_code.to_string()),
+        })
+    }
+
+    async fn ensure_channel_attachment_event_dir(
+        &self,
+        channel_id: &str,
+        event_id: &str,
+    ) -> Result<PathBuf, KernelError> {
+        let runtime_root = self
+            .runtime_root
+            .as_deref()
+            .ok_or_else(|| KernelError::NotFound("runtime root is not configured".to_string()))?;
+        let safe_channel_id = channel_attachment_storage_component(channel_id);
+        let safe_event_id = channel_attachment_storage_component(event_id);
+        ensure_safe_child_directory(
+            runtime_root,
+            &[
+                "channels",
+                safe_channel_id.as_str(),
+                "attachments",
+                safe_event_id.as_str(),
+            ],
+        )
         .await
+    }
+
+    fn channel_attachment_event_dir_path(
+        &self,
+        channel_id: &str,
+        event_id: &str,
+    ) -> Result<PathBuf, KernelError> {
+        let runtime_root = self
+            .runtime_root
+            .as_deref()
+            .ok_or_else(|| KernelError::NotFound("runtime root is not configured".to_string()))?;
+        Ok(runtime_root
+            .join("channels")
+            .join(channel_attachment_storage_component(channel_id))
+            .join("attachments")
+            .join(channel_attachment_storage_component(event_id)))
+    }
+
+    async fn channel_attachment_execution_context_for_turn(
+        &self,
+        turn: &ChannelTurnRecord,
+        prompt_user_text: &str,
+    ) -> Result<ChannelAttachmentExecutionContext, KernelError> {
+        let attachments = self
+            .channel_attachments
+            .list_event_attachments(&turn.channel_id, &turn.inbound_event_id)
+            .await
+            .map_err(internal)?;
+        let runtime_prompt_user_text =
+            channel_attachment_runtime_prompt(prompt_user_text, &attachments)?;
+        let extra_mounts = self
+            .channel_attachment_mounts_for_records(turn, &attachments)
+            .await?;
+        let attachment_source_turn_id = if attachments.is_empty() {
+            None
+        } else {
+            Some(turn.turn_id)
+        };
+
+        Ok(ChannelAttachmentExecutionContext {
+            runtime_prompt_user_text,
+            extra_mounts,
+            attachment_source_turn_id,
+        })
+    }
+
+    async fn channel_attachment_execution_context_for_session_action_source(
+        &self,
+        source_turn: &SessionTurnRecord,
+        prompt_user_text: &str,
+    ) -> Result<ChannelAttachmentExecutionContext, KernelError> {
+        let attachment_source_turn_id = source_turn
+            .attachment_source_turn_id
+            .unwrap_or(source_turn.turn_id);
+        self.channel_attachment_execution_context_for_session_turn(
+            attachment_source_turn_id,
+            prompt_user_text,
+        )
+        .await
+    }
+
+    async fn channel_attachment_execution_context_for_session_turn(
+        &self,
+        turn_id: Uuid,
+        prompt_user_text: &str,
+    ) -> Result<ChannelAttachmentExecutionContext, KernelError> {
+        let Some(turn) = self
+            .channel_state
+            .get_turn(turn_id)
+            .await
+            .map_err(internal)?
+        else {
+            return Ok(ChannelAttachmentExecutionContext::default());
+        };
+
+        self.channel_attachment_execution_context_for_turn(&turn, prompt_user_text)
+            .await
+    }
+
+    async fn channel_attachment_mounts_for_records(
+        &self,
+        turn: &ChannelTurnRecord,
+        attachments: &[ChannelAttachmentRecord],
+    ) -> Result<Vec<MountSpec>, KernelError> {
+        let staged = attachments
+            .iter()
+            .filter(|attachment| attachment.status == ChannelAttachmentRecordStatus::Staged)
+            .collect::<Vec<_>>();
+        if staged.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let upload_event_dir =
+            self.channel_attachment_event_dir_path(&turn.channel_id, &turn.inbound_event_id)?;
+        ensure_existing_directory_is_safe(&upload_event_dir).await?;
+        let upload_event_dir = tokio::fs::canonicalize(&upload_event_dir)
+            .await
+            .map_err(|err| {
+                KernelError::Internal(format!(
+                    "failed to resolve channel attachment event directory '{}': {err}",
+                    upload_event_dir.display()
+                ))
+            })?;
+        let projection_dir = self
+            .prepare_channel_attachment_runtime_projection(turn, &staged, &upload_event_dir)
+            .await?;
+
+        Ok(vec![MountSpec {
+            source: projection_dir,
+            target: CHANNEL_ATTACHMENT_MOUNT_TARGET.to_string(),
+            access: MountAccess::ReadOnly,
+        }])
+    }
+
+    async fn prepare_channel_attachment_runtime_projection(
+        &self,
+        turn: &ChannelTurnRecord,
+        staged: &[&ChannelAttachmentRecord],
+        upload_event_dir: &Path,
+    ) -> Result<PathBuf, KernelError> {
+        let runtime_root = self
+            .runtime_root
+            .as_deref()
+            .ok_or_else(|| KernelError::NotFound("runtime root is not configured".to_string()))?;
+        let channel_component = channel_attachment_storage_component(&turn.channel_id);
+        let event_component = channel_attachment_storage_component(&turn.inbound_event_id);
+        let projection_id = Uuid::new_v4().to_string();
+        let projection_dir = ensure_safe_child_directory(
+            runtime_root,
+            &[
+                "channels",
+                channel_component.as_str(),
+                CHANNEL_ATTACHMENT_PROJECTIONS_DIR,
+                event_component.as_str(),
+                projection_id.as_str(),
+            ],
+        )
+        .await?;
+        let projection_dir = tokio::fs::canonicalize(&projection_dir)
+            .await
+            .map_err(|err| {
+                KernelError::Internal(format!(
+                    "failed to resolve channel attachment runtime projection '{}': {err}",
+                    projection_dir.display()
+                ))
+            })?;
+
+        if let Err(err) = self
+            .populate_channel_attachment_runtime_projection(
+                &projection_dir,
+                staged,
+                upload_event_dir,
+            )
+            .await
+        {
+            self.remove_channel_attachment_runtime_projection_dirs_best_effort(
+                std::slice::from_ref(&projection_dir),
+            )
+            .await;
+            return Err(err);
+        }
+
+        Ok(projection_dir)
+    }
+
+    async fn populate_channel_attachment_runtime_projection(
+        &self,
+        projection_dir: &Path,
+        staged: &[&ChannelAttachmentRecord],
+        upload_event_dir: &Path,
+    ) -> Result<(), KernelError> {
+        for attachment in staged {
+            let storage_path = attachment.storage_path.as_deref().ok_or_else(|| {
+                KernelError::Internal(format!(
+                    "staged attachment '{}' has no storage path",
+                    attachment.attachment_id
+                ))
+            })?;
+            ensure_staged_attachment_file_is_safe(storage_path).await?;
+            let storage_path = tokio::fs::canonicalize(storage_path).await.map_err(|err| {
+                KernelError::Internal(format!(
+                    "failed to resolve staged attachment path '{}': {err}",
+                    storage_path.display()
+                ))
+            })?;
+            if !storage_path.starts_with(upload_event_dir) {
+                return Err(KernelError::Conflict(format!(
+                    "staged attachment path '{}' is outside its event directory",
+                    storage_path.display()
+                )));
+            }
+
+            let filename = attachment
+                .filename
+                .as_deref()
+                .map(|filename| sanitize_channel_attachment_filename(Some(filename)))
+                .unwrap_or_else(|| sanitize_channel_attachment_filename(None));
+            let runtime_component = channel_attachment_runtime_component(&attachment.attachment_id);
+            let target_dir =
+                ensure_safe_child_directory(projection_dir, &[runtime_component.as_str()]).await?;
+            let target_path = target_dir.join(&filename);
+            tokio::fs::copy(&storage_path, &target_path)
+                .await
+                .map_err(|err| {
+                    KernelError::Internal(format!(
+                        "failed to project channel attachment '{}' into runtime mount: {err}",
+                        attachment.attachment_id
+                    ))
+                })?;
+            ensure_staged_attachment_file_is_safe(&target_path).await?;
+        }
+
+        Ok(())
     }
 
     pub async fn pull_channel_stream(
@@ -1154,6 +2988,248 @@ impl Kernel {
         })
     }
 
+    pub async fn pull_channel_outbox(
+        &self,
+        req: ChannelOutboxPullRequest,
+    ) -> Result<ChannelOutboxPullResponse, KernelError> {
+        if req.channel_id.trim().is_empty() || req.worker_id.trim().is_empty() {
+            return Err(KernelError::BadRequest(
+                "channel_id and worker_id are required".to_string(),
+            ));
+        }
+
+        let channel_id = req.channel_id.trim().to_string();
+        let worker_id = req.worker_id.trim().to_string();
+        let conversation_ref = trim_optional_string(req.conversation_ref);
+        let thread_ref = trim_optional_string(req.thread_ref);
+        self.require_active_channel_binding(&channel_id).await?;
+        let limit = req
+            .limit
+            .unwrap_or(DEFAULT_CHANNEL_OUTBOX_PULL_LIMIT)
+            .clamp(1, MAX_CHANNEL_OUTBOX_PULL_LIMIT);
+        let lease_ms = req
+            .lease_ms
+            .unwrap_or(DEFAULT_CHANNEL_OUTBOX_LEASE_MS)
+            .clamp(1, MAX_CHANNEL_OUTBOX_LEASE_MS);
+        let leases = self
+            .channel_outbox
+            .pull_due(ChannelOutboxPull {
+                channel_id: channel_id.clone(),
+                worker_id: worker_id.clone(),
+                conversation_ref,
+                thread_ref,
+                limit,
+                lease_ms,
+            })
+            .await
+            .map_err(internal)?;
+
+        for lease in &leases {
+            self.audit
+                .append(
+                    "channel.outbox.leased",
+                    lease.delivery.session_id,
+                    Some("api".to_string()),
+                    channel_outbox_audit_details(
+                        &lease.delivery,
+                        ChannelOutboxAuditDetails {
+                            attempt_id: Some(lease.attempt_id),
+                            worker_id: Some(&worker_id),
+                            lease_expires_at: Some(lease.lease_expires_at),
+                            ..ChannelOutboxAuditDetails::default()
+                        },
+                    ),
+                )
+                .await
+                .map_err(internal)?;
+        }
+
+        Ok(ChannelOutboxPullResponse {
+            deliveries: leases
+                .into_iter()
+                .map(to_channel_outbox_delivery_view)
+                .collect(),
+        })
+    }
+
+    pub async fn report_channel_outbox(
+        &self,
+        req: ChannelOutboxReportRequest,
+    ) -> Result<ChannelOutboxReportResponse, KernelError> {
+        if req.channel_id.trim().is_empty() || req.worker_id.trim().is_empty() {
+            return Err(KernelError::BadRequest(
+                "channel_id and worker_id are required".to_string(),
+            ));
+        }
+        let channel_id = req.channel_id.trim().to_string();
+        let worker_id = req.worker_id.trim().to_string();
+        self.require_active_channel_binding(&channel_id).await?;
+        validate_optional_json_size(
+            req.provider_receipt.as_ref(),
+            "provider_receipt",
+            MAX_CHANNEL_OUTBOX_RECEIPT_JSON_BYTES,
+        )?;
+        let provider_receipt = req.provider_receipt;
+        let audit_provider_receipt = provider_receipt.clone();
+        let error_code = trim_optional_string(req.error_code);
+        let error_text = trim_optional_limited_string(
+            req.error_text,
+            "error_text",
+            MAX_CHANNEL_OUTBOX_ERROR_TEXT_BYTES,
+        )?;
+        let audit_error_code = error_code.clone();
+        let audit_error_text = error_text.clone();
+        let outcome = match req.outcome {
+            ChannelOutboxReportOutcomeDto::Delivered => ChannelOutboxReportOutcome::Delivered,
+            ChannelOutboxReportOutcomeDto::RetryableFailed => {
+                ChannelOutboxReportOutcome::RetryableFailed
+            }
+            ChannelOutboxReportOutcomeDto::TerminalFailed => {
+                ChannelOutboxReportOutcome::TerminalFailed
+            }
+        };
+        if outcome != ChannelOutboxReportOutcome::Delivered && error_text.is_none() {
+            return Err(KernelError::BadRequest(
+                "error_text is required for failed outbox reports".to_string(),
+            ));
+        }
+
+        let result = self
+            .channel_outbox
+            .report(ChannelOutboxReport {
+                delivery_id: req.delivery_id,
+                attempt_id: req.attempt_id,
+                channel_id,
+                worker_id: worker_id.clone(),
+                outcome,
+                provider_receipt,
+                error_code,
+                error_text,
+            })
+            .await
+            .map_err(channel_outbox_report_error)?;
+
+        self.update_scheduler_delivery_from_outbox(&result.delivery)
+            .await?;
+
+        let audit_event = match result.attempt_status {
+            ChannelOutboxAttemptStatus::Delivered => "channel.outbox.delivered",
+            ChannelOutboxAttemptStatus::RetryableFailed => "channel.outbox.retryable_failed",
+            ChannelOutboxAttemptStatus::TerminalFailed => "channel.outbox.terminal_failed",
+            ChannelOutboxAttemptStatus::StaleRejected => "channel.outbox.stale_report_rejected",
+            ChannelOutboxAttemptStatus::Leased => "channel.outbox.leased",
+        };
+        self.audit
+            .append(
+                audit_event,
+                result.delivery.session_id,
+                Some("api".to_string()),
+                channel_outbox_audit_details(
+                    &result.delivery,
+                    ChannelOutboxAuditDetails {
+                        attempt_id: Some(req.attempt_id),
+                        worker_id: Some(&worker_id),
+                        accepted: Some(result.accepted),
+                        attempt_status: Some(result.attempt_status),
+                        provider_receipt: audit_provider_receipt
+                            .as_ref()
+                            .or(result.delivery.provider_receipt.as_ref()),
+                        error_code: audit_error_code
+                            .as_deref()
+                            .or(result.delivery.last_error_code.as_deref())
+                            .or_else(|| {
+                                (!result.accepted
+                                    && result.attempt_status
+                                        == ChannelOutboxAttemptStatus::StaleRejected)
+                                    .then_some("stale_report")
+                            }),
+                        error_text: audit_error_text
+                            .as_deref()
+                            .or(result.delivery.last_error_text.as_deref())
+                            .or_else(|| {
+                                (!result.accepted
+                                    && result.attempt_status
+                                        == ChannelOutboxAttemptStatus::StaleRejected)
+                                    .then_some("stale outbox report rejected")
+                            }),
+                        ..ChannelOutboxAuditDetails::default()
+                    },
+                ),
+            )
+            .await
+            .map_err(internal)?;
+
+        Ok(ChannelOutboxReportResponse {
+            delivery_id: result.delivery.delivery_id,
+            attempt_id: req.attempt_id,
+            accepted: result.accepted,
+            status: to_channel_outbox_status_dto(result.delivery.status),
+            attempt_status: to_channel_outbox_attempt_status_dto(result.attempt_status),
+            next_attempt_at: result.next_attempt_at,
+        })
+    }
+
+    pub async fn report_channel_health(
+        &self,
+        req: ChannelHealthReportRequest,
+    ) -> Result<ChannelHealthReportResponse, KernelError> {
+        let report = validate_channel_health_report(req)?;
+        self.require_active_channel_binding(&report.channel_id)
+            .await?;
+
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let stored = self
+            .channel_state
+            .insert_health_report_in_tx(
+                &mut tx,
+                NewChannelHealthReport {
+                    channel_id: &report.channel_id,
+                    reporter_id: &report.reporter_id,
+                    status: report.status,
+                    checks: &report.checks,
+                    observed_at: report.observed_at,
+                },
+            )
+            .await
+            .map_err(internal)?;
+        let check_codes = stored
+            .checks
+            .iter()
+            .map(|check| check.code.as_str())
+            .collect::<Vec<_>>();
+        self.audit
+            .append_in_tx(
+                &mut tx,
+                "channel.health.reported",
+                None,
+                Some(stored.reporter_id.clone()),
+                json!({
+                    "channel_id": &stored.channel_id,
+                    "report_id": stored.report_id,
+                    "reporter_id": &stored.reporter_id,
+                    "status": stored.status.as_str(),
+                    "check_codes": check_codes,
+                    "observed_at": stored.observed_at,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+        let response_channel_id = stored.channel_id.clone();
+        let response_observed_at = stored.observed_at;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+
+        Ok(ChannelHealthReportResponse {
+            accepted: true,
+            channel_id: response_channel_id,
+            observed_at: response_observed_at,
+        })
+    }
+
     pub async fn get_channel_binding(
         &self,
         channel_id: &str,
@@ -1195,282 +3271,522 @@ impl Kernel {
             .map_err(internal)
     }
 
-    pub async fn process_inbound_channel_text(
+    async fn process_channel_inbound(
         &self,
-        req: InboundChannelText,
+        req: ChannelInboundRequest,
     ) -> Result<ChannelInboundResponse, KernelError> {
-        let InboundChannelText {
-            channel_id,
-            peer_id,
-            text,
-            session_id,
-            runtime_id,
-            update_id,
-            external_message_id,
-        } = req;
+        let inbound = validate_channel_inbound_request(req)?;
+        self.require_active_channel_binding(&inbound.channel_id)
+            .await?;
 
-        if channel_id.trim().is_empty() || peer_id.trim().is_empty() || text.trim().is_empty() {
-            return Err(KernelError::BadRequest(
-                "channel_id, peer_id and text are required".to_string(),
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let inserted = self
+            .channel_state
+            .insert_inbound_event_in_tx(
+                &mut tx,
+                NewChannelInboundEvent {
+                    event_id: &inbound.event_id,
+                    channel_id: &inbound.channel_id,
+                    sender_ref: &inbound.sender_ref,
+                    conversation_ref: &inbound.conversation_ref,
+                    thread_ref: inbound.thread_ref.as_deref(),
+                    message_ref: inbound.message_ref.as_deref(),
+                    text: inbound.text.as_deref(),
+                    trigger: inbound.trigger,
+                    attachments: &inbound.attachments,
+                    reply_to_ref: inbound.reply_to_ref.as_deref(),
+                    provider_metadata: &inbound.provider_metadata,
+                    received_at: inbound.received_at,
+                },
+            )
+            .await
+            .map_err(internal)?;
+        if inserted.is_none() {
+            tx.rollback().await.map_err(|err| internal(err.into()))?;
+            if let Some(turn) = self
+                .channel_state
+                .get_turn_by_inbound_event(&inbound.channel_id, &inbound.event_id)
+                .await
+                .map_err(internal)?
+                .filter(|turn| turn.status == ChannelTurnStatus::WaitingForAttachments)
+            {
+                self.audit_channel_inbound(
+                    "channel.inbound.duplicate",
+                    &inbound,
+                    "waiting_for_attachments",
+                    None,
+                    Some(turn.turn_id),
+                )
+                .await?;
+                return Ok(channel_inbound_response(
+                    ChannelInboundOutcome::WaitingForAttachments,
+                    "waiting_for_attachments",
+                    None,
+                    None,
+                    Some(turn.session_id),
+                    Some(turn.turn_id),
+                    Some(turn.session_key),
+                ));
+            }
+            self.audit_channel_inbound(
+                "channel.inbound.duplicate",
+                &inbound,
+                "duplicate_event",
+                None,
+                None,
+            )
+            .await?;
+            return Ok(channel_inbound_response(
+                ChannelInboundOutcome::Duplicate,
+                "duplicate_event",
+                None,
+                None,
+                None,
+                None,
+                None,
             ));
         }
 
-        self.require_active_channel_binding(&channel_id).await?;
-
-        let inserted = self
+        if self
             .channel_state
-            .insert_inbound_message(&channel_id, &peer_id, external_message_id, update_id, &text)
+            .find_blocking_grant_in_tx(
+                &mut tx,
+                &inbound.channel_id,
+                &inbound.sender_ref,
+                &inbound.conversation_ref,
+                inbound.thread_ref.as_deref(),
+            )
+            .await
+            .map_err(internal)?
+            .is_some()
+        {
+            self.audit_channel_inbound_in_tx(
+                &mut tx,
+                "channel.inbound.blocked",
+                &inbound,
+                "blocked_grant",
+                None,
+                None,
+            )
+            .await?;
+            tx.commit().await.map_err(|err| internal(err.into()))?;
+            return Ok(channel_inbound_response(
+                ChannelInboundOutcome::Blocked,
+                "blocked_grant",
+                None,
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+
+        if inbound.trigger == ChannelTrigger::None {
+            self.audit_channel_trigger_ignored_in_tx(&mut tx, &inbound)
+                .await?;
+            tx.commit().await.map_err(|err| internal(err.into()))?;
+            return Ok(channel_trigger_ignored_response());
+        }
+
+        let grant = self
+            .channel_state
+            .find_approved_grant_in_tx(
+                &mut tx,
+                &inbound.channel_id,
+                &inbound.sender_ref,
+                &inbound.conversation_ref,
+                inbound.thread_ref.as_deref(),
+                inbound.trigger,
+            )
             .await
             .map_err(internal)?;
-        let Some(inbound_message) = inserted else {
-            return Ok(ChannelInboundResponse {
-                outcome: ChannelInboundOutcome::Duplicate,
-                turn_id: None,
-                session_id: None,
-            });
+        let Some(grant) = grant else {
+            let requested_profile =
+                default_pending_profile(inbound.trigger, inbound.thread_ref.as_deref());
+            let pending_scope = pending_scope_for_profile(&inbound, requested_profile)?;
+            let pairing_code = generate_pairing_code();
+            let pairing_code_hash = hash_pairing_code(&pairing_code);
+            let (pairing, created) = self
+                .channel_state
+                .create_or_refresh_operator_pairing_in_tx(
+                    &mut tx,
+                    OperatorPairingUpsert {
+                        channel_id: &inbound.channel_id,
+                        sender_ref: pending_scope.sender_ref.as_deref(),
+                        conversation_ref: pending_scope.conversation_ref.as_deref(),
+                        thread_ref: pending_scope.thread_ref.as_deref(),
+                        requested_profile,
+                        code_hash: &pairing_code_hash,
+                    },
+                )
+                .await
+                .map_err(internal)?;
+            self.audit_channel_inbound_in_tx(
+                &mut tx,
+                "channel.inbound.pending",
+                &inbound,
+                "approval_required",
+                Some(pairing.pairing_id),
+                None,
+            )
+            .await?;
+            tx.commit().await.map_err(|err| internal(err.into()))?;
+            self.record_channel_pairing_pending_continuity_best_effort(&pairing)
+                .await;
+            return Ok(channel_inbound_response(
+                ChannelInboundOutcome::PendingApproval,
+                "approval_required",
+                Some(pairing.pairing_id),
+                created.then_some(pairing_code),
+                None,
+                None,
+                None,
+            ));
         };
 
-        let peer = match self
-            .channel_state
-            .get_peer(&channel_id, &peer_id)
+        if !trigger_allows(grant.routing_profile, inbound.trigger) {
+            self.audit_channel_trigger_ignored_in_tx(&mut tx, &inbound)
+                .await?;
+            tx.commit().await.map_err(|err| internal(err.into()))?;
+            return Ok(channel_trigger_ignored_response());
+        }
+
+        let session_key = session_key_for_grant(&grant)?;
+        let runtime_id = self.resolve_runtime_id(None)?;
+        let session = match self
+            .sessions
+            .find_latest_by_channel_peer_in_tx(
+                &mut tx,
+                &inbound.channel_id,
+                &session_key,
+                self.session_scope(),
+            )
             .await
             .map_err(internal)?
         {
             Some(existing) => existing,
-            None => {
-                let pending = self
-                    .channel_state
-                    .upsert_pending_peer(&channel_id, &peer_id, &generate_pairing_code())
-                    .await
-                    .map_err(internal)?;
-
-                self.audit
-                    .append(
-                        "channel.peer.pending",
-                        None,
-                        Some("kernel".to_string()),
-                        json!({
-                            "channel_id": channel_id,
-                            "peer_id": peer_id,
-                            "pairing_code": pending.pairing_code,
-                        }),
-                    )
-                    .await
-                    .map_err(internal)?;
-                if let Err(err) = self
-                    .record_pairing_pending_continuity(&channel_id, &peer_id, &pending.pairing_code)
-                    .await
-                {
-                    warn!(
-                        ?err,
-                        channel_id, peer_id, "failed to record pending pairing continuity"
-                    );
-                }
-
-                if let Err(err) = self
-                    .emit_channel_message(
-                        &channel_id,
-                        &peer_id,
-                        None,
-                        None,
-                        &format!(
-                            "Pairing required. Approve with: lionclaw channel pairing approve {} {} {} --trust-tier main",
-                            channel_id, peer_id, pending.pairing_code
-                        ),
-                    )
-                    .await
-                {
-                    warn!(?err, channel_id, peer_id, "failed to emit pending pairing message");
-                }
-
-                self.audit
-                    .append(
-                        "channel.inbound.rejected",
-                        None,
-                        Some("kernel".to_string()),
-                        json!({
-                            "channel_id": channel_id,
-                            "peer_id": peer_id,
-                            "reason": "peer_pending_approval",
-                            "update_id": update_id,
-                        }),
-                    )
-                    .await
-                    .map_err(internal)?;
-
-                return Ok(ChannelInboundResponse {
-                    outcome: ChannelInboundOutcome::PairingPending,
-                    turn_id: None,
-                    session_id: None,
-                });
-            }
-        };
-
-        match peer.status {
-            ChannelPeerStatus::Pending => {
-                if let Err(err) = self
-                    .emit_channel_message(
-                        &channel_id,
-                        &peer_id,
-                        None,
-                        None,
-                        &format!(
-                            "Peer is pending approval. Approve with: lionclaw channel pairing approve {} {} {} --trust-tier main",
-                            channel_id, peer_id, peer.pairing_code
-                        ),
-                    )
-                    .await
-                {
-                    warn!(?err, channel_id, peer_id, "failed to emit pending peer message");
-                }
-                self.audit
-                    .append(
-                        "channel.inbound.rejected",
-                        None,
-                        Some("kernel".to_string()),
-                        json!({
-                            "channel_id": channel_id,
-                            "peer_id": peer_id,
-                            "reason": "peer_pending_approval",
-                            "update_id": update_id,
-                        }),
-                    )
-                    .await
-                    .map_err(internal)?;
-                return Ok(ChannelInboundResponse {
-                    outcome: ChannelInboundOutcome::PairingPending,
-                    turn_id: None,
-                    session_id: None,
-                });
-            }
-            ChannelPeerStatus::Blocked => {
-                self.audit
-                    .append(
-                        "channel.inbound.rejected",
-                        None,
-                        Some("kernel".to_string()),
-                        json!({
-                            "channel_id": channel_id,
-                            "peer_id": peer_id,
-                            "reason": "peer_blocked",
-                            "update_id": update_id,
-                        }),
-                    )
-                    .await
-                    .map_err(internal)?;
-                return Ok(ChannelInboundResponse {
-                    outcome: ChannelInboundOutcome::PeerBlocked,
-                    turn_id: None,
-                    session_id: None,
-                });
-            }
-            ChannelPeerStatus::Approved => {}
-        }
-
-        self.audit
-            .append(
-                "channel.inbound.accepted",
-                None,
-                Some("kernel".to_string()),
-                json!({
-                    "channel_id": channel_id,
-                    "peer_id": peer_id,
-                    "update_id": update_id,
-                    "text_len": text.len(),
-                }),
-            )
-            .await
-            .map_err(internal)?;
-
-        let session = match session_id {
-            Some(session_id) => {
-                let session = self
-                    .get_scoped_session(session_id)
-                    .await
-                    .map_err(|_| KernelError::BadRequest("session_id not found".to_string()))?;
-                if session.channel_id != channel_id || session.peer_id != peer_id {
-                    return Err(KernelError::BadRequest(
-                        "session_id does not belong to this channel_id and peer_id".to_string(),
-                    ));
-                }
-                session
-            }
-            None => match self
+            None => self
                 .sessions
-                .find_latest_by_channel_peer(&channel_id, &peer_id, self.session_scope())
+                .open_in_tx(
+                    &mut tx,
+                    inbound.channel_id.clone(),
+                    session_key.clone(),
+                    self.session_scope().to_string(),
+                    grant.trust_tier.clone(),
+                    SessionHistoryPolicy::Conservative,
+                )
                 .await
-                .map_err(internal)?
-            {
-                Some(existing) => existing,
-                None => self
-                    .sessions
-                    .open(
-                        channel_id.clone(),
-                        peer_id.clone(),
-                        self.session_scope().to_string(),
-                        peer.trust_tier.clone(),
-                        SessionHistoryPolicy::Conservative,
-                    )
-                    .await
-                    .map_err(internal)?,
-            },
+                .map_err(internal)?,
         };
-        let resolved_channel_runtime_id = self
-            .resolve_channel_runtime_id(&channel_id, runtime_id)
-            .await?;
-        let runtime_id = self.resolve_runtime_id(resolved_channel_runtime_id.as_deref())?;
 
+        let has_attachments = !inbound.attachments.is_empty();
+        let waiting_for_attachments = inbound.stageable_attachment_count > 0;
+        let user_text = channel_turn_user_text(&inbound);
+        if has_attachments {
+            let initial_rejections = inbound
+                .initial_attachment_rejections
+                .iter()
+                .map(|rejection| DeclareAttachmentRejection {
+                    attachment_id: rejection.attachment_id.as_str(),
+                    reason_code: rejection.reason_code,
+                })
+                .collect::<Vec<_>>();
+            self.channel_attachments
+                .declare_batch_in_tx(
+                    &mut tx,
+                    &inbound.channel_id,
+                    &inbound.event_id,
+                    &inbound.attachments,
+                    &initial_rejections,
+                )
+                .await
+                .map_err(internal)?;
+        }
         let turn_id = Uuid::new_v4();
-        self.channel_state
-            .enqueue_turn(
-                turn_id,
-                &channel_id,
-                &peer_id,
-                session.session_id,
-                inbound_message.message_id,
-                &runtime_id,
+        let turn_status = if waiting_for_attachments {
+            ChannelTurnStatus::WaitingForAttachments
+        } else {
+            ChannelTurnStatus::Pending
+        };
+        let session_turn_status = if waiting_for_attachments {
+            SessionTurnStatus::WaitingForAttachments
+        } else {
+            SessionTurnStatus::Running
+        };
+        if has_attachments && !waiting_for_attachments {
+            let finalized = self
+                .channel_attachments
+                .finalize_batch_in_tx(&mut tx, &inbound.channel_id, &inbound.event_id)
+                .await
+                .map_err(internal)?;
+            if !finalized {
+                return Err(KernelError::Conflict(
+                    "channel attachment batch is already finalized".to_string(),
+                ));
+            }
+        }
+        self.session_turns
+            .begin_turn_with_status_in_tx(
+                &mut tx,
+                NewSessionTurn {
+                    turn_id,
+                    session_id: session.session_id,
+                    kind: SessionTurnKind::Normal,
+                    display_user_text: user_text.clone(),
+                    prompt_user_text: user_text.clone(),
+                    attachment_source_turn_id: has_attachments.then_some(turn_id),
+                    runtime_id: runtime_id.clone(),
+                },
+                session_turn_status,
             )
             .await
             .map_err(internal)?;
-
-        let stream_context = self
-            .channel_stream_context_for_session(session.session_id, &channel_id, &peer_id, turn_id)
-            .await?;
-        if let Some(stream_context) = &stream_context {
-            self.emit_runtime_event(
-                &Some(stream_context.clone()),
-                &None,
-                RuntimeEvent::Status {
-                    code: Some("queue.queued".to_string()),
-                    text: "queued".to_string(),
+        self.channel_state
+            .enqueue_turn_in_tx(
+                &mut tx,
+                NewChannelTurn {
+                    turn_id,
+                    channel_id: &inbound.channel_id,
+                    session_key: &session_key,
+                    session_id: session.session_id,
+                    inbound_event_id: &inbound.event_id,
+                    runtime_id: &runtime_id,
+                    status: turn_status,
                 },
             )
-            .await?;
-        }
+            .await
+            .map_err(internal)?;
 
+        let event_type = if waiting_for_attachments {
+            "channel.inbound.waiting_for_attachments"
+        } else {
+            "channel.inbound.accepted"
+        };
+        let reason_code = if waiting_for_attachments {
+            "waiting_for_attachments"
+        } else {
+            "accepted"
+        };
+        self.audit_channel_inbound_in_tx(
+            &mut tx,
+            event_type,
+            &inbound,
+            reason_code,
+            None,
+            Some(turn_id),
+        )
+        .await?;
+        if has_attachments && !waiting_for_attachments {
+            self.audit
+                .append_in_tx(
+                    &mut tx,
+                    "channel.attachments.finalized",
+                    Some(session.session_id),
+                    Some("kernel-admission-policy".to_string()),
+                    json!({
+                        "channel_id": &inbound.channel_id,
+                        "event_id": &inbound.event_id,
+                        "turn_id": turn_id,
+                        "session_id": session.session_id,
+                        "worker_id": "kernel-admission-policy",
+                        "staged_count": 0,
+                        "rejected_count": inbound.initial_attachment_rejections.len(),
+                    }),
+                )
+                .await
+                .map_err(internal)?;
+        }
         self.audit
-            .append(
+            .append_in_tx(
+                &mut tx,
                 "channel.turn.queued",
                 Some(session.session_id),
                 Some("kernel".to_string()),
                 json!({
-                    "channel_id": channel_id,
-                    "peer_id": peer_id,
+                    "channel_id": inbound.channel_id,
+                    "session_key": session_key,
                     "runtime_id": runtime_id,
                     "turn_id": turn_id,
-                    "inbound_message_id": inbound_message.message_id,
+                    "inbound_event_id": inbound.event_id,
+                    "status": turn_status.as_str(),
                 }),
             )
             .await
             .map_err(internal)?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
 
-        self.ensure_channel_turn_worker(&channel_id, &peer_id).await;
+        if !waiting_for_attachments {
+            self.emit_queued_channel_turn_status(
+                session.session_id,
+                &inbound.channel_id,
+                &session_key,
+                turn_id,
+            )
+            .await;
+            self.ensure_channel_turn_worker(&inbound.channel_id, &session_key)
+                .await;
+        }
 
-        Ok(ChannelInboundResponse {
-            outcome: ChannelInboundOutcome::Queued,
-            turn_id: Some(turn_id),
-            session_id: Some(session.session_id),
-        })
+        Ok(channel_inbound_response(
+            if waiting_for_attachments {
+                ChannelInboundOutcome::WaitingForAttachments
+            } else {
+                ChannelInboundOutcome::Queued
+            },
+            reason_code,
+            None,
+            None,
+            Some(session.session_id),
+            Some(turn_id),
+            Some(session_key),
+        ))
+    }
+
+    async fn audit_channel_inbound(
+        &self,
+        event_type: &str,
+        inbound: &ValidatedChannelInbound,
+        reason_code: &str,
+        pairing_id: Option<Uuid>,
+        turn_id: Option<Uuid>,
+    ) -> Result<(), KernelError> {
+        let edited = inbound
+            .provider_metadata
+            .get("edited")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        self.audit
+            .append(
+                event_type,
+                None,
+                Some("kernel".to_string()),
+                json!({
+                    "channel_id": inbound.channel_id,
+                    "event_id": inbound.event_id,
+                    "sender_ref": inbound.sender_ref,
+                    "conversation_ref": inbound.conversation_ref,
+                    "thread_ref": inbound.thread_ref,
+                    "reason_code": reason_code,
+                    "pairing_id": pairing_id,
+                    "turn_id": turn_id,
+                    "edited": edited,
+                }),
+            )
+            .await
+            .map_err(internal)
+    }
+
+    async fn audit_channel_inbound_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        event_type: &str,
+        inbound: &ValidatedChannelInbound,
+        reason_code: &str,
+        pairing_id: Option<Uuid>,
+        turn_id: Option<Uuid>,
+    ) -> Result<(), KernelError> {
+        let edited = inbound
+            .provider_metadata
+            .get("edited")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        self.audit
+            .append_in_tx(
+                tx,
+                event_type,
+                None,
+                Some("kernel".to_string()),
+                json!({
+                    "channel_id": inbound.channel_id,
+                    "event_id": inbound.event_id,
+                    "sender_ref": inbound.sender_ref,
+                    "conversation_ref": inbound.conversation_ref,
+                    "thread_ref": inbound.thread_ref,
+                    "reason_code": reason_code,
+                    "pairing_id": pairing_id,
+                    "turn_id": turn_id,
+                    "edited": edited,
+                }),
+            )
+            .await
+            .map_err(internal)
+    }
+
+    async fn audit_channel_trigger_ignored_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        inbound: &ValidatedChannelInbound,
+    ) -> Result<(), KernelError> {
+        self.audit_channel_inbound_in_tx(
+            tx,
+            "channel.inbound.trigger_ignored",
+            inbound,
+            "trigger_insufficient",
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn finish_pairing_claim(
+        &self,
+        mut tx: Transaction<'_, Sqlite>,
+        claim: &ValidatedPairingClaim,
+        pairing: Option<&ChannelPairingRequestRecord>,
+        grant_id: Option<Uuid>,
+        outcome: ChannelPairingClaimOutcome,
+        reason_code: &'static str,
+    ) -> Result<ChannelPairingClaimResponse, KernelError> {
+        self.audit_pairing_claim_in_tx(&mut tx, claim, pairing, grant_id, outcome, reason_code)
+            .await?;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+        Ok(channel_pairing_claim_response(
+            outcome,
+            reason_code,
+            grant_id,
+        ))
+    }
+
+    async fn audit_pairing_claim_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        claim: &ValidatedPairingClaim,
+        pairing: Option<&ChannelPairingRequestRecord>,
+        grant_id: Option<Uuid>,
+        outcome: ChannelPairingClaimOutcome,
+        reason_code: &str,
+    ) -> Result<(), KernelError> {
+        let event_type = if outcome == ChannelPairingClaimOutcome::Approved {
+            "channel.pairing.claim_approved"
+        } else {
+            "channel.pairing.claim_denied"
+        };
+        let requested_profile = pairing.map(|pairing| pairing.requested_profile.as_str());
+        self.audit
+            .append_in_tx(
+                tx,
+                event_type,
+                None,
+                Some("kernel".to_string()),
+                json!({
+                    "channel_id": claim.channel_id,
+                    "pairing_id": pairing.map(|pairing| pairing.pairing_id),
+                    "requested_profile": requested_profile,
+                    "sender_ref": claim.sender_ref,
+                    "conversation_ref": claim.conversation_ref,
+                    "thread_ref": claim.thread_ref,
+                    "grant_id": grant_id,
+                    "outcome": outcome.as_str(),
+                    "reason_code": reason_code,
+                }),
+            )
+            .await
+            .map_err(internal)
     }
 
     pub async fn grant_policy(
@@ -1571,9 +3887,10 @@ impl Kernel {
             ));
         }
         if let Some(delivery) = &req.delivery {
-            if delivery.channel_id.trim().is_empty() || delivery.peer_id.trim().is_empty() {
+            if delivery.channel_id.trim().is_empty() || delivery.conversation_ref.trim().is_empty()
+            {
                 return Err(KernelError::BadRequest(
-                    "delivery channel_id and peer_id are required".to_string(),
+                    "delivery channel_id and conversation_ref are required".to_string(),
                 ));
             }
         }
@@ -1912,6 +4229,33 @@ impl Kernel {
         &self.audit
     }
 
+    async fn update_scheduler_delivery_from_outbox(
+        &self,
+        delivery: &ChannelDeliveryRecord,
+    ) -> Result<(), KernelError> {
+        if delivery.source_kind.as_deref() != Some("scheduler_run") {
+            return Ok(());
+        }
+        let Some(source_id) = delivery.source_id.as_deref() else {
+            return Ok(());
+        };
+        let Ok(run_id) = Uuid::parse_str(source_id) else {
+            return Ok(());
+        };
+        let status = match delivery.status {
+            ChannelOutboxDeliveryStatus::Delivered => SchedulerJobDeliveryStatus::Delivered,
+            ChannelOutboxDeliveryStatus::Failed => SchedulerJobDeliveryStatus::Failed,
+            ChannelOutboxDeliveryStatus::Pending | ChannelOutboxDeliveryStatus::Leased => {
+                return Ok(());
+            }
+        };
+        self.jobs
+            .update_run_delivery_status(run_id, status)
+            .await
+            .map_err(internal)?;
+        Ok(())
+    }
+
     pub(super) async fn record_scheduler_continuity_success(
         &self,
         job: &SchedulerJobRecord,
@@ -1958,6 +4302,51 @@ impl Kernel {
         Ok(())
     }
 
+    async fn record_channel_pairing_pending_continuity_best_effort(
+        &self,
+        pairing: &ChannelPairingRequestRecord,
+    ) {
+        let Some(layout) = &self.continuity else {
+            return;
+        };
+        let scope = channel_pairing_continuity_scope(pairing);
+        if let Err(err) = layout
+            .append_daily_event(ContinuityEvent {
+                at: Utc::now(),
+                title: format!("Pairing required for {scope}"),
+                details: vec![
+                    format!("pairing {}", pairing.pairing_id),
+                    format!("profile {}", pairing.requested_profile.as_str()),
+                ],
+            })
+            .await
+            .map_err(internal)
+        {
+            self.append_audit_event_best_effort(
+                "channel.pairing_pending_continuity.failed",
+                None,
+                "kernel",
+                json!({
+                    "channel_id": pairing.channel_id,
+                    "pairing_id": pairing.pairing_id,
+                    "error": err.to_string(),
+                }),
+            )
+            .await;
+            return;
+        }
+        self.refresh_active_continuity_after_commit_best_effort(
+            "channel.inbound.pending",
+            None,
+            "kernel",
+            json!({
+                "channel_id": pairing.channel_id,
+                "pairing_id": pairing.pairing_id,
+            }),
+        )
+        .await;
+    }
+
     pub(super) async fn record_scheduler_continuity_failure(
         &self,
         job: &SchedulerJobRecord,
@@ -1983,37 +4372,6 @@ impl Kernel {
             json!({
                 "job_id": job.job_id,
                 "run_id": run.run_id,
-            }),
-        )
-        .await;
-        Ok(())
-    }
-
-    async fn record_pairing_pending_continuity(
-        &self,
-        channel_id: &str,
-        peer_id: &str,
-        pairing_code: &str,
-    ) -> Result<(), KernelError> {
-        let Some(layout) = &self.continuity else {
-            return Ok(());
-        };
-
-        layout
-            .append_daily_event(ContinuityEvent {
-                at: Utc::now(),
-                title: format!("Pairing required for {channel_id}/{peer_id}"),
-                details: vec![format!("pairing code {}", pairing_code)],
-            })
-            .await
-            .map_err(internal)?;
-        self.refresh_active_continuity_after_commit_best_effort(
-            "channel.peer.pairing_pending",
-            None,
-            "kernel",
-            json!({
-                "channel_id": channel_id,
-                "peer_id": peer_id,
             }),
         )
         .await;
@@ -2179,11 +4537,12 @@ impl Kernel {
 
         let pending_approvals = self
             .channel_state
-            .list_pending_peers(ACTIVE_GLOBAL_SLICE_LIMIT)
+            .list_pairing_requests(None, Some(ChannelPairingStatus::Pending))
             .await
             .map_err(internal)?
             .into_iter()
-            .map(|peer| format!("{}/{}", peer.channel_id, peer.peer_id))
+            .take(ACTIVE_GLOBAL_SLICE_LIMIT)
+            .map(|pairing| channel_pairing_continuity_scope(&pairing))
             .collect::<Vec<_>>();
 
         let mut matters_today = Vec::new();
@@ -2354,6 +4713,7 @@ impl Kernel {
                     working_dir: None,
                     env_passthrough_keys: Vec::new(),
                     skill_mounts: Vec::new(),
+                    extra_mounts: Vec::new(),
                     timeout_ms: Some(hidden_compaction_turn_timeout.as_millis() as u64),
                 },
             )
@@ -2541,10 +4901,14 @@ impl Kernel {
                 kind: SessionTurnKind::Normal,
                 display_user_text: job.prompt_text.clone(),
                 prompt_user_text: job.prompt_text.clone(),
+                runtime_prompt_user_text: None,
+                attachment_source_turn_id: None,
+                prepared_turn: None,
                 requested_runtime_id: Some(job.runtime_id.clone()),
                 runtime_working_dir: None,
                 runtime_timeout_ms: None,
                 runtime_env_passthrough: None,
+                extra_mounts: Vec::new(),
                 default_policy_scope: Scope::Job(job.job_id),
                 sink: None,
                 emit_channel_stream_done: true,
@@ -3353,6 +5717,7 @@ mod tests {
                     working_dir: None,
                     env_passthrough_keys: Vec::new(),
                     skill_mounts: Vec::new(),
+                    extra_mounts: Vec::new(),
                     timeout_ms: None,
                 },
             )
@@ -3811,21 +6176,62 @@ fn to_channel_binding_view(binding: AppliedChannel) -> ChannelBindingView {
     }
 }
 
-fn to_channel_peer_view(peer: super::channel_state::ChannelPeerRecord) -> ChannelPeerView {
-    let pairing_code = if peer.status == ChannelPeerStatus::Pending {
-        Some(peer.pairing_code)
-    } else {
-        None
-    };
+fn to_channel_pairing_view(pairing: ChannelPairingRequestRecord) -> ChannelPairingView {
+    ChannelPairingView {
+        pairing_id: pairing.pairing_id,
+        channel_id: pairing.channel_id,
+        sender_ref: pairing.sender_ref,
+        conversation_ref: pairing.conversation_ref,
+        thread_ref: pairing.thread_ref,
+        requested_profile: pairing.requested_profile,
+        status: pairing.status,
+        label: pairing.label,
+        created_at: pairing.created_at,
+        expires_at: pairing.expires_at,
+    }
+}
 
-    ChannelPeerView {
-        channel_id: peer.channel_id,
-        peer_id: peer.peer_id,
-        status: peer.status.as_str().to_string(),
-        trust_tier: peer.trust_tier,
-        pairing_code,
-        first_seen: peer.first_seen,
-        updated_at: peer.updated_at,
+fn channel_pairing_continuity_scope(pairing: &ChannelPairingRequestRecord) -> String {
+    match pairing.requested_profile {
+        ChannelRoutingProfile::Direct => format!(
+            "{}/{}",
+            pairing.channel_id,
+            pairing.sender_ref.as_deref().unwrap_or("unknown")
+        ),
+        ChannelRoutingProfile::Conversation => format!(
+            "{}/conversation:{}/sender:{}",
+            pairing.channel_id,
+            pairing.conversation_ref.as_deref().unwrap_or("unknown"),
+            pairing.sender_ref.as_deref().unwrap_or("unknown")
+        ),
+        ChannelRoutingProfile::Thread => format!(
+            "{}/thread:{}/{}",
+            pairing.channel_id,
+            pairing.conversation_ref.as_deref().unwrap_or("unknown"),
+            pairing.thread_ref.as_deref().unwrap_or("unknown")
+        ),
+        ChannelRoutingProfile::Outbound => format!(
+            "{}/outbound:{}",
+            pairing.channel_id,
+            pairing.conversation_ref.as_deref().unwrap_or("unknown")
+        ),
+    }
+}
+
+fn to_channel_grant_view(grant: ChannelGrantRecord) -> ChannelGrantView {
+    ChannelGrantView {
+        grant_id: grant.grant_id,
+        channel_id: grant.channel_id,
+        sender_ref: grant.sender_ref,
+        conversation_ref: grant.conversation_ref,
+        thread_ref: grant.thread_ref,
+        routing_profile: grant.routing_profile,
+        trust_tier: grant.trust_tier,
+        status: grant.status.as_str().to_string(),
+        label: grant.label,
+        created_at: grant.created_at,
+        updated_at: grant.updated_at,
+        revoked_at: grant.revoked_at,
     }
 }
 
@@ -3999,22 +6405,166 @@ fn to_job_schedule_dto(schedule: JobSchedule) -> JobScheduleDto {
 
 fn job_delivery_from_dto(delivery: JobDeliveryTargetDto) -> anyhow::Result<JobDeliveryTarget> {
     let channel_id = delivery.channel_id.trim().to_string();
-    let peer_id = delivery.peer_id.trim().to_string();
-    if channel_id.is_empty() || peer_id.is_empty() {
+    let conversation_ref = delivery.conversation_ref.trim().to_string();
+    if channel_id.is_empty() || conversation_ref.is_empty() {
         return Err(anyhow::anyhow!(
-            "delivery channel_id and peer_id are required"
+            "delivery channel_id and conversation_ref are required"
         ));
     }
     Ok(JobDeliveryTarget {
         channel_id,
-        peer_id,
+        conversation_ref,
+        thread_ref: trim_optional_string(delivery.thread_ref),
+        reply_to_ref: trim_optional_string(delivery.reply_to_ref),
     })
 }
 
 fn to_job_delivery_dto(delivery: JobDeliveryTarget) -> JobDeliveryTargetDto {
     JobDeliveryTargetDto {
         channel_id: delivery.channel_id,
-        peer_id: delivery.peer_id,
+        conversation_ref: delivery.conversation_ref,
+        thread_ref: delivery.thread_ref,
+        reply_to_ref: delivery.reply_to_ref,
+    }
+}
+
+fn trim_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+}
+
+fn trim_optional_limited_string(
+    value: Option<String>,
+    field_name: &str,
+    max_bytes: usize,
+) -> Result<Option<String>, KernelError> {
+    let Some(trimmed) = trim_optional_string(value) else {
+        return Ok(None);
+    };
+    if trimmed.len() > max_bytes {
+        return Err(KernelError::BadRequest(format!(
+            "{field_name} exceeds {max_bytes} bytes"
+        )));
+    }
+    Ok(Some(trimmed))
+}
+
+fn validate_optional_json_size(
+    value: Option<&serde_json::Value>,
+    field_name: &str,
+    max_bytes: usize,
+) -> Result<(), KernelError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let encoded = serde_json::to_vec(value)
+        .map_err(|err| KernelError::BadRequest(format!("invalid {field_name}: {err}")))?;
+    if encoded.len() > max_bytes {
+        return Err(KernelError::BadRequest(format!(
+            "{field_name} exceeds {max_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct ChannelOutboxAuditDetails<'a> {
+    attempt_id: Option<Uuid>,
+    worker_id: Option<&'a str>,
+    accepted: Option<bool>,
+    attempt_status: Option<ChannelOutboxAttemptStatus>,
+    lease_expires_at: Option<DateTime<Utc>>,
+    provider_receipt: Option<&'a Value>,
+    error_code: Option<&'a str>,
+    error_text: Option<&'a str>,
+}
+
+fn channel_outbox_audit_details(
+    delivery: &ChannelDeliveryRecord,
+    details: ChannelOutboxAuditDetails<'_>,
+) -> Value {
+    json!({
+        "channel_id": &delivery.channel_id,
+        "delivery_id": delivery.delivery_id,
+        "attempt_id": details.attempt_id,
+        "worker_id": details.worker_id,
+        "conversation_ref": &delivery.conversation_ref,
+        "thread_ref": &delivery.thread_ref,
+        "reply_to_ref": &delivery.reply_to_ref,
+        "session_id": delivery.session_id,
+        "turn_id": delivery.turn_id,
+        "source_kind": &delivery.source_kind,
+        "source_id": &delivery.source_id,
+        "status": delivery.status.as_str(),
+        "attempt_status": details.attempt_status.map(ChannelOutboxAttemptStatus::as_str),
+        "accepted": details.accepted,
+        "attempt_count": delivery.attempt_count,
+        "lease_expires_at": details.lease_expires_at,
+        "next_attempt_at": delivery.next_attempt_at,
+        "provider_receipt": details.provider_receipt,
+        "error_code": details.error_code,
+        "error_text": details.error_text,
+        "content_format_hint": &delivery.content.format_hint,
+        "content_attachment_count": delivery.content.attachments.len(),
+        "content_text_len": delivery.content.text.len(),
+    })
+}
+
+fn to_channel_outbox_delivery_view(lease: ChannelDeliveryLease) -> ChannelOutboxDeliveryView {
+    ChannelOutboxDeliveryView {
+        delivery_id: lease.delivery.delivery_id,
+        attempt_id: lease.attempt_id,
+        channel_id: lease.delivery.channel_id,
+        conversation_ref: lease.delivery.conversation_ref,
+        thread_ref: lease.delivery.thread_ref,
+        reply_to_ref: lease.delivery.reply_to_ref,
+        session_id: lease.delivery.session_id,
+        turn_id: lease.delivery.turn_id,
+        content: ChannelOutboxContentDto {
+            text: lease.delivery.content.text,
+            format_hint: lease.delivery.content.format_hint,
+            attachments: lease
+                .delivery
+                .content
+                .attachments
+                .into_iter()
+                .map(|attachment| ChannelOutboxAttachmentDto {
+                    attachment_id: attachment.attachment_id,
+                    path: attachment.path,
+                    filename: attachment.filename,
+                    mime_type: attachment.mime_type,
+                })
+                .collect(),
+        },
+        attempt_count: lease.delivery.attempt_count,
+        lease_expires_at: lease.lease_expires_at,
+        created_at: lease.delivery.created_at,
+    }
+}
+
+fn to_channel_outbox_status_dto(
+    status: ChannelOutboxDeliveryStatus,
+) -> ChannelOutboxDeliveryStatusDto {
+    match status {
+        ChannelOutboxDeliveryStatus::Pending => ChannelOutboxDeliveryStatusDto::Pending,
+        ChannelOutboxDeliveryStatus::Leased => ChannelOutboxDeliveryStatusDto::Leased,
+        ChannelOutboxDeliveryStatus::Delivered => ChannelOutboxDeliveryStatusDto::Delivered,
+        ChannelOutboxDeliveryStatus::Failed => ChannelOutboxDeliveryStatusDto::Failed,
+    }
+}
+
+fn to_channel_outbox_attempt_status_dto(
+    status: ChannelOutboxAttemptStatus,
+) -> ChannelOutboxAttemptStatusDto {
+    match status {
+        ChannelOutboxAttemptStatus::Leased => ChannelOutboxAttemptStatusDto::Leased,
+        ChannelOutboxAttemptStatus::Delivered => ChannelOutboxAttemptStatusDto::Delivered,
+        ChannelOutboxAttemptStatus::RetryableFailed => {
+            ChannelOutboxAttemptStatusDto::RetryableFailed
+        }
+        ChannelOutboxAttemptStatus::TerminalFailed => ChannelOutboxAttemptStatusDto::TerminalFailed,
+        ChannelOutboxAttemptStatus::StaleRejected => ChannelOutboxAttemptStatusDto::StaleRejected,
     }
 }
 
@@ -4052,6 +6602,12 @@ fn to_stream_event_view(event: RuntimeEvent) -> StreamEventDto {
             code,
             text: Some(text),
         },
+        RuntimeEvent::Artifact { artifact } => StreamEventDto {
+            kind: StreamEventKindDto::Status,
+            lane: None,
+            code: Some("runtime.artifact".to_string()),
+            text: Some(runtime_artifact_status_text(&artifact)),
+        },
         RuntimeEvent::Error { code, text } => StreamEventDto {
             kind: StreamEventKindDto::Error,
             lane: None,
@@ -4067,8 +6623,1200 @@ fn to_stream_event_view(event: RuntimeEvent) -> StreamEventDto {
     }
 }
 
+fn runtime_artifact_status_text(artifact: &RuntimeArtifact) -> String {
+    let label = artifact
+        .filename
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&artifact.artifact_id);
+    format!("runtime artifact ready: {label}")
+}
+
+fn runtime_artifact_filename(artifact: &RuntimeArtifact) -> String {
+    let fallback = artifact
+        .path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("artifact");
+    safe_artifact_filename(
+        artifact
+            .filename
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(fallback),
+    )
+}
+
+fn safe_artifact_filename(raw: &str) -> String {
+    let name = Path::new(raw)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("artifact");
+    let mut safe = String::new();
+    for byte in name.bytes().take(160) {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_') {
+            safe.push(byte as char);
+        } else {
+            safe.push('_');
+        }
+    }
+    let safe = safe.trim_matches('.');
+    if safe.is_empty() {
+        "artifact".to_string()
+    } else {
+        safe.to_string()
+    }
+}
+
+async fn unique_child_path(parent: &Path, filename: &str) -> Result<PathBuf, KernelError> {
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("artifact");
+    let extension = Path::new(filename).extension().and_then(OsStr::to_str);
+    for index in 0..1000 {
+        let candidate_name = if index == 0 {
+            filename.to_string()
+        } else if let Some(extension) = extension {
+            format!("{stem}-{index}.{extension}")
+        } else {
+            format!("{stem}-{index}")
+        };
+        let candidate = parent.join(candidate_name);
+        if !tokio::fs::try_exists(&candidate)
+            .await
+            .map_err(|err| internal(err.into()))?
+        {
+            return Ok(candidate);
+        }
+    }
+    Err(KernelError::Conflict(format!(
+        "could not allocate a unique artifact filename under '{}'",
+        parent.display()
+    )))
+}
+
 fn internal(err: anyhow::Error) -> KernelError {
     KernelError::Internal(format!("{err:#}"))
+}
+
+fn channel_outbox_report_error(err: anyhow::Error) -> KernelError {
+    let message = err.to_string();
+    if message.contains("not found") {
+        KernelError::NotFound(message)
+    } else if message.contains("mismatch") || message.contains("does not belong") {
+        KernelError::BadRequest(message)
+    } else {
+        internal(err)
+    }
+}
+
+const MAX_PROVIDER_METADATA_BYTES: usize = 16 * 1024;
+const PAIRING_CODE_HEX_CHARS: usize = 20;
+const PAIRING_TOKEN_DEFAULT_EXPIRES_IN_MS: u64 = 24 * 60 * 60 * 1000;
+
+#[derive(Debug, Clone)]
+struct ValidatedChannelInbound {
+    channel_id: String,
+    event_id: String,
+    sender_ref: String,
+    conversation_ref: String,
+    thread_ref: Option<String>,
+    message_ref: Option<String>,
+    text: Option<String>,
+    attachments: Vec<ChannelAttachmentDescriptor>,
+    initial_attachment_rejections: Vec<InitialAttachmentRejection>,
+    stageable_attachment_count: usize,
+    reply_to_ref: Option<String>,
+    trigger: ChannelTrigger,
+    received_at: DateTime<Utc>,
+    provider_metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedChannelHealthReport {
+    channel_id: String,
+    reporter_id: String,
+    status: ChannelHealthStatus,
+    checks: Vec<ChannelHealthCheck>,
+    observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct InitialAttachmentRejection {
+    attachment_id: String,
+    reason_code: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedPairingClaim {
+    channel_id: String,
+    token: String,
+    sender_ref: String,
+    conversation_ref: String,
+    thread_ref: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedPairingInvite {
+    channel_id: String,
+    requested_profile: ChannelRoutingProfile,
+    label: Option<String>,
+    conversation_ref: Option<String>,
+    thread_ref: Option<String>,
+    expires_at: DateTime<Utc>,
+    max_claims: u32,
+}
+
+struct GrantScope {
+    sender_ref: Option<String>,
+    conversation_ref: Option<String>,
+    thread_ref: Option<String>,
+}
+
+#[derive(Debug)]
+struct ChannelPairingBlockCommit<'a> {
+    channel_id: &'a str,
+    grant: Option<ChannelGrantRecord>,
+    pairing_id: Option<Uuid>,
+    blocked_pairing_ids: Vec<Uuid>,
+    reason: Option<String>,
+    event_type: &'static str,
+}
+
+#[derive(Debug, Clone)]
+enum PairingLookup {
+    Id(Uuid),
+    Code(String),
+}
+
+fn validate_channel_health_report(
+    req: ChannelHealthReportRequest,
+) -> Result<ValidatedChannelHealthReport, KernelError> {
+    let channel_id = trim_required(req.channel_id, "channel_id")?;
+    let reporter_id = trim_required(req.reporter_id, "reporter_id")?;
+    if reporter_id.len() > MAX_CHANNEL_HEALTH_REPORTER_ID_BYTES {
+        return Err(KernelError::BadRequest(format!(
+            "reporter_id exceeds {MAX_CHANNEL_HEALTH_REPORTER_ID_BYTES} bytes"
+        )));
+    }
+    let future_cutoff =
+        Utc::now() + ChronoDuration::seconds(CHANNEL_HEALTH_OBSERVED_AT_FUTURE_SKEW_SECONDS);
+    if req.observed_at > future_cutoff {
+        return Err(KernelError::BadRequest(format!(
+            "observed_at cannot be more than {CHANNEL_HEALTH_OBSERVED_AT_FUTURE_SKEW_SECONDS} seconds in the future"
+        )));
+    }
+    if req.checks.len() > MAX_CHANNEL_HEALTH_CHECKS_PER_REPORT {
+        return Err(KernelError::BadRequest(format!(
+            "checks exceeds {MAX_CHANNEL_HEALTH_CHECKS_PER_REPORT} per report"
+        )));
+    }
+
+    let mut checks = Vec::with_capacity(req.checks.len());
+    for check in req.checks {
+        let code = trim_required(check.code, "check.code")?;
+        if code.len() > MAX_CHANNEL_HEALTH_CHECK_CODE_BYTES {
+            return Err(KernelError::BadRequest(format!(
+                "check.code exceeds {MAX_CHANNEL_HEALTH_CHECK_CODE_BYTES} bytes"
+            )));
+        }
+        let message = trim_required(check.message, "check.message")?;
+        if message.len() > MAX_CHANNEL_HEALTH_CHECK_MESSAGE_BYTES {
+            return Err(KernelError::BadRequest(format!(
+                "check.message exceeds {MAX_CHANNEL_HEALTH_CHECK_MESSAGE_BYTES} bytes"
+            )));
+        }
+        let details = if check.details.is_null() {
+            json!({})
+        } else {
+            check.details
+        };
+        validate_optional_json_size(
+            Some(&details),
+            "check.details",
+            MAX_CHANNEL_HEALTH_CHECK_DETAILS_JSON_BYTES,
+        )?;
+        checks.push(ChannelHealthCheck {
+            code,
+            status: check.status,
+            message,
+            details,
+        });
+    }
+
+    Ok(ValidatedChannelHealthReport {
+        channel_id,
+        reporter_id,
+        status: req.status,
+        checks,
+        observed_at: req.observed_at,
+    })
+}
+
+fn validate_channel_pairing_invite(
+    req: ChannelPairingInviteRequest,
+) -> Result<ValidatedPairingInvite, KernelError> {
+    let channel_id = trim_required(req.channel_id, "channel_id")?;
+    let label = trim_optional(req.label);
+    let conversation_ref = trim_optional(req.conversation_ref);
+    let thread_ref = trim_optional(req.thread_ref);
+    validate_invite_profile_scope(
+        req.requested_profile,
+        conversation_ref.as_deref(),
+        thread_ref.as_deref(),
+    )?;
+
+    let expires_in_ms = req
+        .expires_in_ms
+        .unwrap_or(PAIRING_TOKEN_DEFAULT_EXPIRES_IN_MS);
+    if expires_in_ms == 0 {
+        return Err(KernelError::BadRequest(
+            "expires_in_ms must be greater than zero".to_string(),
+        ));
+    }
+    let expires_in_ms = i64::try_from(expires_in_ms).map_err(|_| invalid_invite_expiry_error())?;
+    let expires_in =
+        ChronoDuration::try_milliseconds(expires_in_ms).ok_or_else(invalid_invite_expiry_error)?;
+    let expires_at = Utc::now()
+        .checked_add_signed(expires_in)
+        .ok_or_else(invalid_invite_expiry_error)?;
+    let max_claims = req.max_claims.unwrap_or(1);
+    if max_claims == 0 {
+        return Err(KernelError::BadRequest(
+            "max_claims must be greater than zero".to_string(),
+        ));
+    }
+
+    Ok(ValidatedPairingInvite {
+        channel_id,
+        requested_profile: req.requested_profile,
+        label,
+        conversation_ref,
+        thread_ref,
+        expires_at,
+        max_claims,
+    })
+}
+
+fn invalid_invite_expiry_error() -> KernelError {
+    KernelError::BadRequest("expires_in_ms is too large to represent".to_string())
+}
+
+fn validate_invite_profile_scope(
+    requested_profile: ChannelRoutingProfile,
+    conversation_ref: Option<&str>,
+    thread_ref: Option<&str>,
+) -> Result<(), KernelError> {
+    match requested_profile {
+        ChannelRoutingProfile::Direct => {
+            if conversation_ref.is_some() || thread_ref.is_some() {
+                return Err(KernelError::BadRequest(
+                    "direct invites cannot pre-bind conversation_ref or thread_ref".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        ChannelRoutingProfile::Conversation => {
+            if thread_ref.is_some() {
+                return Err(KernelError::BadRequest(
+                    "conversation invites cannot pre-bind thread_ref".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        ChannelRoutingProfile::Thread => {
+            if thread_ref.is_some() && conversation_ref.is_none() {
+                return Err(KernelError::BadRequest(
+                    "thread invites with thread_ref require conversation_ref".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        ChannelRoutingProfile::Outbound => Err(KernelError::BadRequest(
+            "outbound grants are not user invites".to_string(),
+        )),
+    }
+}
+
+fn validate_channel_pairing_claim(
+    req: ChannelPairingClaimRequest,
+) -> Result<ValidatedPairingClaim, KernelError> {
+    let channel_id = trim_required(req.channel_id, "channel_id")?;
+    let token = trim_required(req.token, "token")?;
+    let sender_ref = trim_required(req.sender_ref, "sender_ref")?;
+    let conversation_ref = trim_required(req.conversation_ref, "conversation_ref")?;
+    let thread_ref = trim_optional(req.thread_ref);
+    validate_provider_metadata(req.provider_metadata)?;
+
+    Ok(ValidatedPairingClaim {
+        channel_id,
+        token,
+        sender_ref,
+        conversation_ref,
+        thread_ref,
+    })
+}
+
+fn validate_channel_inbound_request(
+    req: ChannelInboundRequest,
+) -> Result<ValidatedChannelInbound, KernelError> {
+    let channel_id = trim_required(req.channel_id, "channel_id")?;
+    let event_id = trim_required(req.event_id, "event_id")?;
+    let sender_ref = trim_required(req.sender_ref, "sender_ref")?;
+    let conversation_ref = trim_required(req.conversation_ref, "conversation_ref")?;
+    let thread_ref = trim_optional(req.thread_ref);
+    let message_ref = trim_optional(req.message_ref);
+    let reply_to_ref = trim_optional(req.reply_to_ref);
+    let text = trim_optional(req.text);
+    if text.is_none() && req.attachments.is_empty() {
+        return Err(KernelError::BadRequest(
+            "at least one of text or attachments is required".to_string(),
+        ));
+    }
+    if req.attachments.len() > MAX_CHANNEL_ATTACHMENTS_PER_EVENT {
+        return Err(KernelError::BadRequest(format!(
+            "attachments exceeds {MAX_CHANNEL_ATTACHMENTS_PER_EVENT} per event"
+        )));
+    }
+
+    let mut attachments = Vec::with_capacity(req.attachments.len());
+    let mut attachment_ids = HashSet::with_capacity(req.attachments.len());
+    let mut initial_attachment_rejections = Vec::new();
+    let mut stageable_attachment_count = 0;
+    let mut declared_bytes: i64 = 0;
+    for attachment in req.attachments {
+        let attachment = normalize_attachment_descriptor(attachment)?;
+        if !attachment_ids.insert(attachment.attachment_id.clone()) {
+            return Err(KernelError::BadRequest(format!(
+                "duplicate attachment_id '{}'",
+                attachment.attachment_id
+            )));
+        }
+        let mut rejection_code = None;
+        if let Some(size_bytes) = attachment.size_bytes {
+            if usize::try_from(size_bytes).unwrap_or(usize::MAX) > MAX_CHANNEL_ATTACHMENT_BYTES {
+                rejection_code = Some(CHANNEL_ATTACHMENT_TOO_LARGE);
+            } else if usize::try_from(declared_bytes.saturating_add(size_bytes))
+                .unwrap_or(usize::MAX)
+                > MAX_CHANNEL_EVENT_ATTACHMENT_BYTES
+            {
+                rejection_code = Some(CHANNEL_ATTACHMENT_EVENT_TOO_LARGE);
+            } else {
+                declared_bytes = declared_bytes.saturating_add(size_bytes);
+            }
+        }
+        if let Some(reason_code) = rejection_code {
+            initial_attachment_rejections.push(InitialAttachmentRejection {
+                attachment_id: attachment.attachment_id.clone(),
+                reason_code,
+            });
+        } else {
+            stageable_attachment_count += 1;
+        }
+        attachments.push(attachment);
+    }
+    let provider_metadata = validate_provider_metadata(req.provider_metadata)?;
+
+    Ok(ValidatedChannelInbound {
+        channel_id,
+        event_id,
+        sender_ref,
+        conversation_ref,
+        thread_ref,
+        message_ref,
+        text,
+        attachments,
+        initial_attachment_rejections,
+        stageable_attachment_count,
+        reply_to_ref,
+        trigger: req.trigger,
+        received_at: req.received_at.unwrap_or_else(Utc::now),
+        provider_metadata,
+    })
+}
+
+fn normalize_attachment_descriptor(
+    attachment: ChannelAttachmentDescriptor,
+) -> Result<ChannelAttachmentDescriptor, KernelError> {
+    let attachment_id = trim_required(attachment.attachment_id, "attachment_id")?;
+    let kind = trim_required(attachment.kind, "kind")?;
+    let provider_file_ref = trim_required(attachment.provider_file_ref, "provider_file_ref")?;
+    if attachment.size_bytes.is_some_and(|value| value < 0) {
+        return Err(KernelError::BadRequest(
+            "attachment size_bytes cannot be negative".to_string(),
+        ));
+    }
+    Ok(ChannelAttachmentDescriptor {
+        attachment_id,
+        kind,
+        mime_type: trim_optional(attachment.mime_type),
+        filename: trim_optional(attachment.filename),
+        size_bytes: attachment.size_bytes,
+        provider_file_ref,
+        caption: trim_optional(attachment.caption),
+    })
+}
+
+fn trim_required(value: String, field: &str) -> Result<String, KernelError> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(KernelError::BadRequest(format!("{field} is required")));
+    }
+    Ok(value)
+}
+
+fn trim_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_provider_metadata(
+    provider_metadata: serde_json::Value,
+) -> Result<serde_json::Value, KernelError> {
+    let provider_metadata = if provider_metadata.is_null() {
+        json!({})
+    } else {
+        provider_metadata
+    };
+    let metadata_bytes = serde_json::to_vec(&provider_metadata)
+        .map_err(|err| KernelError::BadRequest(format!("invalid provider_metadata: {err}")))?;
+    if metadata_bytes.len() > MAX_PROVIDER_METADATA_BYTES {
+        return Err(KernelError::BadRequest(format!(
+            "provider_metadata exceeds {MAX_PROVIDER_METADATA_BYTES} bytes"
+        )));
+    }
+    Ok(provider_metadata)
+}
+
+fn hash_pairing_code(raw: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn channel_inbound_response(
+    outcome: ChannelInboundOutcome,
+    reason_code: &str,
+    pairing_id: Option<Uuid>,
+    pairing_code: Option<String>,
+    session_id: Option<Uuid>,
+    turn_id: Option<Uuid>,
+    session_key: Option<String>,
+) -> ChannelInboundResponse {
+    ChannelInboundResponse {
+        outcome,
+        reason_code: Some(reason_code.to_string()),
+        pairing_id,
+        pairing_code,
+        turn_id,
+        session_id,
+        session_key,
+    }
+}
+
+fn channel_trigger_ignored_response() -> ChannelInboundResponse {
+    channel_inbound_response(
+        ChannelInboundOutcome::TriggerIgnored,
+        "trigger_insufficient",
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+fn channel_pairing_claim_response(
+    outcome: ChannelPairingClaimOutcome,
+    reason_code: &str,
+    grant_id: Option<Uuid>,
+) -> ChannelPairingClaimResponse {
+    ChannelPairingClaimResponse {
+        outcome,
+        grant_id,
+        reason_code: Some(reason_code.to_string()),
+    }
+}
+
+fn channel_attachment_finalize_response(
+    channel_id: String,
+    event_id: String,
+    outcome: ChannelAttachmentFinalizeOutcome,
+    session_id: Option<Uuid>,
+    turn_id: Option<Uuid>,
+) -> ChannelAttachmentFinalizeResponse {
+    ChannelAttachmentFinalizeResponse {
+        channel_id,
+        event_id,
+        outcome,
+        session_id,
+        turn_id,
+    }
+}
+
+fn channel_attachment_manifest_value(attachments: &[ChannelAttachmentRecord]) -> serde_json::Value {
+    let staged = attachments
+        .iter()
+        .filter(|attachment| attachment.status == ChannelAttachmentRecordStatus::Staged)
+        .map(|attachment| {
+            let filename = attachment
+                .filename
+                .as_deref()
+                .map(|filename| sanitize_channel_attachment_filename(Some(filename)))
+                .unwrap_or_else(|| sanitize_channel_attachment_filename(None));
+            json!({
+                "id": &attachment.attachment_id,
+                "kind": &attachment.kind,
+                "filename": filename,
+                "mime_type": &attachment.mime_type,
+                "size_bytes": attachment.size_bytes.unwrap_or(0),
+                "sha256": &attachment.sha256,
+                "path": channel_attachment_runtime_path(&attachment.attachment_id, &filename),
+                "caption": &attachment.caption,
+            })
+        })
+        .collect::<Vec<_>>();
+    let rejected = attachments
+        .iter()
+        .filter(|attachment| attachment.status == ChannelAttachmentRecordStatus::Rejected)
+        .map(|attachment| {
+            json!({
+                "id": &attachment.attachment_id,
+                "kind": &attachment.kind,
+                "reason_code": &attachment.rejection_code,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "channel_attachments": staged,
+        "rejected_channel_attachments": rejected,
+    })
+}
+
+fn channel_attachment_runtime_prompt(
+    prompt_user_text: &str,
+    attachments: &[ChannelAttachmentRecord],
+) -> Result<Option<String>, KernelError> {
+    if attachments.is_empty() {
+        return Ok(None);
+    }
+
+    append_channel_attachment_manifest(
+        prompt_user_text,
+        &channel_attachment_manifest_value(attachments),
+    )
+    .map(Some)
+}
+
+fn append_channel_attachment_manifest(
+    prompt_user_text: &str,
+    manifest: &serde_json::Value,
+) -> Result<String, KernelError> {
+    let manifest = serde_json::to_string(manifest).map_err(|err| {
+        KernelError::Internal(format!("failed to encode attachment manifest: {err}"))
+    })?;
+    let prompt_user_text = prompt_user_text.trim_end_matches(['\r', '\n']);
+    let manifest_block =
+        format!("<lionclaw_channel_attachment_manifest>\n{manifest}\n</lionclaw_channel_attachment_manifest>");
+    if prompt_user_text.trim().is_empty() {
+        Ok(manifest_block)
+    } else {
+        Ok(format!("{prompt_user_text}\n\n{manifest_block}"))
+    }
+}
+
+fn channel_attachment_runtime_path(attachment_id: &str, filename: &str) -> String {
+    format!(
+        "/attachments/{}/{}",
+        channel_attachment_runtime_component(attachment_id),
+        filename
+    )
+}
+
+fn channel_attachment_projection_dirs(mounts: &[MountSpec]) -> Vec<PathBuf> {
+    mounts
+        .iter()
+        .filter(|mount| mount.target == CHANNEL_ATTACHMENT_MOUNT_TARGET)
+        .map(|mount| mount.source.clone())
+        .collect()
+}
+
+fn is_channel_attachment_runtime_projection_path(runtime_root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(runtime_root) else {
+        return false;
+    };
+    let mut components = relative.components();
+    matches!(
+        (
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+        ),
+        (
+            Some(Component::Normal(channels)),
+            Some(Component::Normal(channel)),
+            Some(Component::Normal(projections)),
+            Some(Component::Normal(event)),
+            Some(Component::Normal(projection)),
+            None,
+        ) if channels == OsStr::new("channels")
+            && !channel.is_empty()
+            && projections == OsStr::new(CHANNEL_ATTACHMENT_PROJECTIONS_DIR)
+            && !event.is_empty()
+            && !projection.is_empty()
+    )
+}
+
+fn is_channel_attachment_temp_upload(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(".upload-") && name.ends_with(".tmp"))
+}
+
+fn sanitize_channel_attachment_filename(filename: Option<&str>) -> String {
+    let fallback = "attachment.bin";
+    let Some(filename) = filename.map(str::trim).filter(|value| !value.is_empty()) else {
+        return fallback.to_string();
+    };
+    let leaf = filename
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(filename)
+        .trim();
+    let safe = safe_path_label(leaf, fallback, 120);
+    if safe == "." || safe == ".." || safe.is_empty() {
+        fallback.to_string()
+    } else {
+        safe
+    }
+}
+
+fn channel_attachment_storage_component(raw: &str) -> String {
+    format!("sha256-{}", sha256_hex(raw.trim().as_bytes()))
+}
+
+fn channel_attachment_runtime_component(raw: &str) -> String {
+    let digest = sha256_hex(raw.trim().as_bytes());
+    format!(
+        "{}-{}",
+        safe_path_label(raw, "attachment", 80),
+        &digest[..16]
+    )
+}
+
+fn safe_path_label(raw: &str, fallback: &str, max_len: usize) -> String {
+    let raw = raw.trim();
+    let mut out = String::with_capacity(raw.len().max(1));
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-') {
+            out.push(byte as char);
+        } else {
+            out.push('_');
+            out.push(hex_digit(byte >> 4));
+            out.push(hex_digit(byte & 0x0f));
+        }
+    }
+    if out.is_empty() {
+        out.push_str(fallback);
+    }
+    if out == "." || out == ".." {
+        out.insert(0, '_');
+    }
+    if out.len() > max_len {
+        out.truncate(max_len);
+    }
+    out
+}
+
+fn hex_digit(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        10..=15 => (b'a' + (nibble - 10)) as char,
+        _ => '0',
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+async fn ensure_safe_child_directory(
+    root: &Path,
+    components: &[&str],
+) -> Result<PathBuf, KernelError> {
+    tokio::fs::create_dir_all(root)
+        .await
+        .map_err(|err| KernelError::Internal(format!("failed to create runtime root: {err}")))?;
+    ensure_existing_directory_is_safe(root).await?;
+
+    let mut current = root.to_path_buf();
+    for component in components {
+        if component.is_empty() || component.contains('/') || component.contains('\\') {
+            return Err(KernelError::Internal(
+                "unsafe runtime storage path component".to_string(),
+            ));
+        }
+        current.push(component);
+        match tokio::fs::create_dir(&current).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(KernelError::Internal(format!(
+                    "failed to create runtime storage directory '{}': {err}",
+                    current.display()
+                )));
+            }
+        }
+        ensure_existing_directory_is_safe(&current).await?;
+    }
+
+    Ok(current)
+}
+
+async fn ensure_existing_directory_is_safe(path: &Path) -> Result<(), KernelError> {
+    let metadata = tokio::fs::symlink_metadata(path).await.map_err(|err| {
+        KernelError::Internal(format!(
+            "failed to inspect runtime storage directory '{}': {err}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(KernelError::Conflict(format!(
+            "runtime storage path '{}' is not a regular directory",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn ensure_staged_attachment_file_is_safe(path: &Path) -> Result<(), KernelError> {
+    let metadata = tokio::fs::symlink_metadata(path).await.map_err(|err| {
+        KernelError::Internal(format!(
+            "failed to inspect staged attachment '{}': {err}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(KernelError::Conflict(format!(
+            "staged attachment path '{}' is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn remove_file_best_effort(path: &Path) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => warn!(?err, path = %path.display(), "failed to remove file"),
+    }
+}
+
+fn default_pending_profile(
+    trigger: ChannelTrigger,
+    thread_ref: Option<&str>,
+) -> ChannelRoutingProfile {
+    if trigger == ChannelTrigger::Dm {
+        ChannelRoutingProfile::Direct
+    } else if thread_ref.is_some() {
+        ChannelRoutingProfile::Thread
+    } else {
+        ChannelRoutingProfile::Conversation
+    }
+}
+
+fn pending_scope_for_profile(
+    inbound: &ValidatedChannelInbound,
+    profile: ChannelRoutingProfile,
+) -> Result<GrantScope, KernelError> {
+    match profile {
+        ChannelRoutingProfile::Direct => Ok(GrantScope {
+            sender_ref: Some(inbound.sender_ref.clone()),
+            conversation_ref: None,
+            thread_ref: None,
+        }),
+        ChannelRoutingProfile::Conversation => Ok(GrantScope {
+            sender_ref: Some(inbound.sender_ref.clone()),
+            conversation_ref: Some(inbound.conversation_ref.clone()),
+            thread_ref: None,
+        }),
+        ChannelRoutingProfile::Thread => {
+            let thread_ref = inbound.thread_ref.clone().ok_or_else(|| {
+                KernelError::BadRequest("thread routing profile requires thread_ref".to_string())
+            })?;
+            Ok(GrantScope {
+                sender_ref: Some(inbound.sender_ref.clone()),
+                conversation_ref: Some(inbound.conversation_ref.clone()),
+                thread_ref: Some(thread_ref),
+            })
+        }
+        ChannelRoutingProfile::Outbound => Err(KernelError::BadRequest(
+            "outbound routing profile cannot admit inbound events".to_string(),
+        )),
+    }
+}
+
+fn channel_turn_user_text(inbound: &ValidatedChannelInbound) -> String {
+    if let Some(text) = &inbound.text {
+        return text.clone();
+    }
+
+    inbound
+        .attachments
+        .iter()
+        .filter_map(|attachment| attachment.caption.as_deref())
+        .map(str::trim)
+        .filter(|caption| !caption.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn grant_scope_from_token_claim(
+    pairing: &ChannelPairingRequestRecord,
+    claim: &ValidatedPairingClaim,
+) -> Result<GrantScope, &'static str> {
+    if pairing
+        .sender_ref
+        .as_deref()
+        .is_some_and(|expected| expected != claim.sender_ref)
+    {
+        return Err("sender_ref_mismatch");
+    }
+
+    match pairing.requested_profile {
+        ChannelRoutingProfile::Direct => Ok(GrantScope {
+            sender_ref: Some(claim.sender_ref.clone()),
+            conversation_ref: None,
+            thread_ref: None,
+        }),
+        ChannelRoutingProfile::Conversation => {
+            if pairing
+                .conversation_ref
+                .as_deref()
+                .is_some_and(|expected| expected != claim.conversation_ref)
+            {
+                return Err("conversation_ref_mismatch");
+            }
+            Ok(GrantScope {
+                sender_ref: Some(claim.sender_ref.clone()),
+                conversation_ref: Some(claim.conversation_ref.clone()),
+                thread_ref: None,
+            })
+        }
+        ChannelRoutingProfile::Thread => {
+            if pairing
+                .conversation_ref
+                .as_deref()
+                .is_some_and(|expected| expected != claim.conversation_ref)
+            {
+                return Err("conversation_ref_mismatch");
+            }
+            let thread_ref = claim.thread_ref.clone().ok_or("thread_ref_required")?;
+            if pairing
+                .thread_ref
+                .as_deref()
+                .is_some_and(|expected| expected != thread_ref)
+            {
+                return Err("thread_ref_mismatch");
+            }
+            Ok(GrantScope {
+                sender_ref: Some(claim.sender_ref.clone()),
+                conversation_ref: Some(claim.conversation_ref.clone()),
+                thread_ref: Some(thread_ref),
+            })
+        }
+        ChannelRoutingProfile::Outbound => Err("outbound_invite_unsupported"),
+    }
+}
+
+fn existing_token_claim_grant_outcome(
+    status: ChannelGrantStatus,
+) -> Option<(ChannelPairingClaimOutcome, &'static str)> {
+    match status {
+        ChannelGrantStatus::Approved => Some((
+            ChannelPairingClaimOutcome::AlreadyClaimed,
+            "already_claimed",
+        )),
+        ChannelGrantStatus::Blocked => {
+            Some((ChannelPairingClaimOutcome::ScopeMismatch, "scope_blocked"))
+        }
+        ChannelGrantStatus::Revoked => None,
+    }
+}
+
+fn grant_scope_from_pairing(
+    pairing: &ChannelPairingRequestRecord,
+    profile: ChannelRoutingProfile,
+) -> Result<GrantScope, KernelError> {
+    match profile {
+        ChannelRoutingProfile::Direct => {
+            let sender_ref = pairing.sender_ref.clone().ok_or_else(|| {
+                KernelError::BadRequest("direct grant requires sender_ref".to_string())
+            })?;
+            Ok(GrantScope {
+                sender_ref: Some(sender_ref),
+                conversation_ref: None,
+                thread_ref: None,
+            })
+        }
+        ChannelRoutingProfile::Conversation => {
+            let sender_ref = pairing.sender_ref.clone().ok_or_else(|| {
+                KernelError::BadRequest("conversation grant requires sender_ref".to_string())
+            })?;
+            let conversation_ref = pairing.conversation_ref.clone().ok_or_else(|| {
+                KernelError::BadRequest("conversation grant requires conversation_ref".to_string())
+            })?;
+            Ok(GrantScope {
+                sender_ref: Some(sender_ref),
+                conversation_ref: Some(conversation_ref),
+                thread_ref: None,
+            })
+        }
+        ChannelRoutingProfile::Thread => {
+            let sender_ref = pairing.sender_ref.clone().ok_or_else(|| {
+                KernelError::BadRequest("thread grant requires sender_ref".to_string())
+            })?;
+            let conversation_ref = pairing.conversation_ref.clone().ok_or_else(|| {
+                KernelError::BadRequest("thread grant requires conversation_ref".to_string())
+            })?;
+            let thread_ref = pairing.thread_ref.clone().ok_or_else(|| {
+                KernelError::BadRequest("thread grant requires thread_ref".to_string())
+            })?;
+            Ok(GrantScope {
+                sender_ref: Some(sender_ref),
+                conversation_ref: Some(conversation_ref),
+                thread_ref: Some(thread_ref),
+            })
+        }
+        ChannelRoutingProfile::Outbound => {
+            let conversation_ref = pairing.conversation_ref.clone().ok_or_else(|| {
+                KernelError::BadRequest("outbound grant requires conversation_ref".to_string())
+            })?;
+            Ok(GrantScope {
+                sender_ref: None,
+                conversation_ref: Some(conversation_ref),
+                thread_ref: None,
+            })
+        }
+    }
+}
+
+fn infer_block_profile(
+    sender_ref: Option<&str>,
+    conversation_ref: Option<&str>,
+    thread_ref: Option<&str>,
+) -> Result<ChannelRoutingProfile, KernelError> {
+    match (sender_ref, conversation_ref, thread_ref) {
+        (Some(_), Some(_), Some(_)) => Ok(ChannelRoutingProfile::Thread),
+        (Some(_), Some(_), None) => Ok(ChannelRoutingProfile::Conversation),
+        (Some(_), None, None) => Ok(ChannelRoutingProfile::Direct),
+        _ => Err(KernelError::BadRequest(
+            "block requires sender_ref, optionally with conversation_ref and thread_ref"
+                .to_string(),
+        )),
+    }
+}
+
+fn trigger_allows(profile: ChannelRoutingProfile, trigger: ChannelTrigger) -> bool {
+    match profile {
+        ChannelRoutingProfile::Direct => true,
+        ChannelRoutingProfile::Conversation => {
+            matches!(
+                trigger,
+                ChannelTrigger::Mention | ChannelTrigger::ReplyToBot
+            )
+        }
+        ChannelRoutingProfile::Thread => matches!(
+            trigger,
+            ChannelTrigger::Mention
+                | ChannelTrigger::ReplyToBot
+                | ChannelTrigger::ThreadContinuation
+        ),
+        ChannelRoutingProfile::Outbound => false,
+    }
+}
+
+fn session_key_for_grant(grant: &ChannelGrantRecord) -> Result<String, KernelError> {
+    match grant.routing_profile {
+        ChannelRoutingProfile::Direct => {
+            let sender_ref = grant.sender_ref.as_deref().ok_or_else(|| {
+                KernelError::Internal("direct grant missing sender_ref".to_string())
+            })?;
+            Ok(format!(
+                "channel:{}:direct:{}",
+                grant.channel_id,
+                encode_session_key_part(sender_ref)
+            ))
+        }
+        ChannelRoutingProfile::Conversation => {
+            let sender_ref = grant.sender_ref.as_deref().ok_or_else(|| {
+                KernelError::Internal("conversation grant missing sender_ref".to_string())
+            })?;
+            let conversation_ref = grant.conversation_ref.as_deref().ok_or_else(|| {
+                KernelError::Internal("conversation grant missing conversation_ref".to_string())
+            })?;
+            Ok(format!(
+                "channel:{}:conversation:{}:sender:{}",
+                grant.channel_id,
+                encode_session_key_part(conversation_ref),
+                encode_session_key_part(sender_ref)
+            ))
+        }
+        ChannelRoutingProfile::Thread => {
+            let sender_ref = grant.sender_ref.as_deref().ok_or_else(|| {
+                KernelError::Internal("thread grant missing sender_ref".to_string())
+            })?;
+            let conversation_ref = grant.conversation_ref.as_deref().ok_or_else(|| {
+                KernelError::Internal("thread grant missing conversation_ref".to_string())
+            })?;
+            let thread_ref = grant.thread_ref.as_deref().ok_or_else(|| {
+                KernelError::Internal("thread grant missing thread_ref".to_string())
+            })?;
+            Ok(format!(
+                "channel:{}:thread:{}:{}:sender:{}",
+                grant.channel_id,
+                encode_session_key_part(conversation_ref),
+                encode_session_key_part(thread_ref),
+                encode_session_key_part(sender_ref)
+            ))
+        }
+        ChannelRoutingProfile::Outbound => Err(KernelError::BadRequest(
+            "outbound grants do not accept inbound turns".to_string(),
+        )),
+    }
+}
+
+fn encode_session_key_part(raw: &str) -> String {
+    let mut encoded = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            ':' => encoded.push_str("%3A"),
+            '%' => encoded.push_str("%25"),
+            _ => encoded.push(ch),
+        }
+    }
+    encoded
+}
+
+fn decode_session_key_part(raw: &str) -> String {
+    let mut decoded = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            decoded.push(ch);
+            continue;
+        }
+
+        let mut lookahead = chars.clone();
+        let Some(first) = lookahead.next() else {
+            decoded.push('%');
+            continue;
+        };
+        let Some(second) = lookahead.next() else {
+            decoded.push('%');
+            continue;
+        };
+
+        match (first, second) {
+            ('3', 'A') | ('3', 'a') => {
+                chars.next();
+                chars.next();
+                decoded.push(':');
+            }
+            ('2', '5') => {
+                chars.next();
+                chars.next();
+                decoded.push('%');
+            }
+            _ => decoded.push('%'),
+        }
+    }
+    decoded
+}
+
+fn stream_peer_ref_for_session_peer(channel_id: &str, session_peer_id: &str) -> String {
+    let direct_prefix = format!("channel:{channel_id}:direct:");
+    if let Some(sender_ref) = session_peer_id.strip_prefix(&direct_prefix) {
+        return decode_session_key_part(sender_ref);
+    }
+
+    let conversation_prefix = format!("channel:{channel_id}:conversation:");
+    if let Some(rest) = session_peer_id.strip_prefix(&conversation_prefix) {
+        if let Some((conversation_ref, _sender_ref)) = rest.split_once(":sender:") {
+            return decode_session_key_part(conversation_ref);
+        }
+    }
+
+    let thread_prefix = format!("channel:{channel_id}:thread:");
+    if let Some(rest) = session_peer_id.strip_prefix(&thread_prefix) {
+        if let Some((thread_scope, _sender_ref)) = rest.split_once(":sender:") {
+            let Some((conversation_ref, _thread_ref)) = thread_scope.split_once(':') else {
+                return session_peer_id.to_string();
+            };
+            return decode_session_key_part(conversation_ref);
+        }
+    }
+
+    session_peer_id.to_string()
+}
+
+fn delivery_route_for_session_key(
+    channel_id: &str,
+    session_peer_id: &str,
+) -> (String, Option<String>) {
+    match parse_session_key_scope(channel_id, session_peer_id) {
+        Some(SessionKeyScope::Direct { sender_ref }) => (sender_ref, None),
+        Some(SessionKeyScope::Conversation {
+            conversation_ref, ..
+        }) => (conversation_ref, None),
+        Some(SessionKeyScope::Thread {
+            conversation_ref,
+            thread_ref,
+            ..
+        }) => (conversation_ref, Some(thread_ref)),
+        None => (session_peer_id.to_string(), None),
+    }
+}
+
+fn parse_session_key_scope(channel_id: &str, session_peer_id: &str) -> Option<SessionKeyScope> {
+    let direct_prefix = format!("channel:{channel_id}:direct:");
+    if let Some(sender_ref) = session_peer_id.strip_prefix(&direct_prefix) {
+        return Some(SessionKeyScope::Direct {
+            sender_ref: decode_session_key_part(sender_ref),
+        });
+    }
+
+    let conversation_prefix = format!("channel:{channel_id}:conversation:");
+    if let Some(rest) = session_peer_id.strip_prefix(&conversation_prefix) {
+        let (conversation_ref, sender_ref) = rest.split_once(":sender:")?;
+        return Some(SessionKeyScope::Conversation {
+            sender_ref: decode_session_key_part(sender_ref),
+            conversation_ref: decode_session_key_part(conversation_ref),
+        });
+    }
+
+    let thread_prefix = format!("channel:{channel_id}:thread:");
+    if let Some(rest) = session_peer_id.strip_prefix(&thread_prefix) {
+        let (thread_scope, sender_ref) = rest.split_once(":sender:")?;
+        let (conversation_ref, thread_ref) = thread_scope.split_once(':')?;
+        return Some(SessionKeyScope::Thread {
+            sender_ref: decode_session_key_part(sender_ref),
+            conversation_ref: decode_session_key_part(conversation_ref),
+            thread_ref: decode_session_key_part(thread_ref),
+        });
+    }
+
+    None
 }
 
 fn draft_request_error(err: anyhow::Error) -> KernelError {
@@ -4087,9 +7835,16 @@ fn draft_action_error(relative_path: &str, err: anyhow::Error) -> KernelError {
     }
 }
 
-fn parse_channel_send_intent(
-    value: &serde_json::Value,
-) -> Result<(String, String, String), String> {
+#[derive(Debug, Clone)]
+struct ChannelSendIntent {
+    channel_id: String,
+    conversation_ref: String,
+    thread_ref: Option<String>,
+    reply_to_ref: Option<String>,
+    content: String,
+}
+
+fn parse_channel_send_intent(value: &serde_json::Value) -> Result<ChannelSendIntent, String> {
     let channel_id = value
         .get("channel_id")
         .and_then(|raw| raw.as_str())
@@ -4102,6 +7857,18 @@ fn parse_channel_send_intent(
         .map(str::trim)
         .filter(|raw| !raw.is_empty())
         .ok_or_else(|| "channel.send broker output missing conversation_ref".to_string())?;
+    let thread_ref = value
+        .get("thread_ref")
+        .and_then(|raw| raw.as_str())
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(str::to_string);
+    let reply_to_ref = value
+        .get("reply_to_ref")
+        .and_then(|raw| raw.as_str())
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(str::to_string);
     let content = value
         .get("content")
         .and_then(|raw| raw.as_str())
@@ -4110,11 +7877,13 @@ fn parse_channel_send_intent(
         return Err("channel.send broker output missing content".to_string());
     }
 
-    Ok((
-        channel_id.to_string(),
-        conversation_ref.to_string(),
-        content.to_string(),
-    ))
+    Ok(ChannelSendIntent {
+        channel_id: channel_id.to_string(),
+        conversation_ref: conversation_ref.to_string(),
+        thread_ref,
+        reply_to_ref,
+        content: content.to_string(),
+    })
 }
 
 fn summarize_capability_output(
@@ -4133,7 +7902,7 @@ fn summarize_capability_output(
         Capability::ChannelSend => json!({
             "channel_id": output.get("channel_id"),
             "conversation_ref": output.get("conversation_ref"),
-            "message_ids": output.get("message_ids"),
+            "delivery_id": output.get("delivery_id"),
         }),
         _ => json!({
             "type": json_value_type(output),
@@ -4152,62 +7921,14 @@ fn json_value_type(value: &serde_json::Value) -> &'static str {
     }
 }
 
-fn split_text_chunks(content: &str, max_len: usize) -> Vec<String> {
-    if content.is_empty() {
-        return vec![String::new()];
-    }
-    if content.len() <= max_len {
-        return vec![content.to_string()];
-    }
-
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-
-    for line in content.lines() {
-        let additional = if current.is_empty() {
-            line.len()
-        } else {
-            line.len() + 1
-        };
-        if !current.is_empty() && current.len() + additional > max_len {
-            chunks.push(std::mem::take(&mut current));
-        }
-
-        if line.len() > max_len {
-            let mut slice = line;
-            while slice.len() > max_len {
-                let mut split_at = max_len;
-                while !slice.is_char_boundary(split_at) {
-                    split_at -= 1;
-                }
-                chunks.push(slice[..split_at].to_string());
-                slice = &slice[split_at..];
-            }
-            if !slice.is_empty() {
-                if !current.is_empty() {
-                    current.push('\n');
-                }
-                current.push_str(slice);
-            }
-            continue;
-        }
-
-        if !current.is_empty() {
-            current.push('\n');
-        }
-        current.push_str(line);
-    }
-
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
+fn generate_pairing_code() -> String {
+    let raw = Uuid::new_v4().simple().to_string();
+    // Keep enough entropy that storing only a hash is meaningful if state leaks.
+    format!("pc_{}", &raw[..PAIRING_CODE_HEX_CHARS])
 }
 
-fn generate_pairing_code() -> String {
-    let bytes = *Uuid::new_v4().as_bytes();
-    let number = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 1_000_000;
-    format!("{number:06}")
+fn generate_pairing_token() -> String {
+    format!("lc_{}", Uuid::new_v4().simple())
 }
 
 fn assistant_text_from_events(events: &[RuntimeEvent]) -> String {
@@ -4226,6 +7947,7 @@ fn assistant_text_from_events(events: &[RuntimeEvent]) -> String {
 fn summarize_runtime_events(events: &[RuntimeEvent]) -> SessionTurnArtifacts {
     let mut assistant_text = String::new();
     let mut event_views = Vec::with_capacity(events.len());
+    let mut artifacts = Vec::new();
     let mut saw_error = false;
     for event in events {
         if let RuntimeEvent::MessageDelta {
@@ -4238,12 +7960,16 @@ fn summarize_runtime_events(events: &[RuntimeEvent]) -> SessionTurnArtifacts {
         if matches!(event, RuntimeEvent::Error { .. }) {
             saw_error = true;
         }
+        if let RuntimeEvent::Artifact { artifact } = event {
+            artifacts.push(artifact.clone());
+        }
         event_views.push(to_stream_event_view(event.clone()));
     }
 
     SessionTurnArtifacts {
         assistant_text,
         event_views,
+        artifacts,
         saw_error,
     }
 }
@@ -4317,6 +8043,14 @@ fn queued_turn_failure_code(err: &KernelError) -> &'static str {
     }
 }
 
+fn lionclaw_control_session_turn_kind(command_name: &str) -> SessionTurnKind {
+    match command_name {
+        "continue" => SessionTurnKind::Continue,
+        "retry" => SessionTurnKind::Retry,
+        _ => SessionTurnKind::Normal,
+    }
+}
+
 fn session_turn_status_for_error_code(error_code: &str) -> SessionTurnStatus {
     match error_code {
         "runtime.timeout" => SessionTurnStatus::TimedOut,
@@ -4329,8 +8063,99 @@ fn session_turn_status_for_error_code(error_code: &str) -> SessionTurnStatus {
 struct ChannelStreamContext {
     channel_id: String,
     peer_id: String,
+    conversation_ref: String,
+    thread_ref: Option<String>,
+    reply_to_ref: Option<String>,
     session_id: Uuid,
     turn_id: Uuid,
+}
+
+#[derive(Debug)]
+enum SessionKeyScope {
+    Direct {
+        sender_ref: String,
+    },
+    Conversation {
+        sender_ref: String,
+        conversation_ref: String,
+    },
+    Thread {
+        sender_ref: String,
+        conversation_ref: String,
+        thread_ref: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChannelSessionGrantLookup<'a> {
+    sender_ref: Option<&'a str>,
+    conversation_ref: Option<&'a str>,
+    thread_ref: Option<&'a str>,
+    routing_profile: ChannelRoutingProfile,
+}
+
+fn exact_session_grant_lookup(scope: &SessionKeyScope) -> ChannelSessionGrantLookup<'_> {
+    match scope {
+        SessionKeyScope::Direct { sender_ref } => ChannelSessionGrantLookup {
+            sender_ref: Some(sender_ref),
+            conversation_ref: None,
+            thread_ref: None,
+            routing_profile: ChannelRoutingProfile::Direct,
+        },
+        SessionKeyScope::Conversation {
+            sender_ref,
+            conversation_ref,
+        } => ChannelSessionGrantLookup {
+            sender_ref: Some(sender_ref),
+            conversation_ref: Some(conversation_ref),
+            thread_ref: None,
+            routing_profile: ChannelRoutingProfile::Conversation,
+        },
+        SessionKeyScope::Thread {
+            sender_ref,
+            conversation_ref,
+            thread_ref,
+        } => ChannelSessionGrantLookup {
+            sender_ref: Some(sender_ref),
+            conversation_ref: Some(conversation_ref),
+            thread_ref: Some(thread_ref),
+            routing_profile: ChannelRoutingProfile::Thread,
+        },
+    }
+}
+
+fn blocking_session_grant_lookups(scope: &SessionKeyScope) -> Vec<ChannelSessionGrantLookup<'_>> {
+    match scope {
+        SessionKeyScope::Direct { .. } => vec![exact_session_grant_lookup(scope)],
+        SessionKeyScope::Conversation { sender_ref, .. } => vec![
+            exact_session_grant_lookup(scope),
+            ChannelSessionGrantLookup {
+                sender_ref: Some(sender_ref),
+                conversation_ref: None,
+                thread_ref: None,
+                routing_profile: ChannelRoutingProfile::Direct,
+            },
+        ],
+        SessionKeyScope::Thread {
+            sender_ref,
+            conversation_ref,
+            ..
+        } => vec![
+            exact_session_grant_lookup(scope),
+            ChannelSessionGrantLookup {
+                sender_ref: Some(sender_ref),
+                conversation_ref: Some(conversation_ref),
+                thread_ref: None,
+                routing_profile: ChannelRoutingProfile::Conversation,
+            },
+            ChannelSessionGrantLookup {
+                sender_ref: Some(sender_ref),
+                conversation_ref: None,
+                thread_ref: None,
+                routing_profile: ChannelRoutingProfile::Direct,
+            },
+        ],
+    }
 }
 
 #[derive(Debug)]
@@ -4398,15 +8223,26 @@ struct RuntimeControlSessionExecution<'a> {
     audit_actor: String,
 }
 
+#[derive(Default)]
+struct ChannelAttachmentExecutionContext {
+    runtime_prompt_user_text: Option<String>,
+    extra_mounts: Vec<MountSpec>,
+    attachment_source_turn_id: Option<Uuid>,
+}
+
 struct SessionTurnExecution {
     turn_id: Uuid,
     kind: SessionTurnKind,
     display_user_text: String,
     prompt_user_text: String,
+    runtime_prompt_user_text: Option<String>,
+    attachment_source_turn_id: Option<Uuid>,
+    prepared_turn: Option<SessionTurnRecord>,
     requested_runtime_id: Option<String>,
     runtime_working_dir: Option<String>,
     runtime_timeout_ms: Option<u64>,
     runtime_env_passthrough: Option<Vec<String>>,
+    extra_mounts: Vec<MountSpec>,
     default_policy_scope: Scope,
     sink: Option<RuntimeEventSink>,
     emit_channel_stream_done: bool,
@@ -4417,6 +8253,8 @@ struct SessionTurnExecution {
 struct SessionActionExecutionOptions {
     turn_id: Uuid,
     runtime_id_override: Option<String>,
+    prepared_turn: Option<SessionTurnRecord>,
+    history_before_sequence_no: Option<u64>,
     sink: Option<RuntimeEventSink>,
     emit_channel_stream_done: bool,
     audit_actor: String,
@@ -4427,16 +8265,21 @@ impl SessionActionExecutionOptions {
         Self {
             turn_id: Uuid::new_v4(),
             runtime_id_override,
+            prepared_turn: None,
+            history_before_sequence_no: None,
             sink,
             emit_channel_stream_done: true,
             audit_actor: "api".to_string(),
         }
     }
 
-    fn queued_channel(turn: &ChannelTurnRecord) -> Self {
+    fn queued_channel(turn: &ChannelTurnRecord, prepared_turn: SessionTurnRecord) -> Self {
+        let history_before_sequence_no = prepared_turn.sequence_no;
         Self {
             turn_id: turn.turn_id,
             runtime_id_override: Some(turn.runtime_id.clone()),
+            prepared_turn: Some(prepared_turn),
+            history_before_sequence_no: Some(history_before_sequence_no),
             sink: None,
             emit_channel_stream_done: false,
             audit_actor: "kernel".to_string(),
@@ -4453,6 +8296,7 @@ struct RuntimeExecutionSkills {
 struct SessionTurnArtifacts {
     assistant_text: String,
     event_views: Vec<StreamEventDto>,
+    artifacts: Vec<RuntimeArtifact>,
     saw_error: bool,
 }
 
@@ -4620,10 +8464,14 @@ impl Kernel {
                 kind: SessionTurnKind::Normal,
                 display_user_text: req.user_text.clone(),
                 prompt_user_text: req.user_text,
+                runtime_prompt_user_text: None,
+                attachment_source_turn_id: None,
+                prepared_turn: None,
                 requested_runtime_id: req.runtime_id,
                 runtime_working_dir: req.runtime_working_dir,
                 runtime_timeout_ms: req.runtime_timeout_ms,
                 runtime_env_passthrough: req.runtime_env_passthrough,
+                extra_mounts: Vec::new(),
                 default_policy_scope: Scope::Session(req.session_id),
                 sink,
                 emit_channel_stream_done: true,
@@ -4654,10 +8502,14 @@ impl Kernel {
             kind,
             display_user_text,
             prompt_user_text,
+            runtime_prompt_user_text,
+            attachment_source_turn_id,
+            prepared_turn,
             requested_runtime_id,
             runtime_working_dir,
             runtime_timeout_ms,
             runtime_env_passthrough,
+            extra_mounts,
             default_policy_scope,
             sink,
             emit_channel_stream_done,
@@ -4666,17 +8518,30 @@ impl Kernel {
         } = execution;
         let mut kind = kind;
         let mut display_user_text = display_user_text;
-        let mut prompt_user_text = prompt_user_text;
+        let mut stored_prompt_user_text = prompt_user_text;
+        let mut runtime_prompt_user_text = runtime_prompt_user_text;
+        let mut execution_prompt_user_text = stored_prompt_user_text.clone();
         let mut runtime_control = None;
+        let preserve_prepared_display_text = prepared_turn.is_some();
 
         if kind == SessionTurnKind::Normal {
-            match classify_input(&prompt_user_text) {
+            match classify_input(&stored_prompt_user_text) {
                 ClassifiedInput::Empty => {
-                    return Err(KernelError::BadRequest("user_text is required".to_string()));
+                    execution_prompt_user_text = runtime_prompt_user_text
+                        .take()
+                        .filter(|prompt| !prompt.trim().is_empty())
+                        .ok_or_else(|| {
+                            KernelError::BadRequest("user_text is required".to_string())
+                        })?;
                 }
                 ClassifiedInput::Prompt(prompt) => {
-                    display_user_text = prompt.clone();
-                    prompt_user_text = prompt;
+                    if !preserve_prepared_display_text {
+                        display_user_text = prompt.clone();
+                    }
+                    stored_prompt_user_text = prompt;
+                    execution_prompt_user_text = runtime_prompt_user_text
+                        .take()
+                        .unwrap_or_else(|| stored_prompt_user_text.clone());
                 }
                 ClassifiedInput::LionClawControl(control) => {
                     return Err(KernelError::BadRequest(format!(
@@ -4686,12 +8551,48 @@ impl Kernel {
                 }
                 ClassifiedInput::RuntimeControl(control) => {
                     display_user_text = control.raw.clone();
-                    prompt_user_text.clear();
+                    stored_prompt_user_text.clear();
+                    execution_prompt_user_text.clear();
                     kind = SessionTurnKind::RuntimeControl;
                     runtime_control = Some(control);
                 }
             }
         }
+
+        let prepared_turn = if let Some(turn) = prepared_turn {
+            if turn.turn_id != turn_id || turn.session_id != session.session_id {
+                return Err(KernelError::Internal(
+                    "prepared session turn does not match execution context".to_string(),
+                ));
+            }
+            if turn.kind != kind
+                || turn.display_user_text != display_user_text
+                || turn.prompt_user_text != stored_prompt_user_text
+                || turn.attachment_source_turn_id != attachment_source_turn_id
+            {
+                let updated = self
+                    .session_turns
+                    .update_running_turn_input(
+                        turn_id,
+                        kind,
+                        &display_user_text,
+                        &stored_prompt_user_text,
+                        attachment_source_turn_id,
+                    )
+                    .await
+                    .map_err(internal)?
+                    .ok_or_else(|| {
+                        KernelError::Internal(
+                            "prepared session turn was not running before execution".to_string(),
+                        )
+                    })?;
+                Some(updated)
+            } else {
+                Some(turn)
+            }
+        } else {
+            None
+        };
 
         let channel_stream_context = self
             .channel_stream_context_for_session(
@@ -4729,6 +8630,7 @@ impl Kernel {
                     working_dir: runtime_working_dir.clone(),
                     env_passthrough_keys: runtime_env_passthrough.clone().unwrap_or_default(),
                     skill_mounts,
+                    extra_mounts,
                     timeout_ms: runtime_timeout_ms,
                 },
             )
@@ -4740,18 +8642,29 @@ impl Kernel {
         }
         self.materialize_runtime_plan(&runtime_id, &runtime_kind, &execution_plan)
             .await?;
-        let persisted_turn = self
-            .session_turns
-            .begin_turn(NewSessionTurn {
-                turn_id,
-                session_id: session.session_id,
-                kind,
-                display_user_text: display_user_text.clone(),
-                prompt_user_text: prompt_user_text.clone(),
-                runtime_id: runtime_id.clone(),
-            })
-            .await
-            .map_err(internal)?;
+        if let Some(turn) = &prepared_turn {
+            if turn.runtime_id != runtime_id {
+                return Err(KernelError::Internal(
+                    "prepared session turn runtime does not match execution context".to_string(),
+                ));
+            }
+        }
+        let persisted_turn = match prepared_turn {
+            Some(turn) => turn,
+            None => self
+                .session_turns
+                .begin_turn(NewSessionTurn {
+                    turn_id,
+                    session_id: session.session_id,
+                    kind,
+                    display_user_text: display_user_text.clone(),
+                    prompt_user_text: stored_prompt_user_text.clone(),
+                    attachment_source_turn_id,
+                    runtime_id: runtime_id.clone(),
+                })
+                .await
+                .map_err(internal)?,
+        };
 
         let handle = adapter
             .session_start(RuntimeSessionStartInput {
@@ -4807,7 +8720,7 @@ impl Kernel {
         let prompt_envelope = self
             .build_prompt_envelope(
                 session,
-                &prompt_user_text,
+                &execution_prompt_user_text,
                 handle.resumes_existing_session,
                 Some(persisted_turn.sequence_no),
             )
@@ -4816,7 +8729,7 @@ impl Kernel {
             Some(
                 self.build_prompt_envelope(
                     session,
-                    &prompt_user_text,
+                    &execution_prompt_user_text,
                     false,
                     Some(persisted_turn.sequence_no),
                 )
@@ -5024,6 +8937,32 @@ impl Kernel {
             .await?;
             return Err(kernel_error_for_turn_status(status, error_text));
         }
+        let outbox_attachments = if channel_stream_context.is_some() && !artifacts.saw_error {
+            match self
+                .prepare_runtime_artifact_attachments(turn_id, &artifacts.artifacts)
+                .await
+            {
+                Ok(attachments) => attachments,
+                Err(err) => {
+                    self.clear_runtime_session_ready(&execution_plan).await;
+                    self.persist_failed_session_turn(
+                        session,
+                        &persisted_turn,
+                        FailedSessionTurnCompletion {
+                            assistant_text: artifacts.assistant_text.clone(),
+                            error_code: "runtime.error".to_string(),
+                            error_text: err.to_string(),
+                            stream_error_emitted: false,
+                        },
+                        channel_stream_finalizer,
+                    )
+                    .await?;
+                    return Err(err);
+                }
+            }
+        } else {
+            Vec::new()
+        };
         self.session_turns
             .complete_turn(
                 turn_id,
@@ -5067,31 +9006,28 @@ impl Kernel {
                     .map_err(internal)?;
             }
 
-            if !artifacts.saw_error && !artifacts.assistant_text.trim().is_empty() {
-                let message_id = self
-                    .channel_state
-                    .insert_outbound_message(
-                        &stream_context.channel_id,
-                        &stream_context.peer_id,
-                        &artifacts.assistant_text,
-                    )
-                    .await
-                    .map_err(internal)?;
-                self.audit
-                    .append(
-                        "channel.outbound.recorded",
-                        Some(session.session_id),
-                        Some("kernel".to_string()),
-                        json!({
-                            "channel_id": stream_context.channel_id,
-                            "peer_id": stream_context.peer_id,
-                            "message_id": message_id,
-                            "turn_id": turn_id,
-                            "content_len": artifacts.assistant_text.len(),
-                        }),
-                    )
-                    .await
-                    .map_err(internal)?;
+            if !artifacts.saw_error
+                && (!artifacts.assistant_text.trim().is_empty() || !outbox_attachments.is_empty())
+            {
+                let source_id = turn_id.to_string();
+                self.enqueue_channel_delivery_content(
+                    ChannelDeliveryRoute {
+                        channel_id: &stream_context.channel_id,
+                        conversation_ref: &stream_context.conversation_ref,
+                        thread_ref: stream_context.thread_ref.as_deref(),
+                        reply_to_ref: stream_context.reply_to_ref.as_deref(),
+                    },
+                    Some(session.session_id),
+                    Some(turn_id),
+                    Some("session_turn"),
+                    Some(&source_id),
+                    ChannelDeliveryContent {
+                        text: artifacts.assistant_text.clone(),
+                        format_hint: "plain".to_string(),
+                        attachments: outbox_attachments,
+                    },
+                )
+                .await?;
             }
         }
 
@@ -5104,7 +9040,7 @@ impl Kernel {
                     "turn_id": turn_id,
                     "runtime_id": runtime_id,
                     "runtime_skill_ids": runtime_skill_ids,
-                    "prompt_len": prompt_user_text.len(),
+                    "prompt_len": execution_prompt_user_text.len(),
                     "runtime_preset_name": execution_plan.preset_name,
                     "runtime_working_dir": execution_plan.working_dir,
                     "runtime_idle_timeout_ms": execution_plan.idle_timeout.as_millis() as u64,
@@ -5700,27 +9636,11 @@ impl Kernel {
         }
     }
 
-    async fn resolve_channel_runtime_id(
-        &self,
-        _channel_id: &str,
-        requested_runtime_id: Option<String>,
-    ) -> Result<Option<String>, KernelError> {
-        if let Some(runtime_id) = requested_runtime_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            return Ok(Some(runtime_id.to_string()));
-        }
-
-        Ok(None)
-    }
-
     async fn channel_stream_context_for_session(
         &self,
         session_id: Uuid,
         channel_id: &str,
-        peer_id: &str,
+        session_peer_id: &str,
         turn_id: Uuid,
     ) -> Result<Option<ChannelStreamContext>, KernelError> {
         let binding = self.applied_channel(channel_id).cloned();
@@ -5733,12 +9653,66 @@ impl Kernel {
             return Ok(None);
         }
 
+        let (conversation_ref, thread_ref) =
+            delivery_route_for_session_key(channel_id, session_peer_id);
+        let reply_to_ref = match self
+            .channel_state
+            .get_turn(turn_id)
+            .await
+            .map_err(internal)?
+            .filter(|turn| turn.channel_id == channel_id)
+        {
+            Some(turn) => self
+                .channel_state
+                .get_inbound_event(channel_id, &turn.inbound_event_id)
+                .await
+                .map_err(internal)?
+                .and_then(|event| event.message_ref),
+            None => None,
+        };
+
         Ok(Some(ChannelStreamContext {
             channel_id: channel_id.to_string(),
-            peer_id: peer_id.to_string(),
+            peer_id: stream_peer_ref_for_session_peer(channel_id, session_peer_id),
+            conversation_ref,
+            thread_ref,
+            reply_to_ref,
             session_id,
             turn_id,
         }))
+    }
+
+    async fn emit_queued_channel_turn_status(
+        &self,
+        session_id: Uuid,
+        channel_id: &str,
+        session_key: &str,
+        turn_id: Uuid,
+    ) {
+        match self
+            .channel_stream_context_for_session(session_id, channel_id, session_key, turn_id)
+            .await
+        {
+            Ok(Some(stream_context)) => {
+                if let Err(err) = self
+                    .emit_runtime_event(
+                        &Some(stream_context),
+                        &None,
+                        RuntimeEvent::Status {
+                            code: Some("queue.queued".to_string()),
+                            text: "queued".to_string(),
+                        },
+                    )
+                    .await
+                {
+                    warn!(?err, %turn_id, "failed to emit queued channel turn status");
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(?err, %turn_id, "failed to resolve queued channel turn stream context");
+            }
+        }
     }
 
     async fn resolve_stream_consumer_cursor(
@@ -5828,6 +9802,7 @@ impl Kernel {
         context: &ChannelStreamContext,
         event: &RuntimeEvent,
     ) -> Result<i64, KernelError> {
+        let artifact_status_text;
         let (kind, lane, code, text) = match event {
             RuntimeEvent::MessageDelta { lane, text } => (
                 ChannelStreamEventKind::MessageDelta,
@@ -5844,6 +9819,15 @@ impl Kernel {
                 code.as_deref(),
                 Some(text.as_str()),
             ),
+            RuntimeEvent::Artifact { artifact } => {
+                artifact_status_text = runtime_artifact_status_text(artifact);
+                (
+                    ChannelStreamEventKind::Status,
+                    None,
+                    Some("runtime.artifact"),
+                    Some(artifact_status_text.as_str()),
+                )
+            }
             RuntimeEvent::Error { code, text } => (
                 ChannelStreamEventKind::Error,
                 None,
@@ -6038,72 +10022,219 @@ impl Kernel {
         Ok(())
     }
 
-    fn peer_worker_key(channel_id: &str, peer_id: &str) -> String {
-        format!("{channel_id}:{peer_id}")
+    fn session_key_worker_key(channel_id: &str, session_key: &str) -> String {
+        format!("{channel_id}:{session_key}")
     }
 
-    pub(super) async fn emit_channel_message(
+    pub(super) async fn enqueue_channel_delivery(
         &self,
-        channel_id: &str,
-        peer_id: &str,
+        route: ChannelDeliveryRoute<'_>,
         session_id: Option<Uuid>,
         turn_id: Option<Uuid>,
+        source_kind: Option<&str>,
+        source_id: Option<&str>,
         content: &str,
-    ) -> Result<Vec<Uuid>, KernelError> {
-        self.require_active_channel_binding(channel_id).await?;
-        let mut message_ids = Vec::new();
-
-        for chunk in split_text_chunks(content, 3500) {
-            let message_id = self
-                .channel_state
-                .insert_outbound_message(channel_id, peer_id, &chunk)
-                .await
-                .map_err(internal)?;
-            message_ids.push(message_id);
-            self.append_channel_stream_event(ChannelStreamEventInsert {
-                channel_id,
-                peer_id,
-                session_id,
-                turn_id,
-                kind: ChannelStreamEventKind::MessageDelta,
-                lane: Some(ChannelStreamLane::Answer),
-                code: None,
-                text: Some(&chunk),
-            })
-            .await?;
-            self.audit
-                .append(
-                    "channel.outbound.queued",
-                    None,
-                    Some("kernel".to_string()),
-                    json!({
-                        "channel_id": channel_id,
-                        "peer_id": peer_id,
-                        "message_id": message_id,
-                        "content_len": chunk.len(),
-                        "turn_id": turn_id,
-                    }),
-                )
-                .await
-                .map_err(internal)?;
-        }
-
-        self.append_channel_stream_event(ChannelStreamEventInsert {
-            channel_id,
-            peer_id,
+    ) -> Result<Uuid, KernelError> {
+        self.enqueue_channel_delivery_content(
+            route,
             session_id,
             turn_id,
-            kind: ChannelStreamEventKind::Done,
-            lane: None,
-            code: None,
-            text: None,
-        })
-        .await?;
-        Ok(message_ids)
+            source_kind,
+            source_id,
+            ChannelDeliveryContent {
+                text: content.to_string(),
+                format_hint: "plain".to_string(),
+                attachments: Vec::new(),
+            },
+        )
+        .await
     }
 
-    async fn ensure_channel_turn_worker(&self, channel_id: &str, peer_id: &str) {
-        let worker_key = Self::peer_worker_key(channel_id, peer_id);
+    pub(super) async fn enqueue_channel_delivery_content(
+        &self,
+        route: ChannelDeliveryRoute<'_>,
+        session_id: Option<Uuid>,
+        turn_id: Option<Uuid>,
+        source_kind: Option<&str>,
+        source_id: Option<&str>,
+        content: ChannelDeliveryContent,
+    ) -> Result<Uuid, KernelError> {
+        let channel_id = route.channel_id.trim();
+        let conversation_ref = route.conversation_ref.trim();
+        if channel_id.is_empty() || conversation_ref.is_empty() {
+            return Err(KernelError::BadRequest(
+                "channel_id and conversation_ref are required".to_string(),
+            ));
+        }
+        if content.text.trim().is_empty() && content.attachments.is_empty() {
+            return Err(KernelError::BadRequest(
+                "outbox delivery content is required".to_string(),
+            ));
+        }
+        if content.attachments.len() > MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY {
+            return Err(KernelError::BadRequest(format!(
+                "outbox delivery attachments exceeds {MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY} per delivery"
+            )));
+        }
+        self.require_active_channel_binding(channel_id).await?;
+
+        let thread_ref = route
+            .thread_ref
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        let reply_to_ref = route
+            .reply_to_ref
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        let source_kind = source_kind.map(str::trim).filter(|raw| !raw.is_empty());
+        let source_id = source_id.map(str::trim).filter(|raw| !raw.is_empty());
+        let delivery = self
+            .channel_outbox
+            .enqueue_delivery(NewChannelDelivery {
+                route: ChannelDeliveryRoute {
+                    channel_id,
+                    conversation_ref,
+                    thread_ref,
+                    reply_to_ref,
+                },
+                session_id,
+                turn_id,
+                source_kind,
+                source_id,
+                content,
+            })
+            .await
+            .map_err(internal)?;
+
+        self.audit
+            .append(
+                "channel.outbox.created",
+                session_id,
+                Some("kernel".to_string()),
+                channel_outbox_audit_details(&delivery, ChannelOutboxAuditDetails::default()),
+            )
+            .await
+            .map_err(internal)?;
+
+        Ok(delivery.delivery_id)
+    }
+
+    async fn prepare_runtime_artifact_attachments(
+        &self,
+        turn_id: Uuid,
+        artifacts: &[RuntimeArtifact],
+    ) -> Result<Vec<ChannelDeliveryAttachment>, KernelError> {
+        if artifacts.is_empty() {
+            return Ok(Vec::new());
+        }
+        if artifacts.len() > MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY {
+            return Err(KernelError::BadRequest(format!(
+                "runtime artifacts exceeds {MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY} per delivery"
+            )));
+        }
+        let runtime_root = self.runtime_root.as_ref().ok_or_else(|| {
+            KernelError::Runtime(
+                "runtime root is required to publish runtime artifacts".to_string(),
+            )
+        })?;
+        let runtime_root_canonical =
+            tokio::fs::canonicalize(runtime_root).await.map_err(|err| {
+                KernelError::Runtime(format!(
+                    "runtime root '{}' is not readable: {err}",
+                    runtime_root.display()
+                ))
+            })?;
+        let turn_id = turn_id.to_string();
+        let delivery_root = ensure_safe_child_directory(
+            &runtime_root_canonical,
+            &[CHANNEL_OUTBOX_ARTIFACTS_DIR, turn_id.as_str()],
+        )
+        .await?;
+
+        let mut attachments = Vec::with_capacity(artifacts.len());
+        for artifact in artifacts {
+            attachments.push(
+                self.copy_runtime_artifact_for_delivery(
+                    &runtime_root_canonical,
+                    &delivery_root,
+                    artifact,
+                )
+                .await?,
+            );
+        }
+        Ok(attachments)
+    }
+
+    async fn copy_runtime_artifact_for_delivery(
+        &self,
+        runtime_root: &Path,
+        delivery_root: &Path,
+        artifact: &RuntimeArtifact,
+    ) -> Result<ChannelDeliveryAttachment, KernelError> {
+        let canonical_artifact = tokio::fs::canonicalize(&artifact.path)
+            .await
+            .map_err(|err| {
+                KernelError::Runtime(format!(
+                    "runtime artifact '{}' is not readable: {err}",
+                    artifact.path.display()
+                ))
+            })?;
+        if !canonical_artifact.starts_with(runtime_root) {
+            return Err(KernelError::Runtime(format!(
+                "runtime artifact '{}' is outside the runtime root",
+                artifact.path.display()
+            )));
+        }
+        let metadata = tokio::fs::symlink_metadata(&artifact.path)
+            .await
+            .map_err(|err| {
+                KernelError::Runtime(format!(
+                    "runtime artifact '{}' is not readable: {err}",
+                    artifact.path.display()
+                ))
+            })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(KernelError::Runtime(format!(
+                "runtime artifact '{}' is not a regular file",
+                artifact.path.display()
+            )));
+        }
+        if usize::try_from(metadata.len()).unwrap_or(usize::MAX)
+            > MAX_CHANNEL_OUTBOX_ATTACHMENT_BYTES
+        {
+            return Err(KernelError::BadRequest(format!(
+                "runtime artifact '{}' exceeds {MAX_CHANNEL_OUTBOX_ATTACHMENT_BYTES} bytes",
+                artifact.path.display()
+            )));
+        }
+
+        let filename = runtime_artifact_filename(artifact);
+        let destination = unique_child_path(delivery_root, &filename).await?;
+        tokio::fs::copy(&canonical_artifact, &destination)
+            .await
+            .map_err(|err| {
+                KernelError::Runtime(format!(
+                    "failed to copy runtime artifact '{}' to '{}': {err}",
+                    artifact.path.display(),
+                    destination.display()
+                ))
+            })?;
+
+        Ok(ChannelDeliveryAttachment {
+            attachment_id: artifact.artifact_id.clone(),
+            path: destination.to_string_lossy().to_string(),
+            filename: Some(filename),
+            mime_type: Some(
+                artifact
+                    .mime_type
+                    .clone()
+                    .unwrap_or_else(|| drafts::media_type_for_path(&destination)),
+            ),
+        })
+    }
+
+    async fn ensure_channel_turn_worker(&self, channel_id: &str, session_key: &str) {
+        let worker_key = Self::session_key_worker_key(channel_id, session_key);
         {
             let mut workers = self.channel_turn_workers.write().await;
             if !workers.insert(worker_key.clone()) {
@@ -6113,25 +10244,46 @@ impl Kernel {
 
         let kernel = self.clone();
         let channel_id = channel_id.to_string();
-        let peer_id = peer_id.to_string();
+        let session_key = session_key.to_string();
         tokio::spawn(async move {
-            kernel
-                .drain_channel_turns_for_peer(worker_key, channel_id, peer_id)
-                .await;
+            Box::pin(kernel.drain_channel_turns_for_session_key(
+                worker_key,
+                channel_id,
+                session_key,
+            ))
+            .await;
         });
     }
 
-    async fn drain_channel_turns_for_peer(
+    async fn ensure_pending_channel_turn_workers(&self) {
+        let workers = match self.channel_state.pending_turn_workers().await {
+            Ok(workers) => workers,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "failed to load pending channel turns during bootstrap"
+                );
+                return;
+            }
+        };
+
+        for worker in workers {
+            self.ensure_channel_turn_worker(&worker.channel_id, &worker.session_key)
+                .await;
+        }
+    }
+
+    async fn drain_channel_turns_for_session_key(
         self,
         worker_key: String,
         channel_id: String,
-        peer_id: String,
+        session_key: String,
     ) {
         loop {
             loop {
                 let turn = match self
                     .channel_state
-                    .claim_next_pending_turn(&channel_id, &peer_id)
+                    .claim_next_pending_turn(&channel_id, &session_key)
                     .await
                 {
                     Ok(value) => value,
@@ -6142,7 +10294,7 @@ impl Kernel {
                             "kernel",
                             json!({
                                 "channel_id": channel_id,
-                                "peer_id": peer_id,
+                                "session_key": session_key,
                                 "error": err.to_string(),
                             }),
                         )
@@ -6156,13 +10308,13 @@ impl Kernel {
                     break;
                 };
 
-                self.process_queued_channel_turn(turn).await;
+                Box::pin(self.process_queued_channel_turn(turn)).await;
             }
 
             self.channel_turn_workers.write().await.remove(&worker_key);
             if !self
                 .channel_state
-                .has_pending_turns(&channel_id, &peer_id)
+                .has_claimable_pending_turns(&channel_id, &session_key)
                 .await
                 .unwrap_or(false)
             {
@@ -6181,7 +10333,7 @@ impl Kernel {
             .channel_stream_context_for_session(
                 turn.session_id,
                 &turn.channel_id,
-                &turn.peer_id,
+                &turn.session_key,
                 turn.turn_id,
             )
             .await
@@ -6224,31 +10376,26 @@ impl Kernel {
             json!({
                 "turn_id": turn.turn_id,
                 "channel_id": turn.channel_id,
-                "peer_id": turn.peer_id,
+                "session_key": turn.session_key,
                 "runtime_id": turn.runtime_id,
-                "inbound_message_id": turn.inbound_message_id,
+                "inbound_event_id": turn.inbound_event_id,
             }),
         )
         .await;
 
-        let inbound_message = match self
-            .channel_state
-            .get_message(turn.inbound_message_id)
-            .await
-            .map_err(internal)
-        {
-            Ok(Some(message)) => message,
+        let persisted_turn = match self.session_turns.get(turn.turn_id).await.map_err(internal) {
+            Ok(Some(persisted_turn)) => persisted_turn,
             Ok(None) => {
                 if let Err(err) = self
                     .fail_queued_turn(
                         &turn,
                         "queue.failed",
-                        "queued inbound message no longer exists",
+                        "queued session turn no longer exists",
                         stream_context,
                     )
                     .await
                 {
-                    warn!(?err, turn_id = %turn.turn_id, "failed to mark missing-message queued turn failed");
+                    warn!(?err, turn_id = %turn.turn_id, "failed to mark missing queued session turn failed");
                 }
                 return;
             }
@@ -6257,7 +10404,7 @@ impl Kernel {
                     .fail_queued_turn(&turn, "queue.failed", &err.to_string(), stream_context)
                     .await
                 {
-                    warn!(?fail_err, turn_id = %turn.turn_id, "failed to mark queued turn failed after message load error");
+                    warn!(?fail_err, turn_id = %turn.turn_id, "failed to mark queued turn failed after session turn load error");
                 }
                 return;
             }
@@ -6295,10 +10442,17 @@ impl Kernel {
             }
         };
 
-        if let ClassifiedInput::LionClawControl(control) = classify_input(&inbound_message.content)
+        if let ClassifiedInput::LionClawControl(control) =
+            classify_input(&persisted_turn.prompt_user_text)
         {
             if let Err(err) = self
-                .process_queued_lionclaw_control(&turn, &session, control, stream_context.clone())
+                .process_queued_lionclaw_control(
+                    &turn,
+                    &session,
+                    persisted_turn,
+                    control,
+                    stream_context.clone(),
+                )
                 .await
             {
                 let code = queued_turn_failure_code(&err);
@@ -6312,18 +10466,41 @@ impl Kernel {
             return;
         }
 
+        let attachment_context = match self
+            .channel_attachment_execution_context_for_turn(&turn, &persisted_turn.prompt_user_text)
+            .await
+        {
+            Ok(context) => context,
+            Err(err) => {
+                let code = queued_turn_failure_code(&err);
+                if let Err(fail_err) = self
+                    .fail_queued_turn(&turn, code, &err.to_string(), stream_context)
+                    .await
+                {
+                    warn!(?fail_err, turn_id = %turn.turn_id, "failed to mark queued turn failed after attachment mount error");
+                }
+                return;
+            }
+        };
+        let projection_mounts =
+            channel_attachment_projection_dirs(&attachment_context.extra_mounts);
+
         let result = self
             .execute_session_turn_serialized(
                 session,
                 SessionTurnExecution {
                     turn_id: turn.turn_id,
-                    kind: SessionTurnKind::Normal,
-                    display_user_text: inbound_message.content.clone(),
-                    prompt_user_text: inbound_message.content,
+                    kind: persisted_turn.kind,
+                    display_user_text: persisted_turn.display_user_text.clone(),
+                    prompt_user_text: persisted_turn.prompt_user_text.clone(),
+                    runtime_prompt_user_text: attachment_context.runtime_prompt_user_text,
+                    attachment_source_turn_id: attachment_context.attachment_source_turn_id,
+                    prepared_turn: Some(persisted_turn),
                     requested_runtime_id: Some(turn.runtime_id.clone()),
                     runtime_working_dir: None,
                     runtime_timeout_ms: None,
                     runtime_env_passthrough: None,
+                    extra_mounts: attachment_context.extra_mounts,
                     default_policy_scope: Scope::Session(turn.session_id),
                     sink: None,
                     emit_channel_stream_done: false,
@@ -6331,6 +10508,8 @@ impl Kernel {
                     runtime_control_origin: RuntimeControlOrigin::ChannelInbound,
                 },
             )
+            .await;
+        self.remove_channel_attachment_runtime_projection_dirs_best_effort(&projection_mounts)
             .await;
 
         match result {
@@ -6359,6 +10538,7 @@ impl Kernel {
         &self,
         turn: &ChannelTurnRecord,
         session: &super::sessions::Session,
+        prepared_turn: SessionTurnRecord,
         control: LionClawControlInput,
         stream_context: Option<ChannelStreamContext>,
     ) -> Result<(), KernelError> {
@@ -6369,16 +10549,24 @@ impl Kernel {
             json!({
                 "turn_id": turn.turn_id,
                 "channel_id": turn.channel_id,
-                "peer_id": turn.peer_id,
+                "session_key": turn.session_key,
                 "command_name": control.command_name.clone(),
             }),
         )
         .await;
 
+        let prepared_turn = self
+            .normalize_queued_lionclaw_control_turn(
+                prepared_turn,
+                lionclaw_control_session_turn_kind(&control.command_name),
+            )
+            .await?;
+
         match control.command_name.as_str() {
             "continue" => {
                 self.run_queued_session_action(
                     turn,
+                    prepared_turn,
                     SessionActionKind::ContinueLastPartial,
                     stream_context,
                 )
@@ -6387,6 +10575,7 @@ impl Kernel {
             "retry" => {
                 self.run_queued_session_action(
                     turn,
+                    prepared_turn,
                     SessionActionKind::RetryLastTurn,
                     stream_context,
                 )
@@ -6409,8 +10598,13 @@ impl Kernel {
                     },
                 )
                 .await?;
-                self.complete_queued_turn(turn, &turn.runtime_id, message.len(), stream_context)
-                    .await;
+                self.complete_queued_lionclaw_control_turn(
+                    turn,
+                    prepared_turn,
+                    message,
+                    stream_context,
+                )
+                .await?;
             }
             "exit" | "quit" => {
                 let message = "LionClaw exit is only available in local interactive mode.";
@@ -6423,8 +10617,13 @@ impl Kernel {
                     },
                 )
                 .await?;
-                self.complete_queued_turn(turn, &turn.runtime_id, message.len(), stream_context)
-                    .await;
+                self.complete_queued_lionclaw_control_turn(
+                    turn,
+                    prepared_turn,
+                    message.to_string(),
+                    stream_context,
+                )
+                .await?;
             }
             "" => {
                 return Err(KernelError::BadRequest(
@@ -6444,6 +10643,7 @@ impl Kernel {
     async fn run_queued_session_action(
         &self,
         turn: &ChannelTurnRecord,
+        prepared_turn: SessionTurnRecord,
         action: SessionActionKind,
         stream_context: Option<ChannelStreamContext>,
     ) -> Result<(), KernelError> {
@@ -6451,7 +10651,7 @@ impl Kernel {
             .run_session_action_with_options(
                 turn.session_id,
                 action,
-                SessionActionExecutionOptions::queued_channel(turn),
+                SessionActionExecutionOptions::queued_channel(turn, prepared_turn),
             )
             .await?;
 
@@ -6463,6 +10663,61 @@ impl Kernel {
         )
         .await;
         Ok(())
+    }
+
+    async fn complete_queued_lionclaw_control_turn(
+        &self,
+        turn: &ChannelTurnRecord,
+        prepared_turn: SessionTurnRecord,
+        message: String,
+        stream_context: Option<ChannelStreamContext>,
+    ) -> Result<(), KernelError> {
+        self.session_turns
+            .complete_turn(
+                prepared_turn.turn_id,
+                SessionTurnCompletion {
+                    status: SessionTurnStatus::Completed,
+                    assistant_text: message.clone(),
+                    error_code: None,
+                    error_text: None,
+                },
+            )
+            .await
+            .map_err(internal)?;
+        self.sessions
+            .record_turn(turn.session_id)
+            .await
+            .map_err(internal)?;
+        if let Some(context) = &stream_context {
+            self.emit_turn_completed_snapshot(context, &message).await?;
+        }
+        self.complete_queued_turn(turn, &turn.runtime_id, message.len(), stream_context)
+            .await;
+        Ok(())
+    }
+
+    async fn normalize_queued_lionclaw_control_turn(
+        &self,
+        prepared_turn: SessionTurnRecord,
+        kind: SessionTurnKind,
+    ) -> Result<SessionTurnRecord, KernelError> {
+        if prepared_turn.kind == kind && prepared_turn.prompt_user_text.is_empty() {
+            return Ok(prepared_turn);
+        }
+
+        self.session_turns
+            .update_running_turn_input(
+                prepared_turn.turn_id,
+                kind,
+                &prepared_turn.display_user_text,
+                "",
+                None,
+            )
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                KernelError::Internal("queued LionClaw control turn was not running".to_string())
+            })
     }
 
     async fn complete_queued_turn(
@@ -6503,7 +10758,7 @@ impl Kernel {
             json!({
                 "turn_id": turn.turn_id,
                 "channel_id": turn.channel_id,
-                "peer_id": turn.peer_id,
+                "session_key": turn.session_key,
                 "runtime_id": runtime_id,
                 "assistant_text_len": assistant_text_len,
             }),
@@ -6522,6 +10777,31 @@ impl Kernel {
             .fail_turn(turn.turn_id, message)
             .await
             .map_err(internal)?;
+        if let Some(persisted_turn) = self
+            .session_turns
+            .get(turn.turn_id)
+            .await
+            .map_err(internal)?
+        {
+            if persisted_turn.status == SessionTurnStatus::Running {
+                self.session_turns
+                    .complete_turn(
+                        turn.turn_id,
+                        SessionTurnCompletion {
+                            status: SessionTurnStatus::Failed,
+                            assistant_text: persisted_turn.assistant_text,
+                            error_code: Some(code.to_string()),
+                            error_text: Some(message.to_string()),
+                        },
+                    )
+                    .await
+                    .map_err(internal)?;
+                self.sessions
+                    .record_turn(turn.session_id)
+                    .await
+                    .map_err(internal)?;
+            }
+        }
         self.audit
             .append(
                 "channel.turn.failed",
@@ -6530,7 +10810,7 @@ impl Kernel {
                 json!({
                     "turn_id": turn.turn_id,
                     "channel_id": turn.channel_id,
-                    "peer_id": turn.peer_id,
+                    "session_key": turn.session_key,
                     "runtime_id": turn.runtime_id,
                     "error": message,
                     "code": code,
@@ -7667,9 +11947,14 @@ impl Kernel {
             }
 
             if reason.is_none() {
+                let broker_session_peer_id = if capability == Capability::ChannelSend {
+                    stream_peer_ref_for_session_peer(session_channel_id, session_peer_id)
+                } else {
+                    session_peer_id.to_string()
+                };
                 let context = CapabilityExecutionContext {
                     session_channel_id,
-                    session_peer_id,
+                    session_peer_id: &broker_session_peer_id,
                 };
                 executed = true;
                 match self
@@ -7680,22 +11965,31 @@ impl Kernel {
                     Ok(value) => {
                         if capability == Capability::ChannelSend {
                             match parse_channel_send_intent(&value) {
-                                Ok((channel_id, peer_id, content)) => {
+                                Ok(intent) => {
+                                    let source_id = turn_id.to_string();
                                     match self
-                                        .emit_channel_message(
-                                            &channel_id,
-                                            &peer_id,
+                                        .enqueue_channel_delivery(
+                                            ChannelDeliveryRoute {
+                                                channel_id: &intent.channel_id,
+                                                conversation_ref: &intent.conversation_ref,
+                                                thread_ref: intent.thread_ref.as_deref(),
+                                                reply_to_ref: intent.reply_to_ref.as_deref(),
+                                            },
                                             Some(session_id),
                                             Some(turn_id),
-                                            &content,
+                                            Some("session_turn"),
+                                            Some(&source_id),
+                                            &intent.content,
                                         )
                                         .await
                                     {
-                                        Ok(queued_message_ids) => {
+                                        Ok(delivery_id) => {
                                             output = json!({
-                                                "channel_id": channel_id,
-                                                "conversation_ref": peer_id,
-                                                "message_ids": queued_message_ids,
+                                                "channel_id": intent.channel_id,
+                                                "conversation_ref": intent.conversation_ref,
+                                                "thread_ref": intent.thread_ref,
+                                                "reply_to_ref": intent.reply_to_ref,
+                                                "delivery_id": delivery_id,
                                             });
                                             allowed = true;
                                         }

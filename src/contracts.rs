@@ -142,6 +142,7 @@ impl FromStr for SessionTurnKind {
 #[serde(rename_all = "snake_case")]
 pub enum SessionTurnStatus {
     Running,
+    WaitingForAttachments,
     Completed,
     Failed,
     TimedOut,
@@ -153,6 +154,7 @@ impl SessionTurnStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::WaitingForAttachments => "waiting_for_attachments",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::TimedOut => "timed_out",
@@ -168,6 +170,7 @@ impl FromStr for SessionTurnStatus {
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         match raw {
             "running" => Ok(Self::Running),
+            "waiting_for_attachments" => Ok(Self::WaitingForAttachments),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
             "timed_out" => Ok(Self::TimedOut),
@@ -341,7 +344,11 @@ pub enum JobScheduleDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobDeliveryTargetDto {
     pub channel_id: String,
-    pub peer_id: String,
+    pub conversation_ref: String,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
+    #[serde(default)]
+    pub reply_to_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -651,6 +658,111 @@ pub struct ContinuityOpenLoopActionResponse {
     pub archived_path: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelRoutingProfile {
+    Direct,
+    Conversation,
+    Thread,
+    Outbound,
+}
+
+impl ChannelRoutingProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Conversation => "conversation",
+            Self::Thread => "thread",
+            Self::Outbound => "outbound",
+        }
+    }
+}
+
+impl FromStr for ChannelRoutingProfile {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "direct" => Ok(Self::Direct),
+            "conversation" => Ok(Self::Conversation),
+            "thread" => Ok(Self::Thread),
+            "outbound" => Ok(Self::Outbound),
+            other => Err(format!("invalid channel routing profile '{other}'")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelTrigger {
+    Dm,
+    Mention,
+    ReplyToBot,
+    ThreadContinuation,
+    None,
+}
+
+impl ChannelTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dm => "dm",
+            Self::Mention => "mention",
+            Self::ReplyToBot => "reply_to_bot",
+            Self::ThreadContinuation => "thread_continuation",
+            Self::None => "none",
+        }
+    }
+}
+
+impl FromStr for ChannelTrigger {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "dm" => Ok(Self::Dm),
+            "mention" => Ok(Self::Mention),
+            "reply_to_bot" => Ok(Self::ReplyToBot),
+            "thread_continuation" => Ok(Self::ThreadContinuation),
+            "none" => Ok(Self::None),
+            other => Err(format!("invalid channel trigger '{other}'")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelPairingStatus {
+    Pending,
+    Approved,
+    Blocked,
+    Expired,
+}
+
+impl ChannelPairingStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Blocked => "blocked",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+impl FromStr for ChannelPairingStatus {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "pending" => Ok(Self::Pending),
+            "approved" => Ok(Self::Approved),
+            "blocked" => Ok(Self::Blocked),
+            "expired" => Ok(Self::Expired),
+            other => Err(format!("invalid channel pairing status '{other}'")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelBindingView {
     pub channel_id: String,
@@ -663,87 +775,404 @@ pub struct ChannelListResponse {
     pub bindings: Vec<ChannelBindingView>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelPeerView {
-    pub channel_id: String,
-    pub peer_id: String,
-    pub status: String,
-    pub trust_tier: TrustTier,
-    pub pairing_code: Option<String>,
-    pub first_seen: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelHealthStatus {
+    Ok,
+    Warning,
+    Error,
+}
+
+impl ChannelHealthStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
+impl FromStr for ChannelHealthStatus {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "ok" => Ok(Self::Ok),
+            "warning" => Ok(Self::Warning),
+            "error" => Ok(Self::Error),
+            other => Err(format!("invalid channel health status '{other}'")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelPeerListResponse {
-    pub peers: Vec<ChannelPeerView>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelPeerApproveRequest {
-    pub channel_id: String,
-    pub peer_id: String,
-    pub pairing_code: String,
+#[serde(deny_unknown_fields)]
+pub struct ChannelHealthCheck {
+    pub code: String,
+    pub status: ChannelHealthStatus,
+    pub message: String,
     #[serde(default)]
-    pub trust_tier: Option<TrustTier>,
+    pub details: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelPeerBlockRequest {
+#[serde(deny_unknown_fields)]
+pub struct ChannelHealthReportRequest {
     pub channel_id: String,
-    pub peer_id: String,
+    pub reporter_id: String,
+    pub status: ChannelHealthStatus,
+    #[serde(default)]
+    pub checks: Vec<ChannelHealthCheck>,
+    pub observed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelPeerResponse {
-    pub peer: ChannelPeerView,
+pub struct ChannelHealthReportResponse {
+    pub accepted: bool,
+    pub channel_id: String,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPairingView {
+    pub pairing_id: Uuid,
+    pub channel_id: String,
+    #[serde(default)]
+    pub sender_ref: Option<String>,
+    #[serde(default)]
+    pub conversation_ref: Option<String>,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
+    pub requested_profile: ChannelRoutingProfile,
+    pub status: ChannelPairingStatus,
+    #[serde(default)]
+    pub label: Option<String>,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPairingListResponse {
+    pub pairings: Vec<ChannelPairingView>,
+    #[serde(default)]
+    pub grants: Vec<ChannelGrantView>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ChannelPeerListParams {
+pub struct ChannelPairingListParams {
     pub channel_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<ChannelPairingStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelInboundRequest {
+#[serde(deny_unknown_fields)]
+pub struct ChannelPairingInviteRequest {
     pub channel_id: String,
-    pub peer_id: String,
-    pub text: String,
+    pub requested_profile: ChannelRoutingProfile,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub conversation_ref: Option<String>,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
+    #[serde(default)]
+    pub expires_in_ms: Option<u64>,
+    #[serde(default)]
+    pub max_claims: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPairingInviteResponse {
+    pub pairing_id: Uuid,
+    pub channel_id: String,
+    pub token: String,
+    pub requested_profile: ChannelRoutingProfile,
+    pub expires_at: DateTime<Utc>,
+    pub max_claims: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelPairingClaimRequest {
+    pub channel_id: String,
+    pub token: String,
+    pub sender_ref: String,
+    pub conversation_ref: String,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
+    #[serde(default)]
+    pub provider_metadata: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelPairingClaimOutcome {
+    Approved,
+    Expired,
+    AlreadyClaimed,
+    InvalidToken,
+    ScopeMismatch,
+}
+
+impl ChannelPairingClaimOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Expired => "expired",
+            Self::AlreadyClaimed => "already_claimed",
+            Self::InvalidToken => "invalid_token",
+            Self::ScopeMismatch => "scope_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPairingClaimResponse {
+    pub outcome: ChannelPairingClaimOutcome,
+    #[serde(default)]
+    pub grant_id: Option<Uuid>,
+    #[serde(default)]
+    pub reason_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelPairingApproveRequest {
+    pub channel_id: String,
+    #[serde(default)]
+    pub pairing_id: Option<Uuid>,
+    #[serde(default)]
+    pub pairing_code: Option<String>,
+    #[serde(default)]
+    pub routing_profile: Option<ChannelRoutingProfile>,
+    #[serde(default)]
+    pub trust_tier: Option<TrustTier>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelPairingBlockRequest {
+    pub channel_id: String,
+    #[serde(default)]
+    pub pairing_id: Option<Uuid>,
+    #[serde(default)]
+    pub sender_ref: Option<String>,
+    #[serde(default)]
+    pub conversation_ref: Option<String>,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPairingBlockResponse {
+    #[serde(default)]
+    pub grant: Option<ChannelGrantView>,
+    pub blocked_pairing_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelGrantRevokeRequest {
+    pub channel_id: String,
+    pub grant_id: Uuid,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelGrantView {
+    pub grant_id: Uuid,
+    pub channel_id: String,
+    #[serde(default)]
+    pub sender_ref: Option<String>,
+    #[serde(default)]
+    pub conversation_ref: Option<String>,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
+    pub routing_profile: ChannelRoutingProfile,
+    pub trust_tier: TrustTier,
+    pub status: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelGrantResponse {
+    pub grant: ChannelGrantView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelGrantRevokeResponse {
+    pub grant_id: Uuid,
+    pub revoked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelAttachmentDescriptor {
+    pub attachment_id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub size_bytes: Option<i64>,
+    pub provider_file_ref: String,
+    #[serde(default)]
+    pub caption: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelAttachmentStatus {
+    Staged,
+    Rejected,
+}
+
+impl ChannelAttachmentStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Staged => "staged",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelAttachmentStageResponse {
+    pub channel_id: String,
+    pub event_id: String,
+    pub attachment_id: String,
+    pub status: ChannelAttachmentStatus,
+    pub size_bytes: i64,
+    pub sha256: String,
+    #[serde(default)]
+    pub runtime_path: Option<String>,
+    #[serde(default)]
+    pub reason_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelAttachmentMissingReport {
+    pub attachment_id: String,
+    pub reason_code: String,
+    #[serde(default)]
+    pub reason_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelAttachmentFinalizeRequest {
+    pub channel_id: String,
+    pub event_id: String,
+    pub worker_id: String,
+    #[serde(default)]
+    pub missing: Vec<ChannelAttachmentMissingReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelAttachmentFinalizeOutcome {
+    Queued,
+    AlreadyFinalized,
+    NotReady,
+}
+
+impl ChannelAttachmentFinalizeOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::AlreadyFinalized => "already_finalized",
+            Self::NotReady => "not_ready",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelAttachmentFinalizeResponse {
+    pub channel_id: String,
+    pub event_id: String,
+    pub outcome: ChannelAttachmentFinalizeOutcome,
     #[serde(default)]
     pub session_id: Option<Uuid>,
     #[serde(default)]
-    pub update_id: Option<i64>,
+    pub turn_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelInboundRequest {
+    pub channel_id: String,
+    pub event_id: String,
+    pub sender_ref: String,
+    pub conversation_ref: String,
     #[serde(default)]
-    pub external_message_id: Option<String>,
+    pub thread_ref: Option<String>,
     #[serde(default)]
-    pub runtime_id: Option<String>,
+    pub message_ref: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<ChannelAttachmentDescriptor>,
+    #[serde(default)]
+    pub reply_to_ref: Option<String>,
+    pub trigger: ChannelTrigger,
+    #[serde(default)]
+    pub received_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub provider_metadata: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelInboundResponse {
     pub outcome: ChannelInboundOutcome,
     #[serde(default)]
+    pub reason_code: Option<String>,
+    #[serde(default)]
+    pub pairing_id: Option<Uuid>,
+    #[serde(default)]
+    pub pairing_code: Option<String>,
+    #[serde(default)]
     pub turn_id: Option<Uuid>,
     #[serde(default)]
     pub session_id: Option<Uuid>,
+    #[serde(default)]
+    pub session_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelInboundOutcome {
     Queued,
+    WaitingForAttachments,
     Duplicate,
-    PairingPending,
-    PeerBlocked,
+    PendingApproval,
+    Blocked,
+    TriggerIgnored,
 }
 
 impl ChannelInboundOutcome {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Queued => "queued",
+            Self::WaitingForAttachments => "waiting_for_attachments",
             Self::Duplicate => "duplicate",
-            Self::PairingPending => "pairing_pending",
-            Self::PeerBlocked => "peer_blocked",
+            Self::PendingApproval => "pending_approval",
+            Self::Blocked => "blocked",
+            Self::TriggerIgnored => "trigger_ignored",
         }
     }
 }
@@ -815,4 +1244,132 @@ pub struct ChannelStreamAckResponse {
     pub consumer_id: String,
     pub through_sequence: i64,
     pub acknowledged: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxContentDto {
+    pub text: String,
+    #[serde(default = "default_channel_outbox_format_hint")]
+    pub format_hint: String,
+    #[serde(default)]
+    pub attachments: Vec<ChannelOutboxAttachmentDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxAttachmentDto {
+    pub attachment_id: String,
+    pub path: String,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+}
+
+fn default_channel_outbox_format_hint() -> String {
+    "plain".to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelOutboxDeliveryStatusDto {
+    Pending,
+    Leased,
+    Delivered,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelOutboxAttemptStatusDto {
+    Leased,
+    Delivered,
+    RetryableFailed,
+    TerminalFailed,
+    StaleRejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelOutboxReportOutcomeDto {
+    Delivered,
+    RetryableFailed,
+    TerminalFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxPullRequest {
+    pub channel_id: String,
+    pub worker_id: String,
+    #[serde(default)]
+    pub conversation_ref: Option<String>,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub lease_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxDeliveryView {
+    pub delivery_id: Uuid,
+    pub attempt_id: Uuid,
+    pub channel_id: String,
+    pub conversation_ref: String,
+    #[serde(default)]
+    pub thread_ref: Option<String>,
+    #[serde(default)]
+    pub reply_to_ref: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+    #[serde(default)]
+    pub turn_id: Option<Uuid>,
+    pub content: ChannelOutboxContentDto,
+    pub attempt_count: u32,
+    pub lease_expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxPullResponse {
+    pub deliveries: Vec<ChannelOutboxDeliveryView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxReportRequest {
+    pub delivery_id: Uuid,
+    pub attempt_id: Uuid,
+    pub channel_id: String,
+    pub worker_id: String,
+    pub outcome: ChannelOutboxReportOutcomeDto,
+    #[serde(default)]
+    pub provider_receipt: Option<serde_json::Value>,
+    #[serde(default)]
+    pub error_code: Option<String>,
+    #[serde(default)]
+    pub error_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOutboxReportResponse {
+    pub delivery_id: Uuid,
+    pub attempt_id: Uuid,
+    pub accepted: bool,
+    pub status: ChannelOutboxDeliveryStatusDto,
+    pub attempt_status: ChannelOutboxAttemptStatusDto,
+    #[serde(default)]
+    pub next_attempt_at: Option<DateTime<Utc>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChannelOutboxContentDto;
+
+    #[test]
+    fn channel_outbox_content_defaults_to_plain_text() {
+        let content: ChannelOutboxContentDto =
+            serde_json::from_str(r#"{"text":"hello"}"#).expect("decode outbox content");
+
+        assert_eq!(content.format_hint, "plain");
+    }
 }

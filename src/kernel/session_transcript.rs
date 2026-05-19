@@ -508,6 +508,9 @@ pub fn format_failure_note(status: SessionTurnStatus, error_text: Option<&str>) 
             "The previous assistant turn was interrupted before completion. Recorded error: {reason}"
         ),
         SessionTurnStatus::Completed => "The previous assistant turn completed.".to_string(),
+        SessionTurnStatus::WaitingForAttachments => {
+            "The previous assistant turn is waiting for channel attachments.".to_string()
+        }
         SessionTurnStatus::Running => {
             "The previous assistant turn is still marked running.".to_string()
         }
@@ -550,6 +553,12 @@ fn render_turn_for_prompt(
         SessionTurnStatus::Running => {
             sections
                 .push("### Outcome\n\nThe previous assistant turn is still running.".to_string());
+        }
+        SessionTurnStatus::WaitingForAttachments => {
+            sections.push(
+                "### Outcome\n\nThe previous assistant turn is waiting for channel attachments."
+                    .to_string(),
+            );
         }
     }
 
@@ -658,7 +667,7 @@ fn collect_turn_signals(turns: &[SessionTurnRecord]) -> TurnSignals {
                     open_loops.push(open_loop);
                 }
             }
-            SessionTurnStatus::Running => {}
+            SessionTurnStatus::Running | SessionTurnStatus::WaitingForAttachments => {}
         }
     }
 
@@ -1019,6 +1028,7 @@ mod tests {
             assistant_text: assistant_text.to_string(),
             error_code: None,
             error_text: error_text.map(ToString::to_string),
+            attachment_source_turn_id: None,
             runtime_id: "mock".to_string(),
             started_at: Utc::now(),
             finished_at: None,

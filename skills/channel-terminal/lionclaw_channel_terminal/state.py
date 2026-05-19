@@ -67,6 +67,7 @@ class TurnState:
 class PairingState:
     status: PeerStatus = "unknown"
     pairing_code: str | None = None
+    pairing_id: str | None = None
     trust_tier: str | None = None
 
 
@@ -270,15 +271,43 @@ class ChannelViewState:
                 self.active_turn_id = None
                 self.restored_running_turn = False
 
+    def apply_outbox_delivery(self, delivery: object) -> None:
+        if getattr(delivery, "conversation_ref") != self.peer_id:
+            return
+
+        session_id = getattr(delivery, "session_id", None)
+        if session_id is not None and self.active_session_id is None:
+            self.active_session_id = session_id
+
+        content = getattr(delivery, "content")
+        text = getattr(content, "text", "")
+        turn_id = getattr(delivery, "turn_id", None)
+        if turn_id is None:
+            if text:
+                self.activity_lines.append(f"[message] {text}")
+            return
+
+        turn = self._ensure_turn(turn_id)
+        turn.answer_text = text
+        turn.status = "completed"
+        turn.error_text = None
+        turn.restored_running = False
+        self.pending_submission = False
+        self.restored_running_turn = False
+        if turn_id == self.active_turn_id:
+            self.active_turn_id = None
+
     def set_pairing_state(
         self,
         status: PeerStatus,
         pairing_code: str | None = None,
+        pairing_id: str | None = None,
         trust_tier: str | None = None,
     ) -> None:
         self.pairing = PairingState(
             status=status,
             pairing_code=pairing_code,
+            pairing_id=pairing_id,
             trust_tier=trust_tier,
         )
 
@@ -343,10 +372,10 @@ class ChannelViewState:
                     "Send a message to create pairing state."
                 )
             case "pending":
-                code = self.pairing.pairing_code or "-"
+                approval_ref = self.pairing.pairing_code or self.pairing.pairing_id or "-"
                 return (
-                    f"pairing pending for '{peer_id}' with code {code}. "
-                    f"Approve with: lionclaw channel pairing approve {channel_id} {peer_id} {code} --trust-tier main"
+                    f"pairing pending for '{peer_id}'. "
+                    f"Approve with: lionclaw channel pairing approve {channel_id} {approval_ref} --trust-tier main"
                 )
             case "approved":
                 trust = self.pairing.trust_tier or "main"
@@ -361,6 +390,8 @@ class ChannelViewState:
     def input_block_reason(self) -> str | None:
         if self.pairing.status == "blocked":
             return "peer is blocked"
+        if self.pairing.status == "pending":
+            return "pairing pending"
         if self.pending_submission or self.active_turn_id is not None:
             return "turn in progress"
         return None

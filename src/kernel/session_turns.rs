@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
+use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -22,6 +22,7 @@ pub struct SessionTurnRecord {
     pub assistant_text: String,
     pub error_code: Option<String>,
     pub error_text: Option<String>,
+    pub attachment_source_turn_id: Option<Uuid>,
     pub runtime_id: String,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -39,6 +40,7 @@ pub struct NewSessionTurn {
     pub kind: SessionTurnKind,
     pub display_user_text: String,
     pub prompt_user_text: String,
+    pub attachment_source_turn_id: Option<Uuid>,
     pub runtime_id: String,
 }
 
@@ -64,10 +66,63 @@ impl SessionTurnStore {
     pub async fn begin_turn(&self, turn: NewSessionTurn) -> Result<SessionTurnRecord> {
         let started_at_ms = now_ms();
 
+        self.begin_turn_with_started_at(turn, started_at_ms).await
+    }
+
+    pub async fn begin_turn_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        turn: NewSessionTurn,
+    ) -> Result<SessionTurnRecord> {
+        self.begin_turn_with_status_in_tx(tx, turn, SessionTurnStatus::Running)
+            .await
+    }
+
+    pub async fn begin_turn_with_status_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        turn: NewSessionTurn,
+        status: SessionTurnStatus,
+    ) -> Result<SessionTurnRecord> {
+        let started_at_ms = now_ms();
+
         sqlx::query(
             "INSERT INTO session_turns \
-             (turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, runtime_id, started_at_ms, finished_at_ms) \
-             VALUES (?1, ?2, (SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM session_turns WHERE session_id = ?2), ?3, ?4, ?5, ?6, '', NULL, NULL, ?7, ?8, NULL)",
+             (turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, attachment_source_turn_id, runtime_id, started_at_ms, finished_at_ms) \
+             VALUES (?1, ?2, (SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM session_turns WHERE session_id = ?2), ?3, ?4, ?5, ?6, '', NULL, NULL, ?7, ?8, ?9, NULL)",
+        )
+        .bind(turn.turn_id.to_string())
+        .bind(turn.session_id.to_string())
+        .bind(turn.kind.as_str())
+        .bind(status.as_str())
+        .bind(&turn.display_user_text)
+        .bind(&turn.prompt_user_text)
+        .bind(turn.attachment_source_turn_id.map(|turn_id| turn_id.to_string()))
+        .bind(&turn.runtime_id)
+        .bind(started_at_ms)
+        .execute(&mut **tx)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to insert session turn {} for session {}",
+                turn.turn_id, turn.session_id
+            )
+        })?;
+
+        self.get_in_tx(tx, turn.turn_id).await?.ok_or_else(|| {
+            anyhow!("session turn disappeared immediately after transactional insert")
+        })
+    }
+
+    async fn begin_turn_with_started_at(
+        &self,
+        turn: NewSessionTurn,
+        started_at_ms: i64,
+    ) -> Result<SessionTurnRecord> {
+        sqlx::query(
+            "INSERT INTO session_turns \
+             (turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, attachment_source_turn_id, runtime_id, started_at_ms, finished_at_ms) \
+             VALUES (?1, ?2, (SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM session_turns WHERE session_id = ?2), ?3, ?4, ?5, ?6, '', NULL, NULL, ?7, ?8, ?9, NULL)",
         )
         .bind(turn.turn_id.to_string())
         .bind(turn.session_id.to_string())
@@ -75,6 +130,7 @@ impl SessionTurnStore {
         .bind(SessionTurnStatus::Running.as_str())
         .bind(&turn.display_user_text)
         .bind(&turn.prompt_user_text)
+        .bind(turn.attachment_source_turn_id.map(|turn_id| turn_id.to_string()))
         .bind(&turn.runtime_id)
         .bind(started_at_ms)
         .execute(&self.pool)
@@ -143,7 +199,37 @@ impl SessionTurnStore {
         self.get(turn_id).await
     }
 
-    pub async fn interrupt_running_turns(
+    pub async fn update_running_turn_input(
+        &self,
+        turn_id: Uuid,
+        kind: SessionTurnKind,
+        display_user_text: &str,
+        prompt_user_text: &str,
+        attachment_source_turn_id: Option<Uuid>,
+    ) -> Result<Option<SessionTurnRecord>> {
+        let updated = sqlx::query(
+            "UPDATE session_turns \
+             SET kind = ?2, display_user_text = ?3, prompt_user_text = ?4, attachment_source_turn_id = ?5 \
+             WHERE turn_id = ?1 AND status = ?6",
+        )
+        .bind(turn_id.to_string())
+        .bind(kind.as_str())
+        .bind(display_user_text)
+        .bind(prompt_user_text)
+        .bind(attachment_source_turn_id.map(|turn_id| turn_id.to_string()))
+        .bind(SessionTurnStatus::Running.as_str())
+        .execute(&self.pool)
+        .await
+        .context("failed to update running session turn input")?;
+
+        if updated.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        self.get(turn_id).await
+    }
+
+    pub async fn interrupt_running_turns_without_pending_channel_turns(
         &self,
         reason: &str,
     ) -> Result<Vec<InterruptedSessionTurn>> {
@@ -158,6 +244,11 @@ impl SessionTurnStore {
             "SELECT turn_id, session_id \
              FROM session_turns \
              WHERE status = ?1 \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM channel_turns \
+                 WHERE channel_turns.turn_id = session_turns.turn_id \
+                   AND channel_turns.status = 'pending' \
+               ) \
              ORDER BY started_at_ms ASC, turn_id ASC",
         )
         .bind(SessionTurnStatus::Running.as_str())
@@ -168,7 +259,12 @@ impl SessionTurnStore {
         sqlx::query(
             "UPDATE session_turns \
              SET status = ?1, error_code = ?2, error_text = ?3, finished_at_ms = ?4 \
-             WHERE status = ?5",
+             WHERE status = ?5 \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM channel_turns \
+                 WHERE channel_turns.turn_id = session_turns.turn_id \
+                   AND channel_turns.status = 'pending' \
+               )",
         )
         .bind(SessionTurnStatus::Interrupted.as_str())
         .bind("runtime.interrupted")
@@ -202,7 +298,7 @@ impl SessionTurnStore {
 
     pub async fn get(&self, turn_id: Uuid) -> Result<Option<SessionTurnRecord>> {
         let row = sqlx::query(
-            "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, runtime_id, started_at_ms, finished_at_ms \
+            "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, attachment_source_turn_id, runtime_id, started_at_ms, finished_at_ms \
              FROM session_turns \
              WHERE turn_id = ?1",
         )
@@ -214,9 +310,51 @@ impl SessionTurnStore {
         row.map(map_session_turn_row).transpose()
     }
 
+    pub(crate) async fn get_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        turn_id: Uuid,
+    ) -> Result<Option<SessionTurnRecord>> {
+        let row = sqlx::query(
+            "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, attachment_source_turn_id, runtime_id, started_at_ms, finished_at_ms \
+             FROM session_turns \
+             WHERE turn_id = ?1",
+        )
+        .bind(turn_id.to_string())
+        .fetch_optional(&mut **tx)
+        .await
+        .context("failed to query session turn in transaction")?;
+
+        row.map(map_session_turn_row).transpose()
+    }
+
+    pub(crate) async fn mark_waiting_for_attachments_ready_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        turn_id: Uuid,
+    ) -> Result<Option<SessionTurnRecord>> {
+        let changed = sqlx::query(
+            "UPDATE session_turns \
+             SET status = ?2, error_code = NULL, error_text = NULL, finished_at_ms = NULL \
+             WHERE turn_id = ?1 AND status = ?3",
+        )
+        .bind(turn_id.to_string())
+        .bind(SessionTurnStatus::Running.as_str())
+        .bind(SessionTurnStatus::WaitingForAttachments.as_str())
+        .execute(&mut **tx)
+        .await
+        .context("failed to mark attachment-waiting session turn ready")?;
+
+        if changed.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        self.get_in_tx(tx, turn_id).await
+    }
+
     pub async fn latest(&self, session_id: Uuid) -> Result<Option<SessionTurnRecord>> {
         let row = sqlx::query(
-            "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, runtime_id, started_at_ms, finished_at_ms \
+            "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, attachment_source_turn_id, runtime_id, started_at_ms, finished_at_ms \
              FROM session_turns \
              WHERE session_id = ?1 \
              ORDER BY sequence_no DESC \
@@ -237,7 +375,7 @@ impl SessionTurnStore {
     ) -> Result<Vec<SessionTurnRecord>> {
         let limit = i64::try_from(limit).context("session history limit is too large")?;
         let rows = sqlx::query(
-            "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, runtime_id, started_at_ms, finished_at_ms \
+            "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, attachment_source_turn_id, runtime_id, started_at_ms, finished_at_ms \
              FROM session_turns \
              WHERE session_id = ?1 \
              ORDER BY sequence_no DESC \
@@ -267,7 +405,7 @@ impl SessionTurnStore {
         let before_sequence_no =
             i64::try_from(before_sequence_no).context("before_sequence_no is too large")?;
         let rows = sqlx::query(
-            "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, runtime_id, started_at_ms, finished_at_ms \
+            "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, attachment_source_turn_id, runtime_id, started_at_ms, finished_at_ms \
              FROM session_turns \
              WHERE session_id = ?1 AND sequence_no < ?2 \
              ORDER BY sequence_no DESC \
@@ -295,7 +433,7 @@ impl SessionTurnStore {
         through_sequence_no: u64,
     ) -> Result<Vec<SessionTurnRecord>> {
         let rows = sqlx::query(
-            "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, runtime_id, started_at_ms, finished_at_ms \
+            "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, attachment_source_turn_id, runtime_id, started_at_ms, finished_at_ms \
              FROM session_turns \
              WHERE session_id = ?1 AND sequence_no > ?2 AND sequence_no <= ?3 \
              ORDER BY sequence_no ASC",
@@ -312,7 +450,7 @@ impl SessionTurnStore {
 
     pub async fn list_recent_failures(&self, limit: usize) -> Result<Vec<SessionTurnRecord>> {
         let rows = sqlx::query(
-            "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, runtime_id, started_at_ms, finished_at_ms \
+            "SELECT turn_id, session_id, sequence_no, kind, status, display_user_text, prompt_user_text, assistant_text, error_code, error_text, attachment_source_turn_id, runtime_id, started_at_ms, finished_at_ms \
              FROM session_turns \
              WHERE status IN ('failed', 'timed_out', 'cancelled', 'interrupted') \
              ORDER BY started_at_ms DESC, turn_id DESC \
@@ -353,6 +491,7 @@ fn map_session_turn_row(row: SqliteRow) -> Result<SessionTurnRecord> {
     let status_raw: String = row.get("status");
     let started_at_ms: i64 = row.get("started_at_ms");
     let finished_at_ms: Option<i64> = row.get("finished_at_ms");
+    let attachment_source_turn_id_raw: Option<String> = row.get("attachment_source_turn_id");
 
     let turn_id = Uuid::parse_str(&turn_id_raw)
         .with_context(|| format!("invalid turn_id '{turn_id_raw}'"))?;
@@ -371,6 +510,12 @@ fn map_session_turn_row(row: SqliteRow) -> Result<SessionTurnRecord> {
             ms_to_datetime(value).ok_or_else(|| anyhow!("invalid finished_at_ms '{value}'"))
         })
         .transpose()?;
+    let attachment_source_turn_id = attachment_source_turn_id_raw
+        .map(|value| {
+            Uuid::parse_str(&value)
+                .with_context(|| format!("invalid attachment_source_turn_id '{value}'"))
+        })
+        .transpose()?;
 
     Ok(SessionTurnRecord {
         turn_id,
@@ -383,6 +528,7 @@ fn map_session_turn_row(row: SqliteRow) -> Result<SessionTurnRecord> {
         assistant_text: row.get("assistant_text"),
         error_code: row.get("error_code"),
         error_text: row.get("error_text"),
+        attachment_source_turn_id,
         runtime_id: row.get("runtime_id"),
         started_at,
         finished_at,
@@ -424,6 +570,7 @@ mod tests {
                 kind: SessionTurnKind::Normal,
                 display_user_text: "failed".to_string(),
                 prompt_user_text: "failed".to_string(),
+                attachment_source_turn_id: None,
                 runtime_id: "mock".to_string(),
             })
             .await
@@ -448,6 +595,7 @@ mod tests {
                 kind: SessionTurnKind::Normal,
                 display_user_text: "completed".to_string(),
                 prompt_user_text: "completed".to_string(),
+                attachment_source_turn_id: None,
                 runtime_id: "mock".to_string(),
             })
             .await
@@ -472,6 +620,7 @@ mod tests {
                 kind: SessionTurnKind::Normal,
                 display_user_text: "interrupted".to_string(),
                 prompt_user_text: "interrupted".to_string(),
+                attachment_source_turn_id: None,
                 runtime_id: "mock".to_string(),
             })
             .await

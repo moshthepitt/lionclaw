@@ -2,22 +2,67 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
-from lionclaw_channel_telegram.api import LionClawApi, StreamEvent
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramEntityTooLarge,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramNotFound,
+    TelegramRetryAfter,
+    TelegramServerError,
+    TelegramUnauthorizedError,
+)
+
+from lionclaw_channel_telegram.api import (
+    AttachmentMissingReport,
+    HealthCheck,
+    LionClawApi,
+    OutboxDelivery,
+    StreamEvent,
+)
 from lionclaw_channel_telegram.config import WorkerConfig
 from lionclaw_channel_telegram.telegram import (
     AiogramTelegramTransport,
-    TelegramTextUpdate,
+    TelegramEntityTooLargeForStage,
+    TelegramInboundUpdate,
+    TelegramOutboundAttachment,
+    TelegramPairingClaim,
+    TelegramReferenceError,
     TelegramTransport,
-    extract_text_update,
+    extract_inbound_event,
 )
 
 logger = logging.getLogger(__name__)
 
-EXPECTED_INBOUND_OUTCOMES = {"queued", "pairing_pending", "duplicate", "peer_blocked"}
-TYPING_STATUS_CODES = {"queue.started", "runtime.started"}
+EXPECTED_INBOUND_OUTCOMES = {
+    "queued",
+    "waiting_for_attachments",
+    "duplicate",
+    "pending_approval",
+    "blocked",
+    "trigger_ignored",
+}
+TYPING_STATUS_CODES = {"queue.started", "runtime.started", "runtime.artifact"}
+MAX_ATTACHMENT_STAGE_BYTES = 25 * 1024 * 1024
+INITIAL_TYPING_TTL_SECONDS = 8.0
+ACTIVE_TURN_TYPING_TTL_SECONDS = 300.0
+TYPING_REFRESH_SECONDS = 4.0
+MAX_TYPING_FAILURES = 3
+MIN_HEALTH_REPORT_INTERVAL_SECONDS = 1.0
+POLLING_IN_FLIGHT_GRACE_SECONDS = 10.0
+
+
+@dataclass(slots=True, frozen=True)
+class TypingTarget:
+    conversation_ref: str
+    thread_ref: str | None = None
+
+    @property
+    def key(self) -> tuple[str, str | None]:
+        return (self.conversation_ref, self.thread_ref)
 
 
 @dataclass(slots=True)
@@ -37,39 +82,6 @@ class OffsetStore:
         self.path.write_text(str(offset), encoding="utf-8")
 
 
-@dataclass(slots=True)
-class PendingTurns:
-    answer_buffers: dict[tuple[str, str], str] = field(default_factory=dict)
-    active_turns: set[tuple[str, str]] = field(default_factory=set)
-
-    def append_answer(self, peer_id: str, turn_id: str, text: str) -> None:
-        key = (peer_id, turn_id)
-        self.answer_buffers[key] = self.answer_buffers.get(key, "") + text
-        self.active_turns.add(key)
-
-    def replace_answer(self, peer_id: str, turn_id: str, text: str) -> None:
-        key = (peer_id, turn_id)
-        self.answer_buffers[key] = text
-        self.active_turns.add(key)
-
-    def has_turn(self, peer_id: str, turn_id: str) -> bool:
-        return (peer_id, turn_id) in self.active_turns
-
-    def final_text(self, peer_id: str, turn_id: str) -> str | None:
-        key = (peer_id, turn_id)
-        if key not in self.active_turns:
-            return None
-        return self.answer_buffers.get(key, "") or None
-
-    def clear(self, peer_id: str, turn_id: str) -> None:
-        key = (peer_id, turn_id)
-        self.active_turns.discard(key)
-        self.answer_buffers.pop(key, None)
-
-    def has_pending(self) -> bool:
-        return bool(self.active_turns)
-
-
 class TelegramWorker:
     def __init__(
         self,
@@ -83,23 +95,48 @@ class TelegramWorker:
         self.telegram = telegram
         self.offset_store = offset_store
         self.offset = offset_store.load()
-        self.pending_turns = PendingTurns()
+        self._typing_targets: dict[tuple[str, str | None], TypingTarget] = {}
+        self._typing_deadlines: dict[tuple[str, str | None], float] = {}
+        self._typing_routes: dict[str, TypingTarget] = {}
+        self._typing_failures: dict[tuple[str, str | None], int] = {}
+        self._poll_in_flight_started_at: float | None = None
+        self._last_poll_success_observed_at: float | None = None
+        self._last_poll_failure_observed_at: float | None = None
+        self._last_poll_error: str | None = None
+        self._last_poll_update_count: int | None = None
+        self._last_update_id: int | None = None
+        self._last_update_observed_at: float | None = None
+        self._delivery_failure_counts: dict[str, int] = {}
 
     async def process_updates(self) -> None:
+        self._poll_in_flight_started_at = _loop_time()
         try:
             updates = await self.telegram.get_updates(
                 offset=self.offset,
                 timeout_seconds=self.config.telegram_poll_timeout_secs,
             )
-        except Exception:
+        except Exception as err:
+            self._record_poll_failure(err)
             logger.exception("telegram getUpdates request failed")
             return
 
+        self._record_poll_success(len(updates))
+        try:
+            bot_identity = await self.telegram.bot_identity()
+        except Exception:
+            logger.exception("telegram getMe request failed")
+            return
+
         for update in updates:
-            text_update = extract_text_update(update)
-            if text_update is not None:
-                if not await self._submit_inbound(text_update):
+            event = extract_inbound_event(update, bot_identity=bot_identity)
+            if event is not None:
+                if isinstance(event, TelegramPairingClaim):
+                    if not await self._claim_pairing(event):
+                        return
+                elif not await self._submit_inbound(event):
                     return
+            self._last_update_id = update.update_id
+            self._last_update_observed_at = _loop_time()
             self.offset = update.update_id + 1
             self.offset_store.save(self.offset)
 
@@ -110,32 +147,113 @@ class TelegramWorker:
             logger.exception("lionclaw stream pull request failed")
             return
 
-        last_safe_sequence: int | None = None
-        stop_processing = False
+        last_sequence: int | None = None
 
         for event in events:
             if not await self._process_stream_event(event):
-                stop_processing = True
                 break
-            if not self.pending_turns.has_pending():
-                last_safe_sequence = event.sequence
+            last_sequence = event.sequence
 
-        if not stop_processing and last_safe_sequence is not None:
+        if last_sequence is not None:
             try:
-                await self.lionclaw_api.ack_stream(last_safe_sequence)
+                await self.lionclaw_api.ack_stream(last_sequence)
             except Exception:
                 logger.exception(
                     "lionclaw stream ack failed through sequence %s",
-                    last_safe_sequence,
+                    last_sequence,
                 )
 
+    async def flush_outbox(self) -> None:
+        try:
+            deliveries = await self.lionclaw_api.pull_outbox()
+        except Exception:
+            logger.exception("lionclaw outbox pull request failed")
+            return
+
+        for delivery in deliveries:
+            await self._process_outbox_delivery(delivery)
+
+    async def report_health(self) -> None:
+        checks = await self._health_checks()
+        status = _overall_health_status(checks)
+        try:
+            await self.lionclaw_api.report_health(status, checks)
+        except Exception:
+            logger.exception("lionclaw health report submit failed")
+
     async def run_forever(self) -> None:
+        tasks = [
+            asyncio.create_task(self._run_update_loop(), name="telegram-updates"),
+            asyncio.create_task(self._run_stream_loop(), name="lionclaw-stream"),
+            asyncio.create_task(self._run_outbox_loop(), name="lionclaw-outbox"),
+            asyncio.create_task(self._run_typing_loop(), name="telegram-typing"),
+            asyncio.create_task(self._run_health_loop(), name="lionclaw-health"),
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._typing_targets.clear()
+            self._typing_deadlines.clear()
+            self._typing_routes.clear()
+            self._typing_failures.clear()
+
+    async def _run_update_loop(self) -> None:
         while True:
             await self.process_updates()
+            await asyncio.sleep(self.config.telegram_loop_delay_secs)
+
+    async def _run_stream_loop(self) -> None:
+        while True:
             await self.flush_stream()
             await asyncio.sleep(self.config.telegram_loop_delay_secs)
 
-    async def _submit_inbound(self, update: TelegramTextUpdate) -> bool:
+    async def _run_outbox_loop(self) -> None:
+        while True:
+            await self.flush_outbox()
+            await asyncio.sleep(self.config.telegram_loop_delay_secs)
+
+    async def _run_typing_loop(self) -> None:
+        while True:
+            await asyncio.sleep(TYPING_REFRESH_SECONDS)
+            await self.refresh_typing()
+
+    async def _run_health_loop(self) -> None:
+        interval = max(
+            self.config.health_report_interval_secs,
+            MIN_HEALTH_REPORT_INTERVAL_SECONDS,
+        )
+        while True:
+            await self.report_health()
+            await asyncio.sleep(interval)
+
+    async def _claim_pairing(self, claim: TelegramPairingClaim) -> bool:
+        try:
+            response = await self.lionclaw_api.claim_pairing(claim)
+        except Exception:
+            logger.exception(
+                "lionclaw pairing claim failed for update_id=%s",
+                claim.update_id,
+            )
+            return False
+
+        try:
+            await self.telegram.send_message(
+                claim.conversation_ref,
+                _pairing_claim_reply(response.outcome),
+                reply_to_ref=claim.message_ref,
+                thread_ref=claim.thread_ref,
+            )
+        except Exception:
+            logger.exception(
+                "telegram pairing acknowledgement failed for update_id=%s",
+                claim.update_id,
+            )
+        return True
+
+    async def _submit_inbound(self, update: TelegramInboundUpdate) -> bool:
         try:
             response = await self.lionclaw_api.send_inbound(update)
         except Exception:
@@ -151,27 +269,141 @@ class TelegramWorker:
                 update.update_id,
             )
             return False
+        if response.outcome == "pending_approval":
+            await self._notify_pending_approval(update, response.pairing_code)
+        if response.outcome == "queued":
+            self._remember_typing_route(update)
+            await self._start_typing(
+                update.conversation_ref,
+                thread_ref=update.thread_ref,
+                ttl_seconds=INITIAL_TYPING_TTL_SECONDS,
+            )
+        if response.outcome == "waiting_for_attachments":
+            staged = await self._stage_attachments(update)
+            if staged:
+                self._remember_typing_route(update)
+                await self._start_typing(
+                    update.conversation_ref,
+                    thread_ref=update.thread_ref,
+                    ttl_seconds=INITIAL_TYPING_TTL_SECONDS,
+                )
+            return staged
+        return True
+
+    async def _notify_pending_approval(
+        self,
+        update: TelegramInboundUpdate,
+        pairing_code: str | None,
+    ) -> None:
+        text = "This Telegram scope is waiting for operator approval."
+        if pairing_code is not None:
+            text = f"This Telegram scope needs approval. Pairing code: {pairing_code}"
+        try:
+            await self.telegram.send_message(
+                update.conversation_ref,
+                text,
+                reply_to_ref=update.message_ref,
+                thread_ref=update.thread_ref,
+            )
+        except Exception:
+            logger.exception(
+                "telegram pending approval notice failed for update_id=%s",
+                update.update_id,
+            )
+
+    async def _stage_attachments(self, update: TelegramInboundUpdate) -> bool:
+        missing: list[AttachmentMissingReport] = []
+        for attachment in update.attachments:
+            try:
+                downloaded = await self.telegram.download_attachment(
+                    attachment,
+                    max_bytes=MAX_ATTACHMENT_STAGE_BYTES,
+                )
+            except TelegramEntityTooLargeForStage as err:
+                logger.warning(
+                    "telegram attachment too large for event_id=%s attachment_id=%s",
+                    update.event_id,
+                    attachment.attachment_id,
+                )
+                missing.append(
+                    AttachmentMissingReport(
+                        attachment_id=attachment.attachment_id,
+                        reason_code="telegram.file_too_large",
+                        reason_text=str(err),
+                    )
+                )
+                continue
+            except Exception as err:
+                logger.exception(
+                    "telegram attachment download failed for event_id=%s attachment_id=%s",
+                    update.event_id,
+                    attachment.attachment_id,
+                )
+                missing.append(
+                    AttachmentMissingReport(
+                        attachment_id=attachment.attachment_id,
+                        reason_code="telegram.download_failed",
+                        reason_text=str(err),
+                    )
+                )
+                continue
+
+            try:
+                stage = await self.lionclaw_api.stage_attachment(
+                    update,
+                    attachment,
+                    downloaded,
+                )
+            except Exception:
+                logger.exception(
+                    "lionclaw attachment stage failed for event_id=%s attachment_id=%s",
+                    update.event_id,
+                    attachment.attachment_id,
+                )
+                return False
+            if stage.status == "rejected":
+                logger.warning(
+                    "lionclaw rejected attachment event_id=%s attachment_id=%s reason_code=%s",
+                    update.event_id,
+                    attachment.attachment_id,
+                    stage.reason_code,
+                )
+
+        try:
+            response = await self.lionclaw_api.finalize_attachments(update, missing)
+        except Exception:
+            logger.exception(
+                "lionclaw attachment finalize failed for event_id=%s",
+                update.event_id,
+            )
+            return False
+        if response.outcome not in {"queued", "already_finalized"}:
+            logger.error(
+                "lionclaw attachment finalize returned unexpected outcome '%s' for event_id=%s",
+                response.outcome,
+                update.event_id,
+            )
+            return False
         return True
 
     async def _process_stream_event(self, event: StreamEvent) -> bool:
         if event.kind == "message_delta":
-            if event.lane == "answer":
-                self.pending_turns.append_answer(event.peer_id, event.turn_id, event.text)
+            self._extend_typing(
+                event.peer_id,
+                ttl_seconds=ACTIVE_TURN_TYPING_TTL_SECONDS,
+            )
             return True
 
         if event.kind == "status":
             if event.code in TYPING_STATUS_CODES:
-                try:
-                    await self.telegram.send_typing(event.peer_id)
-                except Exception:
-                    logger.exception(
-                        "telegram sendChatAction request failed for peer_id=%s",
-                        event.peer_id,
-                    )
-                    return False
+                await self._start_typing(
+                    event.peer_id,
+                    ttl_seconds=ACTIVE_TURN_TYPING_TTL_SECONDS,
+                )
             return True
 
         if event.kind == "error":
+            self._stop_typing(event.peer_id)
             logger.error(
                 "lionclaw stream error for peer_id=%s turn_id=%s: %s",
                 event.peer_id,
@@ -181,29 +413,397 @@ class TelegramWorker:
             return True
 
         if event.kind == "turn_completed":
-            self.pending_turns.replace_answer(event.peer_id, event.turn_id, event.text)
+            self._stop_typing(event.peer_id)
             return True
 
         if event.kind == "done":
-            if not self.pending_turns.has_turn(event.peer_id, event.turn_id):
-                return True
-            final_text = self.pending_turns.final_text(event.peer_id, event.turn_id)
-            if final_text is None:
-                self.pending_turns.clear(event.peer_id, event.turn_id)
-                return True
-            try:
-                await self.telegram.send_message(event.peer_id, final_text)
-            except Exception:
-                logger.exception(
-                    "telegram sendMessage request failed for peer_id=%s",
-                    event.peer_id,
-                )
-                return False
-            self.pending_turns.clear(event.peer_id, event.turn_id)
+            self._stop_typing(event.peer_id)
             return True
 
         logger.error("lionclaw stream contained unknown event kind '%s'", event.kind)
         return True
+
+    async def refresh_typing(self) -> None:
+        now = _loop_time()
+        active_targets = [
+            self._typing_targets[key]
+            for key, deadline in self._typing_deadlines.items()
+            if deadline > now
+        ]
+        expired_keys = [
+            key for key, deadline in self._typing_deadlines.items() if deadline <= now
+        ]
+        for key in expired_keys:
+            self._typing_targets.pop(key, None)
+            self._typing_deadlines.pop(key, None)
+            self._typing_failures.pop(key, None)
+        for target in active_targets:
+            await self._send_typing(target)
+
+    async def _start_typing(
+        self,
+        conversation_ref: str,
+        *,
+        thread_ref: str | None = None,
+        ttl_seconds: float,
+    ) -> None:
+        target = self._target_for_ref(conversation_ref, thread_ref=thread_ref)
+        self._extend_target_typing(target, ttl_seconds=ttl_seconds)
+        await self._send_typing(target)
+
+    def _extend_typing(self, peer_id: str, *, ttl_seconds: float) -> None:
+        target = self._target_for_ref(peer_id)
+        self._extend_target_typing(target, ttl_seconds=ttl_seconds)
+
+    def _extend_target_typing(
+        self, target: TypingTarget, *, ttl_seconds: float
+    ) -> None:
+        if not target.conversation_ref:
+            return
+        self._typing_targets[target.key] = target
+        deadline = _loop_time() + ttl_seconds
+        self._typing_deadlines[target.key] = max(
+            deadline,
+            self._typing_deadlines.get(target.key, 0.0),
+        )
+
+    def _stop_typing(self, peer_id: str) -> None:
+        target = self._target_for_ref(peer_id)
+        self._typing_targets.pop(target.key, None)
+        self._typing_deadlines.pop(target.key, None)
+        self._typing_failures.pop(target.key, None)
+
+    async def _send_typing(self, target: TypingTarget) -> None:
+        try:
+            await self.telegram.send_typing(target.conversation_ref, target.thread_ref)
+            self._typing_failures.pop(target.key, None)
+        except Exception:
+            failures = self._typing_failures.get(target.key, 0) + 1
+            self._typing_failures[target.key] = failures
+            if failures >= MAX_TYPING_FAILURES:
+                self._typing_targets.pop(target.key, None)
+                self._typing_deadlines.pop(target.key, None)
+            logger.exception(
+                "telegram sendChatAction request failed for conversation_ref=%s thread_ref=%s",
+                target.conversation_ref,
+                target.thread_ref,
+            )
+
+    def _remember_typing_route(self, update: TelegramInboundUpdate) -> None:
+        target = TypingTarget(update.conversation_ref, update.thread_ref)
+        self._typing_routes[update.conversation_ref] = target
+        if update.provider_metadata.get("chat_type") == "private":
+            self._typing_routes[update.sender_ref] = target
+
+    def _target_for_ref(
+        self,
+        conversation_ref: str,
+        *,
+        thread_ref: str | None = None,
+    ) -> TypingTarget:
+        if thread_ref is not None:
+            return TypingTarget(conversation_ref, thread_ref)
+        return self._typing_routes.get(conversation_ref) or TypingTarget(
+            conversation_ref
+        )
+
+    async def _process_outbox_delivery(self, delivery: OutboxDelivery) -> None:
+        try:
+            receipt = await self.telegram.send_message(
+                delivery.conversation_ref,
+                delivery.content.text,
+                delivery.reply_to_ref,
+                delivery.thread_ref,
+                format_hint=delivery.content.format_hint,
+                attachments=[
+                    TelegramOutboundAttachment(
+                        path=attachment.path,
+                        filename=attachment.filename,
+                        mime_type=attachment.mime_type,
+                    )
+                    for attachment in delivery.content.attachments
+                ],
+            )
+        except Exception as err:
+            logger.exception(
+                "telegram sendMessage request failed for delivery_id=%s conversation_ref=%s",
+                delivery.delivery_id,
+                delivery.conversation_ref,
+            )
+            outcome, error_code = _classify_send_failure(err)
+            self._record_delivery_failure(outcome, error_code)
+            await self._report_outbox_with_retry(
+                delivery,
+                outcome,
+                error_code=error_code,
+                error_text=str(err),
+            )
+            return
+
+        await self._report_outbox_with_retry(
+            delivery,
+            "delivered",
+            provider_receipt=receipt,
+        )
+
+    async def _report_outbox_with_retry(
+        self,
+        delivery: OutboxDelivery,
+        outcome: str,
+        *,
+        provider_receipt: dict[str, object] | None = None,
+        error_code: str | None = None,
+        error_text: str | None = None,
+    ) -> None:
+        for attempt_no in range(1, 4):
+            if await self._report_outbox_once(
+                delivery,
+                outcome,
+                provider_receipt=provider_receipt,
+                error_code=error_code,
+                error_text=error_text,
+            ):
+                return
+            await asyncio.sleep(0.25 * attempt_no)
+
+    async def _report_outbox_once(
+        self,
+        delivery: OutboxDelivery,
+        outcome: str,
+        *,
+        provider_receipt: dict[str, object] | None = None,
+        error_code: str | None = None,
+        error_text: str | None = None,
+    ) -> bool:
+        try:
+            response = await self.lionclaw_api.report_outbox(
+                delivery,
+                outcome,
+                provider_receipt=provider_receipt,
+                error_code=error_code,
+                error_text=error_text,
+            )
+        except Exception:
+            logger.exception(
+                "lionclaw outbox report failed for delivery_id=%s outcome=%s",
+                delivery.delivery_id,
+                outcome,
+            )
+            return False
+        if not response.accepted:
+            logger.warning(
+                "lionclaw rejected stale outbox report for delivery_id=%s status=%s attempt_status=%s",
+                delivery.delivery_id,
+                response.status,
+                response.attempt_status,
+            )
+        return True
+
+    async def _health_checks(self) -> list[HealthCheck]:
+        checks = [await self._bot_identity_health_check()]
+        checks.append(self._polling_health_check())
+        checks.append(self._update_lag_health_check())
+        checks.append(self._delivery_errors_health_check())
+        return checks
+
+    async def _bot_identity_health_check(self) -> HealthCheck:
+        try:
+            identity = await self.telegram.bot_identity(refresh=True)
+        except Exception as err:
+            logger.exception("telegram bot identity health check failed")
+            return HealthCheck(
+                code="telegram.bot_identity",
+                status="error",
+                message="getMe failed",
+                details={"error": str(err)},
+            )
+        if identity.user_id is None:
+            return HealthCheck(
+                code="telegram.bot_identity",
+                status="warning",
+                message="getMe succeeded without a bot id",
+                details={"username": identity.username},
+            )
+        return HealthCheck(
+            code="telegram.bot_identity",
+            status="ok",
+            message="getMe succeeded",
+            details={"bot_id": identity.user_id, "username": identity.username},
+        )
+
+    def _polling_health_check(self) -> HealthCheck:
+        details: dict[str, object] = {
+            "offset": self.offset,
+            "poll_timeout_seconds": self.config.telegram_poll_timeout_secs,
+        }
+        if self._last_poll_success_observed_at is not None:
+            details["last_success_age_seconds"] = max(
+                0, int(_loop_time() - self._last_poll_success_observed_at)
+            )
+            details["last_update_count"] = self._last_poll_update_count or 0
+
+        if self._last_poll_error is not None:
+            if self._last_poll_failure_observed_at is not None:
+                details["last_failure_age_seconds"] = max(
+                    0, int(_loop_time() - self._last_poll_failure_observed_at)
+                )
+            details["error"] = self._last_poll_error
+            return HealthCheck(
+                code="telegram.polling",
+                status="error",
+                message="getUpdates failed",
+                details=details,
+            )
+
+        if self._poll_in_flight_started_at is not None:
+            in_flight_age_seconds = max(
+                0, int(_loop_time() - self._poll_in_flight_started_at)
+            )
+            details["in_flight_age_seconds"] = in_flight_age_seconds
+            max_expected_age = (
+                self.config.telegram_poll_timeout_secs + POLLING_IN_FLIGHT_GRACE_SECONDS
+            )
+            if in_flight_age_seconds > max_expected_age:
+                return HealthCheck(
+                    code="telegram.polling",
+                    status="warning",
+                    message="getUpdates request has exceeded its timeout window",
+                    details=details,
+                )
+            return HealthCheck(
+                code="telegram.polling",
+                status="ok",
+                message="getUpdates request is in flight",
+                details=details,
+            )
+
+        if self._last_poll_success_observed_at is None:
+            return HealthCheck(
+                code="telegram.polling",
+                status="warning",
+                message="getUpdates has not completed yet",
+                details=details,
+            )
+
+        return HealthCheck(
+            code="telegram.polling",
+            status="ok",
+            message="getUpdates succeeded",
+            details=details,
+        )
+
+    def _update_lag_health_check(self) -> HealthCheck:
+        details: dict[str, object] = {"offset": self.offset}
+        if self._last_poll_success_observed_at is None:
+            return HealthCheck(
+                code="telegram.update_lag",
+                status="warning",
+                message="no successful getUpdates poll completed yet",
+                details=details,
+            )
+        if self._last_update_id is None or self._last_update_observed_at is None:
+            return HealthCheck(
+                code="telegram.update_lag",
+                status="ok",
+                message="polling active; no updates observed yet",
+                details=details,
+            )
+        age_seconds = max(0, int(_loop_time() - self._last_update_observed_at))
+        details.update(
+            {
+                "last_update_id": self._last_update_id,
+                "last_update_age_seconds": age_seconds,
+            }
+        )
+        return HealthCheck(
+            code="telegram.update_lag",
+            status="ok",
+            message=f"last update observed {age_seconds}s ago",
+            details=details,
+        )
+
+    def _delivery_errors_health_check(self) -> HealthCheck:
+        retryable = self._delivery_failure_counts.get("retryable_failed", 0)
+        terminal = self._delivery_failure_counts.get("terminal_failed", 0)
+        total = retryable + terminal
+        status = "warning" if total else "ok"
+        message = (
+            f"{total} delivery failure(s) observed in this worker process"
+            if total
+            else "no delivery failures observed in this worker process"
+        )
+        return HealthCheck(
+            code="telegram.delivery_errors",
+            status=status,
+            message=message,
+            details={
+                "retryable_failed": retryable,
+                "terminal_failed": terminal,
+            },
+        )
+
+    def _record_delivery_failure(self, outcome: str, error_code: str) -> None:
+        self._delivery_failure_counts[outcome] = (
+            self._delivery_failure_counts.get(outcome, 0) + 1
+        )
+        self._delivery_failure_counts[error_code] = (
+            self._delivery_failure_counts.get(error_code, 0) + 1
+        )
+
+    def _record_poll_success(self, update_count: int) -> None:
+        self._poll_in_flight_started_at = None
+        self._last_poll_success_observed_at = _loop_time()
+        self._last_poll_update_count = update_count
+        self._last_poll_error = None
+
+    def _record_poll_failure(self, err: Exception) -> None:
+        self._poll_in_flight_started_at = None
+        self._last_poll_failure_observed_at = _loop_time()
+        self._last_poll_error = f"{type(err).__name__}: {err}"
+
+
+def _classify_send_failure(err: Exception) -> tuple[str, str]:
+    if isinstance(err, TelegramReferenceError):
+        return "terminal_failed", "telegram.invalid_ref"
+    if isinstance(
+        err,
+        (
+            TelegramBadRequest,
+            TelegramEntityTooLarge,
+            TelegramForbiddenError,
+            TelegramNotFound,
+            TelegramUnauthorizedError,
+        ),
+    ):
+        return "terminal_failed", "telegram.send_rejected"
+    if isinstance(err, (TelegramNetworkError, TelegramRetryAfter, TelegramServerError)):
+        return "retryable_failed", "telegram.send_retryable"
+    return "retryable_failed", "telegram.send_failed"
+
+
+def _pairing_claim_reply(outcome: str) -> str:
+    if outcome == "approved":
+        return "Pairing approved. You can send a message now."
+    if outcome == "already_claimed":
+        return "That pairing link has already been used."
+    if outcome == "expired":
+        return "That pairing link has expired."
+    if outcome == "scope_mismatch":
+        return "That pairing link is not valid for this chat."
+    return "That pairing link is invalid."
+
+
+def _overall_health_status(checks: list[HealthCheck]) -> str:
+    statuses = {check.status for check in checks}
+    if "error" in statuses:
+        return "error"
+    if "warning" in statuses:
+        return "warning"
+    return "ok"
+
+
+def _loop_time() -> float:
+    return asyncio.get_running_loop().time()
 
 
 async def run() -> None:
@@ -216,7 +816,6 @@ async def run() -> None:
         channel_id=config.channel_id,
         consumer_id=config.consumer_id,
         start_mode=config.stream_start_mode,
-        runtime_id=config.runtime_id,
         stream_limit=config.stream_limit,
         stream_wait_ms=config.stream_wait_ms,
     )

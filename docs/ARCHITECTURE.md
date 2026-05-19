@@ -42,7 +42,7 @@ The Rust kernel owns:
 
 - sessions and turn history
 - runtime launch plans
-- channel peer approval, inbound queues, outbound streams
+- channel pairing, scoped grants, inbound queues, progress streams, durable outbox delivery
 - scheduler definitions and run records
 - policy grants and audit events
 - assistant-home continuity files and derived search index
@@ -89,7 +89,8 @@ Skill text can influence prompt context. It cannot grant permissions.
 - `kernel.runtime`: runtime adapter contract and registry.
 - `kernel.runtime.execution`: execution presets, plan compilation, OCI backend, and process execution.
 - `kernel.scheduler`: due-job claiming, lease coordination, retry, and dispatch.
-- `kernel.channel_state`: channel peer trust state, inbound logs, queued turns, outbound stream state, and transcript history.
+- `kernel.channel_state`: channel pairing requests, scoped grants, normalized inbound event admission, queued turns, progress stream state, and transcript history.
+- `kernel.channel_outbox`: durable provider-neutral delivery leases, retry state, provider receipts, and scheduler delivery projections.
 - `kernel.continuity`: assistant-home continuity files, `ACTIVE.md` projection, daily notes, artifacts, open loops, proposals, and retrieval helpers.
 - `kernel.continuity_fs`: descriptor-rooted Unix filesystem helper for assistant-home continuity.
 - `kernel.session_compactions`: persisted transcript compaction summaries and ranges.
@@ -199,6 +200,8 @@ The everyday runtime layout is mount-first:
 - `/runtime`: runtime-private writable state root
 - `/drafts`: runtime-private draft/output area
 - `/lionclaw/skills/<alias>`: installed non-channel skill snapshot assets mounted read-only
+- `/attachments`: read-only channel attachment files for the current inbound
+  event, present only after attachment finalization staged files for that turn
 
 For local `lionclaw run`, target resolution selects one project instance and
 uses that instance's recorded work root. The work root is mounted at
@@ -273,12 +276,20 @@ with the CLI.
 ### Channel
 
 - `GET /v0/channels/list`
-- `GET /v0/channels/peers`
-- `POST /v0/channels/peers/approve`
-- `POST /v0/channels/peers/block`
+- `GET /v0/channels/pairing` (pairing requests and current grant state)
+- `POST /v0/channels/pairing/invite`
+- `POST /v0/channels/pairing/claim`
+- `POST /v0/channels/pairing/approve`
+- `POST /v0/channels/pairing/block`
+- `POST /v0/channels/grants/revoke`
 - `POST /v0/channels/inbound`
+- `POST /v0/channels/attachments/stage` (multipart worker upload)
+- `POST /v0/channels/attachments/finalize`
 - `POST /v0/channels/stream/pull`
 - `POST /v0/channels/stream/ack`
+- `POST /v0/channels/outbox/pull`
+- `POST /v0/channels/outbox/report`
+- `POST /v0/channels/health/report`
 
 ### Job
 
@@ -325,16 +336,89 @@ metadata endpoint used to classify a listener before reusing it.
 External channel skills integrate over HTTP:
 
 1. `GET /v0/sessions/latest` restores the latest durable session snapshot for
-   `(channel_id, peer_id)`.
-2. `POST /v0/channels/inbound` submits normalized inbound messages. Approved
-   peers queue a channel turn and receive an explicit outcome.
-3. `POST /v0/sessions/action` starts `continue_last_partial`,
+   a deterministic `(channel_id, session_key)`.
+2. `POST /v0/channels/inbound` submits normalized inbound facts. Approved
+   grants queue a channel turn and receive an explicit outcome. Inbound v2
+   carries attachment descriptors first; workers fetch binary files only after
+   admission.
+3. If the inbound outcome is `waiting_for_attachments`, the worker uploads each
+   admitted file with `POST /v0/channels/attachments/stage`, then calls
+   `POST /v0/channels/attachments/finalize`. Finalization rejects missing or
+   unstaged descriptors and makes the turn claimable. At execution time, the
+   kernel derives a runtime-only prompt manifest from the stored attachment
+   rows. Descriptors rejected at admission by known size policy are recorded in
+   the manifest immediately; if no stageable attachments remain, the turn queues
+   without waiting for a worker finalize call.
+4. `POST /v0/sessions/action` starts `continue_last_partial`,
    `retry_last_turn`, or `reset_session` for a channel-backed session.
-4. `POST /v0/channels/stream/pull` fetches typed outbound stream events for a
-   consumer cursor.
-5. `POST /v0/channels/stream/ack` records that a worker durably handled events
-   through a sequence.
-6. Peer list, approve, and block endpoints manage pairing trust.
+5. `POST /v0/channels/stream/pull` fetches typed progress events for a
+   consumer cursor. Stream acknowledgment means the worker handled progress
+   events; it does not imply provider message delivery.
+6. `POST /v0/channels/outbox/pull` atomically leases due outbound deliveries.
+   Deliveries carry `conversation_ref`, optional `thread_ref`, optional
+   `reply_to_ref`, `content`, and a stable `delivery_id`. Each pull creates an
+   `attempt_id`; workers perform one provider send attempt per lease. Pulls may
+   optionally scope to a `conversation_ref` / `thread_ref` so interactive
+   per-peer workers, such as the terminal channel, do not lease another peer's
+   delivery.
+7. `POST /v0/channels/outbox/report` records provider outcomes. `delivered`
+   stores provider receipt data, `retryable_failed` returns the delivery to
+   kernel-owned exponential backoff, and `terminal_failed` closes it. Stale
+   reports are recorded as rejected and never overwrite the current attempt.
+8. `POST /v0/channels/health/report` appends a worker health sample for a
+   configured channel. The worker sends `channel_id`, `reporter_id`, overall
+   `status` (`ok`, `warning`, or `error`), `observed_at`, and provider-specific
+   checks with stable `code`, `status`, `message`, and JSON `details`. Provider
+   reachability checks stay in channel workers; the kernel validates and stores
+   normalized samples, audits `channel.health.reported`, and never treats health
+   reports as authority to start, stop, or repair workers. Reports with
+   oversized identities or timestamps more than two minutes in the future are
+   rejected; stored far-future reports are excluded from latest-health selection.
+9. `POST /v0/channels/stream/ack` advances only the progress stream cursor.
+10. Pairing invite/claim, approve/block, and grant revoke endpoints manage
+   channel trust. Invite tokens are returned once, stored only as hashes, and
+   claimed through worker-submitted provider facts.
+   Blocking a sender scope also closes matching pending operator-approval
+   pairing requests. Blocking a token invite by `pairing_id` marks that invite
+   blocked without creating a sender grant. Blocks are enforced from the
+   most-specific scope back to the direct sender.
+
+Attachment files are stored under LionClaw runtime state at
+`runtime/channels/sha256-<channel-id-digest>/attachments/sha256-<event-id-digest>/sha256-<attachment-id-digest>/`.
+The hash components are derived from the normalized IDs; raw provider IDs remain
+in the database and runtime manifest. Staging uses a temp file and commits only
+into kernel-derived path components without following symlinks. Admission and
+staging enforce 10 attachments per event, 25 MiB per attachment, and 50 MiB per
+event. Multipart staging accepts enough body to report typed policy rejections
+for oversized uploads inside the event-size envelope; larger bodies are
+transport rejected. Runtime turns see only staged files through a
+manifest-derived, read-only `/attachments` projection mount. Projection copies
+are removed after the runtime turn; maintenance removes stale projection
+directories left behind by crashes. The runtime-only prompt manifest shape is:
+
+```json
+{
+  "channel_attachments": [
+    {
+      "id": "att-1",
+      "kind": "image",
+      "filename": "image.png",
+      "mime_type": "image/png",
+      "size_bytes": 123,
+      "sha256": "...",
+      "path": "/attachments/att-1-4f4a9410ffcdf895/image.png",
+      "caption": "optional caption"
+    }
+  ],
+  "rejected_channel_attachments": [
+    {
+      "id": "att-2",
+      "kind": "image",
+      "reason_code": "not_staged"
+    }
+  ]
+}
+```
 
 Queued channel turns emit machine-stable status/error codes through the same
 stream contract. Kernel-generated lifecycle codes include:
@@ -349,9 +433,33 @@ stream contract. Kernel-generated lifecycle codes include:
 - `runtime.timeout`
 
 Stream events produced by actual runtime turns include `session_id` and
-`turn_id`. Channel-scoped messages, such as pairing notices or scheduler
-delivery summaries, may omit both fields and must not be treated as active
-session state by channel skills.
+`turn_id`. The stream `peer_id` remains a provider-facing conversation hint for
+typing/progress only; durable outbound routing uses the outbox fields
+`conversation_ref`, `thread_ref`, and `reply_to_ref`. Internal session identity
+is carried by `session_key` and the session row. Channel session keys are grant
+scoped: direct sessions include the sender, conversation sessions include the
+conversation and sender, and thread sessions include the conversation, thread,
+and sender.
+
+Outbox `content` is provider-neutral JSON with `text`, a `format_hint`
+(`plain`, `markdown`, or `html`; default `plain`), and an `attachments` array. Outbound
+attachments are durable file descriptors copied into LionClaw-owned runtime
+outbox storage before delivery is leased. Runtime adapters can emit typed
+artifacts; the kernel converts those artifacts into outbox attachments without
+requiring channel workers to know runtime-private storage layouts. Providers
+choose native delivery methods from MIME type and report delivery outcomes
+through the same lease/report flow as text messages.
+
+Channel health reports are append-only rows in `channel_health_reports`.
+Doctor reads the latest report per channel, along with kernel-visible pending
+pairings and outbox status, to explain channel state without calling provider
+APIs or mutating local state. Pending outbox health includes rows still marked
+`leased` after their lease expiry, so a crashed worker cannot hide undelivered
+messages until another worker pulls. Background channel reports older than ten
+minutes are stale doctor warnings, and background channels with no reports warn.
+Interactive channels can report opportunistically without missing-report or stale
+warnings. Doctor also warns on impossible future report timestamps found in
+stored state without treating those reports as current worker health.
 
 ## Session Continuity
 
@@ -364,7 +472,7 @@ prompts:
 `session_turns` is the durable source of truth for prompt history. It records:
 
 - `kind = normal | retry | continue | runtime_control`
-- `status = running | completed | failed | timed_out | cancelled | interrupted`
+- `status = running | waiting_for_attachments | completed | failed | timed_out | cancelled | interrupted`
 - `display_user_text`
 - `prompt_user_text`
 - `assistant_text`
@@ -375,10 +483,30 @@ prompts:
 Answer-lane text is checkpointed while a turn is still running so restart
 reconciliation can preserve partial replies already emitted to the user.
 Channel-backed running turns also persist the exact stream sequence through
-which the durable assistant checkpoint is synchronized.
+which the durable assistant checkpoint is synchronized. Channels v2 stores
+normalized provider facts, including text and attachment descriptors, in
+`channel_inbound_events`, admits work through scoped grants, and derives
+deterministic session keys such as
+`channel:<channel_id>:direct:<sender_ref>`. Worker-supplied runtime selection is
+not part of the inbound channel contract; the kernel resolves runtime execution
+from the instance/default runtime configuration.
+Session-key components escape `:` and `%` so provider refs such as
+`telegram:chat:-123` remain unambiguous.
+Proactive pairing invites reuse `channel_pairing_requests` with
+`claim_policy = token_claim`; raw invite tokens are never stored, claim counts
+advance inside the same transaction that creates the scoped grant, and expired
+blocked, or over-claimed tokens cannot authorize a channel sender. Pairing claim
+audit stores normalized identity and outcome facts only, never raw worker
+provider metadata.
 
 Kernel bootstrap converts stale `running` session turns into durable
-`interrupted` turns before they can be reused.
+`interrupted` turns before they can be reused. Durable pending channel turns are
+not interrupted on restart; bootstrap re-drives their channel workers so
+accepted inbound work is recoverable after commit.
+Attachment-waiting channel turns are not claimable. Bootstrap finalizes waiting
+attachment batches older than one hour by rejecting unstaged descriptors with
+`not_staged`, then queues the turn. Stale temp uploads older than one day are
+removed, while committed staged blobs are retained.
 
 ## Assistant Continuity
 
@@ -415,9 +543,10 @@ Scheduled runs open fresh synthetic sessions:
 
 Scheduled jobs invoke the selected runtime with explicit job context and the
 daemon's current runtime-visible skill set from applied filesystem state.
-Optional delivery sends the final result through the existing channel
-stream/outbox path without changing the latest interactive session for that
-peer.
+Optional delivery enqueues the final result in the channel outbox without
+changing the latest interactive session for that conversation. Scheduler run
+delivery status is `pending` after enqueue and becomes `delivered` or `failed`
+only after the provider worker reports the outbox attempt outcome.
 
 Paused jobs are skipped by normal scheduler ticks but can still be run
 manually by the operator.
@@ -466,13 +595,13 @@ home.
 7. Ordinary confined runtime file work stays inside mounted work-root, runtime,
    and drafts paths.
 8. Kernel brokers are reserved for explicit side effects and direct-runtime
-   requests. `channel.send` records outbound transcript entries and appends
+   requests. `channel.send` records metadata-only outbound entries and appends
    typed stream events. `net.egress`, `secret.request`, and `scheduler.run`
    remain broker-gated and denied until configured.
 9. Audit covers API mutations, runtime plan allow/deny, runtime
    start/finish/error/timeout, channel lifecycle events, scheduler events, and
    brokered capability decisions.
-10. Channel inbound is gated by pairing approval with duplicate update
+10. Channel inbound is gated by scoped grants with duplicate event
     suppression and worker-controlled polling offsets.
 
 ## Planned Hardening

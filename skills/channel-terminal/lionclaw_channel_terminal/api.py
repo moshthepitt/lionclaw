@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, cast
+from uuid import uuid4
 
 import httpx
 
@@ -13,6 +14,7 @@ class PeerState:
     status: PeerStatus
     pairing_code: str | None = None
     trust_tier: str | None = None
+    pairing_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -20,6 +22,8 @@ class InboundResponse:
     outcome: str
     turn_id: str | None = None
     session_id: str | None = None
+    pairing_id: str | None = None
+    pairing_code: str | None = None
 
 
 @dataclass(slots=True)
@@ -55,6 +59,41 @@ class SessionLatestSnapshot:
     resume_after_sequence: int | None
 
 
+@dataclass(slots=True)
+class OutboxAttachment:
+    attachment_id: str
+    path: str
+    filename: str | None = None
+    mime_type: str | None = None
+
+
+@dataclass(slots=True)
+class OutboxContent:
+    text: str
+    format_hint: str = "markdown"
+    attachments: list[OutboxAttachment] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class OutboxDelivery:
+    delivery_id: str
+    attempt_id: str
+    channel_id: str
+    conversation_ref: str
+    content: OutboxContent
+    thread_ref: str | None = None
+    reply_to_ref: str | None = None
+    session_id: str | None = None
+    turn_id: str | None = None
+
+
+@dataclass(slots=True)
+class OutboxReportResponse:
+    accepted: bool
+    status: str
+    attempt_status: str
+
+
 class LionClawApi:
     def __init__(
         self,
@@ -63,7 +102,6 @@ class LionClawApi:
         peer_id: str,
         consumer_id: str,
         start_mode: str,
-        runtime_id: str | None,
         stream_limit: int,
         stream_wait_ms: int,
         timeout_seconds: float = 35.0,
@@ -73,29 +111,50 @@ class LionClawApi:
         self.peer_id = peer_id
         self.consumer_id = consumer_id
         self.start_mode = start_mode
-        self.runtime_id = runtime_id
         self.stream_limit = stream_limit
         self.stream_wait_ms = stream_wait_ms
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout_seconds)
+        self._inbound_nonce = uuid4().hex
         self._inbound_sequence = 0
+
+    @property
+    def session_key(self) -> str:
+        return f"channel:{self.channel_id}:direct:{_encode_session_key_part(self.peer_id)}"
 
     async def close(self) -> None:
         await self._client.aclose()
 
     async def fetch_peer_state(self) -> PeerState:
         response = await self._client.get(
-            "/v0/channels/peers",
+            "/v0/channels/pairing",
             params={"channel_id": self.channel_id},
         )
         _raise_for_status(response)
         payload = response.json()
-        for peer in payload.get("peers", []):
-            if peer.get("peer_id") != self.peer_id:
-                continue
+        grant = _find_direct_peer_record(
+            payload.get("grants", []),
+            self.peer_id,
+            profile_field="routing_profile",
+        )
+        if grant is not None:
+            status = grant.get("status")
+            if status == "approved":
+                return PeerState(status="approved", trust_tier=grant.get("trust_tier"))
+            if status == "blocked":
+                return PeerState(status="blocked")
+
+        pairing = _find_direct_peer_record(
+            payload.get("pairings", []),
+            self.peer_id,
+            profile_field="requested_profile",
+        )
+        if pairing is not None:
+            status = pairing.get("status", "unknown")
+            if status == "approved":
+                status = "unknown"
             return PeerState(
-                status=peer.get("status", "unknown"),
-                pairing_code=peer.get("pairing_code"),
-                trust_tier=peer.get("trust_tier"),
+                status=_peer_status(status),
+                pairing_id=pairing.get("pairing_id"),
             )
         return PeerState(status="unknown")
 
@@ -105,7 +164,7 @@ class LionClawApi:
     ) -> SessionLatestSnapshot:
         params: dict[str, str] = {
             "channel_id": self.channel_id,
-            "peer_id": self.peer_id,
+            "peer_id": self.session_key,
         }
         if history_policy:
             params["history_policy"] = history_policy
@@ -138,7 +197,7 @@ class LionClawApi:
             "/v0/sessions/open",
             json={
                 "channel_id": self.channel_id,
-                "peer_id": self.peer_id,
+                "peer_id": self.session_key,
                 "trust_tier": trust_tier,
                 "history_policy": history_policy,
             },
@@ -169,17 +228,20 @@ class LionClawApi:
         )
 
     async def send_inbound(self, text: str, session_id: str | None = None) -> InboundResponse:
-        external_message_id = f"terminal-inbound:{self.consumer_id}:{self._inbound_sequence}"
+        event_id = (
+            f"terminal-inbound:{self.consumer_id}:"
+            f"{self._inbound_nonce}:{self._inbound_sequence}"
+        )
         payload: dict[str, Any] = {
             "channel_id": self.channel_id,
-            "peer_id": self.peer_id,
+            "event_id": event_id,
+            "sender_ref": self.peer_id,
+            "conversation_ref": self.peer_id,
             "text": text,
-            "external_message_id": external_message_id,
+            "attachments": [],
+            "trigger": "dm",
+            "provider_metadata": {"source": "channel-terminal"},
         }
-        if session_id:
-            payload["session_id"] = session_id
-        if self.runtime_id:
-            payload["runtime_id"] = self.runtime_id
         response = await self._client.post("/v0/channels/inbound", json=payload)
         _raise_for_status(response)
         data = response.json()
@@ -188,6 +250,8 @@ class LionClawApi:
             outcome=data["outcome"],
             turn_id=data.get("turn_id"),
             session_id=data.get("session_id"),
+            pairing_id=data.get("pairing_id"),
+            pairing_code=data.get("pairing_code"),
         )
 
     async def pull_stream(
@@ -235,6 +299,75 @@ class LionClawApi:
         )
         _raise_for_status(response)
 
+    async def pull_outbox(self, limit: int = 10, lease_ms: int = 120_000) -> list[OutboxDelivery]:
+        response = await self._client.post(
+            "/v0/channels/outbox/pull",
+            json={
+                "channel_id": self.channel_id,
+                "worker_id": self.consumer_id,
+                "conversation_ref": self.peer_id,
+                "limit": limit,
+                "lease_ms": lease_ms,
+            },
+        )
+        _raise_for_status(response)
+        payload = response.json()
+        deliveries = payload.get("deliveries")
+        if not isinstance(deliveries, list):
+            raise RuntimeError("outbox pull response missing deliveries array")
+        return [_parse_outbox_delivery(item) for item in deliveries]
+
+    async def report_outbox(
+        self,
+        delivery: OutboxDelivery,
+        outcome: str,
+        *,
+        provider_receipt: dict[str, Any] | None = None,
+        error_code: str | None = None,
+        error_text: str | None = None,
+    ) -> OutboxReportResponse:
+        response = await self._client.post(
+            "/v0/channels/outbox/report",
+            json={
+                "channel_id": self.channel_id,
+                "worker_id": self.consumer_id,
+                "delivery_id": delivery.delivery_id,
+                "attempt_id": delivery.attempt_id,
+                "outcome": outcome,
+                "provider_receipt": provider_receipt,
+                "error_code": error_code,
+                "error_text": error_text,
+            },
+        )
+        _raise_for_status(response)
+        payload = response.json()
+        return OutboxReportResponse(
+            accepted=bool(payload["accepted"]),
+            status=payload["status"],
+            attempt_status=payload["attempt_status"],
+        )
+
+
+def _find_direct_peer_record(
+    records: list[dict[str, Any]],
+    peer_id: str,
+    *,
+    profile_field: str,
+) -> dict[str, Any] | None:
+    for record in records:
+        if record.get("sender_ref") != peer_id:
+            continue
+        if record.get(profile_field) != "direct":
+            continue
+        return record
+    return None
+
+
+def _peer_status(value: Any) -> PeerStatus:
+    if value in ("pending", "approved", "blocked"):
+        return cast(PeerStatus, value)
+    return "unknown"
+
 
 def _parse_session_open_result(payload: dict[str, Any] | None) -> SessionOpenResult | None:
     if payload is None:
@@ -246,6 +379,42 @@ def _parse_session_open_result(payload: dict[str, Any] | None) -> SessionOpenRes
         trust_tier=payload["trust_tier"],
         history_policy=payload["history_policy"],
     )
+
+
+def _parse_outbox_delivery(item: dict[str, Any]) -> OutboxDelivery:
+    content = item.get("content")
+    if not isinstance(content, dict) or not isinstance(content.get("text"), str):
+        raise RuntimeError("outbox delivery missing content.text")
+    attachments = content.get("attachments", [])
+    if not isinstance(attachments, list):
+        raise RuntimeError("outbox delivery content.attachments must be an array")
+    return OutboxDelivery(
+        delivery_id=item["delivery_id"],
+        attempt_id=item["attempt_id"],
+        channel_id=item["channel_id"],
+        conversation_ref=item["conversation_ref"],
+        thread_ref=item.get("thread_ref"),
+        reply_to_ref=item.get("reply_to_ref"),
+        session_id=item.get("session_id"),
+        turn_id=item.get("turn_id"),
+        content=OutboxContent(
+            text=content["text"],
+            format_hint=content.get("format_hint") or "markdown",
+            attachments=[
+                OutboxAttachment(
+                    attachment_id=attachment["attachment_id"],
+                    path=attachment["path"],
+                    filename=attachment.get("filename"),
+                    mime_type=attachment.get("mime_type"),
+                )
+                for attachment in attachments
+            ],
+        ),
+    )
+
+
+def _encode_session_key_part(value: str) -> str:
+    return value.replace("%", "%25").replace(":", "%3A")
 
 
 def _raise_for_status(response: httpx.Response) -> None:

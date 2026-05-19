@@ -14,9 +14,11 @@ use chrono::{Duration as ChronoDuration, Utc};
 use lionclaw::{
     applied::AppliedState,
     contracts::{
-        ChannelStreamPullRequest, ChannelStreamStartMode, JobCreateRequest, JobRefRequest,
-        JobRunsRequest, SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery,
-        SessionOpenRequest, SessionTurnRequest, StreamEventKindDto, TrustTier,
+        ChannelInboundRequest, ChannelOutboxPullRequest, ChannelOutboxReportOutcomeDto,
+        ChannelOutboxReportRequest, ChannelPairingApproveRequest, ChannelTrigger, JobCreateRequest,
+        JobRefRequest, JobRunsRequest, SchedulerJobDeliveryStatusDto, SessionHistoryPolicy,
+        SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest, SessionTurnRequest,
+        TrustTier,
     },
     home::LionClawHome,
     kernel::{
@@ -26,7 +28,7 @@ use lionclaw::{
             RuntimeExecutionProfile, RuntimeMessageLane, RuntimeSessionHandle,
             RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult, WorkspaceAccess,
         },
-        InboundChannelText, Kernel, KernelError, KernelOptions,
+        Kernel, KernelError, KernelOptions,
     },
     operator::{
         config::ChannelLaunchMode,
@@ -776,12 +778,13 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
             ..KernelOptions::default()
         })
         .await;
-    approve_channel_peer(&kernel, "terminal", "alice").await;
+    approve_channel_grant(&kernel, "terminal", "alice").await;
+    let terminal_session_key = "channel:terminal:direct:alice".to_string();
 
     let seed_session = kernel
         .open_session(SessionOpenRequest {
             channel_id: "terminal".to_string(),
-            peer_id: "alice".to_string(),
+            peer_id: terminal_session_key.clone(),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -799,7 +802,9 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
             allow_capabilities: vec!["fs.read".to_string()],
             delivery: Some(lionclaw::contracts::JobDeliveryTargetDto {
                 channel_id: "terminal".to_string(),
-                peer_id: "alice".to_string(),
+                conversation_ref: "alice".to_string(),
+                thread_ref: None,
+                reply_to_ref: None,
             }),
             retry_attempts: Some(0),
         })
@@ -836,7 +841,7 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
     let latest_terminal = kernel
         .latest_session_snapshot(SessionLatestQuery {
             channel_id: "terminal".to_string(),
-            peer_id: "alice".to_string(),
+            peer_id: terminal_session_key,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
         .await
@@ -849,24 +854,20 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
         seed_session.session_id
     );
 
-    let stream = kernel
-        .pull_channel_stream(ChannelStreamPullRequest {
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
             channel_id: "terminal".to_string(),
-            consumer_id: "scheduler-test".to_string(),
-            start_mode: Some(ChannelStreamStartMode::Resume),
-            start_after_sequence: None,
+            worker_id: "scheduler-test".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
             limit: Some(20),
-            wait_ms: Some(0),
+            lease_ms: Some(120_000),
         })
         .await
-        .expect("pull terminal stream");
-    assert!(stream.events.iter().any(|event| {
-        event.kind == StreamEventKindDto::MessageDelta
-            && event
-                .text
-                .as_deref()
-                .is_some_and(|text| text.contains("[mock]"))
-    }));
+        .expect("pull terminal outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    assert_eq!(outbox.deliveries[0].conversation_ref, "alice");
+    assert!(outbox.deliveries[0].content.text.contains("[mock]"));
 
     let interactive = kernel
         .open_session(SessionOpenRequest {
@@ -925,7 +926,9 @@ async fn scheduled_job_failure_delivers_summary_and_dead_letters() {
             allow_capabilities: Vec::new(),
             delivery: Some(lionclaw::contracts::JobDeliveryTargetDto {
                 channel_id: "terminal".to_string(),
-                peer_id: "bob".to_string(),
+                conversation_ref: "bob".to_string(),
+                thread_ref: None,
+                reply_to_ref: None,
             }),
             retry_attempts: Some(0),
         })
@@ -959,27 +962,51 @@ async fn scheduled_job_failure_delivers_summary_and_dead_letters() {
     );
     assert_eq!(
         runs[0].delivery_status,
-        Some(lionclaw::contracts::SchedulerJobDeliveryStatusDto::Delivered)
+        Some(SchedulerJobDeliveryStatusDto::Pending)
     );
 
-    let stream = kernel
-        .pull_channel_stream(ChannelStreamPullRequest {
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
             channel_id: "terminal".to_string(),
-            consumer_id: "scheduler-failure-test".to_string(),
-            start_mode: Some(ChannelStreamStartMode::Resume),
-            start_after_sequence: None,
+            worker_id: "scheduler-failure-test".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
             limit: Some(20),
-            wait_ms: Some(0),
+            lease_ms: Some(120_000),
         })
         .await
-        .expect("pull failure delivery stream");
-    assert!(stream.events.iter().any(|event| {
-        event.kind == StreamEventKindDto::MessageDelta
-            && event
-                .text
-                .as_deref()
-                .is_some_and(|text| text.contains("Scheduled job 'failing brief' failed"))
-    }));
+        .expect("pull failure delivery outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    assert!(outbox.deliveries[0]
+        .content
+        .text
+        .contains("Scheduled job 'failing brief' failed"));
+
+    kernel
+        .report_channel_outbox(ChannelOutboxReportRequest {
+            delivery_id: outbox.deliveries[0].delivery_id,
+            attempt_id: outbox.deliveries[0].attempt_id,
+            channel_id: "terminal".to_string(),
+            worker_id: "scheduler-failure-test".to_string(),
+            outcome: ChannelOutboxReportOutcomeDto::Delivered,
+            provider_receipt: Some(serde_json::json!({"message_id": "provider-1"})),
+            error_code: None,
+            error_text: None,
+        })
+        .await
+        .expect("report delivered scheduler failure outbox");
+    let runs = kernel
+        .list_job_runs(JobRunsRequest {
+            job_id: created.job.job_id,
+            limit: Some(5),
+        })
+        .await
+        .expect("list failing runs after outbox report")
+        .runs;
+    assert_eq!(
+        runs[0].delivery_status,
+        Some(SchedulerJobDeliveryStatusDto::Delivered)
+    );
 }
 
 #[tokio::test]
@@ -1465,38 +1492,36 @@ async fn install_and_bind_channel(env: &TestEnv, channel_id: &str, skill_name: &
     .expect("bind channel");
 }
 
-async fn approve_channel_peer(kernel: &Kernel, channel_id: &str, peer_id: &str) {
-    let _ = kernel
-        .process_inbound_channel_text(InboundChannelText {
+async fn approve_channel_grant(kernel: &Kernel, channel_id: &str, peer_id: &str) {
+    let response = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
             channel_id: channel_id.to_string(),
-            peer_id: peer_id.to_string(),
-            text: "seed approval".to_string(),
-            session_id: None,
-            runtime_id: Some("mock".to_string()),
-            update_id: Some(1),
-            external_message_id: Some(format!("seed-{channel_id}-{peer_id}")),
+            event_id: format!("seed-{channel_id}-{peer_id}"),
+            sender_ref: peer_id.to_string(),
+            conversation_ref: peer_id.to_string(),
+            thread_ref: None,
+            message_ref: Some(format!("seed-{channel_id}-{peer_id}")),
+            text: Some("seed approval".to_string()),
+            attachments: Vec::new(),
+            reply_to_ref: None,
+            trigger: ChannelTrigger::Dm,
+            received_at: None,
+            provider_metadata: serde_json::json!({}),
         })
         .await
-        .expect("seed pending peer");
-    let peers = kernel
-        .list_channel_peers(Some(channel_id.to_string()))
-        .await
-        .expect("list channel peers");
-    let pairing_code = peers
-        .peers
-        .iter()
-        .find(|peer| peer.peer_id == peer_id)
-        .and_then(|peer| peer.pairing_code.clone())
-        .expect("pairing code");
+        .expect("seed pending pairing");
+    let pairing_code = response.pairing_code.expect("pairing code");
     kernel
-        .approve_channel_peer(lionclaw::contracts::ChannelPeerApproveRequest {
+        .approve_channel_pairing(ChannelPairingApproveRequest {
             channel_id: channel_id.to_string(),
-            peer_id: peer_id.to_string(),
-            pairing_code,
+            pairing_id: None,
+            pairing_code: Some(pairing_code),
+            label: None,
+            routing_profile: None,
             trust_tier: Some(TrustTier::Main),
         })
         .await
-        .expect("approve channel peer");
+        .expect("approve channel pairing");
 }
 
 struct TestEnv {

@@ -170,9 +170,11 @@ message through the terminal UI.
 
 Expected:
 
-- pairing approval is explicit
+- scoped grant approval is explicit
 - the channel response comes from the configured runtime
 - `lionclaw logs -f` can inspect the selected instance without raw HTTP
+- `doctor` surfaces channel pairing/outbox state and worker health without
+  contacting provider APIs
 
 Telegram is credential-gated manual QA. Run it only when a real bot token and
 chat flow are available; do not fake Telegram with local shims in this
@@ -186,9 +188,32 @@ printf 'TELEGRAM_BOT_TOKEN=...\n' > telegram.env
 
 Expected when credentials are available:
 
+- the default runtime image can run common assistant probes such as
+  `codex --version`, `opencode --version`, `python3 --version`,
+  `ffprobe -version`, `file --version`, `jq --version`, and `pdftotext -v`
 - the token is stored in selected-instance private channel env
-- `doctor` does not print the token
-- Telegram delivery works through the configured runtime after peer approval
+- `doctor` does not print the token and shows the latest Telegram worker health
+  report after the worker has submitted one
+- a DM pairing link shaped like `https://t.me/<bot_username>?start=lc_<token>`
+  claims through the kernel and does not start an agent turn
+- a group invite shaped like
+  `https://t.me/<bot_username>?startgroup=lc_<token>` claims where Telegram
+  exposes the payload to the bot
+- unknown targeted Telegram senders receive a pending approval hint and no
+  provider files are downloaded before approval
+- Telegram delivery works through the configured runtime after scoped grant
+  approval
+- a forum topic with a thread grant keeps replies in the same Telegram topic
+- a conversation grant used inside a topic follows the channel scoped-grant
+  behavior from Channels v2
+- a photo, document, voice, or video attachment reaches the runtime under
+  `/attachments/...`
+- a runtime-generated image is returned to Telegram as a native media
+  attachment, even when the runtime final text is empty
+- Markdown in runtime answers renders as Telegram formatting, and local
+  workspace links are shown as labels rather than broken Telegram links
+- a retryable Telegram delivery failure survives worker restart and is retried
+  through the outbox lease/report flow
 
 If credentials are not available, record this subphase as skipped with
 `missing Telegram bot token`.
@@ -212,6 +237,8 @@ Expected:
 - the managed daemon is active
 - configured background workers are active
 - `doctor` reports stable `[LC-D...]` findings when there is drift
+- `doctor` warns when a configured background channel has no worker health
+  report or its latest report is more than ten minutes old
 - `doctor` does not repair, start, stop, allocate, or rewrite state
 - `down` stops only units owned by the selected instance
 
@@ -233,7 +260,7 @@ cd "$PROJ_A"
   --schedule "every 1d" \
   --prompt "Reply with exactly JOB_OK and nothing else." \
   --deliver-channel terminal \
-  --deliver-peer "${USER:-local}"
+  --deliver-conversation "${USER:-local}"
 "$LIONCLAW_BIN" job ls
 "$LIONCLAW_BIN" job run qa-brief
 "$LIONCLAW_BIN" job runs qa-brief
@@ -243,7 +270,7 @@ cd "$PROJ_A"
 Expected:
 
 - manual job run succeeds
-- delivery reaches the approved channel peer
+- delivery is enqueued, then reaches the approved channel conversation after the worker reports provider delivery
 - job history is visible through the CLI
 
 ## Phase 8: Doctor Diagnostics
@@ -358,6 +385,8 @@ Expected:
 
 - every finding has `[LC-D...]`, severity, target, expected, and observed
 - every finding has a read-only `inspect` command
+- channel observations may include latest worker health checks, but provider
+  diagnostics remain worker-reported rather than doctor-performed
 - optional `repair` commands are explicit LionClaw or platform commands
 - info and warnings exit 0
 - errors exit 1
