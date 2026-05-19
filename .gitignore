@@ -1,5 +1,6 @@
 /target/
 /dist/
+/site/public/
 **/*.log
 **/__pycache__/
 **/*.pyc

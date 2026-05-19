@@ -1,0 +1,10 @@
+base_url = "https://lionclaw.co.ke"
+title = "LionClaw"
+description = "LionClaw gives real agent CLIs a local home in your project: sessions, state, channels, jobs, and audit."
+
+compile_sass = false
+build_search_index = false
+
+[markdown]
+smart_punctuation = true
+

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="description" content="{% block description %}{{ config.description }}{% endblock description %}">
+    <meta property="og:title" content="{% block og_title %}{{ config.title }}{% endblock og_title %}">
+    <meta property="og:description" content="{% block og_description %}{{ config.description }}{% endblock og_description %}">
+    <meta property="og:type" content="{% block og_type %}website{% endblock og_type %}">
+    <title>{% block title %}{{ config.title }}{% endblock title %}</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="page">
+      <header class="topbar">
+        <a class="brand" href="/">LionClaw</a>
+        <nav aria-label="Site">
+          <a href="/#start">Start</a>
+          <a href="/#why">Why</a>
+          <a href="/blog/">Blog</a>
+          <a href="https://github.com/moshthepitt/lionclaw" rel="noopener noreferrer">GitHub</a>
+        </nav>
+      </header>
+
+      <main>
+        {% block content %}{% endblock content %}
+      </main>
+
+      <footer class="site-footer">
+        <a href="https://github.com/moshthepitt/lionclaw" rel="noopener noreferrer">GitHub</a>
+        <span aria-hidden="true"> / </span>
+        <a href="https://jayanoris.com/blog/posts/2026-05-14-lionclaw.html" rel="noopener noreferrer">Why I built it</a>
+      </footer>
+    </div>
+  </body>
+</html>
