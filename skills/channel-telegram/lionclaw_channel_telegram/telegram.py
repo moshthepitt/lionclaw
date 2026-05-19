@@ -265,7 +265,7 @@ class AiogramTelegramTransport:
         chat_id = _coerce_chat_id(conversation_ref)
         reply_parameters = _reply_parameters(reply_to_ref)
         message_thread_id = _coerce_thread_id(thread_ref, omit_general=True)
-        sent_messages = _receipt_messages(resume_receipt)
+        sent_messages = _receipt_messages(resume_receipt, chat_id=chat_id)
         resume_count = len(sent_messages)
         if sent_messages:
             reply_parameters = _reply_parameters(str(sent_messages[-1]["message_id"]))
@@ -637,25 +637,72 @@ def _message_receipt(message: Message) -> dict[str, Any]:
     }
 
 
-def _receipt_messages(receipt: dict[str, Any] | None) -> list[dict[str, Any]]:
+def _receipt_messages(
+    receipt: dict[str, Any] | None,
+    *,
+    chat_id: int | str,
+) -> list[dict[str, Any]]:
     if receipt is None:
         return []
     messages = receipt.get("messages")
-    if not isinstance(messages, list):
+    if messages is None:
         messages = [receipt]
+    elif not isinstance(messages, list):
+        raise TelegramReferenceError("telegram resume receipt messages must be a list")
+    if not messages:
+        raise TelegramReferenceError("telegram resume receipt has no messages")
     parsed: list[dict[str, Any]] = []
     for message in messages:
         if not isinstance(message, dict):
-            continue
-        if message.get("message_id") is None or message.get("chat_id") is None:
-            continue
+            raise TelegramReferenceError(
+                "telegram resume receipt message must be an object"
+            )
+        message_id = _coerce_receipt_message_id(message.get("message_id"))
+        receipt_chat_id = _coerce_receipt_chat_id(message.get("chat_id"))
+        if message_id is None:
+            raise TelegramReferenceError(
+                "telegram resume receipt message has invalid message_id"
+            )
+        if receipt_chat_id is None:
+            raise TelegramReferenceError(
+                "telegram resume receipt message has invalid chat_id"
+            )
+        if receipt_chat_id != chat_id:
+            raise TelegramReferenceError(
+                "telegram resume receipt chat_id does not match delivery chat"
+            )
         parsed.append(
             {
-                "message_id": message["message_id"],
-                "chat_id": message["chat_id"],
+                "message_id": message_id,
+                "chat_id": str(receipt_chat_id),
             }
         )
     return parsed
+
+
+def _coerce_receipt_message_id(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str):
+        parsed = _coerce_message_id(value)
+        if parsed is not None and parsed > 0:
+            return parsed
+    return None
+
+
+def _coerce_receipt_chat_id(value: object) -> int | str | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return _coerce_chat_id(value)
+        except TelegramReferenceError:
+            return None
+    return None
 
 
 def _receipt_from_messages(messages: list[dict[str, Any]]) -> dict[str, Any]:
