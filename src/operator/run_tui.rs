@@ -1,6 +1,6 @@
 use std::{
     io::{self, Stdout},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -74,6 +74,7 @@ const DEFAULT_ACTIVITY_PAGE_SCROLL: usize = 8;
 const COMPOSER_MIN_HEIGHT: u16 = 6;
 const COMPOSER_MAX_HEIGHT: u16 = 12;
 const COMPOSER_CHROME_HEIGHT: u16 = 4;
+const KV_LABEL_WIDTH: usize = 16;
 const LOCAL_CLI_CHANNEL_ID: &str = "local-cli";
 const PROJECT_SESSION_LIMIT: usize = 5;
 const ACTIVITY_ERROR_MARKERS: &[&str] = &["error", "failed", "denied"];
@@ -238,7 +239,7 @@ struct BoundarySummary {
     workspace: String,
     network: String,
     secrets: String,
-    timeout: String,
+    turn_timeout: String,
     preset: String,
 }
 
@@ -248,6 +249,29 @@ impl BoundarySummary {
             "read-write" => "rw",
             "read-only" => "ro",
             other => other,
+        }
+    }
+
+    fn workspace_display(&self) -> &str {
+        match self.workspace.as_str() {
+            "rw" => "read-write",
+            "ro" => "read-only",
+            other => other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundaryDisplayRow {
+    label: &'static str,
+    value: String,
+}
+
+impl BoundaryDisplayRow {
+    fn new(label: &'static str, value: impl Into<String>) -> Self {
+        Self {
+            label,
+            value: value.into(),
         }
     }
 }
@@ -572,27 +596,94 @@ impl KeyHint {
     }
 }
 
-const FOOTER_KEY_HINTS: &[KeyHint] = &[
-    KeyHint::new("Ctrl+P", "Commands", "open commands and help"),
-    KeyHint::new("Tab", "Focus", "move focus"),
-    KeyHint::new("Ctrl+C", "Interrupt", "interrupt active turn"),
-    KeyHint::new("Ctrl+D", "Exit", "exit when idle"),
-];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalCommand {
+    Commands,
+    NextFocus,
+    PreviousFocus,
+    InterruptOrConfirmExit,
+    Exit,
+}
 
-const HELP_GLOBAL_KEY_HINTS: &[KeyHint] = &[
-    KeyHint::new("Ctrl+P", "Commands", "open commands and help"),
-    KeyHint::new("Tab", "Next focus", "move focus to the next pane"),
-    KeyHint::new(
-        "Shift+Tab",
-        "Previous focus",
-        "move focus to the previous pane",
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeyChord {
+    code: KeyCode,
+    modifiers: KeyModifiers,
+}
+
+impl KeyChord {
+    const fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
+        Self { code, modifiers }
+    }
+
+    fn matches(self, key: KeyEvent) -> bool {
+        key.code == self.code && key.modifiers == self.modifiers
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GlobalKeyBinding {
+    chord: KeyChord,
+    hint: KeyHint,
+    command: GlobalCommand,
+    show_in_footer: bool,
+}
+
+impl GlobalKeyBinding {
+    const fn new(
+        chord: KeyChord,
+        hint: KeyHint,
+        command: GlobalCommand,
+        show_in_footer: bool,
+    ) -> Self {
+        Self {
+            chord,
+            hint,
+            command,
+            show_in_footer,
+        }
+    }
+}
+
+const GLOBAL_KEY_BINDINGS: &[GlobalKeyBinding] = &[
+    GlobalKeyBinding::new(
+        KeyChord::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        KeyHint::new("Ctrl+P", "Commands", "open commands and help"),
+        GlobalCommand::Commands,
+        true,
     ),
-    KeyHint::new(
-        "Ctrl+C",
-        "Interrupt",
-        "interrupt an active turn; confirm exit when idle",
+    GlobalKeyBinding::new(
+        KeyChord::new(KeyCode::Tab, KeyModifiers::NONE),
+        KeyHint::new("Tab", "Focus", "move focus to the next pane"),
+        GlobalCommand::NextFocus,
+        true,
     ),
-    KeyHint::new("Ctrl+D", "Exit", "exit when idle"),
+    GlobalKeyBinding::new(
+        KeyChord::new(KeyCode::BackTab, KeyModifiers::NONE),
+        KeyHint::new(
+            "Shift+Tab",
+            "Previous focus",
+            "move focus to the previous pane",
+        ),
+        GlobalCommand::PreviousFocus,
+        false,
+    ),
+    GlobalKeyBinding::new(
+        KeyChord::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        KeyHint::new(
+            "Ctrl+C",
+            "Interrupt",
+            "interrupt an active turn; confirm exit when idle",
+        ),
+        GlobalCommand::InterruptOrConfirmExit,
+        true,
+    ),
+    GlobalKeyBinding::new(
+        KeyChord::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        KeyHint::new("Ctrl+D", "Exit", "exit when idle"),
+        GlobalCommand::Exit,
+        true,
+    ),
 ];
 
 const HELP_CONTEXT_KEY_HINTS: &[KeyHint] = &[
@@ -1012,7 +1103,7 @@ impl ConsoleApp {
                 workspace: "blocked".to_string(),
                 network: "blocked".to_string(),
                 secrets: "blocked".to_string(),
-                timeout: "-".to_string(),
+                turn_timeout: "-".to_string(),
                 preset: "-".to_string(),
             },
         }
@@ -1625,7 +1716,7 @@ fn resolve_boundary_summary(
         } else {
             "off".to_string()
         },
-        timeout: if timeouts.idle == timeouts.hard {
+        turn_timeout: if timeouts.idle == timeouts.hard {
             crate::runtime_timeouts::format_duration(timeouts.hard)
         } else {
             format!(
@@ -2022,16 +2113,12 @@ async fn handle_key(
         return;
     }
 
+    if let Some(command) = global_command_for(key) {
+        handle_global_command(app, command);
+        return;
+    }
+
     match (key.code, key.modifiers) {
-        (KeyCode::Char('p'), KeyModifiers::CONTROL) => app.overlay = Some(Overlay::Help),
-        (KeyCode::Tab, _) => {
-            app.focus = app.focus.next(app.project_mode());
-            app.status = format!("focus: {}", app.focus.label());
-        }
-        (KeyCode::BackTab, _) => {
-            app.focus = app.focus.previous(app.project_mode());
-            app.status = format!("focus: {}", app.focus.label());
-        }
         (KeyCode::Esc, _) => {
             app.composer.clear();
             app.status = "composer cleared".to_string();
@@ -2040,27 +2127,6 @@ async fn handle_key(
             app.activate_project_cursor().await;
         }
         (KeyCode::Enter, _) => app.submit_composer(backend_tx),
-        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-            if app.active() {
-                app.status = "finish the active turn before exiting".to_string();
-            } else {
-                app.should_quit = true;
-            }
-        }
-        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-            if app.active() {
-                if let Some(cancel_tx) = app.active_turn_cancel.take() {
-                    match cancel_tx.send("turn interrupted from operator console".to_string()) {
-                        Ok(()) => app.status = "interrupt requested".to_string(),
-                        Err(_) => app.status = "interrupt already completed".to_string(),
-                    }
-                } else {
-                    app.status = "interrupt already requested".to_string();
-                }
-            } else {
-                app.overlay = Some(Overlay::ExitConfirm);
-            }
-        }
         (KeyCode::Up, _) if app.focus == Focus::Project => {
             app.move_project_cursor(-1);
         }
@@ -2123,6 +2189,48 @@ async fn handle_key(
             app.composer.handle_key(key);
         }
         _ => {}
+    }
+}
+
+fn global_command_for(key: KeyEvent) -> Option<GlobalCommand> {
+    GLOBAL_KEY_BINDINGS
+        .iter()
+        .find(|binding| binding.chord.matches(key))
+        .map(|binding| binding.command)
+}
+
+fn handle_global_command(app: &mut ConsoleApp, command: GlobalCommand) {
+    match command {
+        GlobalCommand::Commands => app.overlay = Some(Overlay::Help),
+        GlobalCommand::NextFocus => {
+            app.focus = app.focus.next(app.project_mode());
+            app.status = format!("focus: {}", app.focus.label());
+        }
+        GlobalCommand::PreviousFocus => {
+            app.focus = app.focus.previous(app.project_mode());
+            app.status = format!("focus: {}", app.focus.label());
+        }
+        GlobalCommand::InterruptOrConfirmExit => {
+            if app.active() {
+                if let Some(cancel_tx) = app.active_turn_cancel.take() {
+                    match cancel_tx.send("turn interrupted from operator console".to_string()) {
+                        Ok(()) => app.status = "interrupt requested".to_string(),
+                        Err(_) => app.status = "interrupt already completed".to_string(),
+                    }
+                } else {
+                    app.status = "interrupt already requested".to_string();
+                }
+            } else {
+                app.overlay = Some(Overlay::ExitConfirm);
+            }
+        }
+        GlobalCommand::Exit => {
+            if app.active() {
+                app.status = "finish the active turn before exiting".to_string();
+            } else {
+                app.should_quit = true;
+            }
+        }
     }
 }
 
@@ -2252,7 +2360,8 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
         Span::raw("    "),
         Span::styled(workspace, Style::default().fg(Color::White)),
         Span::raw("    "),
-        Span::styled(boundary.timeout, Style::default().fg(Color::White)),
+        Span::styled("turn:", Style::default().fg(PANEL_BORDER)),
+        Span::styled(boundary.turn_timeout, Style::default().fg(Color::White)),
     ]);
     frame.render_widget(
         Paragraph::new(line),
@@ -2867,6 +2976,7 @@ fn render_inspector(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
 }
 
 fn render_project_cursor_inspector(frame: &mut Frame<'_>, content: Rect, app: &ConsoleApp) {
+    let row_width = inspector_body(content).width as usize;
     match app.project_cursor {
         ProjectSelection::Instance(index) => {
             let Some(instance) = app.instances.get(index) else {
@@ -2910,7 +3020,7 @@ fn render_project_cursor_inspector(frame: &mut Frame<'_>, content: Rect, app: &C
                 lines.push(kv_line("default", "yes"));
             }
             if let Some(work_root) = instance.work_root.as_ref() {
-                lines.push(kv_line("work root", &work_root.display().to_string()));
+                lines.push(kv_path_line("work root", work_root, row_width));
             }
             if let Some(reason) = instance.work_root_finding.as_deref() {
                 lines.push(kv_line("reason", reason));
@@ -2975,10 +3085,7 @@ fn render_project_cursor_inspector(frame: &mut Frame<'_>, content: Rect, app: &C
 fn render_inspector_lines(frame: &mut Frame<'_>, content: Rect, lines: Vec<Line<'static>>) {
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
-        content.inner(Margin {
-            vertical: 1,
-            horizontal: 1,
-        }),
+        inspector_body(content),
     );
 }
 
@@ -2998,10 +3105,7 @@ fn render_instance_inspector(frame: &mut Frame<'_>, content: Rect, app: &Console
         ]);
         frame.render_widget(
             Paragraph::new(text).wrap(Wrap { trim: false }),
-            content.inner(Margin {
-                vertical: 1,
-                horizontal: 1,
-            }),
+            inspector_body(content),
         );
         return;
     }
@@ -3010,6 +3114,7 @@ fn render_instance_inspector(frame: &mut Frame<'_>, content: Rect, app: &Console
         return;
     };
     let boundary = app.boundary_summary();
+    let row_width = inspector_body(content).width as usize;
     let mut lines = vec![
         section_line("●", "Selected"),
         Line::raw(""),
@@ -3019,20 +3124,19 @@ fn render_instance_inspector(frame: &mut Frame<'_>, content: Rect, app: &Console
         kv_line("session", &short_session_id(ready.session_id)),
     ];
     if let Some(work_root) = ready.summary.work_root.as_ref() {
-        lines.push(kv_line("work root", &work_root.display().to_string()));
+        lines.push(kv_path_line("work root", work_root, row_width));
     }
     lines.extend([
         kv_line("preset", &boundary.preset),
+        kv_line("turn timeout", &boundary.turn_timeout),
         Line::raw(""),
         section_line("▱", "Boundary"),
         Line::raw(""),
-        kv_arrow_line("/workspace", "repo", &boundary.workspace),
-        kv_arrow_line("/runtime", "session", "private"),
-        kv_arrow_line("/lionclaw/skills", "", "ro"),
-        Line::raw(""),
-        section_line("◎", "Network"),
-        Line::raw(""),
-        Line::raw(format!("  {}", boundary.network)),
+    ]);
+    for row in boundary_display_rows(&boundary) {
+        lines.push(kv_line(row.label, &row.value));
+    }
+    lines.extend([
         Line::raw(""),
         section_line("⚿", "Secrets"),
         Line::raw(""),
@@ -3063,10 +3167,7 @@ fn render_instance_inspector(frame: &mut Frame<'_>, content: Rect, app: &Console
 
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
-        content.inner(Margin {
-            vertical: 1,
-            horizontal: 1,
-        }),
+        inspector_body(content),
     );
 }
 
@@ -3187,7 +3288,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
     if area.height < 3 || area.width < 4 {
         return;
     }
-    let mut spans = footer_hint_spans(FOOTER_KEY_HINTS);
+    let mut spans = footer_hint_spans();
     if app.focus == Focus::Project {
         spans.push(Span::raw("  "));
         spans.push(key_span("Enter"));
@@ -3207,6 +3308,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp) {
             height: 1,
         },
     );
+}
+
+fn inspector_body(content: Rect) -> Rect {
+    content.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    })
 }
 
 fn render_panel_shell(frame: &mut Frame<'_>, area: Rect, title: &str, focused: bool) -> Rect {
@@ -3313,22 +3421,29 @@ fn section_line(icon: &'static str, label: &'static str) -> Line<'static> {
 
 fn kv_line(label: &'static str, value: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("  {label:<10}"), Style::default().fg(PANEL_MUTED)),
+        Span::styled(
+            format!("  {label:<KV_LABEL_WIDTH$}"),
+            Style::default().fg(PANEL_MUTED),
+        ),
         Span::raw(value.to_string()),
     ])
 }
 
-fn kv_arrow_line(left: &'static str, middle: &'static str, right: &str) -> Line<'static> {
-    let target = if middle.is_empty() {
-        right.to_string()
-    } else {
-        format!("{middle} {right}")
-    };
-    Line::from(vec![
-        Span::raw(format!("  {left:<18}")),
-        Span::styled("->  ", Style::default().fg(PANEL_BORDER)),
-        Span::raw(target),
-    ])
+fn kv_path_line(label: &'static str, path: &Path, row_width: usize) -> Line<'static> {
+    let value_width = row_width.saturating_sub(KV_LABEL_WIDTH + 2);
+    kv_line(
+        label,
+        &middle_elide(&path.display().to_string(), value_width),
+    )
+}
+
+fn boundary_display_rows(boundary: &BoundarySummary) -> Vec<BoundaryDisplayRow> {
+    vec![
+        BoundaryDisplayRow::new("workspace", boundary.workspace_display()),
+        BoundaryDisplayRow::new("network", boundary.network.clone()),
+        BoundaryDisplayRow::new("runtime home", "private"),
+        BoundaryDisplayRow::new("skills snapshots", "read-only"),
+    ]
 }
 
 fn activity_item_lines(item: &ActivityItem) -> Vec<Line<'static>> {
@@ -3358,12 +3473,16 @@ fn key_span(key: &'static str) -> Span<'static> {
     )
 }
 
-fn footer_hint_spans(hints: &[KeyHint]) -> Vec<Span<'static>> {
+fn footer_hint_spans() -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    for hint in hints {
+    for binding in GLOBAL_KEY_BINDINGS
+        .iter()
+        .filter(|binding| binding.show_in_footer)
+    {
         if !spans.is_empty() {
             spans.push(Span::raw("   "));
         }
+        let hint = binding.hint;
         spans.push(key_span(hint.key));
         spans.push(Span::raw(" "));
         spans.push(Span::raw(hint.label));
@@ -3380,25 +3499,61 @@ fn help_overlay_lines() -> Vec<Line<'static>> {
         Line::from("/lionclaw exit"),
         Line::raw(""),
     ];
-    push_help_section(&mut lines, "Global", HELP_GLOBAL_KEY_HINTS);
+    push_global_help_section(&mut lines);
     lines.push(Line::raw(""));
     push_help_section(&mut lines, "Context", HELP_CONTEXT_KEY_HINTS);
     lines
 }
 
+fn push_global_help_section(lines: &mut Vec<Line<'static>>) {
+    lines.push(section_line("▣", "Global"));
+    for binding in GLOBAL_KEY_BINDINGS {
+        push_help_hint(lines, binding.hint);
+    }
+}
+
 fn push_help_section(lines: &mut Vec<Line<'static>>, title: &'static str, hints: &[KeyHint]) {
     lines.push(section_line("▣", title));
     for hint in hints {
-        lines.push(Line::from(vec![
-            key_span(hint.key),
-            Span::raw("  "),
-            Span::raw(hint.description),
-        ]));
+        push_help_hint(lines, *hint);
     }
+}
+
+fn push_help_hint(lines: &mut Vec<Line<'static>>, hint: KeyHint) {
+    lines.push(Line::from(vec![
+        key_span(hint.key),
+        Span::raw("  "),
+        Span::raw(hint.description),
+    ]));
 }
 
 fn truncate_to(value: &str, width: usize) -> String {
     value.chars().take(width).collect()
+}
+
+fn middle_elide(value: &str, width: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= width {
+        return value.to_string();
+    }
+    if width <= 3 {
+        return truncate_to(value, width);
+    }
+
+    let marker = "...";
+    let visible = width - marker.len();
+    let head_count = visible / 2;
+    let tail_count = visible - head_count;
+    let head = value.chars().take(head_count).collect::<String>();
+    let tail = value
+        .chars()
+        .rev()
+        .take(tail_count)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{head}{marker}{tail}")
 }
 
 fn classify_activity_status(text: &str) -> ActivityItemKind {
@@ -3987,7 +4142,7 @@ mod tests {
                     workspace: "rw".to_string(),
                     network: "none".to_string(),
                     secrets: "staged".to_string(),
-                    timeout: "2h".to_string(),
+                    turn_timeout: "2h".to_string(),
                     preset: "everyday".to_string(),
                 },
                 kernel,
@@ -4031,6 +4186,11 @@ mod tests {
         assert!(rendered.contains("Boundary"));
         assert!(rendered.contains("session"));
         assert!(rendered.contains("work root"));
+        assert!(rendered.contains("turn:2h"));
+        assert!(rendered.contains("turn timeout"));
+        assert!(rendered.contains("skills snapshots"));
+        assert!(rendered.contains("read-only"));
+        assert!(!rendered.contains("/lionclaw/skills"));
         assert!(rendered.contains("Ask through the selected runtime"));
         assert!(!rendered.contains("runtime controls pass through"));
         assert!(rendered.contains("Ctrl+P"));
@@ -4299,7 +4459,7 @@ mod tests {
                 workspace: "rw".to_string(),
                 network: "none".to_string(),
                 secrets: "off".to_string(),
-                timeout: "2h".to_string(),
+                turn_timeout: "2h".to_string(),
                 preset: "test".to_string(),
             },
             kernel,
@@ -4487,7 +4647,40 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_d_exits_and_function_keys_are_not_bound() {
+    fn documented_global_shortcuts_route_through_keymap() {
+        assert_eq!(
+            global_command_for(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            Some(GlobalCommand::Commands)
+        );
+        assert_eq!(
+            global_command_for(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(GlobalCommand::NextFocus)
+        );
+        assert_eq!(
+            global_command_for(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)),
+            Some(GlobalCommand::PreviousFocus)
+        );
+        assert_eq!(
+            global_command_for(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(GlobalCommand::InterruptOrConfirmExit)
+        );
+        assert_eq!(
+            global_command_for(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            Some(GlobalCommand::Exit)
+        );
+
+        let footer = footer_hint_spans()
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(footer.contains("Ctrl+P Commands"));
+        assert!(footer.contains("Tab Focus"));
+        assert!(footer.contains("Ctrl+C Interrupt"));
+        assert!(footer.contains("Ctrl+D Exit"));
+    }
+
+    #[test]
+    fn ctrl_d_exits_when_idle() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -4498,33 +4691,47 @@ mod tests {
         runtime.block_on(async {
             handle_key(
                 &mut app,
-                KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
-                &backend_tx,
-            )
-            .await;
-        });
-        assert!(!app.should_quit);
-        assert!(app.overlay.is_none());
-
-        runtime.block_on(async {
-            handle_key(
-                &mut app,
-                KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
-                &backend_tx,
-            )
-            .await;
-        });
-        assert!(!app.should_quit);
-
-        runtime.block_on(async {
-            handle_key(
-                &mut app,
                 KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
                 &backend_tx,
             )
             .await;
         });
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn compact_path_display_preserves_edges() {
+        let path = Path::new("/home/mosh/mosh/misc/projects/example-with-a-very-long-name");
+
+        assert_eq!(
+            middle_elide(&path.display().to_string(), 24),
+            "/home/mosh...y-long-name"
+        );
+    }
+
+    #[test]
+    fn boundary_rows_use_product_terms() {
+        let boundary = BoundarySummary {
+            workspace: "rw".to_string(),
+            network: "off".to_string(),
+            secrets: "off".to_string(),
+            turn_timeout: "30m/2h".to_string(),
+            preset: "everyday".to_string(),
+        };
+
+        let rows = boundary_display_rows(&boundary)
+            .into_iter()
+            .map(|row| (row.label, row.value))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![
+                ("workspace", "read-write".to_string()),
+                ("network", "off".to_string()),
+                ("runtime home", "private".to_string()),
+                ("skills snapshots", "read-only".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -4699,7 +4906,7 @@ mod tests {
                 workspace: "rw".to_string(),
                 network: "none".to_string(),
                 secrets: "off".to_string(),
-                timeout: "2h".to_string(),
+                turn_timeout: "2h".to_string(),
                 preset: "test".to_string(),
             },
             kernel,
@@ -4812,7 +5019,7 @@ mod tests {
                     workspace: "rw".to_string(),
                     network: "none".to_string(),
                     secrets: "off".to_string(),
-                    timeout: "2h".to_string(),
+                    turn_timeout: "2h".to_string(),
                     preset: "test".to_string(),
                 },
                 kernel,
