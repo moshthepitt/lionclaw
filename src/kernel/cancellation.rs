@@ -36,18 +36,14 @@ impl TurnCancellation {
     }
 
     pub async fn cancelled(&self) -> String {
-        if let Some(reason) = self.reason() {
-            return reason;
-        }
-
         let mut rx = self.tx.subscribe();
         loop {
-            if rx.changed().await.is_err() {
-                return DEFAULT_CANCEL_REASON.to_string();
-            }
             let reason = rx.borrow().clone();
             if let Some(reason) = reason {
                 return reason;
+            }
+            if rx.changed().await.is_err() {
+                return DEFAULT_CANCEL_REASON.to_string();
             }
         }
     }
@@ -60,5 +56,42 @@ pub(crate) fn normalize_cancel_reason(reason: impl Into<String>) -> String {
         DEFAULT_CANCEL_REASON.to_string()
     } else {
         reason.chars().take(512).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_returns_already_requested_reason() {
+        let cancellation = TurnCancellation::new();
+        assert!(cancellation.request("operator stop"));
+
+        let reason = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            cancellation.cancelled(),
+        )
+        .await
+        .expect("already requested cancellation should not wait");
+
+        assert_eq!(reason, "operator stop");
+    }
+
+    #[tokio::test]
+    async fn cancelled_waits_for_future_request() {
+        let cancellation = TurnCancellation::new();
+        let waiter = cancellation.clone();
+        let task = tokio::spawn(async move { waiter.cancelled().await });
+
+        tokio::task::yield_now().await;
+        assert!(cancellation.request("operator stop"));
+
+        let reason = tokio::time::timeout(std::time::Duration::from_millis(100), task)
+            .await
+            .expect("future cancellation request should wake waiter")
+            .expect("waiter task should complete");
+
+        assert_eq!(reason, "operator stop");
     }
 }
