@@ -1235,6 +1235,9 @@ fn inspect_channel_worker_health(
     }
 
     let Some(report) = health.latest_report.as_ref() else {
+        if channel.launch_mode == ChannelLaunchMode::Interactive {
+            return;
+        }
         findings.push(
             DoctorFinding::warning(
                 FindingKind::Channel,
@@ -2374,6 +2377,69 @@ mod tests {
         assert!(findings.iter().any(|finding| {
             finding.subject.as_ref() == "channel \"telegram\" has no worker health report"
                 && finding.observed.as_ref() == "no health report received from channel worker yet"
+        }));
+        assert!(observations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn doctor_does_not_warn_when_interactive_channel_has_no_worker_health_report() {
+        let (_temp_dir, home, commands, config, _pool) =
+            doctor_channel_fixture("terminal", ChannelLaunchMode::Interactive).await;
+        let mut findings = Vec::new();
+        let mut observations = Vec::new();
+
+        inspect_channels(
+            &home,
+            "direct-home",
+            &commands,
+            &config,
+            &mut findings,
+            &mut observations,
+        )
+        .await;
+
+        assert!(!findings.iter().any(|finding| {
+            finding.subject.as_ref() == "channel \"terminal\" has no worker health report"
+        }));
+        assert!(observations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn doctor_keeps_kernel_channel_state_when_health_report_table_is_missing() {
+        let (_temp_dir, home, commands, config, pool) =
+            doctor_channel_fixture("telegram", ChannelLaunchMode::Background).await;
+        insert_pending_pairing(&pool, "telegram").await;
+        insert_outbox_message(&pool, "telegram", "failed").await;
+        sqlx::query("DROP TABLE channel_health_reports")
+            .execute(&pool)
+            .await
+            .expect("drop health report table");
+        let mut findings = Vec::new();
+        let mut observations = Vec::new();
+
+        inspect_channels(
+            &home,
+            "direct-home",
+            &commands,
+            &config,
+            &mut findings,
+            &mut observations,
+        )
+        .await;
+
+        assert!(!findings.iter().any(|finding| {
+            finding.subject.as_ref() == "channel \"telegram\" health state cannot be read"
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.subject.as_ref() == "channel \"telegram\" has pending pairings"
+                && finding.observed.as_ref() == "1 pending pairing request"
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.subject.as_ref() == "channel \"telegram\" has failed outbox messages"
+                && finding.observed.as_ref() == "1 failed outbox message"
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.subject.as_ref() == "channel \"telegram\" has no worker health report"
         }));
         assert!(observations.is_empty());
     }

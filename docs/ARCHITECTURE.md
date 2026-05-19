@@ -454,10 +454,10 @@ Channel health reports are append-only rows in `channel_health_reports`.
 Doctor reads the latest report per channel, along with kernel-visible pending
 pairings and outbox status, to explain channel state without calling provider
 APIs or mutating local state. Background channel reports older than ten minutes
-are stale doctor warnings; interactive channels can report opportunistically
-without a stale threshold. Doctor also warns on impossible future report
-timestamps found in stored state without treating those reports as current
-worker health.
+are stale doctor warnings, and background channels with no reports warn.
+Interactive channels can report opportunistically without missing-report or stale
+warnings. Doctor also warns on impossible future report timestamps found in
+stored state without treating those reports as current worker health.
 
 ## Session Continuity
 
