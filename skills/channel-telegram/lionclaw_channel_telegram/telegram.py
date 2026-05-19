@@ -32,10 +32,10 @@ PAIRING_START_RE = re.compile(
     r"\s*$"
 )
 TELEGRAM_PARSE_ERROR_RE = re.compile(
-    r"can't parse entities|parse entities|entity", re.I
+    r"can't parse entities|parse entities|entity", re.IGNORECASE
 )
 LOCAL_LINK_RE = re.compile(r"^(?:/|file:|\.{0,2}/|[A-Za-z]:[\\/])")
-SUPPORTED_LINK_RE = re.compile(r"^(?:https?://|tg://|mailto:)", re.I)
+SUPPORTED_LINK_RE = re.compile(r"^(?:https?://|tg://|mailto:)", re.IGNORECASE)
 FILE_REFERENCE_RE = re.compile(r"^[A-Za-z0-9_.@-]+\.[A-Za-z0-9][A-Za-z0-9_.-]*$")
 PHOTO_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
 VIDEO_MIME_TYPES = {"video/mp4"}

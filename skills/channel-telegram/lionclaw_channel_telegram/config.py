@@ -5,6 +5,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+STREAM_START_MODES = frozenset({"resume", "tail"})
+
 
 @dataclass(slots=True, frozen=True)
 class WorkerConfig:
@@ -36,7 +38,11 @@ class WorkerConfig:
             channel_id=channel_id,
             stream_limit=_int_env("LIONCLAW_STREAM_LIMIT", 100, min_value=1),
             stream_wait_ms=_int_env("LIONCLAW_STREAM_WAIT_MS", 30000, min_value=0),
-            stream_start_mode=_string_env("LIONCLAW_STREAM_START_MODE", "resume"),
+            stream_start_mode=_choice_env(
+                "LIONCLAW_STREAM_START_MODE",
+                "resume",
+                allowed=STREAM_START_MODES,
+            ),
             consumer_id=_string_env(
                 "LIONCLAW_CONSUMER_ID",
                 f"telegram:{channel_id}",
@@ -87,6 +93,14 @@ def _path_env(name: str, default: Path) -> Path:
     if not value.strip():
         raise RuntimeError(f"{name} must not be empty")
     return Path(value).expanduser()
+
+
+def _choice_env(name: str, default: str, *, allowed: frozenset[str]) -> str:
+    value = _string_env(name, default).casefold()
+    if value not in allowed:
+        allowed_values = ", ".join(sorted(allowed))
+        raise RuntimeError(f"{name} must be one of: {allowed_values}")
+    return value
 
 
 def _int_env(name: str, default: int, *, min_value: int) -> int:

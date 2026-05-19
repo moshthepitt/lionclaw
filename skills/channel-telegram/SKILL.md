@@ -84,7 +84,9 @@ LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
   DM links use `https://t.me/<bot_username>?start=lc_<token>`; group links use
   `https://t.me/<bot_username>?startgroup=lc_<token>` where Telegram exposes the
   payload to the bot.
-- The worker defaults `consumer_id` to `telegram:<channel_id>` and `start_mode=resume`, so unacked progress events are replayed after worker restart.
+- The worker defaults `consumer_id` to `telegram:<channel_id>` and
+  `start_mode=resume`, so unacked progress events are replayed after worker
+  restart. `LIONCLAW_STREAM_START_MODE` accepts `resume` or `tail`.
 - Telegram delivery is outbox-driven: typing comes from progress streams, final
   answers come from durable outbox leases, no reasoning lane delivery.
 - Telegram has its own visible command menu. `/help`, `/status`, `/new`,

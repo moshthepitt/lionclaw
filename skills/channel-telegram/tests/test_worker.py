@@ -33,6 +33,7 @@ from lionclaw_channel_telegram.api import (
 )
 from lionclaw_channel_telegram.config import WorkerConfig
 from lionclaw_channel_telegram.telegram import (
+    TELEGRAM_TEXT_LIMIT,
     AiogramTelegramTransport,
     TelegramBotIdentity,
     TelegramDownloadedAttachment,
@@ -1050,6 +1051,34 @@ class WorkerConfigTests(unittest.TestCase):
                 message = str(raised.exception)
                 self.assertIn(real_env_name, message)
                 self.assertIn(error, message)
+
+    def test_from_env_validates_stream_start_mode(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_BOT_TOKEN": "token",
+                "LIONCLAW_STREAM_START_MODE": "TAIL",
+            },
+            clear=True,
+        ):
+            self.assertEqual(WorkerConfig.from_env().stream_start_mode, "tail")
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "LIONCLAW_STREAM_START_MODE": "from_the_middle",
+                },
+                clear=True,
+            ),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            WorkerConfig.from_env()
+
+        message = str(raised.exception)
+        self.assertIn("LIONCLAW_STREAM_START_MODE", message)
+        self.assertIn("resume, tail", message)
 
 
 class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
@@ -3267,12 +3296,14 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
 class TelegramDeliveryHelperTests(unittest.TestCase):
     def test_long_answer_chunks_by_telegram_utf16_limit(self) -> None:
-        chunks = _split_telegram_text("x" * 4001)
+        chunks = _split_telegram_text("x" * (TELEGRAM_TEXT_LIMIT + 1))
 
         self.assertEqual(len(chunks), 2)
-        self.assertEqual(chunks[0], "x" * 4000)
+        self.assertEqual(chunks[0], "x" * TELEGRAM_TEXT_LIMIT)
         self.assertEqual(chunks[1], "x")
-        self.assertTrue(all(_utf16_len(chunk) <= 4000 for chunk in chunks))
+        self.assertTrue(
+            all(_utf16_len(chunk) <= TELEGRAM_TEXT_LIMIT for chunk in chunks)
+        )
 
     def test_long_whitespace_does_not_create_empty_telegram_chunks(self) -> None:
         self.assertEqual(_split_telegram_text((" " * 4001) + "answer"), ["answer"])
@@ -3326,7 +3357,7 @@ class TelegramDeliveryHelperTests(unittest.TestCase):
         self.assertEqual(len(chunks), 1)
         self.assertEqual(chunks[0].plain_text, "<" * 3990)
         self.assertIsNone(chunks[0].html_text)
-        self.assertTrue(_utf16_len(chunks[0].plain_text) <= 4000)
+        self.assertTrue(_utf16_len(chunks[0].plain_text) <= TELEGRAM_TEXT_LIMIT)
 
     def test_markdown_rendering_escapes_code_blocks(self) -> None:
         rendered = _markdown_to_telegram_html("```text\n<b>literal</b>\n```")
