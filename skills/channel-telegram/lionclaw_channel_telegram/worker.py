@@ -133,6 +133,7 @@ class TelegramCommand:
     name: str
     raw: str
     arguments: str
+    target_username: str | None = None
 
 
 @dataclass(slots=True)
@@ -371,7 +372,7 @@ class TelegramWorker:
         if (
             command is not None
             and command.name in LOCAL_TELEGRAM_COMMANDS
-            and _telegram_command_is_addressed(update)
+            and _telegram_command_is_addressed(update, command)
         ):
             return await self._handle_telegram_command(update, command)
 
@@ -1410,15 +1411,27 @@ def _telegram_command(update: TelegramInboundUpdate) -> TelegramCommand | None:
     token = parts[0]
     arguments = parts[1] if len(parts) > 1 else ""
     command = token.removeprefix("/")
+    target_username = None
     if "@" in command:
-        command, _ = command.split("@", 1)
+        command, target_username = command.split("@", 1)
+        target_username = target_username.removeprefix("@").casefold() or None
     command = command.casefold()
     if not command:
         return None
-    return TelegramCommand(name=command, raw=token, arguments=arguments.strip())
+    return TelegramCommand(
+        name=command,
+        raw=token,
+        arguments=arguments.strip(),
+        target_username=target_username,
+    )
 
 
-def _telegram_command_is_addressed(update: TelegramInboundUpdate) -> bool:
+def _telegram_command_is_addressed(
+    update: TelegramInboundUpdate,
+    command: TelegramCommand,
+) -> bool:
+    if command.target_username is not None:
+        return bool(update.provider_metadata.get("command_targets_bot"))
     if update.provider_metadata.get("chat_type") == "private":
         return True
     return update.trigger in {"mention", "reply_to_bot", "thread_continuation"}

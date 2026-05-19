@@ -131,11 +131,45 @@ class ExtractInboundEventTests(unittest.TestCase):
         self.assertIsInstance(mapped, TelegramInboundUpdate)
         assert isinstance(mapped, TelegramInboundUpdate)
         self.assertEqual(mapped.trigger, "mention")
+        self.assertEqual(mapped.provider_metadata["command_target"], "lionclaw_bot")
+        self.assertTrue(mapped.provider_metadata["command_targets_bot"])
+
+    def test_group_command_targeting_other_bot_is_not_a_bot_mention(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 131,
+                "message": {
+                    "message_id": 31,
+                    "date": 0,
+                    "chat": {"id": -10042, "type": "supergroup"},
+                    "from": {"id": 9, "is_bot": False, "first_name": "Nia"},
+                    "message_thread_id": 77,
+                    "is_topic_message": True,
+                    "text": "/stop@other_bot",
+                    "entities": [
+                        {
+                            "type": "bot_command",
+                            "offset": 0,
+                            "length": len("/stop@other_bot"),
+                        }
+                    ],
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(mapped.trigger, "thread_continuation")
+        self.assertEqual(mapped.provider_metadata["command_target"], "other_bot")
+        self.assertFalse(mapped.provider_metadata["command_targets_bot"])
+        self.assertFalse(mapped.provider_metadata["bot_mentioned"])
 
     def test_edited_message_sets_metadata_without_changing_message_ref(self) -> None:
         update = Update.model_validate(
             {
-                "update_id": 131,
+                "update_id": 132,
                 "edited_message": {
                     "message_id": 31,
                     "date": 0,
@@ -151,7 +185,7 @@ class ExtractInboundEventTests(unittest.TestCase):
 
         self.assertIsInstance(mapped, TelegramInboundUpdate)
         assert isinstance(mapped, TelegramInboundUpdate)
-        self.assertEqual(mapped.event_id, "telegram:update:131")
+        self.assertEqual(mapped.event_id, "telegram:update:132")
         self.assertEqual(mapped.message_ref, "telegram:message:31")
         self.assertTrue(mapped.provider_metadata["edited"])
         self.assertEqual(mapped.provider_metadata["source"], "edited_message")
@@ -376,10 +410,39 @@ class ExtractInboundEventTests(unittest.TestCase):
         self.assertEqual(mapped.token, "lc_0123456789abcdef")
         self.assertEqual(mapped.conversation_ref, "telegram:chat:-10042")
 
-    def test_plain_text_mentioning_pairing_token_remains_inbound(self) -> None:
+    def test_startgroup_targeting_other_bot_is_not_pairing_claim(self) -> None:
         update = Update.model_validate(
             {
                 "update_id": 192,
+                "message": {
+                    "message_id": 92,
+                    "date": 0,
+                    "chat": {"id": -10042, "type": "supergroup"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Alice"},
+                    "text": "/startgroup@other_bot lc_0123456789abcdef",
+                    "entities": [
+                        {
+                            "type": "bot_command",
+                            "offset": 0,
+                            "length": len("/startgroup@other_bot"),
+                        }
+                    ],
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(mapped.text, "/startgroup@other_bot lc_0123456789abcdef")
+        self.assertEqual(mapped.provider_metadata["command_target"], "other_bot")
+        self.assertFalse(mapped.provider_metadata["command_targets_bot"])
+
+    def test_plain_text_mentioning_pairing_token_remains_inbound(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 193,
                 "message": {
                     "message_id": 92,
                     "date": 0,
@@ -1354,6 +1417,153 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api.sent_inbound), 1)
         self.assertEqual(api.sent_inbound[0].text, "/stop")
         self.assertEqual(api.cancel_calls, [])
+
+    async def test_topic_command_targeting_other_bot_passes_through(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 932,
+                            "message": {
+                                "message_id": 32,
+                                "date": 0,
+                                "chat": {
+                                    "id": -10077,
+                                    "type": "supergroup",
+                                    "is_forum": True,
+                                },
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "message_thread_id": 77,
+                                "is_topic_message": True,
+                                "text": "/stop@other_bot",
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len("/stop@other_bot"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            await worker._remember_active_turn(
+                TelegramInboundUpdate(
+                    update_id=931,
+                    event_id="telegram:update:931",
+                    sender_ref="telegram:user:77",
+                    conversation_ref="telegram:chat:-10077",
+                    thread_ref="telegram:topic:77",
+                    message_ref="telegram:message:31",
+                    text="slow",
+                    trigger="thread_continuation",
+                    provider_metadata={"chat_type": "supergroup"},
+                ),
+                InboundResponse(
+                    outcome="queued",
+                    turn_id="turn-1",
+                    session_id="session-1",
+                    session_key="channel:telegram:thread:-10077:77",
+                ),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(len(api.sent_inbound), 1)
+        self.assertEqual(api.sent_inbound[0].text, "/stop@other_bot")
+        self.assertEqual(api.cancel_calls, [])
+        self.assertIn("turn-1", worker._active_turns)
+
+    async def test_topic_command_targeting_lionclaw_bot_stays_local(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 933,
+                            "message": {
+                                "message_id": 33,
+                                "date": 0,
+                                "chat": {
+                                    "id": -10077,
+                                    "type": "supergroup",
+                                    "is_forum": True,
+                                },
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "message_thread_id": 77,
+                                "is_topic_message": True,
+                                "text": "/stop@lionclaw_bot",
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len("/stop@lionclaw_bot"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            await worker._remember_active_turn(
+                TelegramInboundUpdate(
+                    update_id=932,
+                    event_id="telegram:update:932",
+                    sender_ref="telegram:user:77",
+                    conversation_ref="telegram:chat:-10077",
+                    thread_ref="telegram:topic:77",
+                    message_ref="telegram:message:32",
+                    text="slow",
+                    trigger="thread_continuation",
+                    provider_metadata={"chat_type": "supergroup"},
+                ),
+                InboundResponse(
+                    outcome="queued",
+                    turn_id="turn-1",
+                    session_id="session-1",
+                    session_key="channel:telegram:thread:-10077:77",
+                ),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertEqual(
+            api.cancel_calls,
+            [
+                (
+                    "session-1",
+                    "channel:telegram:thread:-10077:77",
+                    "turn-1",
+                    "telegram stop command",
+                )
+            ],
+        )
+        self.assertEqual(telegram.sent_messages[-1][1], "Stopping...")
 
     async def test_stop_cancels_active_turn_with_expected_turn_guard(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

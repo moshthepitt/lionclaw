@@ -23,7 +23,11 @@ from aiogram.types import (
 TELEGRAM_TEXT_LIMIT = 4000
 TELEGRAM_CAPTION_LIMIT = 1024
 PAIRING_START_RE = re.compile(
-    r"^/(?:start|startgroup)(?:@[A-Za-z0-9_]+)?\s+(lc_[A-Za-z0-9_-]{8,128})\s*$"
+    r"^/(?:start|startgroup)"
+    r"(?:@([A-Za-z0-9_]+))?"
+    r"\s+"
+    r"(lc_[A-Za-z0-9_-]{8,128})"
+    r"\s*$"
 )
 TELEGRAM_PARSE_ERROR_RE = re.compile(
     r"can't parse entities|parse entities|entity", re.I
@@ -454,7 +458,7 @@ def extract_inbound_event(
     if _is_bot_sender(message):
         return None
 
-    token = _extract_pairing_token(_message_text(message))
+    token = _extract_pairing_token(_message_text(message), bot_identity)
     if token is not None:
         return TelegramPairingClaim(
             token=token,
@@ -627,11 +631,21 @@ def _content_text(message: Message) -> str | None:
     return message.text or message.caption
 
 
-def _extract_pairing_token(text: str | None) -> str | None:
+def _extract_pairing_token(
+    text: str | None,
+    bot_identity: TelegramBotIdentity | None,
+) -> str | None:
     if text is None:
         return None
     match = PAIRING_START_RE.match(text)
-    return match.group(1) if match is not None else None
+    if match is None:
+        return None
+    target_username = match.group(1)
+    if target_username is not None:
+        bot_username = bot_identity.username if bot_identity is not None else None
+        if not _username_matches(target_username, bot_username):
+            return None
+    return match.group(2)
 
 
 def _trigger(message: Message, bot_identity: TelegramBotIdentity | None) -> str:
@@ -737,6 +751,19 @@ def _command_targets_bot(fragment: str, bot_username: str) -> bool:
     return _username_matches(target, bot_username)
 
 
+def _leading_command_target(message: Message) -> str | None:
+    text = _content_text(message)
+    if text is None or not text.startswith("/"):
+        return None
+    token = text.split(maxsplit=1)[0]
+    command = token.removeprefix("/")
+    if "@" not in command:
+        return None
+    _, target = command.split("@", 1)
+    target = target.removeprefix("@").casefold()
+    return target or None
+
+
 def _is_bot_sender(message: Message) -> bool:
     return bool(message.from_user is not None and message.from_user.is_bot)
 
@@ -749,6 +776,7 @@ def _provider_metadata(
     edited: bool,
     bot_identity: TelegramBotIdentity | None,
 ) -> dict[str, Any]:
+    command_target = _leading_command_target(message)
     metadata: dict[str, Any] = {
         "provider": "telegram",
         "update_id": update_id,
@@ -759,6 +787,12 @@ def _provider_metadata(
         "message_id": message.message_id,
         "bot_mentioned": _has_bot_mention(message, bot_identity),
     }
+    if command_target is not None:
+        metadata["command_target"] = command_target
+        metadata["command_targets_bot"] = _username_matches(
+            command_target,
+            bot_identity.username if bot_identity is not None else None,
+        )
     if message.from_user is not None:
         metadata["from_user_id"] = message.from_user.id
         metadata["from_is_bot"] = bool(message.from_user.is_bot)
