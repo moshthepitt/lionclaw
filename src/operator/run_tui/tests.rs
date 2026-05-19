@@ -191,6 +191,29 @@ fn activity_classification_accepts_runtime_neutral_summaries() {
 }
 
 #[test]
+fn cancellation_error_events_do_not_mark_activity_failed() {
+    let mut activity = ActivitySummary::new();
+    activity.start();
+
+    activity.record_stream_event(&StreamEventDto {
+        kind: StreamEventKindDto::Error,
+        lane: None,
+        code: Some("runtime.cancelled".to_string()),
+        text: Some("operator stop".to_string()),
+    });
+    activity.record_stream_event(&StreamEventDto {
+        kind: StreamEventKindDto::Done,
+        lane: None,
+        code: None,
+        text: None,
+    });
+
+    assert_eq!(activity.status, ActivityStatus::Complete);
+    assert_eq!(activity.items[0].kind, ActivityItemKind::Status);
+    assert_eq!(activity.items[0].text, "operator stop");
+}
+
+#[test]
 fn reasoning_deltas_coalesce_into_one_activity_progress_item() {
     let mut activity = ActivitySummary::new();
     activity.start();
@@ -1116,22 +1139,24 @@ fn ctrl_c_requests_active_turn_interrupt() {
         .build()
         .expect("test runtime");
     let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
-    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let cancellation = TurnCancellation::new();
 
     runtime.block_on(async {
         app.active_turn = Some(tokio::spawn(std::future::pending()));
-        app.active_turn_cancel = Some(cancel_tx);
+        app.active_turn_cancel = Some(cancellation.clone());
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
             &backend_tx,
         )
         .await;
-        let reason = cancel_rx.await.expect("cancel reason");
-        assert_eq!(reason, "turn interrupted from operator console");
     });
 
-    assert_eq!(app.status, "interrupt requested");
+    assert_eq!(
+        cancellation.reason().as_deref(),
+        Some("turn interrupted from operator console")
+    );
+    assert_eq!(app.status, "stopping turn");
     assert!(app.active_turn_cancel.is_none());
     if let Some(handle) = app.active_turn.take() {
         handle.abort();

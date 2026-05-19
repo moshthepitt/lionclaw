@@ -96,6 +96,9 @@ Expected on a TTY:
   honest audit details; `Left`/`Right` cycle those views when it is focused
 - the composer accepts printable characters such as `?`; `Tab` visibly moves
   focus, and `Ctrl+D` exits when idle
+- while a turn is active, `Ctrl+C` requests a turn stop instead of exiting the
+  console; the status changes to stopping and the console returns to idle after
+  the cancelled turn is recorded
 
 For the plain fallback:
 

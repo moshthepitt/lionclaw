@@ -7,14 +7,16 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 use lionclaw::{
-    contracts::{SessionOpenRequest, SessionTurnRequest, TrustTier},
+    contracts::{
+        SessionHistoryRequest, SessionOpenRequest, SessionTurnRequest, SessionTurnStatus, TrustTier,
+    },
     kernel::{
         runtime::{
             RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeControlExecution,
             RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender, RuntimeSessionHandle,
             RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
         },
-        Kernel, KernelError, KernelOptions,
+        Kernel, KernelOptions,
     },
 };
 use tempfile::TempDir;
@@ -57,7 +59,7 @@ async fn runtime_timeout_triggers_cancel_close_and_audit() {
         .await
         .expect("open session");
 
-    let err = kernel
+    let turn = kernel
         .turn_session(SessionTurnRequest {
             session_id: session.session_id,
             user_text: "trigger timeout".to_string(),
@@ -67,17 +69,15 @@ async fn runtime_timeout_triggers_cancel_close_and_audit() {
             runtime_env_passthrough: None,
         })
         .await
-        .expect_err("turn should timeout");
-
-    match err {
-        KernelError::RuntimeTimeout(message) => {
-            assert!(
-                message.contains("idle timed out"),
-                "timeout error should include timeout reason"
-            );
-        }
-        other => panic!("unexpected error variant: {other}"),
-    }
+        .expect("turn should resolve as timed out");
+    assert_eq!(turn.status, SessionTurnStatus::TimedOut);
+    assert_eq!(turn.error_code.as_deref(), Some("runtime.timeout"));
+    assert!(
+        turn.error_text
+            .as_deref()
+            .is_some_and(|message| message.contains("idle timed out")),
+        "timeout response should include timeout reason"
+    );
 
     assert_eq!(
         cancel_calls.load(Ordering::SeqCst),
@@ -151,7 +151,7 @@ async fn runtime_timeout_handles_closed_event_stream_without_output() {
         .await
         .expect("open session");
 
-    let err = kernel
+    let turn = kernel
         .turn_session(SessionTurnRequest {
             session_id: session.session_id,
             user_text: "close event stream before output".to_string(),
@@ -161,10 +161,14 @@ async fn runtime_timeout_handles_closed_event_stream_without_output() {
             runtime_env_passthrough: None,
         })
         .await
-        .expect_err("turn should timeout after the runtime closes its event stream");
+        .expect("turn should resolve as timed out after the runtime closes its event stream");
 
+    assert_eq!(turn.status, SessionTurnStatus::TimedOut);
+    assert_eq!(turn.error_code.as_deref(), Some("runtime.timeout"));
     assert!(
-        matches!(err, KernelError::RuntimeTimeout(message) if message.contains("idle timed out")),
+        turn.error_text
+            .as_deref()
+            .is_some_and(|message| message.contains("idle timed out")),
         "closed event stream should still resolve through the normal timeout path"
     );
     assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
@@ -209,7 +213,7 @@ async fn runtime_control_timeout_handles_closed_event_stream_without_output() {
         .await
         .expect("open session");
 
-    let err = kernel
+    let turn = kernel
         .turn_session(SessionTurnRequest {
             session_id: session.session_id,
             user_text: "/closed-events".to_string(),
@@ -219,10 +223,14 @@ async fn runtime_control_timeout_handles_closed_event_stream_without_output() {
             runtime_env_passthrough: None,
         })
         .await
-        .expect_err("control should timeout after the runtime closes its event stream");
+        .expect("control should resolve as timed out after the runtime closes its event stream");
 
+    assert_eq!(turn.status, SessionTurnStatus::TimedOut);
+    assert_eq!(turn.error_code.as_deref(), Some("runtime.timeout"));
     assert!(
-        matches!(err, KernelError::RuntimeTimeout(message) if message.contains("idle timed out")),
+        turn.error_text
+            .as_deref()
+            .is_some_and(|message| message.contains("idle timed out")),
         "closed control event stream should still resolve through the normal timeout path"
     );
     assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
@@ -304,6 +312,91 @@ async fn runtime_activity_resets_idle_timeout() {
 }
 
 #[tokio::test]
+async fn runtime_reported_expected_terminal_errors_return_structured_responses() {
+    let sandbox = TestEnv::new();
+    let kernel = Kernel::new_with_options(
+        &sandbox.db_path(),
+        KernelOptions {
+            runtime_turn_idle_timeout: Duration::from_millis(200),
+            runtime_turn_hard_timeout: Duration::from_millis(500),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let cases = [
+        (
+            "reported-cancelled",
+            "runtime.cancelled",
+            "runtime reported cancellation",
+            SessionTurnStatus::Cancelled,
+        ),
+        (
+            "reported-interrupted",
+            "runtime.interrupted",
+            "runtime reported interruption",
+            SessionTurnStatus::Interrupted,
+        ),
+    ];
+
+    for (runtime_id, code, text, expected_status) in cases {
+        kernel
+            .register_runtime_adapter(
+                runtime_id,
+                Arc::new(ReportedTerminalRuntimeAdapter {
+                    id: runtime_id,
+                    code,
+                    text,
+                }),
+            )
+            .await;
+
+        let session = kernel
+            .open_session(SessionOpenRequest {
+                channel_id: "local-cli".to_string(),
+                peer_id: runtime_id.to_string(),
+                trust_tier: TrustTier::Main,
+                history_policy: None,
+            })
+            .await
+            .expect("open session");
+
+        let turn = kernel
+            .turn_session(SessionTurnRequest {
+                session_id: session.session_id,
+                user_text: "runtime reports terminal condition".to_string(),
+                runtime_id: Some(runtime_id.to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await
+            .expect("expected terminal runtime errors should return a structured response");
+
+        assert_eq!(turn.status, expected_status);
+        assert_eq!(turn.error_code.as_deref(), Some(code));
+        assert_eq!(turn.error_text.as_deref(), Some(text));
+        assert!(
+            turn.stream_events
+                .iter()
+                .any(|event| event.code.as_deref() == Some(code)),
+            "response should include the runtime terminal event"
+        );
+
+        let history = kernel
+            .session_history(SessionHistoryRequest {
+                session_id: session.session_id,
+                limit: Some(1),
+            })
+            .await
+            .expect("history");
+        assert_eq!(history.turns[0].status, expected_status);
+        assert_eq!(history.turns[0].error_code.as_deref(), Some(code));
+    }
+}
+
+#[tokio::test]
 async fn runtime_hard_timeout_reports_safety_limit_and_audit_kind() {
     let sandbox = TestEnv::new();
     let kernel = Kernel::new_with_options(
@@ -337,7 +430,7 @@ async fn runtime_hard_timeout_reports_safety_limit_and_audit_kind() {
         .await
         .expect("open session");
 
-    let err = kernel
+    let turn = kernel
         .turn_session(SessionTurnRequest {
             session_id: session.session_id,
             user_text: "keep producing events until the hard ceiling".to_string(),
@@ -347,17 +440,15 @@ async fn runtime_hard_timeout_reports_safety_limit_and_audit_kind() {
             runtime_env_passthrough: None,
         })
         .await
-        .expect_err("turn should hit the hard timeout");
-
-    match err {
-        KernelError::RuntimeTimeout(message) => {
-            assert!(
-                message.contains("safety limit"),
-                "hard timeout should be explained as a safety limit"
-            );
-        }
-        other => panic!("unexpected error variant: {other}"),
-    }
+        .expect("turn should resolve as hard timed out");
+    assert_eq!(turn.status, SessionTurnStatus::TimedOut);
+    assert_eq!(turn.error_code.as_deref(), Some("runtime.timeout"));
+    assert!(
+        turn.error_text
+            .as_deref()
+            .is_some_and(|message| message.contains("safety limit")),
+        "hard timeout should be explained as a safety limit"
+    );
 
     let timeout_events = kernel
         .query_audit(
@@ -403,6 +494,12 @@ struct ClosedEventStreamRuntimeAdapter {
     cancel_calls: Arc<AtomicUsize>,
     close_calls: Arc<AtomicUsize>,
     sleep_for: Duration,
+}
+
+struct ReportedTerminalRuntimeAdapter {
+    id: &'static str,
+    code: &'static str,
+    text: &'static str,
 }
 
 #[async_trait]
@@ -519,6 +616,60 @@ impl RuntimeAdapter for ClosedEventStreamRuntimeAdapter {
 
     async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
         self.close_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for ReportedTerminalRuntimeAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: self.id.to_string(),
+            version: "0.1".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        _input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("{}-{}", self.id, Uuid::new_v4()),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        let _ = events.send(RuntimeEvent::Error {
+            code: Some(self.code.to_string()),
+            text: self.text.to_string(),
+        });
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(RuntimeTurnResult {
+            capability_requests: Vec::new(),
+        })
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        events: RuntimeEventSender,
+    ) -> Result<()> {
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
+    }
+
+    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
         Ok(())
     }
 }

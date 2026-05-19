@@ -1,5 +1,10 @@
 mod common;
 
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use common::{write_skill_source, TestHome};
@@ -16,10 +21,10 @@ use lionclaw::{
         ChannelPairingBlockResponse, ChannelPairingClaimOutcome, ChannelPairingClaimRequest,
         ChannelPairingInviteRequest, ChannelPairingStatus, ChannelRoutingProfile,
         ChannelStreamAckRequest, ChannelStreamEventView, ChannelStreamPullRequest,
-        ChannelStreamStartMode, ChannelTrigger, DaemonInfoResponse, SessionActionKind,
-        SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery,
-        SessionOpenRequest, SessionTurnKind, SessionTurnRequest, SessionTurnStatus,
-        StreamEventKindDto, StreamLaneDto, TrustTier,
+        ChannelStreamStartMode, ChannelTrigger, DaemonInfoResponse, SessionActionRequest,
+        SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest,
+        SessionTurnKind, SessionTurnRequest, SessionTurnStatus, StreamEventKindDto, StreamLaneDto,
+        TrustTier,
     },
     kernel::{
         channel_attachments::{MAX_CHANNEL_ATTACHMENT_BYTES, MAX_CHANNEL_EVENT_ATTACHMENT_BYTES},
@@ -2791,7 +2796,7 @@ async fn channels_v2_migration_uses_legacy_message_id_for_event_identity() {
             session_id TEXT NOT NULL,
             inbound_message_id TEXT NOT NULL UNIQUE,
             runtime_id TEXT NOT NULL,
-            status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+            status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed', 'timed_out', 'cancelled', 'interrupted')),
             last_error TEXT,
             queued_at_ms INTEGER NOT NULL,
             started_at_ms INTEGER,
@@ -5085,9 +5090,8 @@ async fn channel_session_actions_return_immediately_and_respect_peer_blocking() 
 
     let started_at = Instant::now();
     let retry = kernel
-        .session_action(SessionActionRequest {
+        .session_action(SessionActionRequest::RetryLastTurn {
             session_id: session.session_id,
-            action: SessionActionKind::RetryLastTurn,
         })
         .await
         .expect("retry session action");
@@ -5120,13 +5124,327 @@ async fn channel_session_actions_return_immediately_and_respect_peer_blocking() 
         .expect("block direct grant");
 
     let err = kernel
-        .session_action(SessionActionRequest {
+        .session_action(SessionActionRequest::RetryLastTurn {
             session_id: session.session_id,
-            action: SessionActionKind::RetryLastTurn,
         })
         .await
         .expect_err("blocked peer should reject action");
     assert!(matches!(err, KernelError::Conflict(message) if message.contains("blocked")));
+}
+
+#[tokio::test]
+async fn channel_active_turn_cancel_stops_runtime_and_persists_cancelled_status() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "cancel-skill").await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let cancel_calls = Arc::new(AtomicUsize::new(0));
+    let cancel_reason = Arc::new(tokio::sync::Mutex::new(None));
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("cancel-aware".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+    kernel
+        .register_runtime_adapter(
+            "cancel-aware",
+            Arc::new(CancelAwareAdapter {
+                started: started.clone(),
+                cancel_calls: cancel_calls.clone(),
+                cancel_reason: cancel_reason.clone(),
+            }),
+        )
+        .await;
+
+    create_pending_pairing(&kernel, "terminal", "peer-cancel", "cancel-7601").await;
+    approve_pairing(&kernel, "terminal", "peer-cancel").await;
+    let session_key = direct_session_key("terminal", "peer-cancel");
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: session_key.clone(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open cancellable channel session");
+
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "cancel-7602",
+            "peer-cancel",
+            "peer-cancel",
+            None,
+            "long running turn",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue cancellable turn");
+    let turn_id = queued.turn_id.expect("queued turn id");
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("runtime turn should start before cancellation");
+
+    let stale = kernel
+        .session_action(SessionActionRequest::CancelActiveTurn {
+            session_id: session.session_id,
+            channel_id: "terminal".to_string(),
+            session_key: session_key.clone(),
+            expected_turn_id: Some(uuid::Uuid::new_v4()),
+            reason: Some("operator stop".to_string()),
+        })
+        .await
+        .expect_err("stale cancel guard rejects mismatched turn");
+    assert!(
+        matches!(stale, KernelError::Conflict(message) if message.contains("expected_turn_id"))
+    );
+
+    let cancelled = kernel
+        .session_action(SessionActionRequest::CancelActiveTurn {
+            session_id: session.session_id,
+            channel_id: "terminal".to_string(),
+            session_key: session_key.clone(),
+            expected_turn_id: Some(turn_id),
+            reason: Some("operator stop".to_string()),
+        })
+        .await
+        .expect("cancel active turn");
+    assert_eq!(cancelled.session_id, session.session_id);
+    assert_eq!(cancelled.turn_id, Some(turn_id));
+
+    wait_for_latest_turn(
+        &kernel,
+        session.session_id,
+        |turn| {
+            turn.turn_id == turn_id
+                && turn.status == SessionTurnStatus::Cancelled
+                && turn.error_code.as_deref() == Some("runtime.cancelled")
+                && turn.error_text.as_deref() == Some("operator stop")
+        },
+        "cancelled channel runtime turn",
+    )
+    .await;
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    let statuses = wait_for_joined_turn_statuses(&pool, turn_id, "cancelled", "cancelled").await;
+    assert_eq!(statuses, ("cancelled".to_string(), "cancelled".to_string()));
+    assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(cancel_reason.lock().await.as_deref(), Some("operator stop"));
+
+    let stream = wait_for_stream_events(&kernel, "terminal", "terminal-cancel", |events| {
+        let codes = events
+            .iter()
+            .filter(|event| event.turn_id == Some(turn_id))
+            .filter_map(|event| event.code.as_deref())
+            .collect::<Vec<_>>();
+        codes.contains(&"runtime.cancelled")
+            && codes.contains(&"queue.cancelled")
+            && events.iter().any(|event| {
+                event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::Done
+            })
+    })
+    .await;
+    assert_error_before_done(&stream.events, turn_id, "cancelled channel turn");
+}
+
+#[tokio::test]
+async fn repeated_active_turn_cancel_returns_clear_conflict() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "repeat-cancel-skill").await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let cancel_started = Arc::new(tokio::sync::Notify::new());
+    let release_cancel = Arc::new(tokio::sync::Notify::new());
+    let cancel_calls = Arc::new(AtomicUsize::new(0));
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("blocking-cancel".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+    kernel
+        .register_runtime_adapter(
+            "blocking-cancel",
+            Arc::new(BlockingCancelAdapter {
+                started: started.clone(),
+                cancel_started: cancel_started.clone(),
+                release_cancel: release_cancel.clone(),
+                cancel_calls: cancel_calls.clone(),
+            }),
+        )
+        .await;
+
+    create_pending_pairing(
+        &kernel,
+        "terminal",
+        "peer-repeat-cancel",
+        "cancel-repeat-7801",
+    )
+    .await;
+    approve_pairing(&kernel, "terminal", "peer-repeat-cancel").await;
+    let session_key = direct_session_key("terminal", "peer-repeat-cancel");
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: session_key.clone(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open repeat-cancel session");
+
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "cancel-repeat-7802",
+            "peer-repeat-cancel",
+            "peer-repeat-cancel",
+            None,
+            "long running repeat cancel turn",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue repeat-cancel turn");
+    let turn_id = queued.turn_id.expect("queued turn id");
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("runtime should start");
+
+    kernel
+        .session_action(SessionActionRequest::CancelActiveTurn {
+            session_id: session.session_id,
+            channel_id: "terminal".to_string(),
+            session_key: session_key.clone(),
+            expected_turn_id: Some(turn_id),
+            reason: Some("operator stop".to_string()),
+        })
+        .await
+        .expect("first cancel request");
+    tokio::time::timeout(Duration::from_secs(2), cancel_started.notified())
+        .await
+        .expect("adapter cancel should start");
+
+    let repeated = kernel
+        .session_action(SessionActionRequest::CancelActiveTurn {
+            session_id: session.session_id,
+            channel_id: "terminal".to_string(),
+            session_key: session_key.clone(),
+            expected_turn_id: Some(turn_id),
+            reason: Some("operator stop again".to_string()),
+        })
+        .await
+        .expect_err("repeat active cancel should be explicit");
+    assert!(
+        matches!(repeated, KernelError::Conflict(message) if message.contains("already requested"))
+    );
+
+    release_cancel.notify_waiters();
+    wait_for_latest_turn(
+        &kernel,
+        session.session_id,
+        |turn| turn.turn_id == turn_id && turn.status == SessionTurnStatus::Cancelled,
+        "repeat-cancel turn cancellation",
+    )
+    .await;
+    assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn channel_waiting_turn_cancel_unblocks_following_pending_turn() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "terminal", "waiting-cancel-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    create_pending_pairing(&kernel, "terminal", "peer-wait-cancel", "cancel-wait-7701").await;
+    approve_pairing(&kernel, "terminal", "peer-wait-cancel").await;
+    let session_key = direct_session_key("terminal", "peer-wait-cancel");
+    let session = kernel
+        .open_session(SessionOpenRequest {
+            channel_id: "terminal".to_string(),
+            peer_id: session_key.clone(),
+            trust_tier: TrustTier::Main,
+            history_policy: Some(SessionHistoryPolicy::Interactive),
+        })
+        .await
+        .expect("open waiting-cancel session");
+
+    let waiting = kernel
+        .ingest_channel_inbound(ChannelInboundRequest {
+            attachments: vec![ChannelAttachmentDescriptor {
+                attachment_id: "cancelled-att".to_string(),
+                kind: "document".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                filename: Some("cancelled.txt".to_string()),
+                size_bytes: Some(128),
+                provider_file_ref: "provider-cancelled".to_string(),
+                caption: Some("waiting attachment".to_string()),
+            }],
+            ..v2_text_request(
+                "terminal",
+                "cancel-wait-7702",
+                "peer-wait-cancel",
+                "peer-wait-cancel",
+                None,
+                "wait for attachment",
+                ChannelTrigger::Dm,
+            )
+        })
+        .await
+        .expect("queue waiting attachment turn");
+    assert_eq!(
+        waiting.outcome,
+        ChannelInboundOutcome::WaitingForAttachments
+    );
+    let waiting_turn_id = waiting.turn_id.expect("waiting turn id");
+
+    let later = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "terminal",
+            "cancel-wait-7703",
+            "peer-wait-cancel",
+            "peer-wait-cancel",
+            None,
+            "run after cancelled waiting turn",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue turn behind waiting attachment");
+    let later_turn_id = later.turn_id.expect("later turn id");
+
+    let cancelled = kernel
+        .session_action(SessionActionRequest::CancelActiveTurn {
+            session_id: session.session_id,
+            channel_id: "terminal".to_string(),
+            session_key: session_key.clone(),
+            expected_turn_id: Some(waiting_turn_id),
+            reason: Some("attachment no longer needed".to_string()),
+        })
+        .await
+        .expect("cancel waiting attachment turn");
+    assert_eq!(cancelled.turn_id, Some(waiting_turn_id));
+
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    wait_for_joined_turn_statuses(&pool, waiting_turn_id, "cancelled", "cancelled").await;
+    wait_for_joined_turn_statuses(&pool, later_turn_id, "completed", "completed").await;
+
+    let stream = wait_for_stream_events(&kernel, "terminal", "terminal-wait-cancel", |events| {
+        events.iter().any(|event| {
+            event.turn_id == Some(waiting_turn_id)
+                && event.code.as_deref() == Some("queue.cancelled")
+        }) && stream_has_completed_and_done(events, later_turn_id)
+    })
+    .await;
+    assert_code_before_done(
+        &stream.events,
+        waiting_turn_id,
+        "queue.cancelled",
+        "cancelled waiting turn",
+    );
+    assert_turn_completed_before_done(&stream.events, later_turn_id, "turn after waiting cancel");
 }
 
 #[tokio::test]
@@ -5198,9 +5516,8 @@ async fn channel_runtime_error_event_persists_failed_turn_and_supports_continue(
     );
 
     let continued = kernel
-        .session_action(SessionActionRequest {
+        .session_action(SessionActionRequest::ContinueLastPartial {
             session_id: session.session_id,
-            action: SessionActionKind::ContinueLastPartial,
         })
         .await
         .expect("continue partial");
@@ -5781,6 +6098,32 @@ fn assert_error_before_done(
         "{context} should publish error before done"
     );
     (error_position, done_position)
+}
+
+fn assert_code_before_done(
+    events: &[ChannelStreamEventView],
+    turn_id: uuid::Uuid,
+    code: &str,
+    context: &str,
+) -> (usize, usize) {
+    let code_position = events
+        .iter()
+        .position(|event| event.turn_id == Some(turn_id) && event.code.as_deref() == Some(code))
+        .unwrap_or_else(|| panic!("{context} should publish {code}"));
+    let done_position = events
+        .iter()
+        .position(|event| event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::Done)
+        .unwrap_or_else(|| panic!("{context} should publish done"));
+    let done_count = events
+        .iter()
+        .filter(|event| event.turn_id == Some(turn_id) && event.kind == StreamEventKindDto::Done)
+        .count();
+    assert_eq!(done_count, 1, "{context} should publish exactly one done");
+    assert!(
+        code_position < done_position,
+        "{context} should publish {code} before done"
+    );
+    (code_position, done_position)
 }
 
 fn direct_session_key(channel_id: &str, peer_id: &str) -> String {
@@ -6697,6 +7040,126 @@ impl RuntimeAdapter for PausedEchoAdapter {
         _handle: &RuntimeSessionHandle,
         _reason: Option<String>,
     ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+}
+
+struct CancelAwareAdapter {
+    started: Arc<tokio::sync::Notify>,
+    cancel_calls: Arc<AtomicUsize>,
+    cancel_reason: Arc<tokio::sync::Mutex<Option<String>>>,
+}
+
+struct BlockingCancelAdapter {
+    started: Arc<tokio::sync::Notify>,
+    cancel_started: Arc<tokio::sync::Notify>,
+    release_cancel: Arc<tokio::sync::Notify>,
+    cancel_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl RuntimeAdapter for CancelAwareAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "cancel-aware".to_string(),
+            version: "test".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle, anyhow::Error> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("cancel-aware:{}", input.session_id),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        _event_tx: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult, anyhow::Error> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        _event_tx: RuntimeEventSender,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn cancel(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        reason: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+        *self.cancel_reason.lock().await = reason;
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for BlockingCancelAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "blocking-cancel".to_string(),
+            version: "test".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle, anyhow::Error> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("blocking-cancel:{}", input.session_id),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        _event_tx: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult, anyhow::Error> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        _event_tx: RuntimeEventSender,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn cancel(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+        self.cancel_started.notify_waiters();
+        self.release_cancel.notified().await;
         Ok(())
     }
 
