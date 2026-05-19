@@ -39,6 +39,7 @@ from lionclaw_channel_telegram.telegram import (
     TelegramReferenceError,
     TelegramTransport,
     extract_inbound_event,
+    normalize_telegram_receipt,
 )
 
 logger = logging.getLogger(__name__)
@@ -224,16 +225,29 @@ def _coerce_outbox_receipt_record(value: object) -> OutboxReceiptRecord | None:
     provider_receipt = value.get("provider_receipt")
     if isinstance(status, str) and isinstance(provider_receipt, dict):
         if status in OUTBOX_RECEIPT_STATUSES:
+            normalized = _normalize_outbox_provider_receipt(provider_receipt)
+            if normalized is None:
+                return None
             return OutboxReceiptRecord(
                 status=status,
-                provider_receipt=dict(provider_receipt),
+                provider_receipt=normalized,
             )
         return None
 
-    if value.get("message_id") is not None and value.get("chat_id") is not None:
-        return OutboxReceiptRecord(status="delivered", provider_receipt=dict(value))
+    normalized = _normalize_outbox_provider_receipt(value)
+    if normalized is not None:
+        return OutboxReceiptRecord(status="delivered", provider_receipt=normalized)
 
     return None
+
+
+def _normalize_outbox_provider_receipt(
+    provider_receipt: dict[str, object],
+) -> dict[str, object] | None:
+    try:
+        return normalize_telegram_receipt(provider_receipt)
+    except TelegramReferenceError:
+        return None
 
 
 class TelegramWorker:
@@ -1184,7 +1198,7 @@ class TelegramWorker:
         return self._target_for_ref(event.peer_id)
 
     async def _process_outbox_delivery(self, delivery: OutboxDelivery) -> None:
-        receipt_record = self._outbox_receipts.get(delivery.delivery_id)
+        receipt_record = self._outbox_receipt_for_delivery(delivery)
         if receipt_record is not None and receipt_record.status == "delivered":
             await self._complete_progress_for_delivery(delivery)
             accepted = await self._report_outbox_with_retry(
@@ -1237,6 +1251,36 @@ class TelegramWorker:
         )
         if accepted:
             self._forget_outbox_receipt(delivery.delivery_id)
+
+    def _outbox_receipt_for_delivery(
+        self,
+        delivery: OutboxDelivery,
+    ) -> OutboxReceiptRecord | None:
+        receipt_record = self._outbox_receipts.get(delivery.delivery_id)
+        if receipt_record is None:
+            return None
+        try:
+            provider_receipt = normalize_telegram_receipt(
+                receipt_record.provider_receipt,
+                conversation_ref=delivery.conversation_ref,
+            )
+        except TelegramReferenceError as err:
+            logger.warning(
+                "telegram outbox receipt ignored for delivery_id=%s: %s",
+                delivery.delivery_id,
+                err,
+            )
+            self._forget_outbox_receipt(delivery.delivery_id)
+            return None
+        if provider_receipt == receipt_record.provider_receipt:
+            return receipt_record
+        normalized = OutboxReceiptRecord(
+            status=receipt_record.status,
+            provider_receipt=provider_receipt,
+        )
+        self._outbox_receipts[delivery.delivery_id] = normalized
+        self._save_outbox_receipts()
+        return normalized
 
     async def _handle_outbox_send_failure(
         self,

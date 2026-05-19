@@ -978,7 +978,7 @@ class OutboxReceiptStoreTests(unittest.TestCase):
                 {
                     "delivery-1": OutboxReceiptRecord(
                         status="delivered",
-                        provider_receipt={"message_id": 101},
+                        provider_receipt={"message_id": 101, "chat_id": "77"},
                     )
                 }
             )
@@ -986,7 +986,7 @@ class OutboxReceiptStoreTests(unittest.TestCase):
                 {
                     "delivery-2": OutboxReceiptRecord(
                         status="partial",
-                        provider_receipt={"message_id": 102},
+                        provider_receipt={"message_id": 102, "chat_id": "77"},
                     )
                 }
             )
@@ -996,7 +996,11 @@ class OutboxReceiptStoreTests(unittest.TestCase):
                 {
                     "delivery-2": OutboxReceiptRecord(
                         status="partial",
-                        provider_receipt={"message_id": 102},
+                        provider_receipt={
+                            "message_id": 102,
+                            "chat_id": "77",
+                            "messages": [{"message_id": 102, "chat_id": "77"}],
+                        },
                     )
                 },
             )
@@ -1012,7 +1016,10 @@ class OutboxReceiptStoreTests(unittest.TestCase):
                     {
                         "delivery-1": {
                             "status": "delivered",
-                            "provider_receipt": {"message_id": 101},
+                            "provider_receipt": {
+                                "message_id": 101,
+                                "chat_id": "77",
+                            },
                         },
                         "delivery-2": "bad",
                         "delivery-3": {
@@ -1020,6 +1027,21 @@ class OutboxReceiptStoreTests(unittest.TestCase):
                             "provider_receipt": {"message_id": 103},
                         },
                         "delivery-4": {"message_id": 104, "chat_id": "77"},
+                        "delivery-5": {
+                            "status": "delivered",
+                            "provider_receipt": {"message_id": 105},
+                        },
+                        "delivery-6": {
+                            "status": "partial",
+                            "provider_receipt": {
+                                "message_id": 107,
+                                "chat_id": "88",
+                                "messages": [
+                                    {"message_id": 106, "chat_id": "77"},
+                                    {"message_id": 107, "chat_id": "88"},
+                                ],
+                            },
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -1030,11 +1052,19 @@ class OutboxReceiptStoreTests(unittest.TestCase):
                 {
                     "delivery-1": OutboxReceiptRecord(
                         status="delivered",
-                        provider_receipt={"message_id": 101},
+                        provider_receipt={
+                            "message_id": 101,
+                            "chat_id": "77",
+                            "messages": [{"message_id": 101, "chat_id": "77"}],
+                        },
                     ),
                     "delivery-4": OutboxReceiptRecord(
                         status="delivered",
-                        provider_receipt={"message_id": 104, "chat_id": "77"},
+                        provider_receipt={
+                            "message_id": 104,
+                            "chat_id": "77",
+                            "messages": [{"message_id": 104, "chat_id": "77"}],
+                        },
                     ),
                 },
             )
@@ -1047,7 +1077,10 @@ class OutboxReceiptStoreTests(unittest.TestCase):
                     {
                         f"delivery-{index}": {
                             "status": "delivered",
-                            "provider_receipt": {"message_id": index},
+                            "provider_receipt": {
+                                "message_id": index,
+                                "chat_id": "77",
+                            },
                         }
                         for index in range(MAX_OUTBOX_RECEIPTS + 1)
                     }
@@ -3270,12 +3303,58 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                         "delivery-1",
                         "attempt-2",
                         "delivered",
-                        {"message_id": 101, "chat_id": "telegram:user:77"},
+                        {
+                            "message_id": 101,
+                            "chat_id": "77",
+                            "messages": [{"message_id": 101, "chat_id": "77"}],
+                        },
                         None,
                         None,
                     )
                 ],
             )
+            self.assertEqual(receipt_store.load(), {})
+
+    async def test_mismatched_delivered_outbox_receipt_is_discarded_before_replay(
+        self,
+    ) -> None:
+        delivery = OutboxDelivery(
+            delivery_id="delivery-1",
+            attempt_id="attempt-2",
+            conversation_ref="telegram:user:77",
+            content=OutboxContent(text="final answer"),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            receipt_store = OutboxReceiptStore(
+                Path(temp_dir) / "telegram.outbox-receipts.json"
+            )
+            receipt_store.save(
+                {
+                    "delivery-1": OutboxReceiptRecord(
+                        status="delivered",
+                        provider_receipt={"message_id": 101, "chat_id": "88"},
+                    )
+                }
+            )
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                outbox_receipt_store=receipt_store,
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="WARNING"):
+                await worker._process_outbox_delivery(delivery)
+
+            self.assertEqual(
+                telegram.sent_messages,
+                [("telegram:user:77", "final answer", None, None, [])],
+            )
+            self.assertEqual(telegram.resume_receipts, [None])
+            self.assertEqual(api.outbox_reports[0][2], "delivered")
             self.assertEqual(receipt_store.load(), {})
 
     async def test_partial_outbox_receipt_resumes_after_retryable_send_failure(
@@ -3318,7 +3397,11 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "delivery-1": OutboxReceiptRecord(
                         status="partial",
-                        provider_receipt=partial_receipt,
+                        provider_receipt={
+                            "message_id": 101,
+                            "chat_id": "77",
+                            "messages": [{"message_id": 101, "chat_id": "77"}],
+                        },
                     )
                 },
             )
@@ -3337,8 +3420,63 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 replace(delivery, attempt_id="attempt-2")
             )
 
-            self.assertEqual(second_telegram.resume_receipts, [partial_receipt])
+            self.assertEqual(
+                second_telegram.resume_receipts,
+                [
+                    {
+                        "message_id": 101,
+                        "chat_id": "77",
+                        "messages": [{"message_id": 101, "chat_id": "77"}],
+                    }
+                ],
+            )
             self.assertEqual(second_api.outbox_reports[0][2], "delivered")
+            self.assertEqual(receipt_store.load(), {})
+
+    async def test_mismatched_partial_outbox_receipt_restarts_delivery_without_resume(
+        self,
+    ) -> None:
+        delivery = OutboxDelivery(
+            delivery_id="delivery-1",
+            attempt_id="attempt-2",
+            conversation_ref="telegram:user:77",
+            content=OutboxContent(text="final answer"),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            receipt_store = OutboxReceiptStore(
+                Path(temp_dir) / "telegram.outbox-receipts.json"
+            )
+            receipt_store.save(
+                {
+                    "delivery-1": OutboxReceiptRecord(
+                        status="partial",
+                        provider_receipt={
+                            "message_id": 101,
+                            "chat_id": "88",
+                            "messages": [{"message_id": 101, "chat_id": "88"}],
+                        },
+                    )
+                }
+            )
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                outbox_receipt_store=receipt_store,
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="WARNING"):
+                await worker._process_outbox_delivery(delivery)
+
+            self.assertEqual(telegram.resume_receipts, [None])
+            self.assertEqual(
+                telegram.sent_messages,
+                [("telegram:user:77", "final answer", None, None, [])],
+            )
+            self.assertEqual(api.outbox_reports[0][2], "delivered")
             self.assertEqual(receipt_store.load(), {})
 
     async def test_failed_outbox_send_reports_retryable_failure(self) -> None:

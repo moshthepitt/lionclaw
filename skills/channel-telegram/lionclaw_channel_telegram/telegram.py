@@ -637,10 +637,21 @@ def _message_receipt(message: Message) -> dict[str, Any]:
     }
 
 
+def normalize_telegram_receipt(
+    receipt: dict[str, Any],
+    *,
+    conversation_ref: str | None = None,
+) -> dict[str, Any]:
+    chat_id = (
+        _coerce_chat_id(conversation_ref) if conversation_ref is not None else None
+    )
+    return _receipt_from_messages(_receipt_messages(receipt, chat_id=chat_id))
+
+
 def _receipt_messages(
     receipt: dict[str, Any] | None,
     *,
-    chat_id: int | str,
+    chat_id: int | str | None,
 ) -> list[dict[str, Any]]:
     if receipt is None:
         return []
@@ -652,6 +663,7 @@ def _receipt_messages(
     if not messages:
         raise TelegramReferenceError("telegram resume receipt has no messages")
     parsed: list[dict[str, Any]] = []
+    expected_chat_id = chat_id
     for message in messages:
         if not isinstance(message, dict):
             raise TelegramReferenceError(
@@ -667,7 +679,9 @@ def _receipt_messages(
             raise TelegramReferenceError(
                 "telegram resume receipt message has invalid chat_id"
             )
-        if receipt_chat_id != chat_id:
+        if expected_chat_id is None:
+            expected_chat_id = receipt_chat_id
+        elif receipt_chat_id != expected_chat_id:
             raise TelegramReferenceError(
                 "telegram resume receipt chat_id does not match delivery chat"
             )
