@@ -370,7 +370,6 @@ class TelegramWorker:
         command: TelegramCommand,
     ) -> bool:
         if command.name in LIONCLAW_CONTROL_ALIASES:
-            self._advance_route_generation(update.conversation_ref, update.thread_ref)
             return await self._submit_runtime_passthrough(
                 replace(
                     update,
@@ -432,7 +431,7 @@ class TelegramWorker:
         active.status_text = "Stopping"
         await self._ensure_progress_message(active, force=True)
         try:
-            await self.lionclaw_api.cancel_active_turn(
+            result = await self.lionclaw_api.cancel_active_turn(
                 session_id=active.session_id,
                 session_key=active.session_key,
                 expected_turn_id=active.turn_id,
@@ -463,6 +462,12 @@ class TelegramWorker:
                     active.last_rendered_text = None
             await self._reply(update, text)
             return
+        if result.turn_id is None:
+            if active.provisional_message_ref is not None:
+                await self._delete_progress_message(active)
+            active.terminal = True
+            self._forget_turn(active)
+            await self._reply(update, "No active LionClaw turn is running here.")
 
     async def _send_status(self, update: TelegramInboundUpdate) -> None:
         active = self._active_turn_for_route(update.conversation_ref, update.thread_ref)
