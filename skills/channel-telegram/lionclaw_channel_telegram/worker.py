@@ -708,8 +708,8 @@ class TelegramWorker:
 
     async def _process_stream_event(self, event: StreamEvent) -> bool:
         if event.kind == "message_delta":
-            self._extend_typing(
-                event.peer_id,
+            self._extend_stream_typing(
+                event,
                 ttl_seconds=ACTIVE_TURN_TYPING_TTL_SECONDS,
             )
             if event.turn_id in self._active_turns:
@@ -718,15 +718,15 @@ class TelegramWorker:
 
         if event.kind == "status":
             if event.code in TYPING_STATUS_CODES:
-                await self._start_typing(
-                    event.peer_id,
+                await self._start_stream_typing(
+                    event,
                     ttl_seconds=ACTIVE_TURN_TYPING_TTL_SECONDS,
                 )
             self._update_progress_status(event)
             return True
 
         if event.kind == "error":
-            self._stop_typing(event.peer_id)
+            self._stop_stream_typing(event)
             await self._terminalize_progress(event, _terminal_error_text(event))
             logger.error(
                 "lionclaw stream error for peer_id=%s turn_id=%s: %s",
@@ -737,12 +737,12 @@ class TelegramWorker:
             return True
 
         if event.kind == "turn_completed":
-            self._stop_typing(event.peer_id)
+            self._stop_stream_typing(event)
             await self._complete_progress(event)
             return True
 
         if event.kind == "done":
-            self._stop_typing(event.peer_id)
+            self._stop_stream_typing(event)
             await self._finalize_progress_done(event)
             return True
 
@@ -774,11 +774,25 @@ class TelegramWorker:
         ttl_seconds: float,
     ) -> None:
         target = self._target_for_ref(conversation_ref, thread_ref=thread_ref)
+        if not target.conversation_ref:
+            return
         self._extend_target_typing(target, ttl_seconds=ttl_seconds)
         await self._send_typing(target)
 
-    def _extend_typing(self, peer_id: str, *, ttl_seconds: float) -> None:
-        target = self._target_for_ref(peer_id)
+    async def _start_stream_typing(
+        self,
+        event: StreamEvent,
+        *,
+        ttl_seconds: float,
+    ) -> None:
+        target = self._target_for_stream_event(event)
+        if not target.conversation_ref:
+            return
+        self._extend_target_typing(target, ttl_seconds=ttl_seconds)
+        await self._send_typing(target)
+
+    def _extend_stream_typing(self, event: StreamEvent, *, ttl_seconds: float) -> None:
+        target = self._target_for_stream_event(event)
         self._extend_target_typing(target, ttl_seconds=ttl_seconds)
 
     def _extend_target_typing(
@@ -793,8 +807,10 @@ class TelegramWorker:
             self._typing_deadlines.get(target.key, 0.0),
         )
 
-    def _stop_typing(self, peer_id: str) -> None:
-        target = self._target_for_ref(peer_id)
+    def _stop_stream_typing(self, event: StreamEvent) -> None:
+        self._stop_target_typing(self._target_for_stream_event(event))
+
+    def _stop_target_typing(self, target: TypingTarget) -> None:
         self._typing_targets.pop(target.key, None)
         self._typing_deadlines.pop(target.key, None)
         self._typing_failures.pop(target.key, None)
@@ -1008,6 +1024,12 @@ class TelegramWorker:
         return self._typing_routes.get(conversation_ref) or TypingTarget(
             conversation_ref
         )
+
+    def _target_for_stream_event(self, event: StreamEvent) -> TypingTarget:
+        turn = self._active_turns.get(event.turn_id)
+        if turn is not None and not turn.terminal:
+            return turn.target
+        return self._target_for_ref(event.peer_id)
 
     async def _process_outbox_delivery(self, delivery: OutboxDelivery) -> None:
         try:

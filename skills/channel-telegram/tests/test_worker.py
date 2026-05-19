@@ -1650,6 +1650,79 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_stream_typing_uses_turn_topic_not_latest_chat_route(self) -> None:
+        api = FakeLionClawApi()
+        telegram = FakeTelegramTransport()
+        first_target = ("telegram:chat:-1001", "telegram:topic:1")
+        second_target = ("telegram:chat:-1001", "telegram:topic:2")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            first_update = TelegramInboundUpdate(
+                update_id=151,
+                event_id="telegram:update:151",
+                sender_ref="telegram:user:77",
+                conversation_ref="telegram:chat:-1001",
+                thread_ref="telegram:topic:1",
+                message_ref="telegram:message:151",
+                text="first topic",
+                trigger="thread_continuation",
+                provider_metadata={"chat_type": "supergroup"},
+            )
+            second_update = replace(
+                first_update,
+                update_id=152,
+                event_id="telegram:update:152",
+                thread_ref="telegram:topic:2",
+                message_ref="telegram:message:152",
+                text="second topic",
+            )
+            worker._remember_typing_route(first_update)
+            await worker._remember_active_turn(
+                first_update,
+                InboundResponse(outcome="queued", turn_id="turn-1"),
+            )
+            worker._remember_typing_route(second_update)
+            await worker._remember_active_turn(
+                second_update,
+                InboundResponse(outcome="queued", turn_id="turn-2"),
+            )
+
+            await worker._process_stream_event(
+                StreamEvent(
+                    sequence=151,
+                    peer_id="telegram:chat:-1001",
+                    turn_id="turn-1",
+                    kind="status",
+                    code="runtime.started",
+                )
+            )
+
+            self.assertEqual(
+                telegram.typing_calls[-1],
+                first_target,
+            )
+            self.assertIn(first_target, worker._typing_deadlines)
+            self.assertNotIn(second_target, worker._typing_deadlines)
+
+            await worker._process_stream_event(
+                StreamEvent(
+                    sequence=152,
+                    peer_id="telegram:chat:-1001",
+                    turn_id="turn-1",
+                    kind="turn_completed",
+                )
+            )
+
+            self.assertNotIn(
+                first_target,
+                worker._typing_deadlines,
+            )
+
     async def test_blocked_attachment_inbound_does_not_download(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi(inbound_outcome="blocked")
