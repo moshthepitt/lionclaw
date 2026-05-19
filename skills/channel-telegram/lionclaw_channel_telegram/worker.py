@@ -345,14 +345,14 @@ class TelegramWorker:
             await self._notify_pending_approval(update, response.pairing_code)
         if response.outcome == "queued":
             self._remember_typing_route(update)
-            self._remember_active_turn(update, response)
+            await self._remember_active_turn(update, response)
             await self._start_typing(
                 update.conversation_ref,
                 thread_ref=update.thread_ref,
                 ttl_seconds=INITIAL_TYPING_TTL_SECONDS,
             )
         if response.outcome == "waiting_for_attachments":
-            self._remember_active_turn(update, response)
+            await self._remember_active_turn(update, response)
             staged = await self._stage_attachments(update)
             if staged:
                 self._remember_typing_route(update)
@@ -410,7 +410,7 @@ class TelegramWorker:
             await self._notify_pending_approval(update, response.pairing_code)
         if response.outcome == "queued":
             self._remember_typing_route(update)
-            self._remember_active_turn(update, response)
+            await self._remember_active_turn(update, response)
             await self._start_typing(
                 update.conversation_ref,
                 thread_ref=update.thread_ref,
@@ -427,6 +427,8 @@ class TelegramWorker:
             await self._reply(update, "This turn cannot be stopped yet.")
             return
 
+        previous_status = active.status_text
+        had_provisional = active.provisional_message_ref is not None
         active.status_text = "Stopping"
         await self._ensure_progress_message(active, force=True)
         try:
@@ -441,11 +443,24 @@ class TelegramWorker:
                 "lionclaw active turn cancel failed for turn_id=%s",
                 active.turn_id,
             )
+            already_requested = "already requested" in str(err)
             text = (
                 "Stop was already requested."
-                if "already requested" in str(err)
-                else "I could not stop that turn."
+                if already_requested
+                else ("I could not stop that turn.")
             )
+            if not already_requested:
+                active.status_text = previous_status
+                if had_provisional:
+                    await self._edit_progress_message(
+                        active,
+                        _progress_text(active),
+                        force=True,
+                    )
+                elif active.provisional_message_ref is not None:
+                    await self._delete_progress_message(active)
+                    active.provisional_message_ref = None
+                    active.last_rendered_text = None
             await self._reply(update, text)
             return
 
@@ -492,7 +507,7 @@ class TelegramWorker:
                 update.update_id,
             )
 
-    def _remember_active_turn(
+    async def _remember_active_turn(
         self,
         update: TelegramInboundUpdate,
         response: InboundResponse,
@@ -500,6 +515,14 @@ class TelegramWorker:
         if response.turn_id is None:
             return
         target = TypingTarget(update.conversation_ref, update.thread_ref)
+        previous_turn_id = self._route_turns.get(target.key)
+        if previous_turn_id is not None and previous_turn_id != response.turn_id:
+            previous = self._active_turns.get(previous_turn_id)
+            if previous is not None:
+                if previous.provisional_message_ref is not None:
+                    await self._delete_progress_message(previous)
+                previous.terminal = True
+                self._forget_turn(previous)
         generation = self._advance_route_generation(
             target.conversation_ref,
             target.thread_ref,
@@ -513,11 +536,6 @@ class TelegramWorker:
             generation=generation,
             visible_after=_loop_time() + _progress_threshold_seconds(update),
         )
-        previous_turn_id = self._route_turns.get(target.key)
-        if previous_turn_id is not None and previous_turn_id != turn.turn_id:
-            previous = self._active_turns.get(previous_turn_id)
-            if previous is not None:
-                previous.terminal = True
         self._active_turns[turn.turn_id] = turn
         self._route_turns[target.key] = turn.turn_id
 
@@ -1241,7 +1259,9 @@ def _telegram_command(update: TelegramInboundUpdate) -> TelegramCommand | None:
     text = update.text
     if text is None or not text.startswith("/"):
         return None
-    token, _, arguments = text.partition(" ")
+    parts = text.split(maxsplit=1)
+    token = parts[0]
+    arguments = parts[1] if len(parts) > 1 else ""
     command = token.removeprefix("/")
     if "@" in command:
         command, _ = command.split("@", 1)
