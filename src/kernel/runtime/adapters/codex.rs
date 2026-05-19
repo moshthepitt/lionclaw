@@ -2080,7 +2080,8 @@ mod tests {
     };
 
     use crate::kernel::runtime::{
-        ConfinementConfig, EffectiveExecutionPlan, ExecutionLimits, ExecutionOutput, NetworkMode,
+        append_streamed_text_boundary, append_streamed_text_delta, ConfinementConfig,
+        EffectiveExecutionPlan, ExecutionLimits, ExecutionOutput, NetworkMode,
         OciConfinementConfig, RuntimeAdapter, RuntimeControlExecution, RuntimeControlInput,
         RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeMessageLane,
         RuntimeSessionHandle, RuntimeSessionStartInput, WorkspaceAccess,
@@ -2208,6 +2209,23 @@ mod tests {
             self.shutdowns.fetch_add(1, Ordering::SeqCst);
             Ok(self.output.clone())
         }
+    }
+
+    fn answer_text_from_events(events: impl IntoIterator<Item = RuntimeEvent>) -> String {
+        let mut text = String::new();
+        for event in events {
+            match event {
+                RuntimeEvent::MessageDelta {
+                    lane: RuntimeMessageLane::Answer,
+                    text: delta,
+                } => append_streamed_text_delta(&mut text, &delta),
+                RuntimeEvent::MessageBoundary {
+                    lane: RuntimeMessageLane::Answer,
+                } => append_streamed_text_boundary(&mut text),
+                _ => {}
+            }
+        }
+        text
     }
 
     #[test]
@@ -2680,16 +2698,8 @@ mod tests {
             .await
             .expect("turn completed");
 
-        let text = std::iter::from_fn(|| event_rx.try_recv().ok())
-            .filter_map(|event| match event {
-                RuntimeEvent::MessageDelta {
-                    lane: RuntimeMessageLane::Answer,
-                    text,
-                } => Some(text),
-                _ => None,
-            })
-            .collect::<String>();
-        assert_eq!(text, "First.\n\nSecond.");
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok());
+        assert_eq!(answer_text_from_events(events), "First.\n\nSecond.");
 
         adapter.close(&handle).await.expect("close");
     }
