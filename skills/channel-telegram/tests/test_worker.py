@@ -31,6 +31,7 @@ from lionclaw_channel_telegram.api import (
 )
 from lionclaw_channel_telegram.config import WorkerConfig
 from lionclaw_channel_telegram.telegram import (
+    AiogramTelegramTransport,
     TelegramBotIdentity,
     TelegramDownloadedAttachment,
     TelegramInboundAttachment,
@@ -2811,6 +2812,35 @@ class TelegramDeliveryHelperTests(unittest.TestCase):
         )
 
 
+class AiogramTelegramTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_markdown_attachment_text_uses_message_when_html_caption_too_long(
+        self,
+    ) -> None:
+        bot = RecordingAiogramBot()
+        transport = object.__new__(AiogramTelegramTransport)
+        transport._bot = bot
+        transport._bot_identity = None
+
+        await transport.send_message(
+            "telegram:chat:77",
+            "<" * 300,
+            format_hint="markdown",
+            attachments=[
+                TelegramOutboundAttachment(
+                    path="/tmp/report.txt",
+                    filename="report.txt",
+                    mime_type="text/plain",
+                )
+            ],
+        )
+
+        self.assertEqual(len(bot.sent_messages), 1)
+        self.assertEqual(bot.sent_messages[0]["parse_mode"], "HTML")
+        self.assertEqual(bot.sent_messages[0]["text"], "&lt;" * 300)
+        self.assertEqual(len(bot.sent_documents), 1)
+        self.assertNotIn("caption", bot.sent_documents[0])
+
+
 def build_api(client: httpx.AsyncClient) -> LionClawApi:
     return LionClawApi(
         base_url="http://127.0.0.1:8979",
@@ -3009,6 +3039,45 @@ class MalformedTelegramUpdate:
     @property
     def message(self):
         raise RuntimeError("malformed telegram update")
+
+
+class RecordingAiogramChat:
+    def __init__(self, chat_id: int | str) -> None:
+        self.id = chat_id
+
+
+class RecordingAiogramMessage:
+    def __init__(self, message_id: int, chat_id: int | str) -> None:
+        self.message_id = message_id
+        self.chat = RecordingAiogramChat(chat_id)
+
+
+class RecordingAiogramBot:
+    def __init__(self) -> None:
+        self._next_message_id = 100
+        self.sent_messages: list[dict[str, object]] = []
+        self.sent_documents: list[dict[str, object]] = []
+        self.sent_chat_actions: list[dict[str, object]] = []
+
+    async def send_message(self, **params) -> RecordingAiogramMessage:
+        self.sent_messages.append(dict(params))
+        return self._message_for(params["chat_id"])
+
+    async def send_chat_action(self, **params) -> None:
+        self.sent_chat_actions.append(dict(params))
+
+    async def send_document(
+        self,
+        *,
+        document,
+        **params,
+    ) -> RecordingAiogramMessage:
+        self.sent_documents.append({**params, "document": document})
+        return self._message_for(params["chat_id"])
+
+    def _message_for(self, chat_id: int | str) -> RecordingAiogramMessage:
+        self._next_message_id += 1
+        return RecordingAiogramMessage(self._next_message_id, chat_id)
 
 
 class FakeTelegramTransport:

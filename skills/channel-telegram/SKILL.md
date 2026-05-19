@@ -105,7 +105,7 @@ LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
 - Outbox attachments are sent as native Telegram media where possible
   (`sendPhoto`, `sendVideo`, `sendAudio`/`sendVoice`) and fall back to
   documents by MIME type. Short text on media deliveries is used as the first
-  attachment caption.
+  attachment caption when the rendered caption fits Telegram's limits.
 - Topic `thread_ref` and `reply_to_ref` are converted back into Telegram
   delivery parameters, and each outbox lease is reported with its `attempt_id`.
 - Runtime selection comes from the selected instance's default runtime; workers do not send `runtime_id` in inbound requests.

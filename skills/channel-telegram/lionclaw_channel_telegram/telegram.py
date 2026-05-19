@@ -239,7 +239,7 @@ class AiogramTelegramTransport:
         if (
             attachments
             and len(text_chunks) == 1
-            and _utf16_len(text_chunks[0].plain_text) <= TELEGRAM_CAPTION_LIMIT
+            and _fits_telegram_caption(text_chunks[0])
         ):
             caption_chunk = text_chunks[0]
             text_chunks = []
@@ -930,6 +930,11 @@ def _format_telegram_text_chunks(
     ):
         return formatted
     return [TelegramTextChunk(plain_text=chunk) for chunk in chunks]
+
+
+def _fits_telegram_caption(chunk: TelegramTextChunk) -> bool:
+    send_text = chunk.html_text if chunk.html_text is not None else chunk.plain_text
+    return _utf16_len(send_text) <= TELEGRAM_CAPTION_LIMIT
 
 
 def _markdown_to_telegram_html(markdown: str) -> str:
