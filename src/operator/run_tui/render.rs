@@ -286,12 +286,24 @@ fn render_instances(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {
     }
 
     app.ensure_project_cursor();
-    let rows = project_list_rows(app, content.width as usize);
+    let (list_area, scrollbar_area) = split_scrollable_area(content);
+    if list_area.width == 0 || list_area.height == 0 {
+        return;
+    }
+
+    let rows = project_list_rows(app, list_area.width as usize);
+    let row_count = rows.len();
     let selected_row = project_list_selected_row(&rows, app.project_cursor);
     app.project_list_state.select(selected_row);
     let items = rows.into_iter().map(|row| row.item).collect::<Vec<_>>();
     let list = List::new(items).highlight_style(Style::default().bg(PANEL_SELECTED));
-    frame.render_stateful_widget(list, content, &mut app.project_list_state);
+    frame.render_stateful_widget(list, list_area, &mut app.project_list_state);
+    render_vertical_scrollbar(
+        frame,
+        scrollbar_area,
+        row_count,
+        app.project_list_state.offset(),
+    );
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut ConsoleApp) {

@@ -537,6 +537,63 @@ async fn runtime_boundary_and_audit_inspectors_render_real_context() {
     assert!(audit.contains("actor api"));
 }
 
+#[test]
+fn project_pane_scrolls_and_marks_long_instance_lists() {
+    let mut app = blocked_test_app();
+    app.instances = (0..40)
+        .map(|index| InstanceSummary {
+            name: Some(format!("inst-{index:02}")),
+            is_default: index == 0,
+            home: PathBuf::from(format!("/tmp/instances/inst-{index:02}")),
+            work_root: Some(PathBuf::from(format!("/tmp/project/inst-{index:02}"))),
+            work_root_finding: None,
+            shared_work_root_count: 0,
+            default_runtime: Some("codex".to_string()),
+        })
+        .collect();
+    let selected = app.instances.last().expect("instance").clone();
+    app.selected_index = app.instances.len() - 1;
+    app.project_cursor = ProjectSelection::Instance(app.selected_index);
+    app.selected = SelectedInstanceState::Blocked {
+        summary: selected,
+        blocker: LaunchBlocker::for_instance("inst-39", "blocked"),
+    };
+
+    let rendered = render_to_text(&mut app, 100, 28);
+
+    assert!(app.project_list_state.offset() > 0);
+    assert!(rendered.contains("inst-39"));
+    assert!(rendered.contains("^"));
+    assert!(rendered.contains("v"));
+}
+
+#[tokio::test]
+async fn project_pane_scrolls_and_marks_long_session_lists() {
+    let mut app = ready_test_app(Vec::new()).await;
+    app.project_root = Some(PathBuf::from("/tmp/project"));
+    let sessions = (0..40)
+        .map(|index| {
+            let session_id = Uuid::from_u128(index + 1);
+            ProjectSessionItem {
+                session_id,
+                turn_count: index as u64,
+                current: session_id == app.ready_instance().expect("ready").session_id,
+            }
+        })
+        .collect::<Vec<_>>();
+    let target = sessions.last().expect("session").session_id;
+    app.project_objects.sessions = ProjectObjectSection::Ready(sessions);
+    app.project_cursor = ProjectSelection::Session(target);
+    app.focus = Focus::Project;
+
+    let rendered = render_to_text(&mut app, 100, 28);
+
+    assert!(app.project_list_state.offset() > 0);
+    assert!(rendered.contains(&short_session_id(target)));
+    assert!(rendered.contains("^"));
+    assert!(rendered.contains("v"));
+}
+
 #[tokio::test]
 async fn transcript_scroll_is_bounded_to_wrapped_content_and_renders_scrollbar() {
     let body = (0..40)
