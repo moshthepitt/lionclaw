@@ -51,7 +51,9 @@ from lionclaw_channel_telegram.telegram import (
     extract_inbound_event,
 )
 from lionclaw_channel_telegram.worker import (
+    MAX_DELIVERED_OUTBOX_RECEIPTS,
     OffsetStore,
+    OutboxReceiptStore,
     TelegramWorker,
     _classify_send_failure,
     _overall_health_status,
@@ -962,6 +964,62 @@ class OffsetStoreTests(unittest.TestCase):
             self.assertEqual(store.load(), 43)
             self.assertEqual(path.read_text(encoding="utf-8"), "43")
             self.assertFalse((path.parent / ".telegram.offset.tmp").exists())
+
+
+class OutboxReceiptStoreTests(unittest.TestCase):
+    def test_save_replaces_receipt_file_without_leaving_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "telegram.outbox-receipts.json"
+            store = OutboxReceiptStore(path)
+
+            store.save({"delivery-1": {"message_id": 101}})
+            store.save({"delivery-2": {"message_id": 102}})
+
+            self.assertEqual(store.load(), {"delivery-2": {"message_id": 102}})
+            self.assertFalse(
+                (path.parent / ".telegram.outbox-receipts.json.tmp").exists()
+            )
+
+    def test_load_ignores_malformed_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "telegram.outbox-receipts.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "delivery-1": {"message_id": 101},
+                        "delivery-2": "bad",
+                        3: {"message_id": 103},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                OutboxReceiptStore(path).load(),
+                {
+                    "delivery-1": {"message_id": 101},
+                    "3": {"message_id": 103},
+                },
+            )
+
+    def test_load_caps_oversized_receipt_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "telegram.outbox-receipts.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        f"delivery-{index}": {"message_id": index}
+                        for index in range(MAX_DELIVERED_OUTBOX_RECEIPTS + 1)
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            receipts = OutboxReceiptStore(path).load()
+
+            self.assertEqual(len(receipts), MAX_DELIVERED_OUTBOX_RECEIPTS)
+            self.assertNotIn("delivery-0", receipts)
+            self.assertIn(f"delivery-{MAX_DELIVERED_OUTBOX_RECEIPTS}", receipts)
 
 
 class WorkerConfigTests(unittest.TestCase):
@@ -3100,6 +3158,86 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_delivered_outbox_receipt_survives_report_failure_and_restart(
+        self,
+    ) -> None:
+        async def no_sleep(_delay: float) -> None:
+            return None
+
+        delivery = OutboxDelivery(
+            delivery_id="delivery-1",
+            attempt_id="attempt-1",
+            conversation_ref="telegram:user:77",
+            content=OutboxContent(text="final answer"),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            receipt_store = OutboxReceiptStore(
+                Path(temp_dir) / "telegram.outbox-receipts.json"
+            )
+            first_api = FakeLionClawApi(
+                outbox_report_errors=[
+                    RuntimeError("kernel unavailable"),
+                    RuntimeError("kernel unavailable"),
+                    RuntimeError("kernel unavailable"),
+                ]
+            )
+            first_telegram = FakeTelegramTransport()
+            first_worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=first_api,
+                telegram=first_telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                outbox_receipt_store=receipt_store,
+            )
+
+            with (
+                self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"),
+                patch("lionclaw_channel_telegram.worker.asyncio.sleep", no_sleep),
+            ):
+                await first_worker._process_outbox_delivery(delivery)
+
+            released_delivery = replace(delivery, attempt_id="attempt-2")
+            second_api = FakeLionClawApi()
+            second_telegram = FakeTelegramTransport()
+            second_worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=second_api,
+                telegram=second_telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                outbox_receipt_store=receipt_store,
+            )
+
+            await second_worker._process_outbox_delivery(released_delivery)
+
+            self.assertEqual(
+                first_telegram.sent_messages,
+                [
+                    (
+                        "telegram:user:77",
+                        "final answer",
+                        None,
+                        None,
+                        [],
+                    )
+                ],
+            )
+            self.assertEqual(second_telegram.sent_messages, [])
+            self.assertEqual(len(first_api.outbox_reports), 3)
+            self.assertEqual(
+                second_api.outbox_reports,
+                [
+                    (
+                        "delivery-1",
+                        "attempt-2",
+                        "delivered",
+                        {"message_id": 101, "chat_id": "telegram:user:77"},
+                        None,
+                        None,
+                    )
+                ],
+            )
+            self.assertEqual(receipt_store.load(), {})
+
     async def test_failed_outbox_send_reports_retryable_failure(self) -> None:
         api = FakeLionClawApi(
             outbox_deliveries=[
@@ -3530,6 +3668,7 @@ class FakeLionClawApi:
         inbound_session_key: str | None = None,
         cancel_error: Exception | None = None,
         cancel_turn_id: str | None | object = _USE_EXPECTED_TURN_ID,
+        outbox_report_errors: list[Exception] | None = None,
     ) -> None:
         self.stream_events = list(stream_events or [])
         self.outbox_deliveries = list(outbox_deliveries or [])
@@ -3543,6 +3682,7 @@ class FakeLionClawApi:
         self.inbound_session_key = inbound_session_key
         self.cancel_error = cancel_error
         self.cancel_turn_id = cancel_turn_id
+        self.outbox_report_errors = list(outbox_report_errors or [])
         self.sent_inbound: list[TelegramInboundUpdate] = []
         self.cancel_calls: list[tuple[str, str, str | None, str]] = []
         self.claims: list[TelegramPairingClaim] = []
@@ -3658,6 +3798,8 @@ class FakeLionClawApi:
                 error_text,
             )
         )
+        if self.outbox_report_errors:
+            raise self.outbox_report_errors.pop(0)
         return type(
             "OutboxReportResponse",
             (),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -64,6 +65,7 @@ PROGRESS_EDIT_MIN_SECONDS = 1.0
 PROGRESS_DELETE_RETRY_BASE_SECONDS = 1.0
 PROGRESS_DELETE_RETRY_MAX_SECONDS = 30.0
 COMPACT_STATUS_TEXT_LIMIT = 96
+MAX_DELIVERED_OUTBOX_RECEIPTS = 256
 
 LOCAL_TELEGRAM_COMMANDS = {
     "help",
@@ -156,6 +158,39 @@ class OffsetStore:
         tmp_path.replace(self.path)
 
 
+@dataclass(slots=True)
+class OutboxReceiptStore:
+    path: Path
+
+    def load(self) -> dict[str, dict[str, object]]:
+        if not self.path.exists():
+            return {}
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.exception("telegram outbox receipt store load failed")
+            return {}
+        if not isinstance(raw, dict):
+            logger.warning("telegram outbox receipt store ignored non-object payload")
+            return {}
+        receipts: dict[str, dict[str, object]] = {}
+        for delivery_id, receipt in raw.items():
+            if isinstance(delivery_id, str) and isinstance(receipt, dict):
+                receipts[delivery_id] = dict(receipt)
+        while len(receipts) > MAX_DELIVERED_OUTBOX_RECEIPTS:
+            receipts.pop(next(iter(receipts)))
+        return receipts
+
+    def save(self, receipts: dict[str, dict[str, object]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.path.with_name(f".{self.path.name}.tmp")
+        tmp_path.write_text(
+            json.dumps(receipts, sort_keys=True),
+            encoding="utf-8",
+        )
+        tmp_path.replace(self.path)
+
+
 class TelegramWorker:
     def __init__(
         self,
@@ -163,12 +198,17 @@ class TelegramWorker:
         lionclaw_api: LionClawApi,
         telegram: TelegramTransport,
         offset_store: OffsetStore,
+        outbox_receipt_store: OutboxReceiptStore | None = None,
     ) -> None:
         self.config = config
         self.lionclaw_api = lionclaw_api
         self.telegram = telegram
         self.offset_store = offset_store
         self.offset = offset_store.load()
+        self.outbox_receipt_store = outbox_receipt_store
+        self._delivered_outbox_receipts = (
+            outbox_receipt_store.load() if outbox_receipt_store is not None else {}
+        )
         self._typing_targets: dict[tuple[str, str | None], TypingTarget] = {}
         self._typing_deadlines: dict[tuple[str, str | None], float] = {}
         self._typing_routes: dict[str, TypingTarget] = {}
@@ -309,6 +349,7 @@ class TelegramWorker:
             self._pending_progress_deletes.clear()
             self._route_turns.clear()
             self._route_generations.clear()
+            self._delivered_outbox_receipts.clear()
 
     async def _run_update_loop(self) -> None:
         while True:
@@ -1098,6 +1139,18 @@ class TelegramWorker:
         return self._target_for_ref(event.peer_id)
 
     async def _process_outbox_delivery(self, delivery: OutboxDelivery) -> None:
+        cached_receipt = self._delivered_outbox_receipts.get(delivery.delivery_id)
+        if cached_receipt is not None:
+            await self._complete_progress_for_delivery(delivery)
+            accepted = await self._report_outbox_with_retry(
+                delivery,
+                "delivered",
+                provider_receipt=cached_receipt,
+            )
+            if accepted:
+                self._forget_delivered_outbox_receipt(delivery.delivery_id)
+            return
+
         try:
             receipt = await self.telegram.send_message(
                 delivery.conversation_ref,
@@ -1131,12 +1184,39 @@ class TelegramWorker:
             )
             return
 
+        self._remember_delivered_outbox_receipt(delivery.delivery_id, receipt)
         await self._complete_progress_for_delivery(delivery)
-        await self._report_outbox_with_retry(
+        accepted = await self._report_outbox_with_retry(
             delivery,
             "delivered",
             provider_receipt=receipt,
         )
+        if accepted:
+            self._forget_delivered_outbox_receipt(delivery.delivery_id)
+
+    def _remember_delivered_outbox_receipt(
+        self,
+        delivery_id: str,
+        receipt: dict[str, object],
+    ) -> None:
+        self._delivered_outbox_receipts[delivery_id] = dict(receipt)
+        while len(self._delivered_outbox_receipts) > MAX_DELIVERED_OUTBOX_RECEIPTS:
+            self._delivered_outbox_receipts.pop(
+                next(iter(self._delivered_outbox_receipts))
+            )
+        self._save_delivered_outbox_receipts()
+
+    def _forget_delivered_outbox_receipt(self, delivery_id: str) -> None:
+        if self._delivered_outbox_receipts.pop(delivery_id, None) is not None:
+            self._save_delivered_outbox_receipts()
+
+    def _save_delivered_outbox_receipts(self) -> None:
+        if self.outbox_receipt_store is None:
+            return
+        try:
+            self.outbox_receipt_store.save(self._delivered_outbox_receipts)
+        except Exception:
+            logger.exception("telegram outbox receipt store save failed")
 
     async def _complete_progress_for_delivery(self, delivery: OutboxDelivery) -> None:
         if delivery.turn_id is None:
@@ -1163,17 +1243,19 @@ class TelegramWorker:
         provider_receipt: dict[str, object] | None = None,
         error_code: str | None = None,
         error_text: str | None = None,
-    ) -> None:
+    ) -> bool:
         for attempt_no in range(1, 4):
-            if await self._report_outbox_once(
+            accepted = await self._report_outbox_once(
                 delivery,
                 outcome,
                 provider_receipt=provider_receipt,
                 error_code=error_code,
                 error_text=error_text,
-            ):
-                return
+            )
+            if accepted is not None:
+                return accepted
             await asyncio.sleep(0.25 * attempt_no)
+        return False
 
     async def _report_outbox_once(
         self,
@@ -1183,7 +1265,7 @@ class TelegramWorker:
         provider_receipt: dict[str, object] | None = None,
         error_code: str | None = None,
         error_text: str | None = None,
-    ) -> bool:
+    ) -> bool | None:
         try:
             response = await self.lionclaw_api.report_outbox(
                 delivery,
@@ -1198,7 +1280,7 @@ class TelegramWorker:
                 delivery.delivery_id,
                 outcome,
             )
-            return False
+            return None
         if not response.accepted:
             logger.warning(
                 "lionclaw rejected stale outbox report for delivery_id=%s "
@@ -1207,7 +1289,7 @@ class TelegramWorker:
                 response.status,
                 response.attempt_status,
             )
-        return True
+        return response.accepted
 
     async def _health_checks(self) -> list[HealthCheck]:
         checks = [await self._bot_identity_health_check()]
@@ -1576,6 +1658,9 @@ async def run() -> None:
         lionclaw_api=lionclaw_api,
         telegram=telegram,
         offset_store=OffsetStore(config.telegram_offset_file),
+        outbox_receipt_store=OutboxReceiptStore(
+            config.runtime_dir / "telegram.outbox-receipts.json"
+        ),
     )
 
     try:
