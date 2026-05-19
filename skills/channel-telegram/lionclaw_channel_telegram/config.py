@@ -21,7 +21,7 @@ class WorkerConfig:
     telegram_offset_file: Path
 
     @classmethod
-    def from_env(cls) -> "WorkerConfig":
+    def from_env(cls) -> WorkerConfig:
         telegram_bot_token = _required_env("TELEGRAM_BOT_TOKEN")
         lionclaw_home = Path(
             os.environ.get("LIONCLAW_HOME", str(Path.home() / ".lionclaw"))

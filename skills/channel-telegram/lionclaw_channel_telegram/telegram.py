@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import html
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, Sequence
+from typing import Any, Protocol
 
 from aiogram import Bot
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
+    BotCommand,
     FSInputFile,
     LinkPreviewOptions,
     Message,
@@ -109,6 +111,8 @@ class TelegramTransport(Protocol):
 
     async def get_updates(self, offset: int, timeout_seconds: int) -> list[Update]: ...
 
+    async def configure_commands(self) -> None: ...
+
     async def download_attachment(
         self,
         attachment: TelegramInboundAttachment,
@@ -129,6 +133,21 @@ class TelegramTransport(Protocol):
         self,
         conversation_ref: str,
         thread_ref: str | None = None,
+    ) -> None: ...
+
+    async def edit_message(
+        self,
+        conversation_ref: str,
+        message_ref: str,
+        text: str,
+        *,
+        format_hint: str = "plain",
+    ) -> None: ...
+
+    async def delete_message(
+        self,
+        conversation_ref: str,
+        message_ref: str,
     ) -> None: ...
 
 
@@ -160,6 +179,20 @@ class AiogramTelegramTransport:
             ],
         )
 
+    async def configure_commands(self) -> None:
+        await self._bot.set_my_commands(
+            [
+                BotCommand(command="help", description="Show LionClaw controls"),
+                BotCommand(command="status", description="Show current turn status"),
+                BotCommand(command="new", description="Start a fresh session"),
+                BotCommand(command="stop", description="Stop the active turn"),
+                BotCommand(command="retry", description="Retry the last turn"),
+                BotCommand(command="continue", description="Continue a partial turn"),
+                BotCommand(command="model", description="Open runtime model controls"),
+                BotCommand(command="settings", description="Show Telegram settings"),
+            ]
+        )
+
     async def download_attachment(
         self,
         attachment: TelegramInboundAttachment,
@@ -169,7 +202,8 @@ class AiogramTelegramTransport:
         file_size = telegram_file.file_size or attachment.size_bytes
         if file_size is not None and file_size > max_bytes:
             raise TelegramEntityTooLargeForStage(
-                f"telegram file {attachment.attachment_id} is too large: {file_size} bytes"
+                f"telegram file {attachment.attachment_id} is too large: "
+                f"{file_size} bytes"
             )
         if telegram_file.file_path is None:
             raise RuntimeError("telegram getFile response did not include file_path")
@@ -177,7 +211,8 @@ class AiogramTelegramTransport:
         content = downloaded.read()
         if len(content) > max_bytes:
             raise TelegramEntityTooLargeForStage(
-                f"telegram file {attachment.attachment_id} is too large: {len(content)} bytes"
+                f"telegram file {attachment.attachment_id} is too large: "
+                f"{len(content)} bytes"
             )
         return TelegramDownloadedAttachment(
             attachment=attachment,
@@ -352,6 +387,55 @@ class AiogramTelegramTransport:
             chat_id=_coerce_chat_id(conversation_ref),
             action=ChatAction.TYPING,
             message_thread_id=_coerce_thread_id(thread_ref, omit_general=False),
+        )
+
+    async def edit_message(
+        self,
+        conversation_ref: str,
+        message_ref: str,
+        text: str,
+        *,
+        format_hint: str = "plain",
+    ) -> None:
+        chat_id = _coerce_chat_id(conversation_ref)
+        message_id = _coerce_message_id(message_ref)
+        if message_id is None:
+            raise TelegramReferenceError(
+                f"invalid telegram message_ref '{message_ref}'"
+            )
+        chunks = _format_telegram_text_chunks(text, format_hint)
+        chunk = chunks[0] if chunks else TelegramTextChunk(" ")
+        params: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "link_preview_options": LinkPreviewOptions(is_disabled=True),
+        }
+        if chunk.html_text is not None:
+            try:
+                await self._bot.edit_message_text(
+                    text=chunk.html_text,
+                    parse_mode="HTML",
+                    **params,
+                )
+                return
+            except TelegramBadRequest as err:
+                if not _is_parse_error(err):
+                    raise
+        await self._bot.edit_message_text(text=chunk.plain_text, **params)
+
+    async def delete_message(
+        self,
+        conversation_ref: str,
+        message_ref: str,
+    ) -> None:
+        message_id = _coerce_message_id(message_ref)
+        if message_id is None:
+            raise TelegramReferenceError(
+                f"invalid telegram message_ref '{message_ref}'"
+            )
+        await self._bot.delete_message(
+            chat_id=_coerce_chat_id(conversation_ref),
+            message_id=message_id,
         )
 
 

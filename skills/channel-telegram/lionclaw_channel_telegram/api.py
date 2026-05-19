@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -20,6 +20,9 @@ class InboundResponse:
     reason_code: str | None = None
     pairing_id: str | None = None
     pairing_code: str | None = None
+    turn_id: str | None = None
+    session_id: str | None = None
+    session_key: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -63,6 +66,12 @@ class HealthReportResponse:
     accepted: bool
     channel_id: str
     observed_at: str
+
+
+@dataclass(slots=True, frozen=True)
+class SessionActionResult:
+    session_id: str
+    turn_id: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -157,6 +166,35 @@ class LionClawApi:
             reason_code=payload.get("reason_code"),
             pairing_id=payload.get("pairing_id"),
             pairing_code=payload.get("pairing_code"),
+            turn_id=payload.get("turn_id"),
+            session_id=payload.get("session_id"),
+            session_key=payload.get("session_key"),
+        )
+
+    async def cancel_active_turn(
+        self,
+        *,
+        session_id: str,
+        session_key: str,
+        expected_turn_id: str | None,
+        reason: str,
+    ) -> SessionActionResult:
+        response = await self._client.post(
+            "/v0/sessions/action",
+            json={
+                "action": "cancel_active_turn",
+                "session_id": session_id,
+                "channel_id": self.channel_id,
+                "session_key": session_key,
+                "expected_turn_id": expected_turn_id,
+                "reason": reason,
+            },
+        )
+        _raise_for_status(response)
+        payload = response.json()
+        return SessionActionResult(
+            session_id=payload["session_id"],
+            turn_id=payload.get("turn_id"),
         )
 
     async def claim_pairing(self, claim: TelegramPairingClaim) -> PairingClaimResponse:
@@ -248,11 +286,11 @@ class LionClawApi:
         checks: list[HealthCheck],
         observed_at: datetime | None = None,
     ) -> HealthReportResponse:
-        observed_at = observed_at or datetime.now(timezone.utc)
+        observed_at = observed_at or datetime.now(UTC)
         if observed_at.tzinfo is None:
-            observed_at = observed_at.replace(tzinfo=timezone.utc)
+            observed_at = observed_at.replace(tzinfo=UTC)
         else:
-            observed_at = observed_at.astimezone(timezone.utc)
+            observed_at = observed_at.astimezone(UTC)
         response = await self._client.post(
             "/v0/channels/health/report",
             json={

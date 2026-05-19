@@ -27,11 +27,15 @@ Under the hood, the worker:
    `waiting_for_attachments`,
 6. long-polls `/v0/channels/stream/pull` for progress events,
 7. starts Telegram typing from kernel queue/runtime status events,
-8. leases provider deliveries from `/v0/channels/outbox/pull`,
-9. sends Telegram messages from outbox leases and reports provider outcomes to
+8. renders long-running turns as one provisional Telegram message and edits it
+   on throttled progress state changes,
+9. intercepts Telegram-local commands such as `/status`, `/stop`, `/retry`, and
+   `/continue` without stealing runtime slash commands such as `/model`,
+10. leases provider deliveries from `/v0/channels/outbox/pull`,
+11. sends Telegram messages from outbox leases and reports provider outcomes to
    `/v0/channels/outbox/report`,
-10. submits worker health checks through `/v0/channels/health/report`,
-11. advances its progress cursor through `/v0/channels/stream/ack`.
+12. submits worker health checks through `/v0/channels/health/report`,
+13. advances its progress cursor through `/v0/channels/stream/ack`.
 
 ## Prerequisites
 
@@ -83,6 +87,17 @@ LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
 - The worker defaults `consumer_id` to `telegram:<channel_id>` and `start_mode=resume`, so unacked progress events are replayed after worker restart.
 - Telegram delivery is outbox-driven: typing comes from progress streams, final
   answers come from durable outbox leases, no reasoning lane delivery.
+- Telegram has its own visible command menu. `/help`, `/status`, `/new`,
+  `/stop`, `/retry`, `/continue`, and `/settings` are channel-local aliases.
+  `/retry`, `/continue`, and `/new` are translated to canonical `/lionclaw ...`
+  controls before they enter the kernel. `/stop` uses the channel-safe active
+  turn cancellation action with the expected turn id guard. `/model` and unknown
+  slash commands pass through to the runtime unchanged.
+- Fast turns only show typing. Long turns create one provisional message after a
+  short threshold, edit it at a throttled cadence, and delete it when the durable
+  outbox answer is ready. Cancelled and failed turns leave a terminal status.
+  Transient edit failures are retried; permanent edit failures disable editing
+  for that message and fall back to a normal Telegram message.
 - Outbound text is sent as plain text by default. Markdown hints render to
   Telegram-safe HTML only when the rendered chunks fit Telegram limits; otherwise
   delivery falls back to plain text. Link previews stay disabled so local
@@ -99,3 +114,13 @@ LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
   `LIONCLAW_HEALTH_REPORT_INTERVAL_SECS`. Checks cover a fresh Telegram
   `getMe`, `getUpdates` polling failures or hangs, update lag, and delivery
   failures observed by the current worker process.
+
+## Development Checks
+
+Run these from the repository root when changing this skill:
+
+```bash
+uv run --project skills/channel-telegram black --check skills/channel-telegram/lionclaw_channel_telegram skills/channel-telegram/tests
+uv run --project skills/channel-telegram ruff check skills/channel-telegram/lionclaw_channel_telegram skills/channel-telegram/tests
+uv run --project skills/channel-telegram python -m unittest discover -s skills/channel-telegram/tests -q
+```

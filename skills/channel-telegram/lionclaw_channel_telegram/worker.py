@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from aiogram.exceptions import (
@@ -53,6 +53,32 @@ TYPING_REFRESH_SECONDS = 4.0
 MAX_TYPING_FAILURES = 3
 MIN_HEALTH_REPORT_INTERVAL_SECONDS = 1.0
 POLLING_IN_FLIGHT_GRACE_SECONDS = 10.0
+DM_PROGRESS_THRESHOLD_SECONDS = 1.5
+GROUP_PROGRESS_THRESHOLD_SECONDS = 3.0
+PROGRESS_REFRESH_SECONDS = 0.5
+PROGRESS_EDIT_MIN_SECONDS = 1.0
+
+LOCAL_TELEGRAM_COMMANDS = {
+    "help",
+    "status",
+    "new",
+    "stop",
+    "retry",
+    "continue",
+    "settings",
+}
+LIONCLAW_CONTROL_ALIASES = {
+    "new": "/lionclaw reset",
+    "retry": "/lionclaw retry",
+    "continue": "/lionclaw continue",
+}
+ACTIVE_STATUS_CODES = {
+    "queue.started": "Queued",
+    "runtime.started": "Working",
+    "runtime.artifact": "Preparing artifact",
+}
+CANCELLED_STATUS_CODES = {"runtime.cancelled", "queue.cancelled"}
+COMPLETED_STATUS_CODES = {"queue.completed"}
 
 
 @dataclass(slots=True, frozen=True)
@@ -63,6 +89,31 @@ class TypingTarget:
     @property
     def key(self) -> tuple[str, str | None]:
         return (self.conversation_ref, self.thread_ref)
+
+
+@dataclass(slots=True)
+class ActiveTurn:
+    turn_id: str
+    session_id: str | None
+    session_key: str | None
+    target: TypingTarget
+    reply_to_ref: str | None
+    generation: int
+    visible_after: float
+    status_text: str = "Queued"
+    provisional_message_ref: str | None = None
+    last_rendered_text: str | None = None
+    last_edit_at: float = 0.0
+    can_edit: bool = True
+    terminal: bool = False
+    terminal_text: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class TelegramCommand:
+    name: str
+    raw: str
+    arguments: str
 
 
 @dataclass(slots=True)
@@ -99,6 +150,9 @@ class TelegramWorker:
         self._typing_deadlines: dict[tuple[str, str | None], float] = {}
         self._typing_routes: dict[str, TypingTarget] = {}
         self._typing_failures: dict[tuple[str, str | None], int] = {}
+        self._active_turns: dict[str, ActiveTurn] = {}
+        self._route_turns: dict[tuple[str, str | None], str] = {}
+        self._route_generations: dict[tuple[str, str | None], int] = {}
         self._poll_in_flight_started_at: float | None = None
         self._last_poll_success_observed_at: float | None = None
         self._last_poll_failure_observed_at: float | None = None
@@ -187,6 +241,7 @@ class TelegramWorker:
             asyncio.create_task(self._run_stream_loop(), name="lionclaw-stream"),
             asyncio.create_task(self._run_outbox_loop(), name="lionclaw-outbox"),
             asyncio.create_task(self._run_typing_loop(), name="telegram-typing"),
+            asyncio.create_task(self._run_progress_loop(), name="telegram-progress"),
             asyncio.create_task(self._run_health_loop(), name="lionclaw-health"),
         ]
         try:
@@ -199,6 +254,9 @@ class TelegramWorker:
             self._typing_deadlines.clear()
             self._typing_routes.clear()
             self._typing_failures.clear()
+            self._active_turns.clear()
+            self._route_turns.clear()
+            self._route_generations.clear()
 
     async def _run_update_loop(self) -> None:
         while True:
@@ -219,6 +277,11 @@ class TelegramWorker:
         while True:
             await asyncio.sleep(TYPING_REFRESH_SECONDS)
             await self.refresh_typing()
+
+    async def _run_progress_loop(self) -> None:
+        while True:
+            await asyncio.sleep(PROGRESS_REFRESH_SECONDS)
+            await self.refresh_progress_messages()
 
     async def _run_health_loop(self) -> None:
         interval = max(
@@ -254,6 +317,14 @@ class TelegramWorker:
         return True
 
     async def _submit_inbound(self, update: TelegramInboundUpdate) -> bool:
+        command = _telegram_command(update)
+        if (
+            command is not None
+            and command.name in LOCAL_TELEGRAM_COMMANDS
+            and _telegram_command_is_addressed(update)
+        ):
+            return await self._handle_telegram_command(update, command)
+
         try:
             response = await self.lionclaw_api.send_inbound(update)
         except Exception:
@@ -273,12 +344,14 @@ class TelegramWorker:
             await self._notify_pending_approval(update, response.pairing_code)
         if response.outcome == "queued":
             self._remember_typing_route(update)
+            self._remember_active_turn(update, response)
             await self._start_typing(
                 update.conversation_ref,
                 thread_ref=update.thread_ref,
                 ttl_seconds=INITIAL_TYPING_TTL_SECONDS,
             )
         if response.outcome == "waiting_for_attachments":
+            self._remember_active_turn(update, response)
             staged = await self._stage_attachments(update)
             if staged:
                 self._remember_typing_route(update)
@@ -289,6 +362,184 @@ class TelegramWorker:
                 )
             return staged
         return True
+
+    async def _handle_telegram_command(
+        self,
+        update: TelegramInboundUpdate,
+        command: TelegramCommand,
+    ) -> bool:
+        if command.name in LIONCLAW_CONTROL_ALIASES:
+            self._advance_route_generation(update.conversation_ref, update.thread_ref)
+            return await self._submit_runtime_passthrough(
+                replace(
+                    update,
+                    text=LIONCLAW_CONTROL_ALIASES[command.name],
+                    attachments=[],
+                )
+            )
+        if command.name == "stop":
+            await self._stop_active_turn(update)
+            return True
+        if command.name == "status":
+            await self._send_status(update)
+            return True
+        if command.name == "settings":
+            await self._send_settings(update)
+            return True
+        await self._send_help(update)
+        return True
+
+    async def _submit_runtime_passthrough(self, update: TelegramInboundUpdate) -> bool:
+        try:
+            response = await self.lionclaw_api.send_inbound(update)
+        except Exception:
+            logger.exception(
+                "lionclaw command submit failed for update_id=%s",
+                update.update_id,
+            )
+            return False
+        if response.outcome not in EXPECTED_INBOUND_OUTCOMES:
+            logger.error(
+                "lionclaw command returned unknown outcome '%s' for update_id=%s",
+                response.outcome,
+                update.update_id,
+            )
+            return False
+        if response.outcome == "pending_approval":
+            await self._notify_pending_approval(update, response.pairing_code)
+        if response.outcome == "queued":
+            self._remember_typing_route(update)
+            self._remember_active_turn(update, response)
+            await self._start_typing(
+                update.conversation_ref,
+                thread_ref=update.thread_ref,
+                ttl_seconds=INITIAL_TYPING_TTL_SECONDS,
+            )
+        return True
+
+    async def _stop_active_turn(self, update: TelegramInboundUpdate) -> None:
+        active = self._active_turn_for_route(update.conversation_ref, update.thread_ref)
+        if active is None:
+            await self._reply(update, "No active LionClaw turn is running here.")
+            return
+        if active.session_id is None or active.session_key is None:
+            await self._reply(update, "This turn cannot be stopped yet.")
+            return
+
+        active.status_text = "Stopping"
+        await self._ensure_progress_message(active, force=True)
+        try:
+            await self.lionclaw_api.cancel_active_turn(
+                session_id=active.session_id,
+                session_key=active.session_key,
+                expected_turn_id=active.turn_id,
+                reason="telegram stop command",
+            )
+        except Exception as err:
+            logger.exception(
+                "lionclaw active turn cancel failed for turn_id=%s",
+                active.turn_id,
+            )
+            text = (
+                "Stop was already requested."
+                if "already requested" in str(err)
+                else "I could not stop that turn."
+            )
+            await self._reply(update, text)
+            return
+
+    async def _send_status(self, update: TelegramInboundUpdate) -> None:
+        active = self._active_turn_for_route(update.conversation_ref, update.thread_ref)
+        if active is None:
+            await self._reply(update, "No active LionClaw turn is running here.")
+            return
+        await self._reply(update, f"Active turn: {active.status_text.lower()}.")
+
+    async def _send_settings(self, update: TelegramInboundUpdate) -> None:
+        await self._reply(
+            update,
+            "Telegram channel settings\n"
+            "/status - current turn\n"
+            "/stop - stop active turn\n"
+            "/new - fresh session\n"
+            "/retry - retry last turn\n"
+            "/continue - continue partial turn\n"
+            "/model - runtime model controls",
+        )
+
+    async def _send_help(self, update: TelegramInboundUpdate) -> None:
+        await self._reply(
+            update,
+            "LionClaw controls\n"
+            "/status, /new, /stop, /retry, /continue, /settings\n\n"
+            "Runtime controls\n"
+            "/model and other runtime slash commands pass through unchanged.\n"
+            "Use a leading space before / to send literal slash text.",
+        )
+
+    async def _reply(self, update: TelegramInboundUpdate, text: str) -> None:
+        try:
+            await self.telegram.send_message(
+                update.conversation_ref,
+                text,
+                reply_to_ref=update.message_ref,
+                thread_ref=update.thread_ref,
+            )
+        except Exception:
+            logger.exception(
+                "telegram command reply failed for update_id=%s",
+                update.update_id,
+            )
+
+    def _remember_active_turn(self, update, response) -> None:
+        if response.turn_id is None:
+            return
+        target = TypingTarget(update.conversation_ref, update.thread_ref)
+        generation = self._advance_route_generation(
+            target.conversation_ref,
+            target.thread_ref,
+        )
+        turn = ActiveTurn(
+            turn_id=response.turn_id,
+            session_id=response.session_id,
+            session_key=response.session_key,
+            target=target,
+            reply_to_ref=update.message_ref,
+            generation=generation,
+            visible_after=_loop_time() + _progress_threshold_seconds(update),
+        )
+        previous_turn_id = self._route_turns.get(target.key)
+        if previous_turn_id is not None and previous_turn_id != turn.turn_id:
+            previous = self._active_turns.get(previous_turn_id)
+            if previous is not None:
+                previous.terminal = True
+        self._active_turns[turn.turn_id] = turn
+        self._route_turns[target.key] = turn.turn_id
+
+    def _advance_route_generation(
+        self,
+        conversation_ref: str,
+        thread_ref: str | None,
+    ) -> int:
+        key = (conversation_ref, thread_ref)
+        generation = self._route_generations.get(key, 0) + 1
+        self._route_generations[key] = generation
+        return generation
+
+    def _active_turn_for_route(
+        self,
+        conversation_ref: str,
+        thread_ref: str | None,
+    ) -> ActiveTurn | None:
+        turn_id = self._route_turns.get((conversation_ref, thread_ref))
+        if turn_id is None and thread_ref is not None:
+            turn_id = self._route_turns.get((conversation_ref, None))
+        if turn_id is None:
+            return None
+        active = self._active_turns.get(turn_id)
+        if active is None or active.terminal:
+            return None
+        return active
 
     async def _notify_pending_approval(
         self,
@@ -335,7 +586,8 @@ class TelegramWorker:
                 continue
             except Exception as err:
                 logger.exception(
-                    "telegram attachment download failed for event_id=%s attachment_id=%s",
+                    "telegram attachment download failed for event_id=%s "
+                    "attachment_id=%s",
                     update.event_id,
                     attachment.attachment_id,
                 )
@@ -363,7 +615,8 @@ class TelegramWorker:
                 return False
             if stage.status == "rejected":
                 logger.warning(
-                    "lionclaw rejected attachment event_id=%s attachment_id=%s reason_code=%s",
+                    "lionclaw rejected attachment event_id=%s attachment_id=%s "
+                    "reason_code=%s",
                     update.event_id,
                     attachment.attachment_id,
                     stage.reason_code,
@@ -379,7 +632,8 @@ class TelegramWorker:
             return False
         if response.outcome not in {"queued", "already_finalized"}:
             logger.error(
-                "lionclaw attachment finalize returned unexpected outcome '%s' for event_id=%s",
+                "lionclaw attachment finalize returned unexpected outcome '%s' "
+                "for event_id=%s",
                 response.outcome,
                 update.event_id,
             )
@@ -392,6 +646,8 @@ class TelegramWorker:
                 event.peer_id,
                 ttl_seconds=ACTIVE_TURN_TYPING_TTL_SECONDS,
             )
+            if event.turn_id in self._active_turns:
+                self._active_turns[event.turn_id].status_text = "Answering"
             return True
 
         if event.kind == "status":
@@ -400,10 +656,12 @@ class TelegramWorker:
                     event.peer_id,
                     ttl_seconds=ACTIVE_TURN_TYPING_TTL_SECONDS,
                 )
+            self._update_progress_status(event)
             return True
 
         if event.kind == "error":
             self._stop_typing(event.peer_id)
+            await self._terminalize_progress(event, _terminal_error_text(event))
             logger.error(
                 "lionclaw stream error for peer_id=%s turn_id=%s: %s",
                 event.peer_id,
@@ -414,10 +672,12 @@ class TelegramWorker:
 
         if event.kind == "turn_completed":
             self._stop_typing(event.peer_id)
+            await self._complete_progress(event)
             return True
 
         if event.kind == "done":
             self._stop_typing(event.peer_id)
+            await self._finalize_progress_done(event)
             return True
 
         logger.error("lionclaw stream contained unknown event kind '%s'", event.kind)
@@ -477,17 +737,196 @@ class TelegramWorker:
         try:
             await self.telegram.send_typing(target.conversation_ref, target.thread_ref)
             self._typing_failures.pop(target.key, None)
-        except Exception:
+        except Exception as err:
             failures = self._typing_failures.get(target.key, 0) + 1
+            if isinstance(err, (TelegramForbiddenError, TelegramUnauthorizedError)):
+                failures = MAX_TYPING_FAILURES
             self._typing_failures[target.key] = failures
             if failures >= MAX_TYPING_FAILURES:
                 self._typing_targets.pop(target.key, None)
                 self._typing_deadlines.pop(target.key, None)
             logger.exception(
-                "telegram sendChatAction request failed for conversation_ref=%s thread_ref=%s",
+                "telegram sendChatAction request failed for conversation_ref=%s "
+                "thread_ref=%s",
                 target.conversation_ref,
                 target.thread_ref,
             )
+
+    async def refresh_progress_messages(self) -> None:
+        for turn in list(self._active_turns.values()):
+            if turn.terminal:
+                continue
+            if _loop_time() >= turn.visible_after:
+                await self._ensure_progress_message(turn)
+            if (
+                turn.terminal_text is not None
+                and turn.last_rendered_text == turn.terminal_text
+            ):
+                turn.terminal = True
+                self._forget_turn(turn)
+
+    async def _ensure_progress_message(
+        self,
+        turn: ActiveTurn,
+        *,
+        force: bool = False,
+    ) -> None:
+        if not self._is_current_generation(turn):
+            return
+        text = _progress_text(turn)
+        if turn.provisional_message_ref is None:
+            try:
+                receipt = await self.telegram.send_message(
+                    turn.target.conversation_ref,
+                    text,
+                    reply_to_ref=turn.reply_to_ref,
+                    thread_ref=turn.target.thread_ref,
+                )
+            except Exception:
+                logger.exception(
+                    "telegram progress message send failed for turn_id=%s",
+                    turn.turn_id,
+                )
+                return
+            turn.provisional_message_ref = _receipt_message_ref(receipt)
+            turn.last_rendered_text = text
+            turn.last_edit_at = _loop_time()
+            return
+        await self._edit_progress_message(turn, text, force=force)
+
+    async def _edit_progress_message(
+        self,
+        turn: ActiveTurn,
+        text: str,
+        *,
+        force: bool = False,
+    ) -> bool:
+        if (
+            not turn.can_edit
+            or turn.provisional_message_ref is None
+            or not self._is_current_generation(turn)
+        ):
+            return False
+        now = _loop_time()
+        if not force and now - turn.last_edit_at < PROGRESS_EDIT_MIN_SECONDS:
+            return False
+        if text == turn.last_rendered_text:
+            return True
+        try:
+            await self.telegram.edit_message(
+                turn.target.conversation_ref,
+                turn.provisional_message_ref,
+                text,
+            )
+        except Exception as err:
+            if _is_noop_edit_failure(err):
+                turn.last_rendered_text = text
+                turn.last_edit_at = now
+                return True
+            if _is_permanent_edit_failure(err):
+                turn.can_edit = False
+            logger.exception(
+                "telegram progress message edit failed for turn_id=%s",
+                turn.turn_id,
+            )
+            return False
+        turn.last_rendered_text = text
+        turn.last_edit_at = now
+        return True
+
+    async def _delete_progress_message(self, turn: ActiveTurn) -> None:
+        if turn.provisional_message_ref is None or not self._is_current_generation(
+            turn
+        ):
+            return
+        try:
+            await self.telegram.delete_message(
+                turn.target.conversation_ref,
+                turn.provisional_message_ref,
+            )
+        except Exception:
+            logger.exception(
+                "telegram progress message delete failed for turn_id=%s",
+                turn.turn_id,
+            )
+
+    def _update_progress_status(self, event: StreamEvent) -> None:
+        turn = self._active_turns.get(event.turn_id)
+        if turn is None:
+            return
+        if event.code in ACTIVE_STATUS_CODES:
+            turn.status_text = ACTIVE_STATUS_CODES[event.code]
+        elif event.code in CANCELLED_STATUS_CODES:
+            turn.status_text = "Stopped"
+            turn.terminal_text = "Stopped."
+        elif event.code in COMPLETED_STATUS_CODES:
+            turn.status_text = "Finishing"
+        elif event.text:
+            turn.status_text = _compact_status_text(event.text)
+
+    async def _terminalize_progress(self, event: StreamEvent, text: str) -> None:
+        turn = self._active_turns.get(event.turn_id)
+        if turn is None:
+            return
+        turn.terminal_text = text
+        await self._ensure_progress_message(turn, force=True)
+        edited = await self._edit_progress_message(turn, text, force=True)
+        if edited:
+            turn.terminal = True
+            self._forget_turn(turn)
+            return
+        if (
+            not edited
+            and not turn.can_edit
+            and turn.provisional_message_ref is not None
+        ):
+            await self._send_progress_fallback(turn, text)
+            turn.terminal = True
+            self._forget_turn(turn)
+
+    async def _send_progress_fallback(self, turn: ActiveTurn, text: str) -> None:
+        try:
+            await self.telegram.send_message(
+                turn.target.conversation_ref,
+                text,
+                reply_to_ref=turn.reply_to_ref,
+                thread_ref=turn.target.thread_ref,
+            )
+        except Exception:
+            logger.exception(
+                "telegram progress fallback send failed for turn_id=%s",
+                turn.turn_id,
+            )
+
+    async def _complete_progress(self, event: StreamEvent) -> None:
+        turn = self._active_turns.get(event.turn_id)
+        if turn is None:
+            return
+        turn.status_text = "Finishing"
+        if turn.provisional_message_ref is not None:
+            await self._delete_progress_message(turn)
+        turn.terminal = True
+        self._forget_turn(turn)
+
+    async def _finalize_progress_done(self, event: StreamEvent) -> None:
+        turn = self._active_turns.get(event.turn_id)
+        if turn is None:
+            return
+        if turn.terminal_text is not None:
+            await self._terminalize_progress(event, turn.terminal_text)
+            return
+        if turn.provisional_message_ref is not None:
+            await self._delete_progress_message(turn)
+        turn.terminal = True
+        self._forget_turn(turn)
+
+    def _forget_turn(self, turn: ActiveTurn) -> None:
+        self._active_turns.pop(turn.turn_id, None)
+        if self._route_turns.get(turn.target.key) == turn.turn_id:
+            self._route_turns.pop(turn.target.key, None)
+
+    def _is_current_generation(self, turn: ActiveTurn) -> bool:
+        return self._route_generations.get(turn.target.key) == turn.generation
 
     def _remember_typing_route(self, update: TelegramInboundUpdate) -> None:
         target = TypingTarget(update.conversation_ref, update.thread_ref)
@@ -526,7 +965,8 @@ class TelegramWorker:
             )
         except Exception as err:
             logger.exception(
-                "telegram sendMessage request failed for delivery_id=%s conversation_ref=%s",
+                "telegram sendMessage request failed for delivery_id=%s "
+                "conversation_ref=%s",
                 delivery.delivery_id,
                 delivery.conversation_ref,
             )
@@ -592,7 +1032,8 @@ class TelegramWorker:
             return False
         if not response.accepted:
             logger.warning(
-                "lionclaw rejected stale outbox report for delivery_id=%s status=%s attempt_status=%s",
+                "lionclaw rejected stale outbox report for delivery_id=%s "
+                "status=%s attempt_status=%s",
                 delivery.delivery_id,
                 response.status,
                 response.attempt_status,
@@ -781,6 +1222,89 @@ def _classify_send_failure(err: Exception) -> tuple[str, str]:
     return "retryable_failed", "telegram.send_failed"
 
 
+def _telegram_command(update: TelegramInboundUpdate) -> TelegramCommand | None:
+    text = update.text
+    if text is None or not text.startswith("/"):
+        return None
+    token, _, arguments = text.partition(" ")
+    command = token.removeprefix("/")
+    if "@" in command:
+        command, _ = command.split("@", 1)
+    command = command.casefold()
+    if not command:
+        return None
+    return TelegramCommand(name=command, raw=token, arguments=arguments.strip())
+
+
+def _telegram_command_is_addressed(update: TelegramInboundUpdate) -> bool:
+    if update.provider_metadata.get("chat_type") == "private":
+        return True
+    return update.trigger in {"mention", "reply_to_bot", "thread_continuation"}
+
+
+def _progress_threshold_seconds(update: TelegramInboundUpdate) -> float:
+    if update.provider_metadata.get("chat_type") == "private":
+        return DM_PROGRESS_THRESHOLD_SECONDS
+    return GROUP_PROGRESS_THRESHOLD_SECONDS
+
+
+def _progress_text(turn: ActiveTurn) -> str:
+    if turn.terminal_text is not None:
+        return turn.terminal_text
+    return f"{turn.status_text}..."
+
+
+def _terminal_error_text(event: StreamEvent) -> str:
+    if event.code in CANCELLED_STATUS_CODES:
+        return "Stopped."
+    if event.text:
+        return f"Turn failed: {_compact_status_text(event.text)}"
+    return "Turn failed."
+
+
+def _compact_status_text(text: str) -> str:
+    compact = " ".join(text.strip().split())
+    if len(compact) <= 96:
+        return compact
+    return f"{compact[:93]}..."
+
+
+def _receipt_message_ref(receipt: dict[str, object]) -> str:
+    message_id = receipt.get("message_id")
+    if message_id is None:
+        raise TelegramReferenceError("telegram send response missing message_id")
+    return f"telegram:message:{message_id}"
+
+
+def _is_noop_edit_failure(err: Exception) -> bool:
+    return isinstance(err, TelegramBadRequest) and "not modified" in str(err).lower()
+
+
+def _is_permanent_edit_failure(err: Exception) -> bool:
+    if isinstance(
+        err,
+        (
+            TelegramForbiddenError,
+            TelegramNotFound,
+            TelegramUnauthorizedError,
+        ),
+    ):
+        return True
+    if isinstance(err, TelegramBadRequest):
+        message = str(err).lower()
+        return any(
+            phrase in message
+            for phrase in (
+                "message to edit not found",
+                "message can't be edited",
+                "message is not modified",
+                "message_id_invalid",
+                "not enough rights",
+            )
+        )
+    return False
+
+
 def _pairing_claim_reply(outcome: str) -> str:
     if outcome == "approved":
         return "Pairing approved. You can send a message now."
@@ -828,6 +1352,10 @@ async def run() -> None:
     )
 
     try:
+        try:
+            await telegram.configure_commands()
+        except Exception:
+            logger.exception("telegram command menu configuration failed")
         await worker.run_forever()
     finally:
         await telegram.close()
