@@ -21,9 +21,6 @@ impl TurnCancellation {
 
     pub fn request(&self, reason: impl Into<String>) -> bool {
         let reason = normalize_cancel_reason(reason.into());
-        if self.reason().is_some() {
-            return false;
-        }
         self.tx.send_if_modified(|current| {
             if current.is_some() {
                 false
@@ -48,7 +45,8 @@ impl TurnCancellation {
             if rx.changed().await.is_err() {
                 return DEFAULT_CANCEL_REASON.to_string();
             }
-            if let Some(reason) = rx.borrow().clone() {
+            let reason = rx.borrow().clone();
+            if let Some(reason) = reason {
                 return reason;
             }
         }

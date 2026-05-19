@@ -9339,21 +9339,14 @@ impl Kernel {
                         channel_stream_finalizer,
                     )
                     .await?;
-                return if is_expected_terminal_status(turn_err.status) {
-                    Ok(self.failed_turn_response(
-                        session.session_id,
-                        turn_id,
-                        runtime_skill_ids,
-                        runtime_id,
-                        completion,
-                        turn_err.events,
-                    ))
-                } else {
-                    Err(kernel_error_for_turn_status(
-                        turn_err.status,
-                        turn_err.error_text,
-                    ))
-                };
+                return self.terminal_turn_result(
+                    session.session_id,
+                    turn_id,
+                    runtime_skill_ids,
+                    runtime_id,
+                    completion,
+                    turn_err.events,
+                );
             }
         };
 
@@ -9432,20 +9425,27 @@ impl Kernel {
                 self.clear_runtime_session_ready(&execution_plan).await;
                 let assistant_text = assistant_text_from_events(&events);
                 if let Some((error_code, error_text)) = last_runtime_error(&events) {
-                    let status = session_turn_status_for_error_code(&error_code);
-                    self.persist_failed_session_turn(
-                        session,
-                        &persisted_turn,
-                        FailedSessionTurnCompletion {
-                            assistant_text,
-                            error_code,
-                            error_text: error_text.clone(),
-                            stream_error_emitted: true,
-                        },
-                        channel_stream_finalizer,
-                    )
-                    .await?;
-                    return Err(kernel_error_for_turn_status(status, error_text));
+                    let completion = self
+                        .persist_failed_session_turn(
+                            session,
+                            &persisted_turn,
+                            FailedSessionTurnCompletion {
+                                assistant_text,
+                                error_code,
+                                error_text: error_text.clone(),
+                                stream_error_emitted: true,
+                            },
+                            channel_stream_finalizer,
+                        )
+                        .await?;
+                    return self.terminal_turn_result(
+                        session.session_id,
+                        turn_id,
+                        runtime_skill_ids,
+                        runtime_id,
+                        completion,
+                        events,
+                    );
                 }
                 self.persist_failed_session_turn(
                     session,
@@ -9481,21 +9481,28 @@ impl Kernel {
 
         let artifacts = summarize_runtime_events(&runtime_events);
         if let Some((error_code, error_text)) = last_runtime_error(&runtime_events) {
-            let status = session_turn_status_for_error_code(&error_code);
             self.clear_runtime_session_ready(&execution_plan).await;
-            self.persist_failed_session_turn(
-                session,
-                &persisted_turn,
-                FailedSessionTurnCompletion {
-                    assistant_text: artifacts.assistant_text.clone(),
-                    error_code,
-                    error_text: error_text.clone(),
-                    stream_error_emitted: artifacts.saw_error,
-                },
-                channel_stream_finalizer,
-            )
-            .await?;
-            return Err(kernel_error_for_turn_status(status, error_text));
+            let completion = self
+                .persist_failed_session_turn(
+                    session,
+                    &persisted_turn,
+                    FailedSessionTurnCompletion {
+                        assistant_text: artifacts.assistant_text.clone(),
+                        error_code,
+                        error_text: error_text.clone(),
+                        stream_error_emitted: artifacts.saw_error,
+                    },
+                    channel_stream_finalizer,
+                )
+                .await?;
+            return self.terminal_turn_result(
+                session.session_id,
+                turn_id,
+                runtime_skill_ids,
+                runtime_id,
+                completion,
+                runtime_events,
+            );
         }
         let outbox_attachments = if channel_stream_context.is_some() && !artifacts.saw_error {
             match self
@@ -9720,21 +9727,14 @@ impl Kernel {
                         channel_stream_finalizer,
                     )
                     .await?;
-                return if is_expected_terminal_status(turn_err.status) {
-                    Ok(self.failed_turn_response(
-                        session.session_id,
-                        turn_id,
-                        runtime_skill_ids,
-                        runtime_id,
-                        completion,
-                        turn_err.events,
-                    ))
-                } else {
-                    Err(kernel_error_for_turn_status(
-                        turn_err.status,
-                        turn_err.error_text,
-                    ))
-                };
+                return self.terminal_turn_result(
+                    session.session_id,
+                    turn_id,
+                    runtime_skill_ids,
+                    runtime_id,
+                    completion,
+                    turn_err.events,
+                );
             }
         };
 
@@ -10005,6 +10005,35 @@ impl Kernel {
             runtime_skill_ids,
             runtime_id,
             stream_events: runtime_events_to_views(&runtime_events),
+        }
+    }
+
+    fn terminal_turn_result(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+        runtime_skill_ids: Vec<String>,
+        runtime_id: String,
+        completion: SessionTurnCompletion,
+        runtime_events: Vec<RuntimeEvent>,
+    ) -> Result<SessionTurnResponse, KernelError> {
+        let status = completion.status;
+        if is_expected_terminal_status(status) {
+            Ok(self.failed_turn_response(
+                session_id,
+                turn_id,
+                runtime_skill_ids,
+                runtime_id,
+                completion,
+                runtime_events,
+            ))
+        } else {
+            Err(kernel_error_for_turn_status(
+                status,
+                completion
+                    .error_text
+                    .unwrap_or_else(|| "turn failed".to_string()),
+            ))
         }
     }
 
@@ -11453,21 +11482,20 @@ impl Kernel {
         self.emit_runtime_event(&stream_context, &None, RuntimeEvent::Done)
             .await?;
 
-        let mut details = json!({
-            "turn_id": turn.turn_id,
-            "channel_id": turn.channel_id,
-            "session_key": turn.session_key,
-            "runtime_id": terminal.runtime_id(turn),
-            "status": status.as_str(),
-        });
+        let mut details = serde_json::Map::new();
+        details.insert("turn_id".to_string(), json!(turn.turn_id));
+        details.insert("channel_id".to_string(), json!(turn.channel_id));
+        details.insert("session_key".to_string(), json!(turn.session_key));
+        details.insert("runtime_id".to_string(), json!(terminal.runtime_id(turn)));
+        details.insert("status".to_string(), json!(status.as_str()));
         if let Some(code) = terminal.code() {
-            details["code"] = json!(code);
+            details.insert("code".to_string(), json!(code));
         }
         if status != ChannelTurnStatus::Completed {
-            details["reason"] = json!(message);
+            details.insert("reason".to_string(), json!(message));
         }
         if let Some(assistant_text_len) = terminal.assistant_text_len() {
-            details["assistant_text_len"] = json!(assistant_text_len);
+            details.insert("assistant_text_len".to_string(), json!(assistant_text_len));
         }
 
         self.audit
@@ -11475,7 +11503,7 @@ impl Kernel {
                 status.terminal_audit_event(),
                 Some(turn.session_id),
                 Some("kernel".to_string()),
-                details,
+                Value::Object(details),
             )
             .await
             .map_err(internal)?;

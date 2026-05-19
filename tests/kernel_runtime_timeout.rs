@@ -7,7 +7,9 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 use lionclaw::{
-    contracts::{SessionOpenRequest, SessionTurnRequest, SessionTurnStatus, TrustTier},
+    contracts::{
+        SessionHistoryRequest, SessionOpenRequest, SessionTurnRequest, SessionTurnStatus, TrustTier,
+    },
     kernel::{
         runtime::{
             RuntimeAdapter, RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeControlExecution,
@@ -310,6 +312,91 @@ async fn runtime_activity_resets_idle_timeout() {
 }
 
 #[tokio::test]
+async fn runtime_reported_expected_terminal_errors_return_structured_responses() {
+    let sandbox = TestEnv::new();
+    let kernel = Kernel::new_with_options(
+        &sandbox.db_path(),
+        KernelOptions {
+            runtime_turn_idle_timeout: Duration::from_millis(200),
+            runtime_turn_hard_timeout: Duration::from_millis(500),
+            ..KernelOptions::default()
+        },
+    )
+    .await
+    .expect("kernel init");
+
+    let cases = [
+        (
+            "reported-cancelled",
+            "runtime.cancelled",
+            "runtime reported cancellation",
+            SessionTurnStatus::Cancelled,
+        ),
+        (
+            "reported-interrupted",
+            "runtime.interrupted",
+            "runtime reported interruption",
+            SessionTurnStatus::Interrupted,
+        ),
+    ];
+
+    for (runtime_id, code, text, expected_status) in cases {
+        kernel
+            .register_runtime_adapter(
+                runtime_id,
+                Arc::new(ReportedTerminalRuntimeAdapter {
+                    id: runtime_id,
+                    code,
+                    text,
+                }),
+            )
+            .await;
+
+        let session = kernel
+            .open_session(SessionOpenRequest {
+                channel_id: "local-cli".to_string(),
+                peer_id: runtime_id.to_string(),
+                trust_tier: TrustTier::Main,
+                history_policy: None,
+            })
+            .await
+            .expect("open session");
+
+        let turn = kernel
+            .turn_session(SessionTurnRequest {
+                session_id: session.session_id,
+                user_text: "runtime reports terminal condition".to_string(),
+                runtime_id: Some(runtime_id.to_string()),
+                runtime_working_dir: None,
+                runtime_timeout_ms: None,
+                runtime_env_passthrough: None,
+            })
+            .await
+            .expect("expected terminal runtime errors should return a structured response");
+
+        assert_eq!(turn.status, expected_status);
+        assert_eq!(turn.error_code.as_deref(), Some(code));
+        assert_eq!(turn.error_text.as_deref(), Some(text));
+        assert!(
+            turn.stream_events
+                .iter()
+                .any(|event| event.code.as_deref() == Some(code)),
+            "response should include the runtime terminal event"
+        );
+
+        let history = kernel
+            .session_history(SessionHistoryRequest {
+                session_id: session.session_id,
+                limit: Some(1),
+            })
+            .await
+            .expect("history");
+        assert_eq!(history.turns[0].status, expected_status);
+        assert_eq!(history.turns[0].error_code.as_deref(), Some(code));
+    }
+}
+
+#[tokio::test]
 async fn runtime_hard_timeout_reports_safety_limit_and_audit_kind() {
     let sandbox = TestEnv::new();
     let kernel = Kernel::new_with_options(
@@ -407,6 +494,12 @@ struct ClosedEventStreamRuntimeAdapter {
     cancel_calls: Arc<AtomicUsize>,
     close_calls: Arc<AtomicUsize>,
     sleep_for: Duration,
+}
+
+struct ReportedTerminalRuntimeAdapter {
+    id: &'static str,
+    code: &'static str,
+    text: &'static str,
 }
 
 #[async_trait]
@@ -523,6 +616,60 @@ impl RuntimeAdapter for ClosedEventStreamRuntimeAdapter {
 
     async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
         self.close_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for ReportedTerminalRuntimeAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: self.id.to_string(),
+            version: "0.1".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        _input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("{}-{}", self.id, Uuid::new_v4()),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        let _ = events.send(RuntimeEvent::Error {
+            code: Some(self.code.to_string()),
+            text: self.text.to_string(),
+        });
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(RuntimeTurnResult {
+            capability_requests: Vec::new(),
+        })
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        events: RuntimeEventSender,
+    ) -> Result<()> {
+        let _ = events.send(RuntimeEvent::Done);
+        Ok(())
+    }
+
+    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
         Ok(())
     }
 }
