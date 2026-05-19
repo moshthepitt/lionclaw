@@ -9,15 +9,17 @@ use lionclaw::{
         ChannelAttachmentDescriptor, ChannelAttachmentFinalizeOutcome,
         ChannelAttachmentFinalizeRequest, ChannelAttachmentMissingReport,
         ChannelAttachmentStageResponse, ChannelAttachmentStatus, ChannelGrantView,
-        ChannelInboundOutcome, ChannelInboundRequest, ChannelOutboxDeliveryStatusDto,
-        ChannelOutboxPullRequest, ChannelOutboxReportOutcomeDto, ChannelOutboxReportRequest,
-        ChannelPairingApproveRequest, ChannelPairingBlockRequest, ChannelPairingBlockResponse,
-        ChannelPairingClaimOutcome, ChannelPairingClaimRequest, ChannelPairingInviteRequest,
-        ChannelPairingStatus, ChannelRoutingProfile, ChannelStreamAckRequest,
-        ChannelStreamEventView, ChannelStreamPullRequest, ChannelStreamStartMode, ChannelTrigger,
-        DaemonInfoResponse, SessionActionKind, SessionActionRequest, SessionHistoryPolicy,
-        SessionHistoryRequest, SessionLatestQuery, SessionOpenRequest, SessionTurnKind,
-        SessionTurnRequest, SessionTurnStatus, StreamEventKindDto, StreamLaneDto, TrustTier,
+        ChannelHealthCheck, ChannelHealthReportRequest, ChannelHealthReportResponse,
+        ChannelHealthStatus, ChannelInboundOutcome, ChannelInboundRequest,
+        ChannelOutboxDeliveryStatusDto, ChannelOutboxPullRequest, ChannelOutboxReportOutcomeDto,
+        ChannelOutboxReportRequest, ChannelPairingApproveRequest, ChannelPairingBlockRequest,
+        ChannelPairingBlockResponse, ChannelPairingClaimOutcome, ChannelPairingClaimRequest,
+        ChannelPairingInviteRequest, ChannelPairingStatus, ChannelRoutingProfile,
+        ChannelStreamAckRequest, ChannelStreamEventView, ChannelStreamPullRequest,
+        ChannelStreamStartMode, ChannelTrigger, DaemonInfoResponse, SessionActionKind,
+        SessionActionRequest, SessionHistoryPolicy, SessionHistoryRequest, SessionLatestQuery,
+        SessionOpenRequest, SessionTurnKind, SessionTurnRequest, SessionTurnStatus,
+        StreamEventKindDto, StreamLaneDto, TrustTier,
     },
     kernel::{
         channel_attachments::{MAX_CHANNEL_ATTACHMENT_BYTES, MAX_CHANNEL_EVENT_ATTACHMENT_BYTES},
@@ -107,6 +109,297 @@ async fn list_channels_returns_config_derived_binding_fields() {
     assert_eq!(binding.channel_id, "terminal");
     assert_eq!(binding.skill_alias, "interactive-skill");
     assert_eq!(binding.launch_mode, "interactive");
+}
+
+#[tokio::test]
+async fn channel_health_report_accepts_configured_channel_and_audits_check_codes() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "telegram", "channel-health-skill").await;
+    let kernel = env.kernel().await;
+    let observed_at =
+        chrono::DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000).expect("observed_at");
+
+    let response = kernel
+        .report_channel_health(ChannelHealthReportRequest {
+            channel_id: "telegram".to_string(),
+            reporter_id: "telegram:worker".to_string(),
+            status: ChannelHealthStatus::Warning,
+            checks: vec![
+                ChannelHealthCheck {
+                    code: "telegram.bot_identity".to_string(),
+                    status: ChannelHealthStatus::Ok,
+                    message: "getMe succeeded".to_string(),
+                    details: serde_json::json!({"username": "lionclaw_bot"}),
+                },
+                ChannelHealthCheck {
+                    code: "telegram.delivery_errors".to_string(),
+                    status: ChannelHealthStatus::Warning,
+                    message: "one retryable delivery error observed".to_string(),
+                    details: serde_json::json!({"retryable": 1}),
+                },
+            ],
+            observed_at,
+        })
+        .await
+        .expect("health report accepted");
+
+    assert!(response.accepted);
+    assert_eq!(response.channel_id, "telegram");
+    assert_eq!(response.observed_at, observed_at);
+
+    let health = kernel
+        .get_channel_health("telegram")
+        .await
+        .expect("channel health");
+    let report = health.latest_report.expect("latest report");
+    assert_eq!(report.channel_id, "telegram");
+    assert_eq!(report.reporter_id, "telegram:worker");
+    assert_eq!(report.status, ChannelHealthStatus::Warning);
+    assert_eq!(report.observed_at, observed_at);
+    assert_eq!(report.checks.len(), 2);
+    assert_eq!(report.checks[0].code, "telegram.bot_identity");
+    assert_eq!(report.checks[1].details["retryable"], 1);
+
+    let audit = kernel
+        .query_audit(
+            None,
+            Some("channel.health.reported".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query health audit");
+    let event = audit.events.first().expect("health audit event");
+    assert_eq!(event.details["channel_id"], "telegram");
+    assert_eq!(event.details["reporter_id"], "telegram:worker");
+    assert_eq!(event.details["status"], "warning");
+    assert_eq!(
+        event.details["check_codes"],
+        serde_json::json!(["telegram.bot_identity", "telegram.delivery_errors"])
+    );
+}
+
+#[tokio::test]
+async fn worker_can_submit_channel_health_report_over_http() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "telegram", "channel-health-http-skill").await;
+    let kernel = env.kernel().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test api");
+    let bind_addr = listener.local_addr().expect("test api addr").to_string();
+    let app = build_router(
+        std::sync::Arc::new(kernel.clone()),
+        test_daemon_info(&env, bind_addr.clone()),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test api");
+    });
+
+    let observed_at =
+        chrono::DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000).expect("observed_at");
+    let response = reqwest::Client::new()
+        .post(format!("http://{bind_addr}/v0/channels/health/report"))
+        .json(&ChannelHealthReportRequest {
+            channel_id: "telegram".to_string(),
+            reporter_id: "telegram:worker".to_string(),
+            status: ChannelHealthStatus::Ok,
+            checks: vec![ChannelHealthCheck {
+                code: "telegram.bot_identity".to_string(),
+                status: ChannelHealthStatus::Ok,
+                message: "getMe succeeded".to_string(),
+                details: serde_json::json!({"username": "lionclaw_bot"}),
+            }],
+            observed_at,
+        })
+        .send()
+        .await
+        .expect("submit health report");
+    let status = response.status();
+    let text = response.text().await.expect("read health response");
+    assert!(status.is_success(), "{status}: {text}");
+    let accepted: ChannelHealthReportResponse =
+        serde_json::from_str(&text).expect("decode health report response");
+    assert!(accepted.accepted);
+    assert_eq!(accepted.channel_id, "telegram");
+    assert_eq!(accepted.observed_at, observed_at);
+    assert!(kernel
+        .get_channel_health("telegram")
+        .await
+        .expect("channel health")
+        .latest_report
+        .is_some());
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn channel_health_report_rejects_unconfigured_channel() {
+    let env = TestHome::new().await;
+    let kernel = env.kernel().await;
+
+    let err = kernel
+        .report_channel_health(ChannelHealthReportRequest {
+            channel_id: "telegram".to_string(),
+            reporter_id: "telegram:worker".to_string(),
+            status: ChannelHealthStatus::Ok,
+            checks: Vec::new(),
+            observed_at: Utc::now(),
+        })
+        .await
+        .expect_err("unconfigured channel report must be rejected");
+
+    assert!(err.to_string().contains("not bound to a skill"));
+}
+
+#[tokio::test]
+async fn channel_health_report_rejects_far_future_observed_at() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "telegram", "channel-health-future-skill").await;
+    let kernel = env.kernel().await;
+
+    let err = kernel
+        .report_channel_health(ChannelHealthReportRequest {
+            channel_id: "telegram".to_string(),
+            reporter_id: "telegram:worker".to_string(),
+            status: ChannelHealthStatus::Ok,
+            checks: Vec::new(),
+            observed_at: Utc::now() + ChronoDuration::minutes(5),
+        })
+        .await
+        .expect_err("future health reports must be rejected");
+
+    assert!(err.to_string().contains("observed_at cannot be more than"));
+}
+
+#[tokio::test]
+async fn channel_health_report_rejects_oversized_reporter_id() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "telegram", "channel-health-reporter-skill").await;
+    let kernel = env.kernel().await;
+
+    let err = kernel
+        .report_channel_health(ChannelHealthReportRequest {
+            channel_id: "telegram".to_string(),
+            reporter_id: "w".repeat(257),
+            status: ChannelHealthStatus::Ok,
+            checks: Vec::new(),
+            observed_at: Utc::now(),
+        })
+        .await
+        .expect_err("oversized reporter id must be rejected");
+
+    assert!(err.to_string().contains("reporter_id exceeds"));
+}
+
+#[tokio::test]
+async fn channel_health_selects_latest_report_by_observed_time() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "telegram", "channel-health-latest-skill").await;
+    let kernel = env.kernel().await;
+    let latest_observed_at = chrono::DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000)
+        .expect("latest observed_at");
+    let older_observed_at = latest_observed_at - ChronoDuration::minutes(15);
+
+    kernel
+        .report_channel_health(ChannelHealthReportRequest {
+            channel_id: "telegram".to_string(),
+            reporter_id: "telegram:worker".to_string(),
+            status: ChannelHealthStatus::Ok,
+            checks: vec![ChannelHealthCheck {
+                code: "telegram.bot_identity".to_string(),
+                status: ChannelHealthStatus::Ok,
+                message: "latest report".to_string(),
+                details: serde_json::json!({}),
+            }],
+            observed_at: latest_observed_at,
+        })
+        .await
+        .expect("submit latest report");
+    kernel
+        .report_channel_health(ChannelHealthReportRequest {
+            channel_id: "telegram".to_string(),
+            reporter_id: "telegram:worker".to_string(),
+            status: ChannelHealthStatus::Error,
+            checks: vec![ChannelHealthCheck {
+                code: "telegram.bot_identity".to_string(),
+                status: ChannelHealthStatus::Error,
+                message: "older report".to_string(),
+                details: serde_json::json!({}),
+            }],
+            observed_at: older_observed_at,
+        })
+        .await
+        .expect("submit older report after latest");
+
+    let report = kernel
+        .get_channel_health("telegram")
+        .await
+        .expect("channel health")
+        .latest_report
+        .expect("latest report");
+    assert_eq!(report.observed_at, latest_observed_at);
+    assert_eq!(report.status, ChannelHealthStatus::Ok);
+    assert_eq!(report.checks[0].message, "latest report");
+}
+
+#[tokio::test]
+async fn channel_health_ignores_far_future_report_when_selecting_latest() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "telegram", "channel-health-valid-latest-skill").await;
+    let kernel = env.kernel().await;
+    let valid_observed_at = chrono::DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000)
+        .expect("valid observed_at");
+
+    kernel
+        .report_channel_health(ChannelHealthReportRequest {
+            channel_id: "telegram".to_string(),
+            reporter_id: "telegram:worker".to_string(),
+            status: ChannelHealthStatus::Ok,
+            checks: vec![ChannelHealthCheck {
+                code: "telegram.polling".to_string(),
+                status: ChannelHealthStatus::Ok,
+                message: "valid report".to_string(),
+                details: serde_json::json!({}),
+            }],
+            observed_at: valid_observed_at,
+        })
+        .await
+        .expect("submit valid report");
+
+    let pool = connect_test_pool(&env.home().db_path()).await;
+    let future_observed_at = Utc::now() + ChronoDuration::minutes(30);
+    let checks_json = serde_json::to_string(&vec![ChannelHealthCheck {
+        code: "telegram.polling".to_string(),
+        status: ChannelHealthStatus::Error,
+        message: "poison report".to_string(),
+        details: serde_json::json!({}),
+    }])
+    .expect("health checks json");
+    sqlx::query(
+        "INSERT INTO channel_health_reports \
+         (report_id, channel_id, reporter_id, status, checks_json, observed_at_ms, created_at_ms) \
+         VALUES (?1, 'telegram', 'telegram:bad-clock', 'error', ?2, ?3, ?4)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(checks_json)
+    .bind(lionclaw::kernel::db::datetime_to_ms(future_observed_at))
+    .bind(lionclaw::kernel::db::datetime_to_ms(Utc::now()))
+    .execute(&pool)
+    .await
+    .expect("insert future health report");
+
+    let health = kernel
+        .get_channel_health("telegram")
+        .await
+        .expect("channel health");
+    let latest_report = health.latest_report.expect("latest valid report");
+    assert_eq!(latest_report.observed_at, valid_observed_at);
+    assert_eq!(latest_report.checks[0].message, "valid report");
+
+    let future_report = health.future_report.expect("future report");
+    assert_eq!(future_report.reporter_id, "telegram:bad-clock");
+    assert_eq!(future_report.checks[0].message, "poison report");
 }
 
 #[tokio::test]

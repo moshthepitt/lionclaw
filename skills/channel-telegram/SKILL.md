@@ -30,7 +30,8 @@ Under the hood, the worker:
 8. leases provider deliveries from `/v0/channels/outbox/pull`,
 9. sends Telegram messages from outbox leases and reports provider outcomes to
    `/v0/channels/outbox/report`,
-10. advances its progress cursor through `/v0/channels/stream/ack`.
+10. submits worker health checks through `/v0/channels/health/report`,
+11. advances its progress cursor through `/v0/channels/stream/ack`.
 
 ## Prerequisites
 
@@ -94,3 +95,7 @@ LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
   delivery parameters, and each outbox lease is reported with its `attempt_id`.
 - Runtime selection comes from the selected instance's default runtime; workers do not send `runtime_id` in inbound requests.
 - The worker stores Telegram offset in `$LIONCLAW_HOME/runtime/channels/$LIONCLAW_CHANNEL_ID/telegram.offset` by default.
+- The worker reports health every 60 seconds by default, configurable with
+  `LIONCLAW_HEALTH_REPORT_INTERVAL_SECS`. Checks cover a fresh Telegram
+  `getMe`, `getUpdates` polling failures or hangs, update lag, and delivery
+  failures observed by the current worker process.

@@ -16,6 +16,7 @@ class WorkerConfig:
     consumer_id: str
     telegram_poll_timeout_secs: int
     telegram_loop_delay_secs: float
+    health_report_interval_secs: float
     runtime_dir: Path
     telegram_offset_file: Path
 
@@ -46,6 +47,9 @@ class WorkerConfig:
             ),
             telegram_poll_timeout_secs=_int_env("TELEGRAM_POLL_TIMEOUT_SECS", 25),
             telegram_loop_delay_secs=_float_env("TELEGRAM_LOOP_DELAY_SECS", 1.0),
+            health_report_interval_secs=_float_env(
+                "LIONCLAW_HEALTH_REPORT_INTERVAL_SECS", 60.0
+            ),
             runtime_dir=runtime_dir,
             telegram_offset_file=Path(
                 os.environ.get(

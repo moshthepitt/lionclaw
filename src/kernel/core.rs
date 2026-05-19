@@ -26,7 +26,8 @@ use crate::contracts::{
     ChannelAttachmentFinalizeOutcome, ChannelAttachmentFinalizeRequest,
     ChannelAttachmentFinalizeResponse, ChannelAttachmentStageResponse, ChannelAttachmentStatus,
     ChannelBindingView, ChannelGrantResponse, ChannelGrantRevokeRequest,
-    ChannelGrantRevokeResponse, ChannelGrantView, ChannelInboundOutcome, ChannelInboundRequest,
+    ChannelGrantRevokeResponse, ChannelGrantView, ChannelHealthCheck, ChannelHealthReportRequest,
+    ChannelHealthReportResponse, ChannelHealthStatus, ChannelInboundOutcome, ChannelInboundRequest,
     ChannelInboundResponse, ChannelListResponse, ChannelOutboxAttachmentDto,
     ChannelOutboxAttemptStatusDto, ChannelOutboxContentDto, ChannelOutboxDeliveryStatusDto,
     ChannelOutboxDeliveryView, ChannelOutboxPullRequest, ChannelOutboxPullResponse,
@@ -83,9 +84,10 @@ use super::{
     channel_state::{
         ChannelGrantRecord, ChannelGrantStatus, ChannelGrantUpsert, ChannelPairingRequestRecord,
         ChannelStateStore, ChannelStreamEventInsert, ChannelStreamEventKind,
-        ChannelStreamEventRecord, ChannelTurnRecord, ChannelTurnStatus, NewChannelInboundEvent,
-        NewChannelTurn, OperatorPairingUpsert, StreamMessageLane as ChannelStreamLane,
-        TokenPairingCreate, PAIRING_CLAIM_POLICY_OPERATOR_APPROVAL,
+        ChannelStreamEventRecord, ChannelTurnRecord, ChannelTurnStatus, NewChannelHealthReport,
+        NewChannelInboundEvent, NewChannelTurn, OperatorPairingUpsert,
+        StreamMessageLane as ChannelStreamLane, TokenPairingCreate,
+        CHANNEL_HEALTH_OBSERVED_AT_FUTURE_SKEW_SECONDS, PAIRING_CLAIM_POLICY_OPERATOR_APPROVAL,
         PAIRING_CLAIM_POLICY_TOKEN_CLAIM,
     },
     continuity::{
@@ -145,6 +147,11 @@ const MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY: usize = 10;
 const MAX_CHANNEL_OUTBOX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 const MAX_CHANNEL_OUTBOX_RECEIPT_JSON_BYTES: usize = 64 * 1024;
 const MAX_CHANNEL_OUTBOX_ERROR_TEXT_BYTES: usize = 4096;
+const MAX_CHANNEL_HEALTH_CHECKS_PER_REPORT: usize = 128;
+const MAX_CHANNEL_HEALTH_REPORTER_ID_BYTES: usize = 256;
+const MAX_CHANNEL_HEALTH_CHECK_CODE_BYTES: usize = 128;
+const MAX_CHANNEL_HEALTH_CHECK_MESSAGE_BYTES: usize = 4096;
+const MAX_CHANNEL_HEALTH_CHECK_DETAILS_JSON_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub enum ChannelAttachmentStageContent {
@@ -3159,6 +3166,67 @@ impl Kernel {
             status: to_channel_outbox_status_dto(result.delivery.status),
             attempt_status: to_channel_outbox_attempt_status_dto(result.attempt_status),
             next_attempt_at: result.next_attempt_at,
+        })
+    }
+
+    pub async fn report_channel_health(
+        &self,
+        req: ChannelHealthReportRequest,
+    ) -> Result<ChannelHealthReportResponse, KernelError> {
+        let report = validate_channel_health_report(req)?;
+        self.require_active_channel_binding(&report.channel_id)
+            .await?;
+
+        let mut tx = self
+            .channel_state
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|err| internal(err.into()))?;
+        let stored = self
+            .channel_state
+            .insert_health_report_in_tx(
+                &mut tx,
+                NewChannelHealthReport {
+                    channel_id: &report.channel_id,
+                    reporter_id: &report.reporter_id,
+                    status: report.status,
+                    checks: &report.checks,
+                    observed_at: report.observed_at,
+                },
+            )
+            .await
+            .map_err(internal)?;
+        let check_codes = stored
+            .checks
+            .iter()
+            .map(|check| check.code.as_str())
+            .collect::<Vec<_>>();
+        self.audit
+            .append_in_tx(
+                &mut tx,
+                "channel.health.reported",
+                None,
+                Some(stored.reporter_id.clone()),
+                json!({
+                    "channel_id": &stored.channel_id,
+                    "report_id": stored.report_id,
+                    "reporter_id": &stored.reporter_id,
+                    "status": stored.status.as_str(),
+                    "check_codes": check_codes,
+                    "observed_at": stored.observed_at,
+                }),
+            )
+            .await
+            .map_err(internal)?;
+        let response_channel_id = stored.channel_id.clone();
+        let response_observed_at = stored.observed_at;
+        tx.commit().await.map_err(|err| internal(err.into()))?;
+
+        Ok(ChannelHealthReportResponse {
+            accepted: true,
+            channel_id: response_channel_id,
+            observed_at: response_observed_at,
         })
     }
 
@@ -6667,6 +6735,15 @@ struct ValidatedChannelInbound {
 }
 
 #[derive(Debug, Clone)]
+struct ValidatedChannelHealthReport {
+    channel_id: String,
+    reporter_id: String,
+    status: ChannelHealthStatus,
+    checks: Vec<ChannelHealthCheck>,
+    observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
 struct InitialAttachmentRejection {
     attachment_id: String,
     reason_code: &'static str,
@@ -6712,6 +6789,70 @@ struct ChannelPairingBlockCommit<'a> {
 enum PairingLookup {
     Id(Uuid),
     Code(String),
+}
+
+fn validate_channel_health_report(
+    req: ChannelHealthReportRequest,
+) -> Result<ValidatedChannelHealthReport, KernelError> {
+    let channel_id = trim_required(req.channel_id, "channel_id")?;
+    let reporter_id = trim_required(req.reporter_id, "reporter_id")?;
+    if reporter_id.len() > MAX_CHANNEL_HEALTH_REPORTER_ID_BYTES {
+        return Err(KernelError::BadRequest(format!(
+            "reporter_id exceeds {MAX_CHANNEL_HEALTH_REPORTER_ID_BYTES} bytes"
+        )));
+    }
+    let future_cutoff =
+        Utc::now() + ChronoDuration::seconds(CHANNEL_HEALTH_OBSERVED_AT_FUTURE_SKEW_SECONDS);
+    if req.observed_at > future_cutoff {
+        return Err(KernelError::BadRequest(format!(
+            "observed_at cannot be more than {CHANNEL_HEALTH_OBSERVED_AT_FUTURE_SKEW_SECONDS} seconds in the future"
+        )));
+    }
+    if req.checks.len() > MAX_CHANNEL_HEALTH_CHECKS_PER_REPORT {
+        return Err(KernelError::BadRequest(format!(
+            "checks exceeds {MAX_CHANNEL_HEALTH_CHECKS_PER_REPORT} per report"
+        )));
+    }
+
+    let mut checks = Vec::with_capacity(req.checks.len());
+    for check in req.checks {
+        let code = trim_required(check.code, "check.code")?;
+        if code.len() > MAX_CHANNEL_HEALTH_CHECK_CODE_BYTES {
+            return Err(KernelError::BadRequest(format!(
+                "check.code exceeds {MAX_CHANNEL_HEALTH_CHECK_CODE_BYTES} bytes"
+            )));
+        }
+        let message = trim_required(check.message, "check.message")?;
+        if message.len() > MAX_CHANNEL_HEALTH_CHECK_MESSAGE_BYTES {
+            return Err(KernelError::BadRequest(format!(
+                "check.message exceeds {MAX_CHANNEL_HEALTH_CHECK_MESSAGE_BYTES} bytes"
+            )));
+        }
+        let details = if check.details.is_null() {
+            json!({})
+        } else {
+            check.details
+        };
+        validate_optional_json_size(
+            Some(&details),
+            "check.details",
+            MAX_CHANNEL_HEALTH_CHECK_DETAILS_JSON_BYTES,
+        )?;
+        checks.push(ChannelHealthCheck {
+            code,
+            status: check.status,
+            message,
+            details,
+        });
+    }
+
+    Ok(ValidatedChannelHealthReport {
+        channel_id,
+        reporter_id,
+        status: req.status,
+        checks,
+        observed_at: req.observed_at,
+    })
 }
 
 fn validate_channel_pairing_invite(
