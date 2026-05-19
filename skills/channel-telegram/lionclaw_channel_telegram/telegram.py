@@ -278,6 +278,13 @@ class AiogramTelegramTransport:
         ):
             caption_chunk = text_chunks[0]
             text_chunks = []
+        operation_count = len(text_chunks) + len(attachments)
+        if operation_count == 0:
+            operation_count = 1
+        if resume_count > operation_count:
+            raise TelegramReferenceError(
+                "telegram resume receipt has more messages than planned sends"
+            )
 
         operation_index = 0
         try:

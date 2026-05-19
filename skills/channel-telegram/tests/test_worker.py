@@ -3719,6 +3719,28 @@ class AiogramTelegramTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt["message_id"], 102)
         self.assertEqual(len(receipt["messages"]), 2)
 
+    async def test_resume_receipt_rejects_impossible_message_count(self) -> None:
+        bot = RecordingAiogramBot()
+        transport = object.__new__(AiogramTelegramTransport)
+        transport._bot = bot
+        transport._bot_identity = None
+
+        with self.assertRaisesRegex(TelegramReferenceError, "resume receipt"):
+            await transport.send_message(
+                "telegram:chat:77",
+                "short answer",
+                resume_receipt={
+                    "message_id": 102,
+                    "chat_id": "77",
+                    "messages": [
+                        {"message_id": 101, "chat_id": "77"},
+                        {"message_id": 102, "chat_id": "77"},
+                    ],
+                },
+            )
+
+        self.assertEqual(bot.sent_messages, [])
+
     async def test_partial_send_error_carries_resume_receipt(self) -> None:
         bot = RecordingAiogramBot(
             send_message_errors=[None, RuntimeError("network dropped")]
