@@ -573,16 +573,14 @@ impl KeyHint {
 }
 
 const FOOTER_KEY_HINTS: &[KeyHint] = &[
-    KeyHint::new("F1", "Help", "open help"),
-    KeyHint::new("Ctrl+P", "Palette", "open command palette"),
+    KeyHint::new("Ctrl+P", "Commands", "open commands and help"),
     KeyHint::new("Tab", "Focus", "move focus"),
     KeyHint::new("Ctrl+C", "Interrupt", "interrupt active turn"),
     KeyHint::new("Ctrl+D", "Exit", "exit when idle"),
 ];
 
 const HELP_GLOBAL_KEY_HINTS: &[KeyHint] = &[
-    KeyHint::new("F1", "Help", "open help"),
-    KeyHint::new("Ctrl+P", "Palette", "open command palette"),
+    KeyHint::new("Ctrl+P", "Commands", "open commands and help"),
     KeyHint::new("Tab", "Next focus", "move focus to the next pane"),
     KeyHint::new(
         "Shift+Tab",
@@ -665,7 +663,6 @@ impl Focus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Overlay {
     Help,
-    Palette,
     ExitConfirm,
     InstanceSwitchConfirm { target_index: usize },
     SessionSwitchConfirm { session_id: Uuid },
@@ -2026,8 +2023,7 @@ async fn handle_key(
     }
 
     match (key.code, key.modifiers) {
-        (KeyCode::F(1), _) => app.overlay = Some(Overlay::Help),
-        (KeyCode::Char('p'), KeyModifiers::CONTROL) => app.overlay = Some(Overlay::Palette),
+        (KeyCode::Char('p'), KeyModifiers::CONTROL) => app.overlay = Some(Overlay::Help),
         (KeyCode::Tab, _) => {
             app.focus = app.focus.next(app.project_mode());
             app.status = format!("focus: {}", app.focus.label());
@@ -2178,7 +2174,7 @@ async fn handle_overlay_key(app: &mut ConsoleApp, key: KeyEvent) {
             }
             _ => {}
         },
-        Some(Overlay::Help | Overlay::Palette) => match (key.code, key.modifiers) {
+        Some(Overlay::Help) => match (key.code, key.modifiers) {
             (KeyCode::Esc | KeyCode::Enter, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 app.overlay = None
             }
@@ -3376,7 +3372,14 @@ fn footer_hint_spans(hints: &[KeyHint]) -> Vec<Span<'static>> {
 }
 
 fn help_overlay_lines() -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+    let mut lines = vec![
+        section_line("▣", "LionClaw"),
+        Line::from("/lionclaw continue"),
+        Line::from("/lionclaw retry"),
+        Line::from("/lionclaw reset"),
+        Line::from("/lionclaw exit"),
+        Line::raw(""),
+    ];
     push_help_section(&mut lines, "Global", HELP_GLOBAL_KEY_HINTS);
     lines.push(Line::raw(""));
     push_help_section(&mut lines, "Context", HELP_CONTEXT_KEY_HINTS);
@@ -3467,17 +3470,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &ConsoleApp, overlay: 
     let popup = centered_rect(70, 55, area);
     frame.render_widget(Clear, popup);
     let (title, lines) = match overlay {
-        Overlay::Help => (" Help ", help_overlay_lines()),
-        Overlay::Palette => (
-            " Command Palette ",
-            vec![
-                Line::from("/lionclaw continue"),
-                Line::from("/lionclaw retry"),
-                Line::from("/lionclaw reset"),
-                Line::from("/lionclaw exit"),
-                Line::from("Runtime slash commands pass through from the composer."),
-            ],
-        ),
+        Overlay::Help => (" Commands ", help_overlay_lines()),
         Overlay::ExitConfirm => (
             " Exit ",
             vec![
@@ -4040,9 +4033,8 @@ mod tests {
         assert!(rendered.contains("work root"));
         assert!(rendered.contains("Ask through the selected runtime"));
         assert!(!rendered.contains("runtime controls pass through"));
-        assert!(rendered.contains("F1"));
-        assert!(rendered.contains("Help"));
         assert!(rendered.contains("Ctrl+P"));
+        assert!(rendered.contains("Commands"));
         assert!(rendered.contains("Ctrl+D"));
         assert_eq!(rendered.lines().count(), 50);
     }
@@ -4495,13 +4487,24 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_d_exits_and_f10_is_not_bound() {
+    fn ctrl_d_exits_and_function_keys_are_not_bound() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("test runtime");
         let (backend_tx, _backend_rx) = mpsc::unbounded_channel();
         let mut app = blocked_test_app();
+
+        runtime.block_on(async {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+                &backend_tx,
+            )
+            .await;
+        });
+        assert!(!app.should_quit);
+        assert!(app.overlay.is_none());
 
         runtime.block_on(async {
             handle_key(
@@ -4525,7 +4528,7 @@ mod tests {
     }
 
     #[test]
-    fn question_mark_is_printable_and_f1_opens_help() {
+    fn question_mark_is_printable_and_ctrl_p_opens_commands() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -4563,7 +4566,7 @@ mod tests {
         runtime.block_on(async {
             handle_key(
                 &mut nav_app,
-                KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
                 &backend_tx,
             )
             .await;
