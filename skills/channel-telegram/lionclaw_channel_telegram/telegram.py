@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import html
 import re
 from collections.abc import Sequence
@@ -374,14 +375,12 @@ class AiogramTelegramTransport:
         mime_type: str,
         message_thread_id: int | None,
     ) -> None:
-        try:
+        with contextlib.suppress(Exception):
             await self._bot.send_chat_action(
                 chat_id=chat_id,
                 action=_chat_action_for_mime_type(mime_type),
                 message_thread_id=message_thread_id,
             )
-        except Exception:
-            pass
 
     async def send_typing(
         self,
@@ -697,12 +696,16 @@ def _has_bot_mention(
             bot_username,
         ):
             return True
-        if bot_username is not None and entity_type == "bot_command":
-            if _command_targets_bot(fragment, bot_username):
-                return True
-        if entity_type == "text_mention":
-            if _text_mention_targets_bot(entity, bot_identity):
-                return True
+        if (
+            bot_username is not None
+            and entity_type == "bot_command"
+            and _command_targets_bot(fragment, bot_username)
+        ):
+            return True
+        if entity_type == "text_mention" and _text_mention_targets_bot(
+            entity, bot_identity
+        ):
+            return True
     return False
 
 
@@ -716,12 +719,9 @@ def _text_mention_targets_bot(
     mentioned_user_id = getattr(mentioned_user, "id", None)
     if bot_identity.user_id is not None and mentioned_user_id == bot_identity.user_id:
         return True
-    if bool(getattr(mentioned_user, "is_bot", False)):
-        if _username_matches(
-            getattr(mentioned_user, "username", None), bot_identity.username
-        ):
-            return True
-    return False
+    return bool(getattr(mentioned_user, "is_bot", False)) and _username_matches(
+        getattr(mentioned_user, "username", None), bot_identity.username
+    )
 
 
 def _message_entities(message: Message) -> Sequence[MessageEntity]:
