@@ -37,6 +37,18 @@ TELEGRAM_PARSE_ERROR_RE = re.compile(
 LOCAL_LINK_RE = re.compile(r"^(?:/|file:|\.{0,2}/|[A-Za-z]:[\\/])")
 SUPPORTED_LINK_RE = re.compile(r"^(?:https?://|tg://|mailto:)", re.I)
 FILE_REFERENCE_RE = re.compile(r"^[A-Za-z0-9_.@-]+\.[A-Za-z0-9][A-Za-z0-9_.-]*$")
+PHOTO_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
+VIDEO_MIME_TYPES = {"video/mp4"}
+VOICE_MIME_TYPES = {"audio/ogg"}
+AUDIO_MIME_TYPES = {
+    "audio/aac",
+    "audio/flac",
+    "audio/mp4",
+    "audio/mpeg",
+    "audio/wav",
+    "audio/x-m4a",
+    "audio/x-wav",
+}
 
 
 class TelegramReferenceError(ValueError):
@@ -359,14 +371,19 @@ class AiogramTelegramTransport:
         mime_type: str,
         params: dict[str, Any],
     ) -> Message:
-        if mime_type.startswith("image/"):
-            return await self._bot.send_photo(photo=file, **params)
-        if mime_type.startswith("video/"):
-            return await self._bot.send_video(video=file, **params)
-        if mime_type.startswith("audio/"):
-            if mime_type == "audio/ogg":
+        normalized_mime_type = _normalize_mime_type(mime_type)
+        try:
+            if normalized_mime_type in PHOTO_MIME_TYPES:
+                return await self._bot.send_photo(photo=file, **params)
+            if normalized_mime_type in VIDEO_MIME_TYPES:
+                return await self._bot.send_video(video=file, **params)
+            if normalized_mime_type in VOICE_MIME_TYPES:
                 return await self._bot.send_voice(voice=file, **params)
-            return await self._bot.send_audio(audio=file, **params)
+            if normalized_mime_type in AUDIO_MIME_TYPES:
+                return await self._bot.send_audio(audio=file, **params)
+        except TelegramBadRequest as err:
+            if _is_parse_error(err):
+                raise
         return await self._bot.send_document(document=file, **params)
 
     async def _send_upload_action(
@@ -1099,10 +1116,13 @@ def _is_parse_error(err: TelegramBadRequest) -> bool:
 
 
 def _chat_action_for_mime_type(mime_type: str) -> str:
-    if mime_type.startswith("image/"):
+    normalized_mime_type = _normalize_mime_type(mime_type)
+    if normalized_mime_type in PHOTO_MIME_TYPES:
         return ChatAction.UPLOAD_PHOTO
-    if mime_type.startswith("video/"):
+    if normalized_mime_type in VIDEO_MIME_TYPES:
         return ChatAction.UPLOAD_VIDEO
-    if mime_type.startswith("audio/"):
-        return ChatAction.UPLOAD_DOCUMENT
     return ChatAction.UPLOAD_DOCUMENT
+
+
+def _normalize_mime_type(mime_type: str) -> str:
+    return mime_type.split(";", 1)[0].strip().casefold()

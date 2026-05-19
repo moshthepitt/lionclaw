@@ -3400,6 +3400,57 @@ class AiogramTelegramTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(bot.sent_documents), 1)
         self.assertNotIn("caption", bot.sent_documents[0])
 
+    async def test_unsupported_image_mime_type_is_sent_as_document(self) -> None:
+        bot = RecordingAiogramBot()
+        transport = object.__new__(AiogramTelegramTransport)
+        transport._bot = bot
+        transport._bot_identity = None
+
+        await transport.send_message(
+            "telegram:chat:77",
+            "",
+            attachments=[
+                TelegramOutboundAttachment(
+                    path="/tmp/diagram.svg",
+                    filename="diagram.svg",
+                    mime_type="image/svg+xml",
+                )
+            ],
+        )
+
+        self.assertEqual(bot.sent_photos, [])
+        self.assertEqual(bot.photo_attempts, [])
+        self.assertEqual(len(bot.sent_documents), 1)
+        self.assertEqual(bot.sent_documents[0]["chat_id"], 77)
+
+    async def test_native_photo_bad_request_falls_back_to_document(self) -> None:
+        bot = RecordingAiogramBot(
+            send_photo_error=TelegramBadRequest(
+                method=object(),
+                message="PHOTO_INVALID_DIMENSIONS",
+            )
+        )
+        transport = object.__new__(AiogramTelegramTransport)
+        transport._bot = bot
+        transport._bot_identity = None
+
+        await transport.send_message(
+            "telegram:chat:77",
+            "diagram",
+            attachments=[
+                TelegramOutboundAttachment(
+                    path="/tmp/diagram.png",
+                    filename="diagram.png",
+                    mime_type="image/png",
+                )
+            ],
+        )
+
+        self.assertEqual(len(bot.photo_attempts), 1)
+        self.assertEqual(bot.sent_photos, [])
+        self.assertEqual(len(bot.sent_documents), 1)
+        self.assertEqual(bot.sent_documents[0]["caption"], "diagram")
+
 
 def build_api(client: httpx.AsyncClient) -> LionClawApi:
     return LionClawApi(
@@ -3613,11 +3664,17 @@ class RecordingAiogramMessage:
 
 
 class RecordingAiogramBot:
-    def __init__(self) -> None:
+    def __init__(self, *, send_photo_error: Exception | None = None) -> None:
         self._next_message_id = 100
         self.sent_messages: list[dict[str, object]] = []
+        self.photo_attempts: list[dict[str, object]] = []
+        self.sent_photos: list[dict[str, object]] = []
+        self.sent_videos: list[dict[str, object]] = []
+        self.sent_audios: list[dict[str, object]] = []
+        self.sent_voices: list[dict[str, object]] = []
         self.sent_documents: list[dict[str, object]] = []
         self.sent_chat_actions: list[dict[str, object]] = []
+        self.send_photo_error = send_photo_error
 
     async def send_message(self, **params) -> RecordingAiogramMessage:
         self.sent_messages.append(dict(params))
@@ -3625,6 +3682,45 @@ class RecordingAiogramBot:
 
     async def send_chat_action(self, **params) -> None:
         self.sent_chat_actions.append(dict(params))
+
+    async def send_photo(
+        self,
+        *,
+        photo,
+        **params,
+    ) -> RecordingAiogramMessage:
+        self.photo_attempts.append({**params, "photo": photo})
+        if self.send_photo_error is not None:
+            raise self.send_photo_error
+        self.sent_photos.append({**params, "photo": photo})
+        return self._message_for(params["chat_id"])
+
+    async def send_video(
+        self,
+        *,
+        video,
+        **params,
+    ) -> RecordingAiogramMessage:
+        self.sent_videos.append({**params, "video": video})
+        return self._message_for(params["chat_id"])
+
+    async def send_audio(
+        self,
+        *,
+        audio,
+        **params,
+    ) -> RecordingAiogramMessage:
+        self.sent_audios.append({**params, "audio": audio})
+        return self._message_for(params["chat_id"])
+
+    async def send_voice(
+        self,
+        *,
+        voice,
+        **params,
+    ) -> RecordingAiogramMessage:
+        self.sent_voices.append({**params, "voice": voice})
+        return self._message_for(params["chat_id"])
 
     async def send_document(
         self,
