@@ -1186,12 +1186,31 @@ def _parse_markdown_link(text: str, index: int) -> tuple[str, str, int] | None:
     label_end = text.find("]", index + 1)
     if label_end == -1 or label_end + 1 >= len(text) or text[label_end + 1] != "(":
         return None
-    href_end = text.find(")", label_end + 2)
-    if href_end == -1:
+    href_start = label_end + 2
+    href_end = _find_markdown_link_href_end(text, href_start)
+    if href_end is None:
         return None
     label = text[index + 1 : label_end]
-    href = text[label_end + 2 : href_end].strip()
+    href = text[href_start:href_end].strip()
     return label, href, href_end + 1
+
+
+def _find_markdown_link_href_end(text: str, start: int) -> int | None:
+    depth = 0
+    index = start
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and index + 1 < len(text):
+            index += 2
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            if depth == 0:
+                return index
+            depth -= 1
+        index += 1
+    return None
 
 
 def _render_telegram_link(label: str, href: str) -> str:

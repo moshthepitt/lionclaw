@@ -3733,6 +3733,17 @@ class TelegramDeliveryHelperTests(unittest.TestCase):
         self.assertNotIn("docs/adr/0001.md", rendered)
         self.assertIn('<a href="https://openai.com">OpenAI</a>', rendered)
 
+    def test_markdown_rendering_preserves_parenthesized_links(self) -> None:
+        rendered = _markdown_to_telegram_html(
+            "[Rust](https://en.wikipedia.org/wiki/Rust_(programming_language))"
+        )
+
+        self.assertEqual(
+            rendered,
+            '<a href="https://en.wikipedia.org/wiki/Rust_(programming_language)">'
+            "Rust</a>",
+        )
+
     def test_plain_rendering_does_not_enable_telegram_html_parse_mode(self) -> None:
         chunks = _format_telegram_text_chunks("<b>literal</b>", "plain")
 
