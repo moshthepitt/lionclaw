@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import tempfile
 import unittest
 from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 from aiogram.exceptions import TelegramBadRequest
@@ -959,6 +961,95 @@ class OffsetStoreTests(unittest.TestCase):
             self.assertEqual(store.load(), 43)
             self.assertEqual(path.read_text(encoding="utf-8"), "43")
             self.assertFalse((path.parent / ".telegram.offset.tmp").exists())
+
+
+class WorkerConfigTests(unittest.TestCase):
+    def test_from_env_derives_defaults_from_lionclaw_home(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.dict(
+                os.environ,
+                {
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "LIONCLAW_HOME": temp_dir,
+                },
+                clear=True,
+            ),
+        ):
+            config = WorkerConfig.from_env()
+
+        self.assertEqual(config.telegram_bot_token, "token")
+        self.assertEqual(config.channel_id, "telegram")
+        self.assertEqual(config.consumer_id, "telegram:telegram")
+        self.assertEqual(config.stream_limit, 100)
+        self.assertEqual(config.stream_wait_ms, 30000)
+        self.assertEqual(config.telegram_poll_timeout_secs, 25)
+        self.assertEqual(config.telegram_loop_delay_secs, 1.0)
+        self.assertEqual(config.health_report_interval_secs, 60.0)
+        self.assertEqual(
+            config.runtime_dir,
+            Path(temp_dir) / "runtime" / "channels" / "telegram",
+        )
+        self.assertEqual(
+            config.telegram_offset_file,
+            Path(temp_dir) / "runtime" / "channels" / "telegram" / "telegram.offset",
+        )
+
+    def test_from_env_rejects_empty_required_values(self) -> None:
+        cases = {
+            "TELEGRAM_BOT_TOKEN": "required",
+            "LIONCLAW_HOME": "must not be empty",
+            "LIONCLAW_BASE_URL": "must not be empty",
+            "LIONCLAW_CHANNEL_ID": "must not be empty",
+            "LIONCLAW_CONSUMER_ID": "must not be empty",
+            "LIONCLAW_STREAM_START_MODE": "must not be empty",
+            "LIONCLAW_CHANNEL_RUNTIME_DIR": "must not be empty",
+            "TELEGRAM_OFFSET_FILE": "must not be empty",
+        }
+        for env_name, error in cases.items():
+            with self.subTest(env_name=env_name):
+                env = {"TELEGRAM_BOT_TOKEN": "token", env_name: " "}
+                with (
+                    patch.dict(os.environ, env, clear=True),
+                    self.assertRaises(RuntimeError) as raised,
+                ):
+                    WorkerConfig.from_env()
+                message = str(raised.exception)
+                self.assertIn(env_name, message)
+                self.assertIn(error, message)
+
+    def test_from_env_rejects_invalid_numeric_values(self) -> None:
+        cases = (
+            ("LIONCLAW_STREAM_LIMIT", "0", "must be >= 1"),
+            ("LIONCLAW_STREAM_WAIT_MS", "-1", "must be >= 0"),
+            ("TELEGRAM_POLL_TIMEOUT_SECS", "-1", "must be >= 0"),
+            ("TELEGRAM_LOOP_DELAY_SECS", "-0.01", "must be >= 0"),
+            ("LIONCLAW_HEALTH_REPORT_INTERVAL_SECS", "-1", "must be >= 0"),
+            (
+                "LIONCLAW_STREAM_WAIT_MS_INVALID",
+                "abc",
+                "must be an integer",
+            ),
+            ("TELEGRAM_LOOP_DELAY_SECS_INVALID", "later", "must be a number"),
+            ("TELEGRAM_LOOP_DELAY_SECS_INVALID", "nan", "must be finite"),
+            (
+                "LIONCLAW_HEALTH_REPORT_INTERVAL_SECS_INVALID",
+                "inf",
+                "must be finite",
+            ),
+        )
+        for env_name, value, error in cases:
+            with self.subTest(env_name=env_name, value=value):
+                real_env_name = env_name.removesuffix("_INVALID")
+                env = {"TELEGRAM_BOT_TOKEN": "token", real_env_name: value}
+                with (
+                    patch.dict(os.environ, env, clear=True),
+                    self.assertRaises(RuntimeError) as raised,
+                ):
+                    WorkerConfig.from_env()
+                message = str(raised.exception)
+                self.assertIn(real_env_name, message)
+                self.assertIn(error, message)
 
 
 class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):

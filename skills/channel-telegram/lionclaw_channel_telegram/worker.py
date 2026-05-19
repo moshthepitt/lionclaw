@@ -63,6 +63,7 @@ PROGRESS_REFRESH_SECONDS = 0.5
 PROGRESS_EDIT_MIN_SECONDS = 1.0
 PROGRESS_DELETE_RETRY_BASE_SECONDS = 1.0
 PROGRESS_DELETE_RETRY_MAX_SECONDS = 30.0
+COMPACT_STATUS_TEXT_LIMIT = 96
 
 LOCAL_TELEGRAM_COMMANDS = {
     "help",
@@ -1462,9 +1463,9 @@ def _terminal_error_text(event: StreamEvent) -> str:
 
 def _compact_status_text(text: str) -> str:
     compact = " ".join(text.strip().split())
-    if len(compact) <= 96:
+    if len(compact) <= COMPACT_STATUS_TEXT_LIMIT:
         return compact
-    return f"{compact[:93]}..."
+    return f"{compact[: COMPACT_STATUS_TEXT_LIMIT - 3]}..."
 
 
 def _receipt_message_ref(receipt: dict[str, object]) -> str:
