@@ -1300,20 +1300,25 @@ class TelegramWorker:
         )
         outcome, error_code = _classify_send_failure(err)
         self._record_delivery_failure(outcome, error_code)
-        if partial_receipt is not None and outcome == "retryable_failed":
+        report_receipt = None
+        if partial_receipt is not None:
             self._remember_outbox_receipt(
                 delivery.delivery_id,
                 "partial",
                 partial_receipt,
             )
+            report_receipt = partial_receipt
         elif outcome == "terminal_failed":
             self._forget_outbox_receipt(delivery.delivery_id)
-        await self._report_outbox_with_retry(
+        accepted = await self._report_outbox_with_retry(
             delivery,
             outcome,
+            provider_receipt=report_receipt,
             error_code=error_code,
             error_text=str(err),
         )
+        if accepted and outcome == "terminal_failed":
+            self._forget_outbox_receipt(delivery.delivery_id)
 
     def _remember_outbox_receipt(
         self,

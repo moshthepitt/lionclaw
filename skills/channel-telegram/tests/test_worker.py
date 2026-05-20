@@ -3759,6 +3759,113 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(second_api.outbox_reports[0][2], "delivered")
             self.assertEqual(receipt_store.load(), {})
 
+    async def test_partial_outbox_receipt_survives_terminal_report_failure(
+        self,
+    ) -> None:
+        async def no_sleep(_delay: float) -> None:
+            return None
+
+        partial_receipt = {
+            "message_id": 101,
+            "chat_id": "telegram:user:77",
+            "messages": [{"message_id": 101, "chat_id": "telegram:user:77"}],
+        }
+        delivery = OutboxDelivery(
+            delivery_id="delivery-1",
+            attempt_id="attempt-1",
+            conversation_ref="telegram:user:77",
+            content=OutboxContent(
+                text="final answer",
+                attachments=[
+                    OutboxAttachment(
+                        attachment_id="artifact-1",
+                        path="/tmp/missing-report.txt",
+                        filename="missing-report.txt",
+                        mime_type="text/plain",
+                    )
+                ],
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            receipt_store = OutboxReceiptStore(
+                Path(temp_dir) / "telegram.outbox-receipts.json"
+            )
+            first_api = FakeLionClawApi(
+                outbox_report_errors=[
+                    RuntimeError("kernel unavailable"),
+                    RuntimeError("kernel unavailable"),
+                    RuntimeError("kernel unavailable"),
+                ]
+            )
+            first_telegram = FakeTelegramTransport(
+                partial_send_error=FileNotFoundError("missing artifact"),
+                partial_send_receipt=partial_receipt,
+            )
+            first_worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=first_api,
+                telegram=first_telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                outbox_receipt_store=receipt_store,
+            )
+
+            with (
+                self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"),
+                patch("lionclaw_channel_telegram.worker.asyncio.sleep", no_sleep),
+            ):
+                await first_worker._process_outbox_delivery(delivery)
+
+            self.assertEqual(
+                [report[2] for report in first_api.outbox_reports],
+                ["terminal_failed", "terminal_failed", "terminal_failed"],
+            )
+            self.assertEqual(first_api.outbox_reports[0][3], partial_receipt)
+            self.assertEqual(
+                receipt_store.load(),
+                {
+                    "delivery-1": OutboxReceiptRecord(
+                        status="partial",
+                        provider_receipt={
+                            "message_id": 101,
+                            "chat_id": "77",
+                            "messages": [{"message_id": 101, "chat_id": "77"}],
+                        },
+                    )
+                },
+            )
+
+            second_api = FakeLionClawApi()
+            second_telegram = FakeTelegramTransport(
+                partial_send_error=FileNotFoundError("missing artifact"),
+                partial_send_receipt=partial_receipt,
+            )
+            second_worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=second_api,
+                telegram=second_telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                outbox_receipt_store=receipt_store,
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await second_worker._process_outbox_delivery(
+                    replace(delivery, attempt_id="attempt-2")
+                )
+
+            self.assertEqual(
+                second_telegram.resume_receipts,
+                [
+                    {
+                        "message_id": 101,
+                        "chat_id": "77",
+                        "messages": [{"message_id": 101, "chat_id": "77"}],
+                    }
+                ],
+            )
+            self.assertEqual(second_api.outbox_reports[0][2], "terminal_failed")
+            self.assertEqual(second_api.outbox_reports[0][3], partial_receipt)
+            self.assertEqual(receipt_store.load(), {})
+
     async def test_mismatched_partial_outbox_receipt_restarts_delivery_without_resume(
         self,
     ) -> None:
