@@ -2988,6 +2988,149 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker._active_turns, {})
         self.assertEqual(worker._route_turns, {})
 
+    async def test_empty_done_deletes_visible_progress_without_outbox(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=FakeLionClawApi(),
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await self._remember_visible_progress(worker)
+            await worker._process_stream_event(
+                StreamEvent(
+                    sequence=1,
+                    peer_id="telegram:chat:77",
+                    turn_id="turn-1",
+                    kind="turn_completed",
+                )
+            )
+            await worker._process_stream_event(
+                StreamEvent(
+                    sequence=2,
+                    peer_id="telegram:chat:77",
+                    turn_id="turn-1",
+                    kind="done",
+                )
+            )
+
+        self.assertEqual(
+            telegram.deleted_messages,
+            [("telegram:chat:77", "telegram:message:101")],
+        )
+        self.assertEqual(worker._active_turns, {})
+        self.assertEqual(worker._route_turns, {})
+
+    async def test_done_keeps_progress_until_expected_outbox_arrives(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=FakeLionClawApi(),
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await self._remember_visible_progress(worker)
+            await worker._process_stream_event(
+                StreamEvent(
+                    sequence=1,
+                    peer_id="telegram:chat:77",
+                    turn_id="turn-1",
+                    kind="message_delta",
+                    lane="answer",
+                    text="partial answer",
+                )
+            )
+            await worker._process_stream_event(
+                StreamEvent(
+                    sequence=2,
+                    peer_id="telegram:chat:77",
+                    turn_id="turn-1",
+                    kind="done",
+                )
+            )
+            self.assertEqual(telegram.deleted_messages, [])
+            self.assertIn("turn-1", worker._active_turns)
+
+            await worker._process_outbox_delivery(
+                OutboxDelivery(
+                    delivery_id="delivery-1",
+                    attempt_id="attempt-1",
+                    conversation_ref="telegram:chat:77",
+                    turn_id="turn-1",
+                    content=OutboxContent(text="final answer"),
+                )
+            )
+
+        self.assertEqual(
+            telegram.deleted_messages,
+            [("telegram:chat:77", "telegram:message:101")],
+        )
+        self.assertEqual(worker._active_turns, {})
+        self.assertEqual(worker._route_turns, {})
+
+    async def test_done_keeps_progress_until_artifact_outbox_arrives(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=FakeLionClawApi(),
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await self._remember_visible_progress(worker)
+            await worker._process_stream_event(
+                StreamEvent(
+                    sequence=1,
+                    peer_id="telegram:chat:77",
+                    turn_id="turn-1",
+                    kind="status",
+                    code="runtime.artifact",
+                    text="Created chart.png",
+                )
+            )
+            await worker._process_stream_event(
+                StreamEvent(
+                    sequence=2,
+                    peer_id="telegram:chat:77",
+                    turn_id="turn-1",
+                    kind="done",
+                )
+            )
+            self.assertEqual(telegram.deleted_messages, [])
+            self.assertIn("turn-1", worker._active_turns)
+
+            await worker._process_outbox_delivery(
+                OutboxDelivery(
+                    delivery_id="delivery-1",
+                    attempt_id="attempt-1",
+                    conversation_ref="telegram:chat:77",
+                    turn_id="turn-1",
+                    content=OutboxContent(
+                        text="",
+                        attachments=[
+                            OutboxAttachment(
+                                attachment_id="artifact-1",
+                                path="/tmp/chart.png",
+                                filename="chart.png",
+                                mime_type="image/png",
+                            )
+                        ],
+                    ),
+                )
+            )
+
+        self.assertEqual(
+            telegram.deleted_messages,
+            [("telegram:chat:77", "telegram:message:101")],
+        )
+        self.assertEqual(worker._active_turns, {})
+        self.assertEqual(worker._route_turns, {})
+
     async def test_long_turn_creates_edits_and_deletes_one_progress_message(
         self,
     ) -> None:

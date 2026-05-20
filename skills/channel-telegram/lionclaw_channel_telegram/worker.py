@@ -120,6 +120,7 @@ class ActiveTurn:
     can_edit: bool = True
     terminal: bool = False
     terminal_text: str | None = None
+    expects_outbox_delivery: bool = False
 
 
 @dataclass(slots=True)
@@ -923,7 +924,10 @@ class TelegramWorker:
                 ttl_seconds=ACTIVE_TURN_TYPING_TTL_SECONDS,
             )
             if event.turn_id in self._active_turns:
-                self._active_turns[event.turn_id].status_text = "Answering"
+                turn = self._active_turns[event.turn_id]
+                turn.status_text = "Answering"
+                if event.lane == "answer" and event.text.strip():
+                    turn.expects_outbox_delivery = True
             return True
 
         if event.kind == "status":
@@ -1201,6 +1205,8 @@ class TelegramWorker:
         turn = self._active_turns.get(event.turn_id)
         if turn is None:
             return
+        if event.code == "runtime.artifact":
+            turn.expects_outbox_delivery = True
         if event.code in ACTIVE_STATUS_CODES:
             turn.status_text = ACTIVE_STATUS_CODES[event.code]
         elif event.code in CANCELLED_STATUS_CODES:
@@ -1253,6 +1259,8 @@ class TelegramWorker:
         turn = self._active_turns.get(event.turn_id)
         if turn is None:
             return
+        if event.text.strip():
+            turn.expects_outbox_delivery = True
         turn.status_text = "Finishing"
         if turn.provisional_message_ref is not None:
             await self._edit_progress_message(turn, _progress_text(turn), force=True)
@@ -1265,6 +1273,11 @@ class TelegramWorker:
             await self._terminalize_progress(event, turn.terminal_text)
             return
         if turn.provisional_message_ref is not None:
+            if not turn.expects_outbox_delivery:
+                await self._delete_progress_message(turn)
+                turn.terminal = True
+                self._forget_turn(turn)
+                return
             turn.status_text = "Finishing"
             await self._edit_progress_message(turn, _progress_text(turn), force=True)
             return
