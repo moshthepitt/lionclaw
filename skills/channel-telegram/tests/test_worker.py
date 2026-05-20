@@ -1368,14 +1368,14 @@ class WorkerConfigTests(unittest.TestCase):
 
 
 class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
-    async def _remember_visible_progress(
+    async def _record_active_turn(
         self,
         worker: TelegramWorker,
         *,
         turn_id: str = "turn-1",
         update_id: int = 970,
         message_ref: str = "telegram:message:70",
-    ) -> str:
+    ) -> None:
         await worker._remember_active_turn(
             TelegramInboundUpdate(
                 update_id=update_id,
@@ -1393,6 +1393,21 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 session_id="session-1",
                 session_key="channel:telegram:direct:77",
             ),
+        )
+
+    async def _remember_visible_progress(
+        self,
+        worker: TelegramWorker,
+        *,
+        turn_id: str = "turn-1",
+        update_id: int = 970,
+        message_ref: str = "telegram:message:70",
+    ) -> str:
+        await self._record_active_turn(
+            worker,
+            turn_id=turn_id,
+            update_id=update_id,
+            message_ref=message_ref,
         )
         worker._active_turns[turn_id].visible_after = 0.0
         await worker.refresh_progress_messages()
@@ -4353,6 +4368,124 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(api.outbox_reports[0][2], "retryable_failed")
         self.assertEqual(api.outbox_reports[0][4], "telegram.send_failed")
 
+    async def test_terminal_outbox_failure_terminalizes_visible_progress(self) -> None:
+        api = FakeLionClawApi()
+        telegram = FakeTelegramTransport()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            progress_ref = await self._remember_visible_progress(worker)
+            telegram.sent_messages.clear()
+            telegram.edited_messages.clear()
+            telegram.deleted_messages.clear()
+            delivery = OutboxDelivery(
+                delivery_id="delivery-1",
+                attempt_id="attempt-1",
+                conversation_ref="telegram:chat:77",
+                turn_id="turn-1",
+                content=OutboxContent(text="final answer"),
+            )
+
+            telegram.send_message_error = TelegramReferenceError("bad ref")
+            with self.assertLogs(
+                "lionclaw_channel_telegram.worker",
+                level="ERROR",
+            ):
+                await worker._process_outbox_delivery(delivery)
+
+        self.assertEqual(api.outbox_reports[0][2], "terminal_failed")
+        self.assertEqual(api.outbox_reports[0][4], "telegram.invalid_ref")
+        self.assertEqual(
+            telegram.edited_messages,
+            [
+                (
+                    "telegram:chat:77",
+                    progress_ref,
+                    "Delivery failed: Telegram destination was invalid.",
+                )
+            ],
+        )
+        self.assertEqual(telegram.sent_messages, [])
+        self.assertEqual(telegram.deleted_messages, [])
+        self.assertNotIn("turn-1", worker._active_turns)
+        self.assertEqual(worker._route_turns, {})
+
+    async def test_terminal_outbox_failure_closes_unrendered_progress(self) -> None:
+        api = FakeLionClawApi()
+        telegram = FakeTelegramTransport()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            await self._record_active_turn(worker)
+            delivery = OutboxDelivery(
+                delivery_id="delivery-1",
+                attempt_id="attempt-1",
+                conversation_ref="telegram:chat:77",
+                turn_id="turn-1",
+                content=OutboxContent(text="final answer"),
+            )
+
+            telegram.send_message_error = TelegramReferenceError("bad ref")
+            with self.assertLogs(
+                "lionclaw_channel_telegram.worker",
+                level="ERROR",
+            ):
+                await worker._process_outbox_delivery(delivery)
+
+        self.assertEqual(api.outbox_reports[0][2], "terminal_failed")
+        self.assertEqual(api.outbox_reports[0][4], "telegram.invalid_ref")
+        self.assertEqual(telegram.sent_messages, [])
+        self.assertEqual(telegram.edited_messages, [])
+        self.assertEqual(telegram.deleted_messages, [])
+        self.assertNotIn("turn-1", worker._active_turns)
+        self.assertEqual(worker._route_turns, {})
+
+    async def test_retryable_outbox_failure_keeps_visible_progress_for_retry(
+        self,
+    ) -> None:
+        api = FakeLionClawApi()
+        telegram = FakeTelegramTransport()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            await self._remember_visible_progress(worker)
+            telegram.sent_messages.clear()
+            telegram.edited_messages.clear()
+            telegram.deleted_messages.clear()
+            delivery = OutboxDelivery(
+                delivery_id="delivery-1",
+                attempt_id="attempt-1",
+                conversation_ref="telegram:chat:77",
+                turn_id="turn-1",
+                content=OutboxContent(text="final answer"),
+            )
+
+            telegram.send_message_error = RuntimeError("temporary send failure")
+            with self.assertLogs(
+                "lionclaw_channel_telegram.worker",
+                level="ERROR",
+            ):
+                await worker._process_outbox_delivery(delivery)
+
+        self.assertEqual(api.outbox_reports[0][2], "retryable_failed")
+        self.assertEqual(api.outbox_reports[0][4], "telegram.send_failed")
+        self.assertEqual(telegram.edited_messages, [])
+        self.assertEqual(telegram.sent_messages, [])
+        self.assertEqual(telegram.deleted_messages, [])
+        self.assertIn("turn-1", worker._active_turns)
+
     async def test_report_health_submits_provider_checks(self) -> None:
         api = FakeLionClawApi()
         telegram = FakeTelegramTransport()
@@ -5159,6 +5292,7 @@ class FakeTelegramTransport:
         downloaded_content: bytes = b"file",
         edit_errors: list[Exception] | None = None,
         delete_errors: list[Exception] | None = None,
+        send_message_error: Exception | None = None,
         partial_send_error: Exception | None = None,
         partial_send_receipt: dict[str, object] | None = None,
     ) -> None:
@@ -5182,6 +5316,7 @@ class FakeTelegramTransport:
         self.downloaded_content = downloaded_content
         self.edit_errors = list(edit_errors or [])
         self.delete_errors = list(delete_errors or [])
+        self.send_message_error = send_message_error
         self.partial_send_error = partial_send_error
         self.partial_send_receipt = partial_send_receipt
 
@@ -5229,6 +5364,8 @@ class FakeTelegramTransport:
         resume_receipt: dict[str, object] | None = None,
     ) -> dict[str, object]:
         self.resume_receipts.append(resume_receipt)
+        if self.send_message_error is not None:
+            raise self.send_message_error
         if self.fail_send_message:
             raise RuntimeError("send failed")
         if self.partial_send_error is not None:

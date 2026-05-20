@@ -1224,8 +1224,15 @@ class TelegramWorker:
         turn = self._active_turns.get(event.turn_id)
         if turn is None:
             return
+        await self._terminalize_progress_turn(turn, text)
+
+    async def _terminalize_progress_turn(self, turn: ActiveTurn, text: str) -> None:
         turn.terminal_text = text
         await self._ensure_progress_message(turn, force=True)
+        if turn.provisional_message_ref is None:
+            turn.terminal = True
+            self._forget_turn(turn)
+            return
         edited = await self._edit_progress_message(turn, text, force=True)
         if edited:
             turn.terminal = True
@@ -1438,6 +1445,10 @@ class TelegramWorker:
         )
         if accepted and outcome == "terminal_failed":
             self._forget_outbox_receipt(delivery.delivery_id)
+            await self._terminalize_progress_for_delivery_failure(
+                delivery,
+                _delivery_failure_progress_text(error_code),
+            )
 
     def _remember_outbox_receipt(
         self,
@@ -1481,6 +1492,28 @@ class TelegramWorker:
             await self._delete_progress_message(turn)
         turn.terminal = True
         self._forget_turn(turn)
+
+    async def _terminalize_progress_for_delivery_failure(
+        self,
+        delivery: OutboxDelivery,
+        text: str,
+    ) -> None:
+        if delivery.turn_id is None:
+            return
+        turn = self._active_turns.get(delivery.turn_id)
+        if turn is None:
+            return
+        if turn.target.key != (delivery.conversation_ref, delivery.thread_ref):
+            logger.warning(
+                "telegram outbox failure route mismatch for turn_id=%s "
+                "delivery_id=%s active_route=%s delivery_route=%s",
+                delivery.turn_id,
+                delivery.delivery_id,
+                turn.target.key,
+                (delivery.conversation_ref, delivery.thread_ref),
+            )
+            return
+        await self._terminalize_progress_turn(turn, text)
 
     async def _report_outbox_with_retry(
         self,
@@ -1739,6 +1772,16 @@ def _classify_send_failure(err: Exception) -> tuple[str, str]:
     if isinstance(err, (TelegramNetworkError, TelegramRetryAfter, TelegramServerError)):
         return "retryable_failed", "telegram.send_retryable"
     return "retryable_failed", "telegram.send_failed"
+
+
+def _delivery_failure_progress_text(error_code: str) -> str:
+    if error_code == "telegram.attachment_unreadable":
+        return "Delivery failed: attachment was not readable."
+    if error_code == "telegram.invalid_ref":
+        return "Delivery failed: Telegram destination was invalid."
+    if error_code == "telegram.send_rejected":
+        return "Delivery failed: Telegram rejected the message."
+    return "Delivery failed."
 
 
 def _telegram_command(update: TelegramInboundUpdate) -> TelegramCommand | None:
