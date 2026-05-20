@@ -124,6 +124,41 @@ class ExtractInboundEventTests(unittest.TestCase):
             "@lionclaw_bot",
         )
 
+    def test_group_text_mention_records_leading_bot_mention(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 121,
+                "message": {
+                    "message_id": 21,
+                    "date": 0,
+                    "chat": {"id": -10042, "type": "supergroup"},
+                    "from": {"id": 9, "is_bot": False, "first_name": "Nia"},
+                    "text": "LionClaw /status",
+                    "entities": [
+                        {
+                            "type": "text_mention",
+                            "offset": 0,
+                            "length": len("LionClaw"),
+                            "user": {
+                                "id": 99,
+                                "is_bot": True,
+                                "first_name": "LionClaw",
+                            },
+                        }
+                    ],
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(mapped.trigger, "mention")
+        self.assertTrue(mapped.provider_metadata["bot_mentioned"])
+        self.assertTrue(mapped.provider_metadata["leading_mention_targets_bot"])
+        self.assertEqual(mapped.provider_metadata["leading_mention_text"], "LionClaw")
+
     def test_group_command_targets_bot_by_entity(self) -> None:
         update = Update.model_validate(
             {
@@ -1754,6 +1789,58 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                                     {
                                         "type": "bot_command",
                                         "offset": len("@lionclaw_bot "),
+                                        "length": len("/model"),
+                                    },
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(len(api.sent_inbound), 1)
+        self.assertEqual(api.sent_inbound[0].text, "/model gpt-5.2")
+
+    async def test_leading_text_mention_runtime_command_strips_mention(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 937,
+                            "message": {
+                                "message_id": 37,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "LionClaw /model gpt-5.2",
+                                "entities": [
+                                    {
+                                        "type": "text_mention",
+                                        "offset": 0,
+                                        "length": len("LionClaw"),
+                                        "user": {
+                                            "id": 99,
+                                            "is_bot": True,
+                                            "first_name": "LionClaw",
+                                        },
+                                    },
+                                    {
+                                        "type": "bot_command",
+                                        "offset": len("LionClaw "),
                                         "length": len("/model"),
                                     },
                                 ],
