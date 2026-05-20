@@ -3978,6 +3978,13 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "terminal_failed")
         self.assertEqual(error_code, "telegram.invalid_ref")
 
+        outcome, error_code = _classify_send_failure(
+            FileNotFoundError("missing artifact")
+        )
+
+        self.assertEqual(outcome, "terminal_failed")
+        self.assertEqual(error_code, "telegram.attachment_unreadable")
+
     async def test_bot_identity_failure_makes_worker_health_error(self) -> None:
         api = FakeLionClawApi()
         telegram = FakeTelegramTransport(

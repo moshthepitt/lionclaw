@@ -1598,6 +1598,11 @@ def _classify_send_failure(err: Exception) -> tuple[str, str]:
         return "terminal_failed", "telegram.invalid_ref"
     if isinstance(
         err,
+        (FileNotFoundError, IsADirectoryError, NotADirectoryError, PermissionError),
+    ):
+        return "terminal_failed", "telegram.attachment_unreadable"
+    if isinstance(
+        err,
         (
             TelegramBadRequest,
             TelegramEntityTooLarge,
