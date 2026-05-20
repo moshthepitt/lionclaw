@@ -105,7 +105,9 @@ LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
   short threshold, edit it at a throttled cadence, and delete it when the durable
   outbox answer is ready. Cancelled and failed turns leave a terminal status.
   Transient edit failures are retried; permanent edit failures disable editing
-  for that message and fall back to a normal Telegram message.
+  for that message and fall back to a normal Telegram message. Transient delete
+  failures are persisted under the channel runtime directory and retried after
+  worker restart so stale provisional messages are cleaned up.
 - Outbound text is sent as plain text by default. Markdown hints render to
   Telegram-safe HTML only when the rendered chunks fit Telegram limits; otherwise
   delivery falls back to plain text. Link previews stay disabled so local

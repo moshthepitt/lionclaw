@@ -56,6 +56,8 @@ from lionclaw_channel_telegram.worker import (
     OffsetStore,
     OutboxReceiptRecord,
     OutboxReceiptStore,
+    PendingProgressDelete,
+    ProgressDeleteStore,
     TelegramWorker,
     _classify_send_failure,
     _overall_health_status,
@@ -1132,6 +1134,83 @@ class OutboxReceiptStoreTests(unittest.TestCase):
             self.assertEqual(len(receipts), MAX_OUTBOX_RECEIPTS)
             self.assertNotIn("delivery-0", receipts)
             self.assertIn(f"delivery-{MAX_OUTBOX_RECEIPTS}", receipts)
+
+
+class ProgressDeleteStoreTests(unittest.TestCase):
+    def test_save_replaces_progress_deletes_without_leaving_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "telegram.progress-deletes.json"
+            store = ProgressDeleteStore(path)
+            pending = PendingProgressDelete(
+                turn_id="turn-1",
+                conversation_ref="telegram:chat:77",
+                message_ref="telegram:message:101",
+                attempts=3,
+                next_attempt_at=123.0,
+            )
+
+            store.save({pending.key: pending})
+
+            self.assertEqual(
+                store.load(),
+                {
+                    pending.key: PendingProgressDelete(
+                        turn_id="turn-1",
+                        conversation_ref="telegram:chat:77",
+                        message_ref="telegram:message:101",
+                        attempts=3,
+                        next_attempt_at=0.0,
+                    )
+                },
+            )
+            self.assertFalse(
+                (path.parent / ".telegram.progress-deletes.json.tmp").exists()
+            )
+
+    def test_load_ignores_malformed_progress_deletes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "telegram.progress-deletes.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "pending": [
+                            {
+                                "turn_id": "turn-1",
+                                "conversation_ref": "telegram:chat:77",
+                                "message_ref": "telegram:message:101",
+                                "attempts": 1,
+                            },
+                            {
+                                "turn_id": "",
+                                "conversation_ref": "telegram:chat:77",
+                                "message_ref": "telegram:message:102",
+                                "attempts": 1,
+                            },
+                            {
+                                "turn_id": "turn-3",
+                                "conversation_ref": "telegram:chat:77",
+                                "message_ref": "telegram:message:103",
+                                "attempts": True,
+                            },
+                            "bad",
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                ProgressDeleteStore(path).load(),
+                {
+                    ("telegram:chat:77", "telegram:message:101"): PendingProgressDelete(
+                        turn_id="turn-1",
+                        conversation_ref="telegram:chat:77",
+                        message_ref="telegram:message:101",
+                        attempts=1,
+                        next_attempt_at=0.0,
+                    )
+                },
+            )
 
 
 class WorkerConfigTests(unittest.TestCase):
@@ -3051,6 +3130,65 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             [("telegram:chat:77", progress_ref)],
         )
         self.assertEqual(worker._pending_progress_deletes, {})
+
+    async def test_progress_delete_failure_survives_worker_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            delete_store = ProgressDeleteStore(
+                Path(temp_dir) / "telegram.progress-deletes.json"
+            )
+            first_telegram = FakeTelegramTransport(
+                delete_errors=[RuntimeError("temporary delete failure")]
+            )
+            first_worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=FakeLionClawApi(),
+                telegram=first_telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                progress_delete_store=delete_store,
+            )
+            progress_ref = await self._remember_visible_progress(first_worker)
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await first_worker._process_outbox_delivery(
+                    OutboxDelivery(
+                        delivery_id="delivery-1",
+                        attempt_id="attempt-1",
+                        conversation_ref="telegram:chat:77",
+                        turn_id="turn-1",
+                        content=OutboxContent(text="final answer"),
+                    )
+                )
+
+            self.assertEqual(first_telegram.deleted_messages, [])
+            self.assertEqual(
+                delete_store.load(),
+                {
+                    ("telegram:chat:77", progress_ref): PendingProgressDelete(
+                        turn_id="turn-1",
+                        conversation_ref="telegram:chat:77",
+                        message_ref=progress_ref,
+                        attempts=1,
+                        next_attempt_at=0.0,
+                    )
+                },
+            )
+
+            second_telegram = FakeTelegramTransport()
+            second_worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=FakeLionClawApi(),
+                telegram=second_telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                progress_delete_store=delete_store,
+            )
+
+            await second_worker.refresh_progress_messages()
+
+            self.assertEqual(
+                second_telegram.deleted_messages,
+                [("telegram:chat:77", progress_ref)],
+            )
+            self.assertEqual(delete_store.load(), {})
 
     async def test_permanent_progress_delete_failure_is_not_retried(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

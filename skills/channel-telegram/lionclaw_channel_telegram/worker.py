@@ -69,6 +69,7 @@ PROGRESS_DELETE_RETRY_MAX_SECONDS = 30.0
 COMPACT_STATUS_TEXT_LIMIT = 96
 MAX_OUTBOX_RECEIPTS = 256
 OUTBOX_RECEIPT_STATUSES = {"delivered", "partial"}
+MAX_PENDING_PROGRESS_DELETES = 256
 
 LOCAL_TELEGRAM_COMMANDS = {
     "help",
@@ -132,6 +133,14 @@ class PendingProgressDelete:
     @property
     def key(self) -> tuple[str, str]:
         return (self.conversation_ref, self.message_ref)
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "turn_id": self.turn_id,
+            "conversation_ref": self.conversation_ref,
+            "message_ref": self.message_ref,
+            "attempts": self.attempts,
+        }
 
 
 @dataclass(slots=True, frozen=True)
@@ -218,6 +227,81 @@ class OutboxReceiptStore:
         tmp_path.replace(self.path)
 
 
+@dataclass(slots=True)
+class ProgressDeleteStore:
+    path: Path
+
+    def load(self) -> dict[tuple[str, str], PendingProgressDelete]:
+        if not self.path.exists():
+            return {}
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.exception("telegram progress delete store load failed")
+            return {}
+        if not isinstance(raw, dict):
+            logger.warning("telegram progress delete store ignored non-object payload")
+            return {}
+        items = raw.get("pending", [])
+        if not isinstance(items, list):
+            logger.warning(
+                "telegram progress delete store ignored non-array pending payload"
+            )
+            return {}
+        pending: dict[tuple[str, str], PendingProgressDelete] = {}
+        for value in items:
+            delete = _coerce_pending_progress_delete(value)
+            if delete is not None:
+                pending[delete.key] = delete
+        while len(pending) > MAX_PENDING_PROGRESS_DELETES:
+            pending.pop(next(iter(pending)))
+        return pending
+
+    def save(self, pending: dict[tuple[str, str], PendingProgressDelete]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.path.with_name(f".{self.path.name}.tmp")
+        tmp_path.write_text(
+            json.dumps(
+                {
+                    "pending": [pending[key].to_json() for key in sorted(pending)],
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        tmp_path.replace(self.path)
+
+
+def _coerce_pending_progress_delete(
+    value: object,
+) -> PendingProgressDelete | None:
+    if not isinstance(value, dict):
+        return None
+    turn_id = value.get("turn_id")
+    conversation_ref = value.get("conversation_ref")
+    message_ref = value.get("message_ref")
+    attempts = value.get("attempts", 0)
+    if (
+        not isinstance(turn_id, str)
+        or not turn_id
+        or not isinstance(conversation_ref, str)
+        or not conversation_ref
+        or not isinstance(message_ref, str)
+        or not message_ref
+        or isinstance(attempts, bool)
+        or not isinstance(attempts, int)
+        or attempts < 0
+    ):
+        return None
+    return PendingProgressDelete(
+        turn_id=turn_id,
+        conversation_ref=conversation_ref,
+        message_ref=message_ref,
+        attempts=min(attempts, MAX_PENDING_PROGRESS_DELETES),
+        next_attempt_at=0.0,
+    )
+
+
 def _coerce_outbox_receipt_record(value: object) -> OutboxReceiptRecord | None:
     if not isinstance(value, dict):
         return None
@@ -259,6 +343,7 @@ class TelegramWorker:
         telegram: TelegramTransport,
         offset_store: OffsetStore,
         outbox_receipt_store: OutboxReceiptStore | None = None,
+        progress_delete_store: ProgressDeleteStore | None = None,
     ) -> None:
         self.config = config
         self.lionclaw_api = lionclaw_api
@@ -269,13 +354,14 @@ class TelegramWorker:
         self._outbox_receipts = (
             outbox_receipt_store.load() if outbox_receipt_store is not None else {}
         )
+        self.progress_delete_store = progress_delete_store
         self._typing_targets: dict[tuple[str, str | None], TypingTarget] = {}
         self._typing_deadlines: dict[tuple[str, str | None], float] = {}
         self._typing_routes: dict[str, TypingTarget] = {}
         self._typing_failures: dict[tuple[str, str | None], int] = {}
         self._active_turns: dict[str, ActiveTurn] = {}
         self._pending_progress_deletes: dict[tuple[str, str], PendingProgressDelete] = (
-            {}
+            progress_delete_store.load() if progress_delete_store is not None else {}
         )
         self._route_turns: dict[tuple[str, str | None], str] = {}
         self._route_generations: dict[tuple[str, str | None], int] = {}
@@ -1064,7 +1150,7 @@ class TelegramWorker:
                 continue
             deleted = await self._delete_progress_ref(pending)
             if deleted:
-                self._pending_progress_deletes.pop(pending.key, None)
+                self._forget_pending_progress_delete(pending.key)
             else:
                 self._schedule_progress_delete(pending)
 
@@ -1097,6 +1183,19 @@ class TelegramWorker:
             PROGRESS_DELETE_RETRY_BASE_SECONDS * (2 ** min(queued.attempts - 1, 5)),
         )
         queued.next_attempt_at = _loop_time() + delay_seconds
+        self._save_pending_progress_deletes()
+
+    def _forget_pending_progress_delete(self, key: tuple[str, str]) -> None:
+        if self._pending_progress_deletes.pop(key, None) is not None:
+            self._save_pending_progress_deletes()
+
+    def _save_pending_progress_deletes(self) -> None:
+        if self.progress_delete_store is None:
+            return
+        try:
+            self.progress_delete_store.save(self._pending_progress_deletes)
+        except Exception:
+            logger.exception("telegram progress delete store save failed")
 
     def _update_progress_status(self, event: StreamEvent) -> None:
         turn = self._active_turns.get(event.turn_id)
@@ -1826,6 +1925,9 @@ async def run() -> None:
         offset_store=OffsetStore(config.telegram_offset_file),
         outbox_receipt_store=OutboxReceiptStore(
             config.runtime_dir / "telegram.outbox-receipts.json"
+        ),
+        progress_delete_store=ProgressDeleteStore(
+            config.runtime_dir / "telegram.progress-deletes.json"
         ),
     )
 
