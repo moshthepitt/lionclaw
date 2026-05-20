@@ -875,6 +875,43 @@ class LionClawApiTests(unittest.IsolatedAsyncioTestCase):
         )
         await api.close()
 
+    async def test_pull_stream_normalizes_nullable_text(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "events": [
+                        {
+                            "sequence": 1,
+                            "peer_id": "telegram:chat:77",
+                            "turn_id": "turn-1",
+                            "kind": "message_boundary",
+                            "lane": "answer",
+                            "text": None,
+                        },
+                        {
+                            "sequence": 2,
+                            "peer_id": "telegram:chat:77",
+                            "turn_id": "turn-1",
+                            "kind": "done",
+                        },
+                    ]
+                },
+            )
+
+        client = httpx.AsyncClient(
+            base_url="http://127.0.0.1:8979",
+            transport=httpx.MockTransport(handler),
+        )
+        api = build_api(client)
+
+        events = await api.pull_stream()
+
+        self.assertEqual([event.text for event in events], ["", ""])
+        self.assertEqual(events[0].kind, "message_boundary")
+        self.assertEqual(events[1].kind, "done")
+        await api.close()
+
     async def test_pull_outbox_parses_attachments_and_scoped_refs(self) -> None:
         captured: dict[str, object] = {}
 
@@ -2861,6 +2898,38 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram.typing_peers, ["telegram:user:77"])
         self.assertEqual(telegram.sent_messages, [])
         self.assertEqual(api.acked_sequences, [4])
+
+    async def test_flush_stream_accepts_message_boundary_without_error(self) -> None:
+        api = FakeLionClawApi(
+            stream_events=[
+                StreamEvent(
+                    sequence=1,
+                    peer_id="telegram:chat:77",
+                    turn_id="turn-1",
+                    kind="message_boundary",
+                    lane="answer",
+                ),
+                StreamEvent(
+                    sequence=2,
+                    peer_id="telegram:chat:77",
+                    turn_id="turn-1",
+                    kind="done",
+                ),
+            ]
+        )
+        telegram = FakeTelegramTransport()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            with self.assertNoLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker.flush_stream()
+
+        self.assertEqual(api.acked_sequences, [2])
 
     async def test_fast_turn_does_not_create_progress_message(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

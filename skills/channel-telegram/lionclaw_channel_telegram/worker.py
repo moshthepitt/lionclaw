@@ -930,6 +930,9 @@ class TelegramWorker:
                     turn.expects_outbox_delivery = True
             return True
 
+        if event.kind == "message_boundary":
+            return True
+
         if event.kind == "status":
             if event.code in TYPING_STATUS_CODES:
                 await self._start_stream_typing(

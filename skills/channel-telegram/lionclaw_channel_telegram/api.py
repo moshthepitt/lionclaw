@@ -343,7 +343,7 @@ class LionClawApi:
                 turn_id=item.get("turn_id", ""),
                 lane=item.get("lane"),
                 code=item.get("code"),
-                text=item.get("text", ""),
+                text=_optional_event_text(item),
             )
             for item in events
         ]
@@ -455,6 +455,15 @@ def _raise_for_status(response: httpx.Response) -> None:
                 f"{response.status_code} {response.reason_phrase}: {body}"
             ) from err
         raise
+
+
+def _optional_event_text(item: dict[str, Any]) -> str:
+    text = item.get("text")
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        raise RuntimeError("stream event text must be a string when present")
+    return text
 
 
 def _attachment_descriptor(attachment: TelegramInboundAttachment) -> dict[str, Any]:
