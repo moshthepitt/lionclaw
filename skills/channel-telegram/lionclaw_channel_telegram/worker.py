@@ -648,7 +648,7 @@ class TelegramWorker:
             "LionClaw controls\n"
             "/status, /new, /stop, /retry, /continue, /settings\n\n"
             "Runtime controls\n"
-            "/model and other runtime slash commands pass through unchanged.\n"
+            "/model and other runtime slash commands go to the runtime.\n"
             "Use a leading space before / to send literal slash text.",
         )
 
