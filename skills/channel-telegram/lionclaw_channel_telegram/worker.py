@@ -475,8 +475,10 @@ class TelegramWorker:
             command_is_addressed = _telegram_command_is_addressed(update, command)
             if command.name in LOCAL_TELEGRAM_COMMANDS and command_is_addressed:
                 return await self._handle_telegram_command(update, command)
-            if command.text != update.text and command_is_addressed:
-                update = replace(update, text=command.text)
+            if command_is_addressed:
+                runtime_text = _telegram_runtime_command_text(command)
+                if runtime_text != update.text:
+                    update = replace(update, text=runtime_text)
 
         try:
             response = await self.lionclaw_api.send_inbound(update)
@@ -1649,6 +1651,15 @@ def _telegram_command_text(update: TelegramInboundUpdate) -> str | None:
     if not text_after_mention.startswith("/"):
         return None
     return text_after_mention
+
+
+def _telegram_runtime_command_text(command: TelegramCommand) -> str:
+    if command.target_username is None or "@" not in command.raw:
+        return command.text
+    command_name = command.raw.removeprefix("/").split("@", 1)[0]
+    if not command_name:
+        return command.text
+    return f"/{command_name}{command.text[len(command.raw) :]}"
 
 
 def _telegram_command_is_addressed(

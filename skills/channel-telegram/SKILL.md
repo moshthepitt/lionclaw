@@ -94,11 +94,13 @@ LIONCLAW_BASE_URL=http://127.0.0.1:8979 \
   `/retry`, `/continue`, and `/new` are translated to canonical `/lionclaw ...`
   controls before they enter the kernel. `/stop` uses the channel-safe active
   turn cancellation action with the expected turn id guard. `/model` and unknown
-  slash commands pass through to the runtime unchanged. Bot commands explicitly
-  targeted at a different Telegram bot are never captured as LionClaw-local
-  controls, even inside an active forum topic. In groups, leading bot-mention
-  commands such as `@lionclaw_bot /status` are treated like first-column bot
-  commands; runtime slash commands are forwarded without the leading mention.
+  slash commands pass through to the runtime after Telegram-only addressing
+  syntax is removed. Bot commands explicitly targeted at a different Telegram
+  bot are never captured as LionClaw-local controls, even inside an active forum
+  topic. In groups, commands with a leading bot mention, for example
+  `@lionclaw_bot /status`, are treated like first-column bot commands; runtime
+  slash commands are forwarded without the leading mention or `@lionclaw_bot`
+  command target.
 - Fast turns only show typing. Long turns create one provisional message after a
   short threshold, edit it at a throttled cadence, and delete it when the durable
   outbox answer is ready. Cancelled and failed turns leave a terminal status.

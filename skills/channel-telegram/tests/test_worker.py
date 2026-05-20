@@ -1715,6 +1715,48 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api.sent_inbound), 1)
         self.assertEqual(api.sent_inbound[0].text, "/model gpt-5.2")
 
+    async def test_targeted_runtime_command_strips_bot_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 933,
+                            "message": {
+                                "message_id": 33,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/model@lionclaw_bot gpt-5.2",
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len("/model@lionclaw_bot"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(len(api.sent_inbound), 1)
+        self.assertEqual(api.sent_inbound[0].text, "/model gpt-5.2")
+
     async def test_leading_mention_local_command_stays_local(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
@@ -1790,6 +1832,55 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                                         "type": "bot_command",
                                         "offset": len("@lionclaw_bot "),
                                         "length": len("/model"),
+                                    },
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(len(api.sent_inbound), 1)
+        self.assertEqual(api.sent_inbound[0].text, "/model gpt-5.2")
+
+    async def test_leading_mention_targeted_runtime_command_normalizes_for_runtime(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 938,
+                            "message": {
+                                "message_id": 38,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "@lionclaw_bot /model@lionclaw_bot gpt-5.2",
+                                "entities": [
+                                    {
+                                        "type": "mention",
+                                        "offset": 0,
+                                        "length": len("@lionclaw_bot"),
+                                    },
+                                    {
+                                        "type": "bot_command",
+                                        "offset": len("@lionclaw_bot "),
+                                        "length": len("/model@lionclaw_bot"),
                                     },
                                 ],
                             },
