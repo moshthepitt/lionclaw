@@ -3634,6 +3634,71 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             telegram.sent_messages[-1][1], "Turn failed: bad provider response"
         )
 
+    async def test_progress_edit_failure_deletes_progress_after_fallback(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(
+                inbound_turn_id="turn-1",
+                inbound_session_id="session-1",
+                inbound_session_key="channel:telegram:direct:77",
+            )
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 103,
+                            "message": {
+                                "message_id": 13,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "slow",
+                            },
+                        }
+                    )
+                ],
+                edit_errors=[
+                    TelegramBadRequest(
+                        method=object(),
+                        message="message can't be edited",
+                    )
+                ],
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+            worker._active_turns["turn-1"].visible_after = 0.0
+            await worker.refresh_progress_messages()
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker._process_stream_event(
+                    StreamEvent(
+                        sequence=1,
+                        peer_id="telegram:chat:77",
+                        turn_id="turn-1",
+                        kind="error",
+                        code="runtime.error",
+                        text="bad provider response",
+                    )
+                )
+
+        self.assertEqual(
+            telegram.sent_messages[-1][1], "Turn failed: bad provider response"
+        )
+        self.assertEqual(
+            telegram.deleted_messages,
+            [("telegram:chat:77", "telegram:message:101")],
+        )
+
     async def test_flush_outbox_sends_delivery_and_reports_receipt(self) -> None:
         api = FakeLionClawApi(
             outbox_deliveries=[

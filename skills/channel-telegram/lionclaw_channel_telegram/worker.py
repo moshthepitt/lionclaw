@@ -1227,11 +1227,13 @@ class TelegramWorker:
             and not turn.can_edit
             and turn.provisional_message_ref is not None
         ):
-            await self._send_progress_fallback(turn, text)
+            fallback_sent = await self._send_progress_fallback(turn, text)
+            if fallback_sent:
+                await self._delete_progress_message(turn)
             turn.terminal = True
             self._forget_turn(turn)
 
-    async def _send_progress_fallback(self, turn: ActiveTurn, text: str) -> None:
+    async def _send_progress_fallback(self, turn: ActiveTurn, text: str) -> bool:
         try:
             await self.telegram.send_message(
                 turn.target.conversation_ref,
@@ -1244,6 +1246,8 @@ class TelegramWorker:
                 "telegram progress fallback send failed for turn_id=%s",
                 turn.turn_id,
             )
+            return False
+        return True
 
     async def _complete_progress(self, event: StreamEvent) -> None:
         turn = self._active_turns.get(event.turn_id)
