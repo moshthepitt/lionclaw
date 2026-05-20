@@ -119,6 +119,10 @@ class ExtractInboundEventTests(unittest.TestCase):
         self.assertEqual(mapped.thread_ref, "telegram:topic:77")
         self.assertEqual(mapped.trigger, "mention")
         self.assertTrue(mapped.provider_metadata["bot_mentioned"])
+        self.assertEqual(
+            mapped.provider_metadata["leading_mention_text"],
+            "@lionclaw_bot",
+        )
 
     def test_group_command_targets_bot_by_entity(self) -> None:
         update = Update.model_validate(
@@ -1675,6 +1679,150 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(api.sent_inbound), 1)
         self.assertEqual(api.sent_inbound[0].text, "/model gpt-5.2")
+
+    async def test_leading_mention_local_command_stays_local(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 934,
+                            "message": {
+                                "message_id": 34,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "@lionclaw_bot /status",
+                                "entities": [
+                                    {
+                                        "type": "mention",
+                                        "offset": 0,
+                                        "length": len("@lionclaw_bot"),
+                                    },
+                                    {
+                                        "type": "bot_command",
+                                        "offset": len("@lionclaw_bot "),
+                                        "length": len("/status"),
+                                    },
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertIn("No active LionClaw turn", telegram.sent_messages[0][1])
+
+    async def test_leading_mention_runtime_command_strips_mention(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 935,
+                            "message": {
+                                "message_id": 35,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "@lionclaw_bot /model gpt-5.2",
+                                "entities": [
+                                    {
+                                        "type": "mention",
+                                        "offset": 0,
+                                        "length": len("@lionclaw_bot"),
+                                    },
+                                    {
+                                        "type": "bot_command",
+                                        "offset": len("@lionclaw_bot "),
+                                        "length": len("/model"),
+                                    },
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(len(api.sent_inbound), 1)
+        self.assertEqual(api.sent_inbound[0].text, "/model gpt-5.2")
+
+    async def test_leading_mention_command_targeting_other_bot_passes_through(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 936,
+                            "message": {
+                                "message_id": 36,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "@lionclaw_bot /stop@other_bot",
+                                "entities": [
+                                    {
+                                        "type": "mention",
+                                        "offset": 0,
+                                        "length": len("@lionclaw_bot"),
+                                    },
+                                    {
+                                        "type": "bot_command",
+                                        "offset": len("@lionclaw_bot "),
+                                        "length": len("/stop@other_bot"),
+                                    },
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(len(api.sent_inbound), 1)
+        self.assertEqual(api.sent_inbound[0].text, "@lionclaw_bot /stop@other_bot")
+        self.assertEqual(api.cancel_calls, [])
 
     async def test_unaddressed_group_local_command_passes_through(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

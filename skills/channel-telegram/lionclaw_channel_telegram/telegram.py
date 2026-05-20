@@ -835,10 +835,7 @@ def _has_bot_mention(
     for entity in _message_entities(message):
         fragment = _extract_entity_text(entity, text)
         entity_type = str(entity.type)
-        if entity_type == "mention" and _username_matches(
-            fragment.removeprefix("@"),
-            bot_username,
-        ):
+        if _mention_entity_targets_bot(entity, fragment, bot_identity):
             return True
         if (
             bot_username is not None
@@ -846,10 +843,37 @@ def _has_bot_mention(
             and _command_targets_bot(fragment, bot_username)
         ):
             return True
-        if entity_type == "text_mention" and _text_mention_targets_bot(
-            entity, bot_identity
-        ):
-            return True
+    return False
+
+
+def _leading_bot_mention_text(
+    message: Message,
+    bot_identity: TelegramBotIdentity | None,
+) -> str | None:
+    if bot_identity is None:
+        return None
+    text = _content_text(message)
+    if text is None:
+        return None
+    for entity in _message_entities(message):
+        if entity.offset != 0:
+            continue
+        fragment = _extract_entity_text(entity, text)
+        if _mention_entity_targets_bot(entity, fragment, bot_identity):
+            return fragment
+    return None
+
+
+def _mention_entity_targets_bot(
+    entity: MessageEntity,
+    fragment: str,
+    bot_identity: TelegramBotIdentity,
+) -> bool:
+    entity_type = str(entity.type)
+    if entity_type == "mention":
+        return _username_matches(fragment.removeprefix("@"), bot_identity.username)
+    if entity_type == "text_mention":
+        return _text_mention_targets_bot(entity, bot_identity)
     return False
 
 
@@ -928,6 +952,7 @@ def _provider_metadata(
     bot_identity: TelegramBotIdentity | None,
 ) -> dict[str, Any]:
     command_target = _leading_command_target(message)
+    leading_bot_mention = _leading_bot_mention_text(message, bot_identity)
     metadata: dict[str, Any] = {
         "provider": "telegram",
         "update_id": update_id,
@@ -938,6 +963,11 @@ def _provider_metadata(
         "message_id": message.message_id,
         "bot_mentioned": _has_bot_mention(message, bot_identity),
     }
+    if bot_identity is not None and bot_identity.username is not None:
+        metadata["bot_username"] = bot_identity.username.removeprefix("@").casefold()
+    if leading_bot_mention is not None:
+        metadata["leading_mention_targets_bot"] = True
+        metadata["leading_mention_text"] = leading_bot_mention
     if command_target is not None:
         metadata["command_target"] = command_target
         metadata["command_targets_bot"] = _username_matches(

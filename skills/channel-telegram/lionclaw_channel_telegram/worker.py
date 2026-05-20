@@ -139,6 +139,7 @@ class TelegramCommand:
     name: str
     raw: str
     arguments: str
+    text: str
     target_username: str | None = None
 
 
@@ -470,12 +471,12 @@ class TelegramWorker:
 
     async def _submit_inbound(self, update: TelegramInboundUpdate) -> bool:
         command = _telegram_command(update)
-        if (
-            command is not None
-            and command.name in LOCAL_TELEGRAM_COMMANDS
-            and _telegram_command_is_addressed(update, command)
-        ):
-            return await self._handle_telegram_command(update, command)
+        if command is not None:
+            command_is_addressed = _telegram_command_is_addressed(update, command)
+            if command.name in LOCAL_TELEGRAM_COMMANDS and command_is_addressed:
+                return await self._handle_telegram_command(update, command)
+            if command.text != update.text and command_is_addressed:
+                update = replace(update, text=command.text)
 
         try:
             response = await self.lionclaw_api.send_inbound(update)
@@ -1610,8 +1611,8 @@ def _classify_send_failure(err: Exception) -> tuple[str, str]:
 
 
 def _telegram_command(update: TelegramInboundUpdate) -> TelegramCommand | None:
-    text = update.text
-    if text is None or not text.startswith("/"):
+    text = _telegram_command_text(update)
+    if text is None:
         return None
     parts = text.split(maxsplit=1)
     token = parts[0]
@@ -1628,8 +1629,26 @@ def _telegram_command(update: TelegramInboundUpdate) -> TelegramCommand | None:
         name=command,
         raw=token,
         arguments=arguments.strip(),
+        text=text,
         target_username=target_username,
     )
+
+
+def _telegram_command_text(update: TelegramInboundUpdate) -> str | None:
+    text = update.text
+    if text is None:
+        return None
+    if text.startswith("/"):
+        return text
+    leading_mention = update.provider_metadata.get("leading_mention_text")
+    if not isinstance(leading_mention, str) or not leading_mention:
+        return None
+    if not text.startswith(leading_mention):
+        return None
+    text_after_mention = text[len(leading_mention) :].lstrip()
+    if not text_after_mention.startswith("/"):
+        return None
+    return text_after_mention
 
 
 def _telegram_command_is_addressed(
@@ -1637,7 +1656,13 @@ def _telegram_command_is_addressed(
     command: TelegramCommand,
 ) -> bool:
     if command.target_username is not None:
-        return bool(update.provider_metadata.get("command_targets_bot"))
+        if update.provider_metadata.get("command_targets_bot"):
+            return True
+        bot_username = update.provider_metadata.get("bot_username")
+        return (
+            isinstance(bot_username, str)
+            and command.target_username == bot_username.removeprefix("@").casefold()
+        )
     if update.provider_metadata.get("chat_type") == "private":
         return True
     return update.trigger in {"mention", "reply_to_bot", "thread_continuation"}
