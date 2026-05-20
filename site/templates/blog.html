@@ -6,25 +6,31 @@
 {% block og_description %}Notes on LionClaw, local agents, and owning the tools you use.{% endblock og_description %}
 
 {% block content %}
-<section class="blog-hero" aria-labelledby="blog-heading">
-  <p class="eyebrow">Blog</p>
-  <h1 id="blog-heading">Notes from the local side.</h1>
-  <p>
-    Short writing about LionClaw, agents, ownership, and the work of building it.
-  </p>
-</section>
+<section class="archive" aria-labelledby="blog-heading">
+  <header class="archive-head">
+    <h1 id="blog-heading">Blog</h1>
+  </header>
 
-<section class="post-list" aria-label="Posts">
-  {% for post in section.pages %}
-  <article class="post-card">
-    <h2><a href="{{ post.path }}">{{ post.title }}</a></h2>
-    {% if post.date %}
-    <time datetime="{{ post.date }}">{{ post.date | date(format="%Y-%m-%d") }}</time>
+  <ol class="archive-list" aria-label="Posts">
+    {% for post in paginator.pages %}
+    <li class="archive-item">
+      {% if post.date %}
+      <time datetime="{{ post.date }}">{{ post.date | date(format="%Y-%m-%d") }}</time>
+      {% endif %}
+      <a href="{{ post.path }}">{{ post.title }}</a>
+    </li>
+    {% endfor %}
+  </ol>
+
+  {% if paginator.previous or paginator.next %}
+  <nav class="pagination" aria-label="Pagination">
+    {% if paginator.previous %}
+    <a href="{{ paginator.previous }}">Newer</a>
     {% endif %}
-    {% if post.description %}
-    <p>{{ post.description }}</p>
+    {% if paginator.next %}
+    <a href="{{ paginator.next }}">Older</a>
     {% endif %}
-  </article>
-  {% endfor %}
+  </nav>
+  {% endif %}
 </section>
 {% endblock content %}
