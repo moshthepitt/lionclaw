@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="LionClaw">
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="LionClaw">
   <rect width="64" height="64" fill="#070806"/>
   <rect x="7.5" y="7.5" width="49" height="49" fill="#0b0d09" stroke="#d89135" stroke-width="3"/>
   <path d="M16 45V19h6v20h13v6H16Z" fill="#f1eadc"/>
