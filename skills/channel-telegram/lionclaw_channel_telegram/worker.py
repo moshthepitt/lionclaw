@@ -79,6 +79,7 @@ MAX_OUTBOX_RECEIPTS = 256
 OUTBOX_RECEIPT_STATUSES = {"delivered", "partial"}
 MAX_PENDING_PROGRESS_DELETES = 256
 TEXT_BURST_MAX_SECONDS = 10
+WEBHOOK_COALESCE_DELAY_SECONDS = 0.35
 
 LOCAL_TELEGRAM_COMMANDS = {
     "help",
@@ -235,6 +236,17 @@ class ParsedCallbackAction:
 class ProviderWorkItem:
     update_ids: tuple[int, ...]
     event: TelegramInboundEvent | None
+
+
+WebhookRouteKey = tuple[str, str | None]
+WebhookBatchKey = tuple[str, str | None, str, str, str, str]
+
+
+@dataclass(slots=True)
+class WebhookBatch:
+    key: WebhookBatchKey
+    items: list[ProviderWorkItem]
+    result: asyncio.Future[bool]
 
 
 @dataclass(slots=True)
@@ -575,6 +587,8 @@ class TelegramWorker:
         self._last_update_observed_at: float | None = None
         self._update_extraction_failure_count = 0
         self._delivery_failure_counts: dict[str, int] = {}
+        self._webhook_batches: dict[WebhookBatchKey, WebhookBatch] = {}
+        self._webhook_batch_lock = asyncio.Lock()
 
     async def process_updates(self) -> None:
         self._poll_in_flight_started_at = _loop_time()
@@ -614,10 +628,7 @@ class TelegramWorker:
             (update.update_id,),
             self._extract_provider_event(update, bot_identity),
         )
-        processed = await self._process_provider_work_items(
-            [item],
-            persist_offsets=False,
-        )
+        processed = await self._process_webhook_work_item(item)
         if processed:
             self._record_webhook_success()
         else:
@@ -625,6 +636,89 @@ class TelegramWorker:
                 RuntimeError("webhook update processing failed")
             )
         return processed
+
+    async def _process_webhook_work_item(self, item: ProviderWorkItem) -> bool:
+        key = _webhook_batch_key(item.event)
+        if key is None:
+            if not await self._flush_webhook_batches_for_event(item.event):
+                return False
+            return await self._process_provider_work_items(
+                [item],
+                persist_offsets=False,
+            )
+
+        if not await self._flush_webhook_batches_for_event(item.event, except_key=key):
+            return False
+        future, should_schedule = await self._enqueue_webhook_batch(key, item)
+        if should_schedule:
+            asyncio.create_task(
+                self._flush_webhook_batch(key, WEBHOOK_COALESCE_DELAY_SECONDS),
+                name="telegram-webhook-batch",
+            )
+        return await asyncio.shield(future)
+
+    async def _enqueue_webhook_batch(
+        self,
+        key: WebhookBatchKey,
+        item: ProviderWorkItem,
+    ) -> tuple[asyncio.Future[bool], bool]:
+        async with self._webhook_batch_lock:
+            batch = self._webhook_batches.get(key)
+            should_schedule = False
+            if batch is None:
+                batch = WebhookBatch(
+                    key=key,
+                    items=[],
+                    result=asyncio.get_running_loop().create_future(),
+                )
+                self._webhook_batches[key] = batch
+                should_schedule = True
+            batch.items.append(item)
+            return batch.result, should_schedule
+
+    async def _flush_webhook_batches_for_event(
+        self,
+        event: TelegramInboundEvent | None,
+        *,
+        except_key: WebhookBatchKey | None = None,
+    ) -> bool:
+        route = _webhook_event_route(event)
+        if route is None:
+            return True
+        async with self._webhook_batch_lock:
+            batches = [
+                batch
+                for key, batch in self._webhook_batches.items()
+                if key != except_key and _webhook_batch_route(key) == route
+            ]
+        processed = True
+        for batch in batches:
+            await self._flush_webhook_batch(batch.key, delay_seconds=0.0)
+            processed = await asyncio.shield(batch.result) and processed
+        return processed
+
+    async def _flush_webhook_batch(
+        self,
+        key: WebhookBatchKey,
+        delay_seconds: float,
+    ) -> None:
+        if delay_seconds > 0.0:
+            await asyncio.sleep(delay_seconds)
+        async with self._webhook_batch_lock:
+            batch = self._webhook_batches.pop(key, None)
+        if batch is None:
+            return
+        try:
+            work_items = sorted(batch.items, key=_provider_work_item_sort_key)
+            processed = await self._process_provider_work_items(
+                work_items,
+                persist_offsets=False,
+            )
+        except Exception:
+            logger.exception("telegram webhook batch processing failed")
+            processed = False
+        if not batch.result.done():
+            batch.result.set_result(processed)
 
     async def _process_provider_work_items(
         self,
@@ -2401,6 +2495,48 @@ def _coalesce_work_items(items: list[ProviderWorkItem]) -> list[ProviderWorkItem
     if pending is not None:
         coalesced.append(pending)
     return coalesced
+
+
+def _provider_work_item_sort_key(item: ProviderWorkItem) -> tuple[int, ...]:
+    return item.update_ids
+
+
+def _webhook_batch_key(event: TelegramInboundEvent | None) -> WebhookBatchKey | None:
+    if not isinstance(event, TelegramInboundUpdate):
+        return None
+    if _telegram_command(event) is not None:
+        return None
+    media_group = event.provider_metadata.get("media_group_id")
+    if isinstance(media_group, str) and media_group:
+        lane_kind = "media_group"
+        lane_id = media_group
+    elif event.text is not None and event.text.strip() and not event.attachments:
+        lane_kind = "text"
+        lane_id = "_"
+    else:
+        return None
+    return (
+        event.conversation_ref,
+        event.thread_ref,
+        event.sender_ref,
+        event.trigger,
+        lane_kind,
+        lane_id,
+    )
+
+
+def _webhook_event_route(event: TelegramInboundEvent | None) -> WebhookRouteKey | None:
+    if isinstance(
+        event,
+        TelegramInboundUpdate | TelegramPairingClaim | TelegramCallbackAction,
+    ):
+        return (event.conversation_ref, event.thread_ref)
+    return None
+
+
+def _webhook_batch_route(key: WebhookBatchKey) -> WebhookRouteKey:
+    conversation_ref, thread_ref, *_ = key
+    return (conversation_ref, thread_ref)
 
 
 def _can_merge_work_items(first: ProviderWorkItem, second: ProviderWorkItem) -> bool:

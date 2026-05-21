@@ -2098,6 +2098,269 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker.offset, 0)
         self.assertFalse(offset_exists)
 
+    async def test_process_webhook_update_batches_concurrent_text_messages(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=api,
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            first = Update.model_validate(
+                {
+                    "update_id": 871,
+                    "message": {
+                        "message_id": 171,
+                        "date": 0,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "first",
+                    },
+                }
+            )
+            second = Update.model_validate(
+                {
+                    "update_id": 872,
+                    "message": {
+                        "message_id": 172,
+                        "date": 1,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "second",
+                    },
+                }
+            )
+
+            processed = await asyncio.gather(
+                worker.process_webhook_update(second),
+                worker.process_webhook_update(first),
+            )
+
+        self.assertEqual(processed, [True, True])
+        self.assertEqual(len(api.sent_inbound), 1)
+        self.assertEqual(api.sent_inbound[0].text, "first\n\nsecond")
+        self.assertEqual(api.sent_inbound[0].provider_metadata["update_id"], 872)
+
+    async def test_process_webhook_update_batches_concurrent_media_group(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(inbound_outcome="waiting_for_attachments")
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=api,
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            first = Update.model_validate(
+                {
+                    "update_id": 873,
+                    "message": {
+                        "message_id": 173,
+                        "date": 0,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "media_group_id": "album-webhook",
+                        "caption": "front",
+                        "photo": [
+                            {
+                                "file_id": "photo-file-1",
+                                "file_unique_id": "photo-unique-1",
+                                "width": 100,
+                                "height": 100,
+                                "file_size": 10,
+                            }
+                        ],
+                    },
+                }
+            )
+            second = Update.model_validate(
+                {
+                    "update_id": 874,
+                    "message": {
+                        "message_id": 174,
+                        "date": 1,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "media_group_id": "album-webhook",
+                        "caption": "back",
+                        "photo": [
+                            {
+                                "file_id": "photo-file-2",
+                                "file_unique_id": "photo-unique-2",
+                                "width": 100,
+                                "height": 100,
+                                "file_size": 10,
+                            }
+                        ],
+                    },
+                }
+            )
+
+            processed = await asyncio.gather(
+                worker.process_webhook_update(first),
+                worker.process_webhook_update(second),
+            )
+
+        self.assertEqual(processed, [True, True])
+        self.assertEqual(len(api.sent_inbound), 1)
+        self.assertEqual(api.sent_inbound[0].text, "front\n\nback")
+        self.assertEqual(len(api.sent_inbound[0].attachments), 2)
+        self.assertEqual(len(api.staged_attachments), 2)
+        self.assertEqual(len(api.finalized), 1)
+
+    async def test_process_webhook_update_keeps_commands_ordered_after_pending_text(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(
+                inbound_turn_id="turn-1",
+                inbound_session_id="session-1",
+                inbound_session_key="channel:telegram:direct:77",
+            )
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            text_update = Update.model_validate(
+                {
+                    "update_id": 875,
+                    "message": {
+                        "message_id": 175,
+                        "date": 0,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "start work",
+                    },
+                }
+            )
+            status_update = Update.model_validate(
+                {
+                    "update_id": 876,
+                    "message": {
+                        "message_id": 176,
+                        "date": 1,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "/status",
+                    },
+                }
+            )
+
+            text_task = asyncio.create_task(worker.process_webhook_update(text_update))
+            await asyncio.sleep(0)
+            processed = await asyncio.gather(
+                text_task,
+                worker.process_webhook_update(status_update),
+            )
+
+        self.assertEqual(processed, [True, True])
+        self.assertEqual([update.text for update in api.sent_inbound], ["start work"])
+        self.assertEqual(telegram.sent_messages[0][1], "Active turn: queued.")
+
+    async def test_process_webhook_update_blocks_commands_when_pending_text_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(inbound_outcome="not-a-real-outcome")
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            text_update = Update.model_validate(
+                {
+                    "update_id": 877,
+                    "message": {
+                        "message_id": 177,
+                        "date": 0,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "start work",
+                    },
+                }
+            )
+            status_update = Update.model_validate(
+                {
+                    "update_id": 878,
+                    "message": {
+                        "message_id": 178,
+                        "date": 1,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "/status",
+                    },
+                }
+            )
+
+            text_task = asyncio.create_task(worker.process_webhook_update(text_update))
+            await asyncio.sleep(0)
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                processed = await asyncio.gather(
+                    text_task,
+                    worker.process_webhook_update(status_update),
+                )
+
+        self.assertEqual(processed, [False, False])
+        self.assertEqual([update.text for update in api.sent_inbound], ["start work"])
+        self.assertEqual(telegram.sent_messages, [])
+
     async def test_process_webhook_update_reports_processing_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi(inbound_outcome="not-a-real-outcome")
