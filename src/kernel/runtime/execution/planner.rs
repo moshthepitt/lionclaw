@@ -10,7 +10,8 @@ use crate::kernel::skills::validate_skill_alias;
 
 use super::{
     mount_validation::{
-        mount_target_is_or_under, validate_configured_mounts, MountSourceProtection,
+        mount_target_is_or_under, project_metadata_root_from_instance_home,
+        validate_configured_mounts, MountSourceProtection,
     },
     plan::{
         ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset, MountAccess, MountSpec,
@@ -529,6 +530,12 @@ fn configured_mount_protections(
                 home_root.to_path_buf(),
                 "the selected instance home",
             ));
+            if let Some(metadata_root) = project_metadata_root_from_instance_home(home_root) {
+                roots.push(MountSourceProtection::new(
+                    metadata_root,
+                    "project metadata",
+                ));
+            }
         }
     }
     if let Some(project_workspace_root) = project_workspace_root {
@@ -1147,6 +1154,66 @@ mod tests {
                 "expected {expected:?} in planner error: {err}"
             );
         }
+    }
+
+    #[test]
+    fn planner_rejects_project_metadata_mount_sources_inferred_from_instance_home() {
+        let sandbox = tempdir().expect("temp dir");
+        let runtime_root = sandbox
+            .path()
+            .join("project/.lionclaw/instances/main/runtime");
+        let metadata_source = sandbox.path().join("project/.lionclaw/private");
+        fs::create_dir_all(&runtime_root).expect("runtime root");
+        fs::create_dir_all(&metadata_source).expect("metadata source");
+        let runtimes = [(
+            "codex".to_string(),
+            RuntimeExecutionProfile::new(
+                ConfinementConfig::Oci(OciConfinementConfig {
+                    additional_mounts: vec![MountSpec {
+                        source: metadata_source,
+                        target: "/mnt/private".to_string(),
+                        access: MountAccess::ReadOnly,
+                    }],
+                    ..OciConfinementConfig::default()
+                }),
+                "runtime-codex-v1".to_string(),
+                None,
+                None,
+            ),
+        )]
+        .into_iter()
+        .collect();
+        let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: RuntimeExecutionPolicy::default(),
+            default_preset_name: None,
+            presets: BTreeMap::new(),
+            runtimes,
+            workspace_root: None,
+            project_workspace_root: None,
+            runtime_root: Some(runtime_root),
+            workspace_name: None,
+            default_idle_timeout: Duration::from_secs(30),
+            default_hard_timeout: Duration::from_secs(90),
+        });
+
+        let err = planner
+            .plan(ExecutionPlanRequest {
+                session_id: Some(Uuid::nil()),
+                runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::Interactive,
+                preset_name: None,
+                working_dir: None,
+                env_passthrough_keys: Vec::new(),
+                skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
+                timeout_ms: None,
+            })
+            .expect_err("project metadata mount source");
+
+        assert!(
+            err.contains("project metadata"),
+            "unexpected planner error: {err}"
+        );
     }
 
     #[test]

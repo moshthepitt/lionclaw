@@ -7,8 +7,9 @@ use crate::{
     kernel::{
         runtime::{
             execution::mount_validation::{
-                canonical_mount_source, validate_configured_mount_target,
-                validate_configured_mounts, MountSourceProtection,
+                canonical_mount_source, project_metadata_root_from_instance_home,
+                validate_configured_mount_target, validate_configured_mounts,
+                MountSourceProtection,
             },
             ConfinementConfig, MountAccess, MountSpec,
         },
@@ -172,10 +173,17 @@ fn mount_source_protections(
     project_root: Option<&Path>,
     work_root: Option<&Path>,
 ) -> Vec<MountSourceProtection> {
+    let home_root = home.root();
     let mut roots = vec![MountSourceProtection::new(
-        home.root(),
+        home_root.clone(),
         "the selected instance home",
     )];
+    if let Some(metadata_root) = project_metadata_root_from_instance_home(&home_root) {
+        roots.push(MountSourceProtection::new(
+            metadata_root,
+            "project metadata",
+        ));
+    }
     if let Some(project_root) = project_root {
         roots.push(MountSourceProtection::new(
             project_root.join(".lionclaw"),
@@ -313,5 +321,32 @@ mod tests {
         )
         .expect_err("private");
         assert!(private_err.to_string().contains("selected instance home"));
+    }
+
+    #[test]
+    fn add_rejects_project_metadata_sources_inferred_from_project_instance_home() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = temp_dir.path().join("project");
+        let source = project.join("docs");
+        let metadata_source = project.join(".lionclaw/private");
+        std::fs::create_dir_all(&source).expect("source");
+        std::fs::create_dir_all(&metadata_source).expect("metadata source");
+        let home = LionClawHome::new(project.join(".lionclaw/instances/main"));
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), profile("podman".to_string(), None));
+
+        let err = add_runtime_mount(
+            &mut config,
+            &home,
+            None,
+            "codex",
+            "private",
+            &metadata_source,
+            MountAccess::ReadOnly,
+        )
+        .expect_err("project metadata source");
+
+        assert!(err.to_string().contains("project metadata"));
     }
 }

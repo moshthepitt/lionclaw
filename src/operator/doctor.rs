@@ -991,30 +991,44 @@ fn inspect_runtime_config(
     config: &OperatorConfig,
     findings: &mut Vec<DoctorFinding>,
 ) {
-    inspect_runtime_config_with_podman_resolver(
+    let context = RuntimeConfigInspection {
         project_root,
         name,
         home,
         work_root,
         commands,
         config,
-        findings,
-        || normalize_podman_executable(DEFAULT_OCI_ENGINE),
-    );
+    };
+    inspect_runtime_config_with_podman_resolver(context, findings, || {
+        normalize_podman_executable(DEFAULT_OCI_ENGINE)
+    });
+}
+
+struct RuntimeConfigInspection<'a> {
+    project_root: Option<&'a Path>,
+    name: &'a str,
+    home: &'a Path,
+    work_root: Option<&'a Path>,
+    commands: &'a DoctorCommands,
+    config: &'a OperatorConfig,
 }
 
 fn inspect_runtime_config_with_podman_resolver<F>(
-    project_root: Option<&Path>,
-    name: &str,
-    home: &Path,
-    work_root: Option<&Path>,
-    commands: &DoctorCommands,
-    config: &OperatorConfig,
+    context: RuntimeConfigInspection<'_>,
     findings: &mut Vec<DoctorFinding>,
     resolve_default_podman: F,
 ) where
     F: FnOnce() -> Result<String>,
 {
+    let RuntimeConfigInspection {
+        project_root,
+        name,
+        home,
+        work_root,
+        commands,
+        config,
+    } = context;
+
     let default_runtime_repair = commands.selected("configure --runtime codex");
     let Some(runtime_id) = config.defaults.runtime.as_deref() else {
         if let Some(finding) = default_codex_runtime_configure_blocker(
@@ -3071,12 +3085,14 @@ mod tests {
         let mut findings = Vec::new();
 
         inspect_runtime_config_with_podman_resolver(
-            Some(Path::new("/repo")),
-            "main",
-            Path::new("/repo/.lionclaw/instances/main"),
-            None,
-            &commands,
-            &config,
+            RuntimeConfigInspection {
+                project_root: Some(Path::new("/repo")),
+                name: "main",
+                home: Path::new("/repo/.lionclaw/instances/main"),
+                work_root: None,
+                commands: &commands,
+                config: &config,
+            },
             &mut findings,
             || {
                 Err(anyhow::anyhow!(
@@ -3107,12 +3123,14 @@ mod tests {
         let mut findings = Vec::new();
 
         inspect_runtime_config_with_podman_resolver(
-            Some(Path::new("/repo")),
-            "main",
-            Path::new("/repo/.lionclaw/instances/main"),
-            None,
-            &commands,
-            &config,
+            RuntimeConfigInspection {
+                project_root: Some(Path::new("/repo")),
+                name: "main",
+                home: Path::new("/repo/.lionclaw/instances/main"),
+                work_root: None,
+                commands: &commands,
+                config: &config,
+            },
             &mut findings,
             || {
                 Err(anyhow::anyhow!(

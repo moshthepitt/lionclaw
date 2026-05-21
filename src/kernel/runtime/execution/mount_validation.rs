@@ -173,6 +173,18 @@ pub fn mount_target_is_or_under(target: &str, root: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+pub fn project_metadata_root_from_instance_home(home_root: &Path) -> Option<PathBuf> {
+    let instances_root = home_root.parent()?;
+    if instances_root.file_name()? != "instances" {
+        return None;
+    }
+    let metadata_root = instances_root.parent()?;
+    if metadata_root.file_name()? != ".lionclaw" {
+        return None;
+    }
+    Some(metadata_root.to_path_buf())
+}
+
 fn path_is_or_under(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
 }
@@ -280,5 +292,17 @@ mod tests {
             .expect_err("raw protected symlink");
             assert!(err.contains("selected instance home"));
         }
+    }
+
+    #[test]
+    fn derives_project_metadata_root_from_standard_instance_home() {
+        let root = Path::new("/repo/.lionclaw/instances/main");
+        assert_eq!(
+            project_metadata_root_from_instance_home(root).as_deref(),
+            Some(Path::new("/repo/.lionclaw"))
+        );
+        assert!(
+            project_metadata_root_from_instance_home(Path::new("/tmp/lionclaw-home")).is_none()
+        );
     }
 }
