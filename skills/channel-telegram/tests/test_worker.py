@@ -3052,6 +3052,65 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(retry_result)
         self.assertEqual([submitted.text for submitted in api.sent_inbound], ["hello"])
 
+    async def test_cancelled_webhook_command_wait_does_not_replay_update(self) -> None:
+        class BlockingCommandApi(FakeLionClawApi):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def send_inbound(
+                self,
+                update: TelegramInboundUpdate,
+            ) -> InboundResponse:
+                self.sent_inbound.append(update)
+                self.started.set()
+                await self.release.wait()
+                return InboundResponse(outcome="queued")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = BlockingCommandApi()
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=api,
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            update = Update.model_validate(
+                {
+                    "update_id": 880,
+                    "message": {
+                        "message_id": 180,
+                        "date": 0,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "/retry",
+                    },
+                }
+            )
+
+            first_task = asyncio.create_task(worker.process_webhook_update(update))
+            await asyncio.wait_for(api.started.wait(), timeout=1.0)
+            first_task.cancel()
+            await asyncio.sleep(0)
+            api.release.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await first_task
+            retry_result = await worker.process_webhook_update(update)
+
+        self.assertTrue(retry_result)
+        self.assertEqual(
+            [submitted.text for submitted in api.sent_inbound], ["/lionclaw retry"]
+        )
+
     async def test_process_webhook_update_batches_concurrent_media_group(
         self,
     ) -> None:

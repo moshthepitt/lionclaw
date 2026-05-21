@@ -827,7 +827,17 @@ class TelegramWorker:
                         (update.update_id,),
                         self._extract_provider_event(update, bot_identity),
                     )
-                    processed = await self._process_webhook_work_item(item)
+                    processing = asyncio.create_task(
+                        self._process_webhook_work_item(item),
+                        name="telegram-webhook-update",
+                    )
+                    processed = await self._wait_for_webhook_result(
+                        processing,
+                        cancellation_message=(
+                            "telegram webhook processing wait cancelled; "
+                            "preserving update ownership"
+                        ),
+                    )
                     if not processed:
                         failure = RuntimeError("webhook update processing failed")
                 except Exception as err:
@@ -940,22 +950,28 @@ class TelegramWorker:
             )
 
         future = await self._enqueue_webhook_batch(key, item)
-        return await self._wait_for_webhook_batch_result(future)
+        return await self._wait_for_webhook_result(
+            future,
+            cancellation_message=(
+                "telegram webhook batch wait cancelled; preserving update ownership"
+            ),
+        )
 
-    async def _wait_for_webhook_batch_result(
+    async def _wait_for_webhook_result(
         self,
         result: asyncio.Future[bool],
+        *,
+        cancellation_message: str,
     ) -> bool:
         logged_cancellation = False
         while True:
             try:
                 return await asyncio.shield(result)
             except asyncio.CancelledError:
+                if result.cancelled():
+                    raise
                 if not logged_cancellation:
-                    logger.debug(
-                        "telegram webhook batch wait cancelled; "
-                        "preserving update ownership"
-                    )
+                    logger.debug(cancellation_message)
                     logged_cancellation = True
 
     async def _process_webhook_route_work_items(
