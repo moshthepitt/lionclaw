@@ -1316,7 +1316,8 @@ if [ "${{1:-}}" = "secret" ] && [ "${{2:-}}" = "rm" ]; then
   exit 1
 fi
 case "${{1:-}}" in
-  secret|run) exit 0 ;;
+  run) cat >/dev/null; exit 0 ;;
+  secret) exit 0 ;;
   *) exit 0 ;;
 esac
 "#,
