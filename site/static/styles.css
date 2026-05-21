@@ -14,8 +14,8 @@
   --panel: rgba(10, 14, 10, 0.88);
   --panel-2: rgba(15, 19, 14, 0.92);
   --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-  --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --serif: Georgia, "Times New Roman", serif;
+  --sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --serif: Charter, "Bitstream Charter", "Iowan Old Style", Georgia, "Times New Roman", serif;
 }
 
 * {
@@ -121,12 +121,22 @@ main {
 }
 
 .hero {
+  display: block;
+  min-height: auto;
+  padding: clamp(3.1rem, 6vw, 5.2rem) 0 clamp(3.4rem, 7vw, 6rem);
+  border-top: 0;
+}
+
+.hero-intro {
   display: grid;
-  grid-template-columns: minmax(0, 0.86fr) minmax(460px, 1.14fr);
-  gap: clamp(2rem, 5vw, 4.5rem);
-  align-items: center;
-  min-height: calc(100vh - 5.2rem);
-  padding: clamp(2.2rem, 6vw, 5.2rem) 0 3rem;
+  grid-template-columns: minmax(0, 0.98fr) minmax(22rem, 0.82fr);
+  grid-template-areas: "title copy";
+  gap: clamp(2rem, 6vw, 5rem);
+  align-items: end;
+}
+
+.hero-title {
+  grid-area: title;
 }
 
 .eyebrow {
@@ -161,8 +171,14 @@ h3 {
 }
 
 h1 {
-  max-width: 14.4ch;
+  max-width: 13.2ch;
   font-size: 4.35rem;
+}
+
+.hero h1 {
+  max-width: 13.4ch;
+  font-size: clamp(3.35rem, 5.9vw, 5.35rem);
+  line-height: 0.96;
 }
 
 h2 {
@@ -179,6 +195,17 @@ p {
   color: var(--ink);
   font-size: 1.15rem;
   line-height: 1.5;
+}
+
+.hero-copy p:first-child {
+  margin-top: 0;
+}
+
+.hero-copy {
+  grid-area: copy;
+  align-self: end;
+  max-width: 35rem;
+  padding-bottom: 0.1rem;
 }
 
 .command {
@@ -250,29 +277,58 @@ figcaption code {
 }
 
 .console {
-  overflow: hidden;
+  position: relative;
+  left: 50%;
+  width: min(1360px, calc(100vw - 2rem));
+  max-width: none;
+  margin-top: clamp(2rem, 4.5vw, 3.4rem);
+  margin-right: 0;
+  margin-left: 0;
+  padding: 0;
+  transform: translateX(-50%);
+  overflow: visible;
+  background: transparent;
+}
+
+.console-shot {
+  display: block;
+  width: 100%;
+  margin: 0 auto;
   border: 1px solid var(--line-strong);
   background: #050705;
+  color: inherit;
+  text-decoration: none;
   box-shadow: 0 34px 90px -62px #000;
 }
 
+.console-shot:hover img {
+  filter: brightness(1.06);
+}
+
 .console figcaption {
-  padding: 0.7rem 0.85rem;
-  border-top: 1px solid var(--line);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  width: min(1180px, 100%);
+  margin: 0.7rem auto 0;
   color: var(--muted);
   font-family: var(--sans);
   font-size: 0.88rem;
 }
 
+.console figcaption span {
+  color: var(--ink);
+}
+
 section {
-  padding: clamp(3rem, 6vw, 4.8rem) 0;
+  padding: clamp(3.2rem, 6vw, 5rem) 0;
   border-top: 1px solid var(--line);
 }
 
 .split {
   display: grid;
-  grid-template-columns: minmax(0, 0.72fr) minmax(0, 1.28fr);
-  gap: clamp(1.6rem, 5vw, 4rem);
+  grid-template-columns: minmax(0, 0.78fr) minmax(0, 1.22fr);
+  gap: clamp(2rem, 6vw, 5rem);
   align-items: start;
 }
 
@@ -286,8 +342,8 @@ section {
 
 .point-head {
   display: grid;
-  grid-template-columns: minmax(0, 0.72fr) minmax(0, 1.28fr);
-  gap: clamp(1.6rem, 5vw, 4rem);
+  grid-template-columns: minmax(0, 0.78fr) minmax(0, 1.22fr);
+  gap: clamp(2rem, 6vw, 5rem);
   align-items: start;
 }
 
@@ -306,7 +362,7 @@ section {
 .claim-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
-  margin-top: 2.2rem;
+  margin-top: 2.3rem;
   border-top: 1px solid var(--line);
   border-left: 1px solid var(--line);
 }
@@ -335,12 +391,14 @@ section {
 }
 
 .point-close {
-  max-width: none;
-  margin-top: 1.7rem;
+  max-width: 1080px;
+  margin-top: 2.4rem;
+  padding-top: 1.45rem;
+  border-top: 1px solid var(--line);
   color: var(--gold-2);
   font-family: var(--serif);
-  font-size: 1.55rem;
-  line-height: 1.25;
+  font-size: clamp(1.8rem, 3vw, 3rem);
+  line-height: 1.12;
 }
 
 .site-footer {
@@ -363,7 +421,7 @@ section {
 
 .archive h1 {
   max-width: none;
-  font-size: clamp(2rem, 4vw, 3rem);
+  font-size: clamp(2.4rem, 5vw, 4rem);
   line-height: 1;
 }
 
@@ -385,6 +443,7 @@ section {
 .archive-item a {
   color: var(--ink);
   font-family: var(--serif);
+  font-weight: 400;
   font-size: clamp(1.35rem, 2.2vw, 2rem);
   line-height: 1.12;
   text-decoration: none;
@@ -447,9 +506,9 @@ section {
 }
 
 .article h1 {
-  max-width: 930px;
+  max-width: 980px;
   margin: 0;
-  font-size: clamp(2.75rem, 4.35vw, 4.25rem);
+  font-size: clamp(2.9rem, 5.1vw, 5.25rem);
   line-height: 1.05;
 }
 
@@ -509,6 +568,19 @@ section {
     grid-template-columns: 1fr;
   }
 
+  .hero-intro {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "title"
+      "copy";
+    gap: 0;
+    align-items: start;
+  }
+
+  .hero-copy {
+    padding-top: 1.35rem;
+  }
+
   .hero {
     min-height: auto;
   }
@@ -521,7 +593,7 @@ section {
     font-size: 2.45rem;
   }
 
-  .console {
+  .split .console {
     max-width: 58rem;
   }
 
@@ -557,7 +629,32 @@ section {
     padding-top: 2.5rem;
   }
 
+  .console {
+    left: auto;
+    width: 100%;
+    padding: 0;
+    margin-left: 0;
+    transform: none;
+    overflow-x: auto;
+  }
+
+  .console-shot {
+    display: inline-block;
+    width: auto;
+    min-width: 0;
+  }
+
+  .console-shot img {
+    width: 42rem;
+    max-width: none;
+  }
+
   h1 {
+    max-width: 13ch;
+    font-size: 3rem;
+  }
+
+  .hero h1 {
     max-width: 13ch;
     font-size: 3rem;
   }

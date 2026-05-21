@@ -1,10 +1,8 @@
 +++
 title = "Hello, world"
 date = 2026-05-19
-description = "The LionClaw blog is alive."
+description = "Agents are going to matter. Do not let someone else own yours."
 +++
-
-Hello.
 
 This is the LionClaw blog.
 

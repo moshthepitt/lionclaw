@@ -2,41 +2,52 @@
 
 {% block content %}
 <section class="hero" aria-labelledby="hero-heading">
-  <div class="hero-copy">
-    <p class="eyebrow">Local agent home</p>
-    <h1 id="hero-heading">Your agent should work from your side of the fence.</h1>
-    <p class="lede">
-      AI agents will read your files, remember your work, use your keys,
-      message people, and run jobs.
-    </p>
-    <p>
-      That should not all live inside someone else's platform.
-    </p>
-    <p>
-      LionClaw gives real agent CLIs a local home in your project: sessions,
-      state, channels, jobs, and audit.
-    </p>
-    <p>
-      Use Codex. Use OpenCode. Use whatever comes next. Keep the home.
-    </p>
-    <pre class="command"><code>cd /path/to/your/project
-lionclaw project init
-lionclaw doctor
-lionclaw run</code></pre>
-    <div class="actions" aria-label="Primary links">
-      <a class="button primary" href="#start">Start</a>
-      <a class="button" href="https://github.com/moshthepitt/lionclaw" rel="noopener noreferrer">GitHub</a>
+  <div class="hero-intro">
+    <div class="hero-title">
+      <p class="eyebrow">Local agent home</p>
+      <h1 id="hero-heading">Your agent should work from your side of the fence.</h1>
+    </div>
+    <div class="hero-copy">
+      <p class="lede">
+        AI agents will read your files, remember your work, use your keys,
+        message people, and run jobs.
+      </p>
+      <p>
+        That should not all live inside someone else's platform.
+      </p>
+      <p>
+        LionClaw gives real agent CLIs a local home in your project: sessions,
+        state, channels, jobs, and audit.
+      </p>
+      <p>
+        Use Codex. Use OpenCode. Use whatever comes next. Keep the home.
+      </p>
+      <div class="actions" aria-label="Primary links">
+        <a class="button primary" href="#start">Start</a>
+        <a class="button" href="https://github.com/moshthepitt/lionclaw" rel="noopener noreferrer">GitHub</a>
+      </div>
     </div>
   </div>
 
-  <figure class="console">
-    <img
-      src="/assets/lionclaw-run-console.png"
-      alt="LionClaw run console showing project sessions, transcript, inspector, composer, and command help"
-      width="1890"
-      height="971"
+  <figure class="console" aria-label="LionClaw run console">
+    <a
+      class="console-shot"
+      href="/assets/lionclaw-run-console.png"
+      target="_blank"
+      rel="noopener noreferrer"
+      aria-label="Open full size LionClaw run console screenshot"
     >
-    <figcaption><code>lionclaw run</code> opens the local project console.</figcaption>
+      <img
+        src="/assets/lionclaw-run-console.png"
+        alt="LionClaw run console showing project sessions, transcript, inspector, composer, and command help"
+        width="1890"
+        height="971"
+      >
+    </a>
+    <figcaption>
+      <span><code>lionclaw run</code></span>
+      opens the local project console.
+    </figcaption>
   </figure>
 </section>
 
@@ -85,23 +96,23 @@ lionclaw run</code></pre>
   <div class="claim-grid">
     <article>
       <h3>Your project</h3>
-      <p>It works where your code already lives.</p>
+      <p>The agent starts in the project you already have.</p>
     </article>
     <article>
       <h3>Your memory</h3>
-      <p>Sessions, drafts, and history stay on your machine.</p>
+      <p>Sessions, drafts, and decisions stay on your machine.</p>
     </article>
     <article>
       <h3>Your credentials</h3>
       <p>Keys are handed to a run deliberately.</p>
     </article>
     <article>
-      <h3>Your runs</h3>
-      <p>Interactive work, background jobs, and scheduled tasks go through LionClaw.</p>
+      <h3>Your work</h3>
+      <p>Interactive prompts, background jobs, and scheduled work go through LionClaw.</p>
     </article>
     <article>
       <h3>Your record</h3>
-      <p>Important actions leave something you can inspect later.</p>
+      <p>Important actions leave a trail you can inspect.</p>
     </article>
   </div>
 
