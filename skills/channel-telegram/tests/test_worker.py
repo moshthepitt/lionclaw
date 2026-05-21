@@ -4074,6 +4074,68 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(webhook.status, "error")
         self.assertIn("RuntimeError: handler exploded", webhook.details["error"])
 
+    async def test_cancelled_webhook_processing_failure_restores_cancellation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=api,
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            update = Update.model_validate(
+                {
+                    "update_id": 890,
+                    "message": {
+                        "message_id": 190,
+                        "date": 0,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "will fail then retry",
+                    },
+                }
+            )
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def failing_work_item(item: ProviderWorkItem) -> bool:
+                started.set()
+                await release.wait()
+                raise RuntimeError("handler exploded")
+
+            with patch.object(worker, "_process_webhook_work_item", failing_work_item):
+                task = asyncio.create_task(worker.process_webhook_update(update))
+                await asyncio.wait_for(started.wait(), timeout=1.0)
+                task.cancel()
+                await asyncio.sleep(0)
+                release.set()
+                with (
+                    self.assertLogs(
+                        "lionclaw_channel_telegram.worker",
+                        level="ERROR",
+                    ),
+                    self.assertRaises(asyncio.CancelledError),
+                ):
+                    await task
+
+            retry_result = await worker.process_webhook_update(update)
+
+        self.assertTrue(retry_result)
+        self.assertEqual(
+            [submitted.text for submitted in api.sent_inbound],
+            ["will fail then retry"],
+        )
+
     async def test_offset_save_failure_keeps_unpersisted_update_retryable(
         self,
     ) -> None:
@@ -4193,6 +4255,62 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 [update.text for update in api.sent_inbound],
                 ["first\n\nsecond"],
             )
+
+    async def test_cancelled_polling_processing_failure_restores_cancellation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            update = Update.model_validate(
+                {
+                    "update_id": 952,
+                    "message": {
+                        "message_id": 52,
+                        "date": 0,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "will fail then retry",
+                    },
+                }
+            )
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(updates=[update])
+            offset_store = OffsetStore(Path(temp_dir) / "telegram.offset")
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=offset_store,
+            )
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def failing_work_items(
+                work_items: list[ProviderWorkItem],
+                *,
+                persist_offsets: bool,
+            ) -> bool:
+                self.assertEqual(len(work_items), 1)
+                self.assertTrue(persist_offsets)
+                started.set()
+                await release.wait()
+                raise RuntimeError("handler exploded")
+
+            with patch.object(
+                worker, "_process_provider_work_items", failing_work_items
+            ):
+                task = asyncio.create_task(worker.process_updates())
+                await asyncio.wait_for(started.wait(), timeout=1.0)
+                task.cancel()
+                await asyncio.sleep(0)
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+            self.assertEqual(offset_store.load(), 0)
 
     async def test_cancelled_polling_update_processing_persists_offset_before_retry(
         self,
@@ -8760,6 +8878,88 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertEqual(receipt_store.load(), {})
+
+    async def test_cancelled_partial_outbox_send_restores_cancellation(self) -> None:
+        partial_receipt = {
+            "message_id": 101,
+            "chat_id": "telegram:chat:77",
+            "messages": [{"message_id": 101, "chat_id": "telegram:chat:77"}],
+        }
+
+        class ShieldedPartialFailureTelegram(FakeTelegramTransport):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def send_message(
+                self,
+                conversation_ref: str,
+                text: str,
+                reply_to_ref: str | None = None,
+                thread_ref: str | None = None,
+                format_hint: str = "plain",
+                attachments: Sequence[TelegramOutboundAttachment] = (),
+                resume_receipt: dict[str, object] | None = None,
+                buttons: Sequence[TelegramActionButton] = (),
+            ) -> dict[str, object]:
+                async def provider_send() -> dict[str, object]:
+                    self.started.set()
+                    await self.release.wait()
+                    raise TelegramPartialSendError(
+                        receipt=partial_receipt,
+                        cause=RuntimeError("connection reset"),
+                    )
+
+                return await asyncio.shield(asyncio.create_task(provider_send()))
+
+        delivery = OutboxDelivery(
+            delivery_id="delivery-1",
+            attempt_id="attempt-1",
+            conversation_ref="telegram:chat:77",
+            content=OutboxContent(text="final answer"),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            receipt_store = OutboxReceiptStore(
+                Path(temp_dir) / "telegram.outbox-receipts.json"
+            )
+            api = FakeLionClawApi()
+            telegram = ShieldedPartialFailureTelegram()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                outbox_receipt_store=receipt_store,
+            )
+
+            task = asyncio.create_task(worker._process_outbox_delivery(delivery))
+            await asyncio.wait_for(telegram.started.wait(), timeout=1.0)
+            task.cancel()
+            await asyncio.sleep(0)
+            telegram.release.set()
+            with (
+                self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"),
+                self.assertRaises(asyncio.CancelledError),
+            ):
+                await task
+
+            stored_receipts = receipt_store.load()
+
+        self.assertEqual(api.outbox_reports[0][2], "retryable_failed")
+        self.assertEqual(
+            stored_receipts,
+            {
+                "delivery-1": OutboxReceiptRecord(
+                    status="partial",
+                    provider_receipt={
+                        "message_id": 101,
+                        "chat_id": "77",
+                        "messages": [{"message_id": 101, "chat_id": "77"}],
+                    },
+                )
+            },
+        )
 
     async def test_delivered_outbox_receipt_save_failure_is_retried_without_resend(
         self,
