@@ -3742,6 +3742,51 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         webhook = {check.code: check for check in checks}["telegram.webhook"]
         self.assertEqual(webhook.status, "error")
 
+    async def test_process_webhook_update_records_unexpected_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=FakeLionClawApi(),
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            update = Update.model_validate(
+                {
+                    "update_id": 89,
+                    "message": {
+                        "message_id": 19,
+                        "date": 0,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "will fail unexpectedly",
+                    },
+                }
+            )
+
+            with (
+                patch.object(
+                    worker,
+                    "_process_webhook_work_item",
+                    AsyncMock(side_effect=RuntimeError("handler exploded")),
+                ),
+                self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"),
+            ):
+                processed = await worker.process_webhook_update(update)
+            checks = await worker._health_checks()
+
+        self.assertFalse(processed)
+        webhook = {check.code: check for check in checks}["telegram.webhook"]
+        self.assertEqual(webhook.status, "error")
+        self.assertIn("RuntimeError: handler exploded", webhook.details["error"])
+
     async def test_offset_save_failure_keeps_unpersisted_update_retryable(
         self,
     ) -> None:

@@ -822,13 +822,17 @@ class TelegramWorker:
                 failure = err
                 logger.exception("telegram getMe request failed for webhook update")
             else:
-                item = ProviderWorkItem(
-                    (update.update_id,),
-                    self._extract_provider_event(update, bot_identity),
-                )
-                processed = await self._process_webhook_work_item(item)
-                if not processed:
-                    failure = RuntimeError("webhook update processing failed")
+                try:
+                    item = ProviderWorkItem(
+                        (update.update_id,),
+                        self._extract_provider_event(update, bot_identity),
+                    )
+                    processed = await self._process_webhook_work_item(item)
+                    if not processed:
+                        failure = RuntimeError("webhook update processing failed")
+                except Exception as err:
+                    failure = err
+                    logger.exception("telegram webhook update processing failed")
         finally:
             accepted = await self._finish_webhook_update(update.update_id, processed)
 
