@@ -461,17 +461,40 @@ def _read_private_store_text(path: Path, store_name: str) -> str | None:
 
 
 def _open_private_store_parent(path: Path, *, create: bool) -> int | None:
-    if create:
-        path.parent.mkdir(parents=True, exist_ok=True)
+    parent = path.parent
+    if parent.is_absolute():
+        current_fd = os.open(parent.anchor or "/", _open_directory_flags())
+        parts = parent.parts[1:]
     else:
-        try:
-            path.parent.lstat()
-        except FileNotFoundError:
-            return None
-    return os.open(
-        path.parent,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _open_no_follow_flag(),
-    )
+        current_fd = os.open(".", _open_directory_flags())
+        parts = parent.parts
+
+    try:
+        for part in parts:
+            if part in ("", "."):
+                continue
+            if part == "..":
+                raise OSError(f"private store parent traversal rejected: {parent}")
+            try:
+                next_fd = os.open(part, _open_directory_flags(), dir_fd=current_fd)
+            except FileNotFoundError:
+                if not create:
+                    return None
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(part, mode=0o700, dir_fd=current_fd)
+                next_fd = os.open(part, _open_directory_flags(), dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        result_fd = current_fd
+        current_fd = -1
+        return result_fd
+    finally:
+        if current_fd >= 0:
+            os.close(current_fd)
+
+
+def _open_directory_flags() -> int:
+    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _open_no_follow_flag()
 
 
 def _open_no_follow_flag() -> int:
