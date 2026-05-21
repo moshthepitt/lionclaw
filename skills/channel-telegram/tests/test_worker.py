@@ -2997,7 +2997,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 first_task.cancel()
                 await asyncio.sleep(0)
                 retry_task = asyncio.create_task(worker.process_webhook_update(update))
-                with contextlib.suppress(asyncio.CancelledError):
+                with self.assertRaises(asyncio.CancelledError):
                     await first_task
                 retry_result = await retry_task
 
@@ -3045,7 +3045,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 first_task.cancel()
                 await asyncio.sleep(0)
                 first_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
+                with self.assertRaises(asyncio.CancelledError):
                     await first_task
                 retry_result = await worker.process_webhook_update(update)
 
@@ -3102,7 +3102,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             first_task.cancel()
             await asyncio.sleep(0)
             api.release.set()
-            with contextlib.suppress(asyncio.CancelledError):
+            with self.assertRaises(asyncio.CancelledError):
                 await first_task
             retry_result = await worker.process_webhook_update(update)
 
@@ -4180,7 +4180,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             first_task.cancel()
             await asyncio.sleep(0)
             api.release.set()
-            with contextlib.suppress(asyncio.CancelledError):
+            with self.assertRaises(asyncio.CancelledError):
                 await first_task
 
             second_worker = TelegramWorker(

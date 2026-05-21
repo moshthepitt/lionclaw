@@ -128,6 +128,12 @@ REACTION_FAILED = "😢"
 
 
 @dataclass(slots=True, frozen=True)
+class OwnedUpdateWaitResult:
+    processed: bool
+    was_cancelled: bool
+
+
+@dataclass(slots=True, frozen=True)
 class TypingTarget:
     conversation_ref: str
     thread_ref: str | None = None
@@ -808,13 +814,15 @@ class TelegramWorker:
             self._process_provider_work_items(work_items, persist_offsets=True),
             name="telegram-polling-updates",
         )
-        await self._wait_for_owned_update_result(
+        result = await self._wait_for_owned_update_result(
             processing,
             cancellation_message=(
                 "telegram polling update processing wait cancelled; "
                 "preserving offset ownership"
             ),
         )
+        if result.was_cancelled:
+            raise asyncio.CancelledError
 
     async def process_webhook_update(self, update: Update) -> bool:
         owns_update, update_result = await self._begin_webhook_update(update.update_id)
@@ -825,6 +833,7 @@ class TelegramWorker:
 
         processed = False
         failure: Exception | None = None
+        restore_cancellation = False
         try:
             try:
                 bot_identity = await self.telegram.bot_identity()
@@ -841,13 +850,15 @@ class TelegramWorker:
                         self._process_webhook_work_item(item),
                         name="telegram-webhook-update",
                     )
-                    processed = await self._wait_for_owned_update_result(
+                    result = await self._wait_for_owned_update_result(
                         processing,
                         cancellation_message=(
                             "telegram webhook processing wait cancelled; "
                             "preserving update ownership"
                         ),
                     )
+                    restore_cancellation = result.was_cancelled
+                    processed = result.processed
                     if not processed:
                         failure = RuntimeError("webhook update processing failed")
                 except Exception as err:
@@ -862,6 +873,8 @@ class TelegramWorker:
             if failure is None and processed:
                 failure = RuntimeError("webhook dedupe persistence failed")
             self._record_webhook_result(False, failure=failure)
+        if restore_cancellation:
+            raise asyncio.CancelledError
         return accepted
 
     def _record_webhook_result(
@@ -960,29 +973,38 @@ class TelegramWorker:
             )
 
         future = await self._enqueue_webhook_batch(key, item)
-        return await self._wait_for_owned_update_result(
+        result = await self._wait_for_owned_update_result(
             future,
             cancellation_message=(
                 "telegram webhook batch wait cancelled; preserving update ownership"
             ),
         )
+        if result.was_cancelled:
+            raise asyncio.CancelledError
+        return result.processed
 
     async def _wait_for_owned_update_result(
         self,
         result: asyncio.Future[bool],
         *,
         cancellation_message: str,
-    ) -> bool:
+    ) -> OwnedUpdateWaitResult:
         logged_cancellation = False
+        was_cancelled = False
         while True:
             try:
-                return await asyncio.shield(result)
+                return OwnedUpdateWaitResult(
+                    processed=await asyncio.shield(result),
+                    was_cancelled=was_cancelled,
+                )
             except asyncio.CancelledError:
                 if result.cancelled():
                     raise
+                was_cancelled = True
                 task = asyncio.current_task()
-                if task is not None:
-                    task.uncancel()
+                uncancel = getattr(task, "uncancel", None) if task is not None else None
+                if uncancel is not None:
+                    uncancel()
                 if not logged_cancellation:
                     logger.debug(cancellation_message)
                     logged_cancellation = True
