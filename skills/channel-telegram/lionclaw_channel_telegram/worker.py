@@ -78,6 +78,7 @@ COMPACT_STATUS_TEXT_LIMIT = 96
 MAX_OUTBOX_RECEIPTS = 256
 OUTBOX_RECEIPT_STATUSES = {"delivered", "partial"}
 MAX_PENDING_PROGRESS_DELETES = 256
+TEXT_BURST_MAX_SECONDS = 10
 
 LOCAL_TELEGRAM_COMMANDS = {
     "help",
@@ -2431,7 +2432,11 @@ def _can_merge_inbound_updates(
             and first_media_group
             and first_media_group == second_media_group
         )
-    return not first.attachments and not second.attachments
+    return (
+        not first.attachments
+        and not second.attachments
+        and _within_text_burst_window(first, second)
+    )
 
 
 def _merge_work_items(
@@ -2464,6 +2469,11 @@ def _merge_inbound_updates(
     provider_metadata["batched_update_ids"] = update_ids
     provider_metadata["batched_message_refs"] = message_refs
     provider_metadata["batch_size"] = len(update_ids)
+    latest_message_date_epoch = _message_date_epoch(second)
+    if latest_message_date_epoch is not None:
+        provider_metadata["batched_latest_message_date_epoch"] = (
+            latest_message_date_epoch
+        )
     if "media_group_id" in second.provider_metadata:
         provider_metadata["media_group_id"] = second.provider_metadata["media_group_id"]
     return replace(
@@ -2493,6 +2503,37 @@ def _metadata_list(update: TelegramInboundUpdate, key: str) -> list[object]:
     if isinstance(value, list):
         return list(value)
     return []
+
+
+def _within_text_burst_window(
+    first: TelegramInboundUpdate,
+    second: TelegramInboundUpdate,
+) -> bool:
+    first_epoch = _latest_message_date_epoch(first)
+    second_epoch = _message_date_epoch(second)
+    if first_epoch is None or second_epoch is None:
+        return False
+    return 0 <= second_epoch - first_epoch <= TEXT_BURST_MAX_SECONDS
+
+
+def _latest_message_date_epoch(update: TelegramInboundUpdate) -> int | None:
+    batched_epoch = _metadata_int(update, "batched_latest_message_date_epoch")
+    if batched_epoch is not None:
+        return batched_epoch
+    return _message_date_epoch(update)
+
+
+def _message_date_epoch(update: TelegramInboundUpdate) -> int | None:
+    return _metadata_int(update, "message_date_epoch")
+
+
+def _metadata_int(update: TelegramInboundUpdate, key: str) -> int | None:
+    value = update.provider_metadata.get(key)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
 
 
 def _telegram_command(update: TelegramInboundUpdate) -> TelegramCommand | None:

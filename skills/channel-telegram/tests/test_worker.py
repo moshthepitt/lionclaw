@@ -101,6 +101,7 @@ class ExtractInboundEventTests(unittest.TestCase):
         self.assertEqual(mapped.trigger, "dm")
         self.assertEqual(mapped.attachments, [])
         self.assertEqual(mapped.provider_metadata["chat_type"], "private")
+        self.assertEqual(mapped.provider_metadata["message_date_epoch"], 0)
 
     def test_group_mention_uses_entity_and_topic_refs(self) -> None:
         update = Update.model_validate(
@@ -1753,6 +1754,62 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(api.sent_inbound[0].provider_metadata["update_id"], 82)
         self.assertEqual(worker.offset, 83)
+
+    async def test_process_updates_keeps_stale_backlog_text_messages_separate(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 821,
+                            "message": {
+                                "message_id": 121,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "old backlog",
+                            },
+                        }
+                    ),
+                    Update.model_validate(
+                        {
+                            "update_id": 822,
+                            "message": {
+                                "message_id": 122,
+                                "date": 60,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "newer backlog",
+                            },
+                        }
+                    ),
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(
+            [update.text for update in api.sent_inbound],
+            ["old backlog", "newer backlog"],
+        )
+        self.assertEqual(worker.offset, 823)
 
     async def test_process_updates_does_not_batch_commands_with_text(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

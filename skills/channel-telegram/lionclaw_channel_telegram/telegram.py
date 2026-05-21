@@ -1207,6 +1207,7 @@ def _provider_metadata(
         "chat_id": message.chat.id,
         "chat_type": _chat_type(message),
         "message_id": message.message_id,
+        "message_date_epoch": _message_date_epoch(message),
         "bot_mentioned": _has_bot_mention(message, bot_identity),
     }
     if bot_identity is not None and bot_identity.username is not None:
@@ -1233,6 +1234,15 @@ def _provider_metadata(
     if shared_location is not None:
         metadata["shared_location"] = shared_location
     return metadata
+
+
+def _message_date_epoch(message: Message) -> int:
+    timestamp = getattr(message.date, "timestamp", None)
+    if callable(timestamp):
+        return int(timestamp())
+    if isinstance(message.date, int | float):
+        return int(message.date)
+    return 0
 
 
 def _attachments(message: Message, update_id: int) -> list[TelegramInboundAttachment]:
