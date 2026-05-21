@@ -773,6 +773,7 @@ class TelegramWorker:
         self._webhook_recent_update_ids: dict[int, None] = (
             webhook_update_store.load() if webhook_update_store is not None else {}
         )
+        self._webhook_recent_update_ids_dirty = False
         self._webhook_accepting_updates = True
         self._webhook_state_lock = asyncio.Lock()
 
@@ -805,30 +806,49 @@ class TelegramWorker:
     async def process_webhook_update(self, update: Update) -> bool:
         owns_update, update_result = await self._begin_webhook_update(update.update_id)
         if not owns_update:
-            return await asyncio.shield(update_result)
+            accepted = await asyncio.shield(update_result)
+            self._record_webhook_result(accepted)
+            return accepted
 
         processed = False
+        failure: Exception | None = None
         try:
             try:
                 bot_identity = await self.telegram.bot_identity()
             except Exception as err:
-                self._record_webhook_failure(err)
+                failure = err
                 logger.exception("telegram getMe request failed for webhook update")
-                return False
-            item = ProviderWorkItem(
-                (update.update_id,),
-                self._extract_provider_event(update, bot_identity),
-            )
-            processed = await self._process_webhook_work_item(item)
-            if processed:
-                self._record_webhook_success()
             else:
-                self._record_webhook_failure(
-                    RuntimeError("webhook update processing failed")
+                item = ProviderWorkItem(
+                    (update.update_id,),
+                    self._extract_provider_event(update, bot_identity),
                 )
-            return processed
+                processed = await self._process_webhook_work_item(item)
+                if not processed:
+                    failure = RuntimeError("webhook update processing failed")
         finally:
-            await self._finish_webhook_update(update.update_id, processed)
+            accepted = await self._finish_webhook_update(update.update_id, processed)
+
+        if accepted:
+            self._record_webhook_result(True)
+        else:
+            if failure is None and processed:
+                failure = RuntimeError("webhook dedupe persistence failed")
+            self._record_webhook_result(False, failure=failure)
+        return accepted
+
+    def _record_webhook_result(
+        self,
+        accepted: bool,
+        *,
+        failure: Exception | None = None,
+    ) -> None:
+        if accepted:
+            self._record_webhook_success()
+            return
+        self._record_webhook_failure(
+            failure or RuntimeError("webhook update processing failed")
+        )
 
     async def _begin_webhook_update(
         self,
@@ -838,7 +858,7 @@ class TelegramWorker:
             if not self._webhook_accepting_updates:
                 return False, _resolved_bool_future(False)
             if update_id in self._webhook_recent_update_ids:
-                return False, _resolved_bool_future(True)
+                return False, _resolved_bool_future(self._save_webhook_updates_locked())
             result = self._webhook_update_results.get(update_id)
             if result is not None:
                 return False, result
@@ -850,34 +870,40 @@ class TelegramWorker:
         self,
         update_id: int,
         processed: bool,
-    ) -> None:
-        save_recent_updates = False
+    ) -> bool:
+        accepted = processed
         async with self._webhook_state_lock:
             result = self._webhook_update_results.pop(update_id, None)
             if processed:
-                save_recent_updates = self._remember_webhook_update_locked(update_id)
+                self._remember_webhook_update_locked(update_id)
+                accepted = self._save_webhook_updates_locked()
         if result is not None and not result.done():
-            result.set_result(processed)
-        if save_recent_updates:
-            self._save_webhook_updates()
+            result.set_result(accepted)
+        return accepted
 
-    def _remember_webhook_update_locked(self, update_id: int) -> bool:
+    def _remember_webhook_update_locked(self, update_id: int) -> None:
         if update_id in self._webhook_recent_update_ids:
-            return False
+            return
         self._webhook_recent_update_ids[update_id] = None
         while len(self._webhook_recent_update_ids) > MAX_WEBHOOK_RECENT_UPDATE_IDS:
             self._webhook_recent_update_ids.pop(
                 next(iter(self._webhook_recent_update_ids))
             )
-        return True
+        self._webhook_recent_update_ids_dirty = True
 
-    def _save_webhook_updates(self) -> None:
+    def _save_webhook_updates_locked(self) -> bool:
+        if not self._webhook_recent_update_ids_dirty:
+            return True
         if self.webhook_update_store is None:
-            return
+            self._webhook_recent_update_ids_dirty = False
+            return True
         try:
             self.webhook_update_store.save(self._webhook_recent_update_ids)
         except Exception:
             logger.exception("telegram webhook update store save failed")
+            return False
+        self._webhook_recent_update_ids_dirty = False
+        return True
 
     async def _process_webhook_work_item(self, item: ProviderWorkItem) -> bool:
         key = _webhook_batch_key(item.event)

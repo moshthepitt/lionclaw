@@ -2637,6 +2637,88 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(second_api.sent_inbound, [])
 
+    async def test_webhook_dedupe_save_failure_is_retryable_without_replay(
+        self,
+    ) -> None:
+        class FailingOnceWebhookUpdateStore(WebhookUpdateStore):
+            def __init__(self, path: Path) -> None:
+                super().__init__(path)
+                self.failures_remaining = 1
+
+            def save(self, update_ids: dict[int, None]) -> None:
+                if self.failures_remaining > 0:
+                    self.failures_remaining -= 1
+                    raise RuntimeError("state store unavailable")
+                super().save(update_ids)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = FailingOnceWebhookUpdateStore(
+                Path(temp_dir) / "telegram.webhook-updates.json"
+            )
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                webhook_update_store=store,
+            )
+            await worker._remember_active_turn(
+                TelegramInboundUpdate(
+                    update_id=873,
+                    event_id="telegram:update:873",
+                    sender_ref="telegram:user:77",
+                    conversation_ref="telegram:chat:77",
+                    message_ref="telegram:message:73",
+                    text="long task",
+                    trigger="dm",
+                    provider_metadata={"chat_type": "private"},
+                ),
+                InboundResponse(outcome="queued", turn_id="turn-1"),
+            )
+            update = Update.model_validate(
+                {
+                    "update_id": 874,
+                    "message": {
+                        "message_id": 74,
+                        "date": 0,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "/status",
+                    },
+                }
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                first = await worker.process_webhook_update(update)
+            first_checks = await worker._health_checks()
+            second = await worker.process_webhook_update(update)
+            second_checks = await worker._health_checks()
+            stored_update_ids = store.load()
+
+        self.assertFalse(first)
+        webhook = {check.code: check for check in first_checks}["telegram.webhook"]
+        self.assertEqual(webhook.status, "error")
+        self.assertIn("webhook dedupe persistence failed", webhook.details["error"])
+        self.assertTrue(second)
+        webhook = {check.code: check for check in second_checks}["telegram.webhook"]
+        self.assertEqual(webhook.status, "ok")
+        self.assertEqual(api.sent_inbound, [])
+        self.assertEqual(
+            [message[1] for message in telegram.sent_messages],
+            ["Active turn: queued."],
+        )
+        self.assertEqual(stored_update_ids, {874: None})
+
     async def test_webhook_update_is_rejected_after_worker_shutdown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
