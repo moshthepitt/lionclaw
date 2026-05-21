@@ -1,10 +1,9 @@
 base_url = "https://lionclaw.co.ke"
 title = "LionClaw"
-description = "LionClaw gives real agent CLIs a local home in your project: sessions, state, channels, jobs, and audit."
+description = "LionClaw is a local home for serious AI agents: sessions, state, skills, jobs, credentials, and audit around real agent CLIs."
 
 compile_sass = false
 build_search_index = false
 
 [markdown]
 smart_punctuation = true
-
