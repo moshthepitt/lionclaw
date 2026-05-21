@@ -928,22 +928,7 @@ async fn channel_turn_with_runtime_artifact_enqueues_outbox_attachment_without_t
     tokio::fs::write(&artifact_source, b"png bytes")
         .await
         .expect("write artifact source");
-    let kernel = env
-        .kernel_with_options(KernelOptions {
-            default_runtime_id: Some("artifact-only".to_string()),
-            runtime_root: Some(env.home().runtime_dir()),
-            workspace_name: Some("main".to_string()),
-            ..KernelOptions::default()
-        })
-        .await;
-    kernel
-        .register_runtime_adapter(
-            "artifact-only",
-            std::sync::Arc::new(ArtifactOnlyAdapter {
-                path: artifact_source.clone(),
-            }),
-        )
-        .await;
+    let kernel = artifact_only_kernel(&env, artifact_source.clone()).await;
 
     create_pending_pairing(
         &kernel,
@@ -1014,22 +999,7 @@ async fn channel_turn_with_runtime_artifact_outside_runtime_root_fails_turn() {
     tokio::fs::write(&artifact_source, b"png bytes")
         .await
         .expect("write artifact source");
-    let kernel = env
-        .kernel_with_options(KernelOptions {
-            default_runtime_id: Some("artifact-only".to_string()),
-            runtime_root: Some(env.home().runtime_dir()),
-            workspace_name: Some("main".to_string()),
-            ..KernelOptions::default()
-        })
-        .await;
-    kernel
-        .register_runtime_adapter(
-            "artifact-only",
-            std::sync::Arc::new(ArtifactOnlyAdapter {
-                path: artifact_source.clone(),
-            }),
-        )
-        .await;
+    let kernel = artifact_only_kernel(&env, artifact_source.clone()).await;
 
     create_pending_pairing(
         &kernel,
@@ -1095,6 +1065,104 @@ async fn channel_turn_with_runtime_artifact_outside_runtime_root_fails_turn() {
 }
 
 #[tokio::test]
+async fn channel_turn_with_runtime_artifact_rejects_symlink_escape_source() {
+    use std::os::unix::fs::symlink;
+
+    let env = TestHome::new().await;
+    install_and_bind_channel(
+        &env,
+        "telegram",
+        "channel-outbox-artifact-source-symlink-skill",
+    )
+    .await;
+
+    let outside = env.temp_dir().join("outside-artifact-source");
+    tokio::fs::create_dir_all(&outside)
+        .await
+        .expect("create outside artifact source");
+    tokio::fs::write(outside.join("generated-image.png"), b"secret png bytes")
+        .await
+        .expect("write outside artifact source");
+
+    let artifact_source_dir = env.home().runtime_dir().join("generated-test-artifacts");
+    tokio::fs::create_dir_all(&artifact_source_dir)
+        .await
+        .expect("create artifact source dir");
+    let artifact_source_link = artifact_source_dir.join("escape-link");
+    symlink(&outside, &artifact_source_link).expect("symlink artifact source escape");
+    let artifact_source = artifact_source_link.join("generated-image.png");
+
+    let kernel = artifact_only_kernel(&env, artifact_source.clone()).await;
+
+    create_pending_pairing(
+        &kernel,
+        "telegram",
+        "telegram:user:artifact-source-symlink",
+        "artifact-source-symlink-pairing",
+    )
+    .await;
+    approve_pairing(&kernel, "telegram", "telegram:user:artifact-source-symlink").await;
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "telegram",
+            "artifact-source-symlink-request",
+            "telegram:user:artifact-source-symlink",
+            "telegram:user:artifact-source-symlink",
+            None,
+            "generate an image through a symlinked source",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue artifact turn");
+    let queued_turn_id = queued.turn_id.expect("queued turn id");
+    wait_for_stream_events(
+        &kernel,
+        "telegram",
+        "artifact-source-symlink-stream",
+        |events| {
+            events.iter().any(|event| {
+                event.turn_id == Some(queued_turn_id)
+                    && event.kind == StreamEventKindDto::Error
+                    && event
+                        .text
+                        .as_deref()
+                        .is_some_and(|text| text.contains("outside the runtime root"))
+            }) && events.iter().any(|event| {
+                event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::Done
+            })
+        },
+    )
+    .await;
+
+    let turn = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: queued.session_id.expect("queued session id"),
+            limit: None,
+        })
+        .await
+        .expect("history")
+        .turns
+        .into_iter()
+        .find(|turn| turn.turn_id == queued_turn_id)
+        .expect("artifact source symlink turn");
+    assert_eq!(turn.status, SessionTurnStatus::Failed);
+    assert_eq!(turn.error_code.as_deref(), Some("runtime.error"));
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "telegram".to_string(),
+            worker_id: "artifact-source-symlink-worker".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(1),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull artifact source symlink outbox");
+    assert!(outbox.deliveries.is_empty());
+}
+
+#[tokio::test]
 async fn channel_turn_with_runtime_artifact_rejects_symlinked_outbox_root() {
     use std::os::unix::fs::symlink;
 
@@ -1116,22 +1184,7 @@ async fn channel_turn_with_runtime_artifact_rejects_symlinked_outbox_root() {
     symlink(&outside, env.home().runtime_dir().join("channel-outbox"))
         .expect("symlink channel outbox root");
 
-    let kernel = env
-        .kernel_with_options(KernelOptions {
-            default_runtime_id: Some("artifact-only".to_string()),
-            runtime_root: Some(env.home().runtime_dir()),
-            workspace_name: Some("main".to_string()),
-            ..KernelOptions::default()
-        })
-        .await;
-    kernel
-        .register_runtime_adapter(
-            "artifact-only",
-            std::sync::Arc::new(ArtifactOnlyAdapter {
-                path: artifact_source.clone(),
-            }),
-        )
-        .await;
+    let kernel = artifact_only_kernel(&env, artifact_source.clone()).await;
 
     create_pending_pairing(
         &kernel,
@@ -5998,6 +6051,26 @@ async fn install_and_bind_channel(env: &TestHome, channel_id: &str, skill_name: 
     env.install_skill(skill_name, &skill_source).await;
     env.add_channel(channel_id, skill_name, ChannelLaunchMode::Background)
         .await;
+}
+
+async fn artifact_only_kernel(env: &TestHome, artifact_path: std::path::PathBuf) -> Kernel {
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("artifact-only".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            workspace_name: Some("main".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+    kernel
+        .register_runtime_adapter(
+            "artifact-only",
+            std::sync::Arc::new(ArtifactOnlyAdapter {
+                path: artifact_path,
+            }),
+        )
+        .await;
+    kernel
 }
 
 fn test_daemon_info(env: &TestHome, bind_addr: String) -> DaemonInfoResponse {
