@@ -7,6 +7,7 @@ import hmac
 import json
 import logging
 import os
+import stat
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
@@ -158,11 +159,12 @@ class ActiveTurnStore:
     path: Path
 
     def load(self) -> list[ActiveTurn]:
-        if not self.path.exists():
+        text = _read_private_store_text(self.path, "active turn")
+        if text is None:
             return []
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            raw = json.loads(text)
+        except json.JSONDecodeError:
             logger.exception("telegram active turn store load failed")
             return []
         if not isinstance(raw, dict):
@@ -297,11 +299,12 @@ class OutboxReceiptStore:
     path: Path
 
     def load(self) -> dict[str, OutboxReceiptRecord]:
-        if not self.path.exists():
+        text = _read_private_store_text(self.path, "outbox receipt")
+        if text is None:
             return {}
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            raw = json.loads(text)
+        except json.JSONDecodeError:
             logger.exception("telegram outbox receipt store load failed")
             return {}
         if not isinstance(raw, dict):
@@ -336,11 +339,12 @@ class ProgressDeleteStore:
     path: Path
 
     def load(self) -> dict[tuple[str, str], PendingProgressDelete]:
-        if not self.path.exists():
+        text = _read_private_store_text(self.path, "progress delete")
+        if text is None:
             return {}
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            raw = json.loads(text)
+        except json.JSONDecodeError:
             logger.exception("telegram progress delete store load failed")
             return {}
         if not isinstance(raw, dict):
@@ -383,10 +387,47 @@ def _write_private_store_text(path: Path, text: str) -> None:
         PRIVATE_STORE_FILE_MODE,
     )
     try:
+        os.fchmod(fd, PRIVATE_STORE_FILE_MODE)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             fd = -1
             handle.write(text)
         tmp_path.replace(path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _read_private_store_text(path: Path, store_name: str) -> str | None:
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        logger.warning(
+            "telegram %s store load rejected path=%s: %s",
+            store_name,
+            path,
+            err,
+        )
+        return None
+
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            logger.warning(
+                "telegram %s store load rejected non-file path=%s",
+                store_name,
+                path,
+            )
+            return None
+        if stat.S_IMODE(file_stat.st_mode) != PRIVATE_STORE_FILE_MODE:
+            os.fchmod(fd, PRIVATE_STORE_FILE_MODE)
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            return handle.read()
+    except OSError:
+        logger.exception("telegram %s store load failed", store_name)
+        return None
     finally:
         if fd >= 0:
             os.close(fd)

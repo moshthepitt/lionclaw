@@ -1282,22 +1282,25 @@ def _file_mode(path: Path) -> int:
 
 
 class ActiveTurnStoreTests(unittest.TestCase):
+    def _active_turn(self) -> ActiveTurn:
+        return ActiveTurn(
+            turn_id="turn-1",
+            session_id="session-1",
+            session_key="channel:telegram:direct:77",
+            sender_ref="telegram:user:77",
+            target=TypingTarget("telegram:chat:77"),
+            reply_to_ref="telegram:message:101",
+            generation=1,
+            visible_after=0.0,
+        )
+
     def test_save_replaces_active_turn_file_with_private_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "telegram.active-turns.json"
             path.write_text("{}", encoding="utf-8")
             path.chmod(0o644)
             store = ActiveTurnStore(path)
-            turn = ActiveTurn(
-                turn_id="turn-1",
-                session_id="session-1",
-                session_key="channel:telegram:direct:77",
-                sender_ref="telegram:user:77",
-                target=TypingTarget("telegram:chat:77"),
-                reply_to_ref="telegram:message:101",
-                generation=1,
-                visible_after=0.0,
-            )
+            turn = self._active_turn()
 
             store.save({"turn-1": turn})
 
@@ -1306,6 +1309,31 @@ class ActiveTurnStoreTests(unittest.TestCase):
             self.assertEqual(loaded[0].session_key, "channel:telegram:direct:77")
             self.assertEqual(_file_mode(path), 0o600)
             self.assertFalse((path.parent / ".telegram.active-turns.json.tmp").exists())
+
+    def test_load_hardens_existing_active_turn_file_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "telegram.active-turns.json"
+            store = ActiveTurnStore(path)
+            store.save({"turn-1": self._active_turn()})
+            path.chmod(0o644)
+
+            loaded = store.load()
+
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0].session_key, "channel:telegram:direct:77")
+            self.assertEqual(_file_mode(path), 0o600)
+
+    def test_load_rejects_symlinked_active_turn_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "external-active-turns.json"
+            target.write_text('{"active_turns": []}', encoding="utf-8")
+            path = Path(temp_dir) / "telegram.active-turns.json"
+            path.symlink_to(target)
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="WARNING"):
+                loaded = ActiveTurnStore(path).load()
+
+            self.assertEqual(loaded, [])
 
 
 class OffsetStoreTests(unittest.TestCase):
