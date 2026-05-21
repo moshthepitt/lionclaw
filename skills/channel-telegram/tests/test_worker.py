@@ -3115,6 +3115,88 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api.sent_inbound), 1)
         self.assertEqual(api.sent_inbound[0].text, "/lionclaw retry")
 
+    async def test_route_callback_from_different_sender_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 925,
+                            "message": {
+                                "message_id": 25,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "@lionclaw_bot /help",
+                                "entities": [
+                                    {
+                                        "type": "mention",
+                                        "offset": 0,
+                                        "length": len("@lionclaw_bot"),
+                                    },
+                                    {
+                                        "type": "bot_command",
+                                        "offset": len("@lionclaw_bot "),
+                                        "length": len("/help"),
+                                    },
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+            retry_payload = telegram.sent_buttons[0][1].action
+            telegram.updates = [
+                Update.model_validate(
+                    {
+                        "update_id": 926,
+                        "callback_query": {
+                            "id": "callback-retry-bob",
+                            "from": {
+                                "id": 88,
+                                "is_bot": False,
+                                "first_name": "Bob",
+                            },
+                            "chat_instance": "chat-instance",
+                            "data": retry_payload,
+                            "message": {
+                                "message_id": 102,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 99,
+                                    "is_bot": True,
+                                    "first_name": "LionClaw",
+                                    "username": "lionclaw_bot",
+                                },
+                                "text": "LionClaw controls",
+                            },
+                        },
+                    }
+                )
+            ]
+
+            await worker.process_updates()
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertEqual(
+            telegram.answered_callbacks[-1],
+            ("callback-retry-bob", "That control is no longer valid."),
+        )
+
     async def test_retry_alias_accepts_newline_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
@@ -3988,6 +4070,83 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_stop_callback_from_different_sender_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            await worker._remember_active_turn(
+                TelegramInboundUpdate(
+                    update_id=947,
+                    event_id="telegram:update:947",
+                    sender_ref="telegram:user:77",
+                    conversation_ref="telegram:chat:-10077",
+                    thread_ref="telegram:topic:7",
+                    message_ref="telegram:message:47",
+                    text="long task",
+                    trigger="thread_continuation",
+                    provider_metadata={"chat_type": "supergroup"},
+                ),
+                InboundResponse(
+                    outcome="queued",
+                    turn_id="turn-1",
+                    session_id="session-1",
+                    session_key="channel:telegram:thread:-10077:7",
+                ),
+            )
+            worker._active_turns["turn-1"].visible_after = 0.0
+            await worker.refresh_progress_messages()
+            stop_payload = telegram.sent_buttons[-1][0].action
+            telegram.updates = [
+                Update.model_validate(
+                    {
+                        "update_id": 948,
+                        "callback_query": {
+                            "id": "callback-stop-bob",
+                            "from": {
+                                "id": 88,
+                                "is_bot": False,
+                                "first_name": "Bob",
+                            },
+                            "chat_instance": "chat-instance",
+                            "data": stop_payload,
+                            "message": {
+                                "message_id": 101,
+                                "date": 0,
+                                "chat": {
+                                    "id": -10077,
+                                    "type": "supergroup",
+                                    "is_forum": True,
+                                },
+                                "message_thread_id": 7,
+                                "is_topic_message": True,
+                                "from": {
+                                    "id": 99,
+                                    "is_bot": True,
+                                    "first_name": "LionClaw",
+                                    "username": "lionclaw_bot",
+                                },
+                                "text": "Queued...",
+                            },
+                        },
+                    }
+                )
+            ]
+
+            await worker.process_updates()
+
+        self.assertEqual(api.cancel_calls, [])
+        self.assertEqual(
+            telegram.answered_callbacks[-1],
+            ("callback-stop-bob", "That control is no longer valid."),
+        )
+        self.assertIn("turn-1", worker._active_turns)
+
     async def test_stale_stop_callback_is_acknowledged_without_cancelling(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
@@ -4019,6 +4178,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             payload = worker._callback_payload(
                 "stop",
                 worker._active_turns["turn-1"].target,
+                actor_ref="telegram:user:77",
                 active=worker._active_turns["turn-1"],
             )
             worker._forget_turn(worker._active_turns["turn-1"])

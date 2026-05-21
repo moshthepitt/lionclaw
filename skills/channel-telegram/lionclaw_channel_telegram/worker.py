@@ -134,6 +134,7 @@ class ActiveTurn:
     turn_id: str
     session_id: str | None
     session_key: str | None
+    sender_ref: str
     target: TypingTarget
     reply_to_ref: str | None
     generation: int
@@ -387,6 +388,7 @@ def _active_turn_to_json(turn: ActiveTurn) -> dict[str, object]:
         "turn_id": turn.turn_id,
         "session_id": turn.session_id,
         "session_key": turn.session_key,
+        "sender_ref": turn.sender_ref,
         "conversation_ref": turn.target.conversation_ref,
         "thread_ref": turn.target.thread_ref,
         "reply_to_ref": turn.reply_to_ref,
@@ -406,6 +408,7 @@ def _coerce_active_turn(value: object) -> ActiveTurn | None:
     if not isinstance(value, dict):
         return None
     turn_id = value.get("turn_id")
+    sender_ref = value.get("sender_ref")
     conversation_ref = value.get("conversation_ref")
     generation = value.get("generation")
     visible_after_epoch = value.get("visible_after_epoch", 0.0)
@@ -415,6 +418,8 @@ def _coerce_active_turn(value: object) -> ActiveTurn | None:
     if (
         not isinstance(turn_id, str)
         or not turn_id
+        or not isinstance(sender_ref, str)
+        or not sender_ref
         or not isinstance(conversation_ref, str)
         or not conversation_ref
         or isinstance(generation, bool)
@@ -445,6 +450,7 @@ def _coerce_active_turn(value: object) -> ActiveTurn | None:
         turn_id=turn_id,
         session_id=session_id,
         session_key=session_key,
+        sender_ref=sender_ref,
         target=TypingTarget(conversation_ref, thread_ref),
         reply_to_ref=reply_to_ref,
         generation=generation,
@@ -1065,10 +1071,13 @@ class TelegramWorker:
         active: ActiveTurn | None,
     ) -> bool:
         session_key = active.session_key if active is not None else None
+        if active is not None and callback.sender_ref != active.sender_ref:
+            return False
         expected = _callback_mac(
             self.config.telegram_bot_token,
             parsed.action,
             parsed.target,
+            callback.sender_ref,
             callback.conversation_ref,
             callback.thread_ref,
             session_key,
@@ -1344,15 +1353,19 @@ class TelegramWorker:
         return [
             TelegramActionButton(
                 "New",
-                self._callback_payload("new", route),
+                self._callback_payload("new", route, actor_ref=update.sender_ref),
             ),
             TelegramActionButton(
                 "Retry",
-                self._callback_payload("retry", route),
+                self._callback_payload("retry", route, actor_ref=update.sender_ref),
             ),
             TelegramActionButton(
                 "Continue",
-                self._callback_payload("continue", route),
+                self._callback_payload(
+                    "continue",
+                    route,
+                    actor_ref=update.sender_ref,
+                ),
             ),
         ]
 
@@ -1393,6 +1406,7 @@ class TelegramWorker:
             turn_id=response.turn_id,
             session_id=response.session_id,
             session_key=response.session_key,
+            sender_ref=update.sender_ref,
             target=target,
             reply_to_ref=update.message_ref,
             generation=generation,
@@ -1909,7 +1923,12 @@ class TelegramWorker:
             return []
         buttons = [
             TelegramActionButton(
-                "Status", self._callback_payload("status", turn.target)
+                "Status",
+                self._callback_payload(
+                    "status",
+                    turn.target,
+                    actor_ref=turn.sender_ref,
+                ),
             )
         ]
         if turn.session_id is not None and turn.session_key is not None:
@@ -1917,7 +1936,12 @@ class TelegramWorker:
                 0,
                 TelegramActionButton(
                     "Stop",
-                    self._callback_payload("stop", turn.target, active=turn),
+                    self._callback_payload(
+                        "stop",
+                        turn.target,
+                        actor_ref=turn.sender_ref,
+                        active=turn,
+                    ),
                 ),
             )
         return buttons
@@ -1927,6 +1951,7 @@ class TelegramWorker:
         action: str,
         target: TypingTarget,
         *,
+        actor_ref: str,
         active: ActiveTurn | None = None,
     ) -> str:
         code = CALLBACK_ACTION_CODES[action]
@@ -1936,6 +1961,7 @@ class TelegramWorker:
             self.config.telegram_bot_token,
             action,
             target_id,
+            actor_ref,
             target.conversation_ref,
             target.thread_ref,
             session_key,
@@ -2548,6 +2574,7 @@ def _callback_mac(
     secret: str,
     action: str,
     target: str,
+    actor_ref: str,
     conversation_ref: str,
     thread_ref: str | None,
     session_key: str | None,
@@ -2556,6 +2583,7 @@ def _callback_mac(
         [
             action,
             target,
+            actor_ref,
             conversation_ref,
             thread_ref or "",
             session_key or "",
