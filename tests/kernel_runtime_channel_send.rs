@@ -332,6 +332,7 @@ async fn channel_send_bridge_allows_attachment_only_delivery() {
         .await
         .expect("pull outbox");
     assert_eq!(outbox.deliveries.len(), 1);
+    assert_eq!(outbox.deliveries[0].content.text, "");
     assert_eq!(outbox.deliveries[0].content.attachments.len(), 1);
     assert_eq!(
         outbox.deliveries[0].content.attachments[0]
@@ -903,6 +904,60 @@ async fn channel_send_bridge_rejects_excess_connections() {
 }
 
 #[tokio::test]
+async fn channel_send_bridge_audits_connection_io_failures() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-io-failure").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let request = json!({
+        "idempotency_key": "drop-before-response",
+        "channel_id": "local-cli",
+        "conversation_ref": "member:reviewer",
+        "content": {
+            "text": "client disconnected before response",
+            "format_hint": "plain"
+        }
+    });
+    kernel
+        .register_runtime_adapter(
+            "io-failure-runtime",
+            Arc::new(ChannelSendProbeRuntime::send_and_drop_connection(request)),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-io-failure").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "drop channel send connection before response".to_string(),
+            runtime_id: Some("io-failure-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let audit = kernel
+        .query_audit(
+            Some(session),
+            Some("runtime.channel_send.bridge_error".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query bridge error audit events");
+    assert!(
+        audit.events.iter().any(|event| {
+            event.details["stage"].as_str() == Some("connection_io")
+                && event.details["runtime_id"].as_str() == Some("io-failure-runtime")
+                && event.details["turn_id"].as_str().is_some()
+                && event.details["error"].as_str().is_some()
+        }),
+        "connection I/O failures must be audited under runtime.channel_send.*"
+    );
+}
+
+#[tokio::test]
 async fn channel_send_bridge_audits_wire_protocol_denials() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "local-cli", "runtime-channel-send-wire-errors").await;
@@ -991,6 +1046,9 @@ enum RuntimeAction {
     OpenManyConnections {
         responses: Arc<Mutex<Vec<Value>>>,
     },
+    SendAndDropConnection {
+        request: Value,
+    },
 }
 
 struct ChannelSendProbeRuntime {
@@ -1052,6 +1110,12 @@ impl ChannelSendProbeRuntime {
     fn open_many_connections(responses: Arc<Mutex<Vec<Value>>>) -> Self {
         Self {
             action: RuntimeAction::OpenManyConnections { responses },
+        }
+    }
+
+    fn send_and_drop_connection(request: Value) -> Self {
+        Self {
+            action: RuntimeAction::SendAndDropConnection { request },
         }
     }
 }
@@ -1277,6 +1341,20 @@ async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan)
                 .expect("responses lock")
                 .push(serde_json::from_str(response.trim()).context("decode response")?);
             drop(held_streams);
+            Ok(())
+        }
+        RuntimeAction::SendAndDropConnection { request } => {
+            let socket = env_value(&plan.environment, CHANNEL_SEND_SOCKET_ENV)
+                .context("channel send socket env missing")?;
+            let host_socket = host_path_for_runtime_path(plan, &socket)?;
+            let mut stream = UnixStream::connect(&host_socket)
+                .await
+                .with_context(|| format!("connect {}", host_socket.display()))?;
+            let mut line = serde_json::to_vec(request).expect("serialize request");
+            line.push(b'\n');
+            stream.write_all(&line).await.expect("write request");
+            drop(stream);
+            sleep(Duration::from_millis(100)).await;
             Ok(())
         }
     }

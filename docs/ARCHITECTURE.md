@@ -232,9 +232,9 @@ channel outbox delivery. Channel workers continue to lease and report those
 deliveries through `/v0/channels/outbox/pull` and
 `/v0/channels/outbox/report`.
 
-Bridge setup, accept-loop, and connection-task failures are audited under
-`runtime.channel_send.bridge_error`. Request denials, including connection
-pressure over the bridge's concurrent connection cap, are audited as
+Bridge setup, accept-loop, connection-task, and connection I/O failures are
+audited under `runtime.channel_send.bridge_error`. Request denials, including
+connection pressure over the bridge's concurrent connection cap, are audited as
 `runtime.channel_send.denied`.
 
 Idempotency lives on the outbox row. Runtime channel sends use

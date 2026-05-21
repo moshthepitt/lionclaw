@@ -8810,10 +8810,23 @@ async fn run_runtime_channel_send_bridge(
                         let context = context.clone();
                         streams.spawn(async move {
                             let _permit = permit;
-                            match handle_runtime_channel_send_stream(kernel, context, stream).await
+                            match handle_runtime_channel_send_stream(
+                                kernel.clone(),
+                                context.clone(),
+                                stream,
+                            )
+                            .await
                             {
                                 Ok(()) => {}
                                 Err(err) => {
+                                    let error = err.to_string();
+                                    kernel
+                                        .audit_runtime_channel_send_bridge_error(
+                                            &context,
+                                            "connection_io",
+                                            &error,
+                                        )
+                                        .await;
                                     warn!(?err, "failed to handle runtime channel.send request");
                                 }
                             }
@@ -9207,6 +9220,16 @@ fn runtime_channel_send_connection_limit_problem() -> RuntimeChannelSendProblem 
             "channel.send bridge accepts at most {MAX_RUNTIME_CHANNEL_SEND_CONNECTIONS} concurrent connections"
         ),
     )
+}
+
+fn normalize_runtime_channel_send_content(
+    content: &RuntimeChannelSendContent,
+) -> RuntimeChannelSendContent {
+    let mut normalized = content.clone();
+    if normalized.text.trim().is_empty() && !normalized.attachments.is_empty() {
+        normalized.text.clear();
+    }
+    normalized
 }
 
 #[derive(Debug, Clone)]
@@ -12098,13 +12121,14 @@ impl Kernel {
                 .await;
         }
 
+        let content = normalize_runtime_channel_send_content(content);
         let fingerprint = runtime_channel_send_fingerprint(
             channel_id,
             conversation_ref,
             thread_ref,
             reply_to_ref,
             format_hint,
-            content,
+            &content,
         )?;
         let source_id = format!(
             "{}:{}:{idempotency_key}",
@@ -12148,7 +12172,7 @@ impl Kernel {
             ));
         }
 
-        let runtime_artifacts = match runtime_channel_send_artifacts(&context, content) {
+        let runtime_artifacts = match runtime_channel_send_artifacts(&context, &content) {
             Ok(artifacts) => artifacts,
             Err(problem) => {
                 return self
