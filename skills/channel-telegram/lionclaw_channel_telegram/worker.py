@@ -1606,9 +1606,19 @@ class TelegramWorker:
             )
             if event.turn_id in self._active_turns:
                 turn = self._active_turns[event.turn_id]
-                turn.status_text = "Answering"
-                if event.lane == "answer" and event.text.strip():
+                changed = False
+                if turn.status_text != "Answering":
+                    turn.status_text = "Answering"
+                    changed = True
+                if (
+                    event.lane == "answer"
+                    and event.text.strip()
+                    and not turn.expects_outbox_delivery
+                ):
                     turn.expects_outbox_delivery = True
+                    changed = True
+                if changed:
+                    self._save_active_turns()
             return True
 
         if event.kind == "message_boundary":
