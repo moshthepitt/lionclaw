@@ -225,6 +225,12 @@ class ParsedCallbackAction:
     mac: str
 
 
+@dataclass(slots=True, frozen=True)
+class ProviderWorkItem:
+    update_ids: tuple[int, ...]
+    event: TelegramInboundEvent | None
+
+
 @dataclass(slots=True)
 class OffsetStore:
     path: Path
@@ -580,18 +586,26 @@ class TelegramWorker:
             logger.exception("telegram getMe request failed")
             return
 
+        work_items = []
         for update in updates:
-            update_id = update.update_id
             event = self._extract_provider_event(update, bot_identity)
-            if event is not None:
-                if isinstance(event, TelegramPairingClaim):
-                    if not await self._claim_pairing(event):
+            work_items.append(ProviderWorkItem((update.update_id,), event))
+
+        for item in _coalesce_work_items(work_items):
+            if item.event is not None:
+                if isinstance(item.event, TelegramPairingClaim):
+                    if not await self._claim_pairing(item.event):
                         return
-                elif isinstance(event, TelegramCallbackAction):
-                    if not await self._handle_callback_action(event):
+                elif isinstance(item.event, TelegramCallbackAction):
+                    if not await self._handle_callback_action(item.event):
                         return
-                elif not await self._submit_inbound(event):
+                elif not await self._submit_inbound(item.event):
                     return
+            if not self._save_processed_offsets(item.update_ids):
+                return
+
+    def _save_processed_offsets(self, update_ids: tuple[int, ...]) -> bool:
+        for update_id in update_ids:
             self._last_update_id = update_id
             self._last_update_observed_at = _loop_time()
             next_offset = update_id + 1
@@ -602,8 +616,9 @@ class TelegramWorker:
                     "telegram offset save failed for update_id=%s",
                     update_id,
                 )
-                return
+                return False
             self.offset = next_offset
+        return True
 
     def _extract_provider_event(
         self,
@@ -2208,6 +2223,114 @@ def _callback_update(
         trigger="callback",
         provider_metadata=callback.provider_metadata,
     )
+
+
+def _coalesce_work_items(items: list[ProviderWorkItem]) -> list[ProviderWorkItem]:
+    coalesced: list[ProviderWorkItem] = []
+    pending: ProviderWorkItem | None = None
+    for item in items:
+        if pending is not None and _can_merge_work_items(pending, item):
+            pending = _merge_work_items(pending, item)
+            continue
+        if pending is not None:
+            coalesced.append(pending)
+        pending = item
+    if pending is not None:
+        coalesced.append(pending)
+    return coalesced
+
+
+def _can_merge_work_items(first: ProviderWorkItem, second: ProviderWorkItem) -> bool:
+    if not isinstance(first.event, TelegramInboundUpdate) or not isinstance(
+        second.event, TelegramInboundUpdate
+    ):
+        return False
+    return _can_merge_inbound_updates(first.event, second.event)
+
+
+def _can_merge_inbound_updates(
+    first: TelegramInboundUpdate,
+    second: TelegramInboundUpdate,
+) -> bool:
+    if _telegram_command(first) is not None or _telegram_command(second) is not None:
+        return False
+    if (
+        first.sender_ref != second.sender_ref
+        or first.conversation_ref != second.conversation_ref
+        or first.thread_ref != second.thread_ref
+        or first.trigger != second.trigger
+    ):
+        return False
+    first_media_group = first.provider_metadata.get("media_group_id")
+    second_media_group = second.provider_metadata.get("media_group_id")
+    if isinstance(first_media_group, str) or isinstance(second_media_group, str):
+        return (
+            isinstance(first_media_group, str)
+            and first_media_group
+            and first_media_group == second_media_group
+        )
+    return not first.attachments and not second.attachments
+
+
+def _merge_work_items(
+    first: ProviderWorkItem, second: ProviderWorkItem
+) -> ProviderWorkItem:
+    assert isinstance(first.event, TelegramInboundUpdate)
+    assert isinstance(second.event, TelegramInboundUpdate)
+    return ProviderWorkItem(
+        update_ids=first.update_ids + second.update_ids,
+        event=_merge_inbound_updates(first.event, second.event),
+    )
+
+
+def _merge_inbound_updates(
+    first: TelegramInboundUpdate,
+    second: TelegramInboundUpdate,
+) -> TelegramInboundUpdate:
+    update_ids = _batched_metadata_values(first, second, "update_id")
+    existing_message_refs = _metadata_list(first, "batched_message_refs")
+    if not existing_message_refs and first.message_ref is not None:
+        existing_message_refs = [first.message_ref]
+    message_refs = [
+        ref
+        for ref in (*existing_message_refs, second.message_ref)
+        if isinstance(ref, str)
+    ]
+    texts = [text for text in (first.text, second.text) if text and text.strip()]
+    provider_metadata = dict(first.provider_metadata)
+    provider_metadata["update_id"] = second.update_id
+    provider_metadata["batched_update_ids"] = update_ids
+    provider_metadata["batched_message_refs"] = message_refs
+    provider_metadata["batch_size"] = len(update_ids)
+    if "media_group_id" in second.provider_metadata:
+        provider_metadata["media_group_id"] = second.provider_metadata["media_group_id"]
+    return replace(
+        first,
+        update_id=second.update_id,
+        event_id=f"{first.event_id}:batch:{second.update_id}",
+        text="\n\n".join(texts) if texts else None,
+        attachments=[*first.attachments, *second.attachments],
+        provider_metadata=provider_metadata,
+    )
+
+
+def _batched_metadata_values(
+    first: TelegramInboundUpdate,
+    second: TelegramInboundUpdate,
+    key: str,
+) -> list[int]:
+    values = _metadata_list(first, f"batched_{key}s")
+    if not values:
+        values = [first.provider_metadata.get(key)]
+    values.append(second.provider_metadata.get(key))
+    return [value for value in values if isinstance(value, int)]
+
+
+def _metadata_list(update: TelegramInboundUpdate, key: str) -> list[object]:
+    value = update.provider_metadata.get(key)
+    if isinstance(value, list):
+        return list(value)
+    return []
 
 
 def _telegram_command(update: TelegramInboundUpdate) -> TelegramCommand | None:

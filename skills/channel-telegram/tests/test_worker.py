@@ -1530,6 +1530,190 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
 
+    async def test_process_updates_batches_back_to_back_text_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 81,
+                            "message": {
+                                "message_id": 11,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "first",
+                            },
+                        }
+                    ),
+                    Update.model_validate(
+                        {
+                            "update_id": 82,
+                            "message": {
+                                "message_id": 12,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "second",
+                            },
+                        }
+                    ),
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(len(api.sent_inbound), 1)
+        self.assertEqual(api.sent_inbound[0].text, "first\n\nsecond")
+        self.assertEqual(api.sent_inbound[0].event_id, "telegram:update:81:batch:82")
+        self.assertEqual(
+            api.sent_inbound[0].provider_metadata["batched_update_ids"],
+            [81, 82],
+        )
+        self.assertEqual(api.sent_inbound[0].provider_metadata["update_id"], 82)
+        self.assertEqual(worker.offset, 83)
+
+    async def test_process_updates_does_not_batch_commands_with_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 83,
+                            "message": {
+                                "message_id": 13,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "first",
+                            },
+                        }
+                    ),
+                    Update.model_validate(
+                        {
+                            "update_id": 84,
+                            "message": {
+                                "message_id": 14,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/model gpt-5.2",
+                            },
+                        }
+                    ),
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(
+            [update.text for update in api.sent_inbound], ["first", "/model gpt-5.2"]
+        )
+
+    async def test_process_updates_batches_media_group_attachments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(inbound_outcome="waiting_for_attachments")
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 85,
+                            "message": {
+                                "message_id": 15,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "media_group_id": "album-1",
+                                "caption": "front",
+                                "photo": [
+                                    {
+                                        "file_id": "photo-file-1",
+                                        "file_unique_id": "photo-unique-1",
+                                        "width": 100,
+                                        "height": 100,
+                                        "file_size": 10,
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                    Update.model_validate(
+                        {
+                            "update_id": 86,
+                            "message": {
+                                "message_id": 16,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "media_group_id": "album-1",
+                                "caption": "back",
+                                "photo": [
+                                    {
+                                        "file_id": "photo-file-2",
+                                        "file_unique_id": "photo-unique-2",
+                                        "width": 100,
+                                        "height": 100,
+                                        "file_size": 10,
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(len(api.sent_inbound), 1)
+        self.assertEqual(api.sent_inbound[0].text, "front\n\nback")
+        self.assertEqual(len(api.sent_inbound[0].attachments), 2)
+        self.assertEqual(len(api.staged_attachments), 2)
+        self.assertEqual(len(api.finalized), 1)
+
     async def test_offset_save_failure_keeps_unpersisted_update_retryable(
         self,
     ) -> None:
@@ -1584,7 +1768,9 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(worker.offset, 0)
             self.assertFalse(offset_path.exists())
-            self.assertEqual([update.text for update in api.sent_inbound], ["first"])
+            self.assertEqual(
+                [update.text for update in api.sent_inbound], ["first\n\nsecond"]
+            )
 
     async def test_malformed_update_is_quarantined_and_offset_advances(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
