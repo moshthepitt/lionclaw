@@ -110,6 +110,10 @@ CALLBACK_ACTION_CODES = {
 }
 CALLBACK_CODE_ACTIONS = {code: action for action, code in CALLBACK_ACTION_CODES.items()}
 CALLBACK_ROUTE_TARGET = "_"
+REACTION_RECEIVED = "👀"
+REACTION_COMPLETED = "✅"
+REACTION_STOPPED = "👌"
+REACTION_FAILED = "😢"
 
 
 @dataclass(slots=True, frozen=True)
@@ -915,6 +919,7 @@ class TelegramWorker:
             )
             return False
         if response.outcome == "pending_approval":
+            await self._set_inbound_reaction(update, REACTION_RECEIVED)
             await self._notify_pending_approval(update, response.pairing_code)
         if response.outcome == "queued":
             self._remember_typing_route(update)
@@ -979,6 +984,7 @@ class TelegramWorker:
             )
             return False
         if response.outcome == "pending_approval":
+            await self._set_inbound_reaction(update, REACTION_RECEIVED)
             await self._notify_pending_approval(update, response.pairing_code)
         if response.outcome == "queued":
             self._remember_typing_route(update)
@@ -1094,6 +1100,46 @@ class TelegramWorker:
                 update.update_id,
             )
 
+    async def _set_inbound_reaction(
+        self,
+        update: TelegramInboundUpdate,
+        emoji: str,
+    ) -> None:
+        if update.message_ref is None:
+            return
+        await self._set_message_reaction(
+            update.conversation_ref,
+            update.message_ref,
+            emoji,
+        )
+
+    async def _set_turn_reaction(self, turn: ActiveTurn, emoji: str) -> None:
+        if turn.reply_to_ref is None:
+            return
+        await self._set_message_reaction(
+            turn.target.conversation_ref,
+            turn.reply_to_ref,
+            emoji,
+        )
+
+    async def _set_message_reaction(
+        self,
+        conversation_ref: str,
+        message_ref: str,
+        emoji: str,
+    ) -> None:
+        try:
+            await self.telegram.set_reaction(conversation_ref, message_ref, emoji)
+        except Exception:
+            logger.debug(
+                "telegram message reaction failed for conversation_ref=%s "
+                "message_ref=%s emoji=%s",
+                conversation_ref,
+                message_ref,
+                emoji,
+                exc_info=True,
+            )
+
     def _route_control_buttons(
         self,
         update: TelegramInboundUpdate,
@@ -1159,6 +1205,7 @@ class TelegramWorker:
         self._active_turns[turn.turn_id] = turn
         self._route_turns[target.key] = turn.turn_id
         self._save_active_turns()
+        await self._set_turn_reaction(turn, REACTION_RECEIVED)
 
     def _advance_route_generation(
         self,
@@ -1630,6 +1677,7 @@ class TelegramWorker:
         turn.terminal_text = text
         turn.visible_after = min(turn.visible_after, _loop_time())
         self._save_active_turns()
+        await self._set_turn_reaction(turn, _terminal_reaction(text))
         render_result = await self._ensure_progress_message(turn, force=True)
         if render_result == ProgressRenderResult.RENDERED:
             turn.terminal = True
@@ -1719,6 +1767,7 @@ class TelegramWorker:
         if turn.provisional_message_ref is not None:
             if not turn.expects_outbox_delivery:
                 await self._delete_progress_message(turn)
+                await self._set_turn_reaction(turn, REACTION_COMPLETED)
                 turn.terminal = True
                 self._forget_turn(turn)
                 return
@@ -1726,6 +1775,7 @@ class TelegramWorker:
             self._save_active_turns()
             await self._edit_progress_message(turn, _progress_text(turn), force=True)
             return
+        await self._set_turn_reaction(turn, REACTION_COMPLETED)
         turn.terminal = True
         self._forget_turn(turn)
 
@@ -1926,6 +1976,7 @@ class TelegramWorker:
             return
         if turn.provisional_message_ref is not None:
             await self._delete_progress_message(turn)
+        await self._set_turn_reaction(turn, REACTION_COMPLETED)
         turn.terminal = True
         self._forget_turn(turn)
 
@@ -2529,6 +2580,12 @@ def _terminal_error_text(event: StreamEvent) -> str:
     if event.text:
         return f"Turn failed: {_compact_status_text(event.text)}"
     return "Turn failed."
+
+
+def _terminal_reaction(text: str) -> str:
+    if text.strip().casefold().startswith("stopped"):
+        return REACTION_STOPPED
+    return REACTION_FAILED
 
 
 def _compact_status_text(text: str) -> str:

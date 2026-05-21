@@ -1880,6 +1880,126 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api.staged_attachments), 2)
         self.assertEqual(len(api.finalized), 1)
 
+    async def test_queued_turn_sets_inbound_receipt_reaction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(inbound_turn_id="turn-1")
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 861,
+                            "message": {
+                                "message_id": 61,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "start work",
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(
+            telegram.reactions,
+            [("telegram:chat:77", "telegram:message:61", "👀")],
+        )
+
+    async def test_final_delivery_sets_completed_reaction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=FakeLionClawApi(),
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            await self._record_active_turn(
+                worker,
+                turn_id="turn-1",
+                message_ref="telegram:message:62",
+            )
+
+            await worker._process_outbox_delivery(
+                OutboxDelivery(
+                    delivery_id="delivery-1",
+                    attempt_id="attempt-1",
+                    conversation_ref="telegram:chat:77",
+                    turn_id="turn-1",
+                    content=OutboxContent(text="done"),
+                )
+            )
+
+        self.assertIn(
+            ("telegram:chat:77", "telegram:message:62", "✅"),
+            telegram.reactions,
+        )
+
+    async def test_terminal_stream_events_set_failure_or_stopped_reactions(
+        self,
+    ) -> None:
+        cases = (
+            (
+                StreamEvent(
+                    sequence=1,
+                    peer_id="telegram:chat:77",
+                    turn_id="turn-1",
+                    kind="error",
+                    code="runtime.failed",
+                    text="tool crashed",
+                ),
+                "😢",
+            ),
+            (
+                StreamEvent(
+                    sequence=1,
+                    peer_id="telegram:chat:77",
+                    turn_id="turn-1",
+                    kind="error",
+                    code="runtime.cancelled",
+                    text="cancelled",
+                ),
+                "👌",
+            ),
+        )
+        for event, emoji in cases:
+            with self.subTest(emoji=emoji), tempfile.TemporaryDirectory() as temp_dir:
+                telegram = FakeTelegramTransport()
+                worker = TelegramWorker(
+                    config=build_config(Path(temp_dir)),
+                    lionclaw_api=FakeLionClawApi(),
+                    telegram=telegram,
+                    offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                )
+                await self._record_active_turn(
+                    worker,
+                    turn_id="turn-1",
+                    message_ref="telegram:message:63",
+                )
+
+                with self.assertLogs(
+                    "lionclaw_channel_telegram.worker",
+                    level="ERROR",
+                ):
+                    await worker._process_stream_event(event)
+
+                self.assertIn(
+                    ("telegram:chat:77", "telegram:message:63", emoji),
+                    telegram.reactions,
+                )
+
     async def test_process_webhook_update_submits_without_polling_offset(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             runtime_dir = Path(temp_dir)
@@ -6609,6 +6729,7 @@ class FakeTelegramTransport:
         self.edited_buttons: list[list[TelegramActionButton]] = []
         self.deleted_messages: list[tuple[str, str]] = []
         self.answered_callbacks: list[tuple[str, str | None]] = []
+        self.reactions: list[tuple[str, str, str]] = []
         self.commands_configured = False
         self.sent_format_hints: list[str] = []
         self.typing_peers: list[str] = []
@@ -6742,7 +6863,7 @@ class FakeTelegramTransport:
         message_ref: str,
         emoji: str,
     ) -> None:
-        _ = (conversation_ref, message_ref, emoji)
+        self.reactions.append((conversation_ref, message_ref, emoji))
 
 
 class BlockingUpdatesTelegramTransport(FakeTelegramTransport):
