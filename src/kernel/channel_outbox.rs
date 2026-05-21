@@ -252,7 +252,6 @@ impl ChannelOutboxStore {
     pub async fn enqueue_delivery_idempotent(
         &self,
         input: NewChannelDelivery<'_>,
-        source_fingerprint: &str,
     ) -> Result<ChannelOutboxEnqueueResult> {
         let source_kind = input
             .source_kind
@@ -262,6 +261,10 @@ impl ChannelOutboxStore {
             .source_id
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| anyhow!("idempotent channel delivery requires source_id"))?;
+        let source_fingerprint = input
+            .source_fingerprint
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("idempotent channel delivery requires source_fingerprint"))?;
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")

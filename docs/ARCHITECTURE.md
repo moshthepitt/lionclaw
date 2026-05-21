@@ -217,7 +217,8 @@ object, read one newline-delimited JSON object, then close. The request names a
 configured channel route, provider-neutral content, and an idempotency key.
 Attachment content is not sent over the socket; the request names files under
 `/runtime`, and the kernel reuses the existing runtime-artifact copy and outbox
-attachment path.
+attachment path. Attachment paths are interpreted relative to the current
+runtime state root; parent-directory escapes are rejected.
 
 The bridge is transport only. The kernel validates the current session and turn
 from its own execution context, checks the active channel binding, normalizes

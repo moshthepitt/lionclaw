@@ -36,6 +36,15 @@ use uuid::Uuid;
 
 const CHANNEL_SEND_SOCKET_ENV: &str = "LIONCLAW_CHANNEL_SEND_SOCKET";
 
+type RecordedEnvironments = Arc<Mutex<Vec<Vec<(String, String)>>>>;
+
+#[derive(Clone, Copy)]
+enum ProbeFileSetup {
+    None,
+    Attachment,
+    EscapeSymlink,
+}
+
 #[tokio::test]
 async fn program_backed_runtime_without_channel_send_escape_gets_no_socket_env() {
     let env = TestHome::new().await;
@@ -102,7 +111,7 @@ async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_deliver
                 vec![request],
                 responses.clone(),
                 socket_paths.clone(),
-                true,
+                ProbeFileSetup::Attachment,
             )),
         )
         .await;
@@ -195,7 +204,7 @@ async fn channel_send_bridge_is_idempotent_for_same_payload_and_conflicts_on_cha
                 vec![base_request.clone(), base_request, changed_request],
                 responses.clone(),
                 Arc::new(Mutex::new(Vec::new())),
-                false,
+                ProbeFileSetup::None,
             )),
         )
         .await;
@@ -277,10 +286,34 @@ async fn channel_send_bridge_returns_structured_validation_errors() {
                             "format_hint": "plain"
                         }
                     }),
+                    json!({
+                        "idempotency_key": "attachment-escape",
+                        "channel_id": "local-cli",
+                        "conversation_ref": "member:reviewer",
+                        "content": {
+                            "text": "hello",
+                            "format_hint": "plain",
+                            "attachments": [{
+                                "path": "/runtime/../other-session/secret.txt"
+                            }]
+                        }
+                    }),
+                    json!({
+                        "idempotency_key": "attachment-symlink-escape",
+                        "channel_id": "local-cli",
+                        "conversation_ref": "member:reviewer",
+                        "content": {
+                            "text": "hello",
+                            "format_hint": "plain",
+                            "attachments": [{
+                                "path": "/runtime/escape-link/secret.txt"
+                            }]
+                        }
+                    }),
                 ],
                 responses.clone(),
                 Arc::new(Mutex::new(Vec::new())),
-                false,
+                ProbeFileSetup::EscapeSymlink,
             )),
         )
         .await;
@@ -299,7 +332,7 @@ async fn channel_send_bridge_returns_structured_validation_errors() {
         .expect("turn should complete");
 
     let responses = responses.lock().expect("responses lock").clone();
-    assert_eq!(responses.len(), 3);
+    assert_eq!(responses.len(), 5);
     assert_eq!(responses[0]["ok"].as_bool(), Some(false));
     assert_eq!(
         responses[0]["error"]["code"].as_str(),
@@ -314,6 +347,32 @@ async fn channel_send_bridge_returns_structured_validation_errors() {
     assert_eq!(
         responses[2]["error"]["code"].as_str(),
         Some("unknown_channel")
+    );
+    assert_eq!(responses[3]["ok"].as_bool(), Some(false));
+    assert_eq!(
+        responses[3]["error"]["code"].as_str(),
+        Some("invalid_attachment")
+    );
+    assert_eq!(responses[4]["ok"].as_bool(), Some(false));
+    assert_eq!(
+        responses[4]["error"]["code"].as_str(),
+        Some("invalid_attachment")
+    );
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "test-worker".to_string(),
+            conversation_ref: Some("member:reviewer".to_string()),
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: None,
+        })
+        .await
+        .expect("pull outbox");
+    assert!(
+        outbox.deliveries.is_empty(),
+        "invalid channel.send requests must not enqueue deliveries"
     );
 }
 
@@ -361,13 +420,13 @@ async fn channel_send_bridge_socket_is_removed_after_timeout() {
 #[derive(Clone)]
 enum RuntimeAction {
     RecordEnvironment {
-        observed: Arc<Mutex<Vec<Vec<(String, String)>>>>,
+        observed: RecordedEnvironments,
     },
     SendRequests {
         requests: Vec<Value>,
         responses: Arc<Mutex<Vec<Value>>>,
         socket_paths: Arc<Mutex<Vec<PathBuf>>>,
-        create_attachment: bool,
+        file_setup: ProbeFileSetup,
     },
     Sleep {
         socket_paths: Arc<Mutex<Vec<PathBuf>>>,
@@ -380,7 +439,7 @@ struct ChannelSendProbeRuntime {
 }
 
 impl ChannelSendProbeRuntime {
-    fn record_environment(observed: Arc<Mutex<Vec<Vec<(String, String)>>>>) -> Self {
+    fn record_environment(observed: RecordedEnvironments) -> Self {
         Self {
             action: RuntimeAction::RecordEnvironment { observed },
         }
@@ -390,14 +449,14 @@ impl ChannelSendProbeRuntime {
         requests: Vec<Value>,
         responses: Arc<Mutex<Vec<Value>>>,
         socket_paths: Arc<Mutex<Vec<PathBuf>>>,
-        create_attachment: bool,
+        file_setup: ProbeFileSetup,
     ) -> Self {
         Self {
             action: RuntimeAction::SendRequests {
                 requests,
                 responses,
                 socket_paths,
-                create_attachment,
+                file_setup,
             },
         }
     }
@@ -481,7 +540,7 @@ async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan)
             requests,
             responses,
             socket_paths,
-            create_attachment,
+            file_setup,
         } => {
             let runtime_root = runtime_mount_source(plan)?;
             let socket = env_value(&plan.environment, CHANNEL_SEND_SOCKET_ENV)
@@ -491,15 +550,7 @@ async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan)
                 .lock()
                 .expect("socket paths lock")
                 .push(host_socket);
-            if *create_attachment {
-                let artifact = runtime_root.join("artifacts/sketch.txt");
-                tokio::fs::create_dir_all(artifact.parent().expect("artifact parent"))
-                    .await
-                    .expect("create artifact parent");
-                tokio::fs::write(&artifact, b"sketch bytes")
-                    .await
-                    .expect("write artifact");
-            }
+            prepare_probe_files(&runtime_root, *file_setup).await?;
             for request in requests {
                 let response = send_channel_send_request(plan, request.clone()).await?;
                 responses.lock().expect("responses lock").push(response);
@@ -524,6 +575,38 @@ async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan)
                 .expect("socket paths lock")
                 .push(host_socket);
             sleep(*duration).await;
+            Ok(())
+        }
+    }
+}
+
+async fn prepare_probe_files(runtime_root: &Path, setup: ProbeFileSetup) -> Result<()> {
+    match setup {
+        ProbeFileSetup::None => Ok(()),
+        ProbeFileSetup::Attachment => {
+            let artifact = runtime_root.join("artifacts/sketch.txt");
+            let artifact_parent = artifact.parent().context("artifact parent missing")?;
+            tokio::fs::create_dir_all(artifact_parent)
+                .await
+                .context("create artifact parent")?;
+            tokio::fs::write(&artifact, b"sketch bytes")
+                .await
+                .context("write artifact")?;
+            Ok(())
+        }
+        ProbeFileSetup::EscapeSymlink => {
+            let outside = runtime_root
+                .parent()
+                .context("runtime root parent missing")?
+                .join("channel-send-symlink-escape");
+            tokio::fs::create_dir_all(&outside)
+                .await
+                .context("create symlink escape target")?;
+            tokio::fs::write(outside.join("secret.txt"), b"secret bytes")
+                .await
+                .context("write symlink escape target")?;
+            std::os::unix::fs::symlink(&outside, runtime_root.join("escape-link"))
+                .context("create symlink escape")?;
             Ok(())
         }
     }

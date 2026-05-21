@@ -231,7 +231,9 @@ struct RuntimeChannelSendBridge {
 impl Drop for RuntimeChannelSendBridge {
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
+            match shutdown.send(()) {
+                Ok(()) | Err(()) => {}
+            }
         }
         self.task.abort();
         if let Err(err) = std::fs::remove_file(&self.socket_path) {
@@ -8378,7 +8380,13 @@ async fn read_bounded_json_line(
                     ),
                 ));
             }
-            line.extend_from_slice(&available[..newline_index]);
+            let chunk = available.get(..newline_index).ok_or_else(|| {
+                RuntimeChannelSendProblem::new(
+                    "internal_error",
+                    "invalid channel.send request buffer boundary",
+                )
+            })?;
+            line.extend_from_slice(chunk);
             reader.consume(newline_index + 1);
             return Ok(());
         }
@@ -8486,6 +8494,43 @@ fn runtime_channel_send_artifacts(
         .collect()
 }
 
+async fn validate_runtime_channel_send_artifacts(
+    context: &RuntimeChannelSendContext,
+    artifacts: &[RuntimeArtifact],
+) -> Result<(), RuntimeChannelSendProblem> {
+    let runtime_state_root = tokio::fs::canonicalize(&context.runtime_state_root)
+        .await
+        .map_err(|err| {
+            RuntimeChannelSendProblem::new(
+                "internal_error",
+                format!(
+                    "runtime state root '{}' is not readable: {err}",
+                    context.runtime_state_root.display()
+                ),
+            )
+        })?;
+    for artifact in artifacts {
+        let canonical_artifact = tokio::fs::canonicalize(&artifact.path)
+            .await
+            .map_err(|err| {
+                RuntimeChannelSendProblem::new(
+                    "invalid_attachment",
+                    format!(
+                        "attachment path '{}' is not readable: {err}",
+                        artifact.path.display()
+                    ),
+                )
+            })?;
+        if !canonical_artifact.starts_with(&runtime_state_root) {
+            return Err(RuntimeChannelSendProblem::new(
+                "invalid_attachment",
+                "attachment path must stay under /runtime",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn runtime_channel_send_host_path(
     runtime_state_root: &Path,
     raw_path: &str,
@@ -8503,7 +8548,26 @@ fn runtime_channel_send_host_path(
             "attachment path must be under /runtime",
         )
     })?;
-    Ok(runtime_state_root.join(relative))
+    let mut normalized = PathBuf::new();
+    for component in Path::new(relative).components() {
+        match component {
+            Component::Normal(value) => normalized.push(value),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(RuntimeChannelSendProblem::new(
+                    "invalid_attachment",
+                    "attachment path must stay under /runtime",
+                ));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(RuntimeChannelSendProblem::new(
+            "invalid_attachment",
+            "attachment path must name a file under /runtime",
+        ));
+    }
+    Ok(runtime_state_root.join(normalized))
 }
 
 fn runtime_channel_send_channel_problem(err: KernelError) -> RuntimeChannelSendProblem {
@@ -11271,14 +11335,11 @@ impl Kernel {
                 "invalid_format",
                 "content.format_hint must be plain, markdown, or html",
             );
-            self.audit_runtime_channel_send(
-                "runtime.channel_send.denied",
+            self.audit_runtime_channel_send_denied(
                 &context,
-                json!({
-                    "channel_id": channel_id,
-                    "conversation_ref": conversation_ref,
-                    "reason": problem.code,
-                }),
+                channel_id,
+                conversation_ref,
+                problem.code,
             )
             .await;
             return Err(problem);
@@ -11288,37 +11349,39 @@ impl Kernel {
                 "empty_content",
                 "content text or attachments are required",
             );
-            self.audit_runtime_channel_send(
-                "runtime.channel_send.denied",
+            self.audit_runtime_channel_send_denied(
                 &context,
-                json!({
-                    "channel_id": channel_id,
-                    "conversation_ref": conversation_ref,
-                    "reason": problem.code,
-                }),
+                channel_id,
+                conversation_ref,
+                problem.code,
             )
             .await;
             return Err(problem);
         }
         if request.content.attachments.len() > MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY {
-            return Err(RuntimeChannelSendProblem::new(
+            let problem = RuntimeChannelSendProblem::new(
                 "too_many_attachments",
                 format!(
                     "content.attachments exceeds {MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY} per delivery"
                 ),
-            ));
+            );
+            self.audit_runtime_channel_send_denied(
+                &context,
+                channel_id,
+                conversation_ref,
+                problem.code,
+            )
+            .await;
+            return Err(problem);
         }
 
         if let Err(err) = self.require_active_channel_binding(channel_id).await {
             let problem = runtime_channel_send_channel_problem(err);
-            self.audit_runtime_channel_send(
-                "runtime.channel_send.denied",
+            self.audit_runtime_channel_send_denied(
                 &context,
-                json!({
-                    "channel_id": channel_id,
-                    "conversation_ref": conversation_ref,
-                    "reason": problem.code,
-                }),
+                channel_id,
+                conversation_ref,
+                problem.code,
             )
             .await;
             return Err(problem);
@@ -11374,11 +11437,48 @@ impl Kernel {
             ));
         }
 
-        let runtime_artifacts = runtime_channel_send_artifacts(&context, &request.content)?;
-        let attachments = self
+        let runtime_artifacts = match runtime_channel_send_artifacts(&context, &request.content) {
+            Ok(artifacts) => artifacts,
+            Err(problem) => {
+                self.audit_runtime_channel_send_denied(
+                    &context,
+                    channel_id,
+                    conversation_ref,
+                    problem.code,
+                )
+                .await;
+                return Err(problem);
+            }
+        };
+        if let Err(problem) =
+            validate_runtime_channel_send_artifacts(&context, &runtime_artifacts).await
+        {
+            self.audit_runtime_channel_send_denied(
+                &context,
+                channel_id,
+                conversation_ref,
+                problem.code,
+            )
+            .await;
+            return Err(problem);
+        }
+        let attachments = match self
             .prepare_runtime_artifact_attachments(context.turn_id, &runtime_artifacts)
             .await
-            .map_err(runtime_channel_send_kernel_problem)?;
+            .map_err(runtime_channel_send_kernel_problem)
+        {
+            Ok(attachments) => attachments,
+            Err(problem) => {
+                self.audit_runtime_channel_send_denied(
+                    &context,
+                    channel_id,
+                    conversation_ref,
+                    problem.code,
+                )
+                .await;
+                return Err(problem);
+            }
+        };
         let content = ChannelDeliveryContent {
             text: request.content.text,
             format_hint: format_hint.to_string(),
@@ -11386,23 +11486,20 @@ impl Kernel {
         };
         let delivery = self
             .channel_outbox
-            .enqueue_delivery_idempotent(
-                NewChannelDelivery {
-                    route: ChannelDeliveryRoute {
-                        channel_id,
-                        conversation_ref,
-                        thread_ref,
-                        reply_to_ref,
-                    },
-                    session_id: Some(context.session_id),
-                    turn_id: Some(context.turn_id),
-                    source_kind: Some(RUNTIME_CHANNEL_SEND_SOURCE_KIND),
-                    source_id: Some(&source_id),
-                    source_fingerprint: Some(&fingerprint),
-                    content,
+            .enqueue_delivery_idempotent(NewChannelDelivery {
+                route: ChannelDeliveryRoute {
+                    channel_id,
+                    conversation_ref,
+                    thread_ref,
+                    reply_to_ref,
                 },
-                &fingerprint,
-            )
+                session_id: Some(context.session_id),
+                turn_id: Some(context.turn_id),
+                source_kind: Some(RUNTIME_CHANNEL_SEND_SOURCE_KIND),
+                source_id: Some(&source_id),
+                source_fingerprint: Some(&fingerprint),
+                content,
+            })
             .await
             .map_err(runtime_channel_send_internal_problem)?;
 
@@ -11486,6 +11583,25 @@ impl Kernel {
             Some(context.session_id),
             "kernel",
             details,
+        )
+        .await;
+    }
+
+    async fn audit_runtime_channel_send_denied(
+        &self,
+        context: &RuntimeChannelSendContext,
+        channel_id: &str,
+        conversation_ref: &str,
+        reason: &str,
+    ) {
+        self.audit_runtime_channel_send(
+            "runtime.channel_send.denied",
+            context,
+            json!({
+                "channel_id": channel_id,
+                "conversation_ref": conversation_ref,
+                "reason": reason,
+            }),
         )
         .await;
     }
