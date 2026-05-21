@@ -254,6 +254,50 @@ impl Drop for RuntimeChannelSendBridge {
     }
 }
 
+#[derive(Debug, Default)]
+struct PreparedChannelDeliveryAttachments {
+    attachments: Vec<ChannelDeliveryAttachment>,
+    persisted: bool,
+}
+
+impl PreparedChannelDeliveryAttachments {
+    fn push(&mut self, attachment: ChannelDeliveryAttachment) {
+        self.attachments.push(attachment);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.attachments.is_empty()
+    }
+
+    fn as_slice(&self) -> &[ChannelDeliveryAttachment] {
+        &self.attachments
+    }
+
+    fn mark_persisted(&mut self) {
+        self.persisted = true;
+    }
+}
+
+impl Drop for PreparedChannelDeliveryAttachments {
+    fn drop(&mut self) {
+        if self.persisted {
+            return;
+        }
+        for attachment in &self.attachments {
+            let path = Path::new(&attachment.path);
+            if let Err(err) = std::fs::remove_file(path) {
+                if err.kind() != ErrorKind::NotFound {
+                    warn!(
+                        ?err,
+                        path = %path.display(),
+                        "failed to remove unpersisted channel delivery attachment"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ChannelAttachmentStageContent {
     Bytes(Vec<u8>),
@@ -10322,7 +10366,7 @@ impl Kernel {
                 }
             }
         } else {
-            Vec::new()
+            PreparedChannelDeliveryAttachments::default()
         };
         self.session_turns
             .complete_turn(
@@ -10371,24 +10415,28 @@ impl Kernel {
                 && (!artifacts.assistant_text.trim().is_empty() || !outbox_attachments.is_empty())
             {
                 let source_id = turn_id.to_string();
-                self.enqueue_channel_delivery_content(
-                    ChannelDeliveryRoute {
-                        channel_id: &stream_context.channel_id,
-                        conversation_ref: &stream_context.conversation_ref,
-                        thread_ref: stream_context.thread_ref.as_deref(),
-                        reply_to_ref: stream_context.reply_to_ref.as_deref(),
-                    },
-                    Some(session.session_id),
-                    Some(turn_id),
-                    Some("session_turn"),
-                    Some(&source_id),
-                    ChannelDeliveryContent {
-                        text: artifacts.assistant_text.clone(),
-                        format_hint: "plain".to_string(),
-                        attachments: outbox_attachments,
-                    },
-                )
-                .await?;
+                let mut outbox_attachments = outbox_attachments;
+                let delivery = self
+                    .create_channel_delivery_content(
+                        ChannelDeliveryRoute {
+                            channel_id: &stream_context.channel_id,
+                            conversation_ref: &stream_context.conversation_ref,
+                            thread_ref: stream_context.thread_ref.as_deref(),
+                            reply_to_ref: stream_context.reply_to_ref.as_deref(),
+                        },
+                        Some(session.session_id),
+                        Some(turn_id),
+                        Some("session_turn"),
+                        Some(&source_id),
+                        ChannelDeliveryContent {
+                            text: artifacts.assistant_text.clone(),
+                            format_hint: "plain".to_string(),
+                            attachments: outbox_attachments.as_slice().to_vec(),
+                        },
+                    )
+                    .await?;
+                outbox_attachments.mark_persisted();
+                self.audit_channel_outbox_created(&delivery).await?;
             }
         }
 
@@ -11570,6 +11618,29 @@ impl Kernel {
         source_id: Option<&str>,
         content: ChannelDeliveryContent,
     ) -> Result<Uuid, KernelError> {
+        let delivery = self
+            .create_channel_delivery_content(
+                route,
+                session_id,
+                turn_id,
+                source_kind,
+                source_id,
+                content,
+            )
+            .await?;
+        self.audit_channel_outbox_created(&delivery).await?;
+        Ok(delivery.delivery_id)
+    }
+
+    async fn create_channel_delivery_content(
+        &self,
+        route: ChannelDeliveryRoute<'_>,
+        session_id: Option<Uuid>,
+        turn_id: Option<Uuid>,
+        source_kind: Option<&str>,
+        source_id: Option<&str>,
+        content: ChannelDeliveryContent,
+    ) -> Result<ChannelDeliveryRecord, KernelError> {
         let channel_id = route.channel_id.trim();
         let conversation_ref = route.conversation_ref.trim();
         if channel_id.is_empty() || conversation_ref.is_empty() {
@@ -11618,17 +11689,22 @@ impl Kernel {
             .await
             .map_err(internal)?;
 
+        Ok(delivery)
+    }
+
+    async fn audit_channel_outbox_created(
+        &self,
+        delivery: &ChannelDeliveryRecord,
+    ) -> Result<(), KernelError> {
         self.audit
             .append(
                 "channel.outbox.created",
-                session_id,
+                delivery.session_id,
                 Some("kernel".to_string()),
-                channel_outbox_audit_details(&delivery, ChannelOutboxAuditDetails::default()),
+                channel_outbox_audit_details(delivery, ChannelOutboxAuditDetails::default()),
             )
             .await
-            .map_err(internal)?;
-
-        Ok(delivery.delivery_id)
+            .map_err(internal)
     }
 
     async fn send_runtime_channel_message(
@@ -11803,7 +11879,7 @@ impl Kernel {
             .await;
             return Err(problem);
         }
-        let attachments = match self
+        let mut attachments = match self
             .prepare_runtime_artifact_attachments_beneath(
                 context.turn_id,
                 &context.runtime_state_root,
@@ -11827,7 +11903,7 @@ impl Kernel {
         let content = ChannelDeliveryContent {
             text: request.content.text,
             format_hint: format_hint.to_string(),
-            attachments,
+            attachments: attachments.as_slice().to_vec(),
         };
         self.require_runtime_channel_send_bridge_open(&context, channel_id, conversation_ref)
             .await?;
@@ -11852,18 +11928,9 @@ impl Kernel {
 
         match delivery {
             ChannelOutboxEnqueueResult::Created(delivery) => {
-                self.audit
-                    .append(
-                        "channel.outbox.created",
-                        Some(context.session_id),
-                        Some("kernel".to_string()),
-                        channel_outbox_audit_details(
-                            &delivery,
-                            ChannelOutboxAuditDetails::default(),
-                        ),
-                    )
+                attachments.mark_persisted();
+                self.audit_channel_outbox_created(&delivery)
                     .await
-                    .map_err(internal)
                     .map_err(runtime_channel_send_kernel_problem)?;
                 self.audit_runtime_channel_send(
                     "runtime.channel_send.allowed",
@@ -11986,9 +12053,9 @@ impl Kernel {
         &self,
         turn_id: Uuid,
         artifacts: &[RuntimeArtifact],
-    ) -> Result<Vec<ChannelDeliveryAttachment>, KernelError> {
+    ) -> Result<PreparedChannelDeliveryAttachments, KernelError> {
         if artifacts.is_empty() {
-            return Ok(Vec::new());
+            return Ok(PreparedChannelDeliveryAttachments::default());
         }
         let runtime_root = self.canonical_runtime_root().await?;
         self.prepare_runtime_artifact_attachments_beneath(turn_id, &runtime_root, artifacts)
@@ -12000,9 +12067,9 @@ impl Kernel {
         turn_id: Uuid,
         artifact_root: &Path,
         artifacts: &[RuntimeArtifact],
-    ) -> Result<Vec<ChannelDeliveryAttachment>, KernelError> {
+    ) -> Result<PreparedChannelDeliveryAttachments, KernelError> {
         if artifacts.is_empty() {
-            return Ok(Vec::new());
+            return Ok(PreparedChannelDeliveryAttachments::default());
         }
         if artifacts.len() > MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY {
             return Err(KernelError::BadRequest(format!(
@@ -12032,16 +12099,19 @@ impl Kernel {
         )
         .await?;
 
-        let mut attachments = Vec::with_capacity(artifacts.len());
+        let mut attachments = PreparedChannelDeliveryAttachments {
+            attachments: Vec::with_capacity(artifacts.len()),
+            persisted: false,
+        };
         for artifact in artifacts {
-            attachments.push(
-                self.copy_runtime_artifact_for_delivery(
+            let attachment = self
+                .copy_runtime_artifact_for_delivery(
                     &artifact_root_canonical,
                     &delivery_root,
                     artifact,
                 )
-                .await?,
-            );
+                .await?;
+            attachments.push(attachment);
         }
         Ok(attachments)
     }
