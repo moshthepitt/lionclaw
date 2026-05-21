@@ -83,8 +83,19 @@ async fn program_backed_runtime_without_channel_send_escape_gets_no_socket_env()
 
 #[tokio::test]
 async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_delivery() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "local-cli", "runtime-channel-send-happy").await;
+    let socket_dir = env.home().runtime_dir().join("sockets");
+    tokio::fs::create_dir_all(&socket_dir)
+        .await
+        .expect("create loose socket dir");
+    #[cfg(unix)]
+    tokio::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o755))
+        .await
+        .expect("loosen socket dir permissions");
     let kernel = kernel_with_channel_send_preset(&env, true).await;
     let responses = Arc::new(Mutex::new(Vec::new()));
     let socket_paths = Arc::new(Mutex::new(Vec::new()));
@@ -165,12 +176,24 @@ async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_deliver
         Some("text/plain")
     );
 
-    let sockets = socket_paths.lock().expect("socket paths lock");
-    let socket = &sockets[0];
+    let socket = {
+        let sockets = socket_paths.lock().expect("socket paths lock");
+        sockets[0].clone()
+    };
     assert!(
         !socket.exists(),
         "channel.send socket should be removed after turn completion"
     );
+    #[cfg(unix)]
+    {
+        let mode = tokio::fs::metadata(&socket_dir)
+            .await
+            .expect("socket dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "channel.send socket directory is private");
+    }
 }
 
 #[tokio::test]

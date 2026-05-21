@@ -8315,6 +8315,27 @@ async fn ensure_staged_attachment_file_is_safe(path: &Path) -> Result<(), Kernel
     Ok(())
 }
 
+#[cfg(unix)]
+async fn ensure_owner_private_directory(path: &Path) -> Result<(), KernelError> {
+    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+
+    ensure_existing_directory_is_safe(path).await?;
+    tokio::fs::set_permissions(path, Permissions::from_mode(0o700))
+        .await
+        .map_err(|err| {
+            KernelError::Internal(format!(
+                "failed to make runtime storage directory '{}' private: {err}",
+                path.display()
+            ))
+        })?;
+    ensure_existing_directory_is_safe(path).await
+}
+
+#[cfg(not(unix))]
+async fn ensure_owner_private_directory(path: &Path) -> Result<(), KernelError> {
+    ensure_existing_directory_is_safe(path).await
+}
+
 async fn remove_file_best_effort(path: &Path) {
     match tokio::fs::remove_file(path).await {
         Ok(()) => {}
@@ -11068,6 +11089,7 @@ impl Kernel {
             )
         })?;
         let socket_dir = ensure_safe_child_directory(socket_root, &["sockets"]).await?;
+        ensure_owner_private_directory(&socket_dir).await?;
         let socket_path =
             socket_dir.join(format!("channel-send-{}.sock", context.turn_id.simple()));
         remove_file_best_effort(&socket_path).await;
