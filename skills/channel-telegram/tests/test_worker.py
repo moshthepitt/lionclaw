@@ -3003,6 +3003,59 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(processed)
         self.assertEqual([update.text for update in api.sent_inbound], ["auto flush"])
 
+    async def test_pending_webhook_batches_are_rejected_on_worker_shutdown(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=api,
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            item = ProviderWorkItem(
+                (888,),
+                TelegramInboundUpdate(
+                    update_id=888,
+                    event_id="telegram:update:888",
+                    sender_ref="telegram:user:77",
+                    conversation_ref="telegram:chat:77",
+                    message_ref="telegram:message:188",
+                    thread_ref=None,
+                    text="pending shutdown",
+                    trigger="dm",
+                    provider_metadata={
+                        "provider": "telegram",
+                        "update_id": 888,
+                        "chat_type": "private",
+                        "message_date_epoch": 0,
+                    },
+                ),
+            )
+            key = _webhook_batch_key(item.event)
+            assert key is not None
+
+            with patch(
+                "lionclaw_channel_telegram.worker.WEBHOOK_COALESCE_DELAY_SECONDS",
+                60.0,
+            ):
+                result = await worker._enqueue_webhook_batch(key, item)
+            batch = next(iter(worker._webhook_batches.values()))
+            flush_task = batch.flush_task
+            assert flush_task is not None
+
+            await worker._reject_all_webhook_batches()
+
+        self.assertFalse(await result)
+        self.assertEqual(api.sent_inbound, [])
+        self.assertEqual(worker._webhook_batches, {})
+        self.assertTrue(flush_task.done())
+
     async def test_webhook_batch_enqueue_blocks_later_batches_after_failure(
         self,
     ) -> None:

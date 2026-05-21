@@ -987,6 +987,25 @@ class TelegramWorker:
         if not batch.result.done():
             batch.result.set_result(False)
 
+    async def _reject_all_webhook_batches(self) -> None:
+        async with self._webhook_state_lock:
+            batches = list(self._webhook_batches.values())
+            self._webhook_batches.clear()
+        flush_tasks: list[asyncio.Task[None]] = []
+        for batch in batches:
+            task = batch.flush_task
+            if (
+                task is not None
+                and not task.done()
+                and task is not asyncio.current_task()
+            ):
+                task.cancel()
+                flush_tasks.append(task)
+            if not batch.result.done():
+                batch.result.set_result(False)
+        if flush_tasks:
+            await asyncio.gather(*flush_tasks, return_exceptions=True)
+
     async def _reject_later_webhook_route_batches(
         self,
         batch: WebhookBatch,
@@ -1131,6 +1150,7 @@ class TelegramWorker:
             self._typing_deadlines.clear()
             self._typing_routes.clear()
             self._typing_failures.clear()
+            await self._reject_all_webhook_batches()
             self._active_turns.clear()
             self._pending_progress_deletes.clear()
             self._route_turns.clear()
