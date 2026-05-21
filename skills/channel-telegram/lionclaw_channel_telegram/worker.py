@@ -1265,6 +1265,12 @@ class TelegramWorker:
         if active is None:
             await self._reply(update, "No active LionClaw turn is running here.")
             return
+        if active.sender_ref != update.sender_ref:
+            await self._reply(
+                update,
+                "Only the user who started that turn can stop it.",
+            )
+            return
         if active.session_id is None or active.session_key is None:
             await self._reply(update, "This turn cannot be stopped yet.")
             return

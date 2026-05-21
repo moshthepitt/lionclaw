@@ -4245,6 +4245,77 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(telegram.sent_messages[-1][1], "Stopping...")
 
+    async def test_stop_command_from_different_sender_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 934,
+                            "message": {
+                                "message_id": 34,
+                                "date": 0,
+                                "chat": {
+                                    "id": -10077,
+                                    "type": "supergroup",
+                                    "is_forum": True,
+                                },
+                                "from": {
+                                    "id": 88,
+                                    "is_bot": False,
+                                    "first_name": "Bob",
+                                },
+                                "message_thread_id": 77,
+                                "is_topic_message": True,
+                                "text": "/stop@lionclaw_bot",
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len("/stop@lionclaw_bot"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            await worker._remember_active_turn(
+                TelegramInboundUpdate(
+                    update_id=933,
+                    event_id="telegram:update:933",
+                    sender_ref="telegram:user:77",
+                    conversation_ref="telegram:chat:-10077",
+                    thread_ref="telegram:topic:77",
+                    message_ref="telegram:message:33",
+                    text="slow",
+                    trigger="thread_continuation",
+                    provider_metadata={"chat_type": "supergroup"},
+                ),
+                InboundResponse(
+                    outcome="queued",
+                    turn_id="turn-1",
+                    session_id="session-1",
+                    session_key="channel:telegram:thread:-10077:77",
+                ),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(api.cancel_calls, [])
+        self.assertIn("turn-1", worker._active_turns)
+        self.assertEqual(
+            telegram.sent_messages[-1][1],
+            "Only the user who started that turn can stop it.",
+        )
+
     async def test_topic_stop_does_not_fall_back_to_unthreaded_chat_turn(
         self,
     ) -> None:
