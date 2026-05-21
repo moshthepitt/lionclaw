@@ -129,7 +129,7 @@ REACTION_FAILED = "😢"
 
 @dataclass(slots=True, frozen=True)
 class OwnedUpdateWaitResult:
-    processed: bool
+    succeeded: bool
     was_cancelled: bool
 
 
@@ -858,14 +858,21 @@ class TelegramWorker:
                         ),
                     )
                     restore_cancellation = result.was_cancelled
-                    processed = result.processed
+                    processed = result.succeeded
                     if not processed:
                         failure = RuntimeError("webhook update processing failed")
+                except asyncio.CancelledError:
+                    restore_cancellation = True
                 except Exception as err:
                     failure = err
                     logger.exception("telegram webhook update processing failed")
         finally:
-            accepted = await self._finish_webhook_update(update.update_id, processed)
+            result = await self._finish_owned_webhook_update(
+                update.update_id,
+                processed,
+            )
+            accepted = result.succeeded
+            restore_cancellation = restore_cancellation or result.was_cancelled
 
         if accepted:
             self._record_webhook_result(True)
@@ -919,6 +926,22 @@ class TelegramWorker:
         if result is not None and not result.done():
             result.set_result(accepted)
         return accepted
+
+    async def _finish_owned_webhook_update(
+        self,
+        update_id: int,
+        processed: bool,
+    ) -> OwnedUpdateWaitResult:
+        finishing = asyncio.create_task(
+            self._finish_webhook_update(update_id, processed),
+            name="telegram-webhook-finish",
+        )
+        return await self._wait_for_owned_update_result(
+            finishing,
+            cancellation_message=(
+                "telegram webhook finish wait cancelled; preserving update ownership"
+            ),
+        )
 
     async def _accept_webhook_update_ids(
         self,
@@ -981,7 +1004,7 @@ class TelegramWorker:
         )
         if result.was_cancelled:
             raise asyncio.CancelledError
-        return result.processed
+        return result.succeeded
 
     async def _wait_for_owned_update_result(
         self,
@@ -994,7 +1017,7 @@ class TelegramWorker:
         while True:
             try:
                 return OwnedUpdateWaitResult(
-                    processed=await asyncio.shield(result),
+                    succeeded=await asyncio.shield(result),
                     was_cancelled=was_cancelled,
                 )
             except asyncio.CancelledError:
