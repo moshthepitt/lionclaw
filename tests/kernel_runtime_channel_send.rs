@@ -299,6 +299,16 @@ async fn channel_send_bridge_returns_structured_validation_errors() {
                         }
                     }),
                     json!({
+                        "idempotency_key": "attachment-missing-path",
+                        "channel_id": "local-cli",
+                        "conversation_ref": "member:reviewer",
+                        "content": {
+                            "text": "hello",
+                            "format_hint": "plain",
+                            "attachments": [{}]
+                        }
+                    }),
+                    json!({
                         "idempotency_key": "attachment-symlink-escape",
                         "channel_id": "local-cli",
                         "conversation_ref": "member:reviewer",
@@ -332,7 +342,7 @@ async fn channel_send_bridge_returns_structured_validation_errors() {
         .expect("turn should complete");
 
     let responses = responses.lock().expect("responses lock").clone();
-    assert_eq!(responses.len(), 5);
+    assert_eq!(responses.len(), 6);
     assert_eq!(responses[0]["ok"].as_bool(), Some(false));
     assert_eq!(
         responses[0]["error"]["code"].as_str(),
@@ -358,6 +368,14 @@ async fn channel_send_bridge_returns_structured_validation_errors() {
         responses[4]["error"]["code"].as_str(),
         Some("invalid_attachment")
     );
+    assert_eq!(responses[5]["ok"].as_bool(), Some(false));
+    assert_eq!(
+        responses[5]["error"]["code"].as_str(),
+        Some("invalid_attachment")
+    );
+    assert!(responses[4]["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("attachment path is required")));
 
     let outbox = kernel
         .pull_channel_outbox(ChannelOutboxPullRequest {

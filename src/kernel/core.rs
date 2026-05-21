@@ -210,6 +210,7 @@ struct RuntimeChannelSendContent {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct RuntimeChannelSendAttachment {
+    #[serde(default)]
     path: String,
     #[serde(default)]
     filename: Option<String>,
