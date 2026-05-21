@@ -7360,17 +7360,17 @@ fn open_runtime_artifact_source(
     open_regular_file_beneath_root(artifact_root, &relative, &artifact.path)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn open_regular_file_beneath_root(
     root: &Path,
     relative: &Path,
     display_path: &Path,
 ) -> Result<std::fs::File, KernelError> {
-    use rustix::fs::{open, openat2, Mode, OFlags, ResolveFlags};
+    use rustix::fs::{open, openat, Mode, OFlags};
 
-    let root = open(
+    let mut dir = open(
         root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
     .map_err(|err| {
@@ -7379,36 +7379,68 @@ fn open_regular_file_beneath_root(
             root.display()
         ))
     })?;
-    let file = openat2(
-        &root,
-        relative,
-        OFlags::RDONLY | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
-    )
-    .map_err(|err| {
-        KernelError::Runtime(format!(
-            "runtime artifact '{}' is not readable: {err}",
-            display_path.display()
-        ))
-    })?;
-    let file = std::fs::File::from(file);
-    let metadata = file.metadata().map_err(|err| {
-        KernelError::Runtime(format!(
-            "runtime artifact '{}' is not readable: {err}",
-            display_path.display()
-        ))
-    })?;
-    if !metadata.is_file() {
-        return Err(KernelError::Runtime(format!(
-            "runtime artifact '{}' is not a regular file",
-            display_path.display()
-        )));
+
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(KernelError::Runtime(format!(
+                "runtime artifact '{}' is outside the runtime root",
+                display_path.display()
+            )));
+        };
+        let name = Path::new(name);
+        if components.peek().is_some() {
+            let next_dir = openat(
+                &dir,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|err| {
+                KernelError::Runtime(format!(
+                    "runtime artifact '{}' is not readable: {err}",
+                    display_path.display()
+                ))
+            })?;
+            dir = next_dir;
+            continue;
+        }
+
+        let file = openat(
+            &dir,
+            name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|err| {
+            KernelError::Runtime(format!(
+                "runtime artifact '{}' is not readable: {err}",
+                display_path.display()
+            ))
+        })?;
+        let file = std::fs::File::from(file);
+        let metadata = file.metadata().map_err(|err| {
+            KernelError::Runtime(format!(
+                "runtime artifact '{}' is not readable: {err}",
+                display_path.display()
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(KernelError::Runtime(format!(
+                "runtime artifact '{}' is not a regular file",
+                display_path.display()
+            )));
+        }
+        return Ok(file);
     }
-    Ok(file)
+
+    Err(KernelError::Runtime(format!(
+        "runtime artifact '{}' is not a regular file",
+        display_path.display()
+    )))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn open_regular_file_beneath_root(
     root: &Path,
     relative: &Path,
