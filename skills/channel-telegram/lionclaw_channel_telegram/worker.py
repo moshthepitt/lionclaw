@@ -267,18 +267,16 @@ class OffsetStore:
     path: Path
 
     def load(self) -> int:
-        if not self.path.exists():
+        text = _read_private_store_text(self.path, "offset")
+        if text is None:
             return 0
-        raw_value = self.path.read_text(encoding="utf-8").strip()
+        raw_value = text.strip()
         if raw_value.isdigit():
             return int(raw_value)
         return 0
 
     def save(self, offset: int) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_name(f".{self.path.name}.tmp")
-        tmp_path.write_text(str(offset), encoding="utf-8")
-        tmp_path.replace(self.path)
+        _write_private_store_text(self.path, str(offset))
 
 
 @dataclass(slots=True, frozen=True)
@@ -3361,8 +3359,6 @@ def _safe_loop_time() -> float:
 
 async def run() -> None:
     config = WorkerConfig.from_env()
-    config.runtime_dir.mkdir(parents=True, exist_ok=True)
-    config.telegram_offset_file.parent.mkdir(parents=True, exist_ok=True)
 
     lionclaw_api = LionClawApi(
         base_url=config.lionclaw_base_url,

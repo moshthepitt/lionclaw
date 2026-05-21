@@ -1403,6 +1403,40 @@ class OffsetStoreTests(unittest.TestCase):
             self.assertEqual(store.load(), 43)
             self.assertEqual(path.read_text(encoding="utf-8"), "43")
             self.assertFalse((path.parent / ".telegram.offset.tmp").exists())
+            self.assertEqual(_file_mode(path), 0o600)
+
+    def test_load_hardens_existing_offset_file_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "telegram.offset"
+            path.write_text("42", encoding="utf-8")
+            path.chmod(0o644)
+
+            self.assertEqual(OffsetStore(path).load(), 42)
+
+            self.assertEqual(_file_mode(path), 0o600)
+
+    def test_load_rejects_symlinked_offset_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "external.offset"
+            target.write_text("42", encoding="utf-8")
+            path = Path(temp_dir) / "telegram.offset"
+            path.symlink_to(target)
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="WARNING"):
+                loaded = OffsetStore(path).load()
+
+            self.assertEqual(loaded, 0)
+
+    def test_save_rejects_intermediate_symlinked_offset_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target_dir = Path(temp_dir) / "external"
+            target_dir.mkdir()
+            (target_dir / "nested").mkdir()
+            link_dir = Path(temp_dir) / "linked"
+            link_dir.symlink_to(target_dir, target_is_directory=True)
+
+            with self.assertRaises(OSError):
+                OffsetStore(link_dir / "nested" / "telegram.offset").save(42)
 
 
 class OutboxReceiptStoreTests(unittest.TestCase):
