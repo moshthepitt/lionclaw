@@ -184,14 +184,18 @@ impl RuntimeChannelSendContext {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct RuntimeChannelSendRequest {
+    #[serde(default)]
     idempotency_key: String,
+    #[serde(default)]
     channel_id: String,
+    #[serde(default)]
     conversation_ref: String,
     #[serde(default)]
     thread_ref: Option<String>,
     #[serde(default)]
     reply_to_ref: Option<String>,
-    content: RuntimeChannelSendContent,
+    #[serde(default)]
+    content: Option<RuntimeChannelSendContent>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -8888,10 +8892,9 @@ fn runtime_channel_send_fingerprint(
     thread_ref: Option<&str>,
     reply_to_ref: Option<&str>,
     format_hint: &str,
-    request: &RuntimeChannelSendRequest,
+    content: &RuntimeChannelSendContent,
 ) -> Result<String, RuntimeChannelSendProblem> {
-    let attachments = request
-        .content
+    let attachments = content
         .attachments
         .iter()
         .map(|attachment| {
@@ -8908,7 +8911,7 @@ fn runtime_channel_send_fingerprint(
         "thread_ref": thread_ref,
         "reply_to_ref": reply_to_ref,
         "content": {
-            "text": request.content.text,
+            "text": content.text,
             "format_hint": format_hint,
             "attachments": attachments,
         },
@@ -11827,7 +11830,18 @@ impl Kernel {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let format_hint = request.content.format_hint.trim();
+        let Some(content) = request.content.as_ref() else {
+            let problem = RuntimeChannelSendProblem::new("invalid_request", "content is required");
+            self.audit_runtime_channel_send_denied(
+                &context,
+                channel_id,
+                conversation_ref,
+                problem.code,
+            )
+            .await;
+            return Err(problem);
+        };
+        let format_hint = content.format_hint.trim();
         if !matches!(format_hint, "plain" | "markdown" | "html") {
             let problem = RuntimeChannelSendProblem::new(
                 "invalid_format",
@@ -11842,7 +11856,7 @@ impl Kernel {
             .await;
             return Err(problem);
         }
-        if request.content.text.trim().is_empty() && request.content.attachments.is_empty() {
+        if content.text.trim().is_empty() && content.attachments.is_empty() {
             let problem = RuntimeChannelSendProblem::new(
                 "empty_content",
                 "content text or attachments are required",
@@ -11856,7 +11870,7 @@ impl Kernel {
             .await;
             return Err(problem);
         }
-        if request.content.attachments.len() > MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY {
+        if content.attachments.len() > MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY {
             let problem = RuntimeChannelSendProblem::new(
                 "too_many_attachments",
                 format!(
@@ -11891,7 +11905,7 @@ impl Kernel {
             thread_ref,
             reply_to_ref,
             format_hint,
-            &request,
+            content,
         )?;
         let source_id = format!(
             "{}:{}:{idempotency_key}",
@@ -11935,7 +11949,7 @@ impl Kernel {
             ));
         }
 
-        let runtime_artifacts = match runtime_channel_send_artifacts(&context, &request.content) {
+        let runtime_artifacts = match runtime_channel_send_artifacts(&context, content) {
             Ok(artifacts) => artifacts,
             Err(problem) => {
                 self.audit_runtime_channel_send_denied(
@@ -11982,7 +11996,7 @@ impl Kernel {
             }
         };
         let content = ChannelDeliveryContent {
-            text: request.content.text,
+            text: content.text.clone(),
             format_hint: format_hint.to_string(),
             attachments: attachments.as_slice().to_vec(),
         };

@@ -377,6 +377,87 @@ async fn channel_send_bridge_returns_structured_validation_errors() {
 }
 
 #[tokio::test]
+async fn channel_send_bridge_reports_missing_required_fields_as_validation_errors() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-missing-fields").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(ChannelSendProbeRuntime::send_requests(
+                vec![
+                    json!({
+                        "channel_id": "local-cli",
+                        "conversation_ref": "member:reviewer",
+                        "content": {
+                            "text": "hello",
+                            "format_hint": "plain"
+                        }
+                    }),
+                    json!({
+                        "idempotency_key": "missing-channel",
+                        "conversation_ref": "member:reviewer",
+                        "content": {
+                            "text": "hello",
+                            "format_hint": "plain"
+                        }
+                    }),
+                    json!({
+                        "idempotency_key": "missing-conversation",
+                        "channel_id": "local-cli",
+                        "content": {
+                            "text": "hello",
+                            "format_hint": "plain"
+                        }
+                    }),
+                    json!({
+                        "idempotency_key": "missing-content",
+                        "channel_id": "local-cli",
+                        "conversation_ref": "member:reviewer"
+                    }),
+                ],
+                responses.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+                ProbeFileSetup::None,
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-missing-fields").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "send incomplete messages".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let responses = responses.lock().expect("responses lock").clone();
+    assert_eq!(responses.len(), 4);
+    for response in &responses {
+        assert_eq!(response["ok"].as_bool(), Some(false));
+        assert_eq!(response["error"]["code"].as_str(), Some("invalid_request"));
+    }
+    assert!(responses[0]["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("idempotency_key is required")));
+    assert!(responses[1]["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("channel_id is required")));
+    assert!(responses[2]["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("conversation_ref is required")));
+    assert!(responses[3]["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("content is required")));
+}
+
+#[tokio::test]
 async fn channel_send_bridge_socket_is_removed_after_timeout() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "local-cli", "runtime-channel-send-timeout").await;
