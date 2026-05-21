@@ -1335,6 +1335,32 @@ class ActiveTurnStoreTests(unittest.TestCase):
 
             self.assertEqual(loaded, [])
 
+    def test_load_rejects_symlinked_active_turn_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target_dir = Path(temp_dir) / "external"
+            target_dir.mkdir()
+            target_path = target_dir / "telegram.active-turns.json"
+            ActiveTurnStore(target_path).save({"turn-1": self._active_turn()})
+            link_dir = Path(temp_dir) / "linked"
+            link_dir.symlink_to(target_dir, target_is_directory=True)
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="WARNING"):
+                loaded = ActiveTurnStore(link_dir / target_path.name).load()
+
+            self.assertEqual(loaded, [])
+
+    def test_save_rejects_symlinked_active_turn_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target_dir = Path(temp_dir) / "external"
+            target_dir.mkdir()
+            link_dir = Path(temp_dir) / "linked"
+            link_dir.symlink_to(target_dir, target_is_directory=True)
+
+            with self.assertRaises(OSError):
+                ActiveTurnStore(link_dir / "telegram.active-turns.json").save(
+                    {"turn-1": self._active_turn()}
+                )
+
 
 class OffsetStoreTests(unittest.TestCase):
     def test_save_replaces_offset_file_without_leaving_temp_file(self) -> None:

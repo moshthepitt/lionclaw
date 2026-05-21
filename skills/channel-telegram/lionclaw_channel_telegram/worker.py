@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -378,30 +379,34 @@ class ProgressDeleteStore:
 
 
 def _write_private_store_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.tmp")
-    tmp_path.unlink(missing_ok=True)
-    fd = os.open(
-        tmp_path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-        PRIVATE_STORE_FILE_MODE,
-    )
+    dir_fd = _open_private_store_parent(path, create=True)
     try:
-        os.fchmod(fd, PRIVATE_STORE_FILE_MODE)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            fd = -1
-            handle.write(text)
-        tmp_path.replace(path)
+        tmp_name = f".{path.name}.tmp"
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        fd = -1
+        fd = os.open(
+            tmp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | _open_no_follow_flag(),
+            PRIVATE_STORE_FILE_MODE,
+            dir_fd=dir_fd,
+        )
+        try:
+            os.fchmod(fd, PRIVATE_STORE_FILE_MODE)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                fd = -1
+                handle.write(text)
+            os.replace(tmp_name, path.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        finally:
+            if fd >= 0:
+                os.close(fd)
     finally:
-        if fd >= 0:
-            os.close(fd)
+        os.close(dir_fd)
 
 
 def _read_private_store_text(path: Path, store_name: str) -> str | None:
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except FileNotFoundError:
-        return None
+        dir_fd = _open_private_store_parent(path, create=False)
     except OSError as err:
         logger.warning(
             "telegram %s store load rejected path=%s: %s",
@@ -410,27 +415,67 @@ def _read_private_store_text(path: Path, store_name: str) -> str | None:
             err,
         )
         return None
+    if dir_fd is None:
+        return None
 
     try:
-        file_stat = os.fstat(fd)
-        if not stat.S_ISREG(file_stat.st_mode):
+        try:
+            fd = os.open(
+                path.name,
+                os.O_RDONLY | _open_no_follow_flag(),
+                dir_fd=dir_fd,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as err:
             logger.warning(
-                "telegram %s store load rejected non-file path=%s",
+                "telegram %s store load rejected path=%s: %s",
                 store_name,
                 path,
+                err,
             )
             return None
-        if stat.S_IMODE(file_stat.st_mode) != PRIVATE_STORE_FILE_MODE:
-            os.fchmod(fd, PRIVATE_STORE_FILE_MODE)
-        with os.fdopen(fd, "r", encoding="utf-8") as handle:
-            fd = -1
-            return handle.read()
-    except OSError:
-        logger.exception("telegram %s store load failed", store_name)
-        return None
+
+        try:
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                logger.warning(
+                    "telegram %s store load rejected non-file path=%s",
+                    store_name,
+                    path,
+                )
+                return None
+            if stat.S_IMODE(file_stat.st_mode) != PRIVATE_STORE_FILE_MODE:
+                os.fchmod(fd, PRIVATE_STORE_FILE_MODE)
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                fd = -1
+                return handle.read()
+        except OSError:
+            logger.exception("telegram %s store load failed", store_name)
+            return None
+        finally:
+            if fd >= 0:
+                os.close(fd)
     finally:
-        if fd >= 0:
-            os.close(fd)
+        os.close(dir_fd)
+
+
+def _open_private_store_parent(path: Path, *, create: bool) -> int | None:
+    if create:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        try:
+            path.parent.lstat()
+        except FileNotFoundError:
+            return None
+    return os.open(
+        path.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _open_no_follow_flag(),
+    )
+
+
+def _open_no_follow_flag() -> int:
+    return getattr(os, "O_NOFOLLOW", 0)
 
 
 def _active_turn_to_json(turn: ActiveTurn) -> dict[str, object]:
