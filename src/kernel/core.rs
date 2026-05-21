@@ -164,6 +164,7 @@ const CHANNEL_SEND_SOCKET_ENV: &str = "LIONCLAW_CHANNEL_SEND_SOCKET";
 const CHANNEL_SEND_SOCKET_CONTAINER_PATH: &str = "/runtime/lionclaw/channel-send.sock";
 const CHANNEL_SEND_SOCKET_DIR: &str = "lionclaw";
 const MAX_RUNTIME_CHANNEL_SEND_REQUEST_BYTES: usize = 64 * 1024;
+const RUNTIME_CHANNEL_SEND_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_CHANNEL_SEND_SOURCE_KIND: &str = "runtime_channel_send";
 
 #[derive(Debug, Clone)]
@@ -275,6 +276,47 @@ impl PreparedChannelDeliveryAttachments {
 
     fn mark_persisted(&mut self) {
         self.persisted = true;
+    }
+}
+
+#[derive(Debug)]
+struct ReservedArtifactDestination {
+    path: PathBuf,
+    persisted: bool,
+}
+
+impl ReservedArtifactDestination {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            persisted: false,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn persist(mut self) -> PathBuf {
+        self.persisted = true;
+        self.path.clone()
+    }
+}
+
+impl Drop for ReservedArtifactDestination {
+    fn drop(&mut self) {
+        if self.persisted {
+            return;
+        }
+        if let Err(err) = std::fs::remove_file(&self.path) {
+            if err.kind() != ErrorKind::NotFound {
+                warn!(
+                    ?err,
+                    path = %self.path.display(),
+                    "failed to remove unpersisted runtime artifact destination"
+                );
+            }
+        }
     }
 }
 
@@ -5933,6 +5975,35 @@ mod tests {
             .expect("check reserved destination cleanup"));
     }
 
+    #[test]
+    fn reserved_artifact_destination_removes_unpersisted_file() {
+        let temp_dir = tempdir().expect("temp dir");
+        let destination = temp_dir.path().join("partial.txt");
+        fs::write(&destination, b"partial").expect("write partial destination");
+
+        drop(ReservedArtifactDestination::new(destination.clone()));
+
+        assert!(
+            !destination.exists(),
+            "dropping an unpersisted reservation should remove the file"
+        );
+    }
+
+    #[test]
+    fn reserved_artifact_destination_persist_keeps_file() {
+        let temp_dir = tempdir().expect("temp dir");
+        let destination = temp_dir.path().join("complete.txt");
+        fs::write(&destination, b"complete").expect("write complete destination");
+
+        let persisted = ReservedArtifactDestination::new(destination.clone()).persist();
+
+        assert_eq!(persisted, destination);
+        assert!(
+            persisted.exists(),
+            "persisting a reservation should leave the file in place"
+        );
+    }
+
     async fn kernel_with_home(home: &LionClawHome) -> Kernel {
         let applied_state = AppliedState::load(home).await.expect("load applied state");
         Kernel::new_with_options(
@@ -7307,6 +7378,7 @@ async fn copy_file_to_unique_child(
                 )));
             }
         };
+        let reserved_destination = ReservedArtifactDestination::new(candidate);
 
         let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
         let mut source = tokio::fs::File::from_std(source).take(max_bytes_u64.saturating_add(1));
@@ -7314,29 +7386,26 @@ async fn copy_file_to_unique_child(
         let copied = match tokio::io::copy(&mut source, &mut destination).await {
             Ok(copied) => copied,
             Err(err) => {
-                remove_file_best_effort(&candidate).await;
                 return Err(KernelError::Runtime(format!(
                     "failed to copy runtime artifact '{}' to '{}': {err}",
                     source_label.display(),
-                    candidate.display()
+                    reserved_destination.path().display()
                 )));
             }
         };
         if copied > max_bytes_u64 {
-            remove_file_best_effort(&candidate).await;
             return Err(KernelError::BadRequest(format!(
                 "runtime artifact '{}' exceeds {max_bytes} bytes",
                 source_label.display()
             )));
         }
         if let Err(err) = destination.flush().await {
-            remove_file_best_effort(&candidate).await;
             return Err(KernelError::Runtime(format!(
                 "failed to flush runtime artifact destination '{}': {err}",
-                candidate.display()
+                reserved_destination.path().display()
             )));
         }
-        return Ok(candidate);
+        return Ok(reserved_destination.persist());
     }
     Err(KernelError::Conflict(format!(
         "could not allocate a unique artifact filename under '{}'",
@@ -8680,17 +8749,11 @@ async fn run_runtime_channel_send_bridge(
                         let kernel = kernel.clone();
                         let context = context.clone();
                         streams.spawn(async move {
-                            match timeout(
-                                Duration::from_secs(5),
-                                handle_runtime_channel_send_stream(kernel, context, stream),
-                            )
-                            .await {
-                                Ok(Ok(())) => {}
-                                Ok(Err(err)) => {
-                                    warn!(?err, "failed to handle runtime channel.send request");
-                                }
+                            match handle_runtime_channel_send_stream(kernel, context, stream).await
+                            {
+                                Ok(()) => {}
                                 Err(err) => {
-                                    warn!(?err, "runtime channel.send request timed out");
+                                    warn!(?err, "failed to handle runtime channel.send request");
                                 }
                             }
                         });
@@ -8717,8 +8780,13 @@ async fn handle_runtime_channel_send_stream(
 ) -> Result<(), std::io::Error> {
     let mut reader = BufReader::new(stream);
     let mut line = Vec::new();
-    let response = match read_bounded_json_line(&mut reader, &mut line).await {
-        Ok(()) => match serde_json::from_slice::<RuntimeChannelSendRequest>(&line) {
+    let response = match timeout(
+        RUNTIME_CHANNEL_SEND_REQUEST_READ_TIMEOUT,
+        read_bounded_json_line(&mut reader, &mut line),
+    )
+    .await
+    {
+        Ok(Ok(())) => match serde_json::from_slice::<RuntimeChannelSendRequest>(&line) {
             Ok(request) => runtime_channel_send_response(
                 kernel.send_runtime_channel_message(context, request).await,
             ),
@@ -8727,7 +8795,14 @@ async fn handle_runtime_channel_send_stream(
                 format!("request is not valid channel.send JSON: {err}"),
             ),
         },
-        Err(problem) => runtime_channel_send_error_response(problem.code, problem.message),
+        Ok(Err(problem)) => runtime_channel_send_error_response(problem.code, problem.message),
+        Err(_) => runtime_channel_send_error_response(
+            "request_timeout",
+            format!(
+                "channel.send request must arrive within {}",
+                format_duration(RUNTIME_CHANNEL_SEND_REQUEST_READ_TIMEOUT)
+            ),
+        ),
     };
 
     let mut stream = reader.into_inner();
