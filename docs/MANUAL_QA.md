@@ -244,15 +244,37 @@ Expected when credentials are available:
   provider files are downloaded before approval
 - Telegram delivery works through the configured runtime after scoped grant
   approval
+- `/help`, `/status`, `/new`, `/stop`, `/retry`, `/continue`, `/model`, and
+  `/settings` behave as documented: Telegram-local commands stay local,
+  `/new`/`/retry`/`/continue` enter LionClaw as canonical controls, and `/model`
+  reaches the runtime
+- inline buttons for status, stop, retry, continue, and new-session acknowledge
+  clicks without leaking controls across chats or forum topics
 - a forum topic with a thread grant keeps replies in the same Telegram topic
 - a conversation grant used inside a topic follows the channel scoped-grant
   behavior from Channels v2
 - a photo, document, voice, or video attachment reaches the runtime under
   `/attachments/...`
+- a rapid burst of short text messages from the same chat is received as one
+  coherent turn when Telegram delivers the updates together
+- a Telegram album is received as one turn with all album attachments, and a
+  runtime-generated two-photo/two-video batch is returned as a native Telegram
+  media group
+- a Telegram location and venue reach the runtime as readable text with
+  structured provider metadata
 - a runtime-generated image is returned to Telegram as a native media
   attachment, even when the runtime final text is empty
 - Markdown in runtime answers renders as Telegram formatting, and local
   workspace links are shown as labels rather than broken Telegram links
+- a long-running turn first shows typing, then one provisional message that is
+  edited in place, then deletes that provisional message when the durable final
+  answer arrives
+- the original inbound Telegram message receives best-effort reactions for
+  accepted, completed, stopped, or failed lifecycle states when reactions are
+  available in that chat
+- webhook mode rejects requests without
+  `X-Telegram-Bot-Api-Secret-Token: <TELEGRAM_WEBHOOK_SECRET_TOKEN>` and accepts
+  the same update when the configured secret is present
 - a retryable Telegram delivery failure survives worker restart and is retried
   through the outbox lease/report flow
 
