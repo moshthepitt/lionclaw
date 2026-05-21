@@ -5842,6 +5842,58 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(telegram.sent_messages[-1][1], "Stopping...")
 
+    async def test_active_turn_save_failure_is_retried(self) -> None:
+        class FailingOnceActiveTurnStore(ActiveTurnStore):
+            def __init__(self, path: Path) -> None:
+                super().__init__(path)
+                self.failures_remaining = 1
+
+            def save(self, active_turns: dict[str, ActiveTurn]) -> None:
+                if self.failures_remaining > 0:
+                    self.failures_remaining -= 1
+                    raise RuntimeError("active turn store unavailable")
+                super().save(active_turns)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = FailingOnceActiveTurnStore(
+                Path(temp_dir) / "telegram.active-turns.json"
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=FakeLionClawApi(),
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                active_turn_store=store,
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker._remember_active_turn(
+                    TelegramInboundUpdate(
+                        update_id=948,
+                        event_id="telegram:update:948",
+                        sender_ref="telegram:user:77",
+                        conversation_ref="telegram:chat:77",
+                        message_ref="telegram:message:48",
+                        text="slow",
+                        trigger="dm",
+                        provider_metadata={"chat_type": "private"},
+                    ),
+                    InboundResponse(
+                        outcome="queued",
+                        turn_id="turn-1",
+                        session_id="session-1",
+                        session_key="channel:telegram:direct:77",
+                    ),
+                )
+            self.assertEqual(store.load(), [])
+
+            await worker.refresh_progress_messages()
+            loaded = store.load()
+
+        self.assertEqual([turn.turn_id for turn in loaded], ["turn-1"])
+        self.assertEqual(loaded[0].session_id, "session-1")
+        self.assertEqual(loaded[0].session_key, "channel:telegram:direct:77")
+
     async def test_stop_failure_removes_new_stopping_progress_message(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi(
@@ -6942,6 +6994,79 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 [("telegram:chat:77", progress_ref)],
             )
             self.assertEqual(delete_store.load(), {})
+
+    async def test_progress_delete_save_failure_is_retried(self) -> None:
+        class FailingOnceProgressDeleteStore(ProgressDeleteStore):
+            def __init__(self, path: Path) -> None:
+                super().__init__(path)
+                self.failures_remaining = 1
+
+            def save(
+                self,
+                pending: dict[tuple[str, str], PendingProgressDelete],
+            ) -> None:
+                if self.failures_remaining > 0:
+                    self.failures_remaining -= 1
+                    raise RuntimeError("progress delete store unavailable")
+                super().save(pending)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            delete_store = FailingOnceProgressDeleteStore(
+                Path(temp_dir) / "telegram.progress-deletes.json"
+            )
+            first_telegram = FakeTelegramTransport(
+                delete_errors=[RuntimeError("temporary delete failure")]
+            )
+            first_worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=FakeLionClawApi(),
+                telegram=first_telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                progress_delete_store=delete_store,
+            )
+            progress_ref = await self._remember_visible_progress(first_worker)
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await first_worker._process_outbox_delivery(
+                    OutboxDelivery(
+                        delivery_id="delivery-1",
+                        attempt_id="attempt-1",
+                        conversation_ref="telegram:chat:77",
+                        turn_id="turn-1",
+                        content=OutboxContent(text="final answer"),
+                    )
+                )
+            self.assertEqual(delete_store.load(), {})
+
+            await first_worker.refresh_progress_messages()
+            self.assertEqual(
+                delete_store.load(),
+                {
+                    ("telegram:chat:77", progress_ref): PendingProgressDelete(
+                        turn_id="turn-1",
+                        conversation_ref="telegram:chat:77",
+                        message_ref=progress_ref,
+                        attempts=1,
+                        next_attempt_at=0.0,
+                    )
+                },
+            )
+
+            second_telegram = FakeTelegramTransport()
+            second_worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=FakeLionClawApi(),
+                telegram=second_telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                progress_delete_store=delete_store,
+            )
+            await second_worker.refresh_progress_messages()
+
+        self.assertEqual(
+            second_telegram.deleted_messages,
+            [("telegram:chat:77", progress_ref)],
+        )
+        self.assertEqual(delete_store.load(), {})
 
     async def test_permanent_progress_delete_failure_is_not_retried(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

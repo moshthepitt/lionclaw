@@ -744,9 +744,11 @@ class TelegramWorker:
         self._active_turns: dict[str, ActiveTurn] = {
             turn.turn_id: turn for turn in loaded_active_turns if not turn.terminal
         }
+        self._active_turns_dirty = False
         self._pending_progress_deletes: dict[tuple[str, str], PendingProgressDelete] = (
             progress_delete_store.load() if progress_delete_store is not None else {}
         )
+        self._pending_progress_deletes_dirty = False
         self._route_turns: dict[tuple[str, str | None], str] = {
             turn.target.key: turn.turn_id for turn in self._active_turns.values()
         }
@@ -2105,6 +2107,7 @@ class TelegramWorker:
             )
 
     async def refresh_progress_messages(self) -> None:
+        self._flush_active_turns()
         await self._retry_pending_progress_deletes()
         for turn in list(self._active_turns.values()):
             if turn.terminal:
@@ -2221,6 +2224,7 @@ class TelegramWorker:
         return False
 
     async def _retry_pending_progress_deletes(self) -> None:
+        self._flush_pending_progress_deletes()
         now = _loop_time()
         for pending in list(self._pending_progress_deletes.values()):
             if pending.next_attempt_at > now:
@@ -2266,17 +2270,34 @@ class TelegramWorker:
         if self._pending_progress_deletes.pop(key, None) is not None:
             self._save_pending_progress_deletes()
 
-    def _save_pending_progress_deletes(self) -> None:
+    def _save_pending_progress_deletes(self) -> bool:
+        self._pending_progress_deletes_dirty = True
+        return self._flush_pending_progress_deletes()
+
+    def _flush_pending_progress_deletes(self) -> bool:
+        if not self._pending_progress_deletes_dirty:
+            return True
         if self.progress_delete_store is None:
-            return
+            self._pending_progress_deletes_dirty = False
+            return True
         try:
             self.progress_delete_store.save(self._pending_progress_deletes)
         except Exception:
             logger.exception("telegram progress delete store save failed")
+            return False
+        self._pending_progress_deletes_dirty = False
+        return True
 
-    def _save_active_turns(self) -> None:
+    def _save_active_turns(self) -> bool:
+        self._active_turns_dirty = True
+        return self._flush_active_turns()
+
+    def _flush_active_turns(self) -> bool:
+        if not self._active_turns_dirty:
+            return True
         if self.active_turn_store is None:
-            return
+            self._active_turns_dirty = False
+            return True
         try:
             active_turns = {
                 turn_id: turn
@@ -2286,6 +2307,9 @@ class TelegramWorker:
             self.active_turn_store.save(active_turns)
         except Exception:
             logger.exception("telegram active turn store save failed")
+            return False
+        self._active_turns_dirty = False
+        return True
 
     def _update_progress_status(self, event: StreamEvent) -> None:
         turn = self._active_turns.get(event.turn_id)
