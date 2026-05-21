@@ -204,6 +204,36 @@ This broker is not the normal filesystem and shell path for program-backed
 runtimes. It is reserved for explicit LionClaw-owned actions, direct runtimes,
 narrow non-runtime surfaces, and tests.
 
+## Program-Backed `channel.send`
+
+Program-backed runtimes use a turn-scoped Unix socket for outbound channel
+delivery. When the effective execution preset includes `channel-send`, the
+kernel exposes `LIONCLAW_CHANNEL_SEND_SOCKET` and mounts a LionClaw-owned socket
+at `/runtime/lionclaw/channel-send.sock`. Without that escape class, the
+environment variable and usable socket are absent.
+
+The protocol is one request per connection: write one newline-delimited JSON
+object, read one newline-delimited JSON object, then close. The request names a
+configured channel route, provider-neutral content, and an idempotency key.
+Attachment content is not sent over the socket; the request names files under
+`/runtime`, and the kernel reuses the existing runtime-artifact copy and outbox
+attachment path.
+
+The bridge is transport only. The kernel validates the current session and turn
+from its own execution context, checks the active channel binding, normalizes
+route fields, enforces `plain`/`markdown`/`html` format hints, copies any
+attachments into LionClaw-owned outbox storage, and creates a normal durable
+channel outbox delivery. Channel workers continue to lease and report those
+deliveries through `/v0/channels/outbox/pull` and
+`/v0/channels/outbox/report`.
+
+Idempotency lives on the outbox row. Runtime channel sends use
+`source_kind = "runtime_channel_send"`, a source id scoped to
+`session_id`, `turn_id`, and the runtime idempotency key, plus a canonical
+request fingerprint. Retrying the same key with the same payload returns the
+same delivery id; reusing the key with a different payload returns a structured
+conflict error.
+
 ## Execution Plan And Confined Layout
 
 The everyday runtime layout is mount-first:
@@ -649,9 +679,10 @@ home.
 7. Ordinary confined runtime file work stays inside mounted work-root, runtime,
    and drafts paths.
 8. Kernel brokers are reserved for explicit side effects and direct-runtime
-   requests. `channel.send` records metadata-only outbound entries and appends
-   typed stream events. `net.egress`, `secret.request`, and `scheduler.run`
-   remain broker-gated and denied until configured.
+   requests. Program-backed `channel.send` uses an explicit preset-gated
+   runtime socket and enqueues provider-neutral outbox deliveries only.
+   `net.egress`, `secret.request`, and `scheduler.run` remain broker-gated and
+   denied until configured.
 9. Audit covers API mutations, runtime plan allow/deny, runtime
    start/finish/error/timeout, channel lifecycle events, scheduler events, and
    brokered capability decisions.
