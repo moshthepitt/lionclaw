@@ -37,15 +37,23 @@ class TelegramWebhookServer:
         app.router.add_post(self._config.telegram_webhook_path, self._handle)
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
-        site = web.TCPSite(
-            runner,
-            host=self._config.telegram_webhook_host,
-            port=self._config.telegram_webhook_port,
-        )
-        await site.start()
-        self._runner = runner
-        self._site = site
-        self._record_bound_address(site)
+        try:
+            site = web.TCPSite(
+                runner,
+                host=self._config.telegram_webhook_host,
+                port=self._config.telegram_webhook_port,
+            )
+            await site.start()
+            self._runner = runner
+            self._site = site
+            self._record_bound_address(site)
+        except Exception:
+            await runner.cleanup()
+            self._runner = None
+            self._site = None
+            self.bound_host = None
+            self.bound_port = None
+            raise
         logger.info(
             "telegram webhook server listening on %s:%s%s",
             self.bound_host or self._config.telegram_webhook_host,
@@ -54,12 +62,15 @@ class TelegramWebhookServer:
         )
 
     async def close(self) -> None:
-        if self._runner is not None:
-            await self._runner.cleanup()
-        self._runner = None
-        self._site = None
-        self.bound_host = None
-        self.bound_port = None
+        runner = self._runner
+        try:
+            if runner is not None:
+                await runner.cleanup()
+        finally:
+            self._runner = None
+            self._site = None
+            self.bound_host = None
+            self.bound_port = None
 
     async def _handle(self, request: web.Request) -> web.Response:
         if not self._secret_token_matches(request):

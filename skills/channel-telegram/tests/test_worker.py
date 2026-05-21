@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from aiogram.exceptions import TelegramBadRequest
@@ -6645,6 +6645,77 @@ class AiogramTelegramTransportTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TelegramWebhookServerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_webhook_start_cleans_runner_when_site_start_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+
+            async def handle(update: Update) -> bool:
+                return True
+
+            server = TelegramWebhookServer(
+                replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_port=0,
+                    telegram_webhook_path="/hook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                handle,
+            )
+            start_error = RuntimeError("bind failed")
+            cleanup = AsyncMock()
+
+            with (
+                patch(
+                    "lionclaw_channel_telegram.webhook.web.TCPSite.start",
+                    AsyncMock(side_effect=start_error),
+                ),
+                patch(
+                    "lionclaw_channel_telegram.webhook.web.AppRunner.cleanup",
+                    cleanup,
+                ),
+                self.assertRaisesRegex(RuntimeError, "bind failed"),
+            ):
+                await server.start()
+
+        cleanup.assert_awaited_once()
+        self.assertIsNone(server._runner)
+        self.assertIsNone(server._site)
+        self.assertIsNone(server.bound_host)
+        self.assertIsNone(server.bound_port)
+
+    async def test_webhook_close_clears_state_when_cleanup_fails(self) -> None:
+        class FailingRunner:
+            async def cleanup(self) -> None:
+                raise RuntimeError("cleanup failed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+
+            async def handle(update: Update) -> bool:
+                return True
+
+            server = TelegramWebhookServer(
+                replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_port=0,
+                    telegram_webhook_path="/hook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                handle,
+            )
+            server._runner = FailingRunner()
+            server._site = object()
+            server.bound_host = "127.0.0.1"
+            server.bound_port = 8080
+
+            with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
+                await server.close()
+
+        self.assertIsNone(server._runner)
+        self.assertIsNone(server._site)
+        self.assertIsNone(server.bound_host)
+        self.assertIsNone(server.bound_port)
+
     async def test_webhook_rejects_missing_secret_token(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             handled: list[Update] = []
