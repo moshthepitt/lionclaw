@@ -14,6 +14,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     BotCommand,
     FSInputFile,
+    InaccessibleMessage,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
@@ -732,24 +733,38 @@ def _extract_callback_action(
     if callback is None or not isinstance(callback.data, str):
         return None
     message = _callback_query_message(update)
-    if message is None:
-        return None
-    metadata = _provider_metadata(
-        message,
-        update_id=update.update_id,
-        source="callback_query",
-        edited=False,
-        bot_identity=bot_identity,
-    )
+    if message is not None:
+        metadata = _provider_metadata(
+            message,
+            update_id=update.update_id,
+            source="callback_query",
+            edited=False,
+            bot_identity=bot_identity,
+        )
+        conversation_ref = _conversation_ref(message)
+        thread_ref = _thread_ref(message)
+        message_ref = _message_ref(message)
+    else:
+        inaccessible = _callback_query_inaccessible_message(update)
+        if inaccessible is None:
+            return None
+        metadata = _inaccessible_callback_metadata(
+            inaccessible,
+            update_id=update.update_id,
+            bot_identity=bot_identity,
+        )
+        conversation_ref = _conversation_ref_from_chat_id(inaccessible.chat.id)
+        thread_ref = None
+        message_ref = _message_ref_from_id(inaccessible.message_id)
     metadata["callback_query_id"] = callback.id
     return TelegramCallbackAction(
         update_id=update.update_id,
         callback_query_id=callback.id,
         action=callback.data,
         sender_ref=f"telegram:user:{callback.from_user.id}",
-        conversation_ref=_conversation_ref(message),
-        thread_ref=_thread_ref(message),
-        message_ref=_message_ref(message),
+        conversation_ref=conversation_ref,
+        thread_ref=thread_ref,
+        message_ref=message_ref,
         provider_metadata=metadata,
     )
 
@@ -773,6 +788,16 @@ def _callback_query_message(update: Update) -> Message | None:
         return None
     message = callback.message
     if isinstance(message, Message):
+        return message
+    return None
+
+
+def _callback_query_inaccessible_message(update: Update) -> InaccessibleMessage | None:
+    callback = update.callback_query
+    if callback is None or not isinstance(callback.data, str):
+        return None
+    message = callback.message
+    if isinstance(message, InaccessibleMessage):
         return message
     return None
 
@@ -938,7 +963,11 @@ def _receipt_from_messages(messages: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _message_ref(message: Message) -> str:
-    return f"telegram:message:{message.message_id}"
+    return _message_ref_from_id(message.message_id)
+
+
+def _message_ref_from_id(message_id: int) -> str:
+    return f"telegram:message:{message_id}"
 
 
 def _reply_to_ref(message: Message) -> str | None:
@@ -948,7 +977,11 @@ def _reply_to_ref(message: Message) -> str | None:
 
 
 def _conversation_ref(message: Message) -> str:
-    return f"telegram:chat:{message.chat.id}"
+    return _conversation_ref_from_chat_id(message.chat.id)
+
+
+def _conversation_ref_from_chat_id(chat_id: int) -> str:
+    return f"telegram:chat:{chat_id}"
 
 
 def _sender_ref(message: Message) -> str:
@@ -1314,6 +1347,28 @@ def _provider_metadata(
     shared_location = _shared_location_metadata(message)
     if shared_location is not None:
         metadata["shared_location"] = shared_location
+    return metadata
+
+
+def _inaccessible_callback_metadata(
+    message: InaccessibleMessage,
+    *,
+    update_id: int,
+    bot_identity: TelegramBotIdentity | None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "provider": "telegram",
+        "update_id": update_id,
+        "source": "callback_query",
+        "edited": False,
+        "chat_id": message.chat.id,
+        "chat_type": str(message.chat.type),
+        "message_id": message.message_id,
+        "message_inaccessible": True,
+        "bot_mentioned": False,
+    }
+    if bot_identity is not None and bot_identity.username is not None:
+        metadata["bot_username"] = bot_identity.username.removeprefix("@").casefold()
     return metadata
 
 

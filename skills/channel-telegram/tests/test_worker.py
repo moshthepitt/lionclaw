@@ -271,6 +271,39 @@ class ExtractInboundEventTests(unittest.TestCase):
         self.assertEqual(mapped.thread_ref, "telegram:topic:77")
         self.assertEqual(mapped.message_ref, "telegram:message:32")
 
+    def test_inaccessible_callback_query_still_maps_to_callback_action(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 133,
+                "callback_query": {
+                    "id": "callback-old",
+                    "from": {"id": 9, "is_bot": False, "first_name": "Nia"},
+                    "chat_instance": "chat-instance",
+                    "data": "lc1:s:turn-1:mac",
+                    "message": {
+                        "message_id": 33,
+                        "date": 0,
+                        "chat": {
+                            "id": -10042,
+                            "type": "supergroup",
+                            "is_forum": True,
+                        },
+                    },
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramCallbackAction)
+        assert isinstance(mapped, TelegramCallbackAction)
+        self.assertEqual(mapped.callback_query_id, "callback-old")
+        self.assertEqual(mapped.sender_ref, "telegram:user:9")
+        self.assertEqual(mapped.conversation_ref, "telegram:chat:-10042")
+        self.assertIsNone(mapped.thread_ref)
+        self.assertEqual(mapped.message_ref, "telegram:message:33")
+        self.assertTrue(mapped.provider_metadata["message_inaccessible"])
+
     def test_edited_message_sets_metadata_without_changing_message_ref(self) -> None:
         update = Update.model_validate(
             {
@@ -4227,6 +4260,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             [button.text for button in telegram.sent_buttons[-1]], ["Stop", "Status"]
         )
         self.assertTrue(telegram.sent_buttons[-1][0].action.startswith("lc1:s:turn-1:"))
+        self.assertTrue(telegram.sent_buttons[-1][1].action.startswith("lc1:t:turn-1:"))
 
     async def test_stop_callback_cancels_active_turn_with_expected_turn_guard(
         self,
@@ -4312,6 +4346,90 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 )
             ],
         )
+
+    async def test_inaccessible_topic_stop_callback_uses_active_turn_route(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            await worker._remember_active_turn(
+                TelegramInboundUpdate(
+                    update_id=946,
+                    event_id="telegram:update:946",
+                    sender_ref="telegram:user:77",
+                    conversation_ref="telegram:chat:-10077",
+                    thread_ref="telegram:topic:77",
+                    message_ref="telegram:message:46",
+                    text="long task",
+                    trigger="thread_continuation",
+                    provider_metadata={"chat_type": "supergroup"},
+                ),
+                InboundResponse(
+                    outcome="queued",
+                    turn_id="turn-1",
+                    session_id="session-1",
+                    session_key="channel:telegram:thread:-10077:77",
+                ),
+            )
+            active = worker._active_turns["turn-1"]
+            stop_payload = worker._callback_payload(
+                "stop",
+                active.target,
+                actor_ref=active.sender_ref,
+                active=active,
+            )
+            telegram.updates = [
+                Update.model_validate(
+                    {
+                        "update_id": 947,
+                        "callback_query": {
+                            "id": "callback-old-stop",
+                            "from": {
+                                "id": 77,
+                                "is_bot": False,
+                                "first_name": "Alice",
+                            },
+                            "chat_instance": "chat-instance",
+                            "data": stop_payload,
+                            "message": {
+                                "message_id": 101,
+                                "date": 0,
+                                "chat": {
+                                    "id": -10077,
+                                    "type": "supergroup",
+                                    "is_forum": True,
+                                },
+                            },
+                        },
+                    }
+                )
+            ]
+
+            await worker.process_updates()
+
+        self.assertEqual(
+            telegram.answered_callbacks[-1],
+            ("callback-old-stop", "Stopping"),
+        )
+        self.assertEqual(
+            api.cancel_calls,
+            [
+                (
+                    "session-1",
+                    "channel:telegram:thread:-10077:77",
+                    "turn-1",
+                    "telegram stop command",
+                )
+            ],
+        )
+        self.assertEqual(telegram.sent_messages[-1][3], "telegram:topic:77")
 
     async def test_progress_status_callback_works_for_active_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

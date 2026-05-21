@@ -1033,6 +1033,12 @@ class TelegramWorker:
             return True
 
         update = _callback_update(callback, text=f"/{parsed.action}")
+        if parsed.target != CALLBACK_ROUTE_TARGET and active is not None:
+            update = replace(
+                update,
+                conversation_ref=active.target.conversation_ref,
+                thread_ref=active.target.thread_ref,
+            )
         if parsed.action == "stop":
             await self._answer_callback(callback, "Stopping")
             await self._stop_active_turn(update)
@@ -1063,7 +1069,12 @@ class TelegramWorker:
         active = self._active_turns.get(parsed.target)
         if active is None or active.terminal:
             return None
-        if active.target.key != (callback.conversation_ref, callback.thread_ref):
+        if active.target.conversation_ref != callback.conversation_ref:
+            return None
+        if (
+            callback.thread_ref is not None
+            and active.target.thread_ref != callback.thread_ref
+        ):
             return None
         return active
 
@@ -1074,20 +1085,22 @@ class TelegramWorker:
         active: ActiveTurn | None,
     ) -> bool:
         is_active_turn_callback = parsed.target != CALLBACK_ROUTE_TARGET
-        session_key = active.session_key if is_active_turn_callback and active else None
-        if (
-            is_active_turn_callback
-            and active is not None
-            and callback.sender_ref != active.sender_ref
-        ):
-            return False
+        session_key = None
+        conversation_ref = callback.conversation_ref
+        thread_ref = callback.thread_ref
+        if is_active_turn_callback:
+            if active is None or callback.sender_ref != active.sender_ref:
+                return False
+            session_key = active.session_key
+            conversation_ref = active.target.conversation_ref
+            thread_ref = active.target.thread_ref
         expected = _callback_mac(
             self.config.telegram_bot_token,
             parsed.action,
             parsed.target,
             callback.sender_ref,
-            callback.conversation_ref,
-            callback.thread_ref,
+            conversation_ref,
+            thread_ref,
             session_key,
         )
         return hmac.compare_digest(parsed.mac, expected)
@@ -1955,6 +1968,7 @@ class TelegramWorker:
                     "status",
                     turn.target,
                     actor_ref=turn.sender_ref,
+                    active=turn,
                 ),
             )
         ]
