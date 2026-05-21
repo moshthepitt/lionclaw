@@ -8969,6 +8969,23 @@ async fn validate_runtime_channel_send_artifacts(
             )
         })?;
     for artifact in artifacts {
+        let metadata = tokio::fs::symlink_metadata(&artifact.path)
+            .await
+            .map_err(|err| {
+                RuntimeChannelSendProblem::new(
+                    "invalid_attachment",
+                    format!(
+                        "attachment path '{}' is not readable: {err}",
+                        artifact.path.display()
+                    ),
+                )
+            })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(RuntimeChannelSendProblem::new(
+                "invalid_attachment",
+                "attachment path must name a regular file under /runtime",
+            ));
+        }
         let canonical_artifact = tokio::fs::canonicalize(&artifact.path)
             .await
             .map_err(|err| {

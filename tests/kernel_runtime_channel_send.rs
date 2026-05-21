@@ -42,7 +42,7 @@ type RecordedEnvironments = Arc<Mutex<Vec<Vec<(String, String)>>>>;
 enum ProbeFileSetup {
     None,
     Attachment,
-    EscapeSymlink,
+    InvalidAttachments,
 }
 
 #[tokio::test]
@@ -320,10 +320,34 @@ async fn channel_send_bridge_returns_structured_validation_errors() {
                             }]
                         }
                     }),
+                    json!({
+                        "idempotency_key": "attachment-directory",
+                        "channel_id": "local-cli",
+                        "conversation_ref": "member:reviewer",
+                        "content": {
+                            "text": "hello",
+                            "format_hint": "plain",
+                            "attachments": [{
+                                "path": "/runtime/artifacts"
+                            }]
+                        }
+                    }),
+                    json!({
+                        "idempotency_key": "attachment-final-symlink",
+                        "channel_id": "local-cli",
+                        "conversation_ref": "member:reviewer",
+                        "content": {
+                            "text": "hello",
+                            "format_hint": "plain",
+                            "attachments": [{
+                                "path": "/runtime/artifacts/link.txt"
+                            }]
+                        }
+                    }),
                 ],
                 responses.clone(),
                 Arc::new(Mutex::new(Vec::new())),
-                ProbeFileSetup::EscapeSymlink,
+                ProbeFileSetup::InvalidAttachments,
             )),
         )
         .await;
@@ -342,37 +366,21 @@ async fn channel_send_bridge_returns_structured_validation_errors() {
         .expect("turn should complete");
 
     let responses = responses.lock().expect("responses lock").clone();
-    assert_eq!(responses.len(), 6);
-    assert_eq!(responses[0]["ok"].as_bool(), Some(false));
-    assert_eq!(
-        responses[0]["error"]["code"].as_str(),
-        Some("invalid_format")
-    );
-    assert_eq!(responses[1]["ok"].as_bool(), Some(false));
-    assert_eq!(
-        responses[1]["error"]["code"].as_str(),
-        Some("empty_content")
-    );
-    assert_eq!(responses[2]["ok"].as_bool(), Some(false));
-    assert_eq!(
-        responses[2]["error"]["code"].as_str(),
-        Some("unknown_channel")
-    );
-    assert_eq!(responses[3]["ok"].as_bool(), Some(false));
-    assert_eq!(
-        responses[3]["error"]["code"].as_str(),
-        Some("invalid_attachment")
-    );
-    assert_eq!(responses[4]["ok"].as_bool(), Some(false));
-    assert_eq!(
-        responses[4]["error"]["code"].as_str(),
-        Some("invalid_attachment")
-    );
-    assert_eq!(responses[5]["ok"].as_bool(), Some(false));
-    assert_eq!(
-        responses[5]["error"]["code"].as_str(),
-        Some("invalid_attachment")
-    );
+    let expected_codes = [
+        "invalid_format",
+        "empty_content",
+        "unknown_channel",
+        "invalid_attachment",
+        "invalid_attachment",
+        "invalid_attachment",
+        "invalid_attachment",
+        "invalid_attachment",
+    ];
+    assert_eq!(responses.len(), expected_codes.len());
+    for (response, expected_code) in responses.iter().zip(expected_codes) {
+        assert_eq!(response["ok"].as_bool(), Some(false));
+        assert_eq!(response["error"]["code"].as_str(), Some(expected_code));
+    }
     assert!(responses[4]["error"]["message"]
         .as_str()
         .is_some_and(|message| message.contains("attachment path is required")));
@@ -789,7 +797,7 @@ async fn prepare_probe_files(runtime_root: &Path, setup: ProbeFileSetup) -> Resu
                 .context("write artifact")?;
             Ok(())
         }
-        ProbeFileSetup::EscapeSymlink => {
+        ProbeFileSetup::InvalidAttachments => {
             let outside = runtime_root
                 .parent()
                 .context("runtime root parent missing")?
@@ -802,6 +810,17 @@ async fn prepare_probe_files(runtime_root: &Path, setup: ProbeFileSetup) -> Resu
                 .context("write symlink escape target")?;
             std::os::unix::fs::symlink(&outside, runtime_root.join("escape-link"))
                 .context("create symlink escape")?;
+
+            let artifacts = runtime_root.join("artifacts");
+            tokio::fs::create_dir_all(&artifacts)
+                .await
+                .context("create artifacts dir")?;
+            let regular_file = artifacts.join("regular.txt");
+            tokio::fs::write(&regular_file, b"regular bytes")
+                .await
+                .context("write regular artifact")?;
+            std::os::unix::fs::symlink(&regular_file, artifacts.join("link.txt"))
+                .context("create final symlink artifact")?;
             Ok(())
         }
     }
