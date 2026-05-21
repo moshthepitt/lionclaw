@@ -481,6 +481,30 @@ async fn channel_send_bridge_reports_missing_required_fields_as_validation_error
     assert!(responses[3]["error"]["message"]
         .as_str()
         .is_some_and(|message| message.contains("content is required")));
+
+    let denied = kernel
+        .query_audit(
+            None,
+            Some("runtime.channel_send.denied".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query denied audit events");
+    let invalid_request_denials = denied
+        .events
+        .iter()
+        .filter(|event| event.details["reason"].as_str() == Some("invalid_request"))
+        .count();
+    assert_eq!(invalid_request_denials, 4);
+    assert!(denied.events.iter().any(|event| {
+        event.details["channel_id"].as_str() == Some("")
+            && event.details["conversation_ref"].as_str() == Some("member:reviewer")
+    }));
+    assert!(denied.events.iter().any(|event| {
+        event.details["channel_id"].as_str() == Some("local-cli")
+            && event.details["conversation_ref"].as_str() == Some("")
+    }));
 }
 
 #[tokio::test]

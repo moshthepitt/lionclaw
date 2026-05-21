@@ -11815,26 +11815,44 @@ impl Kernel {
         request: RuntimeChannelSendRequest,
     ) -> Result<RuntimeChannelSendAccepted, RuntimeChannelSendProblem> {
         let idempotency_key = request.idempotency_key.trim();
+        let channel_id = request.channel_id.trim();
+        let conversation_ref = request.conversation_ref.trim();
         if idempotency_key.is_empty() {
-            return Err(RuntimeChannelSendProblem::new(
-                "invalid_request",
-                "idempotency_key is required",
-            ));
+            return self
+                .deny_runtime_channel_send(
+                    &context,
+                    channel_id,
+                    conversation_ref,
+                    RuntimeChannelSendProblem::new(
+                        "invalid_request",
+                        "idempotency_key is required",
+                    ),
+                )
+                .await;
         }
 
-        let channel_id = request.channel_id.trim();
         if channel_id.is_empty() {
-            return Err(RuntimeChannelSendProblem::new(
-                "invalid_request",
-                "channel_id is required",
-            ));
+            return self
+                .deny_runtime_channel_send(
+                    &context,
+                    channel_id,
+                    conversation_ref,
+                    RuntimeChannelSendProblem::new("invalid_request", "channel_id is required"),
+                )
+                .await;
         }
-        let conversation_ref = request.conversation_ref.trim();
         if conversation_ref.is_empty() {
-            return Err(RuntimeChannelSendProblem::new(
-                "invalid_request",
-                "conversation_ref is required",
-            ));
+            return self
+                .deny_runtime_channel_send(
+                    &context,
+                    channel_id,
+                    conversation_ref,
+                    RuntimeChannelSendProblem::new(
+                        "invalid_request",
+                        "conversation_ref is required",
+                    ),
+                )
+                .await;
         }
         self.require_runtime_channel_send_bridge_open(&context, channel_id, conversation_ref)
             .await?;
@@ -11849,72 +11867,67 @@ impl Kernel {
             .map(str::trim)
             .filter(|value| !value.is_empty());
         let Some(content) = request.content.as_ref() else {
-            let problem = RuntimeChannelSendProblem::new("invalid_request", "content is required");
-            self.audit_runtime_channel_send_denied(
-                &context,
-                channel_id,
-                conversation_ref,
-                problem.code,
-            )
-            .await;
-            return Err(problem);
+            return self
+                .deny_runtime_channel_send(
+                    &context,
+                    channel_id,
+                    conversation_ref,
+                    RuntimeChannelSendProblem::new("invalid_request", "content is required"),
+                )
+                .await;
         };
         let format_hint = content.format_hint.trim();
         if !matches!(format_hint, "plain" | "markdown" | "html") {
-            let problem = RuntimeChannelSendProblem::new(
-                "invalid_format",
-                "content.format_hint must be plain, markdown, or html",
-            );
-            self.audit_runtime_channel_send_denied(
-                &context,
-                channel_id,
-                conversation_ref,
-                problem.code,
-            )
-            .await;
-            return Err(problem);
+            return self
+                .deny_runtime_channel_send(
+                    &context,
+                    channel_id,
+                    conversation_ref,
+                    RuntimeChannelSendProblem::new(
+                        "invalid_format",
+                        "content.format_hint must be plain, markdown, or html",
+                    ),
+                )
+                .await;
         }
         if content.text.trim().is_empty() && content.attachments.is_empty() {
-            let problem = RuntimeChannelSendProblem::new(
-                "empty_content",
-                "content text or attachments are required",
-            );
-            self.audit_runtime_channel_send_denied(
-                &context,
-                channel_id,
-                conversation_ref,
-                problem.code,
-            )
-            .await;
-            return Err(problem);
+            return self
+                .deny_runtime_channel_send(
+                    &context,
+                    channel_id,
+                    conversation_ref,
+                    RuntimeChannelSendProblem::new(
+                        "empty_content",
+                        "content text or attachments are required",
+                    ),
+                )
+                .await;
         }
         if content.attachments.len() > MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY {
-            let problem = RuntimeChannelSendProblem::new(
-                "too_many_attachments",
-                format!(
-                    "content.attachments exceeds {MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY} per delivery"
-                ),
-            );
-            self.audit_runtime_channel_send_denied(
-                &context,
-                channel_id,
-                conversation_ref,
-                problem.code,
-            )
-            .await;
-            return Err(problem);
+            return self
+                .deny_runtime_channel_send(
+                    &context,
+                    channel_id,
+                    conversation_ref,
+                    RuntimeChannelSendProblem::new(
+                        "too_many_attachments",
+                        format!(
+                            "content.attachments exceeds {MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY} per delivery"
+                        ),
+                    ),
+                )
+                .await;
         }
 
         if let Err(err) = self.require_active_channel_binding(channel_id).await {
-            let problem = runtime_channel_send_channel_problem(err);
-            self.audit_runtime_channel_send_denied(
-                &context,
-                channel_id,
-                conversation_ref,
-                problem.code,
-            )
-            .await;
-            return Err(problem);
+            return self
+                .deny_runtime_channel_send(
+                    &context,
+                    channel_id,
+                    conversation_ref,
+                    runtime_channel_send_channel_problem(err),
+                )
+                .await;
         }
 
         let fingerprint = runtime_channel_send_fingerprint(
@@ -11970,27 +11983,17 @@ impl Kernel {
         let runtime_artifacts = match runtime_channel_send_artifacts(&context, content) {
             Ok(artifacts) => artifacts,
             Err(problem) => {
-                self.audit_runtime_channel_send_denied(
-                    &context,
-                    channel_id,
-                    conversation_ref,
-                    problem.code,
-                )
-                .await;
-                return Err(problem);
+                return self
+                    .deny_runtime_channel_send(&context, channel_id, conversation_ref, problem)
+                    .await;
             }
         };
         if let Err(problem) =
             validate_runtime_channel_send_artifacts(&context, &runtime_artifacts).await
         {
-            self.audit_runtime_channel_send_denied(
-                &context,
-                channel_id,
-                conversation_ref,
-                problem.code,
-            )
-            .await;
-            return Err(problem);
+            return self
+                .deny_runtime_channel_send(&context, channel_id, conversation_ref, problem)
+                .await;
         }
         let mut attachments = match self
             .prepare_runtime_artifact_attachments_beneath(
@@ -12003,14 +12006,9 @@ impl Kernel {
         {
             Ok(attachments) => attachments,
             Err(problem) => {
-                self.audit_runtime_channel_send_denied(
-                    &context,
-                    channel_id,
-                    conversation_ref,
-                    problem.code,
-                )
-                .await;
-                return Err(problem);
+                return self
+                    .deny_runtime_channel_send(&context, channel_id, conversation_ref, problem)
+                    .await;
             }
         };
         let content = ChannelDeliveryContent {
@@ -12104,7 +12102,22 @@ impl Kernel {
         if context.is_active() {
             return Ok(());
         }
-        let problem = runtime_channel_send_bridge_closed_problem();
+        self.deny_runtime_channel_send(
+            context,
+            channel_id,
+            conversation_ref,
+            runtime_channel_send_bridge_closed_problem(),
+        )
+        .await
+    }
+
+    async fn deny_runtime_channel_send<T>(
+        &self,
+        context: &RuntimeChannelSendContext,
+        channel_id: &str,
+        conversation_ref: &str,
+        problem: RuntimeChannelSendProblem,
+    ) -> Result<T, RuntimeChannelSendProblem> {
         self.audit_runtime_channel_send_denied(context, channel_id, conversation_ref, problem.code)
             .await;
         Err(problem)
