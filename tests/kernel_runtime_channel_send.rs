@@ -20,7 +20,7 @@ use lionclaw::{
             EffectiveExecutionPlan, EscapeClass, ExecutionPreset, NetworkMode, RuntimeAdapter,
             RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
             RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
-            RuntimeTurnMode, RuntimeTurnResult, WorkspaceAccess,
+            RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, WorkspaceAccess,
         },
         Kernel, KernelOptions,
     },
@@ -78,6 +78,43 @@ async fn program_backed_runtime_without_channel_send_escape_gets_no_socket_env()
     assert!(
         env_value(&environments[0], CHANNEL_SEND_SOCKET_ENV).is_none(),
         "runtime must not receive a channel.send bridge without the escape class"
+    );
+}
+
+#[tokio::test]
+async fn direct_runtime_with_channel_send_escape_does_not_start_bridge() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-direct").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "direct-runtime",
+            Arc::new(DirectSocketProbeRuntime {
+                socket_dir: env.home().runtime_dir().join("sockets"),
+                observed: observed.clone(),
+            }),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-direct").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "direct runtime should use brokered capabilities".to_string(),
+            runtime_id: Some("direct-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let observed = observed.lock().expect("observed socket lock").clone();
+    assert_eq!(
+        observed,
+        vec![false],
+        "direct runtimes must not start the program-backed channel.send bridge"
     );
 }
 
@@ -740,6 +777,11 @@ struct ChannelSendProbeRuntime {
     action: RuntimeAction,
 }
 
+struct DirectSocketProbeRuntime {
+    socket_dir: PathBuf,
+    observed: Arc<Mutex<Vec<bool>>>,
+}
+
 impl ChannelSendProbeRuntime {
     fn record_environment(observed: RecordedEnvironments) -> Self {
         Self {
@@ -832,6 +874,61 @@ impl RuntimeAdapter for ChannelSendProbeRuntime {
             Ok(())
         } else {
             Err(anyhow!("probe runtime does not resolve capabilities"))
+        }
+    }
+
+    async fn cancel(&self, _handle: &RuntimeSessionHandle, _reason: Option<String>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeAdapter for DirectSocketProbeRuntime {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "direct-socket-probe".to_string(),
+            version: "0.1".to_string(),
+            healthy: true,
+        }
+    }
+
+    async fn session_start(
+        &self,
+        _input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("direct-socket-probe-{}", Uuid::new_v4()),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn turn(
+        &self,
+        _input: RuntimeTurnInput,
+        events: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult> {
+        self.observed
+            .lock()
+            .expect("observed socket lock")
+            .push(socket_dir_has_channel_send_socket(&self.socket_dir));
+        drop(events.send(RuntimeEvent::Done));
+        Ok(RuntimeTurnResult::default())
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        results: Vec<RuntimeCapabilityResult>,
+        _events: RuntimeEventSender,
+    ) -> Result<()> {
+        if results.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!("direct socket probe does not resolve capabilities"))
         }
     }
 
@@ -1008,6 +1105,18 @@ fn env_value(environment: &[(String, String)], key: &str) -> Option<String> {
         .iter()
         .find(|(candidate, _)| candidate == key)
         .map(|(_, value)| value.clone())
+}
+
+fn socket_dir_has_channel_send_socket(socket_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(socket_dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("channel-send-") && name.ends_with(".sock"))
+    })
 }
 
 fn runtime_mount_source(plan: &EffectiveExecutionPlan) -> Result<PathBuf> {

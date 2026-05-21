@@ -678,7 +678,8 @@ home.
 6. Runtime execution policy supports per-turn working directory, idle timeout
    override, and constrained env passthrough. Configured kernel defaults are
    trusted directly; policy timeout bounds apply to explicit per-turn override
-   requests.
+   requests. `LIONCLAW_*` runtime environment names are kernel-owned and are
+   not accepted through env passthrough.
 7. Ordinary confined runtime file work stays inside mounted work-root, runtime,
    and drafts paths.
 8. Kernel brokers are reserved for explicit side effects and direct-runtime

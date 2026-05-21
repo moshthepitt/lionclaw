@@ -11146,9 +11146,12 @@ impl Kernel {
         session_id: Uuid,
         turn_id: Uuid,
         runtime_id: &str,
+        runtime_turn_mode: RuntimeTurnMode,
         plan: &mut EffectiveExecutionPlan,
     ) -> Result<Option<RuntimeChannelSendBridge>, KernelError> {
-        if !plan.escape_classes.contains(&EscapeClass::ChannelSend) {
+        if runtime_turn_mode != RuntimeTurnMode::ProgramBacked
+            || !plan.escape_classes.contains(&EscapeClass::ChannelSend)
+        {
             plan.environment
                 .retain(|(key, _)| key != CHANNEL_SEND_SOCKET_ENV);
             return Ok(None);
@@ -13350,11 +13353,13 @@ impl Kernel {
         }
 
         let mut execution_plan = execution_plan;
+        let runtime_turn_mode = adapter.turn_mode();
         let _channel_send_bridge = self
             .maybe_start_runtime_channel_send_bridge(
                 session_id,
                 turn_id,
                 runtime_id,
+                runtime_turn_mode,
                 &mut execution_plan,
             )
             .await
@@ -13378,7 +13383,7 @@ impl Kernel {
             })?;
         let codex_home_override = self.codex_home_override.clone();
         let mut turn_task = tokio::spawn(async move {
-            match adapter_for_task.turn_mode() {
+            match runtime_turn_mode {
                 RuntimeTurnMode::Direct => adapter_for_task.turn(input, event_tx).await,
                 RuntimeTurnMode::ProgramBacked => {
                     adapter_for_task
@@ -13668,11 +13673,13 @@ impl Kernel {
             })?;
 
         let mut execution_plan = execution_plan;
+        let runtime_turn_mode = adapter.turn_mode();
         let _channel_send_bridge = self
             .maybe_start_runtime_channel_send_bridge(
                 session_id,
                 turn_id,
                 runtime_id,
+                runtime_turn_mode,
                 &mut execution_plan,
             )
             .await
