@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import math
 import os
+import string
 from dataclasses import dataclass
 from pathlib import Path
 
 STREAM_START_MODES = frozenset({"resume", "tail"})
 TELEGRAM_UPDATE_MODES = frozenset({"polling", "webhook"})
+TELEGRAM_WEBHOOK_SECRET_TOKEN_MAX_LEN = 256
+TELEGRAM_WEBHOOK_SECRET_TOKEN_CHARS = frozenset(
+    string.ascii_letters + string.digits + "_-"
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -75,7 +80,7 @@ class WorkerConfig:
                 "TELEGRAM_WEBHOOK_PATH",
                 "/telegram/webhook",
             ),
-            telegram_webhook_secret_token=_optional_string_env(
+            telegram_webhook_secret_token=_webhook_secret_token_env(
                 "TELEGRAM_WEBHOOK_SECRET_TOKEN"
             ),
             telegram_webhook_max_body_bytes=_int_env(
@@ -127,6 +132,21 @@ def _optional_string_env(name: str) -> str | None:
         return None
     if not value.strip():
         raise RuntimeError(f"{name} must not be empty")
+    return value
+
+
+def _webhook_secret_token_env(name: str) -> str | None:
+    value = _optional_string_env(name)
+    if value is None:
+        return None
+    if len(value) > TELEGRAM_WEBHOOK_SECRET_TOKEN_MAX_LEN:
+        raise RuntimeError(f"{name} must be at most 256 characters")
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError as err:
+        raise RuntimeError(f"{name} must be ASCII") from err
+    if any(char not in TELEGRAM_WEBHOOK_SECRET_TOKEN_CHARS for char in value):
+        raise RuntimeError(f"{name} must use letters, numbers, underscore, and hyphen")
     return value
 
 

@@ -1666,6 +1666,31 @@ class WorkerConfigTests(unittest.TestCase):
 
         self.assertIn("TELEGRAM_WEBHOOK_SECRET_TOKEN", str(raised.exception))
 
+    def test_from_env_validates_webhook_secret_token(self) -> None:
+        cases = (
+            ("secrét", "ASCII"),
+            ("secret!", "letters, numbers, underscore, and hyphen"),
+            ("s" * 257, "at most 256"),
+        )
+        for value, error in cases:
+            with self.subTest(value=value):
+                with (
+                    patch.dict(
+                        os.environ,
+                        {
+                            "TELEGRAM_BOT_TOKEN": "token",
+                            "TELEGRAM_UPDATE_MODE": "webhook",
+                            "TELEGRAM_WEBHOOK_SECRET_TOKEN": value,
+                        },
+                        clear=True,
+                    ),
+                    self.assertRaises(RuntimeError) as raised,
+                ):
+                    WorkerConfig.from_env()
+                message = str(raised.exception)
+                self.assertIn("TELEGRAM_WEBHOOK_SECRET_TOKEN", message)
+                self.assertIn(error, message)
+
     def test_from_env_validates_webhook_path(self) -> None:
         cases = (
             ("telegram/webhook", "must start with /"),
