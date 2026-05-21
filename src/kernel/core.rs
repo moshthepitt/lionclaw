@@ -20,7 +20,7 @@ use sqlx::{Sqlite, Transaction};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    sync::{Mutex, Notify, RwLock},
+    sync::{Mutex, Notify, RwLock, Semaphore},
     task::{JoinHandle, JoinSet},
     time::{sleep, timeout, Instant},
 };
@@ -163,8 +163,10 @@ const MAX_CHANNEL_HEALTH_CHECK_DETAILS_JSON_BYTES: usize = 64 * 1024;
 const CHANNEL_SEND_SOCKET_ENV: &str = "LIONCLAW_CHANNEL_SEND_SOCKET";
 const CHANNEL_SEND_SOCKET_CONTAINER_PATH: &str = "/runtime/lionclaw/channel-send.sock";
 const CHANNEL_SEND_SOCKET_DIR: &str = "lionclaw";
+const MAX_RUNTIME_CHANNEL_SEND_CONNECTIONS: usize = 16;
 const MAX_RUNTIME_CHANNEL_SEND_REQUEST_BYTES: usize = 64 * 1024;
 const RUNTIME_CHANNEL_SEND_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const RUNTIME_CHANNEL_SEND_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const RUNTIME_CHANNEL_SEND_SOURCE_KIND: &str = "runtime_channel_send";
 
 #[derive(Debug, Clone)]
@@ -8785,14 +8787,29 @@ async fn run_runtime_channel_send_bridge(
     listener: UnixListener,
 ) {
     let mut streams = JoinSet::new();
+    let permits = Arc::new(Semaphore::new(MAX_RUNTIME_CHANNEL_SEND_CONNECTIONS));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _)) => {
+                        let permit = match Arc::clone(&permits).try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                reject_runtime_channel_send_connection(
+                                    &kernel,
+                                    &context,
+                                    stream,
+                                    runtime_channel_send_connection_limit_problem(),
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
                         let kernel = kernel.clone();
                         let context = context.clone();
                         streams.spawn(async move {
+                            let _permit = permit;
                             match handle_runtime_channel_send_stream(kernel, context, stream).await
                             {
                                 Ok(()) => {}
@@ -8803,6 +8820,10 @@ async fn run_runtime_channel_send_bridge(
                         });
                     }
                     Err(err) => {
+                        let error = err.to_string();
+                        kernel
+                            .audit_runtime_channel_send_bridge_error(&context, "accept", &error)
+                            .await;
                         warn!(?err, "failed to accept runtime channel.send request");
                         return;
                     }
@@ -8810,10 +8831,36 @@ async fn run_runtime_channel_send_bridge(
             }
             completed = streams.join_next(), if !streams.is_empty() => {
                 if let Some(Err(err)) = completed {
+                    let error = err.to_string();
+                    kernel
+                        .audit_runtime_channel_send_bridge_error(&context, "connection_task", &error)
+                        .await;
                     warn!(?err, "runtime channel.send request task failed");
                 }
             }
         }
+    }
+}
+
+async fn reject_runtime_channel_send_connection(
+    kernel: &Kernel,
+    context: &RuntimeChannelSendContext,
+    stream: UnixStream,
+    problem: RuntimeChannelSendProblem,
+) {
+    kernel
+        .audit_runtime_channel_send_denied(context, "", "", problem.code)
+        .await;
+    let response = runtime_channel_send_error_response(problem.code, problem.message);
+    match timeout(
+        RUNTIME_CHANNEL_SEND_RESPONSE_WRITE_TIMEOUT,
+        write_runtime_channel_send_response(stream, response),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => warn!(?err, "failed to reject runtime channel.send connection"),
+        Err(err) => warn!(?err, "timed out rejecting runtime channel.send connection"),
     }
 }
 
@@ -8863,7 +8910,13 @@ async fn handle_runtime_channel_send_stream(
         }
     };
 
-    let mut stream = reader.into_inner();
+    write_runtime_channel_send_response(reader.into_inner(), response).await
+}
+
+async fn write_runtime_channel_send_response(
+    mut stream: UnixStream,
+    response: Value,
+) -> Result<(), std::io::Error> {
     let mut encoded = serde_json::to_vec(&response)?;
     encoded.push(b'\n');
     stream.write_all(&encoded).await?;
@@ -9144,6 +9197,15 @@ fn runtime_channel_send_bridge_closed_problem() -> RuntimeChannelSendProblem {
     RuntimeChannelSendProblem::new(
         "bridge_closed",
         "channel.send bridge is closed for this turn",
+    )
+}
+
+fn runtime_channel_send_connection_limit_problem() -> RuntimeChannelSendProblem {
+    RuntimeChannelSendProblem::new(
+        "connection_limit",
+        format!(
+            "channel.send bridge accepts at most {MAX_RUNTIME_CHANNEL_SEND_CONNECTIONS} concurrent connections"
+        ),
     )
 }
 
@@ -11099,24 +11161,56 @@ impl Kernel {
         context: RuntimeChannelSendContext,
         plan: &mut EffectiveExecutionPlan,
     ) -> Result<Option<RuntimeChannelSendBridge>, KernelError> {
-        ensure_safe_child_directory(&context.runtime_state_root, &[CHANNEL_SEND_SOCKET_DIR])
-            .await?;
-        let socket_root = self.runtime_root.as_ref().ok_or_else(|| {
-            KernelError::Runtime(
-                "channel.send escape requires a configured runtime root".to_string(),
-            )
-        })?;
-        let socket_dir = ensure_safe_child_directory(socket_root, &["sockets"]).await?;
-        ensure_owner_private_directory(&socket_dir).await?;
+        if let Err(err) =
+            ensure_safe_child_directory(&context.runtime_state_root, &[CHANNEL_SEND_SOCKET_DIR])
+                .await
+        {
+            return self
+                .runtime_channel_send_bridge_error(&context, "runtime_socket_dir", err)
+                .await;
+        }
+        let Some(socket_root) = self.runtime_root.as_ref() else {
+            return self
+                .runtime_channel_send_bridge_error(
+                    &context,
+                    "runtime_root",
+                    KernelError::Runtime(
+                        "channel.send escape requires a configured runtime root".to_string(),
+                    ),
+                )
+                .await;
+        };
+        let socket_dir = match ensure_safe_child_directory(socket_root, &["sockets"]).await {
+            Ok(socket_dir) => socket_dir,
+            Err(err) => {
+                return self
+                    .runtime_channel_send_bridge_error(&context, "host_socket_dir", err)
+                    .await;
+            }
+        };
+        if let Err(err) = ensure_owner_private_directory(&socket_dir).await {
+            return self
+                .runtime_channel_send_bridge_error(&context, "host_socket_dir_permissions", err)
+                .await;
+        }
         let socket_path =
             socket_dir.join(format!("channel-send-{}.sock", context.turn_id.simple()));
         remove_file_best_effort(&socket_path).await;
-        let listener = UnixListener::bind(&socket_path).map_err(|err| {
-            KernelError::Runtime(format!(
-                "failed to bind runtime channel.send socket '{}': {err}",
-                socket_path.display()
-            ))
-        })?;
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(err) => {
+                return self
+                    .runtime_channel_send_bridge_error(
+                        &context,
+                        "bind",
+                        KernelError::Runtime(format!(
+                            "failed to bind runtime channel.send socket '{}': {err}",
+                            socket_path.display()
+                        )),
+                    )
+                    .await;
+            }
+        };
         plan.mounts.push(MountSpec {
             source: socket_path.clone(),
             target: CHANNEL_SEND_SOCKET_CONTAINER_PATH.to_string(),
@@ -11156,13 +11250,19 @@ impl Kernel {
                 .retain(|(key, _)| key != CHANNEL_SEND_SOCKET_ENV);
             return Ok(None);
         }
-        let runtime_state_root = Self::runtime_state_root(plan)
-            .map(Path::to_path_buf)
-            .ok_or_else(|| {
-                KernelError::Runtime(
-                    "channel.send escape requires a runtime state mount".to_string(),
+        let Some(runtime_state_root) = Self::runtime_state_root(plan).map(Path::to_path_buf) else {
+            return self
+                .runtime_channel_send_bridge_error_parts(
+                    session_id,
+                    turn_id,
+                    runtime_id,
+                    "runtime_state_mount",
+                    KernelError::Runtime(
+                        "channel.send escape requires a runtime state mount".to_string(),
+                    ),
                 )
-            })?;
+                .await;
+        };
         self.start_runtime_channel_send_bridge(
             RuntimeChannelSendContext {
                 session_id,
@@ -12227,6 +12327,72 @@ impl Kernel {
             }),
         )
         .await;
+    }
+
+    async fn audit_runtime_channel_send_bridge_error(
+        &self,
+        context: &RuntimeChannelSendContext,
+        stage: &str,
+        error: &str,
+    ) {
+        self.audit_runtime_channel_send_bridge_error_parts(
+            context.session_id,
+            context.turn_id,
+            &context.runtime_id,
+            stage,
+            error,
+        )
+        .await;
+    }
+
+    async fn runtime_channel_send_bridge_error<T>(
+        &self,
+        context: &RuntimeChannelSendContext,
+        stage: &str,
+        err: KernelError,
+    ) -> Result<T, KernelError> {
+        let error = err.to_string();
+        self.audit_runtime_channel_send_bridge_error(context, stage, &error)
+            .await;
+        Err(err)
+    }
+
+    async fn audit_runtime_channel_send_bridge_error_parts(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+        runtime_id: &str,
+        stage: &str,
+        error: &str,
+    ) {
+        self.append_audit_event_best_effort(
+            "runtime.channel_send.bridge_error",
+            Some(session_id),
+            "kernel",
+            json!({
+                "runtime_id": runtime_id,
+                "turn_id": turn_id,
+                "stage": stage,
+                "error": error,
+            }),
+        )
+        .await;
+    }
+
+    async fn runtime_channel_send_bridge_error_parts<T>(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+        runtime_id: &str,
+        stage: &str,
+        err: KernelError,
+    ) -> Result<T, KernelError> {
+        let error = err.to_string();
+        self.audit_runtime_channel_send_bridge_error_parts(
+            session_id, turn_id, runtime_id, stage, &error,
+        )
+        .await;
+        Err(err)
     }
 
     async fn canonical_runtime_root(&self) -> Result<PathBuf, KernelError> {

@@ -36,6 +36,7 @@ use tokio::{
 use uuid::Uuid;
 
 const CHANNEL_SEND_SOCKET_ENV: &str = "LIONCLAW_CHANNEL_SEND_SOCKET";
+const TEST_CHANNEL_SEND_CONNECTION_LIMIT: usize = 16;
 
 type RecordedEnvironments = Arc<Mutex<Vec<Vec<(String, String)>>>>;
 
@@ -268,6 +269,76 @@ async fn program_backed_runtime_with_channel_send_escape_enqueues_outbox_deliver
             & 0o777;
         assert_eq!(mode, 0o700, "channel.send socket directory is private");
     }
+}
+
+#[tokio::test]
+async fn channel_send_bridge_allows_attachment_only_delivery() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-attachment-only").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    let request = json!({
+        "idempotency_key": "send-attachment-only",
+        "channel_id": "local-cli",
+        "conversation_ref": "member:reviewer",
+        "content": {
+            "text": "   ",
+            "format_hint": "plain",
+            "attachments": [{
+                "path": "/runtime/artifacts/sketch.txt",
+                "filename": "sketch.txt",
+                "mime_type": "text/plain"
+            }]
+        }
+    });
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(ChannelSendProbeRuntime::send_requests(
+                vec![request],
+                responses.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+                ProbeFileSetup::Attachment,
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-attachment-only").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "send attachment-only channel message".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let responses = responses.lock().expect("responses lock").clone();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["ok"].as_bool(), Some(true));
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "test-worker".to_string(),
+            conversation_ref: Some("member:reviewer".to_string()),
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: None,
+        })
+        .await
+        .expect("pull outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    assert_eq!(outbox.deliveries[0].content.attachments.len(), 1);
+    assert_eq!(
+        outbox.deliveries[0].content.attachments[0]
+            .filename
+            .as_deref(),
+        Some("sketch.txt")
+    );
 }
 
 #[tokio::test]
@@ -605,6 +676,64 @@ async fn channel_send_bridge_reports_missing_required_fields_as_validation_error
 }
 
 #[tokio::test]
+async fn channel_send_bridge_audits_setup_failures() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-setup-failure").await;
+    tokio::fs::create_dir_all(env.home().runtime_dir())
+        .await
+        .expect("create runtime root");
+    tokio::fs::write(env.home().runtime_dir().join("sockets"), b"not a directory")
+        .await
+        .expect("block socket directory");
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(ChannelSendProbeRuntime::record_environment(Arc::new(
+                Mutex::new(Vec::new()),
+            ))),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-setup-failure").await;
+
+    let result = kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "fail channel send setup".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await;
+
+    assert!(
+        result.is_err(),
+        "setup should fail before runtime execution"
+    );
+    let audit = kernel
+        .query_audit(
+            Some(session),
+            Some("runtime.channel_send.bridge_error".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query bridge error audit events");
+    assert!(
+        audit.events.iter().any(|event| {
+            event.details["stage"].as_str() == Some("host_socket_dir")
+                && event.details["runtime_id"].as_str() == Some("channel-send-runtime")
+                && event.details["turn_id"].as_str().is_some()
+                && event.details["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("not a regular directory"))
+        }),
+        "setup failures must be audited under runtime.channel_send.*"
+    );
+}
+
+#[tokio::test]
 async fn channel_send_bridge_socket_is_removed_after_timeout() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "local-cli", "runtime-channel-send-timeout").await;
@@ -723,6 +852,57 @@ async fn channel_send_bridge_drops_open_connections_after_turn_completion() {
 }
 
 #[tokio::test]
+async fn channel_send_bridge_rejects_excess_connections() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-connection-limit").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "connection-limit-runtime",
+            Arc::new(ChannelSendProbeRuntime::open_many_connections(
+                responses.clone(),
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-connection-limit").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "open too many channel send connections".to_string(),
+            runtime_id: Some("connection-limit-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let responses = responses.lock().expect("responses lock").clone();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["ok"].as_bool(), Some(false));
+    assert_eq!(
+        responses[0]["error"]["code"].as_str(),
+        Some("connection_limit")
+    );
+
+    let denied = kernel
+        .query_audit(
+            Some(session),
+            Some("runtime.channel_send.denied".to_string()),
+            None,
+            Some(20),
+        )
+        .await
+        .expect("query denied audit events");
+    assert!(denied.events.iter().any(|event| {
+        event.details["reason"].as_str() == Some("connection_limit")
+            && event.details["runtime_id"].as_str() == Some("connection-limit-runtime")
+    }));
+}
+
+#[tokio::test]
 async fn channel_send_bridge_audits_wire_protocol_denials() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "local-cli", "runtime-channel-send-wire-errors").await;
@@ -808,6 +988,9 @@ enum RuntimeAction {
     HoldOpenConnection {
         held_stream: Arc<Mutex<Option<UnixStream>>>,
     },
+    OpenManyConnections {
+        responses: Arc<Mutex<Vec<Value>>>,
+    },
 }
 
 struct ChannelSendProbeRuntime {
@@ -863,6 +1046,12 @@ impl ChannelSendProbeRuntime {
     fn hold_open_connection(held_stream: Arc<Mutex<Option<UnixStream>>>) -> Self {
         Self {
             action: RuntimeAction::HoldOpenConnection { held_stream },
+        }
+    }
+
+    fn open_many_connections(responses: Arc<Mutex<Vec<Value>>>) -> Self {
+        Self {
+            action: RuntimeAction::OpenManyConnections { responses },
         }
     }
 }
@@ -1057,6 +1246,37 @@ async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan)
                 .await
                 .with_context(|| format!("connect {}", host_socket.display()))?;
             *held_stream.lock().expect("held stream lock") = Some(stream);
+            Ok(())
+        }
+        RuntimeAction::OpenManyConnections { responses } => {
+            let socket = env_value(&plan.environment, CHANNEL_SEND_SOCKET_ENV)
+                .context("channel send socket env missing")?;
+            let host_socket = host_path_for_runtime_path(plan, &socket)?;
+            let mut held_streams = Vec::new();
+            for _ in 0..TEST_CHANNEL_SEND_CONNECTION_LIMIT {
+                held_streams.push(
+                    UnixStream::connect(&host_socket)
+                        .await
+                        .with_context(|| format!("connect {}", host_socket.display()))?,
+                );
+                sleep(Duration::from_millis(10)).await;
+            }
+            sleep(Duration::from_millis(50)).await;
+
+            let stream = UnixStream::connect(&host_socket)
+                .await
+                .with_context(|| format!("connect {}", host_socket.display()))?;
+            let mut response = String::new();
+            let mut reader = BufReader::new(stream);
+            tokio::time::timeout(Duration::from_millis(250), reader.read_line(&mut response))
+                .await
+                .context("timed out waiting for connection limit response")?
+                .context("read connection limit response")?;
+            responses
+                .lock()
+                .expect("responses lock")
+                .push(serde_json::from_str(response.trim()).context("decode response")?);
+            drop(held_streams);
             Ok(())
         }
     }

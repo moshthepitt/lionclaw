@@ -222,6 +222,7 @@ Attachment content is not sent over the socket; the request names files under
 `/runtime`, and the kernel reuses the existing runtime-artifact copy and outbox
 attachment path. Attachment paths are interpreted relative to the current
 runtime state root; parent-directory and symlink escapes are rejected.
+Attachment-only sends are valid; text-only sends must carry non-empty text.
 
 The bridge is transport only. The kernel validates the current session and turn
 from its own execution context, checks the active channel binding, normalizes
@@ -230,6 +231,11 @@ attachments into LionClaw-owned outbox storage, and creates a normal durable
 channel outbox delivery. Channel workers continue to lease and report those
 deliveries through `/v0/channels/outbox/pull` and
 `/v0/channels/outbox/report`.
+
+Bridge setup, accept-loop, and connection-task failures are audited under
+`runtime.channel_send.bridge_error`. Request denials, including connection
+pressure over the bridge's concurrent connection cap, are audited as
+`runtime.channel_send.denied`.
 
 Idempotency lives on the outbox row. Runtime channel sends use
 `source_kind = "runtime_channel_send"`, a source id scoped to

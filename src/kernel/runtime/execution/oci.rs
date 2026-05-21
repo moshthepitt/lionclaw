@@ -975,6 +975,39 @@ mod tests {
     }
 
     #[test]
+    fn oci_backend_emits_channel_send_socket_mount_and_env() {
+        let mut request = sample_execution_request();
+        request.plan.mounts.push(MountSpec {
+            source: "/host/runtime/sockets/channel-send-test.sock".into(),
+            target: "/runtime/lionclaw/channel-send.sock".to_string(),
+            access: MountAccess::ReadWrite,
+        });
+        request.plan.environment.push((
+            "LIONCLAW_CHANNEL_SEND_SOCKET".to_string(),
+            "/runtime/lionclaw/channel-send.sock".to_string(),
+        ));
+
+        let invocation = build_oci_process_invocation(
+            prepare_oci_process_launch(&request, None).expect("prepare"),
+            &[],
+        );
+
+        assert!(invocation.args.windows(2).any(|pair| {
+            pair == [
+                "--volume".to_string(),
+                "/host/runtime/sockets/channel-send-test.sock:/runtime/lionclaw/channel-send.sock:rw,Z"
+                    .to_string(),
+            ]
+        }));
+        assert!(invocation.args.windows(2).any(|pair| {
+            pair == [
+                "--env".to_string(),
+                "LIONCLAW_CHANNEL_SEND_SOCKET=/runtime/lionclaw/channel-send.sock".to_string(),
+            ]
+        }));
+    }
+
+    #[test]
     fn oci_backend_adds_none_network_flag() {
         let mut plan = sample_plan();
         plan.network_mode = NetworkMode::None;
