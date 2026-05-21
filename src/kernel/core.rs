@@ -9996,11 +9996,12 @@ impl Kernel {
             KernelError::NotFound(format!("runtime adapter '{runtime_id}' not found"))
         })?;
         let runtime_kind = adapter.info().await.id;
+        let runtime_turn_mode = adapter.turn_mode();
         let RuntimeExecutionSkills {
             skill_ids: runtime_skill_ids,
             mounts: skill_mounts,
         } = self
-            .resolve_runtime_execution_skills(adapter.turn_mode())
+            .resolve_runtime_execution_skills(runtime_turn_mode)
             .await?;
         let execution_plan = self
             .resolve_runtime_execution_plan(
@@ -10344,7 +10345,12 @@ impl Kernel {
         }
         let outbox_attachments = if channel_stream_context.is_some() && !artifacts.saw_error {
             match self
-                .prepare_runtime_artifact_attachments(turn_id, &artifacts.artifacts)
+                .prepare_runtime_artifact_attachments_for_turn(
+                    turn_id,
+                    runtime_turn_mode,
+                    &execution_plan,
+                    &artifacts.artifacts,
+                )
                 .await
             {
                 Ok(attachments) => attachments,
@@ -12059,6 +12065,35 @@ impl Kernel {
         }
         let runtime_root = self.canonical_runtime_root().await?;
         self.prepare_runtime_artifact_attachments_beneath(turn_id, &runtime_root, artifacts)
+            .await
+    }
+
+    async fn prepare_runtime_artifact_attachments_for_turn(
+        &self,
+        turn_id: Uuid,
+        runtime_turn_mode: RuntimeTurnMode,
+        execution_plan: &EffectiveExecutionPlan,
+        artifacts: &[RuntimeArtifact],
+    ) -> Result<PreparedChannelDeliveryAttachments, KernelError> {
+        if artifacts.is_empty() {
+            return Ok(PreparedChannelDeliveryAttachments::default());
+        }
+        if runtime_turn_mode == RuntimeTurnMode::ProgramBacked {
+            let runtime_state_root = Self::runtime_state_root(execution_plan).ok_or_else(|| {
+                KernelError::Runtime(
+                    "runtime state root is required to publish program-backed runtime artifacts"
+                        .to_string(),
+                )
+            })?;
+            return self
+                .prepare_runtime_artifact_attachments_beneath(
+                    turn_id,
+                    runtime_state_root,
+                    artifacts,
+                )
+                .await;
+        }
+        self.prepare_runtime_artifact_attachments(turn_id, artifacts)
             .await
     }
 
