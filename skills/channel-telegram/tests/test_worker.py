@@ -7565,6 +7565,41 @@ class AiogramTelegramTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt["message_id"], 102)
         self.assertEqual(len(receipt["messages"]), 2)
 
+    async def test_album_bad_request_falls_back_to_serial_attachments(self) -> None:
+        bot = RecordingAiogramBot(
+            send_media_group_error=TelegramBadRequest(
+                method=object(),
+                message="MEDIA_GROUP_INVALID",
+            )
+        )
+        transport = object.__new__(AiogramTelegramTransport)
+        transport._bot = bot
+        transport._bot_identity = None
+
+        receipt = await transport.send_message(
+            "telegram:chat:77",
+            "album caption",
+            attachments=[
+                TelegramOutboundAttachment(
+                    path="/tmp/a.png",
+                    filename="a.png",
+                    mime_type="image/png",
+                ),
+                TelegramOutboundAttachment(
+                    path="/tmp/b.png",
+                    filename="b.png",
+                    mime_type="image/png",
+                ),
+            ],
+        )
+
+        self.assertEqual(len(bot.sent_media_groups), 1)
+        self.assertEqual(len(bot.sent_photos), 2)
+        self.assertEqual(bot.sent_photos[0]["caption"], "album caption")
+        self.assertEqual(bot.sent_documents, [])
+        self.assertEqual(receipt["message_id"], 102)
+        self.assertEqual(len(receipt["messages"]), 2)
+
     async def test_buttons_force_serial_attachment_send_instead_of_album(self) -> None:
         bot = RecordingAiogramBot()
         transport = object.__new__(AiogramTelegramTransport)
@@ -8184,6 +8219,7 @@ class RecordingAiogramBot:
         self,
         *,
         send_photo_error: Exception | None = None,
+        send_media_group_error: Exception | None = None,
         send_message_errors: list[Exception | None] | None = None,
     ) -> None:
         self._next_message_id = 100
@@ -8199,6 +8235,7 @@ class RecordingAiogramBot:
         self.answered_callbacks: list[dict[str, object]] = []
         self.reactions: list[dict[str, object]] = []
         self.send_photo_error = send_photo_error
+        self.send_media_group_error = send_media_group_error
         self.send_message_errors = list(send_message_errors or [])
 
     async def send_message(self, **params) -> RecordingAiogramMessage:
@@ -8267,6 +8304,8 @@ class RecordingAiogramBot:
         **params,
     ) -> list[RecordingAiogramMessage]:
         self.sent_media_groups.append({**params, "media": media})
+        if self.send_media_group_error is not None:
+            raise self.send_media_group_error
         return [self._message_for(params["chat_id"]) for _ in media]
 
     async def edit_message_text(self, **params) -> None:

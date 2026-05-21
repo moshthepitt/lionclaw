@@ -359,16 +359,21 @@ class AiogramTelegramTransport:
             and not buttons
             and _can_send_native_album(attachments)
         ):
-            messages = await self._send_media_group(
-                chat_id=chat_id,
-                attachments=attachments,
-                reply_parameters=reply_parameters,
-                message_thread_id=message_thread_id,
-                caption=caption_chunk,
-            )
-            return _receipt_from_messages(
-                [_message_receipt(message) for message in messages]
-            )
+            try:
+                messages = await self._send_media_group(
+                    chat_id=chat_id,
+                    attachments=attachments,
+                    reply_parameters=reply_parameters,
+                    message_thread_id=message_thread_id,
+                    caption=caption_chunk,
+                )
+            except TelegramBadRequest as err:
+                if _is_parse_error(err):
+                    raise
+            else:
+                return _receipt_from_messages(
+                    [_message_receipt(message) for message in messages]
+                )
         operation_count = len(text_chunks) + len(attachments)
         if operation_count == 0:
             operation_count = 1
