@@ -940,13 +940,23 @@ class TelegramWorker:
             )
 
         future = await self._enqueue_webhook_batch(key, item)
-        try:
-            return await asyncio.shield(future)
-        except asyncio.CancelledError:
-            logger.debug(
-                "telegram webhook batch wait cancelled; preserving update ownership"
-            )
-            return await asyncio.shield(future)
+        return await self._wait_for_webhook_batch_result(future)
+
+    async def _wait_for_webhook_batch_result(
+        self,
+        result: asyncio.Future[bool],
+    ) -> bool:
+        logged_cancellation = False
+        while True:
+            try:
+                return await asyncio.shield(result)
+            except asyncio.CancelledError:
+                if not logged_cancellation:
+                    logger.debug(
+                        "telegram webhook batch wait cancelled; "
+                        "preserving update ownership"
+                    )
+                    logged_cancellation = True
 
     async def _process_webhook_route_work_items(
         self,

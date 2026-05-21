@@ -3004,6 +3004,54 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(retry_result)
         self.assertEqual([submitted.text for submitted in api.sent_inbound], ["hello"])
 
+    async def test_repeatedly_cancelled_webhook_batch_wait_does_not_replay_update(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=api,
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            update = Update.model_validate(
+                {
+                    "update_id": 879,
+                    "message": {
+                        "message_id": 179,
+                        "date": 0,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "hello",
+                    },
+                }
+            )
+
+            with patch(
+                "lionclaw_channel_telegram.worker.WEBHOOK_COALESCE_DELAY_SECONDS",
+                0.05,
+            ):
+                first_task = asyncio.create_task(worker.process_webhook_update(update))
+                await asyncio.sleep(0)
+                first_task.cancel()
+                await asyncio.sleep(0)
+                first_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await first_task
+                retry_result = await worker.process_webhook_update(update)
+
+        self.assertTrue(retry_result)
+        self.assertEqual([submitted.text for submitted in api.sent_inbound], ["hello"])
+
     async def test_process_webhook_update_batches_concurrent_media_group(
         self,
     ) -> None:
