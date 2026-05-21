@@ -1073,8 +1073,13 @@ class TelegramWorker:
         parsed: ParsedCallbackAction,
         active: ActiveTurn | None,
     ) -> bool:
-        session_key = active.session_key if active is not None else None
-        if active is not None and callback.sender_ref != active.sender_ref:
+        is_active_turn_callback = parsed.target != CALLBACK_ROUTE_TARGET
+        session_key = active.session_key if is_active_turn_callback and active else None
+        if (
+            is_active_turn_callback
+            and active is not None
+            and callback.sender_ref != active.sender_ref
+        ):
             return False
         expected = _callback_mac(
             self.config.telegram_bot_token,
