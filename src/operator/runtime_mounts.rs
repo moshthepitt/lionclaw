@@ -7,9 +7,9 @@ use crate::{
     kernel::{
         runtime::{
             execution::mount_validation::{
-                canonical_mount_source, project_metadata_root_from_instance_home,
-                validate_configured_mount_target, validate_configured_mounts,
-                MountSourceProtection,
+                canonical_mount_source, normalize_runtime_mount_target,
+                project_metadata_root_from_instance_home, validate_configured_mount_target,
+                validate_configured_mounts, MountSourceProtection,
             },
             ConfinementConfig, MountAccess, MountSpec,
         },
@@ -76,20 +76,31 @@ pub(crate) fn remove_runtime_mount(
     runtime_id: &str,
     target: &str,
 ) -> Result<MountSpec> {
-    let target = resolve_runtime_mount_target(target)?;
+    let targets = remove_target_candidates(target)?;
+    let display_target = targets
+        .first()
+        .map(String::as_str)
+        .unwrap_or_else(|| target.trim());
     let profile = runtime_profile_mut(config, runtime_id)?;
     let mounts = &mut runtime_oci_mut(profile).additional_mounts;
     let matches = mounts
         .iter()
         .enumerate()
-        .filter_map(|(index, mount)| same_mount_target(&mount.target, &target).then_some(index))
+        .filter_map(|(index, mount)| {
+            targets
+                .iter()
+                .any(|target| same_mount_target(&mount.target, target))
+                .then_some(index)
+        })
         .collect::<Vec<_>>();
 
     match matches.as_slice() {
-        [] => bail!("runtime profile '{runtime_id}' has no mount target '{target}'"),
+        [] => bail!(
+            "runtime profile '{runtime_id}' has no mount target '{display_target}'"
+        ),
         [index] => Ok(mounts.remove(*index)),
         _ => bail!(
-            "runtime profile '{runtime_id}' has multiple mounts for target '{target}'; edit the config to remove the ambiguity"
+            "runtime profile '{runtime_id}' has multiple mounts for target '{display_target}'; edit the config to remove the ambiguity"
         ),
     }
 }
@@ -148,6 +159,26 @@ fn runtime_oci_mut(
     match profile.confinement_mut() {
         ConfinementConfig::Oci(oci) => oci,
     }
+}
+
+fn remove_target_candidates(raw: &str) -> Result<Vec<String>> {
+    let target = raw.trim();
+    if target.is_empty() {
+        bail!("mount target is required");
+    }
+
+    let mut candidates = Vec::new();
+    if target.starts_with('/') {
+        if let Ok(normalized) = normalize_runtime_mount_target(target) {
+            candidates.push(normalized);
+        }
+    } else if let Ok(resolved) = resolve_runtime_mount_target(target) {
+        candidates.push(resolved);
+    }
+    if !candidates.iter().any(|candidate| candidate == target) {
+        candidates.push(target.to_string());
+    }
+    Ok(candidates)
 }
 
 fn same_mount_target(left: &str, right: &str) -> bool {
@@ -348,5 +379,33 @@ mod tests {
         .expect_err("project metadata source");
 
         assert!(err.to_string().contains("project metadata"));
+    }
+
+    #[test]
+    fn remove_accepts_invalid_hand_edited_targets() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source = temp_dir.path().join("docs");
+        std::fs::create_dir(&source).expect("source");
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            profile("podman".to_string(), Some(source)),
+        );
+        let profile = runtime_profile_mut(&mut config, "codex").expect("runtime");
+        let oci = runtime_oci_mut(profile);
+        oci.additional_mounts[0].target = "/workspace/cache".to_string();
+
+        let removed = remove_runtime_mount(&mut config, "codex", "/workspace/cache/")
+            .expect("remove reserved target");
+
+        assert_eq!(removed.target, "/workspace/cache");
+        assert!(configured_runtime_mounts(&config, "codex")
+            .expect("list")
+            .is_empty());
+        assert!(remove_runtime_mount(&mut config, "codex", "docs")
+            .expect_err("missing")
+            .to_string()
+            .contains("/mnt/docs"));
     }
 }

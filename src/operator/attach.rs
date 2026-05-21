@@ -37,9 +37,18 @@ pub(crate) struct ChannelAttachSpec {
     pub expected_daemon_fingerprint: String,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ChannelAttachContext<'a, M> {
+    pub home: &'a LionClawHome,
+    pub manager: &'a M,
+    pub project_root: Option<&'a Path>,
+    pub work_root: &'a Path,
+}
+
 pub async fn attach_channel<M: UnitManager>(
     home: &LionClawHome,
     manager: &M,
+    project_root: Option<&Path>,
     work_root: &Path,
     channel_id: String,
     requested_peer_id: Option<String>,
@@ -47,9 +56,12 @@ pub async fn attach_channel<M: UnitManager>(
 ) -> Result<()> {
     let binaries = crate::operator::reconcile::resolve_stack_binaries()?;
     attach_channel_with_binaries(
-        home,
-        manager,
-        work_root,
+        ChannelAttachContext {
+            home,
+            manager,
+            project_root,
+            work_root,
+        },
         channel_id,
         requested_peer_id,
         requested_runtime_id,
@@ -59,20 +71,22 @@ pub async fn attach_channel<M: UnitManager>(
 }
 
 pub(crate) async fn attach_channel_with_binaries<M: UnitManager>(
-    home: &LionClawHome,
-    manager: &M,
-    work_root: &Path,
+    context: ChannelAttachContext<'_, M>,
     channel_id: String,
     requested_peer_id: Option<String>,
     requested_runtime_id: Option<String>,
     binaries: &StackBinaryPaths,
 ) -> Result<()> {
+    let ChannelAttachContext {
+        home,
+        manager: _,
+        project_root: _,
+        work_root,
+    } = context;
     let home_id = home.ensure_home_id().await?;
     let project_scope = project_scope_for_work_root(work_root);
     let spec = prepare_channel_attach(
-        home,
-        manager,
-        work_root,
+        context,
         channel_id,
         requested_peer_id,
         requested_runtime_id,
@@ -135,14 +149,18 @@ pub(crate) async fn attach_channel_with_binaries<M: UnitManager>(
 }
 
 pub(crate) async fn prepare_channel_attach<M: UnitManager>(
-    home: &LionClawHome,
-    manager: &M,
-    work_root: &Path,
+    context: ChannelAttachContext<'_, M>,
     channel_id: String,
     requested_peer_id: Option<String>,
     requested_runtime_id: Option<String>,
     binaries: &StackBinaryPaths,
 ) -> Result<ChannelAttachSpec> {
+    let ChannelAttachContext {
+        home,
+        manager,
+        project_root,
+        work_root,
+    } = context;
     let expected_project_scope = project_scope_for_work_root(work_root);
     let local_state = load_operator_state(home).await?;
     let initial_config = local_state.config.clone();
@@ -156,6 +174,7 @@ pub(crate) async fn prepare_channel_attach<M: UnitManager>(
         home,
         &initial_config,
         &initial_runtime_id,
+        project_root,
         Some(work_root),
     )
     .await?;
@@ -179,12 +198,28 @@ pub(crate) async fn prepare_channel_attach<M: UnitManager>(
     {
         DaemonClassification::Absent => {
             started_managed_units = true;
-            up_for_work_root(home, manager, &initial_runtime_id, binaries, work_root).await?
+            up_for_work_root(
+                home,
+                manager,
+                &initial_runtime_id,
+                binaries,
+                project_root,
+                work_root,
+            )
+            .await?
         }
         DaemonClassification::SameHome => local_state,
         DaemonClassification::SameHomeDifferentConfig => {
             started_managed_units = true;
-            up_for_work_root(home, manager, &initial_runtime_id, binaries, work_root).await?
+            up_for_work_root(
+                home,
+                manager,
+                &initial_runtime_id,
+                binaries,
+                project_root,
+                work_root,
+            )
+            .await?
         }
         DaemonClassification::SameHomeDifferentProject => {
             return Err(anyhow!(
@@ -326,7 +361,9 @@ mod tests {
     use axum::{routing::get, Json, Router};
     use serde_json::json;
 
-    use super::{launch_channel_attach, prepare_channel_attach, ChannelAttachSpec};
+    use super::{
+        launch_channel_attach, prepare_channel_attach, ChannelAttachContext, ChannelAttachSpec,
+    };
     use crate::{
         applied::{compute_daemon_fingerprint, AppliedState},
         config::resolve_project_workspace_root,
@@ -588,9 +625,12 @@ mod tests {
             seed_interactive_channel(ChannelLaunchMode::Background).await;
 
         let err = prepare_channel_attach(
-            &home,
-            &manager,
-            &current_work_root(),
+            ChannelAttachContext {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: &current_work_root(),
+            },
             "terminal".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
@@ -612,9 +652,12 @@ mod tests {
             .expect("rewrite runtime auth");
 
         let err = prepare_channel_attach(
-            &home,
-            &manager,
-            &current_work_root(),
+            ChannelAttachContext {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: &current_work_root(),
+            },
             "terminal".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
@@ -634,9 +677,12 @@ mod tests {
             seed_interactive_channel(ChannelLaunchMode::Interactive).await;
 
         let spec = prepare_channel_attach(
-            &home,
-            &manager,
-            &current_work_root(),
+            ChannelAttachContext {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: &current_work_root(),
+            },
             "terminal".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
@@ -698,9 +744,12 @@ mod tests {
         merge_channel_env(&home, "terminal", &channel_env).expect("persist channel env");
 
         let spec = prepare_channel_attach(
-            &home,
-            &manager,
-            &current_work_root(),
+            ChannelAttachContext {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: &current_work_root(),
+            },
             "terminal".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
@@ -725,9 +774,12 @@ mod tests {
         .expect("update channel with missing required env");
 
         let err = prepare_channel_attach(
-            &home,
-            &manager,
-            &current_work_root(),
+            ChannelAttachContext {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: &current_work_root(),
+            },
             "terminal".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
@@ -783,9 +835,12 @@ mod tests {
         let manager = RemovingInstalledSkillOnStartManager::new(&home, "terminal");
 
         let spec = prepare_channel_attach(
-            &home,
-            &manager,
-            &current_work_root(),
+            ChannelAttachContext {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: &current_work_root(),
+            },
             "terminal".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
@@ -845,9 +900,12 @@ mod tests {
         .await;
 
         let spec = prepare_channel_attach(
-            &home,
-            &manager,
-            &current_work_root(),
+            ChannelAttachContext {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: &current_work_root(),
+            },
             "terminal".to_string(),
             None,
             Some("codex".to_string()),
@@ -898,9 +956,12 @@ mod tests {
         .await;
 
         let spec = prepare_channel_attach(
-            &home,
-            &manager,
-            &current_work_root(),
+            ChannelAttachContext {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: &current_work_root(),
+            },
             "terminal".to_string(),
             None,
             Some("codex".to_string()),
@@ -956,9 +1017,12 @@ mod tests {
             .expect("set unit status");
 
         let spec = prepare_channel_attach(
-            &home,
-            &manager,
-            &current_work_root(),
+            ChannelAttachContext {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: &current_work_root(),
+            },
             "terminal".to_string(),
             None,
             Some("codex".to_string()),
@@ -1016,9 +1080,12 @@ mod tests {
         .await;
 
         let err = prepare_channel_attach(
-            &home,
-            &manager,
-            &current_work_root(),
+            ChannelAttachContext {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: &current_work_root(),
+            },
             "terminal".to_string(),
             None,
             Some("missing".to_string()),
@@ -1063,9 +1130,12 @@ mod tests {
         .await;
 
         let err = prepare_channel_attach(
-            &home,
-            &manager,
-            &current_work_root(),
+            ChannelAttachContext {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: &current_work_root(),
+            },
             "terminal".to_string(),
             None,
             Some("codex".to_string()),
@@ -1092,9 +1162,12 @@ mod tests {
         .await;
 
         let err = prepare_channel_attach(
-            &home,
-            &manager,
-            &current_work_root(),
+            ChannelAttachContext {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: &current_work_root(),
+            },
             "terminal".to_string(),
             None,
             Some("codex".to_string()),
@@ -1141,9 +1214,12 @@ mod tests {
         .await;
 
         let err = prepare_channel_attach(
-            &home,
-            &manager,
-            &current_work_root(),
+            ChannelAttachContext {
+                home: &home,
+                manager: &manager,
+                project_root: None,
+                work_root: &current_work_root(),
+            },
             "terminal".to_string(),
             None,
             Some("codex".to_string()),

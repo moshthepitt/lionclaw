@@ -55,10 +55,11 @@ async fn load_default_runtime(home: &std::path::Path) -> Option<String> {
 }
 
 pub(super) async fn open_selected_instance(
+    project_root: Option<&Path>,
     summary: InstanceSummary,
     launch: &ConsoleLaunchOptions,
 ) -> SelectedInstanceState {
-    match try_open_selected_instance(summary.clone(), launch).await {
+    match try_open_selected_instance(project_root, summary.clone(), launch).await {
         Ok(ready) => SelectedInstanceState::Ready(Box::new(ready)),
         Err(err) => SelectedInstanceState::Blocked {
             blocker: LaunchBlocker::for_instance(summary.display_name(), err.to_string()),
@@ -145,6 +146,7 @@ fn project_session_items(
 }
 
 async fn try_open_selected_instance(
+    project_root: Option<&Path>,
     summary: InstanceSummary,
     launch: &ConsoleLaunchOptions,
 ) -> Result<ReadyInstance> {
@@ -166,6 +168,7 @@ async fn try_open_selected_instance(
         &home,
         &config,
         &runtime_id,
+        project_root,
         Some(work_root),
     )
     .await?;

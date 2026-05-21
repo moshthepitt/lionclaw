@@ -196,6 +196,7 @@ pub async fn up_for_work_root<M: UnitManager>(
     manager: &M,
     runtime_id: &str,
     binaries: &StackBinaryPaths,
+    project_root: Option<&Path>,
     work_root: &Path,
 ) -> Result<OperatorState> {
     let mut state = load_operator_state(home).await?;
@@ -256,8 +257,14 @@ pub async fn up_for_work_root<M: UnitManager>(
     }
 
     let previous_units = manager.owned_units(home)?.names();
-    validate_runtime_launch_prerequisites_for_work_root(home, config, runtime_id, Some(work_root))
-        .await?;
+    validate_runtime_launch_prerequisites_for_work_root(
+        home,
+        config,
+        runtime_id,
+        project_root,
+        Some(work_root),
+    )
+    .await?;
     render_runtime_cache_for_work_root(home, &state.config, runtime_id, work_root).await?;
     let units = build_managed_units(
         home,
@@ -1631,9 +1638,16 @@ mod tests {
         let binaries = StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         };
-        let state = up_for_work_root(&home, &manager, "codex", &binaries, &current_work_root())
-            .await
-            .expect("up");
+        let state = up_for_work_root(
+            &home,
+            &manager,
+            "codex",
+            &binaries,
+            None,
+            &current_work_root(),
+        )
+        .await
+        .expect("up");
         let project_workspace_root =
             resolve_project_workspace_root().expect("resolve project workspace root");
 
@@ -1690,9 +1704,16 @@ mod tests {
         let binaries = StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         };
-        up_for_work_root(&home, &manager, "codex", &binaries, &current_work_root())
-            .await
-            .expect("up");
+        up_for_work_root(
+            &home,
+            &manager,
+            "codex",
+            &binaries,
+            None,
+            &current_work_root(),
+        )
+        .await
+        .expect("up");
         let telegram_unit_name = channel_unit_name(&test_unit_identity(&home), "telegram");
         let unit = manager
             .managed_unit(&telegram_unit_name)
@@ -1758,9 +1779,16 @@ mod tests {
         let binaries = StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         };
-        let err = up_for_work_root(&home, &manager, "codex", &binaries, &current_work_root())
-            .await
-            .expect_err("undeclared env should fail");
+        let err = up_for_work_root(
+            &home,
+            &manager,
+            "codex",
+            &binaries,
+            None,
+            &current_work_root(),
+        )
+        .await
+        .expect_err("undeclared env should fail");
 
         assert!(err.to_string().contains("EXTRA_SECRET"));
         assert!(!err.to_string().contains("do-not-expose"));
@@ -1877,6 +1905,7 @@ mod tests {
             &StackBinaryPaths {
                 daemon_bin: "/tmp/lionclawd".into(),
             },
+            None,
             &current_work_root(),
         )
         .await
@@ -1929,6 +1958,7 @@ mod tests {
             &StackBinaryPaths {
                 daemon_bin: "/tmp/lionclawd".into(),
             },
+            None,
             &current_work_root(),
         )
         .await
@@ -1981,9 +2011,16 @@ mod tests {
         let binaries = StackBinaryPaths {
             daemon_bin: "/tmp/lionclawd".into(),
         };
-        let state = up_for_work_root(&home, &manager, "codex", &binaries, &current_work_root())
-            .await
-            .expect("up");
+        let state = up_for_work_root(
+            &home,
+            &manager,
+            "codex",
+            &binaries,
+            None,
+            &current_work_root(),
+        )
+        .await
+        .expect("up");
 
         assert_eq!(state.applied_state.channels().len(), 1);
         assert_eq!(
@@ -2049,9 +2086,16 @@ mod tests {
             daemon_bin: "/tmp/lionclawd".into(),
         };
 
-        up_for_work_root(&home, &manager, "codex", &binaries, &current_work_root())
-            .await
-            .expect("same-home managed daemon should be reused");
+        up_for_work_root(
+            &home,
+            &manager,
+            "codex",
+            &binaries,
+            None,
+            &current_work_root(),
+        )
+        .await
+        .expect("same-home managed daemon should be reused");
         assert!(manager
             .was_restarted(&daemon_unit)
             .expect("read restart state"));
@@ -2076,9 +2120,16 @@ mod tests {
             daemon_bin: "/tmp/lionclawd".into(),
         };
         let daemon_unit = test_daemon_unit_name(&home);
-        up_for_work_root(&home, &manager, "codex", &binaries, &current_work_root())
-            .await
-            .expect("initial up");
+        up_for_work_root(
+            &home,
+            &manager,
+            "codex",
+            &binaries,
+            None,
+            &current_work_root(),
+        )
+        .await
+        .expect("initial up");
         assert!(
             !manager
                 .was_restarted(&daemon_unit)
@@ -2125,9 +2176,16 @@ mod tests {
         .await
         .expect("install runtime-visible skill");
 
-        up_for_work_root(&home, &manager, "codex", &binaries, &current_work_root())
-            .await
-            .expect("reconcile changed skills");
+        up_for_work_root(
+            &home,
+            &manager,
+            "codex",
+            &binaries,
+            None,
+            &current_work_root(),
+        )
+        .await
+        .expect("reconcile changed skills");
         assert!(
             manager
                 .was_restarted(&daemon_unit)

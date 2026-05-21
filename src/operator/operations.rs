@@ -63,6 +63,7 @@ impl ProjectOperationReport {
 pub async fn up_instance<M: UnitManager>(
     home: &LionClawHome,
     manager: &M,
+    project_root: Option<&Path>,
     work_root: &Path,
 ) -> Result<String> {
     let config = OperatorConfig::load(home).await?;
@@ -70,7 +71,15 @@ pub async fn up_instance<M: UnitManager>(
         anyhow!("no default runtime configured for selected instance\nRun:\n  lionclaw configure --runtime codex")
     })?;
     let binaries = resolve_stack_binaries()?;
-    let state = up_for_work_root(home, manager, &runtime_id, &binaries, work_root).await?;
+    let state = up_for_work_root(
+        home,
+        manager,
+        &runtime_id,
+        &binaries,
+        project_root,
+        work_root,
+    )
+    .await?;
     let worker_count = state
         .config
         .channels
@@ -111,7 +120,7 @@ pub async fn operate_project_instances<M: UnitManager>(
         let home = LionClawHome::new(entry.home.clone());
         let outcome = match operation {
             StackOperation::Up => match entry.work_root.as_deref() {
-                Some(work_root) => up_instance(&home, manager, work_root).await,
+                Some(work_root) => up_instance(&home, manager, Some(project_root), work_root).await,
                 None => Err(anyhow!(
                     "{}",
                     entry

@@ -779,6 +779,7 @@ pub async fn run() -> Result<ExitCode> {
                 ConnectChannelRequest {
                     home: &target.instance_home,
                     manager: &manager,
+                    project_root: target.project_root.as_deref(),
                     work_root: target.require_work_root()?,
                     channel_or_path: &args.channel_or_path,
                     env_inputs: ConnectEnvInputs {
@@ -817,6 +818,7 @@ pub async fn run() -> Result<ExitCode> {
             } else {
                 run_local(
                     &target.instance_home,
+                    target.project_root.as_deref(),
                     target.require_work_root()?,
                     target.instance_name.as_deref(),
                     args.runtime,
@@ -841,9 +843,13 @@ pub async fn run() -> Result<ExitCode> {
                 let target = resolved_target
                     .as_ref()
                     .ok_or_else(|| anyhow!("up requires a resolved LionClaw target"))?;
-                let message =
-                    up_instance(&target.instance_home, &manager, target.require_work_root()?)
-                        .await?;
+                let message = up_instance(
+                    &target.instance_home,
+                    &manager,
+                    target.project_root.as_deref(),
+                    target.require_work_root()?,
+                )
+                .await?;
                 println!("{message}");
             }
         }
@@ -1148,8 +1154,18 @@ pub async fn run() -> Result<ExitCode> {
             ChannelCommand::Attach(args) => {
                 let manager = SystemdUserUnitManager;
                 let work_root = required_command_work_root(&resolved_target, "channel attach")?;
-                attach_channel(&home, &manager, work_root, args.id, args.peer, args.runtime)
-                    .await?;
+                attach_channel(
+                    &home,
+                    &manager,
+                    resolved_target
+                        .as_ref()
+                        .and_then(|target| target.project_root.as_deref()),
+                    work_root,
+                    args.id,
+                    args.peer,
+                    args.runtime,
+                )
+                .await?;
             }
             ChannelCommand::Pairing { command } => match command {
                 ChannelPairingCommand::List(args) => {
