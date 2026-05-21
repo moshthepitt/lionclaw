@@ -1738,6 +1738,9 @@ class TelegramWorker:
             if turn.terminal:
                 continue
             if _loop_time() >= turn.visible_after:
+                if turn.terminal_text is not None:
+                    await self._finish_terminal_progress_turn(turn, turn.terminal_text)
+                    continue
                 await self._ensure_progress_message(turn)
             if (
                 turn.terminal_text is not None
@@ -1947,6 +1950,9 @@ class TelegramWorker:
         turn.visible_after = min(turn.visible_after, _loop_time())
         self._save_active_turns()
         await self._set_turn_reaction(turn, _terminal_reaction(text))
+        await self._finish_terminal_progress_turn(turn, text)
+
+    async def _finish_terminal_progress_turn(self, turn: ActiveTurn, text: str) -> None:
         render_result = await self._ensure_progress_message(turn, force=True)
         if render_result == ProgressRenderResult.RENDERED:
             turn.terminal = True
@@ -1956,8 +1962,9 @@ class TelegramWorker:
             return
         if turn.provisional_message_ref is not None:
             fallback_sent = await self._send_progress_fallback(turn, text)
-            if fallback_sent:
-                await self._delete_progress_message(turn)
+            if not fallback_sent:
+                return
+            await self._delete_progress_message(turn)
         turn.terminal = True
         self._forget_turn(turn)
 
