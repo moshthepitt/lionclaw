@@ -107,11 +107,14 @@ class TelegramWebhookServer:
     def _secret_token_matches(self, request: web.Request) -> bool:
         expected = self._config.telegram_webhook_secret_token
         actual = request.headers.get(TELEGRAM_SECRET_TOKEN_HEADER)
-        return (
-            expected is not None
-            and actual is not None
-            and hmac.compare_digest(actual, expected)
-        )
+        if expected is None or actual is None:
+            return False
+        try:
+            actual_bytes = actual.encode("ascii")
+            expected_bytes = expected.encode("ascii")
+        except UnicodeEncodeError:
+            return False
+        return hmac.compare_digest(actual_bytes, expected_bytes)
 
     def _record_bound_address(self, site: web.TCPSite) -> None:
         server = getattr(site, "_server", None)

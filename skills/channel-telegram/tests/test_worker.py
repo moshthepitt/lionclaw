@@ -8025,6 +8025,31 @@ class TelegramWebhookServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(handled, [])
 
+    async def test_webhook_rejects_non_ascii_secret_token_without_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+
+            async def handle(update: Update) -> bool:
+                _ = update
+                return True
+
+            server = TelegramWebhookServer(
+                replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_port=0,
+                    telegram_webhook_path="/hook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                handle,
+            )
+            request = type(
+                "Request",
+                (),
+                {"headers": {TELEGRAM_SECRET_TOKEN_HEADER: "secrét"}},
+            )()
+
+            self.assertFalse(server._secret_token_matches(request))
+
     async def test_webhook_accepts_valid_secret_token(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             handled: list[Update] = []
