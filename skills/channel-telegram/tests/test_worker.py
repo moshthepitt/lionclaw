@@ -2361,6 +2361,91 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([update.text for update in api.sent_inbound], ["start work"])
         self.assertEqual(telegram.sent_messages, [])
 
+    async def test_process_webhook_update_serializes_batches_for_same_route(
+        self,
+    ) -> None:
+        class BlockingApi(FakeLionClawApi):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started: list[str | None] = []
+                self.first_started = asyncio.Event()
+                self.release_first = asyncio.Event()
+
+            async def send_inbound(
+                self,
+                update: TelegramInboundUpdate,
+            ) -> InboundResponse:
+                self.started.append(update.text)
+                if update.text == "first":
+                    self.first_started.set()
+                    await self.release_first.wait()
+                return await super().send_inbound(update)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = BlockingApi()
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=api,
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            first = Update.model_validate(
+                {
+                    "update_id": 879,
+                    "message": {
+                        "message_id": 179,
+                        "date": 0,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "first",
+                    },
+                }
+            )
+            second = Update.model_validate(
+                {
+                    "update_id": 880,
+                    "message": {
+                        "message_id": 180,
+                        "date": 20,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "second",
+                    },
+                }
+            )
+
+            with patch(
+                "lionclaw_channel_telegram.worker.WEBHOOK_COALESCE_DELAY_SECONDS",
+                0.01,
+            ):
+                first_task = asyncio.create_task(worker.process_webhook_update(first))
+                await asyncio.wait_for(api.first_started.wait(), timeout=1.0)
+                second_task = asyncio.create_task(worker.process_webhook_update(second))
+                await asyncio.sleep(0.05)
+
+                self.assertEqual(api.started, ["first"])
+                self.assertFalse(second_task.done())
+
+                api.release_first.set()
+                processed = await asyncio.gather(first_task, second_task)
+
+        self.assertEqual(processed, [True, True])
+        self.assertEqual(
+            [update.text for update in api.sent_inbound], ["first", "second"]
+        )
+
     async def test_process_webhook_update_reports_processing_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi(inbound_outcome="not-a-real-outcome")
