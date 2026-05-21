@@ -2719,6 +2719,88 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(stored_update_ids, {874: None})
 
+    async def test_webhook_batch_dedupe_save_failure_rejects_whole_batch_without_replay(
+        self,
+    ) -> None:
+        class FailingBatchWebhookUpdateStore(WebhookUpdateStore):
+            def __init__(self, path: Path) -> None:
+                super().__init__(path)
+                self.failures_remaining = 1
+
+            def save(self, update_ids: dict[int, None]) -> None:
+                if len(update_ids) > 1 and self.failures_remaining > 0:
+                    self.failures_remaining -= 1
+                    raise RuntimeError("state store unavailable")
+                super().save(update_ids)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = FailingBatchWebhookUpdateStore(
+                Path(temp_dir) / "telegram.webhook-updates.json"
+            )
+            api = FakeLionClawApi()
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=api,
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                webhook_update_store=store,
+            )
+            first = Update.model_validate(
+                {
+                    "update_id": 875,
+                    "message": {
+                        "message_id": 75,
+                        "date": 0,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "first",
+                    },
+                }
+            )
+            second = Update.model_validate(
+                {
+                    "update_id": 876,
+                    "message": {
+                        "message_id": 76,
+                        "date": 1,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "second",
+                    },
+                }
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                first_result, second_result = await asyncio.gather(
+                    worker.process_webhook_update(first),
+                    worker.process_webhook_update(second),
+                )
+            self.assertEqual(store.load(), {})
+            retry_first = await worker.process_webhook_update(first)
+            retry_second = await worker.process_webhook_update(second)
+            stored_update_ids = store.load()
+
+        self.assertFalse(first_result)
+        self.assertFalse(second_result)
+        self.assertTrue(retry_first)
+        self.assertTrue(retry_second)
+        self.assertEqual(
+            [update.text for update in api.sent_inbound], ["first\n\nsecond"]
+        )
+        self.assertEqual(stored_update_ids, {875: None, 876: None})
+
     async def test_webhook_update_is_rejected_after_worker_shutdown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()

@@ -875,11 +875,22 @@ class TelegramWorker:
         async with self._webhook_state_lock:
             result = self._webhook_update_results.pop(update_id, None)
             if processed:
-                self._remember_webhook_update_locked(update_id)
-                accepted = self._save_webhook_updates_locked()
+                accepted = self._accept_webhook_update_ids_locked((update_id,))
         if result is not None and not result.done():
             result.set_result(accepted)
         return accepted
+
+    async def _accept_webhook_update_ids(
+        self,
+        update_ids: tuple[int, ...],
+    ) -> bool:
+        async with self._webhook_state_lock:
+            return self._accept_webhook_update_ids_locked(update_ids)
+
+    def _accept_webhook_update_ids_locked(self, update_ids: tuple[int, ...]) -> bool:
+        for update_id in update_ids:
+            self._remember_webhook_update_locked(update_id)
+        return self._save_webhook_updates_locked()
 
     def _remember_webhook_update_locked(self, update_id: int) -> None:
         if update_id in self._webhook_recent_update_ids:
@@ -1089,6 +1100,10 @@ class TelegramWorker:
                 work_items,
                 persist_offsets=False,
             )
+            if processed:
+                processed = await self._accept_webhook_update_ids(
+                    _work_item_update_ids(work_items)
+                )
             reject_later_batches = not processed
         except asyncio.CancelledError:
             reject_later_batches = True
@@ -3124,6 +3139,18 @@ def _coalesce_work_items(items: list[ProviderWorkItem]) -> list[ProviderWorkItem
 
 def _provider_work_item_sort_key(item: ProviderWorkItem) -> tuple[int, ...]:
     return item.update_ids
+
+
+def _work_item_update_ids(items: Iterable[ProviderWorkItem]) -> tuple[int, ...]:
+    update_ids: list[int] = []
+    seen: set[int] = set()
+    for item in items:
+        for update_id in item.update_ids:
+            if update_id in seen:
+                continue
+            seen.add(update_id)
+            update_ids.append(update_id)
+    return tuple(update_ids)
 
 
 def _webhook_batch_key(event: TelegramInboundEvent | None) -> WebhookBatchKey | None:
