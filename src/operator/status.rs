@@ -8,6 +8,7 @@ use super::{
     config::{ManagedChannelConfig, OperatorConfig},
     managed_units::{SystemdUserUnitManager, UnitManager},
     runtime_integration::{runtime_auth_guidance, runtime_profile_facts},
+    runtime_mounts::validate_runtime_profile_mounts,
     target::{
         inspect_target_work_root, list_project_instance_statuses, TargetContext, TargetSelection,
     },
@@ -283,6 +284,15 @@ fn readiness_findings(input: &InstanceRenderInput) -> Vec<String> {
     let facts = runtime_profile_facts(profile);
     if let Some(err) = facts.validation_error {
         findings.push(format!("runtime profile \"{runtime_id}\" invalid: {err}"));
+    } else if let Err(err) = validate_runtime_profile_mounts(
+        &LionClawHome::new(input.home.clone()),
+        input.project_root.as_deref(),
+        input.work_root.as_deref(),
+        profile,
+    ) {
+        findings.push(format!(
+            "runtime profile \"{runtime_id}\" invalid mounts: {err}"
+        ));
     }
     if findings.is_empty() {
         findings.push("ready".to_string());
@@ -313,6 +323,7 @@ mod tests {
     use std::{fs, os::unix::fs::PermissionsExt};
 
     use super::*;
+    use crate::kernel::runtime::{ConfinementConfig, MountAccess, MountSpec};
     use crate::operator::{
         managed_units::{daemon_unit_name, ensure_unit_identity, FakeUnitManager},
         runtime_integration::configure_runtime_profile_with_engine_resolver,
@@ -356,6 +367,37 @@ mod tests {
         assert!(output.contains("runtime: codex kind=codex bin=codex"));
         assert!(output.contains("image: lionclaw-runtime:v1"));
         assert!(output.contains("readiness: ready"));
+    }
+
+    #[tokio::test]
+    async fn status_reports_invalid_configured_runtime_mounts() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        let home = LionClawHome::new(project.instance.home.clone());
+        let private = home.root().join("config/private");
+        fs::create_dir_all(&private).expect("private mount source");
+        let mut config = OperatorConfig::load(&home).await.expect("load config");
+        configure_test_codex(&mut config, &fake_podman(temp_dir.path()));
+        let runtime = config.runtimes.get_mut("codex").expect("runtime");
+        let ConfinementConfig::Oci(oci) = runtime.confinement_mut();
+        oci.additional_mounts.push(MountSpec {
+            source: private,
+            target: "/mnt/private".to_string(),
+            access: MountAccess::ReadOnly,
+        });
+        config.save(&home).await.expect("save config");
+        let target = TargetContext {
+            project_root: Some(project.project_root.clone()),
+            instance_name: Some("main".to_string()),
+            instance_home: home,
+            work_root: Some(project.instance.work_root.clone()),
+        };
+
+        let output = render_target_status(&target).await.expect("status");
+
+        assert!(output.contains("readiness: run blocked"));
+        assert!(output.contains("invalid mounts"));
+        assert!(output.contains("selected instance home"));
     }
 
     #[tokio::test]

@@ -31,6 +31,7 @@ use crate::{
         },
         runtime::resolve_runtime_execution_context,
         runtime_integration::{runtime_auth_guidance, DEFAULT_OCI_ENGINE},
+        runtime_mounts::validate_runtime_profile_mounts,
         target::{
             discover_diagnostic_project_root, instance_home_path, instances_dir_path,
             normalize_project_default_instance, project_dir_path, project_file_path,
@@ -757,7 +758,15 @@ async fn inspect_instance<M: UnitManager>(
         }
     };
 
-    inspect_runtime_config(name, &commands, &config, &mut findings);
+    inspect_runtime_config(
+        project_root,
+        name,
+        &home,
+        work_root.as_deref(),
+        &commands,
+        &config,
+        &mut findings,
+    );
     inspect_channels(
         &lion_home,
         name,
@@ -974,18 +983,31 @@ fn inspect_instance_work_root(
 }
 
 fn inspect_runtime_config(
+    project_root: Option<&Path>,
     name: &str,
+    home: &Path,
+    work_root: Option<&Path>,
     commands: &DoctorCommands,
     config: &OperatorConfig,
     findings: &mut Vec<DoctorFinding>,
 ) {
-    inspect_runtime_config_with_podman_resolver(name, commands, config, findings, || {
-        normalize_podman_executable(DEFAULT_OCI_ENGINE)
-    });
+    inspect_runtime_config_with_podman_resolver(
+        project_root,
+        name,
+        home,
+        work_root,
+        commands,
+        config,
+        findings,
+        || normalize_podman_executable(DEFAULT_OCI_ENGINE),
+    );
 }
 
 fn inspect_runtime_config_with_podman_resolver<F>(
+    project_root: Option<&Path>,
     name: &str,
+    home: &Path,
+    work_root: Option<&Path>,
     commands: &DoctorCommands,
     config: &OperatorConfig,
     findings: &mut Vec<DoctorFinding>,
@@ -1050,6 +1072,24 @@ fn inspect_runtime_config_with_podman_resolver<F>(
             )
             .with_inspect(commands.selected("status"))
             .with_repair(default_runtime_repair),
+        );
+    } else if let Err(err) = validate_runtime_profile_mounts(
+        &LionClawHome::new(home.to_path_buf()),
+        project_root,
+        work_root,
+        profile,
+    ) {
+        findings.push(
+            DoctorFinding::error(
+                FindingKind::Runtime,
+                format!(
+                    "runtime profile \"{runtime_id}\" has invalid mounts for instance \"{name}\""
+                ),
+                format!("instance {name} runtime profile {runtime_id} mounts"),
+                err.to_string(),
+            )
+            .with_inspect(commands.selected(&format!("runtime mount list {runtime_id}")))
+            .with_repair(commands.selected("runtime mount remove <runtime-id> <target>")),
         );
     }
 
@@ -2343,7 +2383,7 @@ mod tests {
 
     use super::*;
     use crate::contracts::DaemonInfoResponse;
-    use crate::kernel::runtime::{ConfinementConfig, OciConfinementConfig};
+    use crate::kernel::runtime::{ConfinementConfig, MountAccess, MountSpec, OciConfinementConfig};
     use crate::operator::config::{daemon_compat_fingerprint, RuntimeProfileConfig};
     use crate::operator::managed_units::{
         channel_unit_name, daemon_unit_name, ensure_unit_identity, render_daemon_unit,
@@ -3031,7 +3071,10 @@ mod tests {
         let mut findings = Vec::new();
 
         inspect_runtime_config_with_podman_resolver(
+            Some(Path::new("/repo")),
             "main",
+            Path::new("/repo/.lionclaw/instances/main"),
+            None,
             &commands,
             &config,
             &mut findings,
@@ -3064,7 +3107,10 @@ mod tests {
         let mut findings = Vec::new();
 
         inspect_runtime_config_with_podman_resolver(
+            Some(Path::new("/repo")),
             "main",
+            Path::new("/repo/.lionclaw/instances/main"),
+            None,
             &commands,
             &config,
             &mut findings,
@@ -3078,6 +3124,62 @@ mod tests {
         let finding = findings.first().expect("runtime finding");
         assert_eq!(findings.len(), 1);
         assert_podman_configure_blocker(finding);
+    }
+
+    #[test]
+    fn doctor_reports_invalid_configured_runtime_mounts() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project_root = temp_dir.path();
+        let home = project_root.join(".lionclaw/instances/main");
+        let private = home.join("config/private");
+        let engine = temp_dir.path().join("podman");
+        fs::create_dir_all(&private).expect("private source");
+        fs::write(&engine, "#!/usr/bin/env bash\nexit 0\n").expect("fake podman");
+        fs::set_permissions(&engine, fs::Permissions::from_mode(0o755)).expect("chmod podman");
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "codex".to_string(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: engine.to_string_lossy().to_string(),
+                    image: Some("lionclaw-runtime:v1".to_string()),
+                    additional_mounts: vec![MountSpec {
+                        source: private,
+                        target: "/mnt/private".to_string(),
+                        access: MountAccess::ReadOnly,
+                    }],
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+        let commands = DoctorCommands::for_target(Some(project_root), "main", &home);
+        let mut findings = Vec::new();
+
+        inspect_runtime_config(
+            Some(project_root),
+            "main",
+            &home,
+            Some(project_root),
+            &commands,
+            &config,
+            &mut findings,
+        );
+
+        let report = DoctorReport {
+            findings,
+            observations: Vec::new(),
+            next_command: None,
+        };
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.subject.contains("invalid mounts"))
+            .expect("invalid mount finding");
+        assert_eq!(finding.severity, FindingSeverity::Error);
+        assert!(finding.observed.contains("selected instance home"));
     }
 
     fn assert_podman_configure_blocker(finding: &DoctorFinding) {
@@ -3970,7 +4072,15 @@ mod tests {
         let commands = DoctorCommands::for_target(None, "main", temp_dir.path());
         let mut findings = Vec::new();
 
-        inspect_runtime_config("main", &commands, &config, &mut findings);
+        inspect_runtime_config(
+            None,
+            "main",
+            temp_dir.path(),
+            None,
+            &commands,
+            &config,
+            &mut findings,
+        );
 
         assert!(!marker.exists());
         assert!(!findings

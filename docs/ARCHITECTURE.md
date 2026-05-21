@@ -214,6 +214,8 @@ The everyday runtime layout is mount-first:
 - `/lionclaw/skills/<alias>`: installed non-channel skill assets mounted read-only
 - `/attachments`: read-only channel attachment files for the current inbound
   event, present only after attachment finalization staged files for that turn
+- `/mnt/<target>` or another explicit absolute target: operator-configured
+  extra directory mounts stored on the selected runtime profile
 
 For local `lionclaw run`, target resolution selects one project instance and
 uses that instance's recorded work root. In project mode, the operator console
@@ -223,6 +225,19 @@ instance's existing home, work root, runtime config, sessions, and audit scope;
 it does not mutate project, instance, runtime, channel, skill, or default
 configuration. The selected work root is mounted at `/workspace`. The instance
 home remains LionClaw's state root and is not the project tree or work root.
+
+Configured extra mounts are instance/runtime-profile scoped. Operators manage
+them with `lionclaw runtime mount add|list|remove <runtime-id> ...`. The
+positional mount value is target identity: a path-safe token resolves to
+`/mnt/<token>`, while an absolute value is used as the exact container target.
+Persisted state remains the execution planner's `MountSpec { source, target,
+access }`; there is no separate mount name. Mount sources must be existing
+canonical directories outside LionClaw project metadata and instance-private
+state. Targets must be absolute, unique within the runtime profile, and outside
+reserved runtime paths: `/workspace`, `/runtime`, `/drafts`, `/attachments`,
+`/lionclaw`, `/run/secrets`, `/proc`, `/sys`, and `/dev`. The operator CLI,
+status/doctor checks, runtime launch validation, and planner all validate the
+configured mounts so hand-edited config cannot bypass planner safety checks.
 
 The operator console treats the transcript as durable conversation: user prompts
 and assistant answer deltas are rendered as message blocks. Runtime status,

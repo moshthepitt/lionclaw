@@ -162,7 +162,13 @@ async fn try_open_selected_instance(
         launch.requested_runtime.as_deref(),
         summary.display_name(),
     )?;
-    validate_runtime_launch_prerequisites(&home, &config, &runtime_id).await?;
+    validate_runtime_launch_prerequisites_for_work_root(
+        &home,
+        &config,
+        &runtime_id,
+        Some(work_root),
+    )
+    .await?;
     render_runtime_cache_for_work_root(&home, &config, &runtime_id, work_root).await?;
     let effective_timeouts = launch
         .timeout_override

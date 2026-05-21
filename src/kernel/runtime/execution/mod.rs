@@ -4,6 +4,7 @@
 //! process utilities so confinement policy stays out of individual adapters.
 
 pub mod backend;
+pub mod mount_validation;
 pub mod oci;
 pub mod plan;
 pub mod planner;

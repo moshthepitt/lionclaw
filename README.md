@@ -135,9 +135,26 @@ Confined runtime layout:
 - `/runtime`: runtime-private writable state
 - `/drafts`: runtime-private draft/output area
 - `/lionclaw/skills/<alias>`: installed non-channel skill assets
+- `/mnt/<target>`: optional operator-configured extra directories
 
 Network policy is intentionally coarse today: `on` or `none`. `on` uses the
 Podman network namespace, not host networking.
+
+Extra runtime mounts are explicit runtime-profile state. Use a short target
+token for the normal `/mnt/<token>` path, or an absolute container target when
+needed:
+
+```bash
+lionclaw runtime mount add codex docs --source /absolute/docs
+lionclaw runtime mount add codex /reference/docs --source /absolute/docs --read-write
+lionclaw runtime mount list codex
+lionclaw runtime mount remove codex docs
+```
+
+Mounts default to read-only. LionClaw rejects files, missing directories,
+LionClaw metadata and instance-state paths, duplicate targets, and reserved
+runtime paths such as `/workspace`, `/runtime`, `/drafts`, `/attachments`,
+`/lionclaw`, `/run/secrets`, `/proc`, `/sys`, and `/dev`.
 
 ## Projects And Instances
 

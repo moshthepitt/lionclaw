@@ -913,6 +913,12 @@ mod tests {
             .args
             .windows(2)
             .any(|pair| { pair == ["--volume".to_string(), "/host/refs:/refs:ro,Z".to_string()] }));
+        assert!(invocation.args.windows(2).any(|pair| {
+            pair == [
+                "--volume".to_string(),
+                "/host/cache:/mnt/cache:rw,Z".to_string(),
+            ]
+        }));
         assert!(invocation
             .args
             .windows(2)
@@ -1326,6 +1332,11 @@ esac
                     source: "/host/refs".into(),
                     target: "/refs".to_string(),
                     access: MountAccess::ReadOnly,
+                },
+                MountSpec {
+                    source: "/host/cache".into(),
+                    target: "/mnt/cache".to_string(),
+                    access: MountAccess::ReadWrite,
                 },
             ],
             mount_runtime_secrets: true,

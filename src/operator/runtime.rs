@@ -20,6 +20,7 @@ use crate::kernel::{
 use super::config::{
     daemon_compat_fingerprint_with_runtime_context, OperatorConfig, RuntimeProfileConfig,
 };
+use super::runtime_mounts::validate_configured_runtime_mounts;
 
 #[derive(Debug, Clone)]
 pub struct ResolvedRuntimeExecutionContext {
@@ -137,7 +138,19 @@ pub async fn validate_runtime_launch_prerequisites(
     config: &OperatorConfig,
     runtime_id: &str,
 ) -> Result<()> {
+    validate_runtime_launch_prerequisites_for_work_root(home, config, runtime_id, None).await
+}
+
+pub async fn validate_runtime_launch_prerequisites_for_work_root(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+    runtime_id: &str,
+    work_root: Option<&Path>,
+) -> Result<()> {
     validate_runtime_availability(config, runtime_id)?;
+    validate_configured_runtime_mounts(home, None, work_root, config, runtime_id).map_err(
+        |err| anyhow!("configured runtime profile '{runtime_id}' has invalid mounts: {err}"),
+    )?;
     let profile = config
         .runtime(runtime_id)
         .ok_or_else(|| anyhow!("runtime profile '{runtime_id}' is not configured"))?;

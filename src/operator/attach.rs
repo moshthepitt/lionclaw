@@ -23,7 +23,7 @@ use crate::{
         },
         runtime::{
             resolve_runtime_execution_context, resolve_runtime_id,
-            validate_runtime_launch_prerequisites,
+            validate_runtime_launch_prerequisites_for_work_root,
         },
     },
 };
@@ -152,7 +152,13 @@ pub(crate) async fn prepare_channel_attach<M: UnitManager>(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     let initial_runtime_id = resolve_runtime_id(&initial_config, requested_runtime_id.as_deref())?;
-    validate_runtime_launch_prerequisites(home, &initial_config, &initial_runtime_id).await?;
+    validate_runtime_launch_prerequisites_for_work_root(
+        home,
+        &initial_config,
+        &initial_runtime_id,
+        Some(work_root),
+    )
+    .await?;
     let expected_runtime_config_fingerprint =
         resolve_runtime_execution_context(home, &initial_config, Some(&initial_runtime_id))
             .await?

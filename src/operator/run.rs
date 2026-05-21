@@ -21,7 +21,7 @@ use crate::{
     operator::{
         config::OperatorConfig,
         reconcile::{open_runtime_kernel_for_work_root, render_runtime_cache_for_work_root},
-        runtime::{resolve_runtime_id, validate_runtime_launch_prerequisites},
+        runtime::{resolve_runtime_id, validate_runtime_launch_prerequisites_for_work_root},
     },
     runtime_timeouts::RuntimeTurnTimeouts,
 };
@@ -106,7 +106,13 @@ async fn run_local_with_io_and_timeouts<R: BufRead + Send, W: Write + Send>(
         requested_runtime.as_deref(),
         instance_name.unwrap_or("selected home"),
     )?;
-    validate_runtime_launch_prerequisites(home, &config, &runtime_id).await?;
+    validate_runtime_launch_prerequisites_for_work_root(
+        home,
+        &config,
+        &runtime_id,
+        Some(work_root),
+    )
+    .await?;
     render_runtime_cache_for_work_root(home, &config, &runtime_id, work_root).await?;
 
     let effective_timeouts = timeout_override.unwrap_or_else(RuntimeTurnTimeouts::interactive);

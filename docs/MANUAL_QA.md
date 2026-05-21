@@ -75,6 +75,21 @@ Expected:
 - `status` targets the selected project instance
 - `doctor` reports no blocking setup issues and prints the scoped `run` command
 
+Check explicit runtime mounts:
+
+```bash
+mkdir -p "$PROJ_A/reference-docs"
+"$LIONCLAW_BIN" runtime mount add codex docs --source "$PROJ_A/reference-docs"
+"$LIONCLAW_BIN" runtime mount list codex
+"$LIONCLAW_BIN" runtime mount remove codex docs
+```
+
+Expected:
+
+- `add` reports a read-only mount at `/mnt/docs`
+- `list` shows target, source, and access
+- `remove` deletes the mount and a subsequent `list` reports no configured mounts
+
 ## Phase 2: Direct Run
 
 Start the everyday path:

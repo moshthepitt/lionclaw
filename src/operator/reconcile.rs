@@ -29,7 +29,7 @@ use crate::{
         redaction::SecretRedactor,
         runtime::{
             register_configured_runtimes, resolve_runtime_execution_context,
-            validate_runtime_launch_prerequisites,
+            validate_runtime_launch_prerequisites_for_work_root,
         },
         snapshot::{install_snapshot, resolve_local_source},
     },
@@ -256,7 +256,8 @@ pub async fn up_for_work_root<M: UnitManager>(
     }
 
     let previous_units = manager.owned_units(home)?.names();
-    validate_runtime_launch_prerequisites(home, config, runtime_id).await?;
+    validate_runtime_launch_prerequisites_for_work_root(home, config, runtime_id, Some(work_root))
+        .await?;
     render_runtime_cache_for_work_root(home, &state.config, runtime_id, work_root).await?;
     let units = build_managed_units(
         home,
