@@ -124,6 +124,7 @@ pub struct NewChannelDelivery<'a> {
     pub turn_id: Option<Uuid>,
     pub source_kind: Option<&'a str>,
     pub source_id: Option<&'a str>,
+    pub source_fingerprint: Option<&'a str>,
     pub content: ChannelDeliveryContent,
 }
 
@@ -160,6 +161,7 @@ pub struct ChannelDeliveryRecord {
     pub turn_id: Option<Uuid>,
     pub source_kind: Option<String>,
     pub source_id: Option<String>,
+    pub source_fingerprint: Option<String>,
     pub status: ChannelOutboxDeliveryStatus,
     pub content: ChannelDeliveryContent,
     pub provider_receipt: Option<Value>,
@@ -192,6 +194,13 @@ pub struct ChannelOutboxReportResult {
 }
 
 #[derive(Debug, Clone)]
+pub enum ChannelOutboxEnqueueResult {
+    Created(ChannelDeliveryRecord),
+    Existing(ChannelDeliveryRecord),
+    Conflict(ChannelDeliveryRecord),
+}
+
+#[derive(Debug, Clone)]
 pub struct ChannelOutboxStore {
     pool: SqlitePool,
 }
@@ -213,11 +222,11 @@ impl ChannelOutboxStore {
         sqlx::query(
             "INSERT INTO channel_outbox_messages \
              (delivery_id, channel_id, conversation_ref, thread_ref, reply_to_ref, session_id, turn_id, \
-              source_kind, source_id, status, content_json, provider_receipt_json, attempt_count, \
+              source_kind, source_id, source_fingerprint, status, content_json, provider_receipt_json, attempt_count, \
               next_attempt_at_ms, lease_owner, lease_expires_at_ms, current_attempt_id, last_error_code, \
               last_error_text, created_at_ms, updated_at_ms, delivered_at_ms, failed_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?10, NULL, 0, ?11, \
-              NULL, NULL, NULL, NULL, NULL, ?11, ?11, NULL, NULL)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, NULL, 0, ?12, \
+              NULL, NULL, NULL, NULL, NULL, ?12, ?12, NULL, NULL)",
         )
         .bind(delivery_id.to_string())
         .bind(input.route.channel_id)
@@ -228,6 +237,7 @@ impl ChannelOutboxStore {
         .bind(input.turn_id.map(|value| value.to_string()))
         .bind(input.source_kind)
         .bind(input.source_id)
+        .bind(input.source_fingerprint)
         .bind(content_json)
         .bind(now)
         .execute(&self.pool)
@@ -239,10 +249,87 @@ impl ChannelOutboxStore {
             .ok_or_else(|| anyhow!("enqueued channel outbox delivery disappeared"))
     }
 
+    pub async fn enqueue_delivery_idempotent(
+        &self,
+        input: NewChannelDelivery<'_>,
+    ) -> Result<ChannelOutboxEnqueueResult> {
+        let source_kind = input
+            .source_kind
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("idempotent channel delivery requires source_kind"))?;
+        let source_id = input
+            .source_id
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("idempotent channel delivery requires source_id"))?;
+        let source_fingerprint = input
+            .source_fingerprint
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("idempotent channel delivery requires source_fingerprint"))?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .context("failed to start channel outbox enqueue transaction")?;
+
+        if let Some(existing) = self
+            .get_delivery_by_source_in_tx(&mut tx, source_kind, source_id)
+            .await?
+        {
+            tx.commit()
+                .await
+                .context("failed to commit channel outbox idempotency lookup")?;
+            return if existing.source_fingerprint.as_deref() == Some(source_fingerprint) {
+                Ok(ChannelOutboxEnqueueResult::Existing(existing))
+            } else {
+                Ok(ChannelOutboxEnqueueResult::Conflict(existing))
+            };
+        }
+
+        let delivery_id = Uuid::new_v4();
+        let now = now_ms();
+        let content_json = serde_json::to_string(&input.content)
+            .context("failed to encode channel outbox content")?;
+
+        sqlx::query(
+            "INSERT INTO channel_outbox_messages \
+             (delivery_id, channel_id, conversation_ref, thread_ref, reply_to_ref, session_id, turn_id, \
+              source_kind, source_id, source_fingerprint, status, content_json, provider_receipt_json, attempt_count, \
+              next_attempt_at_ms, lease_owner, lease_expires_at_ms, current_attempt_id, last_error_code, \
+              last_error_text, created_at_ms, updated_at_ms, delivered_at_ms, failed_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, NULL, 0, ?12, \
+              NULL, NULL, NULL, NULL, NULL, ?12, ?12, NULL, NULL)",
+        )
+        .bind(delivery_id.to_string())
+        .bind(input.route.channel_id)
+        .bind(input.route.conversation_ref)
+        .bind(input.route.thread_ref)
+        .bind(input.route.reply_to_ref)
+        .bind(input.session_id.map(|value| value.to_string()))
+        .bind(input.turn_id.map(|value| value.to_string()))
+        .bind(source_kind)
+        .bind(source_id)
+        .bind(source_fingerprint)
+        .bind(content_json)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .context("failed to enqueue idempotent channel outbox delivery")?;
+
+        let delivery = self
+            .get_delivery_in_tx(&mut tx, delivery_id)
+            .await?
+            .ok_or_else(|| anyhow!("enqueued channel outbox delivery disappeared"))?;
+        tx.commit()
+            .await
+            .context("failed to commit channel outbox enqueue transaction")?;
+
+        Ok(ChannelOutboxEnqueueResult::Created(delivery))
+    }
+
     pub async fn get_delivery(&self, delivery_id: Uuid) -> Result<Option<ChannelDeliveryRecord>> {
         let row = sqlx::query(
             "SELECT delivery_id, channel_id, conversation_ref, thread_ref, reply_to_ref, session_id, turn_id, \
-             source_kind, source_id, status, content_json, provider_receipt_json, attempt_count, \
+             source_kind, source_id, source_fingerprint, status, content_json, provider_receipt_json, attempt_count, \
              next_attempt_at_ms, lease_owner, lease_expires_at_ms, current_attempt_id, last_error_code, \
              last_error_text, created_at_ms, updated_at_ms, delivered_at_ms, failed_at_ms \
              FROM channel_outbox_messages WHERE delivery_id = ?1",
@@ -251,6 +338,30 @@ impl ChannelOutboxStore {
         .fetch_optional(&self.pool)
         .await
         .context("failed to query channel outbox delivery")?;
+
+        row.map(map_delivery_row).transpose()
+    }
+
+    pub async fn get_delivery_by_source(
+        &self,
+        source_kind: &str,
+        source_id: &str,
+    ) -> Result<Option<ChannelDeliveryRecord>> {
+        let row = sqlx::query(
+            "SELECT delivery_id, channel_id, conversation_ref, thread_ref, reply_to_ref, session_id, turn_id, \
+             source_kind, source_id, source_fingerprint, status, content_json, provider_receipt_json, attempt_count, \
+             next_attempt_at_ms, lease_owner, lease_expires_at_ms, current_attempt_id, last_error_code, \
+             last_error_text, created_at_ms, updated_at_ms, delivered_at_ms, failed_at_ms \
+             FROM channel_outbox_messages \
+             WHERE source_kind = ?1 AND source_id = ?2 \
+             ORDER BY created_at_ms ASC \
+             LIMIT 1",
+        )
+        .bind(source_kind)
+        .bind(source_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to query channel outbox delivery by source")?;
 
         row.map(map_delivery_row).transpose()
     }
@@ -558,7 +669,7 @@ impl ChannelOutboxStore {
     ) -> Result<Option<ChannelDeliveryRecord>> {
         let row = sqlx::query(
             "SELECT delivery_id, channel_id, conversation_ref, thread_ref, reply_to_ref, session_id, turn_id, \
-             source_kind, source_id, status, content_json, provider_receipt_json, attempt_count, \
+             source_kind, source_id, source_fingerprint, status, content_json, provider_receipt_json, attempt_count, \
              next_attempt_at_ms, lease_owner, lease_expires_at_ms, current_attempt_id, last_error_code, \
              last_error_text, created_at_ms, updated_at_ms, delivered_at_ms, failed_at_ms \
              FROM channel_outbox_messages WHERE delivery_id = ?1",
@@ -567,6 +678,31 @@ impl ChannelOutboxStore {
         .fetch_optional(&mut **tx)
         .await
         .context("failed to query channel outbox delivery in transaction")?;
+
+        row.map(map_delivery_row).transpose()
+    }
+
+    async fn get_delivery_by_source_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        source_kind: &str,
+        source_id: &str,
+    ) -> Result<Option<ChannelDeliveryRecord>> {
+        let row = sqlx::query(
+            "SELECT delivery_id, channel_id, conversation_ref, thread_ref, reply_to_ref, session_id, turn_id, \
+             source_kind, source_id, source_fingerprint, status, content_json, provider_receipt_json, attempt_count, \
+             next_attempt_at_ms, lease_owner, lease_expires_at_ms, current_attempt_id, last_error_code, \
+             last_error_text, created_at_ms, updated_at_ms, delivered_at_ms, failed_at_ms \
+             FROM channel_outbox_messages \
+             WHERE source_kind = ?1 AND source_id = ?2 \
+             ORDER BY created_at_ms ASC \
+             LIMIT 1",
+        )
+        .bind(source_kind)
+        .bind(source_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .context("failed to query channel outbox delivery by source")?;
 
         row.map(map_delivery_row).transpose()
     }
@@ -696,6 +832,7 @@ fn map_delivery_row(row: SqliteRow) -> Result<ChannelDeliveryRecord> {
         turn_id: optional_uuid(row.get("turn_id"), "turn_id")?,
         source_kind: row.get("source_kind"),
         source_id: row.get("source_id"),
+        source_fingerprint: row.get("source_fingerprint"),
         status,
         content,
         provider_receipt: parse_optional_json(

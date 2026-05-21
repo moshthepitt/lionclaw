@@ -5,17 +5,23 @@ use std::{
     io::ErrorKind,
     path::{Component, Path, PathBuf},
     str::FromStr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime},
 };
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, Transaction};
 use tokio::{
-    io::AsyncWriteExt,
-    sync::{Mutex, Notify, RwLock},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{UnixListener, UnixStream},
+    sync::{Mutex, Notify, RwLock, Semaphore},
+    task::{JoinHandle, JoinSet},
     time::{sleep, timeout, Instant},
 };
 use tracing::warn;
@@ -77,8 +83,8 @@ use super::{
     channel_outbox::{
         ChannelDeliveryAttachment, ChannelDeliveryContent, ChannelDeliveryLease,
         ChannelDeliveryRecord, ChannelDeliveryRoute, ChannelOutboxAttemptStatus,
-        ChannelOutboxDeliveryStatus, ChannelOutboxPull, ChannelOutboxReport,
-        ChannelOutboxReportOutcome, ChannelOutboxStore, NewChannelDelivery,
+        ChannelOutboxDeliveryStatus, ChannelOutboxEnqueueResult, ChannelOutboxPull,
+        ChannelOutboxReport, ChannelOutboxReportOutcome, ChannelOutboxStore, NewChannelDelivery,
         DEFAULT_CHANNEL_OUTBOX_LEASE_MS, DEFAULT_CHANNEL_OUTBOX_PULL_LIMIT,
         MAX_CHANNEL_OUTBOX_LEASE_MS, MAX_CHANNEL_OUTBOX_PULL_LIMIT,
     },
@@ -109,14 +115,14 @@ use super::{
     runtime::{
         append_streamed_text_boundary, append_streamed_text_delta, project_runtime_skills,
         register_builtin_runtime_adapters, resolve_oci_image_compatibility_identity,
-        skill_mount_target, EffectiveExecutionPlan, ExecutionPlanPurpose, ExecutionPlanRequest,
-        ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset, HiddenTurnSupport, MountAccess,
-        MountSpec, NetworkMode, RuntimeAdapter, RuntimeArtifact, RuntimeCapabilityRequest,
-        RuntimeCapabilityResult, RuntimeControlExecution, RuntimeControlInput,
-        RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent, RuntimeExecutionProfile,
-        RuntimeMessageLane, RuntimeProgramTurnExecution, RuntimeRegistry, RuntimeSecretsMount,
-        RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
-        RuntimeTurnResult,
+        skill_mount_target, EffectiveExecutionPlan, EscapeClass, ExecutionPlanPurpose,
+        ExecutionPlanRequest, ExecutionPlanner, ExecutionPlannerConfig, ExecutionPreset,
+        HiddenTurnSupport, MountAccess, MountSpec, NetworkMode, RuntimeAdapter, RuntimeArtifact,
+        RuntimeCapabilityRequest, RuntimeCapabilityResult, RuntimeControlExecution,
+        RuntimeControlInput, RuntimeControlOrigin, RuntimeControlOutcome, RuntimeEvent,
+        RuntimeExecutionProfile, RuntimeMessageLane, RuntimeProgramTurnExecution, RuntimeRegistry,
+        RuntimeSecretsMount, RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput,
+        RuntimeTurnMode, RuntimeTurnResult,
     },
     runtime_policy::RuntimeExecutionPolicy,
     scheduler::{SchedulerConfig, SchedulerEngine},
@@ -154,6 +160,192 @@ const MAX_CHANNEL_HEALTH_REPORTER_ID_BYTES: usize = 256;
 const MAX_CHANNEL_HEALTH_CHECK_CODE_BYTES: usize = 128;
 const MAX_CHANNEL_HEALTH_CHECK_MESSAGE_BYTES: usize = 4096;
 const MAX_CHANNEL_HEALTH_CHECK_DETAILS_JSON_BYTES: usize = 64 * 1024;
+const CHANNEL_SEND_SOCKET_ENV: &str = "LIONCLAW_CHANNEL_SEND_SOCKET";
+const CHANNEL_SEND_SOCKET_CONTAINER_PATH: &str = "/runtime/lionclaw/channel-send.sock";
+const CHANNEL_SEND_SOCKET_DIR: &str = "lionclaw";
+const MAX_RUNTIME_CHANNEL_SEND_CONNECTIONS: usize = 16;
+const MAX_RUNTIME_CHANNEL_SEND_REQUEST_BYTES: usize = 64 * 1024;
+const RUNTIME_CHANNEL_SEND_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const RUNTIME_CHANNEL_SEND_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+const RUNTIME_CHANNEL_SEND_SOURCE_KIND: &str = "runtime_channel_send";
+
+#[derive(Debug, Clone)]
+struct RuntimeChannelSendContext {
+    session_id: Uuid,
+    turn_id: Uuid,
+    runtime_id: String,
+    runtime_state_root: PathBuf,
+    active: Arc<AtomicBool>,
+}
+
+impl RuntimeChannelSendContext {
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RuntimeChannelSendRequest {
+    #[serde(default)]
+    idempotency_key: String,
+    #[serde(default)]
+    channel_id: String,
+    #[serde(default)]
+    conversation_ref: String,
+    #[serde(default)]
+    thread_ref: Option<String>,
+    #[serde(default)]
+    reply_to_ref: Option<String>,
+    #[serde(default)]
+    content: Option<RuntimeChannelSendContent>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RuntimeChannelSendContent {
+    #[serde(default)]
+    text: String,
+    #[serde(default = "default_runtime_channel_send_format_hint")]
+    format_hint: String,
+    #[serde(default)]
+    attachments: Vec<RuntimeChannelSendAttachment>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RuntimeChannelSendAttachment {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeChannelSendAccepted {
+    delivery_id: Uuid,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeChannelSendProblem {
+    code: &'static str,
+    message: String,
+}
+
+impl RuntimeChannelSendProblem {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+struct RuntimeChannelSendBridge {
+    socket_path: PathBuf,
+    active: Arc<AtomicBool>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for RuntimeChannelSendBridge {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+        self.task.abort();
+        if let Err(err) = std::fs::remove_file(&self.socket_path) {
+            if err.kind() != ErrorKind::NotFound {
+                warn!(
+                    ?err,
+                    path = %self.socket_path.display(),
+                    "failed to remove runtime channel.send socket"
+                );
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PreparedChannelDeliveryAttachments {
+    attachments: Vec<ChannelDeliveryAttachment>,
+    persisted: bool,
+}
+
+impl PreparedChannelDeliveryAttachments {
+    fn push(&mut self, attachment: ChannelDeliveryAttachment) {
+        self.attachments.push(attachment);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.attachments.is_empty()
+    }
+
+    fn as_slice(&self) -> &[ChannelDeliveryAttachment] {
+        &self.attachments
+    }
+
+    fn mark_persisted(&mut self) {
+        self.persisted = true;
+    }
+}
+
+#[derive(Debug)]
+struct ReservedArtifactDestination {
+    path: PathBuf,
+    persisted: bool,
+}
+
+impl ReservedArtifactDestination {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            persisted: false,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn persist(mut self) -> PathBuf {
+        self.persisted = true;
+        self.path.clone()
+    }
+}
+
+impl Drop for ReservedArtifactDestination {
+    fn drop(&mut self) {
+        if self.persisted {
+            return;
+        }
+        if let Err(err) = std::fs::remove_file(&self.path) {
+            if err.kind() != ErrorKind::NotFound {
+                warn!(
+                    ?err,
+                    path = %self.path.display(),
+                    "failed to remove unpersisted runtime artifact destination"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for PreparedChannelDeliveryAttachments {
+    fn drop(&mut self) {
+        if self.persisted {
+            return;
+        }
+        for attachment in &self.attachments {
+            let path = Path::new(&attachment.path);
+            if let Err(err) = std::fs::remove_file(path) {
+                if err.kind() != ErrorKind::NotFound {
+                    warn!(
+                        ?err,
+                        path = %path.display(),
+                        "failed to remove unpersisted channel delivery attachment"
+                    );
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ChannelAttachmentStageContent {
@@ -5692,6 +5884,147 @@ mod tests {
         assert!(debug.contains("/tmp/lionclaw-home"));
     }
 
+    #[tokio::test]
+    async fn safe_child_directory_rejects_current_and_parent_components() {
+        let temp_dir = tempdir().expect("temp dir");
+
+        for component in [".", ".."] {
+            let err = ensure_safe_child_directory(temp_dir.path(), &[component])
+                .await
+                .expect_err("relative traversal component should be rejected");
+            assert!(
+                matches!(err, KernelError::Internal(message) if message.contains("unsafe runtime storage path component"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_artifact_copy_reserves_unique_destinations_atomically() {
+        let temp_dir = tempdir().expect("temp dir");
+        let source_dir = temp_dir.path().join("source");
+        let delivery_root = temp_dir.path().join("delivery");
+        tokio::fs::create_dir_all(&source_dir)
+            .await
+            .expect("create source dir");
+        tokio::fs::create_dir_all(&delivery_root)
+            .await
+            .expect("create delivery dir");
+        let first_source = source_dir.join("first.txt");
+        let second_source = source_dir.join("second.txt");
+        tokio::fs::write(&first_source, b"first payload")
+            .await
+            .expect("write first source");
+        tokio::fs::write(&second_source, b"second payload")
+            .await
+            .expect("write second source");
+        let first = std::fs::File::open(&first_source).expect("open first source");
+        let second = std::fs::File::open(&second_source).expect("open second source");
+
+        let (first_destination, second_destination) = tokio::join!(
+            copy_file_to_unique_child(
+                first,
+                &first_source,
+                &delivery_root,
+                "attachment.txt",
+                MAX_CHANNEL_OUTBOX_ATTACHMENT_BYTES,
+            ),
+            copy_file_to_unique_child(
+                second,
+                &second_source,
+                &delivery_root,
+                "attachment.txt",
+                MAX_CHANNEL_OUTBOX_ATTACHMENT_BYTES,
+            ),
+        );
+        let first_destination = first_destination.expect("copy first source");
+        let second_destination = second_destination.expect("copy second source");
+
+        assert_ne!(first_destination, second_destination);
+        let mut names = vec![
+            first_destination
+                .file_name()
+                .and_then(OsStr::to_str)
+                .expect("first destination file name")
+                .to_string(),
+            second_destination
+                .file_name()
+                .and_then(OsStr::to_str)
+                .expect("second destination file name")
+                .to_string(),
+        ];
+        names.sort();
+        assert_eq!(names, ["attachment-1.txt", "attachment.txt"]);
+
+        let mut payloads = vec![
+            tokio::fs::read(first_destination)
+                .await
+                .expect("read first destination"),
+            tokio::fs::read(second_destination)
+                .await
+                .expect("read second destination"),
+        ];
+        payloads.sort();
+        assert_eq!(
+            payloads,
+            [b"first payload".to_vec(), b"second payload".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_artifact_copy_removes_reserved_destination_on_size_overflow() {
+        let temp_dir = tempdir().expect("temp dir");
+        let delivery_root = temp_dir.path().join("delivery");
+        tokio::fs::create_dir_all(&delivery_root)
+            .await
+            .expect("create delivery dir");
+        let source_path = temp_dir.path().join("oversized.txt");
+        tokio::fs::write(&source_path, b"oversized payload")
+            .await
+            .expect("write source");
+        let source = std::fs::File::open(&source_path).expect("open source");
+
+        let err =
+            copy_file_to_unique_child(source, &source_path, &delivery_root, "artifact.txt", 4)
+                .await
+                .expect_err("oversized copy should fail");
+
+        assert!(
+            matches!(err, KernelError::BadRequest(message) if message.contains("exceeds 4 bytes"))
+        );
+        assert!(!tokio::fs::try_exists(delivery_root.join("artifact.txt"))
+            .await
+            .expect("check reserved destination cleanup"));
+    }
+
+    #[test]
+    fn reserved_artifact_destination_removes_unpersisted_file() {
+        let temp_dir = tempdir().expect("temp dir");
+        let destination = temp_dir.path().join("partial.txt");
+        fs::write(&destination, b"partial").expect("write partial destination");
+
+        drop(ReservedArtifactDestination::new(destination.clone()));
+
+        assert!(
+            !destination.exists(),
+            "dropping an unpersisted reservation should remove the file"
+        );
+    }
+
+    #[test]
+    fn reserved_artifact_destination_persist_keeps_file() {
+        let temp_dir = tempdir().expect("temp dir");
+        let destination = temp_dir.path().join("complete.txt");
+        fs::write(&destination, b"complete").expect("write complete destination");
+
+        let persisted = ReservedArtifactDestination::new(destination.clone()).persist();
+
+        assert_eq!(persisted, destination);
+        assert!(
+            persisted.exists(),
+            "persisting a reservation should leave the file in place"
+        );
+    }
+
     async fn kernel_with_home(home: &LionClawHome) -> Kernel {
         let applied_state = AppliedState::load(home).await.expect("load applied state");
         Kernel::new_with_options(
@@ -7029,7 +7362,13 @@ fn safe_artifact_filename(raw: &str) -> String {
     }
 }
 
-async fn unique_child_path(parent: &Path, filename: &str) -> Result<PathBuf, KernelError> {
+async fn copy_file_to_unique_child(
+    source: std::fs::File,
+    source_label: &Path,
+    parent: &Path,
+    filename: &str,
+    max_bytes: usize,
+) -> Result<PathBuf, KernelError> {
     let stem = Path::new(filename)
         .file_stem()
         .and_then(OsStr::to_str)
@@ -7045,17 +7384,234 @@ async fn unique_child_path(parent: &Path, filename: &str) -> Result<PathBuf, Ker
             format!("{stem}-{index}")
         };
         let candidate = parent.join(candidate_name);
-        if !tokio::fs::try_exists(&candidate)
+        let destination = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
             .await
-            .map_err(|err| internal(err.into()))?
         {
-            return Ok(candidate);
+            Ok(file) => file,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(KernelError::Runtime(format!(
+                    "failed to reserve runtime artifact destination '{}': {err}",
+                    candidate.display()
+                )));
+            }
+        };
+        let reserved_destination = ReservedArtifactDestination::new(candidate);
+
+        let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+        let mut source = tokio::fs::File::from_std(source).take(max_bytes_u64.saturating_add(1));
+        let mut destination = destination;
+        let copied = match tokio::io::copy(&mut source, &mut destination).await {
+            Ok(copied) => copied,
+            Err(err) => {
+                return Err(KernelError::Runtime(format!(
+                    "failed to copy runtime artifact '{}' to '{}': {err}",
+                    source_label.display(),
+                    reserved_destination.path().display()
+                )));
+            }
+        };
+        if copied > max_bytes_u64 {
+            return Err(KernelError::BadRequest(format!(
+                "runtime artifact '{}' exceeds {max_bytes} bytes",
+                source_label.display()
+            )));
         }
+        if let Err(err) = destination.flush().await {
+            return Err(KernelError::Runtime(format!(
+                "failed to flush runtime artifact destination '{}': {err}",
+                reserved_destination.path().display()
+            )));
+        }
+        return Ok(reserved_destination.persist());
     }
     Err(KernelError::Conflict(format!(
         "could not allocate a unique artifact filename under '{}'",
         parent.display()
     )))
+}
+
+fn runtime_artifact_relative_path(
+    artifact_root: &Path,
+    artifact: &RuntimeArtifact,
+) -> Result<PathBuf, KernelError> {
+    let metadata = std::fs::symlink_metadata(&artifact.path).map_err(|err| {
+        KernelError::Runtime(format!(
+            "runtime artifact '{}' is not readable: {err}",
+            artifact.path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(KernelError::Runtime(format!(
+            "runtime artifact '{}' is not a regular file",
+            artifact.path.display()
+        )));
+    }
+    let canonical_artifact = std::fs::canonicalize(&artifact.path).map_err(|err| {
+        KernelError::Runtime(format!(
+            "runtime artifact '{}' is not readable: {err}",
+            artifact.path.display()
+        ))
+    })?;
+    let relative = canonical_artifact
+        .strip_prefix(artifact_root)
+        .map_err(|_| {
+            KernelError::Runtime(format!(
+                "runtime artifact '{}' is outside the runtime root",
+                artifact.path.display()
+            ))
+        })?;
+    let mut normalized = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(value) => normalized.push(value),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(KernelError::Runtime(format!(
+                    "runtime artifact '{}' is outside the runtime root",
+                    artifact.path.display()
+                )));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(KernelError::Runtime(format!(
+            "runtime artifact '{}' is not a regular file",
+            artifact.path.display()
+        )));
+    }
+    Ok(normalized)
+}
+
+fn open_runtime_artifact_source(
+    artifact_root: &Path,
+    artifact: &RuntimeArtifact,
+) -> Result<std::fs::File, KernelError> {
+    let relative = runtime_artifact_relative_path(artifact_root, artifact)?;
+    open_regular_file_beneath_root(artifact_root, &relative, &artifact.path)
+}
+
+#[cfg(unix)]
+fn open_regular_file_beneath_root(
+    root: &Path,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<std::fs::File, KernelError> {
+    use rustix::fs::{open, openat, Mode, OFlags};
+
+    let mut dir = open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|err| {
+        KernelError::Runtime(format!(
+            "runtime artifact root '{}' is not readable: {err}",
+            root.display()
+        ))
+    })?;
+
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(KernelError::Runtime(format!(
+                "runtime artifact '{}' is outside the runtime root",
+                display_path.display()
+            )));
+        };
+        let name = Path::new(name);
+        if components.peek().is_some() {
+            let next_dir = openat(
+                &dir,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|err| {
+                KernelError::Runtime(format!(
+                    "runtime artifact '{}' is not readable: {err}",
+                    display_path.display()
+                ))
+            })?;
+            dir = next_dir;
+            continue;
+        }
+
+        let file = openat(
+            &dir,
+            name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|err| {
+            KernelError::Runtime(format!(
+                "runtime artifact '{}' is not readable: {err}",
+                display_path.display()
+            ))
+        })?;
+        let file = std::fs::File::from(file);
+        let metadata = file.metadata().map_err(|err| {
+            KernelError::Runtime(format!(
+                "runtime artifact '{}' is not readable: {err}",
+                display_path.display()
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(KernelError::Runtime(format!(
+                "runtime artifact '{}' is not a regular file",
+                display_path.display()
+            )));
+        }
+        return Ok(file);
+    }
+
+    Err(KernelError::Runtime(format!(
+        "runtime artifact '{}' is not a regular file",
+        display_path.display()
+    )))
+}
+
+#[cfg(not(unix))]
+fn open_regular_file_beneath_root(
+    root: &Path,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<std::fs::File, KernelError> {
+    let path = root.join(relative);
+    let file = std::fs::File::open(&path).map_err(|err| {
+        KernelError::Runtime(format!(
+            "runtime artifact '{}' is not readable: {err}",
+            display_path.display()
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|err| {
+        KernelError::Runtime(format!(
+            "runtime artifact '{}' is not readable: {err}",
+            display_path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(KernelError::Runtime(format!(
+            "runtime artifact '{}' is not a regular file",
+            display_path.display()
+        )));
+    }
+    let canonical = std::fs::canonicalize(&path).map_err(|err| {
+        KernelError::Runtime(format!(
+            "runtime artifact '{}' is not readable: {err}",
+            display_path.display()
+        ))
+    })?;
+    if !canonical.starts_with(root) {
+        return Err(KernelError::Runtime(format!(
+            "runtime artifact '{}' is outside the runtime root",
+            display_path.display()
+        )));
+    }
+    Ok(file)
 }
 
 fn internal(err: anyhow::Error) -> KernelError {
@@ -7721,7 +8277,11 @@ async fn ensure_safe_child_directory(
 
     let mut current = root.to_path_buf();
     for component in components {
-        if component.is_empty() || component.contains('/') || component.contains('\\') {
+        if component.is_empty()
+            || matches!(*component, "." | "..")
+            || component.contains('/')
+            || component.contains('\\')
+        {
             return Err(KernelError::Internal(
                 "unsafe runtime storage path component".to_string(),
             ));
@@ -7773,6 +8333,27 @@ async fn ensure_staged_attachment_file_is_safe(path: &Path) -> Result<(), Kernel
         )));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+async fn ensure_owner_private_directory(path: &Path) -> Result<(), KernelError> {
+    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+
+    ensure_existing_directory_is_safe(path).await?;
+    tokio::fs::set_permissions(path, Permissions::from_mode(0o700))
+        .await
+        .map_err(|err| {
+            KernelError::Internal(format!(
+                "failed to make runtime storage directory '{}' private: {err}",
+                path.display()
+            ))
+        })?;
+    ensure_existing_directory_is_safe(path).await
+}
+
+#[cfg(not(unix))]
+async fn ensure_owner_private_directory(path: &Path) -> Result<(), KernelError> {
+    ensure_existing_directory_is_safe(path).await
 }
 
 async fn remove_file_best_effort(path: &Path) {
@@ -8194,6 +8775,473 @@ fn draft_action_error(relative_path: &str, err: anyhow::Error) -> KernelError {
     } else {
         internal(err)
     }
+}
+
+fn default_runtime_channel_send_format_hint() -> String {
+    "plain".to_string()
+}
+
+async fn run_runtime_channel_send_bridge(
+    kernel: Kernel,
+    context: RuntimeChannelSendContext,
+    listener: UnixListener,
+) {
+    let mut streams = JoinSet::new();
+    let permits = Arc::new(Semaphore::new(MAX_RUNTIME_CHANNEL_SEND_CONNECTIONS));
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, _)) => {
+                        let permit = match Arc::clone(&permits).try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                reject_runtime_channel_send_connection(
+                                    &kernel,
+                                    &context,
+                                    stream,
+                                    runtime_channel_send_connection_limit_problem(),
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
+                        let kernel = kernel.clone();
+                        let context = context.clone();
+                        streams.spawn(async move {
+                            let _permit = permit;
+                            match handle_runtime_channel_send_stream(
+                                kernel.clone(),
+                                context.clone(),
+                                stream,
+                            )
+                            .await
+                            {
+                                Ok(()) => {}
+                                Err(err) => {
+                                    let error = err.to_string();
+                                    kernel
+                                        .audit_runtime_channel_send_bridge_error(
+                                            &context,
+                                            "connection_io",
+                                            &error,
+                                        )
+                                        .await;
+                                    warn!(?err, "failed to handle runtime channel.send request");
+                                }
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        let error = err.to_string();
+                        kernel
+                            .audit_runtime_channel_send_bridge_error(&context, "accept", &error)
+                            .await;
+                        warn!(?err, "failed to accept runtime channel.send request");
+                        return;
+                    }
+                }
+            }
+            completed = streams.join_next(), if !streams.is_empty() => {
+                if let Some(Err(err)) = completed {
+                    let error = err.to_string();
+                    kernel
+                        .audit_runtime_channel_send_bridge_error(&context, "connection_task", &error)
+                        .await;
+                    warn!(?err, "runtime channel.send request task failed");
+                }
+            }
+        }
+    }
+}
+
+async fn reject_runtime_channel_send_connection(
+    kernel: &Kernel,
+    context: &RuntimeChannelSendContext,
+    stream: UnixStream,
+    problem: RuntimeChannelSendProblem,
+) {
+    kernel
+        .audit_runtime_channel_send_denied(context, "", "", problem.code)
+        .await;
+    let response = runtime_channel_send_error_response(problem.code, problem.message);
+    match timeout(
+        RUNTIME_CHANNEL_SEND_RESPONSE_WRITE_TIMEOUT,
+        write_runtime_channel_send_response(stream, response),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            let error = err.to_string();
+            kernel
+                .audit_runtime_channel_send_bridge_error(context, "connection_io", &error)
+                .await;
+            warn!(?err, "failed to reject runtime channel.send connection");
+        }
+        Err(err) => {
+            let error = err.to_string();
+            kernel
+                .audit_runtime_channel_send_bridge_error(context, "connection_io", &error)
+                .await;
+            warn!(?err, "timed out rejecting runtime channel.send connection");
+        }
+    }
+}
+
+async fn handle_runtime_channel_send_stream(
+    kernel: Kernel,
+    context: RuntimeChannelSendContext,
+    stream: UnixStream,
+) -> Result<(), std::io::Error> {
+    let mut reader = BufReader::new(stream);
+    let mut line = Vec::new();
+    let response = match timeout(
+        RUNTIME_CHANNEL_SEND_REQUEST_READ_TIMEOUT,
+        read_bounded_json_line(&mut reader, &mut line),
+    )
+    .await
+    {
+        Ok(Ok(())) => match serde_json::from_slice::<RuntimeChannelSendRequest>(&line) {
+            Ok(request) => runtime_channel_send_response(
+                kernel.send_runtime_channel_message(context, request).await,
+            ),
+            Err(err) => {
+                runtime_channel_send_denied_response(
+                    &kernel,
+                    &context,
+                    RuntimeChannelSendProblem::new(
+                        "invalid_json",
+                        format!("request is not valid channel.send JSON: {err}"),
+                    ),
+                )
+                .await
+            }
+        },
+        Ok(Err(problem)) => runtime_channel_send_denied_response(&kernel, &context, problem).await,
+        Err(_) => {
+            runtime_channel_send_denied_response(
+                &kernel,
+                &context,
+                RuntimeChannelSendProblem::new(
+                    "request_timeout",
+                    format!(
+                        "channel.send request must arrive within {}",
+                        format_duration(RUNTIME_CHANNEL_SEND_REQUEST_READ_TIMEOUT)
+                    ),
+                ),
+            )
+            .await
+        }
+    };
+
+    write_runtime_channel_send_response(reader.into_inner(), response).await
+}
+
+async fn write_runtime_channel_send_response(
+    mut stream: UnixStream,
+    response: Value,
+) -> Result<(), std::io::Error> {
+    let mut encoded = serde_json::to_vec(&response)?;
+    encoded.push(b'\n');
+    stream.write_all(&encoded).await?;
+    stream.shutdown().await
+}
+
+async fn read_bounded_json_line(
+    reader: &mut BufReader<UnixStream>,
+    line: &mut Vec<u8>,
+) -> Result<(), RuntimeChannelSendProblem> {
+    loop {
+        let available = reader.fill_buf().await.map_err(|err| {
+            RuntimeChannelSendProblem::new("io_error", format!("failed to read request: {err}"))
+        })?;
+        if available.is_empty() {
+            return Err(RuntimeChannelSendProblem::new(
+                "invalid_request",
+                "request must end with a newline",
+            ));
+        }
+        if let Some(newline_index) = available.iter().position(|byte| *byte == b'\n') {
+            if line.len() + newline_index > MAX_RUNTIME_CHANNEL_SEND_REQUEST_BYTES {
+                return Err(RuntimeChannelSendProblem::new(
+                    "request_too_large",
+                    format!(
+                        "channel.send request exceeds {MAX_RUNTIME_CHANNEL_SEND_REQUEST_BYTES} bytes"
+                    ),
+                ));
+            }
+            let chunk = available.get(..newline_index).ok_or_else(|| {
+                RuntimeChannelSendProblem::new(
+                    "internal_error",
+                    "invalid channel.send request buffer boundary",
+                )
+            })?;
+            line.extend_from_slice(chunk);
+            reader.consume(newline_index + 1);
+            return Ok(());
+        }
+        if line.len() + available.len() > MAX_RUNTIME_CHANNEL_SEND_REQUEST_BYTES {
+            return Err(RuntimeChannelSendProblem::new(
+                "request_too_large",
+                format!(
+                    "channel.send request exceeds {MAX_RUNTIME_CHANNEL_SEND_REQUEST_BYTES} bytes"
+                ),
+            ));
+        }
+        let consumed = available.len();
+        line.extend_from_slice(available);
+        reader.consume(consumed);
+    }
+}
+
+fn runtime_channel_send_response(
+    result: Result<RuntimeChannelSendAccepted, RuntimeChannelSendProblem>,
+) -> Value {
+    match result {
+        Ok(accepted) => json!({
+            "ok": true,
+            "delivery_id": accepted.delivery_id,
+            "status": "queued",
+        }),
+        Err(problem) => runtime_channel_send_error_response(problem.code, problem.message),
+    }
+}
+
+fn runtime_channel_send_error_response(code: &str, message: impl Into<String>) -> Value {
+    json!({
+        "ok": false,
+        "error": {
+            "code": code,
+            "message": message.into(),
+        },
+    })
+}
+
+async fn runtime_channel_send_denied_response(
+    kernel: &Kernel,
+    context: &RuntimeChannelSendContext,
+    problem: RuntimeChannelSendProblem,
+) -> Value {
+    kernel
+        .audit_runtime_channel_send_denied(context, "", "", problem.code)
+        .await;
+    runtime_channel_send_error_response(problem.code, problem.message)
+}
+
+fn runtime_channel_send_fingerprint(
+    channel_id: &str,
+    conversation_ref: &str,
+    thread_ref: Option<&str>,
+    reply_to_ref: Option<&str>,
+    format_hint: &str,
+    content: &RuntimeChannelSendContent,
+) -> Result<String, RuntimeChannelSendProblem> {
+    let attachments = content
+        .attachments
+        .iter()
+        .map(|attachment| {
+            json!({
+                "path": attachment.path.trim(),
+                "filename": attachment.filename.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+                "mime_type": attachment.mime_type.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let canonical = json!({
+        "channel_id": channel_id,
+        "conversation_ref": conversation_ref,
+        "thread_ref": thread_ref,
+        "reply_to_ref": reply_to_ref,
+        "content": {
+            "text": content.text,
+            "format_hint": format_hint,
+            "attachments": attachments,
+        },
+    });
+    let encoded = serde_json::to_vec(&canonical)
+        .map_err(|err| RuntimeChannelSendProblem::new("internal_error", err.to_string()))?;
+    Ok(sha256_hex(&encoded))
+}
+
+fn runtime_channel_send_artifacts(
+    context: &RuntimeChannelSendContext,
+    content: &RuntimeChannelSendContent,
+) -> Result<Vec<RuntimeArtifact>, RuntimeChannelSendProblem> {
+    content
+        .attachments
+        .iter()
+        .enumerate()
+        .map(|(index, attachment)| {
+            let path =
+                runtime_channel_send_host_path(&context.runtime_state_root, &attachment.path)?;
+            Ok(RuntimeArtifact {
+                artifact_id: format!("runtime-channel-send-{}", index + 1),
+                path,
+                filename: attachment
+                    .filename
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                mime_type: attachment
+                    .mime_type
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+async fn validate_runtime_channel_send_artifacts(
+    context: &RuntimeChannelSendContext,
+    artifacts: &[RuntimeArtifact],
+) -> Result<(), RuntimeChannelSendProblem> {
+    let runtime_state_root = tokio::fs::canonicalize(&context.runtime_state_root)
+        .await
+        .map_err(|err| {
+            RuntimeChannelSendProblem::new(
+                "internal_error",
+                format!(
+                    "runtime state root '{}' is not readable: {err}",
+                    context.runtime_state_root.display()
+                ),
+            )
+        })?;
+    for artifact in artifacts {
+        let metadata = tokio::fs::symlink_metadata(&artifact.path)
+            .await
+            .map_err(|err| {
+                RuntimeChannelSendProblem::new(
+                    "invalid_attachment",
+                    format!(
+                        "attachment path '{}' is not readable: {err}",
+                        artifact.path.display()
+                    ),
+                )
+            })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(RuntimeChannelSendProblem::new(
+                "invalid_attachment",
+                "attachment path must name a regular file under /runtime",
+            ));
+        }
+        let canonical_artifact = tokio::fs::canonicalize(&artifact.path)
+            .await
+            .map_err(|err| {
+                RuntimeChannelSendProblem::new(
+                    "invalid_attachment",
+                    format!(
+                        "attachment path '{}' is not readable: {err}",
+                        artifact.path.display()
+                    ),
+                )
+            })?;
+        if !canonical_artifact.starts_with(&runtime_state_root) {
+            return Err(RuntimeChannelSendProblem::new(
+                "invalid_attachment",
+                "attachment path must stay under /runtime",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn runtime_channel_send_host_path(
+    runtime_state_root: &Path,
+    raw_path: &str,
+) -> Result<PathBuf, RuntimeChannelSendProblem> {
+    let path = raw_path.trim();
+    if path.is_empty() {
+        return Err(RuntimeChannelSendProblem::new(
+            "invalid_attachment",
+            "attachment path is required",
+        ));
+    }
+    let relative = path.strip_prefix("/runtime/").ok_or_else(|| {
+        RuntimeChannelSendProblem::new(
+            "invalid_attachment",
+            "attachment path must be under /runtime",
+        )
+    })?;
+    let mut normalized = PathBuf::new();
+    for component in Path::new(relative).components() {
+        match component {
+            Component::Normal(value) => normalized.push(value),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(RuntimeChannelSendProblem::new(
+                    "invalid_attachment",
+                    "attachment path must stay under /runtime",
+                ));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(RuntimeChannelSendProblem::new(
+            "invalid_attachment",
+            "attachment path must name a file under /runtime",
+        ));
+    }
+    Ok(runtime_state_root.join(normalized))
+}
+
+fn runtime_channel_send_channel_problem(err: KernelError) -> RuntimeChannelSendProblem {
+    match err {
+        KernelError::NotFound(message) => {
+            RuntimeChannelSendProblem::new("unknown_channel", message)
+        }
+        KernelError::Conflict(message) => {
+            RuntimeChannelSendProblem::new("channel_unavailable", message)
+        }
+        other => runtime_channel_send_kernel_problem(other),
+    }
+}
+
+fn runtime_channel_send_kernel_problem(err: KernelError) -> RuntimeChannelSendProblem {
+    match err {
+        KernelError::BadRequest(message) => {
+            RuntimeChannelSendProblem::new("invalid_request", message)
+        }
+        KernelError::NotFound(message) => RuntimeChannelSendProblem::new("not_found", message),
+        KernelError::Conflict(message) => RuntimeChannelSendProblem::new("conflict", message),
+        KernelError::Runtime(message) | KernelError::RuntimeTimeout(message) => {
+            RuntimeChannelSendProblem::new("runtime_error", message)
+        }
+        KernelError::Internal(message) => RuntimeChannelSendProblem::new("internal_error", message),
+    }
+}
+
+fn runtime_channel_send_internal_problem(err: anyhow::Error) -> RuntimeChannelSendProblem {
+    RuntimeChannelSendProblem::new("internal_error", err.to_string())
+}
+
+fn runtime_channel_send_bridge_closed_problem() -> RuntimeChannelSendProblem {
+    RuntimeChannelSendProblem::new(
+        "bridge_closed",
+        "channel.send bridge is closed for this turn",
+    )
+}
+
+fn runtime_channel_send_connection_limit_problem() -> RuntimeChannelSendProblem {
+    RuntimeChannelSendProblem::new(
+        "connection_limit",
+        format!(
+            "channel.send bridge accepts at most {MAX_RUNTIME_CHANNEL_SEND_CONNECTIONS} concurrent connections"
+        ),
+    )
+}
+
+fn normalize_runtime_channel_send_content(
+    content: &RuntimeChannelSendContent,
+) -> RuntimeChannelSendContent {
+    let mut normalized = content.clone();
+    if normalized.text.trim().is_empty() && !normalized.attachments.is_empty() {
+        normalized.text.clear();
+    }
+    normalized
 }
 
 #[derive(Debug, Clone)]
@@ -9205,11 +10253,12 @@ impl Kernel {
             KernelError::NotFound(format!("runtime adapter '{runtime_id}' not found"))
         })?;
         let runtime_kind = adapter.info().await.id;
+        let runtime_turn_mode = adapter.turn_mode();
         let RuntimeExecutionSkills {
             skill_ids: runtime_skill_ids,
             mounts: skill_mounts,
         } = self
-            .resolve_runtime_execution_skills(adapter.turn_mode())
+            .resolve_runtime_execution_skills(runtime_turn_mode)
             .await?;
         let execution_plan = self
             .resolve_runtime_execution_plan(
@@ -9553,7 +10602,12 @@ impl Kernel {
         }
         let outbox_attachments = if channel_stream_context.is_some() && !artifacts.saw_error {
             match self
-                .prepare_runtime_artifact_attachments(turn_id, &artifacts.artifacts)
+                .prepare_runtime_artifact_attachments_for_turn(
+                    turn_id,
+                    runtime_turn_mode,
+                    &execution_plan,
+                    &artifacts.artifacts,
+                )
                 .await
             {
                 Ok(attachments) => attachments,
@@ -9575,7 +10629,7 @@ impl Kernel {
                 }
             }
         } else {
-            Vec::new()
+            PreparedChannelDeliveryAttachments::default()
         };
         self.session_turns
             .complete_turn(
@@ -9624,24 +10678,28 @@ impl Kernel {
                 && (!artifacts.assistant_text.trim().is_empty() || !outbox_attachments.is_empty())
             {
                 let source_id = turn_id.to_string();
-                self.enqueue_channel_delivery_content(
-                    ChannelDeliveryRoute {
-                        channel_id: &stream_context.channel_id,
-                        conversation_ref: &stream_context.conversation_ref,
-                        thread_ref: stream_context.thread_ref.as_deref(),
-                        reply_to_ref: stream_context.reply_to_ref.as_deref(),
-                    },
-                    Some(session.session_id),
-                    Some(turn_id),
-                    Some("session_turn"),
-                    Some(&source_id),
-                    ChannelDeliveryContent {
-                        text: artifacts.assistant_text.clone(),
-                        format_hint: "plain".to_string(),
-                        attachments: outbox_attachments,
-                    },
-                )
-                .await?;
+                let mut outbox_attachments = outbox_attachments;
+                let delivery = self
+                    .create_channel_delivery_content(
+                        ChannelDeliveryRoute {
+                            channel_id: &stream_context.channel_id,
+                            conversation_ref: &stream_context.conversation_ref,
+                            thread_ref: stream_context.thread_ref.as_deref(),
+                            reply_to_ref: stream_context.reply_to_ref.as_deref(),
+                        },
+                        Some(session.session_id),
+                        Some(turn_id),
+                        Some("session_turn"),
+                        Some(&source_id),
+                        ChannelDeliveryContent {
+                            text: artifacts.assistant_text.clone(),
+                            format_hint: "plain".to_string(),
+                            attachments: outbox_attachments.as_slice().to_vec(),
+                        },
+                    )
+                    .await?;
+                outbox_attachments.mark_persisted();
+                self.audit_channel_outbox_created(&delivery).await?;
             }
         }
 
@@ -10131,6 +11189,126 @@ impl Kernel {
             .iter()
             .find(|mount| mount.target == "/runtime")
             .map(|mount| mount.source.as_path())
+    }
+
+    async fn start_runtime_channel_send_bridge(
+        &self,
+        context: RuntimeChannelSendContext,
+        plan: &mut EffectiveExecutionPlan,
+    ) -> Result<Option<RuntimeChannelSendBridge>, KernelError> {
+        if let Err(err) =
+            ensure_safe_child_directory(&context.runtime_state_root, &[CHANNEL_SEND_SOCKET_DIR])
+                .await
+        {
+            return self
+                .runtime_channel_send_bridge_error(&context, "runtime_socket_dir", err)
+                .await;
+        }
+        let Some(socket_root) = self.runtime_root.as_ref() else {
+            return self
+                .runtime_channel_send_bridge_error(
+                    &context,
+                    "runtime_root",
+                    KernelError::Runtime(
+                        "channel.send escape requires a configured runtime root".to_string(),
+                    ),
+                )
+                .await;
+        };
+        let socket_dir = match ensure_safe_child_directory(socket_root, &["sockets"]).await {
+            Ok(socket_dir) => socket_dir,
+            Err(err) => {
+                return self
+                    .runtime_channel_send_bridge_error(&context, "host_socket_dir", err)
+                    .await;
+            }
+        };
+        if let Err(err) = ensure_owner_private_directory(&socket_dir).await {
+            return self
+                .runtime_channel_send_bridge_error(&context, "host_socket_dir_permissions", err)
+                .await;
+        }
+        let socket_path =
+            socket_dir.join(format!("channel-send-{}.sock", context.turn_id.simple()));
+        remove_file_best_effort(&socket_path).await;
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(err) => {
+                return self
+                    .runtime_channel_send_bridge_error(
+                        &context,
+                        "bind",
+                        KernelError::Runtime(format!(
+                            "failed to bind runtime channel.send socket '{}': {err}",
+                            socket_path.display()
+                        )),
+                    )
+                    .await;
+            }
+        };
+        plan.mounts.push(MountSpec {
+            source: socket_path.clone(),
+            target: CHANNEL_SEND_SOCKET_CONTAINER_PATH.to_string(),
+            access: MountAccess::ReadWrite,
+        });
+
+        plan.environment
+            .retain(|(key, _)| key != CHANNEL_SEND_SOCKET_ENV);
+        plan.environment.push((
+            CHANNEL_SEND_SOCKET_ENV.to_string(),
+            CHANNEL_SEND_SOCKET_CONTAINER_PATH.to_string(),
+        ));
+
+        let kernel = self.clone();
+        let active = Arc::clone(&context.active);
+        let task = tokio::spawn(run_runtime_channel_send_bridge(kernel, context, listener));
+
+        Ok(Some(RuntimeChannelSendBridge {
+            socket_path,
+            active,
+            task,
+        }))
+    }
+
+    async fn maybe_start_runtime_channel_send_bridge(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+        runtime_id: &str,
+        runtime_turn_mode: RuntimeTurnMode,
+        plan: &mut EffectiveExecutionPlan,
+    ) -> Result<Option<RuntimeChannelSendBridge>, KernelError> {
+        if runtime_turn_mode != RuntimeTurnMode::ProgramBacked
+            || !plan.escape_classes.contains(&EscapeClass::ChannelSend)
+        {
+            plan.environment
+                .retain(|(key, _)| key != CHANNEL_SEND_SOCKET_ENV);
+            return Ok(None);
+        }
+        let Some(runtime_state_root) = Self::runtime_state_root(plan).map(Path::to_path_buf) else {
+            return self
+                .runtime_channel_send_bridge_error_parts(
+                    session_id,
+                    turn_id,
+                    runtime_id,
+                    "runtime_state_mount",
+                    KernelError::Runtime(
+                        "channel.send escape requires a runtime state mount".to_string(),
+                    ),
+                )
+                .await;
+        };
+        self.start_runtime_channel_send_bridge(
+            RuntimeChannelSendContext {
+                session_id,
+                turn_id,
+                runtime_id: runtime_id.to_string(),
+                runtime_state_root,
+                active: Arc::new(AtomicBool::new(true)),
+            },
+            plan,
+        )
+        .await
     }
 
     async fn resolve_runtime_execution_skills(
@@ -10745,6 +11923,29 @@ impl Kernel {
         source_id: Option<&str>,
         content: ChannelDeliveryContent,
     ) -> Result<Uuid, KernelError> {
+        let delivery = self
+            .create_channel_delivery_content(
+                route,
+                session_id,
+                turn_id,
+                source_kind,
+                source_id,
+                content,
+            )
+            .await?;
+        self.audit_channel_outbox_created(&delivery).await?;
+        Ok(delivery.delivery_id)
+    }
+
+    async fn create_channel_delivery_content(
+        &self,
+        route: ChannelDeliveryRoute<'_>,
+        session_id: Option<Uuid>,
+        turn_id: Option<Uuid>,
+        source_kind: Option<&str>,
+        source_id: Option<&str>,
+        content: ChannelDeliveryContent,
+    ) -> Result<ChannelDeliveryRecord, KernelError> {
         let channel_id = route.channel_id.trim();
         let conversation_ref = route.conversation_ref.trim();
         if channel_id.is_empty() || conversation_ref.is_empty() {
@@ -10787,49 +11988,535 @@ impl Kernel {
                 turn_id,
                 source_kind,
                 source_id,
+                source_fingerprint: None,
                 content,
             })
             .await
             .map_err(internal)?;
 
+        Ok(delivery)
+    }
+
+    async fn audit_channel_outbox_created(
+        &self,
+        delivery: &ChannelDeliveryRecord,
+    ) -> Result<(), KernelError> {
         self.audit
             .append(
                 "channel.outbox.created",
-                session_id,
+                delivery.session_id,
                 Some("kernel".to_string()),
-                channel_outbox_audit_details(&delivery, ChannelOutboxAuditDetails::default()),
+                channel_outbox_audit_details(delivery, ChannelOutboxAuditDetails::default()),
             )
             .await
-            .map_err(internal)?;
+            .map_err(internal)
+    }
 
-        Ok(delivery.delivery_id)
+    async fn send_runtime_channel_message(
+        &self,
+        context: RuntimeChannelSendContext,
+        request: RuntimeChannelSendRequest,
+    ) -> Result<RuntimeChannelSendAccepted, RuntimeChannelSendProblem> {
+        let idempotency_key = request.idempotency_key.trim();
+        let channel_id = request.channel_id.trim();
+        let conversation_ref = request.conversation_ref.trim();
+        if idempotency_key.is_empty() {
+            return self
+                .deny_runtime_channel_send(
+                    &context,
+                    channel_id,
+                    conversation_ref,
+                    RuntimeChannelSendProblem::new(
+                        "invalid_request",
+                        "idempotency_key is required",
+                    ),
+                )
+                .await;
+        }
+
+        if channel_id.is_empty() {
+            return self
+                .deny_runtime_channel_send(
+                    &context,
+                    channel_id,
+                    conversation_ref,
+                    RuntimeChannelSendProblem::new("invalid_request", "channel_id is required"),
+                )
+                .await;
+        }
+        if conversation_ref.is_empty() {
+            return self
+                .deny_runtime_channel_send(
+                    &context,
+                    channel_id,
+                    conversation_ref,
+                    RuntimeChannelSendProblem::new(
+                        "invalid_request",
+                        "conversation_ref is required",
+                    ),
+                )
+                .await;
+        }
+        self.require_runtime_channel_send_bridge_open(&context, channel_id, conversation_ref)
+            .await?;
+        let thread_ref = request
+            .thread_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let reply_to_ref = request
+            .reply_to_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let Some(content) = request.content.as_ref() else {
+            return self
+                .deny_runtime_channel_send(
+                    &context,
+                    channel_id,
+                    conversation_ref,
+                    RuntimeChannelSendProblem::new("invalid_request", "content is required"),
+                )
+                .await;
+        };
+        let format_hint = content.format_hint.trim();
+        if !matches!(format_hint, "plain" | "markdown" | "html") {
+            return self
+                .deny_runtime_channel_send(
+                    &context,
+                    channel_id,
+                    conversation_ref,
+                    RuntimeChannelSendProblem::new(
+                        "invalid_format",
+                        "content.format_hint must be plain, markdown, or html",
+                    ),
+                )
+                .await;
+        }
+        if content.text.trim().is_empty() && content.attachments.is_empty() {
+            return self
+                .deny_runtime_channel_send(
+                    &context,
+                    channel_id,
+                    conversation_ref,
+                    RuntimeChannelSendProblem::new(
+                        "empty_content",
+                        "content text or attachments are required",
+                    ),
+                )
+                .await;
+        }
+        if content.attachments.len() > MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY {
+            return self
+                .deny_runtime_channel_send(
+                    &context,
+                    channel_id,
+                    conversation_ref,
+                    RuntimeChannelSendProblem::new(
+                        "too_many_attachments",
+                        format!(
+                            "content.attachments exceeds {MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY} per delivery"
+                        ),
+                    ),
+                )
+                .await;
+        }
+
+        if let Err(err) = self.require_active_channel_binding(channel_id).await {
+            return self
+                .deny_runtime_channel_send(
+                    &context,
+                    channel_id,
+                    conversation_ref,
+                    runtime_channel_send_channel_problem(err),
+                )
+                .await;
+        }
+
+        let content = normalize_runtime_channel_send_content(content);
+        let fingerprint = runtime_channel_send_fingerprint(
+            channel_id,
+            conversation_ref,
+            thread_ref,
+            reply_to_ref,
+            format_hint,
+            &content,
+        )?;
+        let source_id = format!(
+            "{}:{}:{idempotency_key}",
+            context.session_id, context.turn_id
+        );
+        if let Some(existing) = self
+            .channel_outbox
+            .get_delivery_by_source(RUNTIME_CHANNEL_SEND_SOURCE_KIND, &source_id)
+            .await
+            .map_err(runtime_channel_send_internal_problem)?
+        {
+            if existing.source_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+                self.audit_runtime_channel_send(
+                    "runtime.channel_send.allowed",
+                    &context,
+                    json!({
+                        "channel_id": channel_id,
+                        "conversation_ref": conversation_ref,
+                        "delivery_id": existing.delivery_id,
+                        "idempotent": true,
+                    }),
+                )
+                .await;
+                return Ok(RuntimeChannelSendAccepted {
+                    delivery_id: existing.delivery_id,
+                });
+            }
+            self.audit_runtime_channel_send(
+                "runtime.channel_send.conflict",
+                &context,
+                json!({
+                    "channel_id": channel_id,
+                    "conversation_ref": conversation_ref,
+                    "delivery_id": existing.delivery_id,
+                }),
+            )
+            .await;
+            return Err(RuntimeChannelSendProblem::new(
+                "conflict",
+                "idempotency key was reused with a different payload",
+            ));
+        }
+
+        let runtime_artifacts = match runtime_channel_send_artifacts(&context, &content) {
+            Ok(artifacts) => artifacts,
+            Err(problem) => {
+                return self
+                    .deny_runtime_channel_send(&context, channel_id, conversation_ref, problem)
+                    .await;
+            }
+        };
+        if let Err(problem) =
+            validate_runtime_channel_send_artifacts(&context, &runtime_artifacts).await
+        {
+            return self
+                .deny_runtime_channel_send(&context, channel_id, conversation_ref, problem)
+                .await;
+        }
+        let mut attachments = match self
+            .prepare_runtime_artifact_attachments_beneath(
+                context.turn_id,
+                &context.runtime_state_root,
+                &runtime_artifacts,
+            )
+            .await
+            .map_err(runtime_channel_send_kernel_problem)
+        {
+            Ok(attachments) => attachments,
+            Err(problem) => {
+                return self
+                    .deny_runtime_channel_send(&context, channel_id, conversation_ref, problem)
+                    .await;
+            }
+        };
+        let content = ChannelDeliveryContent {
+            text: content.text.clone(),
+            format_hint: format_hint.to_string(),
+            attachments: attachments.as_slice().to_vec(),
+        };
+        self.require_runtime_channel_send_bridge_open(&context, channel_id, conversation_ref)
+            .await?;
+        let delivery = self
+            .channel_outbox
+            .enqueue_delivery_idempotent(NewChannelDelivery {
+                route: ChannelDeliveryRoute {
+                    channel_id,
+                    conversation_ref,
+                    thread_ref,
+                    reply_to_ref,
+                },
+                session_id: Some(context.session_id),
+                turn_id: Some(context.turn_id),
+                source_kind: Some(RUNTIME_CHANNEL_SEND_SOURCE_KIND),
+                source_id: Some(&source_id),
+                source_fingerprint: Some(&fingerprint),
+                content,
+            })
+            .await
+            .map_err(runtime_channel_send_internal_problem)?;
+
+        match delivery {
+            ChannelOutboxEnqueueResult::Created(delivery) => {
+                attachments.mark_persisted();
+                self.audit_channel_outbox_created(&delivery)
+                    .await
+                    .map_err(runtime_channel_send_kernel_problem)?;
+                self.audit_runtime_channel_send(
+                    "runtime.channel_send.allowed",
+                    &context,
+                    json!({
+                        "channel_id": channel_id,
+                        "conversation_ref": conversation_ref,
+                        "delivery_id": delivery.delivery_id,
+                        "idempotent": false,
+                    }),
+                )
+                .await;
+                Ok(RuntimeChannelSendAccepted {
+                    delivery_id: delivery.delivery_id,
+                })
+            }
+            ChannelOutboxEnqueueResult::Existing(delivery) => {
+                self.audit_runtime_channel_send(
+                    "runtime.channel_send.allowed",
+                    &context,
+                    json!({
+                        "channel_id": channel_id,
+                        "conversation_ref": conversation_ref,
+                        "delivery_id": delivery.delivery_id,
+                        "idempotent": true,
+                    }),
+                )
+                .await;
+                Ok(RuntimeChannelSendAccepted {
+                    delivery_id: delivery.delivery_id,
+                })
+            }
+            ChannelOutboxEnqueueResult::Conflict(delivery) => {
+                self.audit_runtime_channel_send(
+                    "runtime.channel_send.conflict",
+                    &context,
+                    json!({
+                        "channel_id": channel_id,
+                        "conversation_ref": conversation_ref,
+                        "delivery_id": delivery.delivery_id,
+                    }),
+                )
+                .await;
+                Err(RuntimeChannelSendProblem::new(
+                    "conflict",
+                    "idempotency key was reused with a different payload",
+                ))
+            }
+        }
+    }
+
+    async fn require_runtime_channel_send_bridge_open(
+        &self,
+        context: &RuntimeChannelSendContext,
+        channel_id: &str,
+        conversation_ref: &str,
+    ) -> Result<(), RuntimeChannelSendProblem> {
+        if context.is_active() {
+            return Ok(());
+        }
+        self.deny_runtime_channel_send(
+            context,
+            channel_id,
+            conversation_ref,
+            runtime_channel_send_bridge_closed_problem(),
+        )
+        .await
+    }
+
+    async fn deny_runtime_channel_send<T>(
+        &self,
+        context: &RuntimeChannelSendContext,
+        channel_id: &str,
+        conversation_ref: &str,
+        problem: RuntimeChannelSendProblem,
+    ) -> Result<T, RuntimeChannelSendProblem> {
+        self.audit_runtime_channel_send_denied(context, channel_id, conversation_ref, problem.code)
+            .await;
+        Err(problem)
+    }
+
+    async fn audit_runtime_channel_send(
+        &self,
+        event_type: &str,
+        context: &RuntimeChannelSendContext,
+        mut details: Value,
+    ) {
+        if let Value::Object(object) = &mut details {
+            object.insert("runtime_id".to_string(), json!(context.runtime_id));
+            object.insert("turn_id".to_string(), json!(context.turn_id));
+        }
+        self.append_audit_event_best_effort(
+            event_type,
+            Some(context.session_id),
+            "kernel",
+            details,
+        )
+        .await;
+    }
+
+    async fn audit_runtime_channel_send_denied(
+        &self,
+        context: &RuntimeChannelSendContext,
+        channel_id: &str,
+        conversation_ref: &str,
+        reason: &str,
+    ) {
+        self.audit_runtime_channel_send(
+            "runtime.channel_send.denied",
+            context,
+            json!({
+                "channel_id": channel_id,
+                "conversation_ref": conversation_ref,
+                "reason": reason,
+            }),
+        )
+        .await;
+    }
+
+    async fn audit_runtime_channel_send_bridge_error(
+        &self,
+        context: &RuntimeChannelSendContext,
+        stage: &str,
+        error: &str,
+    ) {
+        self.audit_runtime_channel_send_bridge_error_parts(
+            context.session_id,
+            context.turn_id,
+            &context.runtime_id,
+            stage,
+            error,
+        )
+        .await;
+    }
+
+    async fn runtime_channel_send_bridge_error<T>(
+        &self,
+        context: &RuntimeChannelSendContext,
+        stage: &str,
+        err: KernelError,
+    ) -> Result<T, KernelError> {
+        let error = err.to_string();
+        self.audit_runtime_channel_send_bridge_error(context, stage, &error)
+            .await;
+        Err(err)
+    }
+
+    async fn audit_runtime_channel_send_bridge_error_parts(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+        runtime_id: &str,
+        stage: &str,
+        error: &str,
+    ) {
+        self.append_audit_event_best_effort(
+            "runtime.channel_send.bridge_error",
+            Some(session_id),
+            "kernel",
+            json!({
+                "runtime_id": runtime_id,
+                "turn_id": turn_id,
+                "stage": stage,
+                "error": error,
+            }),
+        )
+        .await;
+    }
+
+    async fn runtime_channel_send_bridge_error_parts<T>(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+        runtime_id: &str,
+        stage: &str,
+        err: KernelError,
+    ) -> Result<T, KernelError> {
+        let error = err.to_string();
+        self.audit_runtime_channel_send_bridge_error_parts(
+            session_id, turn_id, runtime_id, stage, &error,
+        )
+        .await;
+        Err(err)
+    }
+
+    async fn canonical_runtime_root(&self) -> Result<PathBuf, KernelError> {
+        let runtime_root = self.runtime_root.as_ref().ok_or_else(|| {
+            KernelError::Runtime(
+                "runtime root is required to publish runtime artifacts".to_string(),
+            )
+        })?;
+        tokio::fs::canonicalize(runtime_root).await.map_err(|err| {
+            KernelError::Runtime(format!(
+                "runtime root '{}' is not readable: {err}",
+                runtime_root.display()
+            ))
+        })
     }
 
     async fn prepare_runtime_artifact_attachments(
         &self,
         turn_id: Uuid,
         artifacts: &[RuntimeArtifact],
-    ) -> Result<Vec<ChannelDeliveryAttachment>, KernelError> {
+    ) -> Result<PreparedChannelDeliveryAttachments, KernelError> {
         if artifacts.is_empty() {
-            return Ok(Vec::new());
+            return Ok(PreparedChannelDeliveryAttachments::default());
+        }
+        let runtime_root = self.canonical_runtime_root().await?;
+        self.prepare_runtime_artifact_attachments_beneath(turn_id, &runtime_root, artifacts)
+            .await
+    }
+
+    async fn prepare_runtime_artifact_attachments_for_turn(
+        &self,
+        turn_id: Uuid,
+        runtime_turn_mode: RuntimeTurnMode,
+        execution_plan: &EffectiveExecutionPlan,
+        artifacts: &[RuntimeArtifact],
+    ) -> Result<PreparedChannelDeliveryAttachments, KernelError> {
+        if artifacts.is_empty() {
+            return Ok(PreparedChannelDeliveryAttachments::default());
+        }
+        if runtime_turn_mode == RuntimeTurnMode::ProgramBacked {
+            let runtime_state_root = Self::runtime_state_root(execution_plan).ok_or_else(|| {
+                KernelError::Runtime(
+                    "runtime state root is required to publish program-backed runtime artifacts"
+                        .to_string(),
+                )
+            })?;
+            return self
+                .prepare_runtime_artifact_attachments_beneath(
+                    turn_id,
+                    runtime_state_root,
+                    artifacts,
+                )
+                .await;
+        }
+        self.prepare_runtime_artifact_attachments(turn_id, artifacts)
+            .await
+    }
+
+    async fn prepare_runtime_artifact_attachments_beneath(
+        &self,
+        turn_id: Uuid,
+        artifact_root: &Path,
+        artifacts: &[RuntimeArtifact],
+    ) -> Result<PreparedChannelDeliveryAttachments, KernelError> {
+        if artifacts.is_empty() {
+            return Ok(PreparedChannelDeliveryAttachments::default());
         }
         if artifacts.len() > MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY {
             return Err(KernelError::BadRequest(format!(
                 "runtime artifacts exceeds {MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY} per delivery"
             )));
         }
-        let runtime_root = self.runtime_root.as_ref().ok_or_else(|| {
-            KernelError::Runtime(
-                "runtime root is required to publish runtime artifacts".to_string(),
-            )
-        })?;
-        let runtime_root_canonical =
-            tokio::fs::canonicalize(runtime_root).await.map_err(|err| {
-                KernelError::Runtime(format!(
-                    "runtime root '{}' is not readable: {err}",
-                    runtime_root.display()
-                ))
-            })?;
+        let runtime_root_canonical = self.canonical_runtime_root().await?;
+        let artifact_root_canonical =
+            tokio::fs::canonicalize(artifact_root)
+                .await
+                .map_err(|err| {
+                    KernelError::Runtime(format!(
+                        "runtime artifact root '{}' is not readable: {err}",
+                        artifact_root.display()
+                    ))
+                })?;
+        if !artifact_root_canonical.starts_with(&runtime_root_canonical) {
+            return Err(KernelError::Runtime(format!(
+                "runtime artifact root '{}' is outside the runtime root",
+                artifact_root.display()
+            )));
+        }
         let turn_id = turn_id.to_string();
         let delivery_root = ensure_safe_child_directory(
             &runtime_root_canonical,
@@ -10837,54 +12524,36 @@ impl Kernel {
         )
         .await?;
 
-        let mut attachments = Vec::with_capacity(artifacts.len());
+        let mut attachments = PreparedChannelDeliveryAttachments {
+            attachments: Vec::with_capacity(artifacts.len()),
+            persisted: false,
+        };
         for artifact in artifacts {
-            attachments.push(
-                self.copy_runtime_artifact_for_delivery(
-                    &runtime_root_canonical,
+            let attachment = self
+                .copy_runtime_artifact_for_delivery(
+                    &artifact_root_canonical,
                     &delivery_root,
                     artifact,
                 )
-                .await?,
-            );
+                .await?;
+            attachments.push(attachment);
         }
         Ok(attachments)
     }
 
     async fn copy_runtime_artifact_for_delivery(
         &self,
-        runtime_root: &Path,
+        artifact_root: &Path,
         delivery_root: &Path,
         artifact: &RuntimeArtifact,
     ) -> Result<ChannelDeliveryAttachment, KernelError> {
-        let canonical_artifact = tokio::fs::canonicalize(&artifact.path)
-            .await
-            .map_err(|err| {
-                KernelError::Runtime(format!(
-                    "runtime artifact '{}' is not readable: {err}",
-                    artifact.path.display()
-                ))
-            })?;
-        if !canonical_artifact.starts_with(runtime_root) {
-            return Err(KernelError::Runtime(format!(
-                "runtime artifact '{}' is outside the runtime root",
+        let source = open_runtime_artifact_source(artifact_root, artifact)?;
+        let metadata = source.metadata().map_err(|err| {
+            KernelError::Runtime(format!(
+                "runtime artifact '{}' is not readable: {err}",
                 artifact.path.display()
-            )));
-        }
-        let metadata = tokio::fs::symlink_metadata(&artifact.path)
-            .await
-            .map_err(|err| {
-                KernelError::Runtime(format!(
-                    "runtime artifact '{}' is not readable: {err}",
-                    artifact.path.display()
-                ))
-            })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(KernelError::Runtime(format!(
-                "runtime artifact '{}' is not a regular file",
-                artifact.path.display()
-            )));
-        }
+            ))
+        })?;
         if usize::try_from(metadata.len()).unwrap_or(usize::MAX)
             > MAX_CHANNEL_OUTBOX_ATTACHMENT_BYTES
         {
@@ -10895,16 +12564,14 @@ impl Kernel {
         }
 
         let filename = runtime_artifact_filename(artifact);
-        let destination = unique_child_path(delivery_root, &filename).await?;
-        tokio::fs::copy(&canonical_artifact, &destination)
-            .await
-            .map_err(|err| {
-                KernelError::Runtime(format!(
-                    "failed to copy runtime artifact '{}' to '{}': {err}",
-                    artifact.path.display(),
-                    destination.display()
-                ))
-            })?;
+        let destination = copy_file_to_unique_child(
+            source,
+            &artifact.path,
+            delivery_root,
+            &filename,
+            MAX_CHANNEL_OUTBOX_ATTACHMENT_BYTES,
+        )
+        .await?;
 
         Ok(ChannelDeliveryAttachment {
             attachment_id: artifact.artifact_id.clone(),
@@ -11887,6 +13554,24 @@ impl Kernel {
             });
         }
 
+        let mut execution_plan = execution_plan;
+        let runtime_turn_mode = adapter.turn_mode();
+        let _channel_send_bridge = self
+            .maybe_start_runtime_channel_send_bridge(
+                session_id,
+                turn_id,
+                runtime_id,
+                runtime_turn_mode,
+                &mut execution_plan,
+            )
+            .await
+            .map_err(|err| FailedRuntimeTurn {
+                events: Vec::new(),
+                status: SessionTurnStatus::Failed,
+                error_code: "runtime.error".to_string(),
+                error_text: err.to_string(),
+            })?;
+
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let adapter_for_task = Arc::clone(&adapter);
         let runtime_secrets_mount = self
@@ -11900,7 +13585,7 @@ impl Kernel {
             })?;
         let codex_home_override = self.codex_home_override.clone();
         let mut turn_task = tokio::spawn(async move {
-            match adapter_for_task.turn_mode() {
+            match runtime_turn_mode {
                 RuntimeTurnMode::Direct => adapter_for_task.turn(input, event_tx).await,
                 RuntimeTurnMode::ProgramBacked => {
                     adapter_for_task

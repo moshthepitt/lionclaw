@@ -30,8 +30,9 @@ use lionclaw::{
         channel_attachments::{MAX_CHANNEL_ATTACHMENT_BYTES, MAX_CHANNEL_EVENT_ATTACHMENT_BYTES},
         runtime::{
             RuntimeAdapter, RuntimeAdapterInfo, RuntimeArtifact, RuntimeCapabilityResult,
-            RuntimeEvent, RuntimeEventSender, RuntimeMessageLane, RuntimeSessionHandle,
-            RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnResult,
+            RuntimeEvent, RuntimeEventSender, RuntimeMessageLane, RuntimeProgramTurnExecution,
+            RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
+            RuntimeTurnResult,
         },
         ChannelAttachmentStageContent, ChannelAttachmentStageInput, Kernel, KernelError,
         KernelOptions,
@@ -928,22 +929,7 @@ async fn channel_turn_with_runtime_artifact_enqueues_outbox_attachment_without_t
     tokio::fs::write(&artifact_source, b"png bytes")
         .await
         .expect("write artifact source");
-    let kernel = env
-        .kernel_with_options(KernelOptions {
-            default_runtime_id: Some("artifact-only".to_string()),
-            runtime_root: Some(env.home().runtime_dir()),
-            workspace_name: Some("main".to_string()),
-            ..KernelOptions::default()
-        })
-        .await;
-    kernel
-        .register_runtime_adapter(
-            "artifact-only",
-            std::sync::Arc::new(ArtifactOnlyAdapter {
-                path: artifact_source.clone(),
-            }),
-        )
-        .await;
+    let kernel = artifact_only_kernel(&env, artifact_source.clone()).await;
 
     create_pending_pairing(
         &kernel,
@@ -1014,22 +1000,7 @@ async fn channel_turn_with_runtime_artifact_outside_runtime_root_fails_turn() {
     tokio::fs::write(&artifact_source, b"png bytes")
         .await
         .expect("write artifact source");
-    let kernel = env
-        .kernel_with_options(KernelOptions {
-            default_runtime_id: Some("artifact-only".to_string()),
-            runtime_root: Some(env.home().runtime_dir()),
-            workspace_name: Some("main".to_string()),
-            ..KernelOptions::default()
-        })
-        .await;
-    kernel
-        .register_runtime_adapter(
-            "artifact-only",
-            std::sync::Arc::new(ArtifactOnlyAdapter {
-                path: artifact_source.clone(),
-            }),
-        )
-        .await;
+    let kernel = artifact_only_kernel(&env, artifact_source.clone()).await;
 
     create_pending_pairing(
         &kernel,
@@ -1095,6 +1066,294 @@ async fn channel_turn_with_runtime_artifact_outside_runtime_root_fails_turn() {
 }
 
 #[tokio::test]
+async fn channel_turn_with_runtime_artifact_cleans_prepared_attachment_on_later_failure() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "telegram", "channel-outbox-artifact-cleanup-skill").await;
+
+    let artifact_source_dir = env.home().runtime_dir().join("generated-test-artifacts");
+    tokio::fs::create_dir_all(&artifact_source_dir)
+        .await
+        .expect("create artifact source dir");
+    let valid_artifact_source = artifact_source_dir.join("first-image.png");
+    tokio::fs::write(&valid_artifact_source, b"first png bytes")
+        .await
+        .expect("write valid artifact source");
+
+    let outside_artifact_source = env.temp_dir().join("outside-runtime.png");
+    tokio::fs::write(&outside_artifact_source, b"outside png bytes")
+        .await
+        .expect("write outside artifact source");
+
+    let kernel = artifact_sequence_kernel(
+        &env,
+        vec![
+            image_runtime_artifact(
+                "artifact:image:valid",
+                valid_artifact_source.clone(),
+                "first-image.png",
+            ),
+            image_runtime_artifact(
+                "artifact:image:escape",
+                outside_artifact_source,
+                "outside-runtime.png",
+            ),
+        ],
+    )
+    .await;
+
+    create_pending_pairing(
+        &kernel,
+        "telegram",
+        "telegram:user:artifact-cleanup",
+        "artifact-cleanup-pairing",
+    )
+    .await;
+    approve_pairing(&kernel, "telegram", "telegram:user:artifact-cleanup").await;
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "telegram",
+            "artifact-cleanup-request",
+            "telegram:user:artifact-cleanup",
+            "telegram:user:artifact-cleanup",
+            None,
+            "generate images with one invalid artifact",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue artifact turn");
+    let queued_turn_id = queued.turn_id.expect("queued turn id");
+    wait_for_stream_events(&kernel, "telegram", "artifact-cleanup-stream", |events| {
+        events.iter().any(|event| {
+            event.turn_id == Some(queued_turn_id)
+                && event.kind == StreamEventKindDto::Error
+                && event
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("outside the runtime root"))
+        }) && events.iter().any(|event| {
+            event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::Done
+        })
+    })
+    .await;
+
+    let copied = env
+        .home()
+        .runtime_dir()
+        .join("channel-outbox")
+        .join(queued_turn_id.to_string())
+        .join("first-image.png");
+    assert!(
+        !tokio::fs::try_exists(&copied)
+            .await
+            .expect("check copied artifact cleanup"),
+        "prepared runtime artifact copies must be removed when a later artifact fails"
+    );
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "telegram".to_string(),
+            worker_id: "artifact-cleanup-worker".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(1),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull artifact cleanup outbox");
+    assert!(outbox.deliveries.is_empty());
+}
+
+#[tokio::test]
+async fn channel_turn_with_program_backed_runtime_artifact_rejects_runtime_state_escape() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(
+        &env,
+        "telegram",
+        "channel-outbox-program-artifact-escape-skill",
+    )
+    .await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("program-artifact-escape".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            workspace_name: Some("main".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+    kernel
+        .register_runtime_adapter(
+            "program-artifact-escape",
+            std::sync::Arc::new(ProgramBackedRuntimeStateEscapeArtifactAdapter),
+        )
+        .await;
+
+    create_pending_pairing(
+        &kernel,
+        "telegram",
+        "telegram:user:program-artifact-escape",
+        "program-artifact-escape-pairing",
+    )
+    .await;
+    approve_pairing(&kernel, "telegram", "telegram:user:program-artifact-escape").await;
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "telegram",
+            "program-artifact-escape-request",
+            "telegram:user:program-artifact-escape",
+            "telegram:user:program-artifact-escape",
+            None,
+            "generate an escaped program-backed artifact",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue program artifact turn");
+    let queued_turn_id = queued.turn_id.expect("queued turn id");
+    wait_for_stream_events(
+        &kernel,
+        "telegram",
+        "program-artifact-escape-stream",
+        |events| {
+            events.iter().any(|event| {
+                event.turn_id == Some(queued_turn_id)
+                    && event.kind == StreamEventKindDto::Error
+                    && event
+                        .text
+                        .as_deref()
+                        .is_some_and(|text| text.contains("outside the runtime root"))
+            }) && events.iter().any(|event| {
+                event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::Done
+            })
+        },
+    )
+    .await;
+
+    let turn = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: queued.session_id.expect("queued session id"),
+            limit: None,
+        })
+        .await
+        .expect("history")
+        .turns
+        .into_iter()
+        .find(|turn| turn.turn_id == queued_turn_id)
+        .expect("program artifact escape turn");
+    assert_eq!(turn.status, SessionTurnStatus::Failed);
+    assert_eq!(turn.error_code.as_deref(), Some("runtime.error"));
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "telegram".to_string(),
+            worker_id: "program-artifact-escape-worker".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(1),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull program artifact escape outbox");
+    assert!(outbox.deliveries.is_empty());
+}
+
+#[tokio::test]
+async fn channel_turn_with_runtime_artifact_rejects_symlink_escape_source() {
+    use std::os::unix::fs::symlink;
+
+    let env = TestHome::new().await;
+    install_and_bind_channel(
+        &env,
+        "telegram",
+        "channel-outbox-artifact-source-symlink-skill",
+    )
+    .await;
+
+    let outside = env.temp_dir().join("outside-artifact-source");
+    tokio::fs::create_dir_all(&outside)
+        .await
+        .expect("create outside artifact source");
+    tokio::fs::write(outside.join("generated-image.png"), b"secret png bytes")
+        .await
+        .expect("write outside artifact source");
+
+    let artifact_source_dir = env.home().runtime_dir().join("generated-test-artifacts");
+    tokio::fs::create_dir_all(&artifact_source_dir)
+        .await
+        .expect("create artifact source dir");
+    let artifact_source_link = artifact_source_dir.join("escape-link");
+    symlink(&outside, &artifact_source_link).expect("symlink artifact source escape");
+    let artifact_source = artifact_source_link.join("generated-image.png");
+
+    let kernel = artifact_only_kernel(&env, artifact_source.clone()).await;
+
+    create_pending_pairing(
+        &kernel,
+        "telegram",
+        "telegram:user:artifact-source-symlink",
+        "artifact-source-symlink-pairing",
+    )
+    .await;
+    approve_pairing(&kernel, "telegram", "telegram:user:artifact-source-symlink").await;
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "telegram",
+            "artifact-source-symlink-request",
+            "telegram:user:artifact-source-symlink",
+            "telegram:user:artifact-source-symlink",
+            None,
+            "generate an image through a symlinked source",
+            ChannelTrigger::Dm,
+        ))
+        .await
+        .expect("queue artifact turn");
+    let queued_turn_id = queued.turn_id.expect("queued turn id");
+    wait_for_stream_events(
+        &kernel,
+        "telegram",
+        "artifact-source-symlink-stream",
+        |events| {
+            events.iter().any(|event| {
+                event.turn_id == Some(queued_turn_id)
+                    && event.kind == StreamEventKindDto::Error
+                    && event
+                        .text
+                        .as_deref()
+                        .is_some_and(|text| text.contains("outside the runtime root"))
+            }) && events.iter().any(|event| {
+                event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::Done
+            })
+        },
+    )
+    .await;
+
+    let turn = kernel
+        .session_history(SessionHistoryRequest {
+            session_id: queued.session_id.expect("queued session id"),
+            limit: None,
+        })
+        .await
+        .expect("history")
+        .turns
+        .into_iter()
+        .find(|turn| turn.turn_id == queued_turn_id)
+        .expect("artifact source symlink turn");
+    assert_eq!(turn.status, SessionTurnStatus::Failed);
+    assert_eq!(turn.error_code.as_deref(), Some("runtime.error"));
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "telegram".to_string(),
+            worker_id: "artifact-source-symlink-worker".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(1),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull artifact source symlink outbox");
+    assert!(outbox.deliveries.is_empty());
+}
+
+#[tokio::test]
 async fn channel_turn_with_runtime_artifact_rejects_symlinked_outbox_root() {
     use std::os::unix::fs::symlink;
 
@@ -1116,22 +1375,7 @@ async fn channel_turn_with_runtime_artifact_rejects_symlinked_outbox_root() {
     symlink(&outside, env.home().runtime_dir().join("channel-outbox"))
         .expect("symlink channel outbox root");
 
-    let kernel = env
-        .kernel_with_options(KernelOptions {
-            default_runtime_id: Some("artifact-only".to_string()),
-            runtime_root: Some(env.home().runtime_dir()),
-            workspace_name: Some("main".to_string()),
-            ..KernelOptions::default()
-        })
-        .await;
-    kernel
-        .register_runtime_adapter(
-            "artifact-only",
-            std::sync::Arc::new(ArtifactOnlyAdapter {
-                path: artifact_source.clone(),
-            }),
-        )
-        .await;
+    let kernel = artifact_only_kernel(&env, artifact_source.clone()).await;
 
     create_pending_pairing(
         &kernel,
@@ -6000,6 +6244,45 @@ async fn install_and_bind_channel(env: &TestHome, channel_id: &str, skill_name: 
         .await;
 }
 
+async fn artifact_only_kernel(env: &TestHome, artifact_path: std::path::PathBuf) -> Kernel {
+    artifact_sequence_kernel(
+        env,
+        vec![image_runtime_artifact(
+            "artifact:image:1",
+            artifact_path,
+            "generated-image.png",
+        )],
+    )
+    .await
+}
+
+async fn artifact_sequence_kernel(env: &TestHome, artifacts: Vec<RuntimeArtifact>) -> Kernel {
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("artifact-only".to_string()),
+            runtime_root: Some(env.home().runtime_dir()),
+            workspace_name: Some("main".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+    kernel
+        .register_runtime_adapter(
+            "artifact-only",
+            std::sync::Arc::new(ArtifactOnlyAdapter { artifacts }),
+        )
+        .await;
+    kernel
+}
+
+fn image_runtime_artifact(id: &str, path: std::path::PathBuf, filename: &str) -> RuntimeArtifact {
+    RuntimeArtifact {
+        artifact_id: id.to_string(),
+        path,
+        filename: Some(filename.to_string()),
+        mime_type: Some("image/png".to_string()),
+    }
+}
+
 fn test_daemon_info(env: &TestHome, bind_addr: String) -> DaemonInfoResponse {
     DaemonInfoResponse {
         daemon: "lionclawd".to_string(),
@@ -6853,7 +7136,89 @@ impl RuntimeAdapter for SlowAnswerAdapter {
 }
 
 struct ArtifactOnlyAdapter {
-    path: std::path::PathBuf,
+    artifacts: Vec<RuntimeArtifact>,
+}
+
+struct ProgramBackedRuntimeStateEscapeArtifactAdapter;
+
+#[async_trait]
+impl RuntimeAdapter for ProgramBackedRuntimeStateEscapeArtifactAdapter {
+    async fn info(&self) -> RuntimeAdapterInfo {
+        RuntimeAdapterInfo {
+            id: "program-artifact-escape".to_string(),
+            version: "test".to_string(),
+            healthy: true,
+        }
+    }
+
+    fn turn_mode(&self) -> RuntimeTurnMode {
+        RuntimeTurnMode::ProgramBacked
+    }
+
+    async fn session_start(
+        &self,
+        input: RuntimeSessionStartInput,
+    ) -> Result<RuntimeSessionHandle, anyhow::Error> {
+        Ok(RuntimeSessionHandle {
+            runtime_session_id: format!("program-artifact-escape:{}", input.session_id),
+            resumes_existing_session: false,
+        })
+    }
+
+    async fn program_backed_turn(
+        &self,
+        execution: RuntimeProgramTurnExecution,
+        event_tx: RuntimeEventSender,
+    ) -> Result<RuntimeTurnResult, anyhow::Error> {
+        let runtime_state_root = execution
+            .plan
+            .mounts
+            .iter()
+            .find(|mount| mount.target == "/runtime")
+            .map(|mount| mount.source.as_path())
+            .ok_or_else(|| anyhow::anyhow!("runtime state root missing"))?;
+        let outside_current_state = runtime_state_root
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("runtime state root parent missing"))?
+            .join("outside-current-runtime-state");
+        tokio::fs::create_dir_all(&outside_current_state).await?;
+        let artifact_path = outside_current_state.join("generated-image.png");
+        tokio::fs::write(&artifact_path, b"escaped png bytes").await?;
+
+        event_tx
+            .send(RuntimeEvent::Artifact {
+                artifact: image_runtime_artifact(
+                    "artifact:image:program-escape",
+                    artifact_path,
+                    "generated-image.png",
+                ),
+            })
+            .expect("send artifact");
+        Ok(RuntimeTurnResult {
+            capability_requests: Vec::new(),
+        })
+    }
+
+    async fn resolve_capability_requests(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _results: Vec<RuntimeCapabilityResult>,
+        _event_tx: RuntimeEventSender,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn cancel(
+        &self,
+        _handle: &RuntimeSessionHandle,
+        _reason: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn close(&self, _handle: &RuntimeSessionHandle) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -6881,16 +7246,13 @@ impl RuntimeAdapter for ArtifactOnlyAdapter {
         _input: RuntimeTurnInput,
         event_tx: RuntimeEventSender,
     ) -> Result<RuntimeTurnResult, anyhow::Error> {
-        event_tx
-            .send(RuntimeEvent::Artifact {
-                artifact: RuntimeArtifact {
-                    artifact_id: "artifact:image:1".to_string(),
-                    path: self.path.clone(),
-                    filename: Some("generated-image.png".to_string()),
-                    mime_type: Some("image/png".to_string()),
-                },
-            })
-            .expect("send artifact");
+        for artifact in &self.artifacts {
+            event_tx
+                .send(RuntimeEvent::Artifact {
+                    artifact: artifact.clone(),
+                })
+                .expect("send artifact");
+        }
         Ok(RuntimeTurnResult {
             capability_requests: Vec::new(),
         })

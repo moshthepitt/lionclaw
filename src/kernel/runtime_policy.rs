@@ -4,6 +4,8 @@ use std::{
     time::Duration,
 };
 
+const RESERVED_RUNTIME_ENV_PREFIX: &str = "LIONCLAW_";
+
 #[derive(Debug, Clone)]
 pub struct RuntimeExecutionRule {
     pub working_dir_roots: Vec<PathBuf>,
@@ -188,6 +190,11 @@ fn resolve_environment(
         if normalized.is_empty() {
             return Err("runtime_env_passthrough cannot include empty keys".to_string());
         }
+        if normalized.starts_with(RESERVED_RUNTIME_ENV_PREFIX) {
+            return Err(format!(
+                "runtime_env_passthrough key '{normalized}' uses the reserved LionClaw namespace '{RESERVED_RUNTIME_ENV_PREFIX}'"
+            ));
+        }
         if !allowed_keys.contains(&normalized) {
             return Err(format!(
                 "runtime_env_passthrough key '{normalized}' is not allowed by policy"
@@ -289,5 +296,31 @@ mod tests {
             .expect_err("unknown key should be denied");
 
         assert!(err.contains("not allowed by policy"));
+    }
+
+    #[test]
+    fn policy_rejects_reserved_lionclaw_passthrough_keys() {
+        let mut allowed = BTreeSet::new();
+        allowed.insert("LIONCLAW_CHANNEL_SEND_SOCKET".to_string());
+        let rule = RuntimeExecutionRule {
+            allowed_env_passthrough_keys: allowed,
+            ..RuntimeExecutionRule::default()
+        };
+        let policy = RuntimeExecutionPolicy::default().with_rule("mock", rule);
+
+        let err = policy
+            .evaluate(
+                "mock",
+                RuntimeExecutionRequest::new(
+                    None,
+                    vec!["LIONCLAW_CHANNEL_SEND_SOCKET".to_string()],
+                    Some(300),
+                ),
+                Duration::from_millis(300),
+                Duration::from_millis(900),
+            )
+            .expect_err("LionClaw-owned env names should be denied");
+
+        assert!(err.contains("reserved LionClaw namespace"));
     }
 }
