@@ -1091,7 +1091,7 @@ class TelegramWorker:
         if is_active_turn_callback:
             if active is None or callback.sender_ref != active.sender_ref:
                 return False
-            session_key = active.session_key
+            session_key = active.session_key if parsed.action == "stop" else None
             conversation_ref = active.target.conversation_ref
             thread_ref = active.target.thread_ref
         expected = _callback_mac(
@@ -1997,7 +1997,9 @@ class TelegramWorker:
     ) -> str:
         code = CALLBACK_ACTION_CODES[action]
         target_id = active.turn_id if active is not None else CALLBACK_ROUTE_TARGET
-        session_key = active.session_key if active is not None else None
+        session_key = (
+            active.session_key if active is not None and action == "stop" else None
+        )
         mac = _callback_mac(
             self.config.telegram_bot_token,
             action,

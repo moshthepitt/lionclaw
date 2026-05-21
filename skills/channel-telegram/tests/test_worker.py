@@ -5959,6 +5959,86 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(active.session_id, "session-1")
         self.assertEqual(active.session_key, "channel:telegram:direct:77")
 
+    async def test_status_callback_survives_late_session_key_fill(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            update = TelegramInboundUpdate(
+                update_id=976,
+                event_id="telegram:update:976",
+                sender_ref="telegram:user:77",
+                conversation_ref="telegram:chat:77",
+                message_ref="telegram:message:76",
+                text="slow",
+                trigger="dm",
+                provider_metadata={"chat_type": "private"},
+            )
+            await worker._remember_active_turn(
+                update,
+                InboundResponse(
+                    outcome="queued",
+                    turn_id="turn-1",
+                    session_id=None,
+                    session_key=None,
+                ),
+            )
+            worker._active_turns["turn-1"].visible_after = 0.0
+            await worker.refresh_progress_messages()
+            status_payload = telegram.sent_buttons[-1][0].action
+
+            await worker._remember_active_turn(
+                replace(update, update_id=977, event_id="telegram:update:977"),
+                InboundResponse(
+                    outcome="queued",
+                    turn_id="turn-1",
+                    session_id="session-1",
+                    session_key="channel:telegram:direct:77",
+                ),
+            )
+            telegram.updates = [
+                Update.model_validate(
+                    {
+                        "update_id": 978,
+                        "callback_query": {
+                            "id": "callback-status-late-key",
+                            "from": {
+                                "id": 77,
+                                "is_bot": False,
+                                "first_name": "Alice",
+                            },
+                            "chat_instance": "chat-instance",
+                            "data": status_payload,
+                            "message": {
+                                "message_id": 101,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 99,
+                                    "is_bot": True,
+                                    "first_name": "LionClaw",
+                                    "username": "lionclaw_bot",
+                                },
+                                "text": "Queued...",
+                            },
+                        },
+                    }
+                )
+            ]
+
+            await worker.process_updates()
+
+        self.assertEqual(
+            telegram.answered_callbacks[-1],
+            ("callback-status-late-key", "Status sent"),
+        )
+        self.assertEqual(telegram.sent_messages[-1][1], "Active turn: queued.")
+
     async def test_new_turn_supersedes_and_deletes_old_progress_message(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
