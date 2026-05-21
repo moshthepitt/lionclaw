@@ -728,6 +728,7 @@ class TelegramWorker:
         self._webhook_route_gates: dict[WebhookRouteKey, WebhookRouteGate] = {}
         self._webhook_update_results: dict[int, asyncio.Future[bool]] = {}
         self._webhook_recent_update_ids: dict[int, None] = {}
+        self._webhook_accepting_updates = True
         self._webhook_state_lock = asyncio.Lock()
 
     async def process_updates(self) -> None:
@@ -789,6 +790,8 @@ class TelegramWorker:
         update_id: int,
     ) -> tuple[bool, asyncio.Future[bool]]:
         async with self._webhook_state_lock:
+            if not self._webhook_accepting_updates:
+                return False, _resolved_bool_future(False)
             if update_id in self._webhook_recent_update_ids:
                 return False, _resolved_bool_future(True)
             result = self._webhook_update_results.get(update_id)
@@ -1057,6 +1060,10 @@ class TelegramWorker:
             if not result.done():
                 result.set_result(False)
 
+    async def _close_webhook_ingress(self) -> None:
+        async with self._webhook_state_lock:
+            self._webhook_accepting_updates = False
+
     async def _reject_later_webhook_route_batches(
         self,
         batch: WebhookBatch,
@@ -1201,6 +1208,7 @@ class TelegramWorker:
             self._typing_deadlines.clear()
             self._typing_routes.clear()
             self._typing_failures.clear()
+            await self._close_webhook_ingress()
             await self._reject_all_webhook_batches()
             await self._reject_all_webhook_updates()
             self._active_turns.clear()

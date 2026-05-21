@@ -2509,6 +2509,47 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             ["Active turn: queued."],
         )
 
+    async def test_webhook_update_is_rejected_after_worker_shutdown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=api,
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            task = asyncio.create_task(worker.run_forever(receive_updates=False))
+            await asyncio.sleep(0)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+            processed = await worker.process_webhook_update(
+                Update.model_validate(
+                    {
+                        "update_id": 872,
+                        "message": {
+                            "message_id": 72,
+                            "date": 0,
+                            "chat": {"id": 77, "type": "private"},
+                            "from": {
+                                "id": 77,
+                                "is_bot": False,
+                                "first_name": "Alice",
+                            },
+                            "text": "late webhook",
+                        },
+                    }
+                )
+            )
+
+        self.assertFalse(processed)
+        self.assertEqual(api.sent_inbound, [])
+
     async def test_process_webhook_update_batches_concurrent_text_messages(
         self,
     ) -> None:
