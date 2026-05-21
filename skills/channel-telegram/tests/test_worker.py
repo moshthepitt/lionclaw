@@ -2801,6 +2801,64 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(stored_update_ids, {875: None, 876: None})
 
+    async def test_worker_shutdown_flushes_dirty_webhook_update_state(self) -> None:
+        class FailingOnceWebhookUpdateStore(WebhookUpdateStore):
+            def __init__(self, path: Path) -> None:
+                super().__init__(path)
+                self.failures_remaining = 1
+
+            def save(self, update_ids: dict[int, None]) -> None:
+                if self.failures_remaining > 0:
+                    self.failures_remaining -= 1
+                    raise RuntimeError("state store unavailable")
+                super().save(update_ids)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = FailingOnceWebhookUpdateStore(
+                Path(temp_dir) / "telegram.webhook-updates.json"
+            )
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=FakeLionClawApi(),
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                webhook_update_store=store,
+            )
+            update = Update.model_validate(
+                {
+                    "update_id": 877,
+                    "message": {
+                        "message_id": 77,
+                        "date": 0,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "/status",
+                    },
+                }
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                self.assertFalse(await worker.process_webhook_update(update))
+            self.assertEqual(store.load(), {})
+
+            task = asyncio.create_task(worker.run_forever(receive_updates=False))
+            await asyncio.sleep(0)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+            stored_update_ids = store.load()
+
+        self.assertEqual(stored_update_ids, {877: None})
+
     async def test_webhook_update_is_rejected_after_worker_shutdown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()

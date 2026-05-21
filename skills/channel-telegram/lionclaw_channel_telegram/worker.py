@@ -923,6 +923,10 @@ class TelegramWorker:
         self._webhook_recent_update_ids_dirty = False
         return True
 
+    async def _flush_webhook_update_state(self) -> bool:
+        async with self._webhook_state_lock:
+            return self._save_webhook_updates_locked()
+
     async def _process_webhook_work_item(self, item: ProviderWorkItem) -> bool:
         key = _webhook_batch_key(item.event)
         if key is None:
@@ -1324,6 +1328,7 @@ class TelegramWorker:
             await self._close_webhook_ingress()
             await self._reject_all_webhook_batches()
             await self._reject_all_webhook_updates()
+            await self._flush_webhook_update_state()
             self._flush_durable_state()
             self._active_turns.clear()
             self._pending_progress_deletes.clear()
