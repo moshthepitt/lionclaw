@@ -625,6 +625,70 @@ async fn channel_send_bridge_drops_open_connections_after_turn_completion() {
     );
 }
 
+#[tokio::test]
+async fn channel_send_bridge_audits_wire_protocol_denials() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-wire-errors").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    let mut oversized = vec![b'x'; 64 * 1024 + 1];
+    oversized.push(b'\n');
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(ChannelSendProbeRuntime::send_raw_requests(
+                vec![
+                    b"{not-json}\n".to_vec(),
+                    b"{\"unterminated\":true".to_vec(),
+                    oversized,
+                ],
+                responses.clone(),
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-wire-errors").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "send malformed channel messages".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let responses = responses.lock().expect("responses lock").clone();
+    let expected_codes = ["invalid_json", "invalid_request", "request_too_large"];
+    assert_eq!(responses.len(), expected_codes.len());
+    for (response, expected_code) in responses.iter().zip(expected_codes) {
+        assert_eq!(response["ok"].as_bool(), Some(false));
+        assert_eq!(response["error"]["code"].as_str(), Some(expected_code));
+    }
+
+    let denied = kernel
+        .query_audit(
+            None,
+            Some("runtime.channel_send.denied".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query denied audit events");
+    for expected_code in expected_codes {
+        assert!(
+            denied.events.iter().any(|event| {
+                event.details["reason"].as_str() == Some(expected_code)
+                    && event.details["channel_id"].as_str() == Some("")
+                    && event.details["conversation_ref"].as_str() == Some("")
+            }),
+            "missing denied audit event for {expected_code}"
+        );
+    }
+}
+
 #[derive(Clone)]
 enum RuntimeAction {
     RecordEnvironment {
@@ -635,6 +699,10 @@ enum RuntimeAction {
         responses: Arc<Mutex<Vec<Value>>>,
         socket_paths: Arc<Mutex<Vec<PathBuf>>>,
         file_setup: ProbeFileSetup,
+    },
+    SendRawRequests {
+        requests: Vec<Vec<u8>>,
+        responses: Arc<Mutex<Vec<Value>>>,
     },
     Sleep {
         socket_paths: Arc<Mutex<Vec<PathBuf>>>,
@@ -668,6 +736,15 @@ impl ChannelSendProbeRuntime {
                 responses,
                 socket_paths,
                 file_setup,
+            },
+        }
+    }
+
+    fn send_raw_requests(requests: Vec<Vec<u8>>, responses: Arc<Mutex<Vec<Value>>>) -> Self {
+        Self {
+            action: RuntimeAction::SendRawRequests {
+                requests,
+                responses,
             },
         }
     }
@@ -774,6 +851,16 @@ async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan)
             }
             Ok(())
         }
+        RuntimeAction::SendRawRequests {
+            requests,
+            responses,
+        } => {
+            for request in requests {
+                let response = send_raw_channel_send_request(plan, request).await?;
+                responses.lock().expect("responses lock").push(response);
+            }
+            Ok(())
+        }
         RuntimeAction::Sleep {
             socket_paths,
             duration,
@@ -860,6 +947,28 @@ async fn send_channel_send_request(plan: &EffectiveExecutionPlan, request: Value
     let mut line = serde_json::to_vec(&request).expect("serialize request");
     line.push(b'\n');
     stream.write_all(&line).await.expect("write request");
+    stream.shutdown().await.expect("shutdown request writer");
+
+    let mut response = String::new();
+    let mut reader = BufReader::new(stream);
+    reader
+        .read_line(&mut response)
+        .await
+        .expect("read response");
+    serde_json::from_str(response.trim()).context("decode response")
+}
+
+async fn send_raw_channel_send_request(
+    plan: &EffectiveExecutionPlan,
+    request: &[u8],
+) -> Result<Value> {
+    let socket = env_value(&plan.environment, CHANNEL_SEND_SOCKET_ENV)
+        .context("channel send socket env missing")?;
+    let host_socket = host_path_for_runtime_path(plan, &socket)?;
+    let mut stream = UnixStream::connect(&host_socket)
+        .await
+        .with_context(|| format!("connect {}", host_socket.display()))?;
+    stream.write_all(request).await.expect("write request");
     stream.shutdown().await.expect("shutdown request writer");
 
     let mut response = String::new();

@@ -8795,19 +8795,33 @@ async fn handle_runtime_channel_send_stream(
             Ok(request) => runtime_channel_send_response(
                 kernel.send_runtime_channel_message(context, request).await,
             ),
-            Err(err) => runtime_channel_send_error_response(
-                "invalid_json",
-                format!("request is not valid channel.send JSON: {err}"),
-            ),
+            Err(err) => {
+                runtime_channel_send_denied_response(
+                    &kernel,
+                    &context,
+                    RuntimeChannelSendProblem::new(
+                        "invalid_json",
+                        format!("request is not valid channel.send JSON: {err}"),
+                    ),
+                )
+                .await
+            }
         },
-        Ok(Err(problem)) => runtime_channel_send_error_response(problem.code, problem.message),
-        Err(_) => runtime_channel_send_error_response(
-            "request_timeout",
-            format!(
-                "channel.send request must arrive within {}",
-                format_duration(RUNTIME_CHANNEL_SEND_REQUEST_READ_TIMEOUT)
-            ),
-        ),
+        Ok(Err(problem)) => runtime_channel_send_denied_response(&kernel, &context, problem).await,
+        Err(_) => {
+            runtime_channel_send_denied_response(
+                &kernel,
+                &context,
+                RuntimeChannelSendProblem::new(
+                    "request_timeout",
+                    format!(
+                        "channel.send request must arrive within {}",
+                        format_duration(RUNTIME_CHANNEL_SEND_REQUEST_READ_TIMEOUT)
+                    ),
+                ),
+            )
+            .await
+        }
     };
 
     let mut stream = reader.into_inner();
@@ -8885,6 +8899,17 @@ fn runtime_channel_send_error_response(code: &str, message: impl Into<String>) -
             "message": message.into(),
         },
     })
+}
+
+async fn runtime_channel_send_denied_response(
+    kernel: &Kernel,
+    context: &RuntimeChannelSendContext,
+    problem: RuntimeChannelSendProblem,
+) -> Value {
+    kernel
+        .audit_runtime_channel_send_denied(context, "", "", problem.code)
+        .await;
+    runtime_channel_send_error_response(problem.code, problem.message)
 }
 
 fn runtime_channel_send_fingerprint(
