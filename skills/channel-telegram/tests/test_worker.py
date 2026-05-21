@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import os
+import stat
 import tempfile
 import unittest
 from collections.abc import Sequence
@@ -60,6 +61,7 @@ from lionclaw_channel_telegram.webhook import (
 )
 from lionclaw_channel_telegram.worker import (
     MAX_OUTBOX_RECEIPTS,
+    ActiveTurn,
     ActiveTurnStore,
     OffsetStore,
     OutboxReceiptRecord,
@@ -68,6 +70,7 @@ from lionclaw_channel_telegram.worker import (
     ProgressDeleteStore,
     ProviderWorkItem,
     TelegramWorker,
+    TypingTarget,
     _classify_send_failure,
     _overall_health_status,
     _webhook_batch_key,
@@ -1274,6 +1277,37 @@ class LionClawApiTests(unittest.IsolatedAsyncioTestCase):
         await api.close()
 
 
+def _file_mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+class ActiveTurnStoreTests(unittest.TestCase):
+    def test_save_replaces_active_turn_file_with_private_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "telegram.active-turns.json"
+            path.write_text("{}", encoding="utf-8")
+            path.chmod(0o644)
+            store = ActiveTurnStore(path)
+            turn = ActiveTurn(
+                turn_id="turn-1",
+                session_id="session-1",
+                session_key="channel:telegram:direct:77",
+                sender_ref="telegram:user:77",
+                target=TypingTarget("telegram:chat:77"),
+                reply_to_ref="telegram:message:101",
+                generation=1,
+                visible_after=0.0,
+            )
+
+            store.save({"turn-1": turn})
+
+            loaded = store.load()
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0].session_key, "channel:telegram:direct:77")
+            self.assertEqual(_file_mode(path), 0o600)
+            self.assertFalse((path.parent / ".telegram.active-turns.json.tmp").exists())
+
+
 class OffsetStoreTests(unittest.TestCase):
     def test_save_replaces_offset_file_without_leaving_temp_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1292,6 +1326,8 @@ class OutboxReceiptStoreTests(unittest.TestCase):
     def test_save_replaces_receipt_file_without_leaving_temp_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "telegram.outbox-receipts.json"
+            path.write_text("{}", encoding="utf-8")
+            path.chmod(0o644)
             store = OutboxReceiptStore(path)
 
             store.save(
@@ -1327,6 +1363,7 @@ class OutboxReceiptStoreTests(unittest.TestCase):
             self.assertFalse(
                 (path.parent / ".telegram.outbox-receipts.json.tmp").exists()
             )
+            self.assertEqual(_file_mode(path), 0o600)
 
     def test_load_ignores_malformed_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1419,6 +1456,8 @@ class ProgressDeleteStoreTests(unittest.TestCase):
     def test_save_replaces_progress_deletes_without_leaving_temp_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "telegram.progress-deletes.json"
+            path.write_text("{}", encoding="utf-8")
+            path.chmod(0o644)
             store = ProgressDeleteStore(path)
             pending = PendingProgressDelete(
                 turn_id="turn-1",
@@ -1445,6 +1484,7 @@ class ProgressDeleteStoreTests(unittest.TestCase):
             self.assertFalse(
                 (path.parent / ".telegram.progress-deletes.json.tmp").exists()
             )
+            self.assertEqual(_file_mode(path), 0o600)
 
     def test_load_ignores_malformed_progress_deletes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

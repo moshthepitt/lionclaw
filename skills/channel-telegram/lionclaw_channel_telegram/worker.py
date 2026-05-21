@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
@@ -80,6 +81,7 @@ COMPACT_STATUS_TEXT_LIMIT = 96
 MAX_OUTBOX_RECEIPTS = 256
 OUTBOX_RECEIPT_STATUSES = {"delivered", "partial"}
 MAX_PENDING_PROGRESS_DELETES = 256
+PRIVATE_STORE_FILE_MODE = 0o600
 TEXT_BURST_MAX_SECONDS = 10
 WEBHOOK_COALESCE_DELAY_SECONDS = 0.35
 
@@ -180,17 +182,14 @@ class ActiveTurnStore:
         return active
 
     def save(self, active_turns: dict[str, ActiveTurn]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_name(f".{self.path.name}.tmp")
         turns = [
             _active_turn_to_json(active_turns[turn_id])
             for turn_id in sorted(active_turns)
         ]
-        tmp_path.write_text(
+        _write_private_store_text(
+            self.path,
             json.dumps({"active_turns": turns}, sort_keys=True),
-            encoding="utf-8",
         )
-        tmp_path.replace(self.path)
 
 
 @dataclass(slots=True)
@@ -320,9 +319,8 @@ class OutboxReceiptStore:
         return receipts
 
     def save(self, receipts: dict[str, OutboxReceiptRecord]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_name(f".{self.path.name}.tmp")
-        tmp_path.write_text(
+        _write_private_store_text(
+            self.path,
             json.dumps(
                 {
                     delivery_id: record.to_json()
@@ -330,9 +328,7 @@ class OutboxReceiptStore:
                 },
                 sort_keys=True,
             ),
-            encoding="utf-8",
         )
-        tmp_path.replace(self.path)
 
 
 @dataclass(slots=True)
@@ -366,18 +362,34 @@ class ProgressDeleteStore:
         return pending
 
     def save(self, pending: dict[tuple[str, str], PendingProgressDelete]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_name(f".{self.path.name}.tmp")
-        tmp_path.write_text(
+        _write_private_store_text(
+            self.path,
             json.dumps(
                 {
                     "pending": [pending[key].to_json() for key in sorted(pending)],
                 },
                 sort_keys=True,
             ),
-            encoding="utf-8",
         )
-        tmp_path.replace(self.path)
+
+
+def _write_private_store_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    tmp_path.unlink(missing_ok=True)
+    fd = os.open(
+        tmp_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        PRIVATE_STORE_FILE_MODE,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(text)
+        tmp_path.replace(path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def _active_turn_to_json(turn: ActiveTurn) -> dict[str, object]:
