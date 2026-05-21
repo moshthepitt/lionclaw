@@ -251,6 +251,7 @@ class WebhookBatch:
     key: WebhookBatchKey
     items: list[ProviderWorkItem]
     result: asyncio.Future[bool]
+    flush_task: asyncio.Task[None] | None = None
 
 
 @dataclass(slots=True)
@@ -665,12 +666,7 @@ class TelegramWorker:
                 [item], persist_offsets=False
             )
 
-        future, should_schedule = await self._enqueue_webhook_batch(key, item)
-        if should_schedule:
-            asyncio.create_task(
-                self._flush_webhook_batch(key, WEBHOOK_COALESCE_DELAY_SECONDS),
-                name="telegram-webhook-batch",
-            )
+        future = await self._enqueue_webhook_batch(key, item)
         return await asyncio.shield(future)
 
     async def _process_webhook_route_work_items(
@@ -726,10 +722,9 @@ class TelegramWorker:
         self,
         key: WebhookBatchKey,
         item: ProviderWorkItem,
-    ) -> tuple[asyncio.Future[bool], bool]:
+    ) -> asyncio.Future[bool]:
         async with self._webhook_state_lock:
             batch = self._webhook_batches.get(key)
-            should_schedule = False
             if batch is None:
                 batch = WebhookBatch(
                     key=key,
@@ -737,14 +732,14 @@ class TelegramWorker:
                     result=asyncio.get_running_loop().create_future(),
                 )
                 self._webhook_batches[key] = batch
-                should_schedule = True
+                self._schedule_webhook_batch_flush(batch)
             batch.items.append(item)
             route_batches = _sorted_webhook_batches_for_route(
                 self._webhook_batches.values(),
                 _webhook_batch_route(key),
             )
             if route_batches == [batch]:
-                return batch.result, should_schedule
+                return batch.result
 
             current_index = next(
                 index
@@ -757,12 +752,25 @@ class TelegramWorker:
             else:
                 batches_to_flush = route_batches[: current_index + 1]
                 batches_to_reject_on_failure = route_batches[current_index + 1 :]
-                should_schedule = False
 
         if not await self._flush_webhook_batches(batches_to_flush):
             await self._reject_webhook_batches(batches_to_reject_on_failure)
-            should_schedule = False
-        return batch.result, should_schedule
+        return batch.result
+
+    def _schedule_webhook_batch_flush(self, batch: WebhookBatch) -> None:
+        if batch.flush_task is not None and not batch.flush_task.done():
+            return
+        batch.flush_task = asyncio.create_task(
+            self._flush_webhook_batch(batch.key, WEBHOOK_COALESCE_DELAY_SECONDS),
+            name="telegram-webhook-batch",
+        )
+
+    @staticmethod
+    def _cancel_webhook_batch_flush(batch: WebhookBatch) -> None:
+        task = batch.flush_task
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
 
     async def _flush_webhook_batches_for_event(
         self,
@@ -797,6 +805,7 @@ class TelegramWorker:
             async with self._webhook_state_lock:
                 if self._webhook_batches.get(batch.key) is batch:
                     self._webhook_batches.pop(batch.key, None)
+            self._cancel_webhook_batch_flush(batch)
             if not batch.result.done():
                 batch.result.set_result(False)
 
@@ -805,15 +814,23 @@ class TelegramWorker:
         key: WebhookBatchKey,
         delay_seconds: float,
     ) -> None:
-        if delay_seconds > 0.0:
-            await asyncio.sleep(delay_seconds)
+        try:
+            if delay_seconds > 0.0:
+                await asyncio.sleep(delay_seconds)
+        except asyncio.CancelledError:
+            await self._reject_webhook_batch_by_key(key)
+            raise
         async with self._webhook_state_lock:
             batch = self._webhook_batches.pop(key, None)
         if batch is None:
             return
+        self._cancel_webhook_batch_flush(batch)
         route = _webhook_batch_route(key)
-        gate = await self._acquire_webhook_route_gate(route)
+        gate: WebhookRouteGate | None = None
+        processed = False
+        reject_later_batches = False
         try:
+            gate = await self._acquire_webhook_route_gate(route)
             if batch.result.done():
                 return
             work_items = sorted(batch.items, key=_provider_work_item_sort_key)
@@ -821,13 +838,51 @@ class TelegramWorker:
                 work_items,
                 persist_offsets=False,
             )
+            reject_later_batches = not processed
+        except asyncio.CancelledError:
+            reject_later_batches = True
+            raise
         except Exception:
             logger.exception("telegram webhook batch processing failed")
             processed = False
+            reject_later_batches = True
         finally:
-            await self._release_webhook_route_gate(route, gate)
+            try:
+                if gate is not None:
+                    try:
+                        if reject_later_batches:
+                            await self._reject_later_webhook_route_batches(batch)
+                    finally:
+                        await self._release_webhook_route_gate(route, gate)
+            finally:
+                if not batch.result.done():
+                    batch.result.set_result(processed)
+
+    async def _reject_webhook_batch_by_key(self, key: WebhookBatchKey) -> None:
+        async with self._webhook_state_lock:
+            batch = self._webhook_batches.pop(key, None)
+        if batch is None:
+            return
+        self._cancel_webhook_batch_flush(batch)
         if not batch.result.done():
-            batch.result.set_result(processed)
+            batch.result.set_result(False)
+
+    async def _reject_later_webhook_route_batches(
+        self,
+        batch: WebhookBatch,
+    ) -> None:
+        route = _webhook_batch_route(batch.key)
+        batch_sort_key = _webhook_batch_sort_key(batch)
+        async with self._webhook_state_lock:
+            later_batches = [
+                candidate
+                for candidate in _sorted_webhook_batches_for_route(
+                    self._webhook_batches.values(),
+                    route,
+                )
+                if _webhook_batch_sort_key(candidate) > batch_sort_key
+            ]
+        await self._reject_webhook_batches(later_batches)
 
     async def _process_provider_work_items(
         self,
