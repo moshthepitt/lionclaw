@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+
+{% block title %}Blog / {{ config.title }}{% endblock title %}
+{% block description %}Notes on LionClaw, local agents, and owning the tools you use.{% endblock description %}
+{% block og_title %}Blog / {{ config.title }}{% endblock og_title %}
+{% block og_description %}Notes on LionClaw, local agents, and owning the tools you use.{% endblock og_description %}
+
+{% block content %}
+<section class="archive" aria-labelledby="blog-heading">
+  <header class="archive-head">
+    <h1 id="blog-heading">Blog</h1>
+    <p>Build notes and arguments for keeping serious agent work local.</p>
+  </header>
+
+  <ol class="archive-list" aria-label="Posts">
+    {% for post in paginator.pages %}
+    <li class="archive-item">
+      {% if post.date %}
+      <time datetime="{{ post.date }}">{{ post.date | date(format="%Y-%m-%d") }}</time>
+      {% endif %}
+      <a href="{{ post.permalink | safe }}">{{ post.title }}</a>
+    </li>
+    {% endfor %}
+  </ol>
+
+  {% if paginator.previous or paginator.next %}
+  <nav class="pagination" aria-label="Pagination">
+    {% if paginator.previous %}
+    <a href="{{ paginator.previous }}">Newer</a>
+    {% endif %}
+    {% if paginator.next %}
+    <a href="{{ paginator.next }}">Older</a>
+    {% endif %}
+  </nav>
+  {% endif %}
+</section>
+{% endblock content %}

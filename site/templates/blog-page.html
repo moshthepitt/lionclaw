@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+
+{% block title %}{{ page.title }} / {{ config.title }}{% endblock title %}
+{% block description %}{% if page.description %}{{ page.description }}{% else %}{{ config.description }}{% endif %}{% endblock description %}
+{% block og_title %}{{ page.title }} / {{ config.title }}{% endblock og_title %}
+{% block og_description %}{% if page.description %}{{ page.description }}{% else %}{{ config.description }}{% endif %}{% endblock og_description %}
+{% block og_type %}article{% endblock og_type %}
+
+{% block content %}
+<article class="article">
+  <header class="article-head">
+    <div class="article-kicker">
+      <a href="/blog/">Blog</a>
+      {% if page.date %}
+      <time datetime="{{ page.date }}">{{ page.date | date(format="%Y-%m-%d") }}</time>
+      {% endif %}
+    </div>
+    <h1>{{ page.title }}</h1>
+  </header>
+  <div class="article-body">
+    {{ page.content | safe }}
+  </div>
+</article>
+{% endblock content %}

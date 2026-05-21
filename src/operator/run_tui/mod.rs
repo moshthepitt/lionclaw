@@ -81,12 +81,16 @@ use render::{
 
 const EVENT_POLL: Duration = Duration::from_millis(50);
 const HISTORY_LIMIT: usize = 24;
-const PANEL_BORDER: Color = Color::Rgb(0, 205, 220);
-const PANEL_MUTED: Color = Color::Rgb(128, 132, 142);
-const PANEL_SELECTED: Color = Color::Rgb(0, 68, 72);
-const PANEL_READY: Color = Color::Rgb(91, 255, 112);
-const PANEL_WARN: Color = Color::Rgb(255, 198, 55);
-const PANEL_ERROR: Color = Color::Rgb(255, 82, 82);
+const PANEL_BG: Color = Color::Reset;
+const PANEL_INK: Color = Color::Reset;
+const PANEL_TEXT: Color = Color::Reset;
+const PANEL_BORDER: Color = Color::Rgb(216, 145, 53);
+const PANEL_LINE: Color = Color::DarkGray;
+const PANEL_MUTED: Color = Color::Gray;
+const PANEL_SELECTED: Color = Color::Rgb(42, 42, 38);
+const PANEL_READY: Color = Color::Rgb(142, 163, 122);
+const PANEL_WARN: Color = Color::Rgb(216, 145, 53);
+const PANEL_ERROR: Color = Color::Rgb(196, 85, 48);
 const ACTIVITY_ITEM_HISTORY_LIMIT: usize = 200;
 const DEFAULT_TRANSCRIPT_PAGE_SCROLL: usize = 8;
 const DEFAULT_ACTIVITY_PAGE_SCROLL: usize = 8;
@@ -908,16 +912,17 @@ impl ConsoleComposer {
 
     fn from_text(text: &str) -> Self {
         let mut input = TextArea::default();
-        input.set_style(Style::default().fg(Color::White));
-        input.set_cursor_line_style(Style::default());
+        input.set_style(Style::default().fg(PANEL_TEXT).bg(PANEL_BG));
+        input.set_cursor_line_style(Style::default().bg(PANEL_BG));
         input.set_cursor_style(
             Style::default()
                 .fg(PANEL_BORDER)
+                .bg(PANEL_BG)
                 .add_modifier(Modifier::REVERSED),
         );
         input.set_styled_placeholder(Line::from(vec![Span::styled(
             "Ask through the selected runtime...",
-            Style::default().fg(PANEL_MUTED),
+            Style::default().fg(PANEL_MUTED).bg(PANEL_BG),
         )]));
         input.set_wrap_mode(WrapMode::WordOrGlyph);
         if !text.is_empty() {

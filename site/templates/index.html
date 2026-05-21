@@ -1,0 +1,211 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero" aria-labelledby="hero-heading">
+  <div class="hero-intro">
+    <div class="hero-title">
+      <p class="eyebrow">Local agent home</p>
+      <h1 id="hero-heading">Your agent should work from your side of the fence.</h1>
+    </div>
+    <div class="hero-copy">
+      <p class="lede">
+        Run Codex, OpenCode, Claude Code, or whatever comes next from a local
+        project home.
+      </p>
+      <p>
+        LionClaw gives the agent a place to work that belongs to the project,
+        not the platform.
+      </p>
+      <p>
+        The harness can change. The home stays yours.
+      </p>
+      <div class="actions" aria-label="Primary links">
+        <a class="button primary" href="#start">Start</a>
+        <a class="button" href="https://github.com/moshthepitt/lionclaw" rel="noopener noreferrer">GitHub</a>
+        <a class="button" href="#why">Why LionClaw</a>
+      </div>
+    </div>
+  </div>
+
+  <figure class="console" aria-label="LionClaw run console">
+    <a
+      class="console-shot"
+      href="/assets/lionclaw-run-console.png"
+      target="_blank"
+      rel="noopener noreferrer"
+      aria-label="Open full size LionClaw run console screenshot"
+    >
+      <img
+        src="/assets/lionclaw-run-console.png"
+        alt="LionClaw run console showing project sessions, transcript, inspector, composer, and command help"
+        width="1890"
+        height="969"
+      >
+    </a>
+    <figcaption>
+      <span><code>lionclaw run</code></span>
+      opens the local project console around a real agent CLI.
+    </figcaption>
+  </figure>
+</section>
+
+<section id="what" class="contract" aria-labelledby="contract-heading">
+  <div class="contract-head">
+    <p class="eyebrow">What LionClaw is</p>
+    <h2 id="contract-heading">The agent does the work. LionClaw keeps the home.</h2>
+  </div>
+  <div class="contract-body">
+    <p>
+      Codex, OpenCode, Claude Code, and future harnesses still do the agent
+      work.
+    </p>
+    <p>
+      LionClaw keeps the project-side boundary: where the agent runs, what
+      state it sees, which skills are mounted, which credentials are staged,
+      what jobs exist, and what gets recorded.
+    </p>
+  </div>
+  <div class="contract-grid" aria-label="Agent CLI and LionClaw responsibilities">
+    <article>
+      <h3>Agent CLI</h3>
+      <ul>
+        <li>Reasons about the task</li>
+        <li>Writes code</li>
+        <li>Uses tools</li>
+        <li>Answers prompts</li>
+      </ul>
+    </article>
+    <article>
+      <h3>LionClaw</h3>
+      <ul>
+        <li>Creates the project home</li>
+        <li>Keeps sessions and state</li>
+        <li>Mounts skills</li>
+        <li>Stages credentials</li>
+        <li>Tracks jobs and channels</li>
+        <li>Records audit</li>
+      </ul>
+    </article>
+  </div>
+</section>
+
+<section id="start" class="split" aria-labelledby="start-heading">
+  <div>
+    <p class="eyebrow">Start</p>
+    <h2 id="start-heading">Start where your work already is.</h2>
+    <p>
+      No new platform to move into. No dashboard as the source of truth.
+      No vendor-owned project memory.
+    </p>
+    <p>
+      Run <code>doctor</code>. Fix what it reports. Then run the agent.
+    </p>
+    <p>
+      If the agent changes next month, the project home does not have to.
+    </p>
+  </div>
+  <pre class="command long"><code>git clone https://github.com/moshthepitt/lionclaw
+cd lionclaw
+cargo build --release
+export PATH="$PWD/target/release:$PATH"
+
+cd /path/to/your/project
+lionclaw project init
+lionclaw doctor
+lionclaw run</code></pre>
+</section>
+
+<section id="today" class="today" aria-labelledby="today-heading">
+  <div class="today-head">
+    <div>
+      <p class="eyebrow">What exists today</p>
+      <h2 id="today-heading">The core is already real.</h2>
+    </div>
+    <div class="today-intro">
+      <p>
+        LionClaw already has the working surfaces a serious local agent needs:
+        project identity, a runtime boundary, a console, mounted skills,
+        scheduled work, channels, and audit.
+      </p>
+      <p>
+        This is enough to start serious project-side agent work now. The bigger
+        public workflow writeups can sit on top of this core.
+      </p>
+    </div>
+  </div>
+
+  <div class="today-ledger" aria-label="Implemented LionClaw surfaces">
+    <article>
+      <h3><span>Project Home</span><code>.lionclaw/</code></h3>
+      <p>Project identity, instance homes, runtime profiles, sessions, skills, jobs, logs, runtime state, and audit live beside the work.</p>
+    </article>
+    <article>
+      <h3><span>Run Console</span><code>lionclaw run</code></h3>
+      <p>A local operator console for real agent CLIs: project objects, durable transcript, inspector, composer, activity, and interrupt controls.</p>
+    </article>
+    <article>
+      <h3><span>Runtime Boundary</span></h3>
+      <p>Each turn is launched from a plan: work root at <code>/workspace</code>, private state at <code>/runtime</code>, drafts at <code>/drafts</code>, mounted skills, staged auth, network mode, and timeouts.</p>
+    </article>
+    <article>
+      <h3><span>Runtime Profiles</span><code>lionclaw runtime add</code></h3>
+      <p>Profiles choose the agent kind, executable, image, and confinement options. LionClaw turns that into an explicit launch plan before the agent starts.</p>
+    </article>
+    <article>
+      <h3><span>Skills</span></h3>
+      <p>Skills are installed project-side and mounted into the runtime view. They can guide the work; they do not become authority by being prompt text.</p>
+    </article>
+    <article>
+      <h3><span>Jobs and Channels</span></h3>
+      <p>Jobs run prompts in fresh sessions. Channels, pairing, attachments, outbox delivery, health, cancellation, and audit are core paths.</p>
+    </article>
+    <article>
+      <h3><span>Doctor</span><code>lionclaw doctor</code></h3>
+      <p>Read-only diagnostics with stable <code>LC-D...</code> findings and repair commands. It reports drift instead of quietly rewriting state.</p>
+    </article>
+    <article>
+      <h3><span>Audit</span></h3>
+      <p>Runtime plans, turns, controls, channel events, job runs, policy outcomes, and timeouts leave records you can inspect.</p>
+    </article>
+  </div>
+</section>
+
+<section id="why" class="point" aria-labelledby="point-heading">
+  <div class="point-head">
+    <div>
+      <p class="eyebrow">Why LionClaw</p>
+      <h2 id="point-heading">An agent is not just chat.</h2>
+    </div>
+    <div class="point-copy">
+      <p>
+        It reads files. It writes code. It remembers decisions. It can use
+        credentials. It can message people. It can run work while you are away.
+      </p>
+      <p class="point-principle">
+        That power should not all live inside someone else's platform.
+      </p>
+      <p>
+        The model can be commercial. The harness can change. But the project
+        home, memory, credentials, jobs, and audit trail should stay somewhere
+        you can inspect and move.
+      </p>
+      <p>
+        LionClaw is for that.
+      </p>
+    </div>
+  </div>
+
+  <div class="final-cta" aria-label="Start using LionClaw">
+    <p class="final-cta-line">
+      Agents will become the interface to everything. Do not let someone else own yours.
+    </p>
+    <p class="final-cta-copy">
+      Use the strongest agent available. Keep the home local.
+    </p>
+    <div class="actions">
+      <a class="button primary" href="/#start">Start</a>
+      <a class="button" href="https://github.com/moshthepitt/lionclaw" rel="noopener noreferrer">GitHub</a>
+    </div>
+  </div>
+</section>
+{% endblock content %}
