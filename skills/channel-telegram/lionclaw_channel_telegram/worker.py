@@ -1318,6 +1318,7 @@ class TelegramWorker:
             await self._close_webhook_ingress()
             await self._reject_all_webhook_batches()
             await self._reject_all_webhook_updates()
+            self._flush_durable_state()
             self._active_turns.clear()
             self._pending_progress_deletes.clear()
             self._route_turns.clear()
@@ -2277,6 +2278,11 @@ class TelegramWorker:
     def _save_pending_progress_deletes(self) -> bool:
         self._pending_progress_deletes_dirty = True
         return self._flush_pending_progress_deletes()
+
+    def _flush_durable_state(self) -> None:
+        self._flush_active_turns()
+        self._flush_pending_progress_deletes()
+        self._save_outbox_receipts()
 
     def _flush_pending_progress_deletes(self) -> bool:
         if not self._pending_progress_deletes_dirty:

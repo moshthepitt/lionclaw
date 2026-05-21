@@ -5939,6 +5939,121 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(loaded[0].session_id, "session-1")
         self.assertEqual(loaded[0].session_key, "channel:telegram:direct:77")
 
+    async def test_shutdown_flush_retries_dirty_durable_state(self) -> None:
+        class FailingOnceActiveTurnStore(ActiveTurnStore):
+            def __init__(self, path: Path) -> None:
+                super().__init__(path)
+                self.failures_remaining = 1
+
+            def save(self, active_turns: dict[str, ActiveTurn]) -> None:
+                if self.failures_remaining > 0:
+                    self.failures_remaining -= 1
+                    raise RuntimeError("active turn store unavailable")
+                super().save(active_turns)
+
+        class FailingOnceProgressDeleteStore(ProgressDeleteStore):
+            def __init__(self, path: Path) -> None:
+                super().__init__(path)
+                self.failures_remaining = 1
+
+            def save(
+                self,
+                pending: dict[tuple[str, str], PendingProgressDelete],
+            ) -> None:
+                if self.failures_remaining > 0:
+                    self.failures_remaining -= 1
+                    raise RuntimeError("progress delete store unavailable")
+                super().save(pending)
+
+        class FailingOnceOutboxReceiptStore(OutboxReceiptStore):
+            def __init__(self, path: Path) -> None:
+                super().__init__(path)
+                self.failures_remaining = 1
+
+            def save(self, receipts: dict[str, OutboxReceiptRecord]) -> None:
+                if self.failures_remaining > 0:
+                    self.failures_remaining -= 1
+                    raise RuntimeError("outbox receipt store unavailable")
+                super().save(receipts)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            active_store = FailingOnceActiveTurnStore(
+                Path(temp_dir) / "telegram.active-turns.json"
+            )
+            progress_delete_store = FailingOnceProgressDeleteStore(
+                Path(temp_dir) / "telegram.progress-deletes.json"
+            )
+            outbox_receipt_store = FailingOnceOutboxReceiptStore(
+                Path(temp_dir) / "telegram.outbox-receipts.json"
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=FakeLionClawApi(),
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                active_turn_store=active_store,
+                progress_delete_store=progress_delete_store,
+                outbox_receipt_store=outbox_receipt_store,
+            )
+            pending_delete = PendingProgressDelete(
+                turn_id="turn-1",
+                conversation_ref="telegram:chat:77",
+                message_ref="telegram:message:101",
+                attempts=2,
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker._remember_active_turn(
+                    TelegramInboundUpdate(
+                        update_id=949,
+                        event_id="telegram:update:949",
+                        sender_ref="telegram:user:77",
+                        conversation_ref="telegram:chat:77",
+                        message_ref="telegram:message:49",
+                        text="slow",
+                        trigger="dm",
+                        provider_metadata={"chat_type": "private"},
+                    ),
+                    InboundResponse(
+                        outcome="queued",
+                        turn_id="turn-1",
+                        session_id="session-1",
+                        session_key="channel:telegram:direct:77",
+                    ),
+                )
+                worker._pending_progress_deletes[pending_delete.key] = pending_delete
+                worker._save_pending_progress_deletes()
+                worker._remember_outbox_receipt(
+                    "delivery-1",
+                    "delivered",
+                    {"message_id": 101, "chat_id": "77"},
+                )
+            self.assertEqual(active_store.load(), [])
+            self.assertEqual(progress_delete_store.load(), {})
+            self.assertEqual(outbox_receipt_store.load(), {})
+
+            worker._flush_durable_state()
+
+            active_turns = active_store.load()
+            pending_deletes = progress_delete_store.load()
+            outbox_receipts = outbox_receipt_store.load()
+
+        self.assertEqual([turn.turn_id for turn in active_turns], ["turn-1"])
+        self.assertEqual(pending_deletes, {pending_delete.key: pending_delete})
+        self.assertEqual(
+            outbox_receipts,
+            {
+                "delivery-1": OutboxReceiptRecord(
+                    status="delivered",
+                    provider_receipt={
+                        "message_id": 101,
+                        "chat_id": "77",
+                        "messages": [{"message_id": 101, "chat_id": "77"}],
+                    },
+                )
+            },
+        )
+
     async def test_stop_failure_removes_new_stopping_progress_message(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi(
