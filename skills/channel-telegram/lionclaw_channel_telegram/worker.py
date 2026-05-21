@@ -1206,6 +1206,8 @@ class TelegramWorker:
                     await self._handle_unsupported_content(item.event)
                 elif not await self._submit_inbound(item.event):
                     return False
+            if not self._flush_turn_state():
+                return False
             if persist_offsets:
                 if not self._save_processed_offsets(item.update_ids):
                     return False
@@ -1266,6 +1268,8 @@ class TelegramWorker:
             last_sequence = event.sequence
 
         if last_sequence is not None:
+            if not self._flush_turn_state():
+                return
             try:
                 await self.lionclaw_api.ack_stream(last_sequence)
             except Exception:
@@ -2279,10 +2283,15 @@ class TelegramWorker:
         self._pending_progress_deletes_dirty = True
         return self._flush_pending_progress_deletes()
 
-    def _flush_durable_state(self) -> None:
-        self._flush_active_turns()
-        self._flush_pending_progress_deletes()
-        self._save_outbox_receipts()
+    def _flush_durable_state(self) -> bool:
+        turn_state_flushed = self._flush_turn_state()
+        outbox_receipts_flushed = self._save_outbox_receipts()
+        return turn_state_flushed and outbox_receipts_flushed
+
+    def _flush_turn_state(self) -> bool:
+        active_flushed = self._flush_active_turns()
+        deletes_flushed = self._flush_pending_progress_deletes()
+        return active_flushed and deletes_flushed
 
     def _flush_pending_progress_deletes(self) -> bool:
         if not self._pending_progress_deletes_dirty:

@@ -5888,20 +5888,10 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram.sent_messages[-1][1], "Stopping...")
 
     async def test_active_turn_save_failure_is_retried(self) -> None:
-        class FailingOnceActiveTurnStore(ActiveTurnStore):
-            def __init__(self, path: Path) -> None:
-                super().__init__(path)
-                self.failures_remaining = 1
-
-            def save(self, active_turns: dict[str, ActiveTurn]) -> None:
-                if self.failures_remaining > 0:
-                    self.failures_remaining -= 1
-                    raise RuntimeError("active turn store unavailable")
-                super().save(active_turns)
-
         with tempfile.TemporaryDirectory() as temp_dir:
-            store = FailingOnceActiveTurnStore(
-                Path(temp_dir) / "telegram.active-turns.json"
+            store = FailingActiveTurnStore(
+                Path(temp_dir) / "telegram.active-turns.json",
+                failures=1,
             )
             worker = TelegramWorker(
                 config=build_config(Path(temp_dir)),
@@ -5939,18 +5929,97 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(loaded[0].session_id, "session-1")
         self.assertEqual(loaded[0].session_key, "channel:telegram:direct:77")
 
+    async def test_polling_offset_waits_for_dirty_active_turn_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            active_store = FailingActiveTurnStore(
+                Path(temp_dir) / "telegram.active-turns.json",
+                failures=2,
+            )
+            offset_path = Path(temp_dir) / "telegram.offset"
+            api = FakeLionClawApi(
+                inbound_turn_id="turn-1",
+                inbound_session_id="session-1",
+                inbound_session_key="channel:telegram:direct:77",
+            )
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 950,
+                            "message": {
+                                "message_id": 50,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "slow",
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(offset_path),
+                active_turn_store=active_store,
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker.process_updates()
+            self.assertEqual(worker.offset, 0)
+            self.assertFalse(offset_path.exists())
+            self.assertEqual(active_store.load(), [])
+
+            await worker.process_updates()
+
+            self.assertEqual(worker.offset, 951)
+            self.assertEqual(offset_path.read_text(encoding="utf-8"), "951")
+            self.assertEqual(
+                [turn.turn_id for turn in active_store.load()],
+                ["turn-1"],
+            )
+
+    async def test_stream_ack_waits_for_dirty_active_turn_state(self) -> None:
+        event = StreamEvent(
+            sequence=17,
+            peer_id="telegram:chat:77",
+            turn_id="turn-1",
+            kind="status",
+            code="runtime.started",
+            text="running",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            active_store = FailingActiveTurnStore(
+                Path(temp_dir) / "telegram.active-turns.json",
+                failures=0,
+            )
+            api = FakeLionClawApi(stream_events=[event])
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                active_turn_store=active_store,
+            )
+            await self._record_active_turn(worker)
+            active_store.failures_remaining = 2
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker.flush_stream()
+            self.assertEqual(api.acked_sequences, [])
+
+            await worker.flush_stream()
+            stored_turns = active_store.load()
+
+        self.assertEqual(api.acked_sequences, [17])
+        self.assertEqual(stored_turns[0].status_text, "Working")
+
     async def test_shutdown_flush_retries_dirty_durable_state(self) -> None:
-        class FailingOnceActiveTurnStore(ActiveTurnStore):
-            def __init__(self, path: Path) -> None:
-                super().__init__(path)
-                self.failures_remaining = 1
-
-            def save(self, active_turns: dict[str, ActiveTurn]) -> None:
-                if self.failures_remaining > 0:
-                    self.failures_remaining -= 1
-                    raise RuntimeError("active turn store unavailable")
-                super().save(active_turns)
-
         class FailingOnceProgressDeleteStore(ProgressDeleteStore):
             def __init__(self, path: Path) -> None:
                 super().__init__(path)
@@ -5977,8 +6046,9 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 super().save(receipts)
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            active_store = FailingOnceActiveTurnStore(
-                Path(temp_dir) / "telegram.active-turns.json"
+            active_store = FailingActiveTurnStore(
+                Path(temp_dir) / "telegram.active-turns.json",
+                failures=1,
             )
             progress_delete_store = FailingOnceProgressDeleteStore(
                 Path(temp_dir) / "telegram.progress-deletes.json"
@@ -9644,6 +9714,18 @@ async def _post_webhook_update(
 
 
 _USE_EXPECTED_TURN_ID = object()
+
+
+class FailingActiveTurnStore(ActiveTurnStore):
+    def __init__(self, path: Path, *, failures: int) -> None:
+        super().__init__(path)
+        self.failures_remaining = failures
+
+    def save(self, active_turns: dict[str, ActiveTurn]) -> None:
+        if self.failures_remaining > 0:
+            self.failures_remaining -= 1
+            raise RuntimeError("active turn store unavailable")
+        super().save(active_turns)
 
 
 class FakeLionClawApi:
