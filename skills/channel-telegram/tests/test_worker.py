@@ -8653,6 +8653,114 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(receipt_store.load(), {})
 
+    async def test_cancelled_outbox_send_preserves_delivered_receipt(self) -> None:
+        class ShieldedProviderSendTelegram(FakeTelegramTransport):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def send_message(
+                self,
+                conversation_ref: str,
+                text: str,
+                reply_to_ref: str | None = None,
+                thread_ref: str | None = None,
+                format_hint: str = "plain",
+                attachments: Sequence[TelegramOutboundAttachment] = (),
+                resume_receipt: dict[str, object] | None = None,
+                buttons: Sequence[TelegramActionButton] = (),
+            ) -> dict[str, object]:
+                async def provider_send() -> dict[str, object]:
+                    self.started.set()
+                    await self.release.wait()
+                    self.sent_messages.append(
+                        (
+                            conversation_ref,
+                            text,
+                            reply_to_ref,
+                            thread_ref,
+                            [attachment.path for attachment in attachments],
+                        )
+                    )
+                    return {"message_id": 101, "chat_id": "telegram:chat:77"}
+
+                return await asyncio.shield(asyncio.create_task(provider_send()))
+
+        delivery = OutboxDelivery(
+            delivery_id="delivery-1",
+            attempt_id="attempt-1",
+            conversation_ref="telegram:chat:77",
+            content=OutboxContent(text="final answer"),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            receipt_store = OutboxReceiptStore(
+                Path(temp_dir) / "telegram.outbox-receipts.json"
+            )
+            first_api = FakeLionClawApi(report_accepted=False)
+            first_telegram = ShieldedProviderSendTelegram()
+            first_worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=first_api,
+                telegram=first_telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                outbox_receipt_store=receipt_store,
+            )
+
+            first_task = asyncio.create_task(
+                first_worker._process_outbox_delivery(delivery)
+            )
+            await asyncio.wait_for(first_telegram.started.wait(), timeout=1.0)
+            first_task.cancel()
+            await asyncio.sleep(0)
+            first_telegram.release.set()
+            with (
+                self.assertLogs("lionclaw_channel_telegram.worker", level="WARNING"),
+                self.assertRaises(asyncio.CancelledError),
+            ):
+                await first_task
+            await asyncio.wait_for(
+                _wait_until(lambda: len(first_telegram.sent_messages) == 1),
+                timeout=1.0,
+            )
+
+            second_api = FakeLionClawApi()
+            second_telegram = FakeTelegramTransport()
+            second_worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=second_api,
+                telegram=second_telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                outbox_receipt_store=receipt_store,
+            )
+            await second_worker._process_outbox_delivery(
+                replace(delivery, attempt_id="attempt-2")
+            )
+
+        self.assertEqual(
+            first_telegram.sent_messages,
+            [("telegram:chat:77", "final answer", None, None, [])],
+        )
+        self.assertEqual(second_telegram.sent_messages, [])
+        self.assertEqual(
+            second_api.outbox_reports,
+            [
+                (
+                    "delivery-1",
+                    "attempt-2",
+                    "delivered",
+                    {
+                        "message_id": 101,
+                        "chat_id": "77",
+                        "messages": [{"message_id": 101, "chat_id": "77"}],
+                    },
+                    None,
+                    None,
+                )
+            ],
+        )
+        self.assertEqual(receipt_store.load(), {})
+
     async def test_delivered_outbox_receipt_save_failure_is_retried_without_resend(
         self,
     ) -> None:

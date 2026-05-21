@@ -128,6 +128,12 @@ REACTION_FAILED = "😢"
 
 
 @dataclass(slots=True, frozen=True)
+class OwnedWaitResult[T]:
+    value: T
+    was_cancelled: bool
+
+
+@dataclass(slots=True, frozen=True)
 class OwnedUpdateWaitResult:
     succeeded: bool
     was_cancelled: bool
@@ -1012,12 +1018,27 @@ class TelegramWorker:
         *,
         cancellation_message: str,
     ) -> OwnedUpdateWaitResult:
+        owned_result = await self._wait_for_owned_result(
+            result,
+            cancellation_message=cancellation_message,
+        )
+        return OwnedUpdateWaitResult(
+            succeeded=owned_result.value,
+            was_cancelled=owned_result.was_cancelled,
+        )
+
+    async def _wait_for_owned_result[T](
+        self,
+        result: asyncio.Future[T],
+        *,
+        cancellation_message: str,
+    ) -> OwnedWaitResult[T]:
         logged_cancellation = False
         was_cancelled = False
         while True:
             try:
-                return OwnedUpdateWaitResult(
-                    succeeded=await asyncio.shield(result),
+                return OwnedWaitResult(
+                    value=await asyncio.shield(result),
                     was_cancelled=was_cancelled,
                 )
             except asyncio.CancelledError:
@@ -2628,8 +2649,36 @@ class TelegramWorker:
             )
             return
 
+        restore_cancellation = False
         try:
-            receipt = await self.telegram.send_message(
+            result = await self._send_outbox_message(delivery, receipt_record)
+            receipt = result.value
+            restore_cancellation = result.was_cancelled
+        except asyncio.CancelledError:
+            raise
+        except TelegramPartialSendError as err:
+            await self._handle_outbox_send_failure(
+                delivery,
+                err.cause,
+                partial_receipt=err.receipt,
+            )
+            return
+        except Exception as err:
+            await self._handle_outbox_send_failure(delivery, err)
+            return
+
+        self._remember_outbox_receipt(delivery.delivery_id, "delivered", receipt)
+        await self._report_delivered_outbox_when_durable(delivery, receipt)
+        if restore_cancellation:
+            raise asyncio.CancelledError
+
+    async def _send_outbox_message(
+        self,
+        delivery: OutboxDelivery,
+        receipt_record: OutboxReceiptRecord | None,
+    ) -> OwnedWaitResult[dict[str, object]]:
+        sending = asyncio.create_task(
+            self.telegram.send_message(
                 delivery.conversation_ref,
                 delivery.content.text,
                 delivery.reply_to_ref,
@@ -2648,20 +2697,15 @@ class TelegramWorker:
                     if receipt_record is not None and receipt_record.status == "partial"
                     else None
                 ),
-            )
-        except TelegramPartialSendError as err:
-            await self._handle_outbox_send_failure(
-                delivery,
-                err.cause,
-                partial_receipt=err.receipt,
-            )
-            return
-        except Exception as err:
-            await self._handle_outbox_send_failure(delivery, err)
-            return
-
-        self._remember_outbox_receipt(delivery.delivery_id, "delivered", receipt)
-        await self._report_delivered_outbox_when_durable(delivery, receipt)
+            ),
+            name="telegram-outbox-send",
+        )
+        return await self._wait_for_owned_result(
+            sending,
+            cancellation_message=(
+                "telegram outbox send wait cancelled; preserving delivery receipt"
+            ),
+        )
 
     async def _report_delivered_outbox_when_durable(
         self,
