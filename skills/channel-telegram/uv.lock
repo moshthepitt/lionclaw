@@ -334,6 +334,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiogram" },
+    { name = "aiohttp" },
     { name = "httpx" },
 ]
 
@@ -346,6 +347,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiogram", specifier = "==3.15.0" },
+    { name = "aiohttp", specifier = "==3.10.11" },
     { name = "httpx", specifier = "==0.28.1" },
 ]
 

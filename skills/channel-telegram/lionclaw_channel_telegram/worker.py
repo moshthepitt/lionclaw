@@ -48,6 +48,7 @@ from lionclaw_channel_telegram.telegram import (
     extract_inbound_event,
     normalize_telegram_receipt,
 )
+from lionclaw_channel_telegram.webhook import TelegramWebhookServer
 
 logger = logging.getLogger(__name__)
 
@@ -562,6 +563,9 @@ class TelegramWorker:
         self._last_poll_failure_observed_at: float | None = None
         self._last_poll_error: str | None = None
         self._last_poll_update_count: int | None = None
+        self._last_webhook_success_observed_at: float | None = None
+        self._last_webhook_failure_observed_at: float | None = None
+        self._last_webhook_error: str | None = None
         self._last_update_id: int | None = None
         self._last_update_observed_at: float | None = None
         self._update_extraction_failure_count = 0
@@ -591,23 +595,58 @@ class TelegramWorker:
             event = self._extract_provider_event(update, bot_identity)
             work_items.append(ProviderWorkItem((update.update_id,), event))
 
+        await self._process_provider_work_items(work_items, persist_offsets=True)
+
+    async def process_webhook_update(self, update: Update) -> bool:
+        try:
+            bot_identity = await self.telegram.bot_identity()
+        except Exception as err:
+            self._record_webhook_failure(err)
+            logger.exception("telegram getMe request failed for webhook update")
+            return False
+
+        item = ProviderWorkItem(
+            (update.update_id,),
+            self._extract_provider_event(update, bot_identity),
+        )
+        processed = await self._process_provider_work_items(
+            [item],
+            persist_offsets=False,
+        )
+        if processed:
+            self._record_webhook_success()
+        else:
+            self._record_webhook_failure(
+                RuntimeError("webhook update processing failed")
+            )
+        return processed
+
+    async def _process_provider_work_items(
+        self,
+        work_items: list[ProviderWorkItem],
+        *,
+        persist_offsets: bool,
+    ) -> bool:
         for item in _coalesce_work_items(work_items):
             if item.event is not None:
                 if isinstance(item.event, TelegramPairingClaim):
                     if not await self._claim_pairing(item.event):
-                        return
+                        return False
                 elif isinstance(item.event, TelegramCallbackAction):
                     if not await self._handle_callback_action(item.event):
-                        return
+                        return False
                 elif not await self._submit_inbound(item.event):
-                    return
-            if not self._save_processed_offsets(item.update_ids):
-                return
+                    return False
+            if persist_offsets:
+                if not self._save_processed_offsets(item.update_ids):
+                    return False
+            else:
+                self._record_processed_updates(item.update_ids)
+        return True
 
     def _save_processed_offsets(self, update_ids: tuple[int, ...]) -> bool:
         for update_id in update_ids:
-            self._last_update_id = update_id
-            self._last_update_observed_at = _loop_time()
+            self._record_processed_update(update_id)
             next_offset = update_id + 1
             try:
                 self.offset_store.save(next_offset)
@@ -619,6 +658,14 @@ class TelegramWorker:
                 return False
             self.offset = next_offset
         return True
+
+    def _record_processed_updates(self, update_ids: tuple[int, ...]) -> None:
+        for update_id in update_ids:
+            self._record_processed_update(update_id)
+
+    def _record_processed_update(self, update_id: int) -> None:
+        self._last_update_id = update_id
+        self._last_update_observed_at = _loop_time()
 
     def _extract_provider_event(
         self,
@@ -676,15 +723,19 @@ class TelegramWorker:
         except Exception:
             logger.exception("lionclaw health report submit failed")
 
-    async def run_forever(self) -> None:
+    async def run_forever(self, *, receive_updates: bool = True) -> None:
         tasks = [
-            asyncio.create_task(self._run_update_loop(), name="telegram-updates"),
             asyncio.create_task(self._run_stream_loop(), name="lionclaw-stream"),
             asyncio.create_task(self._run_outbox_loop(), name="lionclaw-outbox"),
             asyncio.create_task(self._run_typing_loop(), name="telegram-typing"),
             asyncio.create_task(self._run_progress_loop(), name="telegram-progress"),
             asyncio.create_task(self._run_health_loop(), name="lionclaw-health"),
         ]
+        if receive_updates:
+            tasks.insert(
+                0,
+                asyncio.create_task(self._run_update_loop(), name="telegram-updates"),
+            )
         try:
             await asyncio.gather(*tasks)
         finally:
@@ -1958,7 +2009,10 @@ class TelegramWorker:
 
     async def _health_checks(self) -> list[HealthCheck]:
         checks = [await self._bot_identity_health_check()]
-        checks.append(self._polling_health_check())
+        if self.config.telegram_update_mode == "webhook":
+            checks.append(self._webhook_health_check())
+        else:
+            checks.append(self._polling_health_check())
         checks.append(self._update_lag_health_check())
         checks.append(self._update_extraction_health_check())
         checks.append(self._delivery_errors_health_check())
@@ -2050,9 +2104,58 @@ class TelegramWorker:
             details=details,
         )
 
+    def _webhook_health_check(self) -> HealthCheck:
+        details: dict[str, object] = {
+            "host": self.config.telegram_webhook_host,
+            "port": self.config.telegram_webhook_port,
+            "path": self.config.telegram_webhook_path,
+            "secret_token_configured": self.config.telegram_webhook_secret_token
+            is not None,
+        }
+        if self._last_webhook_success_observed_at is not None:
+            details["last_success_age_seconds"] = max(
+                0, int(_loop_time() - self._last_webhook_success_observed_at)
+            )
+        if self._last_webhook_error is not None:
+            if self._last_webhook_failure_observed_at is not None:
+                details["last_failure_age_seconds"] = max(
+                    0, int(_loop_time() - self._last_webhook_failure_observed_at)
+                )
+            details["error"] = self._last_webhook_error
+            return HealthCheck(
+                code="telegram.webhook",
+                status="error",
+                message="webhook update processing failed",
+                details=details,
+            )
+        if self._last_webhook_success_observed_at is None:
+            return HealthCheck(
+                code="telegram.webhook",
+                status="ok",
+                message="webhook receiver configured; no updates observed yet",
+                details=details,
+            )
+        return HealthCheck(
+            code="telegram.webhook",
+            status="ok",
+            message="webhook updates accepted",
+            details=details,
+        )
+
     def _update_lag_health_check(self) -> HealthCheck:
-        details: dict[str, object] = {"offset": self.offset}
-        if self._last_poll_success_observed_at is None:
+        details: dict[str, object] = {
+            "offset": self.offset,
+            "update_mode": self.config.telegram_update_mode,
+        }
+        if self.config.telegram_update_mode == "webhook":
+            if self._last_update_id is None or self._last_update_observed_at is None:
+                return HealthCheck(
+                    code="telegram.update_lag",
+                    status="ok",
+                    message="webhook active; no updates observed yet",
+                    details=details,
+                )
+        elif self._last_poll_success_observed_at is None:
             return HealthCheck(
                 code="telegram.update_lag",
                 status="warning",
@@ -2133,6 +2236,14 @@ class TelegramWorker:
         self._poll_in_flight_started_at = None
         self._last_poll_failure_observed_at = _loop_time()
         self._last_poll_error = f"{type(err).__name__}: {err}"
+
+    def _record_webhook_success(self) -> None:
+        self._last_webhook_success_observed_at = _loop_time()
+        self._last_webhook_error = None
+
+    def _record_webhook_failure(self, err: Exception) -> None:
+        self._last_webhook_failure_observed_at = _loop_time()
+        self._last_webhook_error = f"{type(err).__name__}: {err}"
 
 
 def _classify_send_failure(err: Exception) -> tuple[str, str]:
@@ -2537,6 +2648,7 @@ async def run() -> None:
         stream_wait_ms=config.stream_wait_ms,
     )
     telegram = AiogramTelegramTransport(config.telegram_bot_token)
+    webhook_server: TelegramWebhookServer | None = None
     worker = TelegramWorker(
         config=config,
         lionclaw_api=lionclaw_api,
@@ -2558,8 +2670,17 @@ async def run() -> None:
             await telegram.configure_commands()
         except Exception:
             logger.exception("telegram command menu configuration failed")
-        await worker.run_forever()
+        if config.telegram_update_mode == "webhook":
+            webhook_server = TelegramWebhookServer(
+                config, worker.process_webhook_update
+            )
+            await webhook_server.start()
+            await worker.run_forever(receive_updates=False)
+        else:
+            await worker.run_forever()
     finally:
+        if webhook_server is not None:
+            await webhook_server.close()
         await telegram.close()
         await lionclaw_api.close()
 

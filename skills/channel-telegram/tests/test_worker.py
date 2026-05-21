@@ -53,6 +53,10 @@ from lionclaw_channel_telegram.telegram import (
     _split_telegram_text,
     extract_inbound_event,
 )
+from lionclaw_channel_telegram.webhook import (
+    TELEGRAM_SECRET_TOKEN_HEADER,
+    TelegramWebhookServer,
+)
 from lionclaw_channel_telegram.worker import (
     MAX_OUTBOX_RECEIPTS,
     ActiveTurnStore,
@@ -1402,6 +1406,12 @@ class WorkerConfigTests(unittest.TestCase):
         self.assertEqual(config.stream_wait_ms, 30000)
         self.assertEqual(config.telegram_poll_timeout_secs, 25)
         self.assertEqual(config.telegram_loop_delay_secs, 1.0)
+        self.assertEqual(config.telegram_update_mode, "polling")
+        self.assertEqual(config.telegram_webhook_host, "127.0.0.1")
+        self.assertEqual(config.telegram_webhook_port, 8080)
+        self.assertEqual(config.telegram_webhook_path, "/telegram/webhook")
+        self.assertIsNone(config.telegram_webhook_secret_token)
+        self.assertEqual(config.telegram_webhook_max_body_bytes, 1024 * 1024)
         self.assertEqual(config.health_report_interval_secs, 60.0)
         self.assertEqual(
             config.runtime_dir,
@@ -1422,6 +1432,10 @@ class WorkerConfigTests(unittest.TestCase):
             "LIONCLAW_STREAM_START_MODE": "must not be empty",
             "LIONCLAW_CHANNEL_RUNTIME_DIR": "must not be empty",
             "TELEGRAM_OFFSET_FILE": "must not be empty",
+            "TELEGRAM_UPDATE_MODE": "must not be empty",
+            "TELEGRAM_WEBHOOK_HOST": "must not be empty",
+            "TELEGRAM_WEBHOOK_PATH": "must not be empty",
+            "TELEGRAM_WEBHOOK_SECRET_TOKEN": "must not be empty",
         }
         for env_name, error in cases.items():
             with self.subTest(env_name=env_name):
@@ -1441,6 +1455,9 @@ class WorkerConfigTests(unittest.TestCase):
             ("LIONCLAW_STREAM_WAIT_MS", "-1", "must be >= 0"),
             ("TELEGRAM_POLL_TIMEOUT_SECS", "-1", "must be >= 0"),
             ("TELEGRAM_LOOP_DELAY_SECS", "-0.01", "must be >= 0"),
+            ("TELEGRAM_WEBHOOK_PORT", "-1", "must be >= 0"),
+            ("TELEGRAM_WEBHOOK_PORT", "65536", "must be <= 65535"),
+            ("TELEGRAM_WEBHOOK_MAX_BODY_BYTES", "0", "must be >= 1"),
             ("LIONCLAW_HEALTH_REPORT_INTERVAL_SECS", "-1", "must be >= 0"),
             (
                 "LIONCLAW_STREAM_WAIT_MS_INVALID",
@@ -1495,6 +1512,70 @@ class WorkerConfigTests(unittest.TestCase):
         message = str(raised.exception)
         self.assertIn("LIONCLAW_STREAM_START_MODE", message)
         self.assertIn("resume, tail", message)
+
+    def test_from_env_validates_telegram_update_mode(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_BOT_TOKEN": "token",
+                "TELEGRAM_UPDATE_MODE": "WEBHOOK",
+                "TELEGRAM_WEBHOOK_SECRET_TOKEN": "secret",
+            },
+            clear=True,
+        ):
+            config = WorkerConfig.from_env()
+
+        self.assertEqual(config.telegram_update_mode, "webhook")
+        self.assertEqual(config.telegram_webhook_secret_token, "secret")
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "TELEGRAM_UPDATE_MODE": "side_channel",
+                },
+                clear=True,
+            ),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            WorkerConfig.from_env()
+
+        message = str(raised.exception)
+        self.assertIn("TELEGRAM_UPDATE_MODE", message)
+        self.assertIn("polling, webhook", message)
+
+    def test_from_env_requires_secret_token_for_webhook_mode(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {"TELEGRAM_BOT_TOKEN": "token", "TELEGRAM_UPDATE_MODE": "webhook"},
+                clear=True,
+            ),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            WorkerConfig.from_env()
+
+        self.assertIn("TELEGRAM_WEBHOOK_SECRET_TOKEN", str(raised.exception))
+
+    def test_from_env_validates_webhook_path(self) -> None:
+        cases = (
+            ("telegram/webhook", "must start with /"),
+            ("/telegram hook", "must not contain whitespace"),
+        )
+        for value, error in cases:
+            with self.subTest(value=value):
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"TELEGRAM_BOT_TOKEN": "token", "TELEGRAM_WEBHOOK_PATH": value},
+                        clear=True,
+                    ),
+                    self.assertRaises(RuntimeError) as raised,
+                ):
+                    WorkerConfig.from_env()
+                self.assertIn("TELEGRAM_WEBHOOK_PATH", str(raised.exception))
+                self.assertIn(error, str(raised.exception))
 
 
 class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
@@ -1798,6 +1879,85 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api.sent_inbound[0].attachments), 2)
         self.assertEqual(len(api.staged_attachments), 2)
         self.assertEqual(len(api.finalized), 1)
+
+    async def test_process_webhook_update_submits_without_polling_offset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime_dir = Path(temp_dir)
+            offset_path = runtime_dir / "telegram.offset"
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(runtime_dir),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(offset_path),
+            )
+            update = Update.model_validate(
+                {
+                    "update_id": 87,
+                    "message": {
+                        "message_id": 17,
+                        "date": 0,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "from webhook",
+                    },
+                }
+            )
+
+            processed = await worker.process_webhook_update(update)
+            offset_exists = offset_path.exists()
+
+        self.assertTrue(processed)
+        self.assertEqual([update.text for update in api.sent_inbound], ["from webhook"])
+        self.assertEqual(worker.offset, 0)
+        self.assertFalse(offset_exists)
+
+    async def test_process_webhook_update_reports_processing_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(inbound_outcome="not-a-real-outcome")
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=api,
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            update = Update.model_validate(
+                {
+                    "update_id": 88,
+                    "message": {
+                        "message_id": 18,
+                        "date": 0,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "will fail",
+                    },
+                }
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                processed = await worker.process_webhook_update(update)
+            checks = await worker._health_checks()
+
+        self.assertFalse(processed)
+        webhook = {check.code: check for check in checks}["telegram.webhook"]
+        self.assertEqual(webhook.status, "error")
 
     async def test_offset_save_failure_keeps_unpersisted_update_retryable(
         self,
@@ -5959,6 +6119,118 @@ class AiogramTelegramTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.reactions[0]["reaction"][0].emoji, "👍")
 
 
+class TelegramWebhookServerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_webhook_rejects_missing_secret_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            handled: list[Update] = []
+
+            async def handle(update: Update) -> bool:
+                handled.append(update)
+                return True
+
+            server = TelegramWebhookServer(
+                replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_port=0,
+                    telegram_webhook_path="/hook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                handle,
+            )
+            await server.start()
+            try:
+                response = await _post_webhook_update(server, headers={})
+            finally:
+                await server.close()
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(handled, [])
+
+    async def test_webhook_accepts_valid_secret_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            handled: list[Update] = []
+
+            async def handle(update: Update) -> bool:
+                handled.append(update)
+                return True
+
+            server = TelegramWebhookServer(
+                replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_port=0,
+                    telegram_webhook_path="/hook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                handle,
+            )
+            await server.start()
+            try:
+                response = await _post_webhook_update(
+                    server,
+                    headers={TELEGRAM_SECRET_TOKEN_HEADER: "secret"},
+                )
+            finally:
+                await server.close()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ok": True})
+        self.assertEqual([update.update_id for update in handled], [91])
+
+    async def test_webhook_returns_retryable_status_for_processing_failure(
+        self,
+    ) -> None:
+        for failure in (False, RuntimeError("handler failed")):
+            with self.subTest(failure=type(failure).__name__):
+                response = await self._post_with_handler_result(failure)
+
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.json()["error"], "temporary_failure")
+
+    async def _post_with_handler_result(
+        self,
+        failure: bool | Exception,
+    ) -> httpx.Response:
+        with tempfile.TemporaryDirectory() as temp_dir:
+
+            async def handle(update: Update) -> bool:
+                _ = update
+                if isinstance(failure, Exception):
+                    raise failure
+                return failure
+
+            server = TelegramWebhookServer(
+                replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_port=0,
+                    telegram_webhook_path="/hook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                handle,
+            )
+            await server.start()
+            try:
+                if isinstance(failure, Exception):
+                    with self.assertLogs(
+                        "lionclaw_channel_telegram.webhook",
+                        level="ERROR",
+                    ):
+                        response = await _post_webhook_update(
+                            server,
+                            headers={TELEGRAM_SECRET_TOKEN_HEADER: "secret"},
+                        )
+                else:
+                    response = await _post_webhook_update(
+                        server,
+                        headers={TELEGRAM_SECRET_TOKEN_HEADER: "secret"},
+                    )
+            finally:
+                await server.close()
+        return response
+
+
 def build_api(client: httpx.AsyncClient) -> LionClawApi:
     return LionClawApi(
         base_url="http://127.0.0.1:8979",
@@ -5982,10 +6254,43 @@ def build_config(runtime_dir: Path) -> WorkerConfig:
         consumer_id="telegram:telegram",
         telegram_poll_timeout_secs=25,
         telegram_loop_delay_secs=0.0,
+        telegram_update_mode="polling",
+        telegram_webhook_host="127.0.0.1",
+        telegram_webhook_port=8080,
+        telegram_webhook_path="/telegram/webhook",
+        telegram_webhook_secret_token=None,
+        telegram_webhook_max_body_bytes=1024 * 1024,
         health_report_interval_secs=60.0,
         runtime_dir=runtime_dir,
         telegram_offset_file=runtime_dir / "telegram.offset",
     )
+
+
+async def _post_webhook_update(
+    server: TelegramWebhookServer,
+    *,
+    headers: dict[str, str],
+) -> httpx.Response:
+    assert server.bound_port is not None
+    async with httpx.AsyncClient() as client:
+        return await client.post(
+            f"http://127.0.0.1:{server.bound_port}/hook",
+            headers=headers,
+            json={
+                "update_id": 91,
+                "message": {
+                    "message_id": 19,
+                    "date": 0,
+                    "chat": {"id": 77, "type": "private"},
+                    "from": {
+                        "id": 77,
+                        "is_bot": False,
+                        "first_name": "Alice",
+                    },
+                    "text": "webhook hello",
+                },
+            },
+        )
 
 
 _USE_EXPECTED_TURN_ID = object()

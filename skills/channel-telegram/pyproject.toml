@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Telegram channel skill for LionClaw"
 requires-python = ">=3.12"
 dependencies = [
+  "aiohttp==3.10.11",
   "aiogram==3.15.0",
   "httpx==0.28.1",
 ]
