@@ -18,9 +18,10 @@ use lionclaw::{
     kernel::{
         runtime::{
             EffectiveExecutionPlan, EscapeClass, ExecutionPreset, NetworkMode, RuntimeAdapter,
-            RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeEvent, RuntimeEventSender,
-            RuntimeProgramTurnExecution, RuntimeSessionHandle, RuntimeSessionStartInput,
-            RuntimeTurnInput, RuntimeTurnMode, RuntimeTurnResult, WorkspaceAccess,
+            RuntimeAdapterInfo, RuntimeCapabilityResult, RuntimeControlExecution,
+            RuntimeControlOutcome, RuntimeEvent, RuntimeEventSender, RuntimeProgramTurnExecution,
+            RuntimeSessionHandle, RuntimeSessionStartInput, RuntimeTurnInput, RuntimeTurnMode,
+            RuntimeTurnResult, WorkspaceAccess,
         },
         Kernel, KernelOptions,
     },
@@ -115,6 +116,42 @@ async fn direct_runtime_with_channel_send_escape_does_not_start_bridge() {
         observed,
         vec![false],
         "direct runtimes must not start the program-backed channel.send bridge"
+    );
+}
+
+#[tokio::test]
+async fn runtime_control_with_channel_send_escape_gets_no_socket_env() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-control").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    kernel
+        .register_runtime_adapter(
+            "channel-send-runtime",
+            Arc::new(ChannelSendProbeRuntime::record_environment(
+                observed.clone(),
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-control").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "/probe-control".to_string(),
+            runtime_id: Some("channel-send-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("runtime control should complete");
+
+    let environments = observed.lock().expect("observed env lock");
+    assert_eq!(environments.len(), 1);
+    assert!(
+        env_value(&environments[0], CHANNEL_SEND_SOCKET_ENV).is_none(),
+        "runtime controls must not receive the program-backed channel.send bridge"
     );
 }
 
@@ -862,6 +899,17 @@ impl RuntimeAdapter for ChannelSendProbeRuntime {
         run_probe_action(&self.action, &execution.plan).await?;
         drop(events.send(RuntimeEvent::Done));
         Ok(RuntimeTurnResult::default())
+    }
+
+    async fn runtime_control(
+        &self,
+        execution: RuntimeControlExecution,
+        _events: RuntimeEventSender,
+    ) -> Result<RuntimeControlOutcome> {
+        run_probe_action(&self.action, &execution.plan).await?;
+        Ok(RuntimeControlOutcome::Handled {
+            message: "control handled".to_string(),
+        })
     }
 
     async fn resolve_capability_requests(

@@ -13672,24 +13672,6 @@ impl Kernel {
                 error_text: err.to_string(),
             })?;
 
-        let mut execution_plan = execution_plan;
-        let runtime_turn_mode = adapter.turn_mode();
-        let _channel_send_bridge = self
-            .maybe_start_runtime_channel_send_bridge(
-                session_id,
-                turn_id,
-                runtime_id,
-                runtime_turn_mode,
-                &mut execution_plan,
-            )
-            .await
-            .map_err(|err| FailedRuntimeTurn {
-                events: Vec::new(),
-                status: SessionTurnStatus::Failed,
-                error_code: "runtime.error".to_string(),
-                error_text: err.to_string(),
-            })?;
-
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let adapter_for_task = Arc::clone(&adapter);
         let runtime_secrets_mount = self

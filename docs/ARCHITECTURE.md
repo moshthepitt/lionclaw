@@ -212,7 +212,8 @@ kernel exposes `LIONCLAW_CHANNEL_SEND_SOCKET` and mounts a LionClaw-owned socket
 at `/runtime/lionclaw/channel-send.sock`. Without that escape class, the
 environment variable and usable socket are absent. The bridge is valid only
 while the runtime turn is active; turn completion or timeout removes the socket
-and invalidates open connections.
+and invalidates open connections. Native runtime controls do not receive this
+bridge.
 
 The protocol is one request per connection: write one newline-delimited JSON
 object, read one newline-delimited JSON object, then close. The request names a
