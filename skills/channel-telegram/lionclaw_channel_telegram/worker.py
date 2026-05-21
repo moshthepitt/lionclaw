@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 
 from aiogram.exceptions import (
@@ -142,6 +143,12 @@ class PendingProgressDelete:
             "message_ref": self.message_ref,
             "attempts": self.attempts,
         }
+
+
+class ProgressRenderResult(Enum):
+    RENDERED = "rendered"
+    RETRYABLE_FAILED = "retryable_failed"
+    TERMINAL_FAILED = "terminal_failed"
 
 
 @dataclass(slots=True, frozen=True)
@@ -809,8 +816,6 @@ class TelegramWorker:
         thread_ref: str | None,
     ) -> ActiveTurn | None:
         turn_id = self._route_turns.get((conversation_ref, thread_ref))
-        if turn_id is None and thread_ref is not None:
-            turn_id = self._route_turns.get((conversation_ref, None))
         if turn_id is None:
             return None
         active = self._active_turns.get(turn_id)
@@ -1070,9 +1075,9 @@ class TelegramWorker:
         turn: ActiveTurn,
         *,
         force: bool = False,
-    ) -> None:
+    ) -> ProgressRenderResult:
         if not self._is_current_generation(turn):
-            return
+            return ProgressRenderResult.TERMINAL_FAILED
         text = _progress_text(turn)
         if turn.provisional_message_ref is None:
             try:
@@ -1082,17 +1087,24 @@ class TelegramWorker:
                     reply_to_ref=turn.reply_to_ref,
                     thread_ref=turn.target.thread_ref,
                 )
-            except Exception:
+            except Exception as err:
                 logger.exception(
                     "telegram progress message send failed for turn_id=%s",
                     turn.turn_id,
                 )
-                return
+                if _is_permanent_send_failure(err):
+                    return ProgressRenderResult.TERMINAL_FAILED
+                return ProgressRenderResult.RETRYABLE_FAILED
             turn.provisional_message_ref = _receipt_message_ref(receipt)
             turn.last_rendered_text = text
             turn.last_edit_at = _loop_time()
-            return
-        await self._edit_progress_message(turn, text, force=force)
+            return ProgressRenderResult.RENDERED
+        edited = await self._edit_progress_message(turn, text, force=force)
+        if edited:
+            return ProgressRenderResult.RENDERED
+        if turn.can_edit:
+            return ProgressRenderResult.RETRYABLE_FAILED
+        return ProgressRenderResult.TERMINAL_FAILED
 
     async def _edit_progress_message(
         self,
@@ -1228,26 +1240,20 @@ class TelegramWorker:
 
     async def _terminalize_progress_turn(self, turn: ActiveTurn, text: str) -> None:
         turn.terminal_text = text
-        await self._ensure_progress_message(turn, force=True)
-        if turn.provisional_message_ref is None:
+        turn.visible_after = min(turn.visible_after, _loop_time())
+        render_result = await self._ensure_progress_message(turn, force=True)
+        if render_result == ProgressRenderResult.RENDERED:
             turn.terminal = True
             self._forget_turn(turn)
             return
-        edited = await self._edit_progress_message(turn, text, force=True)
-        if edited:
-            turn.terminal = True
-            self._forget_turn(turn)
+        if render_result == ProgressRenderResult.RETRYABLE_FAILED:
             return
-        if (
-            not edited
-            and not turn.can_edit
-            and turn.provisional_message_ref is not None
-        ):
+        if turn.provisional_message_ref is not None:
             fallback_sent = await self._send_progress_fallback(turn, text)
             if fallback_sent:
                 await self._delete_progress_message(turn)
-            turn.terminal = True
-            self._forget_turn(turn)
+        turn.terminal = True
+        self._forget_turn(turn)
 
     async def _send_progress_fallback(self, turn: ActiveTurn, text: str) -> bool:
         try:
@@ -1782,6 +1788,11 @@ def _delivery_failure_progress_text(error_code: str) -> str:
     if error_code == "telegram.send_rejected":
         return "Delivery failed: Telegram rejected the message."
     return "Delivery failed."
+
+
+def _is_permanent_send_failure(err: Exception) -> bool:
+    outcome, _ = _classify_send_failure(err)
+    return outcome == "terminal_failed"
 
 
 def _telegram_command(update: TelegramInboundUpdate) -> TelegramCommand | None:
