@@ -106,7 +106,7 @@ class TelegramWebhookServer:
 
     def _secret_token_matches(self, request: web.Request) -> bool:
         expected = self._config.telegram_webhook_secret_token
-        actual = request.headers.get(TELEGRAM_SECRET_TOKEN_HEADER)
+        actual = _single_header_value(request.headers, TELEGRAM_SECRET_TOKEN_HEADER)
         if expected is None or actual is None:
             return False
         try:
@@ -124,3 +124,21 @@ class TelegramWebhookServer:
         host, port, *_ = sockets[0].getsockname()
         self.bound_host = str(host)
         self.bound_port = int(port)
+
+
+def _single_header_value(headers: object, name: str) -> str | None:
+    getall = getattr(headers, "getall", None)
+    if callable(getall):
+        raw_values = getall(name, [])
+        if raw_values is None:
+            return None
+        values = list(raw_values)
+        if len(values) != 1:
+            return None
+        value = values[0]
+    else:
+        get = getattr(headers, "get", None)
+        if not callable(get):
+            return None
+        value = get(name)
+    return value if isinstance(value, str) else None

@@ -1122,7 +1122,7 @@ class TelegramWorker:
             thread_ref,
             session_key,
         )
-        return hmac.compare_digest(parsed.mac, expected)
+        return _constant_time_ascii_equals(parsed.mac, expected)
 
     async def _answer_callback(
         self,
@@ -2728,6 +2728,15 @@ def _callback_mac(
     ).encode("utf-8")
     digest = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).digest()
     return base64.urlsafe_b64encode(digest[:6]).decode("ascii").rstrip("=")
+
+
+def _constant_time_ascii_equals(actual: str, expected: str) -> bool:
+    try:
+        actual_bytes = actual.encode("ascii")
+        expected_bytes = expected.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    return hmac.compare_digest(actual_bytes, expected_bytes)
 
 
 def _callback_update(

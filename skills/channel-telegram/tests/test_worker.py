@@ -3511,6 +3511,55 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             ("callback-retry-bob", "That control is no longer valid."),
         )
 
+    async def test_malformed_callback_mac_is_rejected_without_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 927,
+                            "callback_query": {
+                                "id": "callback-bad-mac",
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "chat_instance": "chat-instance",
+                                "data": "lc1:r:_:secrét",
+                                "message": {
+                                    "message_id": 102,
+                                    "date": 0,
+                                    "chat": {"id": 77, "type": "private"},
+                                    "from": {
+                                        "id": 99,
+                                        "is_bot": True,
+                                        "first_name": "LionClaw",
+                                        "username": "lionclaw_bot",
+                                    },
+                                    "text": "LionClaw controls",
+                                },
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertEqual(
+            telegram.answered_callbacks[-1],
+            ("callback-bad-mac", "That control is no longer valid."),
+        )
+
     async def test_route_callback_works_while_route_has_active_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
@@ -8071,6 +8120,42 @@ class TelegramWebhookServerTests(unittest.IsolatedAsyncioTestCase):
                 "Request",
                 (),
                 {"headers": {TELEGRAM_SECRET_TOKEN_HEADER: "secrét"}},
+            )()
+
+            self.assertFalse(server._secret_token_matches(request))
+
+    async def test_webhook_rejects_duplicate_secret_token_headers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+
+            async def handle(update: Update) -> bool:
+                _ = update
+                return True
+
+            class DuplicateSecretHeaders:
+                def get(self, name: str, default: object = None) -> object:
+                    if name == TELEGRAM_SECRET_TOKEN_HEADER:
+                        return "secret"
+                    return default
+
+                def getall(self, name: str, default: object = None) -> object:
+                    if name == TELEGRAM_SECRET_TOKEN_HEADER:
+                        return ["secret", "secret"]
+                    return default
+
+            server = TelegramWebhookServer(
+                replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_port=0,
+                    telegram_webhook_path="/hook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                handle,
+            )
+            request = type(
+                "Request",
+                (),
+                {"headers": DuplicateSecretHeaders()},
             )()
 
             self.assertFalse(server._secret_token_matches(request))
