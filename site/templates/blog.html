@@ -18,7 +18,7 @@
       {% if post.date %}
       <time datetime="{{ post.date }}">{{ post.date | date(format="%Y-%m-%d") }}</time>
       {% endif %}
-      <a href="{{ post.path }}">{{ post.title }}</a>
+      <a href="{{ post.permalink | safe }}">{{ post.title }}</a>
     </li>
     {% endfor %}
   </ol>
