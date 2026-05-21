@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="LionClaw">
+  <rect width="64" height="64" fill="#070806"/>
+  <rect x="7.5" y="7.5" width="49" height="49" fill="#0b0d09" stroke="#d89135" stroke-width="3"/>
+  <path d="M16 45V19h6v20h13v6H16Z" fill="#f1eadc"/>
+  <path d="M43 46c-7.9 0-13.5-5.7-13.5-13.8C29.5 24 35.1 18 43 18c3.4 0 6.5 1.1 9 3.1l-3.2 4.9c-1.6-1.1-3.3-1.7-5.3-1.7-4.5 0-7.5 3.1-7.5 7.8 0 4.8 3 7.7 7.7 7.7 2 0 3.8-.6 5.5-1.8l3 5c-2.5 2-5.7 3-9.2 3Z" fill="#d89135"/>
+</svg>
