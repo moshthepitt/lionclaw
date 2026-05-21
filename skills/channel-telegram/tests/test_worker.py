@@ -35,6 +35,7 @@ from lionclaw_channel_telegram.config import WorkerConfig
 from lionclaw_channel_telegram.telegram import (
     TELEGRAM_TEXT_LIMIT,
     AiogramTelegramTransport,
+    TelegramActionButton,
     TelegramBotIdentity,
     TelegramDownloadedAttachment,
     TelegramInboundAttachment,
@@ -4794,6 +4795,45 @@ class AiogramTelegramTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.sent_messages, [])
         self.assertEqual(bot.sent_documents, [])
 
+    async def test_send_message_attaches_inline_buttons_to_first_message(self) -> None:
+        bot = RecordingAiogramBot()
+        transport = object.__new__(AiogramTelegramTransport)
+        transport._bot = bot
+        transport._bot_identity = None
+
+        await transport.send_message(
+            "telegram:chat:77",
+            "Working...",
+            buttons=[
+                TelegramActionButton("Stop", "lc:v1:stop:turn-1"),
+                TelegramActionButton("Status", "lc:v1:status:turn-1"),
+            ],
+        )
+
+        markup = bot.sent_messages[0]["reply_markup"]
+        self.assertEqual(len(markup.inline_keyboard), 1)
+        self.assertEqual(markup.inline_keyboard[0][0].text, "Stop")
+        self.assertEqual(
+            markup.inline_keyboard[0][0].callback_data,
+            "lc:v1:stop:turn-1",
+        )
+        self.assertEqual(markup.inline_keyboard[0][1].text, "Status")
+
+    async def test_invalid_inline_button_action_is_rejected_before_send(self) -> None:
+        bot = RecordingAiogramBot()
+        transport = object.__new__(AiogramTelegramTransport)
+        transport._bot = bot
+        transport._bot_identity = None
+
+        with self.assertRaisesRegex(TelegramReferenceError, "64 bytes"):
+            await transport.send_message(
+                "telegram:chat:77",
+                "Working...",
+                buttons=[TelegramActionButton("Stop", "x" * 65)],
+            )
+
+        self.assertEqual(bot.sent_messages, [])
+
     async def test_markdown_attachment_text_uses_message_when_html_caption_too_long(
         self,
     ) -> None:
@@ -4843,6 +4883,69 @@ class AiogramTelegramTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.photo_attempts, [])
         self.assertEqual(len(bot.sent_documents), 1)
         self.assertEqual(bot.sent_documents[0]["chat_id"], 77)
+
+    async def test_compatible_attachments_are_sent_as_native_album(self) -> None:
+        bot = RecordingAiogramBot()
+        transport = object.__new__(AiogramTelegramTransport)
+        transport._bot = bot
+        transport._bot_identity = None
+
+        receipt = await transport.send_message(
+            "telegram:chat:77",
+            "album caption",
+            attachments=[
+                TelegramOutboundAttachment(
+                    path="/tmp/a.png",
+                    filename="a.png",
+                    mime_type="image/png",
+                ),
+                TelegramOutboundAttachment(
+                    path="/tmp/b.mp4",
+                    filename="b.mp4",
+                    mime_type="video/mp4",
+                ),
+            ],
+        )
+
+        self.assertEqual(len(bot.sent_media_groups), 1)
+        media = bot.sent_media_groups[0]["media"]
+        self.assertEqual(
+            [item.__class__.__name__ for item in media],
+            ["InputMediaPhoto", "InputMediaVideo"],
+        )
+        self.assertEqual(media[0].caption, "album caption")
+        self.assertEqual(bot.sent_photos, [])
+        self.assertEqual(bot.sent_videos, [])
+        self.assertEqual(receipt["message_id"], 102)
+        self.assertEqual(len(receipt["messages"]), 2)
+
+    async def test_buttons_force_serial_attachment_send_instead_of_album(self) -> None:
+        bot = RecordingAiogramBot()
+        transport = object.__new__(AiogramTelegramTransport)
+        transport._bot = bot
+        transport._bot_identity = None
+
+        await transport.send_message(
+            "telegram:chat:77",
+            "album caption",
+            buttons=[TelegramActionButton("Stop", "lc:v1:stop:turn-1")],
+            attachments=[
+                TelegramOutboundAttachment(
+                    path="/tmp/a.png",
+                    filename="a.png",
+                    mime_type="image/png",
+                ),
+                TelegramOutboundAttachment(
+                    path="/tmp/b.png",
+                    filename="b.png",
+                    mime_type="image/png",
+                ),
+            ],
+        )
+
+        self.assertEqual(bot.sent_media_groups, [])
+        self.assertEqual(len(bot.sent_photos), 2)
+        self.assertIsNotNone(bot.sent_photos[0]["reply_markup"])
 
     async def test_resume_receipt_skips_already_sent_text_chunks(self) -> None:
         bot = RecordingAiogramBot()
@@ -4980,6 +5083,23 @@ class AiogramTelegramTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.sent_photos, [])
         self.assertEqual(len(bot.sent_documents), 1)
         self.assertEqual(bot.sent_documents[0]["caption"], "diagram")
+
+    async def test_callback_answer_and_reaction_use_telegram_methods(self) -> None:
+        bot = RecordingAiogramBot()
+        transport = object.__new__(AiogramTelegramTransport)
+        transport._bot = bot
+        transport._bot_identity = None
+
+        await transport.answer_callback("callback-1", "Stopping")
+        await transport.set_reaction("telegram:chat:77", "telegram:message:44", "👍")
+
+        self.assertEqual(
+            bot.answered_callbacks,
+            [{"callback_query_id": "callback-1", "text": "Stopping"}],
+        )
+        self.assertEqual(bot.reactions[0]["chat_id"], 77)
+        self.assertEqual(bot.reactions[0]["message_id"], 44)
+        self.assertEqual(bot.reactions[0]["reaction"][0].emoji, "👍")
 
 
 def build_api(client: httpx.AsyncClient) -> LionClawApi:
@@ -5212,7 +5332,10 @@ class RecordingAiogramBot:
         self.sent_audios: list[dict[str, object]] = []
         self.sent_voices: list[dict[str, object]] = []
         self.sent_documents: list[dict[str, object]] = []
+        self.sent_media_groups: list[dict[str, object]] = []
         self.sent_chat_actions: list[dict[str, object]] = []
+        self.answered_callbacks: list[dict[str, object]] = []
+        self.reactions: list[dict[str, object]] = []
         self.send_photo_error = send_photo_error
         self.send_message_errors = list(send_message_errors or [])
 
@@ -5274,6 +5397,24 @@ class RecordingAiogramBot:
     ) -> RecordingAiogramMessage:
         self.sent_documents.append({**params, "document": document})
         return self._message_for(params["chat_id"])
+
+    async def send_media_group(
+        self,
+        *,
+        media,
+        **params,
+    ) -> list[RecordingAiogramMessage]:
+        self.sent_media_groups.append({**params, "media": media})
+        return [self._message_for(params["chat_id"]) for _ in media]
+
+    async def edit_message_text(self, **params) -> None:
+        self.sent_messages.append(dict(params))
+
+    async def answer_callback_query(self, **params) -> None:
+        self.answered_callbacks.append(dict(params))
+
+    async def set_message_reaction(self, **params) -> None:
+        self.reactions.append(dict(params))
 
     def _message_for(self, chat_id: int | str) -> RecordingAiogramMessage:
         self._next_message_id += 1

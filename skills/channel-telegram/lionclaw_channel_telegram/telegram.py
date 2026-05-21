@@ -14,10 +14,15 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     BotCommand,
     FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
     LinkPreviewOptions,
     Message,
     MessageEntity,
     PhotoSize,
+    ReactionTypeEmoji,
     ReplyParameters,
     Update,
 )
@@ -126,6 +131,12 @@ class TelegramOutboundAttachment:
 
 
 @dataclass(slots=True, frozen=True)
+class TelegramActionButton:
+    text: str
+    action: str
+
+
+@dataclass(slots=True, frozen=True)
 class TelegramTextChunk:
     plain_text: str
     html_text: str | None = None
@@ -158,6 +169,7 @@ class TelegramTransport(Protocol):
         format_hint: str = "plain",
         attachments: Sequence[TelegramOutboundAttachment] = (),
         resume_receipt: dict[str, Any] | None = None,
+        buttons: Sequence[TelegramActionButton] = (),
     ) -> dict[str, Any]: ...
 
     async def send_typing(
@@ -173,12 +185,26 @@ class TelegramTransport(Protocol):
         text: str,
         *,
         format_hint: str = "plain",
+        buttons: Sequence[TelegramActionButton] = (),
     ) -> None: ...
 
     async def delete_message(
         self,
         conversation_ref: str,
         message_ref: str,
+    ) -> None: ...
+
+    async def answer_callback(
+        self,
+        callback_query_id: str,
+        text: str | None = None,
+    ) -> None: ...
+
+    async def set_reaction(
+        self,
+        conversation_ref: str,
+        message_ref: str,
+        emoji: str,
     ) -> None: ...
 
 
@@ -207,6 +233,7 @@ class AiogramTelegramTransport:
                 "edited_message",
                 "channel_post",
                 "edited_channel_post",
+                "callback_query",
             ],
         )
 
@@ -261,10 +288,12 @@ class AiogramTelegramTransport:
         format_hint: str = "plain",
         attachments: Sequence[TelegramOutboundAttachment] = (),
         resume_receipt: dict[str, Any] | None = None,
+        buttons: Sequence[TelegramActionButton] = (),
     ) -> dict[str, Any]:
         chat_id = _coerce_chat_id(conversation_ref)
         reply_parameters = _reply_parameters(reply_to_ref)
         message_thread_id = _coerce_thread_id(thread_ref, omit_general=True)
+        reply_markup = _inline_keyboard(buttons)
         sent_messages = _receipt_messages(resume_receipt, chat_id=chat_id)
         resume_count = len(sent_messages)
         if sent_messages:
@@ -278,6 +307,22 @@ class AiogramTelegramTransport:
         ):
             caption_chunk = text_chunks[0]
             text_chunks = []
+        if (
+            not resume_receipt
+            and not text_chunks
+            and not buttons
+            and _can_send_native_album(attachments)
+        ):
+            messages = await self._send_media_group(
+                chat_id=chat_id,
+                attachments=attachments,
+                reply_parameters=reply_parameters,
+                message_thread_id=message_thread_id,
+                caption=caption_chunk,
+            )
+            return _receipt_from_messages(
+                [_message_receipt(message) for message in messages]
+            )
         operation_count = len(text_chunks) + len(attachments)
         if operation_count == 0:
             operation_count = 1
@@ -297,6 +342,7 @@ class AiogramTelegramTransport:
                     chunk=chunk,
                     reply_parameters=reply_parameters,
                     message_thread_id=message_thread_id,
+                    reply_markup=reply_markup if operation_index == 0 else None,
                 )
                 sent_messages.append(_message_receipt(message))
                 reply_parameters = _reply_parameters(str(message.message_id))
@@ -312,6 +358,7 @@ class AiogramTelegramTransport:
                     reply_parameters=reply_parameters,
                     message_thread_id=message_thread_id,
                     caption=caption_chunk if index == 0 else None,
+                    reply_markup=reply_markup if operation_index == 0 else None,
                 )
                 sent_messages.append(_message_receipt(message))
                 reply_parameters = _reply_parameters(str(message.message_id))
@@ -323,6 +370,7 @@ class AiogramTelegramTransport:
                     text=" ",
                     reply_parameters=reply_parameters,
                     message_thread_id=message_thread_id,
+                    reply_markup=reply_markup,
                 )
                 sent_messages.append(_message_receipt(message))
         except Exception as err:
@@ -342,12 +390,14 @@ class AiogramTelegramTransport:
         chunk: TelegramTextChunk,
         reply_parameters: ReplyParameters | None,
         message_thread_id: int | None,
+        reply_markup: InlineKeyboardMarkup | None,
     ) -> Message:
         params: dict[str, Any] = {
             "chat_id": chat_id,
             "reply_parameters": reply_parameters,
             "message_thread_id": message_thread_id,
             "link_preview_options": LinkPreviewOptions(is_disabled=True),
+            "reply_markup": reply_markup,
         }
         if chunk.html_text is not None:
             try:
@@ -369,6 +419,7 @@ class AiogramTelegramTransport:
         reply_parameters: ReplyParameters | None,
         message_thread_id: int | None,
         caption: TelegramTextChunk | None = None,
+        reply_markup: InlineKeyboardMarkup | None = None,
     ) -> Message:
         path = Path(attachment.path)
         file = FSInputFile(path, filename=attachment.filename or path.name)
@@ -376,6 +427,7 @@ class AiogramTelegramTransport:
             "chat_id": chat_id,
             "reply_parameters": reply_parameters,
             "message_thread_id": message_thread_id,
+            "reply_markup": reply_markup,
         }
         mime_type = attachment.mime_type or ""
         await self._send_upload_action(chat_id, mime_type, message_thread_id)
@@ -398,6 +450,35 @@ class AiogramTelegramTransport:
             params = {**common, "caption": caption.plain_text}
         return await self._send_attachment_once(
             file=file, mime_type=mime_type, params=params
+        )
+
+    async def _send_media_group(
+        self,
+        *,
+        chat_id: int | str,
+        attachments: Sequence[TelegramOutboundAttachment],
+        reply_parameters: ReplyParameters | None,
+        message_thread_id: int | None,
+        caption: TelegramTextChunk | None = None,
+    ) -> list[Message]:
+        dominant_mime_type = attachments[0].mime_type or ""
+        await self._send_upload_action(chat_id, dominant_mime_type, message_thread_id)
+        html_caption = caption is not None and caption.html_text is not None
+        try:
+            return await self._bot.send_media_group(
+                chat_id=chat_id,
+                media=_album_media(attachments, caption=caption, use_html=True),
+                reply_parameters=reply_parameters,
+                message_thread_id=message_thread_id,
+            )
+        except TelegramBadRequest as err:
+            if not html_caption or not _is_parse_error(err):
+                raise
+        return await self._bot.send_media_group(
+            chat_id=chat_id,
+            media=_album_media(attachments, caption=caption, use_html=False),
+            reply_parameters=reply_parameters,
+            message_thread_id=message_thread_id,
         )
 
     async def _send_attachment_once(
@@ -453,6 +534,7 @@ class AiogramTelegramTransport:
         text: str,
         *,
         format_hint: str = "plain",
+        buttons: Sequence[TelegramActionButton] = (),
     ) -> None:
         chat_id = _coerce_chat_id(conversation_ref)
         message_id = _coerce_message_id(message_ref)
@@ -466,6 +548,7 @@ class AiogramTelegramTransport:
             "chat_id": chat_id,
             "message_id": message_id,
             "link_preview_options": LinkPreviewOptions(is_disabled=True),
+            "reply_markup": _inline_keyboard(buttons),
         }
         if chunk.html_text is not None:
             try:
@@ -493,6 +576,33 @@ class AiogramTelegramTransport:
         await self._bot.delete_message(
             chat_id=_coerce_chat_id(conversation_ref),
             message_id=message_id,
+        )
+
+    async def answer_callback(
+        self,
+        callback_query_id: str,
+        text: str | None = None,
+    ) -> None:
+        await self._bot.answer_callback_query(
+            callback_query_id=callback_query_id,
+            text=text,
+        )
+
+    async def set_reaction(
+        self,
+        conversation_ref: str,
+        message_ref: str,
+        emoji: str,
+    ) -> None:
+        message_id = _coerce_message_id(message_ref)
+        if message_id is None:
+            raise TelegramReferenceError(
+                f"invalid telegram message_ref '{message_ref}'"
+            )
+        await self._bot.set_message_reaction(
+            chat_id=_coerce_chat_id(conversation_ref),
+            message_id=message_id,
+            reaction=[ReactionTypeEmoji(emoji=emoji)],
         )
 
 
@@ -565,6 +675,16 @@ def _first_supported_message(update: Update) -> tuple[Message, str, bool] | None
     for candidate, source, edited in candidates:
         if candidate is not None:
             return candidate, source, edited
+    return None
+
+
+def _callback_query_message(update: Update) -> Message | None:
+    callback = update.callback_query
+    if callback is None or not isinstance(callback.data, str):
+        return None
+    message = callback.message
+    if isinstance(message, Message):
+        return message
     return None
 
 
@@ -1128,6 +1248,74 @@ def _attachment(
         size_bytes=size_bytes,
         caption=caption,
     )
+
+
+def _inline_keyboard(
+    buttons: Sequence[TelegramActionButton],
+) -> InlineKeyboardMarkup | None:
+    if not buttons:
+        return None
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for button in buttons:
+        text = button.text.strip()
+        action = button.action.strip()
+        if not text:
+            raise TelegramReferenceError(
+                "telegram inline button text must not be empty"
+            )
+        if not action:
+            raise TelegramReferenceError(
+                "telegram inline button action must not be empty"
+            )
+        if len(action.encode("utf-8")) > 64:
+            raise TelegramReferenceError(
+                "telegram inline button action exceeds 64 bytes"
+            )
+        row.append(InlineKeyboardButton(text=text, callback_data=action))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _can_send_native_album(
+    attachments: Sequence[TelegramOutboundAttachment],
+) -> bool:
+    if not 2 <= len(attachments) <= 10:
+        return False
+    for attachment in attachments:
+        normalized_mime_type = _normalize_mime_type(attachment.mime_type or "")
+        if normalized_mime_type not in PHOTO_MIME_TYPES | VIDEO_MIME_TYPES:
+            return False
+    return True
+
+
+def _album_media(
+    attachments: Sequence[TelegramOutboundAttachment],
+    *,
+    caption: TelegramTextChunk | None,
+    use_html: bool,
+) -> list[InputMediaPhoto | InputMediaVideo]:
+    media: list[InputMediaPhoto | InputMediaVideo] = []
+    for index, attachment in enumerate(attachments):
+        path = Path(attachment.path)
+        file = FSInputFile(path, filename=attachment.filename or path.name)
+        params: dict[str, Any] = {"media": file}
+        if index == 0 and caption is not None:
+            if use_html and caption.html_text is not None:
+                params["caption"] = caption.html_text
+                params["parse_mode"] = "HTML"
+            else:
+                params["caption"] = caption.plain_text
+        normalized_mime_type = _normalize_mime_type(attachment.mime_type or "")
+        if normalized_mime_type in PHOTO_MIME_TYPES:
+            media.append(InputMediaPhoto(**params))
+        else:
+            media.append(InputMediaVideo(**params))
+    return media
 
 
 def _format_telegram_text_chunks(
