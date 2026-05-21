@@ -2277,6 +2277,130 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api.staged_attachments), 2)
         self.assertEqual(len(api.finalized), 1)
 
+    async def test_process_webhook_update_keeps_album_window_after_order_flush(
+        self,
+    ) -> None:
+        class AttachmentAwareApi(FakeLionClawApi):
+            async def send_inbound(
+                self,
+                update: TelegramInboundUpdate,
+            ) -> InboundResponse:
+                self.sent_inbound.append(update)
+                return InboundResponse(
+                    outcome=(
+                        "waiting_for_attachments" if update.attachments else "queued"
+                    ),
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = AttachmentAwareApi()
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=api,
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            text = Update.model_validate(
+                {
+                    "update_id": 8731,
+                    "message": {
+                        "message_id": 1731,
+                        "date": 0,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "before album",
+                    },
+                }
+            )
+            first_album = Update.model_validate(
+                {
+                    "update_id": 8732,
+                    "message": {
+                        "message_id": 1732,
+                        "date": 1,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "media_group_id": "album-after-text",
+                        "caption": "front",
+                        "photo": [
+                            {
+                                "file_id": "photo-file-1",
+                                "file_unique_id": "photo-unique-1",
+                                "width": 100,
+                                "height": 100,
+                                "file_size": 10,
+                            }
+                        ],
+                    },
+                }
+            )
+            second_album = Update.model_validate(
+                {
+                    "update_id": 8733,
+                    "message": {
+                        "message_id": 1733,
+                        "date": 2,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "media_group_id": "album-after-text",
+                        "caption": "back",
+                        "photo": [
+                            {
+                                "file_id": "photo-file-2",
+                                "file_unique_id": "photo-unique-2",
+                                "width": 100,
+                                "height": 100,
+                                "file_size": 10,
+                            }
+                        ],
+                    },
+                }
+            )
+
+            with patch(
+                "lionclaw_channel_telegram.worker.WEBHOOK_COALESCE_DELAY_SECONDS",
+                0.05,
+            ):
+                text_task = asyncio.create_task(worker.process_webhook_update(text))
+                await asyncio.sleep(0)
+                first_album_task = asyncio.create_task(
+                    worker.process_webhook_update(first_album)
+                )
+                await asyncio.sleep(0.01)
+                second_album_task = asyncio.create_task(
+                    worker.process_webhook_update(second_album)
+                )
+                processed = await asyncio.gather(
+                    text_task,
+                    first_album_task,
+                    second_album_task,
+                )
+
+        self.assertEqual(processed, [True, True, True])
+        self.assertEqual(
+            [update.text for update in api.sent_inbound],
+            ["before album", "front\n\nback"],
+        )
+        self.assertEqual(len(api.sent_inbound[1].attachments), 2)
+        self.assertEqual(len(api.staged_attachments), 2)
+        self.assertEqual(len(api.finalized), 1)
+
     async def test_process_webhook_update_keeps_commands_ordered_after_pending_text(
         self,
     ) -> None:
@@ -2562,11 +2686,13 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 older_key,
                 older,
             )
+            self.assertTrue(await older_result)
+            self.assertFalse(newer_result.done())
+            await worker._flush_webhook_batch(newer_key, delay_seconds=0.0)
 
         self.assertTrue(should_schedule_newer)
         self.assertFalse(should_schedule_older)
         self.assertTrue(await newer_result)
-        self.assertTrue(await older_result)
         self.assertEqual(
             [update.text for update in api.sent_inbound],
             ["first", "album"],

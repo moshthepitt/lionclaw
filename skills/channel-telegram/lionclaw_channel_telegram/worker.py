@@ -737,9 +737,23 @@ class TelegramWorker:
             )
             if route_batches == [batch]:
                 return batch.result, should_schedule
-            should_schedule = False
 
-        await self._flush_webhook_batches(route_batches)
+            current_index = next(
+                index
+                for index, route_batch in enumerate(route_batches)
+                if route_batch is batch
+            )
+            if current_index == len(route_batches) - 1:
+                batches_to_flush = route_batches[:current_index]
+                batches_to_reject_on_failure = route_batches[current_index:]
+            else:
+                batches_to_flush = route_batches[: current_index + 1]
+                batches_to_reject_on_failure = route_batches[current_index + 1 :]
+                should_schedule = False
+
+        if not await self._flush_webhook_batches(batches_to_flush):
+            await self._reject_webhook_batches(batches_to_reject_on_failure)
+            should_schedule = False
         return batch.result, should_schedule
 
     async def _flush_webhook_batches_for_event(
