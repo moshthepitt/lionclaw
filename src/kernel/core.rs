@@ -5,7 +5,10 @@ use std::{
     io::ErrorKind,
     path::{Component, Path, PathBuf},
     str::FromStr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime},
 };
 
@@ -17,8 +20,8 @@ use sqlx::{Sqlite, Transaction};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    sync::{oneshot, Mutex, Notify, RwLock},
-    task::JoinHandle,
+    sync::{Mutex, Notify, RwLock},
+    task::{JoinHandle, JoinSet},
     time::{sleep, timeout, Instant},
 };
 use tracing::warn;
@@ -169,6 +172,13 @@ struct RuntimeChannelSendContext {
     turn_id: Uuid,
     runtime_id: String,
     runtime_state_root: PathBuf,
+    active: Arc<AtomicBool>,
+}
+
+impl RuntimeChannelSendContext {
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -224,17 +234,13 @@ impl RuntimeChannelSendProblem {
 
 struct RuntimeChannelSendBridge {
     socket_path: PathBuf,
-    shutdown: Option<oneshot::Sender<()>>,
+    active: Arc<AtomicBool>,
     task: JoinHandle<()>,
 }
 
 impl Drop for RuntimeChannelSendBridge {
     fn drop(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            match shutdown.send(()) {
-                Ok(()) | Err(()) => {}
-            }
-        }
+        self.active.store(false, Ordering::Release);
         self.task.abort();
         if let Err(err) = std::fs::remove_file(&self.socket_path) {
             if err.kind() != ErrorKind::NotFound {
@@ -8297,26 +8303,28 @@ async fn run_runtime_channel_send_bridge(
     kernel: Kernel,
     context: RuntimeChannelSendContext,
     listener: UnixListener,
-    mut shutdown: oneshot::Receiver<()>,
 ) {
+    let mut streams = JoinSet::new();
     loop {
         tokio::select! {
-            _ = &mut shutdown => {
-                return;
-            }
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _)) => {
                         let kernel = kernel.clone();
                         let context = context.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = timeout(
+                        streams.spawn(async move {
+                            match timeout(
                                 Duration::from_secs(5),
                                 handle_runtime_channel_send_stream(kernel, context, stream),
                             )
-                            .await
-                            {
-                                warn!(?err, "runtime channel.send request timed out");
+                            .await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(err)) => {
+                                    warn!(?err, "failed to handle runtime channel.send request");
+                                }
+                                Err(err) => {
+                                    warn!(?err, "runtime channel.send request timed out");
+                                }
                             }
                         });
                     }
@@ -8324,6 +8332,11 @@ async fn run_runtime_channel_send_bridge(
                         warn!(?err, "failed to accept runtime channel.send request");
                         return;
                     }
+                }
+            }
+            completed = streams.join_next(), if !streams.is_empty() => {
+                if let Some(Err(err)) = completed {
+                    warn!(?err, "runtime channel.send request task failed");
                 }
             }
         }
@@ -8598,6 +8611,13 @@ fn runtime_channel_send_kernel_problem(err: KernelError) -> RuntimeChannelSendPr
 
 fn runtime_channel_send_internal_problem(err: anyhow::Error) -> RuntimeChannelSendProblem {
     RuntimeChannelSendProblem::new("internal_error", err.to_string())
+}
+
+fn runtime_channel_send_bridge_closed_problem() -> RuntimeChannelSendProblem {
+    RuntimeChannelSendProblem::new(
+        "bridge_closed",
+        "channel.send bridge is closed for this turn",
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -10573,17 +10593,12 @@ impl Kernel {
         ));
 
         let kernel = self.clone();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let task = tokio::spawn(run_runtime_channel_send_bridge(
-            kernel,
-            context,
-            listener,
-            shutdown_rx,
-        ));
+        let active = Arc::clone(&context.active);
+        let task = tokio::spawn(run_runtime_channel_send_bridge(kernel, context, listener));
 
         Ok(Some(RuntimeChannelSendBridge {
             socket_path,
-            shutdown: Some(shutdown_tx),
+            active,
             task,
         }))
     }
@@ -10613,6 +10628,7 @@ impl Kernel {
                 turn_id,
                 runtime_id: runtime_id.to_string(),
                 runtime_state_root,
+                active: Arc::new(AtomicBool::new(true)),
             },
             plan,
         )
@@ -11319,6 +11335,8 @@ impl Kernel {
                 "conversation_ref is required",
             ));
         }
+        self.require_runtime_channel_send_bridge_open(&context, channel_id, conversation_ref)
+            .await?;
         let thread_ref = request
             .thread_ref
             .as_deref()
@@ -11484,6 +11502,8 @@ impl Kernel {
             format_hint: format_hint.to_string(),
             attachments,
         };
+        self.require_runtime_channel_send_bridge_open(&context, channel_id, conversation_ref)
+            .await?;
         let delivery = self
             .channel_outbox
             .enqueue_delivery_idempotent(NewChannelDelivery {
@@ -11566,6 +11586,21 @@ impl Kernel {
                 ))
             }
         }
+    }
+
+    async fn require_runtime_channel_send_bridge_open(
+        &self,
+        context: &RuntimeChannelSendContext,
+        channel_id: &str,
+        conversation_ref: &str,
+    ) -> Result<(), RuntimeChannelSendProblem> {
+        if context.is_active() {
+            return Ok(());
+        }
+        let problem = runtime_channel_send_bridge_closed_problem();
+        self.audit_runtime_channel_send_denied(context, channel_id, conversation_ref, problem.code)
+            .await;
+        Err(problem)
     }
 
     async fn audit_runtime_channel_send(

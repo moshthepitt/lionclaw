@@ -210,7 +210,9 @@ Program-backed runtimes use a turn-scoped Unix socket for outbound channel
 delivery. When the effective execution preset includes `channel-send`, the
 kernel exposes `LIONCLAW_CHANNEL_SEND_SOCKET` and mounts a LionClaw-owned socket
 at `/runtime/lionclaw/channel-send.sock`. Without that escape class, the
-environment variable and usable socket are absent.
+environment variable and usable socket are absent. The bridge is valid only
+while the runtime turn is active; turn completion or timeout removes the socket
+and invalidates open connections.
 
 The protocol is one request per connection: write one newline-delimited JSON
 object, read one newline-delimited JSON object, then close. The request names a
@@ -218,7 +220,7 @@ configured channel route, provider-neutral content, and an idempotency key.
 Attachment content is not sent over the socket; the request names files under
 `/runtime`, and the kernel reuses the existing runtime-artifact copy and outbox
 attachment path. Attachment paths are interpreted relative to the current
-runtime state root; parent-directory escapes are rejected.
+runtime state root; parent-directory and symlink escapes are rejected.
 
 The bridge is transport only. The kernel validates the current session and turn
 from its own execution context, checks the active channel binding, normalizes

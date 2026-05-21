@@ -417,6 +417,83 @@ async fn channel_send_bridge_socket_is_removed_after_timeout() {
     );
 }
 
+#[tokio::test]
+async fn channel_send_bridge_drops_open_connections_after_turn_completion() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-stale-connection").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    let held_stream = Arc::new(Mutex::new(None));
+    kernel
+        .register_runtime_adapter(
+            "stale-connection-runtime",
+            Arc::new(ChannelSendProbeRuntime::hold_open_connection(
+                held_stream.clone(),
+            )),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-stale-connection").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "open stale channel send connection".to_string(),
+            runtime_id: Some("stale-connection-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let mut stream = held_stream
+        .lock()
+        .expect("held stream lock")
+        .take()
+        .expect("runtime should hold an open socket connection");
+    let request = json!({
+        "idempotency_key": "after-turn-complete",
+        "channel_id": "local-cli",
+        "conversation_ref": "member:reviewer",
+        "content": {
+            "text": "this must not enqueue",
+            "format_hint": "plain"
+        }
+    });
+    let mut line = serde_json::to_vec(&request).expect("serialize request");
+    line.push(b'\n');
+    drop(stream.write_all(&line).await);
+    drop(stream.shutdown().await);
+
+    let mut response = String::new();
+    let mut reader = BufReader::new(stream);
+    if let Ok(Ok(_)) =
+        tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut response)).await
+    {
+        if !response.trim().is_empty() {
+            let response: Value = serde_json::from_str(response.trim()).expect("decode response");
+            assert_eq!(response["ok"].as_bool(), Some(false));
+            assert_eq!(response["error"]["code"].as_str(), Some("bridge_closed"));
+        }
+    }
+    sleep(Duration::from_millis(50)).await;
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "local-cli".to_string(),
+            worker_id: "test-worker".to_string(),
+            conversation_ref: Some("member:reviewer".to_string()),
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: None,
+        })
+        .await
+        .expect("pull outbox");
+    assert!(
+        outbox.deliveries.is_empty(),
+        "channel.send must not enqueue after the turn-scoped bridge is dropped"
+    );
+}
+
 #[derive(Clone)]
 enum RuntimeAction {
     RecordEnvironment {
@@ -431,6 +508,9 @@ enum RuntimeAction {
     Sleep {
         socket_paths: Arc<Mutex<Vec<PathBuf>>>,
         duration: Duration,
+    },
+    HoldOpenConnection {
+        held_stream: Arc<Mutex<Option<UnixStream>>>,
     },
 }
 
@@ -467,6 +547,12 @@ impl ChannelSendProbeRuntime {
                 socket_paths,
                 duration,
             },
+        }
+    }
+
+    fn hold_open_connection(held_stream: Arc<Mutex<Option<UnixStream>>>) -> Self {
+        Self {
+            action: RuntimeAction::HoldOpenConnection { held_stream },
         }
     }
 }
@@ -575,6 +661,16 @@ async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan)
                 .expect("socket paths lock")
                 .push(host_socket);
             sleep(*duration).await;
+            Ok(())
+        }
+        RuntimeAction::HoldOpenConnection { held_stream } => {
+            let socket = env_value(&plan.environment, CHANNEL_SEND_SOCKET_ENV)
+                .context("channel send socket env missing")?;
+            let host_socket = host_path_for_runtime_path(plan, &socket)?;
+            let stream = UnixStream::connect(&host_socket)
+                .await
+                .with_context(|| format!("connect {}", host_socket.display()))?;
+            *held_stream.lock().expect("held stream lock") = Some(stream);
             Ok(())
         }
     }
