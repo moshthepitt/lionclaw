@@ -37,6 +37,7 @@ from lionclaw_channel_telegram.telegram import (
     AiogramTelegramTransport,
     TelegramActionButton,
     TelegramBotIdentity,
+    TelegramCallbackAction,
     TelegramDownloadedAttachment,
     TelegramInboundAttachment,
     TelegramInboundUpdate,
@@ -217,6 +218,48 @@ class ExtractInboundEventTests(unittest.TestCase):
         self.assertEqual(mapped.provider_metadata["command_target"], "other_bot")
         self.assertFalse(mapped.provider_metadata["command_targets_bot"])
         self.assertFalse(mapped.provider_metadata["bot_mentioned"])
+
+    def test_callback_query_maps_to_callback_action(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 132,
+                "callback_query": {
+                    "id": "callback-1",
+                    "from": {"id": 9, "is_bot": False, "first_name": "Nia"},
+                    "chat_instance": "chat-instance",
+                    "data": "lc1:s:turn-1:mac",
+                    "message": {
+                        "message_id": 32,
+                        "date": 0,
+                        "chat": {
+                            "id": -10042,
+                            "type": "supergroup",
+                            "is_forum": True,
+                        },
+                        "message_thread_id": 77,
+                        "is_topic_message": True,
+                        "from": {
+                            "id": 99,
+                            "is_bot": True,
+                            "first_name": "LionClaw",
+                            "username": "lionclaw_bot",
+                        },
+                        "text": "Working...",
+                    },
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramCallbackAction)
+        assert isinstance(mapped, TelegramCallbackAction)
+        self.assertEqual(mapped.callback_query_id, "callback-1")
+        self.assertEqual(mapped.action, "lc1:s:turn-1:mac")
+        self.assertEqual(mapped.sender_ref, "telegram:user:9")
+        self.assertEqual(mapped.conversation_ref, "telegram:chat:-10042")
+        self.assertEqual(mapped.thread_ref, "telegram:topic:77")
+        self.assertEqual(mapped.message_ref, "telegram:message:32")
 
     def test_edited_message_sets_metadata_without_changing_message_ref(self) -> None:
         update = Update.model_validate(
@@ -1712,6 +1755,75 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api.sent_inbound), 1)
         self.assertEqual(api.sent_inbound[0].text, "/lionclaw retry")
 
+    async def test_retry_callback_submits_canonical_lionclaw_control(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 923,
+                            "message": {
+                                "message_id": 23,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/help",
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+            retry_payload = telegram.sent_buttons[0][1].action
+            api.sent_inbound.clear()
+            telegram.updates = [
+                Update.model_validate(
+                    {
+                        "update_id": 924,
+                        "callback_query": {
+                            "id": "callback-retry",
+                            "from": {
+                                "id": 77,
+                                "is_bot": False,
+                                "first_name": "Alice",
+                            },
+                            "chat_instance": "chat-instance",
+                            "data": retry_payload,
+                            "message": {
+                                "message_id": 101,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 99,
+                                    "is_bot": True,
+                                    "first_name": "LionClaw",
+                                    "username": "lionclaw_bot",
+                                },
+                                "text": "LionClaw controls",
+                            },
+                        },
+                    }
+                )
+            ]
+
+            await worker.process_updates()
+
+        self.assertEqual(telegram.answered_callbacks[-1], ("callback-retry", "Queued"))
+        self.assertEqual(len(api.sent_inbound), 1)
+        self.assertEqual(api.sent_inbound[0].text, "/lionclaw retry")
+
     async def test_retry_alias_accepts_newline_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
@@ -2456,6 +2568,206 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(api.sent_inbound), 1)
         self.assertEqual(telegram.sent_messages[-1][1], "Stopping...")
+
+    async def test_progress_message_includes_scoped_stop_callback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(
+                inbound_turn_id="turn-1",
+                inbound_session_id="session-1",
+                inbound_session_key="channel:telegram:direct:77",
+            )
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 944,
+                            "message": {
+                                "message_id": 44,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "long task",
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+            worker._active_turns["turn-1"].visible_after = 0.0
+            await worker.refresh_progress_messages()
+
+        self.assertEqual(
+            [button.text for button in telegram.sent_buttons[-1]], ["Stop", "Status"]
+        )
+        self.assertTrue(telegram.sent_buttons[-1][0].action.startswith("lc1:s:turn-1:"))
+
+    async def test_stop_callback_cancels_active_turn_with_expected_turn_guard(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(
+                inbound_turn_id="turn-1",
+                inbound_session_id="session-1",
+                inbound_session_key="channel:telegram:direct:77",
+            )
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 945,
+                            "message": {
+                                "message_id": 45,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "long task",
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+            worker._active_turns["turn-1"].visible_after = 0.0
+            await worker.refresh_progress_messages()
+            stop_payload = telegram.sent_buttons[-1][0].action
+            telegram.updates = [
+                Update.model_validate(
+                    {
+                        "update_id": 946,
+                        "callback_query": {
+                            "id": "callback-stop",
+                            "from": {
+                                "id": 77,
+                                "is_bot": False,
+                                "first_name": "Alice",
+                            },
+                            "chat_instance": "chat-instance",
+                            "data": stop_payload,
+                            "message": {
+                                "message_id": 101,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 99,
+                                    "is_bot": True,
+                                    "first_name": "LionClaw",
+                                    "username": "lionclaw_bot",
+                                },
+                                "text": "Queued...",
+                            },
+                        },
+                    }
+                )
+            ]
+
+            await worker.process_updates()
+
+        self.assertEqual(telegram.answered_callbacks[-1], ("callback-stop", "Stopping"))
+        self.assertEqual(
+            api.cancel_calls,
+            [
+                (
+                    "session-1",
+                    "channel:telegram:direct:77",
+                    "turn-1",
+                    "telegram stop command",
+                )
+            ],
+        )
+
+    async def test_stale_stop_callback_is_acknowledged_without_cancelling(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            await worker._remember_active_turn(
+                TelegramInboundUpdate(
+                    update_id=948,
+                    event_id="telegram:update:948",
+                    sender_ref="telegram:user:77",
+                    conversation_ref="telegram:chat:77",
+                    message_ref="telegram:message:48",
+                    text="slow",
+                    trigger="dm",
+                    provider_metadata={"chat_type": "private"},
+                ),
+                InboundResponse(
+                    outcome="queued",
+                    turn_id="turn-1",
+                    session_id="session-1",
+                    session_key="channel:telegram:direct:77",
+                ),
+            )
+            payload = worker._callback_payload(
+                "stop",
+                worker._active_turns["turn-1"].target,
+                active=worker._active_turns["turn-1"],
+            )
+            worker._forget_turn(worker._active_turns["turn-1"])
+            telegram.updates = [
+                Update.model_validate(
+                    {
+                        "update_id": 949,
+                        "callback_query": {
+                            "id": "callback-stale",
+                            "from": {
+                                "id": 77,
+                                "is_bot": False,
+                                "first_name": "Alice",
+                            },
+                            "chat_instance": "chat-instance",
+                            "data": payload,
+                            "message": {
+                                "message_id": 101,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 99,
+                                    "is_bot": True,
+                                    "first_name": "LionClaw",
+                                    "username": "lionclaw_bot",
+                                },
+                                "text": "Queued...",
+                            },
+                        },
+                    }
+                )
+            ]
+
+            await worker.process_updates()
+
+        self.assertEqual(api.cancel_calls, [])
+        self.assertEqual(
+            telegram.answered_callbacks[-1],
+            ("callback-stale", "That control is no longer active."),
+        )
 
     async def test_active_turn_state_survives_worker_restart_for_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5715,9 +6027,12 @@ class FakeTelegramTransport:
         self.sent_messages: list[tuple[str, str, str | None, str | None, list[str]]] = (
             []
         )
+        self.sent_buttons: list[list[TelegramActionButton]] = []
         self.resume_receipts: list[dict[str, object] | None] = []
         self.edited_messages: list[tuple[str, str, str]] = []
+        self.edited_buttons: list[list[TelegramActionButton]] = []
         self.deleted_messages: list[tuple[str, str]] = []
+        self.answered_callbacks: list[tuple[str, str | None]] = []
         self.commands_configured = False
         self.sent_format_hints: list[str] = []
         self.typing_peers: list[str] = []
@@ -5779,7 +6094,7 @@ class FakeTelegramTransport:
         resume_receipt: dict[str, object] | None = None,
         buttons: Sequence[TelegramActionButton] = (),
     ) -> dict[str, object]:
-        _ = buttons
+        self.sent_buttons.append(list(buttons))
         self.resume_receipts.append(resume_receipt)
         if self.send_message_error is not None:
             raise self.send_message_error
@@ -5824,7 +6139,7 @@ class FakeTelegramTransport:
         format_hint: str = "plain",
         buttons: Sequence[TelegramActionButton] = (),
     ) -> None:
-        _ = buttons
+        self.edited_buttons.append(list(buttons))
         if self.edit_errors:
             raise self.edit_errors.pop(0)
         self.edited_messages.append((conversation_ref, message_ref, text))
@@ -5837,6 +6152,21 @@ class FakeTelegramTransport:
         if self.delete_errors:
             raise self.delete_errors.pop(0)
         self.deleted_messages.append((conversation_ref, message_ref))
+
+    async def answer_callback(
+        self,
+        callback_query_id: str,
+        text: str | None = None,
+    ) -> None:
+        self.answered_callbacks.append((callback_query_id, text))
+
+    async def set_reaction(
+        self,
+        conversation_ref: str,
+        message_ref: str,
+        emoji: str,
+    ) -> None:
+        _ = (conversation_ref, message_ref, emoji)
 
 
 class BlockingUpdatesTelegramTransport(FakeTelegramTransport):

@@ -116,6 +116,18 @@ class TelegramPairingClaim:
 
 
 @dataclass(slots=True, frozen=True)
+class TelegramCallbackAction:
+    update_id: int
+    callback_query_id: str
+    action: str
+    sender_ref: str
+    conversation_ref: str
+    message_ref: str | None
+    thread_ref: str | None = None
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True, frozen=True)
 class TelegramDownloadedAttachment:
     attachment: TelegramInboundAttachment
     content: bytes
@@ -142,7 +154,9 @@ class TelegramTextChunk:
     html_text: str | None = None
 
 
-TelegramInboundEvent = TelegramInboundUpdate | TelegramPairingClaim
+TelegramInboundEvent = (
+    TelegramInboundUpdate | TelegramPairingClaim | TelegramCallbackAction
+)
 
 
 class TelegramTransport(Protocol):
@@ -614,6 +628,10 @@ def extract_inbound_event(
     update: Update,
     bot_identity: TelegramBotIdentity | None = None,
 ) -> TelegramInboundEvent | None:
+    callback = _extract_callback_action(update, bot_identity)
+    if callback is not None:
+        return callback
+
     supported = _first_supported_message(update)
     if supported is None:
         return None
@@ -662,6 +680,36 @@ def extract_inbound_event(
             edited=edited,
             bot_identity=bot_identity,
         ),
+    )
+
+
+def _extract_callback_action(
+    update: Update,
+    bot_identity: TelegramBotIdentity | None,
+) -> TelegramCallbackAction | None:
+    callback = update.callback_query
+    if callback is None or not isinstance(callback.data, str):
+        return None
+    message = _callback_query_message(update)
+    if message is None:
+        return None
+    metadata = _provider_metadata(
+        message,
+        update_id=update.update_id,
+        source="callback_query",
+        edited=False,
+        bot_identity=bot_identity,
+    )
+    metadata["callback_query_id"] = callback.id
+    return TelegramCallbackAction(
+        update_id=update.update_id,
+        callback_query_id=callback.id,
+        action=callback.data,
+        sender_ref=f"telegram:user:{callback.from_user.id}",
+        conversation_ref=_conversation_ref(message),
+        thread_ref=_thread_ref(message),
+        message_ref=_message_ref(message),
+        provider_metadata=metadata,
     )
 
 
