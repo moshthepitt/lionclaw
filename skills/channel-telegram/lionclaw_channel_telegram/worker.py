@@ -114,6 +114,7 @@ CALLBACK_ACTION_CODES = {
 }
 CALLBACK_CODE_ACTIONS = {code: action for action, code in CALLBACK_ACTION_CODES.items()}
 CALLBACK_ROUTE_TARGET = "_"
+CALLBACK_ROUTE_TARGET_PREFIX = "route."
 REACTION_RECEIVED = "👀"
 REACTION_COMPLETED = "✅"
 REACTION_STOPPED = "👌"
@@ -1024,8 +1025,9 @@ class TelegramWorker:
         if parsed is None:
             await self._answer_callback(callback, "Unknown LionClaw control.")
             return True
+        route = _callback_route_for(parsed, callback)
         active = self._active_turn_for_callback(callback, parsed)
-        if active is None and parsed.target != CALLBACK_ROUTE_TARGET:
+        if active is None and route is None:
             await self._answer_callback(callback, "That control is no longer active.")
             return True
         if not self._callback_mac_matches(callback, parsed, active):
@@ -1033,7 +1035,13 @@ class TelegramWorker:
             return True
 
         update = _callback_update(callback, text=f"/{parsed.action}")
-        if parsed.target != CALLBACK_ROUTE_TARGET and active is not None:
+        if route is not None:
+            update = replace(
+                update,
+                conversation_ref=route.conversation_ref,
+                thread_ref=route.thread_ref,
+            )
+        elif active is not None:
             update = replace(
                 update,
                 conversation_ref=active.target.conversation_ref,
@@ -1061,10 +1069,11 @@ class TelegramWorker:
         callback: TelegramCallbackAction,
         parsed: ParsedCallbackAction,
     ) -> ActiveTurn | None:
-        if parsed.target == CALLBACK_ROUTE_TARGET:
+        route = _callback_route_for(parsed, callback)
+        if route is not None:
             return self._active_turn_for_route(
-                callback.conversation_ref,
-                callback.thread_ref,
+                route.conversation_ref,
+                route.thread_ref,
             )
         active = self._active_turns.get(parsed.target)
         if active is None or active.terminal:
@@ -1084,11 +1093,21 @@ class TelegramWorker:
         parsed: ParsedCallbackAction,
         active: ActiveTurn | None,
     ) -> bool:
-        is_active_turn_callback = parsed.target != CALLBACK_ROUTE_TARGET
+        route = _callback_route_for(parsed, callback)
         session_key = None
         conversation_ref = callback.conversation_ref
         thread_ref = callback.thread_ref
-        if is_active_turn_callback:
+        if route is not None:
+            if route.conversation_ref != callback.conversation_ref:
+                return False
+            if (
+                callback.thread_ref is not None
+                and route.thread_ref != callback.thread_ref
+            ):
+                return False
+            conversation_ref = route.conversation_ref
+            thread_ref = route.thread_ref
+        else:
             if active is None or callback.sender_ref != active.sender_ref:
                 return False
             session_key = active.session_key if parsed.action == "stop" else None
@@ -1996,7 +2015,9 @@ class TelegramWorker:
         active: ActiveTurn | None = None,
     ) -> str:
         code = CALLBACK_ACTION_CODES[action]
-        target_id = active.turn_id if active is not None else CALLBACK_ROUTE_TARGET
+        target_id = (
+            active.turn_id if active is not None else _callback_route_target(target)
+        )
         session_key = (
             active.session_key if active is not None and action == "stop" else None
         )
@@ -2611,6 +2632,62 @@ def _parse_callback_action(value: str) -> ParsedCallbackAction | None:
     if action is None or not target or not mac:
         return None
     return ParsedCallbackAction(action=action, target=target, mac=mac)
+
+
+def _callback_route_target(target: TypingTarget) -> str:
+    chat_id = _ref_suffix(target.conversation_ref, "telegram:chat:")
+    if chat_id is None or not _signed_integer_text(chat_id):
+        return CALLBACK_ROUTE_TARGET
+    if target.thread_ref is None:
+        return f"{CALLBACK_ROUTE_TARGET_PREFIX}{chat_id}._"
+    topic_id = _ref_suffix(target.thread_ref, "telegram:topic:")
+    if topic_id is None or not topic_id.isdigit():
+        return CALLBACK_ROUTE_TARGET
+    return f"{CALLBACK_ROUTE_TARGET_PREFIX}{chat_id}.{topic_id}"
+
+
+def _callback_route(
+    target_id: str,
+    callback: TelegramCallbackAction,
+) -> TypingTarget | None:
+    if target_id == CALLBACK_ROUTE_TARGET:
+        return TypingTarget(callback.conversation_ref, callback.thread_ref)
+    if not target_id.startswith(CALLBACK_ROUTE_TARGET_PREFIX):
+        return None
+    route = target_id.removeprefix(CALLBACK_ROUTE_TARGET_PREFIX)
+    chat_id, separator, topic_id = route.partition(".")
+    if separator != "." or not _signed_integer_text(chat_id):
+        return None
+    if topic_id == "_":
+        thread_ref = None
+    elif topic_id.isdigit():
+        thread_ref = f"telegram:topic:{topic_id}"
+    else:
+        return None
+    return TypingTarget(f"telegram:chat:{chat_id}", thread_ref)
+
+
+def _is_route_action(parsed: ParsedCallbackAction) -> bool:
+    return parsed.action in LIONCLAW_CONTROL_ALIASES
+
+
+def _callback_route_for(
+    parsed: ParsedCallbackAction,
+    callback: TelegramCallbackAction,
+) -> TypingTarget | None:
+    if not _is_route_action(parsed):
+        return None
+    return _callback_route(parsed.target, callback)
+
+
+def _ref_suffix(value: str, prefix: str) -> str | None:
+    if value.startswith(prefix):
+        return value.removeprefix(prefix)
+    return None
+
+
+def _signed_integer_text(value: str) -> bool:
+    return value.removeprefix("-").isdigit()
 
 
 def _callback_mac(

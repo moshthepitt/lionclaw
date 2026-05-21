@@ -3312,6 +3312,98 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api.sent_inbound), 1)
         self.assertEqual(api.sent_inbound[0].text, "/lionclaw retry")
 
+    async def test_topic_route_callback_survives_inaccessible_message(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 930,
+                            "message": {
+                                "message_id": 30,
+                                "date": 0,
+                                "chat": {
+                                    "id": -10077,
+                                    "type": "supergroup",
+                                    "is_forum": True,
+                                },
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "message_thread_id": 55,
+                                "is_topic_message": True,
+                                "text": "@lionclaw_bot /help",
+                                "entities": [
+                                    {
+                                        "type": "mention",
+                                        "offset": 0,
+                                        "length": len("@lionclaw_bot"),
+                                    },
+                                    {
+                                        "type": "bot_command",
+                                        "offset": len("@lionclaw_bot "),
+                                        "length": len("/help"),
+                                    },
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+            retry_payload = telegram.sent_buttons[0][1].action
+            self.assertIn("route.-10077.55", retry_payload)
+            api.sent_inbound.clear()
+            telegram.updates = [
+                Update.model_validate(
+                    {
+                        "update_id": 931,
+                        "callback_query": {
+                            "id": "callback-topic-retry-old",
+                            "from": {
+                                "id": 77,
+                                "is_bot": False,
+                                "first_name": "Alice",
+                            },
+                            "chat_instance": "chat-instance",
+                            "data": retry_payload,
+                            "message": {
+                                "message_id": 130,
+                                "date": 0,
+                                "chat": {
+                                    "id": -10077,
+                                    "type": "supergroup",
+                                    "is_forum": True,
+                                },
+                            },
+                        },
+                    }
+                )
+            ]
+
+            await worker.process_updates()
+
+        self.assertEqual(
+            telegram.answered_callbacks[-1],
+            ("callback-topic-retry-old", "Queued"),
+        )
+        self.assertEqual(len(api.sent_inbound), 1)
+        self.assertEqual(api.sent_inbound[0].text, "/lionclaw retry")
+        self.assertEqual(api.sent_inbound[0].conversation_ref, "telegram:chat:-10077")
+        self.assertEqual(api.sent_inbound[0].thread_ref, "telegram:topic:55")
+
     async def test_route_callback_from_different_sender_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
