@@ -904,6 +904,48 @@ async fn channel_send_bridge_rejects_excess_connections() {
 }
 
 #[tokio::test]
+async fn channel_send_bridge_audits_connection_limit_response_io_failures() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "local-cli", "runtime-channel-send-limit-io-failure").await;
+    let kernel = kernel_with_channel_send_preset(&env, true).await;
+    kernel
+        .register_runtime_adapter(
+            "connection-limit-io-runtime",
+            Arc::new(ChannelSendProbeRuntime::open_many_connections_and_drop_rejected()),
+        )
+        .await;
+    let session = open_test_session(&kernel, "runtime-channel-send-limit-io-failure").await;
+
+    kernel
+        .turn_session(SessionTurnRequest {
+            session_id: session,
+            user_text: "drop rejected channel send connection".to_string(),
+            runtime_id: Some("connection-limit-io-runtime".to_string()),
+            runtime_working_dir: None,
+            runtime_timeout_ms: None,
+            runtime_env_passthrough: None,
+        })
+        .await
+        .expect("turn should complete");
+
+    let audit = kernel
+        .query_audit(
+            Some(session),
+            Some("runtime.channel_send.bridge_error".to_string()),
+            None,
+            Some(10),
+        )
+        .await
+        .expect("query bridge error audit events");
+    assert!(audit.events.iter().any(|event| {
+        event.details["stage"].as_str() == Some("connection_io")
+            && event.details["runtime_id"].as_str() == Some("connection-limit-io-runtime")
+            && event.details["turn_id"].as_str().is_some()
+            && event.details["error"].as_str().is_some()
+    }));
+}
+
+#[tokio::test]
 async fn channel_send_bridge_audits_connection_io_failures() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "local-cli", "runtime-channel-send-io-failure").await;
@@ -1046,6 +1088,7 @@ enum RuntimeAction {
     OpenManyConnections {
         responses: Arc<Mutex<Vec<Value>>>,
     },
+    OpenManyConnectionsAndDropRejected,
     SendAndDropConnection {
         request: Value,
     },
@@ -1110,6 +1153,12 @@ impl ChannelSendProbeRuntime {
     fn open_many_connections(responses: Arc<Mutex<Vec<Value>>>) -> Self {
         Self {
             action: RuntimeAction::OpenManyConnections { responses },
+        }
+    }
+
+    fn open_many_connections_and_drop_rejected() -> Self {
+        Self {
+            action: RuntimeAction::OpenManyConnectionsAndDropRejected,
         }
     }
 
@@ -1313,23 +1362,8 @@ async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan)
             Ok(())
         }
         RuntimeAction::OpenManyConnections { responses } => {
-            let socket = env_value(&plan.environment, CHANNEL_SEND_SOCKET_ENV)
-                .context("channel send socket env missing")?;
-            let host_socket = host_path_for_runtime_path(plan, &socket)?;
-            let mut held_streams = Vec::new();
-            for _ in 0..TEST_CHANNEL_SEND_CONNECTION_LIMIT {
-                held_streams.push(
-                    UnixStream::connect(&host_socket)
-                        .await
-                        .with_context(|| format!("connect {}", host_socket.display()))?,
-                );
-                sleep(Duration::from_millis(10)).await;
-            }
-            sleep(Duration::from_millis(50)).await;
-
-            let stream = UnixStream::connect(&host_socket)
-                .await
-                .with_context(|| format!("connect {}", host_socket.display()))?;
+            let (host_socket, held_streams) = open_channel_send_connections_to_limit(plan).await?;
+            let stream = connect_channel_send_socket(&host_socket).await?;
             let mut response = String::new();
             let mut reader = BufReader::new(stream);
             tokio::time::timeout(Duration::from_millis(250), reader.read_line(&mut response))
@@ -1343,13 +1377,19 @@ async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan)
             drop(held_streams);
             Ok(())
         }
+        RuntimeAction::OpenManyConnectionsAndDropRejected => {
+            let (host_socket, held_streams) = open_channel_send_connections_to_limit(plan).await?;
+            let stream = connect_channel_send_socket(&host_socket).await?;
+            drop(stream);
+            sleep(Duration::from_millis(100)).await;
+            drop(held_streams);
+            Ok(())
+        }
         RuntimeAction::SendAndDropConnection { request } => {
             let socket = env_value(&plan.environment, CHANNEL_SEND_SOCKET_ENV)
                 .context("channel send socket env missing")?;
             let host_socket = host_path_for_runtime_path(plan, &socket)?;
-            let mut stream = UnixStream::connect(&host_socket)
-                .await
-                .with_context(|| format!("connect {}", host_socket.display()))?;
+            let mut stream = connect_channel_send_socket(&host_socket).await?;
             let mut line = serde_json::to_vec(request).expect("serialize request");
             line.push(b'\n');
             stream.write_all(&line).await.expect("write request");
@@ -1358,6 +1398,27 @@ async fn run_probe_action(action: &RuntimeAction, plan: &EffectiveExecutionPlan)
             Ok(())
         }
     }
+}
+
+async fn open_channel_send_connections_to_limit(
+    plan: &EffectiveExecutionPlan,
+) -> Result<(PathBuf, Vec<UnixStream>)> {
+    let socket = env_value(&plan.environment, CHANNEL_SEND_SOCKET_ENV)
+        .context("channel send socket env missing")?;
+    let host_socket = host_path_for_runtime_path(plan, &socket)?;
+    let mut held_streams = Vec::new();
+    for _ in 0..TEST_CHANNEL_SEND_CONNECTION_LIMIT {
+        held_streams.push(connect_channel_send_socket(&host_socket).await?);
+        sleep(Duration::from_millis(10)).await;
+    }
+    sleep(Duration::from_millis(50)).await;
+    Ok((host_socket, held_streams))
+}
+
+async fn connect_channel_send_socket(host_socket: &Path) -> Result<UnixStream> {
+    UnixStream::connect(host_socket)
+        .await
+        .with_context(|| format!("connect {}", host_socket.display()))
 }
 
 async fn prepare_probe_files(runtime_root: &Path, setup: ProbeFileSetup) -> Result<()> {

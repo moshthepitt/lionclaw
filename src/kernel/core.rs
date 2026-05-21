@@ -8872,8 +8872,20 @@ async fn reject_runtime_channel_send_connection(
     .await
     {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => warn!(?err, "failed to reject runtime channel.send connection"),
-        Err(err) => warn!(?err, "timed out rejecting runtime channel.send connection"),
+        Ok(Err(err)) => {
+            let error = err.to_string();
+            kernel
+                .audit_runtime_channel_send_bridge_error(context, "connection_io", &error)
+                .await;
+            warn!(?err, "failed to reject runtime channel.send connection");
+        }
+        Err(err) => {
+            let error = err.to_string();
+            kernel
+                .audit_runtime_channel_send_bridge_error(context, "connection_io", &error)
+                .await;
+            warn!(?err, "timed out rejecting runtime channel.send connection");
+        }
     }
 }
 
