@@ -739,6 +739,91 @@ class ExtractInboundEventTests(unittest.TestCase):
             "telegram:update:301:attachment:photo:photo-large-unique",
         )
 
+    def test_location_maps_to_text_and_metadata(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 302,
+                "message": {
+                    "message_id": 302,
+                    "date": 0,
+                    "chat": {"id": 42, "type": "private"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Alice"},
+                    "location": {
+                        "latitude": -1.292066,
+                        "longitude": 36.821945,
+                        "horizontal_accuracy": 12.5,
+                    },
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(
+            mapped.text,
+            "Shared location: latitude -1.292066, "
+            "longitude 36.821945 (geo:-1.292066,36.821945)",
+        )
+        self.assertEqual(mapped.attachments, [])
+        self.assertEqual(
+            mapped.provider_metadata["shared_location"],
+            {
+                "kind": "location",
+                "latitude": -1.292066,
+                "longitude": 36.821945,
+                "horizontal_accuracy": 12.5,
+            },
+        )
+
+    def test_venue_maps_to_text_and_metadata(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 303,
+                "message": {
+                    "message_id": 303,
+                    "date": 0,
+                    "chat": {"id": 42, "type": "private"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Alice"},
+                    "venue": {
+                        "location": {
+                            "latitude": -1.2841,
+                            "longitude": 36.8155,
+                        },
+                        "title": "Nairobi Garage",
+                        "address": "Kilimani, Nairobi",
+                        "google_place_id": "place-123",
+                        "google_place_type": "coworking_space",
+                    },
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(
+            mapped.text,
+            "Shared venue: Nairobi Garage\n"
+            "Kilimani, Nairobi\n"
+            "Location: latitude -1.2841, longitude 36.8155 "
+            "(geo:-1.2841,36.8155)",
+        )
+        self.assertEqual(
+            mapped.provider_metadata["shared_location"],
+            {
+                "kind": "venue",
+                "title": "Nairobi Garage",
+                "address": "Kilimani, Nairobi",
+                "latitude": -1.2841,
+                "longitude": 36.8155,
+                "google_place_id": "place-123",
+                "google_place_type": "coworking_space",
+            },
+        )
+
     def test_bot_sender_is_ignored(self) -> None:
         update = Update.model_validate(
             {

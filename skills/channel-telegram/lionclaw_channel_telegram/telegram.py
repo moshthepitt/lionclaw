@@ -946,7 +946,85 @@ def _message_text(message: Message) -> str | None:
 
 
 def _content_text(message: Message) -> str | None:
-    return message.text or message.caption
+    return message.text or message.caption or _shared_location_text(message)
+
+
+def _shared_location_text(message: Message) -> str | None:
+    location = _shared_location_metadata(message)
+    if location is None:
+        return None
+    coordinates = _location_coordinates_text(location)
+    if location["kind"] == "venue":
+        lines = [f"Shared venue: {location['title']}"]
+        address = location.get("address")
+        if isinstance(address, str) and address:
+            lines.append(address)
+        lines.append(f"Location: {coordinates}")
+        return "\n".join(lines)
+    return f"Shared location: {coordinates}"
+
+
+def _shared_location_metadata(message: Message) -> dict[str, Any] | None:
+    if message.venue is not None:
+        venue = message.venue
+        metadata: dict[str, Any] = {
+            "kind": "venue",
+            "title": venue.title,
+            "address": venue.address,
+            "latitude": venue.location.latitude,
+            "longitude": venue.location.longitude,
+        }
+        _copy_optional_attrs(
+            venue,
+            metadata,
+            (
+                "foursquare_id",
+                "foursquare_type",
+                "google_place_id",
+                "google_place_type",
+            ),
+        )
+        return metadata
+    if message.location is not None:
+        location = message.location
+        metadata = {
+            "kind": "location",
+            "latitude": location.latitude,
+            "longitude": location.longitude,
+        }
+        _copy_optional_attrs(
+            location,
+            metadata,
+            (
+                "horizontal_accuracy",
+                "live_period",
+                "heading",
+                "proximity_alert_radius",
+            ),
+        )
+        return metadata
+    return None
+
+
+def _copy_optional_attrs(
+    source: object,
+    target: dict[str, Any],
+    attrs: Sequence[str],
+) -> None:
+    for attr in attrs:
+        value = getattr(source, attr, None)
+        if value is not None:
+            target[attr] = value
+
+
+def _location_coordinates_text(location: dict[str, Any]) -> str:
+    latitude = _format_coordinate(location["latitude"])
+    longitude = _format_coordinate(location["longitude"])
+    return f"latitude {latitude}, longitude {longitude} (geo:{latitude},{longitude})"
+
+
+def _format_coordinate(value: object) -> str:
+    return f"{float(value):.6f}".rstrip("0").rstrip(".")
 
 
 def _extract_pairing_token(
@@ -1151,6 +1229,9 @@ def _provider_metadata(
         metadata["message_thread_id"] = message.message_thread_id
     if message.media_group_id is not None:
         metadata["media_group_id"] = message.media_group_id
+    shared_location = _shared_location_metadata(message)
+    if shared_location is not None:
+        metadata["shared_location"] = shared_location
     return metadata
 
 
