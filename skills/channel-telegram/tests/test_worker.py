@@ -4118,6 +4118,85 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 ["first\n\nsecond"],
             )
 
+    async def test_cancelled_polling_update_processing_persists_offset_before_retry(
+        self,
+    ) -> None:
+        class BlockingPollingApi(FakeLionClawApi):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def send_inbound(
+                self,
+                update: TelegramInboundUpdate,
+            ) -> InboundResponse:
+                self.sent_inbound.append(update)
+                self.started.set()
+                await self.release.wait()
+                return InboundResponse(outcome="queued")
+
+        class OffsetAwareTelegramTransport(FakeTelegramTransport):
+            async def get_updates(
+                self,
+                offset: int,
+                timeout_seconds: int,
+            ) -> list[Update]:
+                return [
+                    update
+                    for update in self.updates
+                    if getattr(update, "update_id", -1) >= offset
+                ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            update = Update.model_validate(
+                {
+                    "update_id": 953,
+                    "message": {
+                        "message_id": 53,
+                        "date": 0,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "/retry",
+                    },
+                }
+            )
+            api = BlockingPollingApi()
+            telegram = OffsetAwareTelegramTransport(updates=[update])
+            offset_store = OffsetStore(Path(temp_dir) / "telegram.offset")
+            first_worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=offset_store,
+            )
+
+            first_task = asyncio.create_task(first_worker.process_updates())
+            await asyncio.wait_for(api.started.wait(), timeout=1.0)
+            first_task.cancel()
+            await asyncio.sleep(0)
+            api.release.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await first_task
+
+            second_worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=offset_store,
+            )
+            await second_worker.process_updates()
+            saved_offset = offset_store.load()
+
+        self.assertEqual(
+            [submitted.text for submitted in api.sent_inbound], ["/lionclaw retry"]
+        )
+        self.assertEqual(saved_offset, 954)
+
     async def test_malformed_update_is_quarantined_and_offset_advances(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()

@@ -804,7 +804,17 @@ class TelegramWorker:
             event = self._extract_provider_event(update, bot_identity)
             work_items.append(ProviderWorkItem((update.update_id,), event))
 
-        await self._process_provider_work_items(work_items, persist_offsets=True)
+        processing = asyncio.create_task(
+            self._process_provider_work_items(work_items, persist_offsets=True),
+            name="telegram-polling-updates",
+        )
+        await self._wait_for_owned_update_result(
+            processing,
+            cancellation_message=(
+                "telegram polling update processing wait cancelled; "
+                "preserving offset ownership"
+            ),
+        )
 
     async def process_webhook_update(self, update: Update) -> bool:
         owns_update, update_result = await self._begin_webhook_update(update.update_id)
@@ -831,7 +841,7 @@ class TelegramWorker:
                         self._process_webhook_work_item(item),
                         name="telegram-webhook-update",
                     )
-                    processed = await self._wait_for_webhook_result(
+                    processed = await self._wait_for_owned_update_result(
                         processing,
                         cancellation_message=(
                             "telegram webhook processing wait cancelled; "
@@ -950,14 +960,14 @@ class TelegramWorker:
             )
 
         future = await self._enqueue_webhook_batch(key, item)
-        return await self._wait_for_webhook_result(
+        return await self._wait_for_owned_update_result(
             future,
             cancellation_message=(
                 "telegram webhook batch wait cancelled; preserving update ownership"
             ),
         )
 
-    async def _wait_for_webhook_result(
+    async def _wait_for_owned_update_result(
         self,
         result: asyncio.Future[bool],
         *,
@@ -970,6 +980,9 @@ class TelegramWorker:
             except asyncio.CancelledError:
                 if result.cancelled():
                     raise
+                task = asyncio.current_task()
+                if task is not None:
+                    task.uncancel()
                 if not logged_cancellation:
                     logger.debug(cancellation_message)
                     logged_cancellation = True
