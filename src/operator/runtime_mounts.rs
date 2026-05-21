@@ -371,6 +371,35 @@ mod tests {
     }
 
     #[test]
+    fn add_rejects_mounts_that_cannot_be_emitted_for_podman() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source = temp_dir.path().join("docs:archive,current");
+        std::fs::create_dir(&source).expect("source");
+        let home = LionClawHome::new(temp_dir.path().join(".lionclaw/instances/main"));
+        std::fs::create_dir_all(home.root()).expect("home");
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), profile("podman".to_string(), None));
+
+        let err = add_runtime_mount(
+            &mut config,
+            RuntimeMountContext {
+                home: &home,
+                project_root: None,
+                work_root: None,
+            },
+            "codex",
+            "docs",
+            &source,
+            MountAccess::ReadOnly,
+        )
+        .expect_err("unrepresentable mount");
+
+        assert!(err.to_string().contains("Podman --mount"));
+        assert!(err.to_string().contains("contains ','"));
+    }
+
+    #[test]
     fn add_rejects_project_metadata_sources_inferred_from_project_instance_home() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let project = temp_dir.path().join("project");

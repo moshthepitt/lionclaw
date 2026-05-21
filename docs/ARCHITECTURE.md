@@ -236,9 +236,11 @@ canonical directories outside LionClaw project/work-root metadata and
 instance-private state. Targets must be absolute, unique within the runtime
 profile, and outside reserved runtime paths: `/workspace`, `/runtime`,
 `/drafts`, `/attachments`, `/lionclaw`, `/run/secrets`, `/proc`, `/sys`, and
-`/dev`. The operator CLI, status/doctor checks, runtime launch validation, and
-planner all validate the configured mounts so hand-edited config cannot bypass
-planner safety checks.
+`/dev`. Configured mounts must also be representable as Podman bind-mount
+arguments: when `:` in the source or target requires the `--mount` form, neither
+path may contain `,`. The operator CLI, status/doctor checks, runtime launch
+validation, and planner all validate the configured mounts so hand-edited config
+cannot bypass planner safety checks.
 
 The operator console treats the transcript as durable conversation: user prompts
 and assistant answer deltas are rendered as message blocks. Runtime status,

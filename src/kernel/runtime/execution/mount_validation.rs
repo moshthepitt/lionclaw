@@ -18,6 +18,18 @@ const RESERVED_EXTRA_MOUNT_TARGETS: &[&str] = &[
     "/dev",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PodmanBindMountArgumentForm {
+    Volume,
+    Mount,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PodmanBindMountArgument<'a> {
+    pub source: &'a str,
+    pub form: PodmanBindMountArgumentForm,
+}
+
 #[derive(Debug, Clone)]
 pub struct MountSourceProtection {
     pub path: PathBuf,
@@ -91,8 +103,43 @@ pub fn validate_configured_mounts(
         }
         validate_configured_mount_source(&mount.source, protected_roots)
             .map_err(|err| format!("runtime mount target '{target}' has invalid source: {err}"))?;
+        podman_bind_mount_argument(&mount.source, &target).map_err(|err| {
+            format!("runtime mount target '{target}' cannot be represented as a Podman bind mount: {err}")
+        })?;
     }
     Ok(())
+}
+
+pub(crate) fn podman_bind_mount_argument<'a>(
+    source: &'a Path,
+    target: &str,
+) -> Result<PodmanBindMountArgument<'a>, String> {
+    let source_text = source
+        .to_str()
+        .ok_or_else(|| format!("mount source '{}' is not valid UTF-8", source.display()))?;
+    let mount_form_required = source_text.contains(':') || target.contains(':');
+    if mount_form_required {
+        if source_text.contains(',') {
+            return Err(format!(
+                "mount source '{}' contains ',' but Podman --mount is required when the source or target contains ':'",
+                source.display()
+            ));
+        }
+        if target.contains(',') {
+            return Err(format!(
+                "mount target '{target}' contains ',' but Podman --mount is required when the source or target contains ':'"
+            ));
+        }
+        return Ok(PodmanBindMountArgument {
+            source: source_text,
+            form: PodmanBindMountArgumentForm::Mount,
+        });
+    }
+
+    Ok(PodmanBindMountArgument {
+        source: source_text,
+        form: PodmanBindMountArgumentForm::Volume,
+    })
 }
 
 pub fn canonical_mount_source(source: &Path) -> Result<PathBuf, String> {
@@ -272,6 +319,66 @@ mod tests {
             &[],
         )
         .expect("colon source is valid at the configured-mount layer");
+    }
+
+    #[test]
+    fn rejects_comma_when_podman_mount_form_is_required() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let comma_source = temp_dir.path().join("docs,current");
+        let colon_comma_source = temp_dir.path().join("docs:archive,current");
+        let colon_source = temp_dir.path().join("docs:archive");
+        for source in [&comma_source, &colon_comma_source, &colon_source] {
+            std::fs::create_dir(source).expect("source dir");
+        }
+
+        validate_configured_mounts(
+            &[MountSpec {
+                source: comma_source.clone(),
+                target: "/mnt/docs".to_string(),
+                access: MountAccess::ReadOnly,
+            }],
+            &[],
+        )
+        .expect("comma source is valid when --volume can represent it");
+
+        let err = validate_configured_mounts(
+            &[MountSpec {
+                source: colon_comma_source,
+                target: "/mnt/docs".to_string(),
+                access: MountAccess::ReadOnly,
+            }],
+            &[],
+        )
+        .expect_err("source comma with required --mount");
+        assert!(err.contains("runtime mount target '/mnt/docs'"));
+        assert!(err.contains("Podman --mount"));
+        assert!(err.contains("contains ','"));
+
+        let err = validate_configured_mounts(
+            &[MountSpec {
+                source: comma_source,
+                target: "/mnt/docs:archive".to_string(),
+                access: MountAccess::ReadOnly,
+            }],
+            &[],
+        )
+        .expect_err("source comma with target colon");
+        assert!(err.contains("runtime mount target '/mnt/docs:archive'"));
+        assert!(err.contains("Podman --mount"));
+        assert!(err.contains("contains ','"));
+
+        let err = validate_configured_mounts(
+            &[MountSpec {
+                source: colon_source,
+                target: "/mnt/docs,current".to_string(),
+                access: MountAccess::ReadOnly,
+            }],
+            &[],
+        )
+        .expect_err("target comma with source colon");
+        assert!(err.contains("runtime mount target '/mnt/docs,current'"));
+        assert!(err.contains("Podman --mount"));
+        assert!(err.contains("contains ','"));
     }
 
     #[test]

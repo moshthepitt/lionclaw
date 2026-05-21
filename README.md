@@ -155,6 +155,9 @@ Mounts default to read-only. LionClaw rejects files, missing directories,
 project/work-root metadata and instance-state paths, duplicate targets, and
 reserved runtime paths such as `/workspace`, `/runtime`, `/drafts`,
 `/attachments`, `/lionclaw`, `/run/secrets`, `/proc`, `/sys`, and `/dev`.
+Podman bind-mount arguments must also be representable: commas are accepted
+only when neither the source nor target path requires the `--mount` form by
+containing `:`.
 
 ## Projects And Instances
 

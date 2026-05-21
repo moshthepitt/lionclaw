@@ -16,6 +16,7 @@ use super::{
         ExecutionBackend, ExecutionOutput, ExecutionRequest, ExecutionSession,
         ExecutionStdoutSender,
     },
+    mount_validation::{podman_bind_mount_argument, PodmanBindMountArgumentForm},
     plan::{ConfinementBackend, MountAccess, MountSpec, NetworkMode, RuntimeAuthKind},
     process::{run_process_streaming, spawn_process_session, ProcessInvocation, ProcessSession},
     runtime_auth::prepare_runtime_auth,
@@ -709,68 +710,33 @@ fn strip_mount_prefix(requested: &Path, source: &Path) -> Option<PathBuf> {
     requested.strip_prefix(source).ok().map(Path::to_path_buf)
 }
 
-fn format_volume_spec(mount: &MountSpec) -> Result<String> {
-    let source = mount.source.to_str().ok_or_else(|| {
-        anyhow!(
-            "mount source '{}' is not valid UTF-8",
-            mount.source.display()
-        )
-    })?;
-    if source.contains(':') {
-        bail!(
-            "mount source '{}' contains ':' and cannot be represented safely as an OCI volume argument",
-            mount.source.display()
-        );
-    }
-    if mount.target.contains(':') {
-        bail!(
-            "mount target '{}' contains ':' and cannot be represented safely as an OCI volume argument",
-            mount.target
-        );
-    }
-
+fn format_volume_spec(source: &str, mount: &MountSpec) -> String {
     let access = match mount.access {
         MountAccess::ReadOnly => READ_ONLY_BIND_MOUNT_OPTIONS,
         MountAccess::ReadWrite => READ_WRITE_BIND_MOUNT_OPTIONS,
     };
-    Ok(format!("{source}:{}:{access}", mount.target))
+    format!("{source}:{}:{access}", mount.target)
 }
 
 fn format_bind_mount_arg(mount: &MountSpec) -> Result<(&'static str, String)> {
-    let source = mount.source.to_str().ok_or_else(|| {
-        anyhow!(
-            "mount source '{}' is not valid UTF-8",
-            mount.source.display()
-        )
-    })?;
-    if source.contains(':') || mount.target.contains(':') {
-        return Ok(("--mount", format_mount_spec(source, mount)?));
+    let argument =
+        podman_bind_mount_argument(&mount.source, &mount.target).map_err(anyhow::Error::msg)?;
+    match argument.form {
+        PodmanBindMountArgumentForm::Volume => {
+            Ok(("--volume", format_volume_spec(argument.source, mount)))
+        }
+        PodmanBindMountArgumentForm::Mount => {
+            Ok(("--mount", format_mount_spec(argument.source, mount)))
+        }
     }
-    Ok(("--volume", format_volume_spec(mount)?))
 }
 
-fn format_mount_spec(source: &str, mount: &MountSpec) -> Result<String> {
-    if source.contains(',') {
-        bail!(
-            "mount source '{}' contains both ':' and ',' and cannot be represented safely as an OCI bind mount argument",
-            mount.source.display()
-        );
-    }
-    if mount.target.contains(',') {
-        bail!(
-            "mount target '{}' contains both ':' and ',' and cannot be represented safely as an OCI bind mount argument",
-            mount.target
-        );
-    }
-
+fn format_mount_spec(source: &str, mount: &MountSpec) -> String {
     let access = match mount.access {
         MountAccess::ReadOnly => "readonly,relabel=private",
         MountAccess::ReadWrite => "rw,relabel=private",
     };
-    Ok(format!(
-        "type=bind,src={source},target={},{}",
-        mount.target, access
-    ))
+    format!("type=bind,src={source},target={},{}", mount.target, access)
 }
 
 fn workspace_lionclaw_metadata_mask_needed(
@@ -1084,8 +1050,8 @@ mod tests {
 
         let err = prepare_oci_process_launch(&request, None).expect_err("unrepresentable mount");
 
-        assert!(err.to_string().contains("contains both ':' and ','"));
-        assert!(err.to_string().contains("OCI bind mount argument"));
+        assert!(err.to_string().contains("Podman --mount"));
+        assert!(err.to_string().contains("contains ','"));
     }
 
     #[test]
