@@ -4,7 +4,7 @@ import contextlib
 import html
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -639,6 +639,14 @@ def extract_inbound_event(
     if _is_bot_sender(message):
         return None
 
+    metadata = _provider_metadata(
+        message,
+        update_id=update.update_id,
+        source=source,
+        edited=edited,
+        bot_identity=bot_identity,
+    )
+
     token = _extract_pairing_token(_message_text(message), bot_identity)
     if token is not None:
         return TelegramPairingClaim(
@@ -648,17 +656,11 @@ def extract_inbound_event(
             conversation_ref=_conversation_ref(message),
             thread_ref=_thread_ref(message),
             message_ref=_message_ref(message),
-            provider_metadata=_provider_metadata(
-                message,
-                update_id=update.update_id,
-                source=source,
-                edited=edited,
-                bot_identity=bot_identity,
-            ),
+            provider_metadata=metadata,
         )
 
-    text = _content_text(message)
-    attachments = _attachments(message, update.update_id)
+    text = _normalized_content_text(message, metadata)
+    attachments = _normalized_attachments(message, update.update_id, text=text)
     if text is None and not attachments:
         return None
 
@@ -673,13 +675,7 @@ def extract_inbound_event(
         text=text,
         attachments=attachments,
         trigger=_trigger(message, bot_identity),
-        provider_metadata=_provider_metadata(
-            message,
-            update_id=update.update_id,
-            source=source,
-            edited=edited,
-            bot_identity=bot_identity,
-        ),
+        provider_metadata=metadata,
     )
 
 
@@ -949,6 +945,38 @@ def _content_text(message: Message) -> str | None:
     return message.text or message.caption or _shared_location_text(message)
 
 
+def _normalized_content_text(
+    message: Message,
+    provider_metadata: dict[str, Any],
+) -> str | None:
+    text = _content_text(message)
+    if text is None:
+        return None
+    leading_mention = provider_metadata.get("leading_mention_text")
+    if isinstance(leading_mention, str) and text.startswith(leading_mention):
+        text_after_mention = text[len(leading_mention) :].lstrip()
+        if _should_strip_leading_mention_payload(
+            text_after_mention,
+            provider_metadata,
+        ):
+            text = text_after_mention
+    return text if text.strip() else None
+
+
+def _should_strip_leading_mention_payload(
+    text_after_mention: str,
+    provider_metadata: dict[str, Any],
+) -> bool:
+    command_target = _leading_command_target_from_text(text_after_mention)
+    if command_target is None:
+        return True
+    bot_username = provider_metadata.get("bot_username")
+    return isinstance(bot_username, str) and _username_matches(
+        command_target,
+        bot_username,
+    )
+
+
 def _shared_location_text(message: Message) -> str | None:
     location = _shared_location_metadata(message)
     if location is None:
@@ -1174,7 +1202,13 @@ def _command_targets_bot(fragment: str, bot_username: str) -> bool:
 
 def _leading_command_target(message: Message) -> str | None:
     text = _content_text(message)
-    if text is None or not text.startswith("/"):
+    if text is None:
+        return None
+    return _leading_command_target_from_text(text)
+
+
+def _leading_command_target_from_text(text: str) -> str | None:
+    if not text.startswith("/"):
         return None
     token = text.split(maxsplit=1)[0]
     command = token.removeprefix("/")
@@ -1245,6 +1279,19 @@ def _message_date_epoch(message: Message) -> int | None:
     if isinstance(message.date, int | float):
         return int(message.date)
     return None
+
+
+def _normalized_attachments(
+    message: Message,
+    update_id: int,
+    *,
+    text: str | None,
+) -> list[TelegramInboundAttachment]:
+    caption = text if message.caption is not None else None
+    attachments = _attachments(message, update_id)
+    if caption == message.caption:
+        return attachments
+    return [replace(attachment, caption=caption) for attachment in attachments]
 
 
 def _attachments(message: Message, update_id: int) -> list[TelegramInboundAttachment]:

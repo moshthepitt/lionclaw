@@ -129,6 +129,7 @@ class ExtractInboundEventTests(unittest.TestCase):
         self.assertEqual(mapped.sender_ref, "telegram:user:9")
         self.assertEqual(mapped.conversation_ref, "telegram:chat:-10042")
         self.assertEqual(mapped.thread_ref, "telegram:topic:77")
+        self.assertEqual(mapped.text, "status")
         self.assertEqual(mapped.trigger, "mention")
         self.assertTrue(mapped.provider_metadata["bot_mentioned"])
         self.assertEqual(
@@ -166,6 +167,7 @@ class ExtractInboundEventTests(unittest.TestCase):
 
         self.assertIsInstance(mapped, TelegramInboundUpdate)
         assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(mapped.text, "/status")
         self.assertEqual(mapped.trigger, "mention")
         self.assertTrue(mapped.provider_metadata["bot_mentioned"])
         self.assertTrue(mapped.provider_metadata["leading_mention_targets_bot"])
@@ -599,6 +601,43 @@ class ExtractInboundEventTests(unittest.TestCase):
         self.assertEqual(attachment.mime_type, "text/plain")
         self.assertEqual(attachment.size_bytes, 123)
         self.assertEqual(attachment.caption, "please read")
+
+    def test_caption_leading_bot_mention_is_stripped_from_text_and_attachment(
+        self,
+    ) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 201,
+                "message": {
+                    "message_id": 101,
+                    "date": 0,
+                    "chat": {"id": -10042, "type": "supergroup"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Alice"},
+                    "caption": "@lionclaw_bot inspect this",
+                    "caption_entities": [
+                        {"type": "mention", "offset": 0, "length": 13}
+                    ],
+                    "photo": [
+                        {
+                            "file_id": "photo-large",
+                            "file_unique_id": "photo-large-unique",
+                            "width": 640,
+                            "height": 480,
+                            "file_size": 100,
+                        }
+                    ],
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramInboundUpdate)
+        assert isinstance(mapped, TelegramInboundUpdate)
+        self.assertEqual(mapped.text, "inspect this")
+        self.assertEqual(len(mapped.attachments), 1)
+        self.assertEqual(mapped.attachments[0].caption, "inspect this")
+        self.assertEqual(mapped.trigger, "mention")
 
     def test_supported_media_types_create_attachment_descriptors(self) -> None:
         cases = {

@@ -94,7 +94,8 @@ TELEGRAM_WEBHOOK_PATH=/telegram/webhook \
 - Telegram usernames and display names are metadata only. Authorization identity
   uses numeric Telegram ids encoded in stable refs.
 - Private chats map to `dm`; group mentions and bot replies use Telegram
-  entities and the bot's numeric id; forum topics map to scoped thread refs.
+  entities and the bot's numeric id; leading bot mentions are stripped from the
+  runtime-facing text and captions; forum topics map to scoped thread refs.
 - Supported inbound media descriptors include photos, documents, audio, voice,
   video, stickers, video notes, and animations. Telegram locations and venues
   are forwarded as readable text with structured provider metadata. Provider
