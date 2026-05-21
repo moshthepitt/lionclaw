@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, Transaction};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     sync::{Mutex, Notify, RwLock},
     task::{JoinHandle, JoinSet},
@@ -5791,6 +5791,104 @@ mod tests {
         assert!(debug.contains("/tmp/lionclaw-home"));
     }
 
+    #[tokio::test]
+    async fn runtime_artifact_copy_reserves_unique_destinations_atomically() {
+        let temp_dir = tempdir().expect("temp dir");
+        let source_dir = temp_dir.path().join("source");
+        let delivery_root = temp_dir.path().join("delivery");
+        tokio::fs::create_dir_all(&source_dir)
+            .await
+            .expect("create source dir");
+        tokio::fs::create_dir_all(&delivery_root)
+            .await
+            .expect("create delivery dir");
+        let first_source = source_dir.join("first.txt");
+        let second_source = source_dir.join("second.txt");
+        tokio::fs::write(&first_source, b"first payload")
+            .await
+            .expect("write first source");
+        tokio::fs::write(&second_source, b"second payload")
+            .await
+            .expect("write second source");
+        let first = std::fs::File::open(&first_source).expect("open first source");
+        let second = std::fs::File::open(&second_source).expect("open second source");
+
+        let (first_destination, second_destination) = tokio::join!(
+            copy_file_to_unique_child(
+                first,
+                &first_source,
+                &delivery_root,
+                "attachment.txt",
+                MAX_CHANNEL_OUTBOX_ATTACHMENT_BYTES,
+            ),
+            copy_file_to_unique_child(
+                second,
+                &second_source,
+                &delivery_root,
+                "attachment.txt",
+                MAX_CHANNEL_OUTBOX_ATTACHMENT_BYTES,
+            ),
+        );
+        let first_destination = first_destination.expect("copy first source");
+        let second_destination = second_destination.expect("copy second source");
+
+        assert_ne!(first_destination, second_destination);
+        let mut names = vec![
+            first_destination
+                .file_name()
+                .and_then(OsStr::to_str)
+                .expect("first destination file name")
+                .to_string(),
+            second_destination
+                .file_name()
+                .and_then(OsStr::to_str)
+                .expect("second destination file name")
+                .to_string(),
+        ];
+        names.sort();
+        assert_eq!(names, ["attachment-1.txt", "attachment.txt"]);
+
+        let mut payloads = vec![
+            tokio::fs::read(first_destination)
+                .await
+                .expect("read first destination"),
+            tokio::fs::read(second_destination)
+                .await
+                .expect("read second destination"),
+        ];
+        payloads.sort();
+        assert_eq!(
+            payloads,
+            [b"first payload".to_vec(), b"second payload".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_artifact_copy_removes_reserved_destination_on_size_overflow() {
+        let temp_dir = tempdir().expect("temp dir");
+        let delivery_root = temp_dir.path().join("delivery");
+        tokio::fs::create_dir_all(&delivery_root)
+            .await
+            .expect("create delivery dir");
+        let source_path = temp_dir.path().join("oversized.txt");
+        tokio::fs::write(&source_path, b"oversized payload")
+            .await
+            .expect("write source");
+        let source = std::fs::File::open(&source_path).expect("open source");
+
+        let err =
+            copy_file_to_unique_child(source, &source_path, &delivery_root, "artifact.txt", 4)
+                .await
+                .expect_err("oversized copy should fail");
+
+        assert!(
+            matches!(err, KernelError::BadRequest(message) if message.contains("exceeds 4 bytes"))
+        );
+        assert!(!tokio::fs::try_exists(delivery_root.join("artifact.txt"))
+            .await
+            .expect("check reserved destination cleanup"));
+    }
+
     async fn kernel_with_home(home: &LionClawHome) -> Kernel {
         let applied_state = AppliedState::load(home).await.expect("load applied state");
         Kernel::new_with_options(
@@ -7128,7 +7226,13 @@ fn safe_artifact_filename(raw: &str) -> String {
     }
 }
 
-async fn unique_child_path(parent: &Path, filename: &str) -> Result<PathBuf, KernelError> {
+async fn copy_file_to_unique_child(
+    source: std::fs::File,
+    source_label: &Path,
+    parent: &Path,
+    filename: &str,
+    max_bytes: usize,
+) -> Result<PathBuf, KernelError> {
     let stem = Path::new(filename)
         .file_stem()
         .and_then(OsStr::to_str)
@@ -7144,17 +7248,204 @@ async fn unique_child_path(parent: &Path, filename: &str) -> Result<PathBuf, Ker
             format!("{stem}-{index}")
         };
         let candidate = parent.join(candidate_name);
-        if !tokio::fs::try_exists(&candidate)
+        let destination = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
             .await
-            .map_err(|err| internal(err.into()))?
         {
-            return Ok(candidate);
+            Ok(file) => file,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(KernelError::Runtime(format!(
+                    "failed to reserve runtime artifact destination '{}': {err}",
+                    candidate.display()
+                )));
+            }
+        };
+
+        let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+        let mut source = tokio::fs::File::from_std(source).take(max_bytes_u64.saturating_add(1));
+        let mut destination = destination;
+        let copied = match tokio::io::copy(&mut source, &mut destination).await {
+            Ok(copied) => copied,
+            Err(err) => {
+                remove_file_best_effort(&candidate).await;
+                return Err(KernelError::Runtime(format!(
+                    "failed to copy runtime artifact '{}' to '{}': {err}",
+                    source_label.display(),
+                    candidate.display()
+                )));
+            }
+        };
+        if copied > max_bytes_u64 {
+            remove_file_best_effort(&candidate).await;
+            return Err(KernelError::BadRequest(format!(
+                "runtime artifact '{}' exceeds {max_bytes} bytes",
+                source_label.display()
+            )));
         }
+        if let Err(err) = destination.flush().await {
+            remove_file_best_effort(&candidate).await;
+            return Err(KernelError::Runtime(format!(
+                "failed to flush runtime artifact destination '{}': {err}",
+                candidate.display()
+            )));
+        }
+        return Ok(candidate);
     }
     Err(KernelError::Conflict(format!(
         "could not allocate a unique artifact filename under '{}'",
         parent.display()
     )))
+}
+
+fn runtime_artifact_relative_path(
+    artifact_root: &Path,
+    artifact: &RuntimeArtifact,
+) -> Result<PathBuf, KernelError> {
+    let metadata = std::fs::symlink_metadata(&artifact.path).map_err(|err| {
+        KernelError::Runtime(format!(
+            "runtime artifact '{}' is not readable: {err}",
+            artifact.path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(KernelError::Runtime(format!(
+            "runtime artifact '{}' is not a regular file",
+            artifact.path.display()
+        )));
+    }
+    let canonical_artifact = std::fs::canonicalize(&artifact.path).map_err(|err| {
+        KernelError::Runtime(format!(
+            "runtime artifact '{}' is not readable: {err}",
+            artifact.path.display()
+        ))
+    })?;
+    let relative = canonical_artifact
+        .strip_prefix(artifact_root)
+        .map_err(|_| {
+            KernelError::Runtime(format!(
+                "runtime artifact '{}' is outside the runtime root",
+                artifact.path.display()
+            ))
+        })?;
+    let mut normalized = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(value) => normalized.push(value),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(KernelError::Runtime(format!(
+                    "runtime artifact '{}' is outside the runtime root",
+                    artifact.path.display()
+                )));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(KernelError::Runtime(format!(
+            "runtime artifact '{}' is not a regular file",
+            artifact.path.display()
+        )));
+    }
+    Ok(normalized)
+}
+
+fn open_runtime_artifact_source(
+    artifact_root: &Path,
+    artifact: &RuntimeArtifact,
+) -> Result<std::fs::File, KernelError> {
+    let relative = runtime_artifact_relative_path(artifact_root, artifact)?;
+    open_regular_file_beneath_root(artifact_root, &relative, &artifact.path)
+}
+
+#[cfg(target_os = "linux")]
+fn open_regular_file_beneath_root(
+    root: &Path,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<std::fs::File, KernelError> {
+    use rustix::fs::{open, openat2, Mode, OFlags, ResolveFlags};
+
+    let root = open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|err| {
+        KernelError::Runtime(format!(
+            "runtime artifact root '{}' is not readable: {err}",
+            root.display()
+        ))
+    })?;
+    let file = openat2(
+        &root,
+        relative,
+        OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+    )
+    .map_err(|err| {
+        KernelError::Runtime(format!(
+            "runtime artifact '{}' is not readable: {err}",
+            display_path.display()
+        ))
+    })?;
+    let file = std::fs::File::from(file);
+    let metadata = file.metadata().map_err(|err| {
+        KernelError::Runtime(format!(
+            "runtime artifact '{}' is not readable: {err}",
+            display_path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(KernelError::Runtime(format!(
+            "runtime artifact '{}' is not a regular file",
+            display_path.display()
+        )));
+    }
+    Ok(file)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_regular_file_beneath_root(
+    root: &Path,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<std::fs::File, KernelError> {
+    let path = root.join(relative);
+    let file = std::fs::File::open(&path).map_err(|err| {
+        KernelError::Runtime(format!(
+            "runtime artifact '{}' is not readable: {err}",
+            display_path.display()
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|err| {
+        KernelError::Runtime(format!(
+            "runtime artifact '{}' is not readable: {err}",
+            display_path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(KernelError::Runtime(format!(
+            "runtime artifact '{}' is not a regular file",
+            display_path.display()
+        )));
+    }
+    let canonical = std::fs::canonicalize(&path).map_err(|err| {
+        KernelError::Runtime(format!(
+            "runtime artifact '{}' is not readable: {err}",
+            display_path.display()
+        ))
+    })?;
+    if !canonical.starts_with(root) {
+        return Err(KernelError::Runtime(format!(
+            "runtime artifact '{}' is outside the runtime root",
+            display_path.display()
+        )));
+    }
+    Ok(file)
 }
 
 fn internal(err: anyhow::Error) -> KernelError {
@@ -11481,7 +11772,11 @@ impl Kernel {
             return Err(problem);
         }
         let attachments = match self
-            .prepare_runtime_artifact_attachments(context.turn_id, &runtime_artifacts)
+            .prepare_runtime_artifact_attachments_beneath(
+                context.turn_id,
+                &context.runtime_state_root,
+                &runtime_artifacts,
+            )
             .await
             .map_err(runtime_channel_send_kernel_problem)
         {
@@ -11641,9 +11936,37 @@ impl Kernel {
         .await;
     }
 
+    async fn canonical_runtime_root(&self) -> Result<PathBuf, KernelError> {
+        let runtime_root = self.runtime_root.as_ref().ok_or_else(|| {
+            KernelError::Runtime(
+                "runtime root is required to publish runtime artifacts".to_string(),
+            )
+        })?;
+        tokio::fs::canonicalize(runtime_root).await.map_err(|err| {
+            KernelError::Runtime(format!(
+                "runtime root '{}' is not readable: {err}",
+                runtime_root.display()
+            ))
+        })
+    }
+
     async fn prepare_runtime_artifact_attachments(
         &self,
         turn_id: Uuid,
+        artifacts: &[RuntimeArtifact],
+    ) -> Result<Vec<ChannelDeliveryAttachment>, KernelError> {
+        if artifacts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let runtime_root = self.canonical_runtime_root().await?;
+        self.prepare_runtime_artifact_attachments_beneath(turn_id, &runtime_root, artifacts)
+            .await
+    }
+
+    async fn prepare_runtime_artifact_attachments_beneath(
+        &self,
+        turn_id: Uuid,
+        artifact_root: &Path,
         artifacts: &[RuntimeArtifact],
     ) -> Result<Vec<ChannelDeliveryAttachment>, KernelError> {
         if artifacts.is_empty() {
@@ -11654,18 +11977,22 @@ impl Kernel {
                 "runtime artifacts exceeds {MAX_CHANNEL_OUTBOX_ATTACHMENTS_PER_DELIVERY} per delivery"
             )));
         }
-        let runtime_root = self.runtime_root.as_ref().ok_or_else(|| {
-            KernelError::Runtime(
-                "runtime root is required to publish runtime artifacts".to_string(),
-            )
-        })?;
-        let runtime_root_canonical =
-            tokio::fs::canonicalize(runtime_root).await.map_err(|err| {
-                KernelError::Runtime(format!(
-                    "runtime root '{}' is not readable: {err}",
-                    runtime_root.display()
-                ))
-            })?;
+        let runtime_root_canonical = self.canonical_runtime_root().await?;
+        let artifact_root_canonical =
+            tokio::fs::canonicalize(artifact_root)
+                .await
+                .map_err(|err| {
+                    KernelError::Runtime(format!(
+                        "runtime artifact root '{}' is not readable: {err}",
+                        artifact_root.display()
+                    ))
+                })?;
+        if !artifact_root_canonical.starts_with(&runtime_root_canonical) {
+            return Err(KernelError::Runtime(format!(
+                "runtime artifact root '{}' is outside the runtime root",
+                artifact_root.display()
+            )));
+        }
         let turn_id = turn_id.to_string();
         let delivery_root = ensure_safe_child_directory(
             &runtime_root_canonical,
@@ -11677,7 +12004,7 @@ impl Kernel {
         for artifact in artifacts {
             attachments.push(
                 self.copy_runtime_artifact_for_delivery(
-                    &runtime_root_canonical,
+                    &artifact_root_canonical,
                     &delivery_root,
                     artifact,
                 )
@@ -11689,38 +12016,17 @@ impl Kernel {
 
     async fn copy_runtime_artifact_for_delivery(
         &self,
-        runtime_root: &Path,
+        artifact_root: &Path,
         delivery_root: &Path,
         artifact: &RuntimeArtifact,
     ) -> Result<ChannelDeliveryAttachment, KernelError> {
-        let canonical_artifact = tokio::fs::canonicalize(&artifact.path)
-            .await
-            .map_err(|err| {
-                KernelError::Runtime(format!(
-                    "runtime artifact '{}' is not readable: {err}",
-                    artifact.path.display()
-                ))
-            })?;
-        if !canonical_artifact.starts_with(runtime_root) {
-            return Err(KernelError::Runtime(format!(
-                "runtime artifact '{}' is outside the runtime root",
+        let source = open_runtime_artifact_source(artifact_root, artifact)?;
+        let metadata = source.metadata().map_err(|err| {
+            KernelError::Runtime(format!(
+                "runtime artifact '{}' is not readable: {err}",
                 artifact.path.display()
-            )));
-        }
-        let metadata = tokio::fs::symlink_metadata(&artifact.path)
-            .await
-            .map_err(|err| {
-                KernelError::Runtime(format!(
-                    "runtime artifact '{}' is not readable: {err}",
-                    artifact.path.display()
-                ))
-            })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(KernelError::Runtime(format!(
-                "runtime artifact '{}' is not a regular file",
-                artifact.path.display()
-            )));
-        }
+            ))
+        })?;
         if usize::try_from(metadata.len()).unwrap_or(usize::MAX)
             > MAX_CHANNEL_OUTBOX_ATTACHMENT_BYTES
         {
@@ -11731,16 +12037,14 @@ impl Kernel {
         }
 
         let filename = runtime_artifact_filename(artifact);
-        let destination = unique_child_path(delivery_root, &filename).await?;
-        tokio::fs::copy(&canonical_artifact, &destination)
-            .await
-            .map_err(|err| {
-                KernelError::Runtime(format!(
-                    "failed to copy runtime artifact '{}' to '{}': {err}",
-                    artifact.path.display(),
-                    destination.display()
-                ))
-            })?;
+        let destination = copy_file_to_unique_child(
+            source,
+            &artifact.path,
+            delivery_root,
+            &filename,
+            MAX_CHANNEL_OUTBOX_ATTACHMENT_BYTES,
+        )
+        .await?;
 
         Ok(ChannelDeliveryAttachment {
             attachment_id: artifact.artifact_id.clone(),
