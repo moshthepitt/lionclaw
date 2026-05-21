@@ -2521,21 +2521,14 @@ class TelegramWorker:
         return self._target_for_ref(event.peer_id)
 
     async def _process_outbox_delivery(self, delivery: OutboxDelivery) -> None:
-        if (
-            self._outbox_receipts_dirty
-            and delivery.delivery_id not in self._outbox_receipts
-        ):
-            self._save_outbox_receipts()
+        if self._outbox_receipts_dirty and not self._save_outbox_receipts():
+            return
         receipt_record = self._outbox_receipt_for_delivery(delivery)
         if receipt_record is not None and receipt_record.status == "delivered":
-            await self._complete_progress_for_delivery(delivery)
-            accepted = await self._report_outbox_with_retry(
+            await self._report_delivered_outbox_when_durable(
                 delivery,
-                "delivered",
-                provider_receipt=receipt_record.provider_receipt,
+                receipt_record.provider_receipt,
             )
-            if accepted:
-                self._forget_outbox_receipt(delivery.delivery_id)
             return
 
         try:
@@ -2571,11 +2564,22 @@ class TelegramWorker:
             return
 
         self._remember_outbox_receipt(delivery.delivery_id, "delivered", receipt)
+        await self._report_delivered_outbox_when_durable(delivery, receipt)
+
+    async def _report_delivered_outbox_when_durable(
+        self,
+        delivery: OutboxDelivery,
+        provider_receipt: dict[str, object],
+    ) -> None:
+        if not self._save_outbox_receipts():
+            return
         await self._complete_progress_for_delivery(delivery)
+        if not self._flush_turn_state():
+            return
         accepted = await self._report_outbox_with_retry(
             delivery,
             "delivered",
-            provider_receipt=receipt,
+            provider_receipt=provider_receipt,
         )
         if accepted:
             self._forget_outbox_receipt(delivery.delivery_id)
@@ -2635,9 +2639,20 @@ class TelegramWorker:
                 "partial",
                 partial_receipt,
             )
+            if not self._save_outbox_receipts():
+                return
             report_receipt = partial_receipt
         elif outcome == "terminal_failed":
             self._forget_outbox_receipt(delivery.delivery_id)
+            if not self._save_outbox_receipts():
+                return
+        if outcome == "terminal_failed":
+            await self._terminalize_progress_for_delivery_failure(
+                delivery,
+                _delivery_failure_progress_text(error_code),
+            )
+            if not self._flush_turn_state():
+                return
         accepted = await self._report_outbox_with_retry(
             delivery,
             outcome,
@@ -2647,10 +2662,6 @@ class TelegramWorker:
         )
         if accepted and outcome == "terminal_failed":
             self._forget_outbox_receipt(delivery.delivery_id)
-            await self._terminalize_progress_for_delivery_failure(
-                delivery,
-                _delivery_failure_progress_text(error_code),
-            )
 
     def _remember_outbox_receipt(
         self,

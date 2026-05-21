@@ -7244,12 +7244,13 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             delete_store = FailingOnceProgressDeleteStore(
                 Path(temp_dir) / "telegram.progress-deletes.json"
             )
+            api = FakeLionClawApi()
             first_telegram = FakeTelegramTransport(
                 delete_errors=[RuntimeError("temporary delete failure")]
             )
             first_worker = TelegramWorker(
                 config=build_config(Path(temp_dir)),
-                lionclaw_api=FakeLionClawApi(),
+                lionclaw_api=api,
                 telegram=first_telegram,
                 offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
                 progress_delete_store=delete_store,
@@ -7266,37 +7267,27 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                         content=OutboxContent(text="final answer"),
                     )
                 )
-            self.assertEqual(delete_store.load(), {})
+            expected_pending_delete = {
+                ("telegram:chat:77", progress_ref): PendingProgressDelete(
+                    turn_id="turn-1",
+                    conversation_ref="telegram:chat:77",
+                    message_ref=progress_ref,
+                    attempts=1,
+                    next_attempt_at=0.0,
+                )
+            }
+            self.assertEqual(delete_store.load(), expected_pending_delete)
+            self.assertEqual(api.outbox_reports[0][2], "delivered")
 
+            pending_delete = next(iter(first_worker._pending_progress_deletes.values()))
+            pending_delete.next_attempt_at = 0.0
             await first_worker.refresh_progress_messages()
+
             self.assertEqual(
-                delete_store.load(),
-                {
-                    ("telegram:chat:77", progress_ref): PendingProgressDelete(
-                        turn_id="turn-1",
-                        conversation_ref="telegram:chat:77",
-                        message_ref=progress_ref,
-                        attempts=1,
-                        next_attempt_at=0.0,
-                    )
-                },
+                first_telegram.deleted_messages,
+                [("telegram:chat:77", progress_ref)],
             )
-
-            second_telegram = FakeTelegramTransport()
-            second_worker = TelegramWorker(
-                config=build_config(Path(temp_dir)),
-                lionclaw_api=FakeLionClawApi(),
-                telegram=second_telegram,
-                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
-                progress_delete_store=delete_store,
-            )
-            await second_worker.refresh_progress_messages()
-
-        self.assertEqual(
-            second_telegram.deleted_messages,
-            [("telegram:chat:77", progress_ref)],
-        )
-        self.assertEqual(delete_store.load(), {})
+            self.assertEqual(delete_store.load(), {})
 
     async def test_permanent_progress_delete_failure_is_not_retried(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -8237,17 +8228,6 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_delivered_outbox_receipt_save_failure_is_retried_without_resend(
         self,
     ) -> None:
-        class FailingOnceOutboxReceiptStore(OutboxReceiptStore):
-            def __init__(self, path: Path) -> None:
-                super().__init__(path)
-                self.failures_remaining = 1
-
-            def save(self, receipts: dict[str, OutboxReceiptRecord]) -> None:
-                if self.failures_remaining > 0:
-                    self.failures_remaining -= 1
-                    raise RuntimeError("receipt store unavailable")
-                super().save(receipts)
-
         class NormalizedReceiptTelegramTransport(FakeTelegramTransport):
             async def send_message(
                 self,
@@ -8286,8 +8266,9 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             content=OutboxContent(text="final answer"),
         )
         with tempfile.TemporaryDirectory() as temp_dir:
-            receipt_store = FailingOnceOutboxReceiptStore(
-                Path(temp_dir) / "telegram.outbox-receipts.json"
+            receipt_store = FailingOutboxReceiptStore(
+                Path(temp_dir) / "telegram.outbox-receipts.json",
+                failures=1,
             )
             api = FakeLionClawApi(
                 outbox_report_errors=[
@@ -8314,7 +8295,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await worker._process_outbox_delivery(delivery)
 
-            self.assertEqual(receipt_store.load(), {})
+            self.assertIn("delivery-1", receipt_store.load())
             with (
                 self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"),
                 patch("lionclaw_channel_telegram.worker.asyncio.sleep", no_sleep),
@@ -8341,6 +8322,77 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 )
             },
         )
+
+    async def test_delivered_outbox_report_waits_for_durable_turn_state(self) -> None:
+        delivery = OutboxDelivery(
+            delivery_id="delivery-1",
+            attempt_id="attempt-1",
+            conversation_ref="telegram:chat:77",
+            turn_id="turn-1",
+            content=OutboxContent(text="final answer"),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            active_store = FailingActiveTurnStore(
+                Path(temp_dir) / "telegram.active-turns.json",
+                failures=0,
+            )
+            receipt_store = OutboxReceiptStore(
+                Path(temp_dir) / "telegram.outbox-receipts.json"
+            )
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                active_turn_store=active_store,
+                outbox_receipt_store=receipt_store,
+            )
+            await self._record_active_turn(worker)
+
+            active_store.failures_remaining = 2
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker._process_outbox_delivery(delivery)
+
+            self.assertEqual(api.outbox_reports, [])
+            self.assertEqual(
+                telegram.sent_messages,
+                [("telegram:chat:77", "final answer", None, None, [])],
+            )
+            self.assertEqual(
+                [turn.turn_id for turn in active_store.load()],
+                ["turn-1"],
+            )
+            self.assertIn("delivery-1", receipt_store.load())
+
+            await worker._process_outbox_delivery(
+                replace(delivery, attempt_id="attempt-2")
+            )
+
+            self.assertEqual(
+                telegram.sent_messages,
+                [("telegram:chat:77", "final answer", None, None, [])],
+            )
+            self.assertEqual(
+                api.outbox_reports,
+                [
+                    (
+                        "delivery-1",
+                        "attempt-2",
+                        "delivered",
+                        {
+                            "message_id": 101,
+                            "chat_id": "77",
+                            "messages": [{"message_id": 101, "chat_id": "77"}],
+                        },
+                        None,
+                        None,
+                    )
+                ],
+            )
+            self.assertEqual(active_store.load(), [])
+            self.assertEqual(receipt_store.load(), {})
 
     async def test_mismatched_delivered_outbox_receipt_is_discarded_before_replay(
         self,
@@ -8718,6 +8770,63 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram.deleted_messages, [])
         self.assertNotIn("turn-1", worker._active_turns)
         self.assertEqual(worker._route_turns, {})
+
+    async def test_terminal_outbox_failure_report_waits_for_durable_turn_state(
+        self,
+    ) -> None:
+        delivery = OutboxDelivery(
+            delivery_id="delivery-1",
+            attempt_id="attempt-1",
+            conversation_ref="telegram:chat:77",
+            turn_id="turn-1",
+            content=OutboxContent(text="final answer"),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            active_store = FailingActiveTurnStore(
+                Path(temp_dir) / "telegram.active-turns.json",
+                failures=0,
+            )
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                active_turn_store=active_store,
+            )
+            await self._record_active_turn(worker)
+
+            active_store.failures_remaining = 3
+            telegram.send_message_error = TelegramReferenceError("bad ref")
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker._process_outbox_delivery(delivery)
+
+            self.assertEqual(api.outbox_reports, [])
+            self.assertEqual(
+                [turn.turn_id for turn in active_store.load()],
+                ["turn-1"],
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker._process_outbox_delivery(
+                    replace(delivery, attempt_id="attempt-2")
+                )
+
+            self.assertEqual(
+                api.outbox_reports,
+                [
+                    (
+                        "delivery-1",
+                        "attempt-2",
+                        "terminal_failed",
+                        None,
+                        "telegram.invalid_ref",
+                        "bad ref",
+                    )
+                ],
+            )
+            self.assertEqual(active_store.load(), [])
 
     async def test_retryable_outbox_failure_keeps_visible_progress_for_retry(
         self,
@@ -9726,6 +9835,18 @@ class FailingActiveTurnStore(ActiveTurnStore):
             self.failures_remaining -= 1
             raise RuntimeError("active turn store unavailable")
         super().save(active_turns)
+
+
+class FailingOutboxReceiptStore(OutboxReceiptStore):
+    def __init__(self, path: Path, *, failures: int) -> None:
+        super().__init__(path)
+        self.failures_remaining = failures
+
+    def save(self, receipts: dict[str, OutboxReceiptRecord]) -> None:
+        if self.failures_remaining > 0:
+            self.failures_remaining -= 1
+            raise RuntimeError("receipt store unavailable")
+        super().save(receipts)
 
 
 class FakeLionClawApi:
