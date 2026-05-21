@@ -3845,6 +3845,68 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 [update.text for update in api.sent_inbound], ["first\n\nsecond"]
             )
 
+    async def test_coalesced_polling_offsets_are_persisted_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 951,
+                            "message": {
+                                "message_id": 51,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "first",
+                            },
+                        }
+                    ),
+                    Update.model_validate(
+                        {
+                            "update_id": 952,
+                            "message": {
+                                "message_id": 52,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "second",
+                            },
+                        }
+                    ),
+                ]
+            )
+            offset_path = Path(temp_dir) / "telegram.offset"
+            offset_store = SelectiveFailingOffsetStore(
+                offset_path,
+                fail_offsets={953},
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=offset_store,
+            )
+
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                await worker.process_updates()
+
+            self.assertEqual(offset_store.attempted_offsets, [953])
+            self.assertEqual(worker.offset, 0)
+            self.assertFalse(offset_path.exists())
+            self.assertEqual(
+                [update.text for update in api.sent_inbound],
+                ["first\n\nsecond"],
+            )
+
     async def test_malformed_update_is_quarantined_and_offset_advances(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
@@ -10010,6 +10072,19 @@ class FakeLionClawApi:
 class FailingOffsetStore(OffsetStore):
     def save(self, offset: int) -> None:
         raise RuntimeError(f"cannot persist offset {offset}")
+
+
+class SelectiveFailingOffsetStore(OffsetStore):
+    def __init__(self, path: Path, *, fail_offsets: set[int]) -> None:
+        super().__init__(path)
+        self.fail_offsets = set(fail_offsets)
+        self.attempted_offsets: list[int] = []
+
+    def save(self, offset: int) -> None:
+        self.attempted_offsets.append(offset)
+        if offset in self.fail_offsets:
+            raise RuntimeError(f"cannot persist offset {offset}")
+        super().save(offset)
 
 
 class MalformedTelegramUpdate:

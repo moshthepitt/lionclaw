@@ -1216,18 +1216,20 @@ class TelegramWorker:
         return True
 
     def _save_processed_offsets(self, update_ids: tuple[int, ...]) -> bool:
+        if not update_ids:
+            return True
         for update_id in update_ids:
             self._record_processed_update(update_id)
-            next_offset = update_id + 1
-            try:
-                self.offset_store.save(next_offset)
-            except Exception:
-                logger.exception(
-                    "telegram offset save failed for update_id=%s",
-                    update_id,
-                )
-                return False
-            self.offset = next_offset
+        next_offset = max(update_ids) + 1
+        try:
+            self.offset_store.save(next_offset)
+        except Exception:
+            logger.exception(
+                "telegram offset save failed for update_ids=%s",
+                update_ids,
+            )
+            return False
+        self.offset = next_offset
         return True
 
     def _record_processed_updates(self, update_ids: tuple[int, ...]) -> None:
