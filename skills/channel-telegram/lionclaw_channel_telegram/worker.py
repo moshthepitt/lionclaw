@@ -86,6 +86,7 @@ MAX_PENDING_PROGRESS_DELETES = 256
 PRIVATE_STORE_FILE_MODE = 0o600
 TEXT_BURST_MAX_SECONDS = 10
 WEBHOOK_COALESCE_DELAY_SECONDS = 0.35
+MAX_WEBHOOK_RECENT_UPDATE_IDS = 4096
 
 LOCAL_TELEGRAM_COMMANDS = {
     "help",
@@ -725,6 +726,8 @@ class TelegramWorker:
         self._delivery_failure_counts: dict[str, int] = {}
         self._webhook_batches: dict[WebhookBatchKey, WebhookBatch] = {}
         self._webhook_route_gates: dict[WebhookRouteKey, WebhookRouteGate] = {}
+        self._webhook_update_results: dict[int, asyncio.Future[bool]] = {}
+        self._webhook_recent_update_ids: dict[int, None] = {}
         self._webhook_state_lock = asyncio.Lock()
 
     async def process_updates(self) -> None:
@@ -754,25 +757,65 @@ class TelegramWorker:
         await self._process_provider_work_items(work_items, persist_offsets=True)
 
     async def process_webhook_update(self, update: Update) -> bool:
-        try:
-            bot_identity = await self.telegram.bot_identity()
-        except Exception as err:
-            self._record_webhook_failure(err)
-            logger.exception("telegram getMe request failed for webhook update")
-            return False
+        owns_update, update_result = await self._begin_webhook_update(update.update_id)
+        if not owns_update:
+            return await asyncio.shield(update_result)
 
-        item = ProviderWorkItem(
-            (update.update_id,),
-            self._extract_provider_event(update, bot_identity),
-        )
-        processed = await self._process_webhook_work_item(item)
-        if processed:
-            self._record_webhook_success()
-        else:
-            self._record_webhook_failure(
-                RuntimeError("webhook update processing failed")
+        processed = False
+        try:
+            try:
+                bot_identity = await self.telegram.bot_identity()
+            except Exception as err:
+                self._record_webhook_failure(err)
+                logger.exception("telegram getMe request failed for webhook update")
+                return False
+            item = ProviderWorkItem(
+                (update.update_id,),
+                self._extract_provider_event(update, bot_identity),
             )
-        return processed
+            processed = await self._process_webhook_work_item(item)
+            if processed:
+                self._record_webhook_success()
+            else:
+                self._record_webhook_failure(
+                    RuntimeError("webhook update processing failed")
+                )
+            return processed
+        finally:
+            await self._finish_webhook_update(update.update_id, processed)
+
+    async def _begin_webhook_update(
+        self,
+        update_id: int,
+    ) -> tuple[bool, asyncio.Future[bool]]:
+        async with self._webhook_state_lock:
+            if update_id in self._webhook_recent_update_ids:
+                return False, _resolved_bool_future(True)
+            result = self._webhook_update_results.get(update_id)
+            if result is not None:
+                return False, result
+            result = asyncio.get_running_loop().create_future()
+            self._webhook_update_results[update_id] = result
+            return True, result
+
+    async def _finish_webhook_update(
+        self,
+        update_id: int,
+        processed: bool,
+    ) -> None:
+        async with self._webhook_state_lock:
+            result = self._webhook_update_results.pop(update_id, None)
+            if processed:
+                self._remember_webhook_update_locked(update_id)
+        if result is not None and not result.done():
+            result.set_result(processed)
+
+    def _remember_webhook_update_locked(self, update_id: int) -> None:
+        self._webhook_recent_update_ids[update_id] = None
+        while len(self._webhook_recent_update_ids) > MAX_WEBHOOK_RECENT_UPDATE_IDS:
+            self._webhook_recent_update_ids.pop(
+                next(iter(self._webhook_recent_update_ids))
+            )
 
     async def _process_webhook_work_item(self, item: ProviderWorkItem) -> bool:
         key = _webhook_batch_key(item.event)
@@ -1006,6 +1049,14 @@ class TelegramWorker:
         if flush_tasks:
             await asyncio.gather(*flush_tasks, return_exceptions=True)
 
+    async def _reject_all_webhook_updates(self) -> None:
+        async with self._webhook_state_lock:
+            results = list(self._webhook_update_results.values())
+            self._webhook_update_results.clear()
+        for result in results:
+            if not result.done():
+                result.set_result(False)
+
     async def _reject_later_webhook_route_batches(
         self,
         batch: WebhookBatch,
@@ -1151,6 +1202,7 @@ class TelegramWorker:
             self._typing_routes.clear()
             self._typing_failures.clear()
             await self._reject_all_webhook_batches()
+            await self._reject_all_webhook_updates()
             self._active_turns.clear()
             self._pending_progress_deletes.clear()
             self._route_turns.clear()
@@ -3369,6 +3421,12 @@ def _overall_health_status(checks: list[HealthCheck]) -> str:
     if "warning" in statuses:
         return "warning"
     return "ok"
+
+
+def _resolved_bool_future(value: bool) -> asyncio.Future[bool]:
+    future = asyncio.get_running_loop().create_future()
+    future.set_result(value)
+    return future
 
 
 def _loop_time() -> float:
