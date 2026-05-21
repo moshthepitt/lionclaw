@@ -119,6 +119,7 @@ CALLBACK_ACTION_CODES = {
 CALLBACK_CODE_ACTIONS = {code: action for action, code in CALLBACK_ACTION_CODES.items()}
 CALLBACK_ROUTE_TARGET = "_"
 CALLBACK_ROUTE_TARGET_PREFIX = "route."
+CALLBACK_MAC_BYTES = 12
 REACTION_RECEIVED = "👀"
 REACTION_COMPLETED = "✅"
 REACTION_STOPPED = "👌"
@@ -2907,7 +2908,11 @@ def _callback_mac(
         ]
     ).encode("utf-8")
     digest = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(digest[:6]).decode("ascii").rstrip("=")
+    return (
+        base64.urlsafe_b64encode(digest[:CALLBACK_MAC_BYTES])
+        .decode("ascii")
+        .rstrip("=")
+    )
 
 
 def _constant_time_ascii_equals(actual: str, expected: str) -> bool:

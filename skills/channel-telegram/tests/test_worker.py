@@ -7,6 +7,7 @@ import os
 import stat
 import tempfile
 import unittest
+import uuid
 from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -4822,6 +4823,47 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(telegram.sent_buttons[-1][0].action.startswith("lc1:s:turn-1:"))
         self.assertTrue(telegram.sent_buttons[-1][1].action.startswith("lc1:t:turn-1:"))
+
+    async def test_callback_payloads_use_strong_mac_within_telegram_limit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=FakeLionClawApi(),
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            active = ActiveTurn(
+                turn_id=str(uuid.uuid4()),
+                session_id=str(uuid.uuid4()),
+                session_key="channel:telegram:thread:-1001234567890:987654321",
+                sender_ref="telegram:user:123456789",
+                target=TypingTarget(
+                    "telegram:chat:-1001234567890",
+                    "telegram:topic:987654321",
+                ),
+                reply_to_ref="telegram:message:42",
+                generation=1,
+                visible_after=0.0,
+            )
+
+            stop_payload = worker._callback_payload(
+                "stop",
+                active.target,
+                actor_ref=active.sender_ref,
+                active=active,
+            )
+            route_payload = worker._callback_payload(
+                "continue",
+                active.target,
+                actor_ref=active.sender_ref,
+            )
+
+        for payload in (stop_payload, route_payload):
+            mac = payload.rsplit(":", 1)[1]
+            self.assertLessEqual(len(payload.encode("utf-8")), 64)
+            self.assertEqual(len(mac), 16)
 
     async def test_stop_callback_cancels_active_turn_with_expected_turn_guard(
         self,
