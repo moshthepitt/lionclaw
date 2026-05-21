@@ -731,6 +731,7 @@ class TelegramWorker:
         self._outbox_receipts = (
             outbox_receipt_store.load() if outbox_receipt_store is not None else {}
         )
+        self._outbox_receipts_dirty = False
         self.progress_delete_store = progress_delete_store
         self.webhook_update_store = webhook_update_store
         self._typing_targets: dict[tuple[str, str | None], TypingTarget] = {}
@@ -2477,6 +2478,11 @@ class TelegramWorker:
         return self._target_for_ref(event.peer_id)
 
     async def _process_outbox_delivery(self, delivery: OutboxDelivery) -> None:
+        if (
+            self._outbox_receipts_dirty
+            and delivery.delivery_id not in self._outbox_receipts
+        ):
+            self._save_outbox_receipts()
         receipt_record = self._outbox_receipt_for_delivery(delivery)
         if receipt_record is not None and receipt_record.status == "delivered":
             await self._complete_progress_for_delivery(delivery)
@@ -2552,12 +2558,15 @@ class TelegramWorker:
             self._forget_outbox_receipt(delivery.delivery_id)
             return None
         if provider_receipt == receipt_record.provider_receipt:
+            if self._outbox_receipts_dirty:
+                self._save_outbox_receipts()
             return receipt_record
         normalized = OutboxReceiptRecord(
             status=receipt_record.status,
             provider_receipt=provider_receipt,
         )
         self._outbox_receipts[delivery.delivery_id] = normalized
+        self._outbox_receipts_dirty = True
         self._save_outbox_receipts()
         return normalized
 
@@ -2612,19 +2621,27 @@ class TelegramWorker:
         )
         while len(self._outbox_receipts) > MAX_OUTBOX_RECEIPTS:
             self._outbox_receipts.pop(next(iter(self._outbox_receipts)))
+        self._outbox_receipts_dirty = True
         self._save_outbox_receipts()
 
     def _forget_outbox_receipt(self, delivery_id: str) -> None:
         if self._outbox_receipts.pop(delivery_id, None) is not None:
+            self._outbox_receipts_dirty = True
             self._save_outbox_receipts()
 
-    def _save_outbox_receipts(self) -> None:
+    def _save_outbox_receipts(self) -> bool:
+        if not self._outbox_receipts_dirty:
+            return True
         if self.outbox_receipt_store is None:
-            return
+            self._outbox_receipts_dirty = False
+            return True
         try:
             self.outbox_receipt_store.save(self._outbox_receipts)
         except Exception:
             logger.exception("telegram outbox receipt store save failed")
+            return False
+        self._outbox_receipts_dirty = False
+        return True
 
     async def _complete_progress_for_delivery(self, delivery: OutboxDelivery) -> None:
         if delivery.turn_id is None:

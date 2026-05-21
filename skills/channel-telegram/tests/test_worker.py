@@ -7879,6 +7879,114 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(receipt_store.load(), {})
 
+    async def test_delivered_outbox_receipt_save_failure_is_retried_without_resend(
+        self,
+    ) -> None:
+        class FailingOnceOutboxReceiptStore(OutboxReceiptStore):
+            def __init__(self, path: Path) -> None:
+                super().__init__(path)
+                self.failures_remaining = 1
+
+            def save(self, receipts: dict[str, OutboxReceiptRecord]) -> None:
+                if self.failures_remaining > 0:
+                    self.failures_remaining -= 1
+                    raise RuntimeError("receipt store unavailable")
+                super().save(receipts)
+
+        class NormalizedReceiptTelegramTransport(FakeTelegramTransport):
+            async def send_message(
+                self,
+                conversation_ref: str,
+                text: str,
+                reply_to_ref: str | None = None,
+                thread_ref: str | None = None,
+                format_hint: str = "plain",
+                attachments: Sequence[TelegramOutboundAttachment] = (),
+                resume_receipt: dict[str, object] | None = None,
+                buttons: Sequence[TelegramActionButton] = (),
+            ) -> dict[str, object]:
+                await super().send_message(
+                    conversation_ref,
+                    text,
+                    reply_to_ref,
+                    thread_ref,
+                    format_hint,
+                    attachments,
+                    resume_receipt,
+                    buttons,
+                )
+                return {
+                    "message_id": 101,
+                    "chat_id": "77",
+                    "messages": [{"message_id": 101, "chat_id": "77"}],
+                }
+
+        async def no_sleep(_delay: float) -> None:
+            return None
+
+        delivery = OutboxDelivery(
+            delivery_id="delivery-1",
+            attempt_id="attempt-1",
+            conversation_ref="telegram:user:77",
+            content=OutboxContent(text="final answer"),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            receipt_store = FailingOnceOutboxReceiptStore(
+                Path(temp_dir) / "telegram.outbox-receipts.json"
+            )
+            api = FakeLionClawApi(
+                outbox_report_errors=[
+                    RuntimeError("kernel unavailable"),
+                    RuntimeError("kernel unavailable"),
+                    RuntimeError("kernel unavailable"),
+                    RuntimeError("kernel unavailable"),
+                    RuntimeError("kernel unavailable"),
+                    RuntimeError("kernel unavailable"),
+                ]
+            )
+            telegram = NormalizedReceiptTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                outbox_receipt_store=receipt_store,
+            )
+
+            with (
+                self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"),
+                patch("lionclaw_channel_telegram.worker.asyncio.sleep", no_sleep),
+            ):
+                await worker._process_outbox_delivery(delivery)
+
+            self.assertEqual(receipt_store.load(), {})
+            with (
+                self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"),
+                patch("lionclaw_channel_telegram.worker.asyncio.sleep", no_sleep),
+            ):
+                await worker._process_outbox_delivery(
+                    replace(delivery, attempt_id="attempt-2")
+                )
+            stored_receipts = receipt_store.load()
+
+        self.assertEqual(
+            telegram.sent_messages,
+            [("telegram:user:77", "final answer", None, None, [])],
+        )
+        self.assertEqual(
+            stored_receipts,
+            {
+                "delivery-1": OutboxReceiptRecord(
+                    status="delivered",
+                    provider_receipt={
+                        "message_id": 101,
+                        "chat_id": "77",
+                        "messages": [{"message_id": 101, "chat_id": "77"}],
+                    },
+                )
+            },
+        )
+
     async def test_mismatched_delivered_outbox_receipt_is_discarded_before_replay(
         self,
     ) -> None:
