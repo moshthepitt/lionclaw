@@ -1076,35 +1076,42 @@ fn inspect_runtime_config_with_podman_resolver<F>(
         return;
     };
 
-    if let Err(err) = profile.validate() {
-        findings.push(
-            DoctorFinding::error(
-                FindingKind::Runtime,
-                format!("runtime profile \"{runtime_id}\" is invalid for instance \"{name}\""),
-                format!("instance {name} runtime profile {runtime_id}"),
-                err.to_string(),
-            )
-            .with_inspect(commands.selected("status"))
-            .with_repair(default_runtime_repair),
-        );
-    } else if let Err(err) = validate_runtime_profile_mounts(
-        &LionClawHome::new(home.to_path_buf()),
-        project_root,
-        work_root,
-        profile,
-    ) {
-        findings.push(
-            DoctorFinding::error(
+    let home = LionClawHome::new(home.to_path_buf());
+    for (configured_runtime_id, configured_profile) in &config.runtimes {
+        if let Err(err) =
+            validate_runtime_profile_mounts(&home, project_root, work_root, configured_profile)
+        {
+            findings.push(
+                DoctorFinding::error(
+                    FindingKind::Runtime,
+                    format!(
+                        "runtime profile \"{configured_runtime_id}\" has invalid mounts for instance \"{name}\""
+                    ),
+                    format!("instance {name} runtime profile {configured_runtime_id} mounts"),
+                    err.to_string(),
+                )
+                .with_inspect(commands.selected(&format!(
+                    "runtime mount list {configured_runtime_id}"
+                )))
+                .with_repair(
+                    commands.selected(&format!("runtime mount remove {configured_runtime_id} <target>")),
+                ),
+            );
+        } else if let Err(err) = configured_profile.validate() {
+            let mut finding = DoctorFinding::error(
                 FindingKind::Runtime,
                 format!(
-                    "runtime profile \"{runtime_id}\" has invalid mounts for instance \"{name}\""
+                    "runtime profile \"{configured_runtime_id}\" is invalid for instance \"{name}\""
                 ),
-                format!("instance {name} runtime profile {runtime_id} mounts"),
+                format!("instance {name} runtime profile {configured_runtime_id}"),
                 err.to_string(),
             )
-            .with_inspect(commands.selected(&format!("runtime mount list {runtime_id}")))
-            .with_repair(commands.selected("runtime mount remove <runtime-id> <target>")),
-        );
+            .with_inspect(commands.selected("status"));
+            if configured_runtime_id == runtime_id {
+                finding = finding.with_repair(default_runtime_repair.clone());
+            }
+            findings.push(finding);
+        }
     }
 
     if let Some(guidance) = runtime_auth_guidance(profile) {
@@ -3198,6 +3205,70 @@ mod tests {
             .expect("invalid mount finding");
         assert_eq!(finding.severity, FindingSeverity::Error);
         assert!(finding.observed.contains("selected instance home"));
+    }
+
+    #[test]
+    fn doctor_reports_invalid_non_default_runtime_mounts() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project_root = temp_dir.path();
+        let home = project_root.join(".lionclaw/instances/main");
+        let engine = temp_dir.path().join("podman");
+        let missing = temp_dir.path().join("missing-docs");
+        fs::write(&engine, "#!/usr/bin/env bash\nexit 0\n").expect("fake podman");
+        fs::set_permissions(&engine, fs::Permissions::from_mode(0o755)).expect("chmod podman");
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime(
+            "codex".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "codex".to_string(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine: engine.to_string_lossy().to_string(),
+                    image: Some("lionclaw-runtime:v1".to_string()),
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+        let mut reviewer = config.runtimes.get("codex").expect("codex").clone();
+        let ConfinementConfig::Oci(oci) = reviewer.confinement_mut();
+        oci.additional_mounts.push(MountSpec {
+            source: missing,
+            target: "/mnt/docs".to_string(),
+            access: MountAccess::ReadOnly,
+        });
+        config.upsert_runtime("reviewer".to_string(), reviewer);
+        let commands = DoctorCommands::for_target(Some(project_root), "main", &home);
+        let mut findings = Vec::new();
+
+        inspect_runtime_config(
+            Some(project_root),
+            "main",
+            &home,
+            Some(project_root),
+            &commands,
+            &config,
+            &mut findings,
+        );
+
+        let finding = findings
+            .iter()
+            .find(|finding| finding.subject.contains("\"reviewer\" has invalid mounts"))
+            .expect("reviewer invalid mount finding");
+        assert_eq!(finding.severity, FindingSeverity::Error);
+        assert!(finding
+            .observed
+            .contains("runtime mount target '/mnt/docs'"));
+        assert!(finding
+            .runbook
+            .inspect
+            .contains("runtime mount list reviewer"));
+        assert!(finding
+            .runbook
+            .repair
+            .as_deref()
+            .expect("repair")
+            .contains("runtime mount remove reviewer <target>"));
     }
 
     fn assert_podman_configure_blocker(finding: &DoctorFinding) {

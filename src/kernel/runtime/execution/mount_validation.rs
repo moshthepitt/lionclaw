@@ -84,11 +84,13 @@ pub fn validate_configured_mounts(
 ) -> Result<(), String> {
     let mut seen_targets = BTreeSet::new();
     for mount in mounts {
-        let target = validate_configured_mount_target(&mount.target)?;
+        let target = validate_configured_mount_target(&mount.target)
+            .map_err(|err| format!("runtime mount target '{}' is invalid: {err}", mount.target))?;
         if !seen_targets.insert(target.clone()) {
             return Err(format!("duplicate runtime mount target '{target}'"));
         }
-        validate_configured_mount_source(&mount.source, protected_roots)?;
+        validate_configured_mount_source(&mount.source, protected_roots)
+            .map_err(|err| format!("runtime mount target '{target}' has invalid source: {err}"))?;
     }
     Ok(())
 }
@@ -249,6 +251,27 @@ mod tests {
         });
         let err = validate_configured_mounts(&duplicate, &[]).expect_err("duplicate");
         assert!(err.contains("duplicate runtime mount target"));
+
+        let missing = MountSpec {
+            source: temp_dir.path().join("missing"),
+            target: "/mnt/missing".to_string(),
+            access: MountAccess::ReadOnly,
+        };
+        let err = validate_configured_mounts(&[missing], &[]).expect_err("missing source");
+        assert!(err.contains("runtime mount target '/mnt/missing'"));
+        assert!(err.contains("failed to resolve mount source"));
+
+        let colon_source = temp_dir.path().join("docs:archive");
+        std::fs::create_dir(&colon_source).expect("colon source dir");
+        validate_configured_mounts(
+            &[MountSpec {
+                source: colon_source,
+                target: "/mnt/colon".to_string(),
+                access: MountAccess::ReadOnly,
+            }],
+            &[],
+        )
+        .expect("colon source is valid at the configured-mount layer");
     }
 
     #[test]

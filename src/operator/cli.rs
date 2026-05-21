@@ -995,13 +995,6 @@ pub async fn run() -> Result<ExitCode> {
                 match command {
                     RuntimeMountCommand::List(args) => {
                         let config = OperatorConfig::load(&home).await?;
-                        validate_configured_runtime_mounts(
-                            mount_context.home,
-                            mount_context.project_root,
-                            mount_context.work_root,
-                            &config,
-                            &args.runtime_id,
-                        )?;
                         let mounts = configured_runtime_mounts(&config, &args.runtime_id)?;
                         if mounts.is_empty() {
                             println!("no mounts configured for runtime {}", args.runtime_id);
@@ -1015,6 +1008,13 @@ pub async fn run() -> Result<ExitCode> {
                                 );
                             }
                         }
+                        validate_configured_runtime_mounts(
+                            mount_context.home,
+                            mount_context.project_root,
+                            mount_context.work_root,
+                            &config,
+                            &args.runtime_id,
+                        )?;
                     }
                     RuntimeMountCommand::Add(args) => {
                         let mut config = OperatorConfig::load(&home).await?;

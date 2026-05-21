@@ -283,8 +283,9 @@ fn prepare_oci_process_launch(
     }
 
     for mount in &request.plan.mounts {
-        args.push("--volume".to_string());
-        args.push(format_volume_spec(mount)?);
+        let (flag, spec) = format_bind_mount_arg(mount)?;
+        args.push(flag.to_string());
+        args.push(spec);
     }
 
     if workspace_lionclaw_metadata_mask_needed(&request.plan.mounts, &config.tmpfs) {
@@ -735,6 +736,43 @@ fn format_volume_spec(mount: &MountSpec) -> Result<String> {
     Ok(format!("{source}:{}:{access}", mount.target))
 }
 
+fn format_bind_mount_arg(mount: &MountSpec) -> Result<(&'static str, String)> {
+    let source = mount.source.to_str().ok_or_else(|| {
+        anyhow!(
+            "mount source '{}' is not valid UTF-8",
+            mount.source.display()
+        )
+    })?;
+    if source.contains(':') || mount.target.contains(':') {
+        return Ok(("--mount", format_mount_spec(source, mount)?));
+    }
+    Ok(("--volume", format_volume_spec(mount)?))
+}
+
+fn format_mount_spec(source: &str, mount: &MountSpec) -> Result<String> {
+    if source.contains(',') {
+        bail!(
+            "mount source '{}' contains both ':' and ',' and cannot be represented safely as an OCI bind mount argument",
+            mount.source.display()
+        );
+    }
+    if mount.target.contains(',') {
+        bail!(
+            "mount target '{}' contains both ':' and ',' and cannot be represented safely as an OCI bind mount argument",
+            mount.target
+        );
+    }
+
+    let access = match mount.access {
+        MountAccess::ReadOnly => "readonly,relabel=private",
+        MountAccess::ReadWrite => "rw,relabel=private",
+    };
+    Ok(format!(
+        "type=bind,src={source},target={},{}",
+        mount.target, access
+    ))
+}
+
 fn workspace_lionclaw_metadata_mask_needed(
     mounts: &[MountSpec],
     configured_tmpfs: &[String],
@@ -997,6 +1035,57 @@ mod tests {
             .args
             .windows(2)
             .any(|pair| { pair == ["--network".to_string(), "none".to_string()] }));
+    }
+
+    #[test]
+    fn oci_backend_uses_mount_arg_for_colon_paths() {
+        let mut request = sample_execution_request();
+        request.plan.working_dir = None;
+        request.plan.mounts = vec![
+            MountSpec {
+                source: "/host/refs:archive".into(),
+                target: "/refs".to_string(),
+                access: MountAccess::ReadOnly,
+            },
+            MountSpec {
+                source: "/host/cache".into(),
+                target: "/mnt/cache:archive".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        let prepared = prepare_oci_process_launch(&request, None).expect("prepare");
+
+        assert!(prepared.args.windows(2).any(|pair| {
+            pair == [
+                "--mount".to_string(),
+                "type=bind,src=/host/refs:archive,target=/refs,readonly,relabel=private"
+                    .to_string(),
+            ]
+        }));
+        assert!(prepared.args.windows(2).any(|pair| {
+            pair == [
+                "--mount".to_string(),
+                "type=bind,src=/host/cache,target=/mnt/cache:archive,rw,relabel=private"
+                    .to_string(),
+            ]
+        }));
+    }
+
+    #[test]
+    fn oci_backend_rejects_bind_mount_paths_with_colon_and_comma() {
+        let mut request = sample_execution_request();
+        request.plan.working_dir = None;
+        request.plan.mounts = vec![MountSpec {
+            source: "/host/refs:archive,current".into(),
+            target: "/refs".to_string(),
+            access: MountAccess::ReadOnly,
+        }];
+
+        let err = prepare_oci_process_launch(&request, None).expect_err("unrepresentable mount");
+
+        assert!(err.to_string().contains("contains both ':' and ','"));
+        assert!(err.to_string().contains("OCI bind mount argument"));
     }
 
     #[test]
