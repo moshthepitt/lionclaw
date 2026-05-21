@@ -1199,6 +1199,7 @@ def _provider_metadata(
 ) -> dict[str, Any]:
     command_target = _leading_command_target(message)
     leading_bot_mention = _leading_bot_mention_text(message, bot_identity)
+    message_date_epoch = _message_date_epoch(message)
     metadata: dict[str, Any] = {
         "provider": "telegram",
         "update_id": update_id,
@@ -1207,9 +1208,10 @@ def _provider_metadata(
         "chat_id": message.chat.id,
         "chat_type": _chat_type(message),
         "message_id": message.message_id,
-        "message_date_epoch": _message_date_epoch(message),
         "bot_mentioned": _has_bot_mention(message, bot_identity),
     }
+    if message_date_epoch is not None:
+        metadata["message_date_epoch"] = message_date_epoch
     if bot_identity is not None and bot_identity.username is not None:
         metadata["bot_username"] = bot_identity.username.removeprefix("@").casefold()
     if leading_bot_mention is not None:
@@ -1236,13 +1238,13 @@ def _provider_metadata(
     return metadata
 
 
-def _message_date_epoch(message: Message) -> int:
+def _message_date_epoch(message: Message) -> int | None:
     timestamp = getattr(message.date, "timestamp", None)
     if callable(timestamp):
         return int(timestamp())
     if isinstance(message.date, int | float):
         return int(message.date)
-    return 0
+    return None
 
 
 def _attachments(message: Message, update_id: int) -> list[TelegramInboundAttachment]:
