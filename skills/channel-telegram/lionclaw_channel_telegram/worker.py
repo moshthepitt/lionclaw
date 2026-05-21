@@ -281,6 +281,43 @@ class OffsetStore:
         _write_private_store_text(self.path, str(offset))
 
 
+@dataclass(slots=True)
+class WebhookUpdateStore:
+    path: Path
+
+    def load(self) -> dict[int, None]:
+        text = _read_private_store_text(self.path, "webhook update")
+        if text is None:
+            return {}
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError:
+            logger.exception("telegram webhook update store load failed")
+            return {}
+        if not isinstance(raw, dict):
+            logger.warning("telegram webhook update store ignored non-object payload")
+            return {}
+        raw_update_ids = raw.get("update_ids", [])
+        if not isinstance(raw_update_ids, list):
+            logger.warning(
+                "telegram webhook update store ignored non-array update_ids payload"
+            )
+            return {}
+        update_ids: dict[int, None] = {}
+        for raw_update_id in raw_update_ids:
+            if _is_valid_update_id(raw_update_id):
+                update_ids[int(raw_update_id)] = None
+        while len(update_ids) > MAX_WEBHOOK_RECENT_UPDATE_IDS:
+            update_ids.pop(next(iter(update_ids)))
+        return update_ids
+
+    def save(self, update_ids: dict[int, None]) -> None:
+        _write_private_store_text(
+            self.path,
+            json.dumps({"update_ids": list(update_ids)}, sort_keys=True),
+        )
+
+
 @dataclass(slots=True, frozen=True)
 class OutboxReceiptRecord:
     status: str
@@ -601,6 +638,10 @@ def _is_json_number(value: object) -> bool:
     return not isinstance(value, bool) and isinstance(value, (int, float))
 
 
+def _is_valid_update_id(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 0
+
+
 def _epoch_to_loop_time(epoch_seconds: float) -> float:
     return _safe_loop_time() + max(0.0, epoch_seconds - time.time())
 
@@ -678,6 +719,7 @@ class TelegramWorker:
         active_turn_store: ActiveTurnStore | None = None,
         outbox_receipt_store: OutboxReceiptStore | None = None,
         progress_delete_store: ProgressDeleteStore | None = None,
+        webhook_update_store: WebhookUpdateStore | None = None,
     ) -> None:
         self.config = config
         self.lionclaw_api = lionclaw_api
@@ -690,6 +732,7 @@ class TelegramWorker:
             outbox_receipt_store.load() if outbox_receipt_store is not None else {}
         )
         self.progress_delete_store = progress_delete_store
+        self.webhook_update_store = webhook_update_store
         self._typing_targets: dict[tuple[str, str | None], TypingTarget] = {}
         self._typing_deadlines: dict[tuple[str, str | None], float] = {}
         self._typing_routes: dict[str, TypingTarget] = {}
@@ -727,7 +770,9 @@ class TelegramWorker:
         self._webhook_batches: dict[WebhookBatchKey, WebhookBatch] = {}
         self._webhook_route_gates: dict[WebhookRouteKey, WebhookRouteGate] = {}
         self._webhook_update_results: dict[int, asyncio.Future[bool]] = {}
-        self._webhook_recent_update_ids: dict[int, None] = {}
+        self._webhook_recent_update_ids: dict[int, None] = (
+            webhook_update_store.load() if webhook_update_store is not None else {}
+        )
         self._webhook_accepting_updates = True
         self._webhook_state_lock = asyncio.Lock()
 
@@ -806,19 +851,33 @@ class TelegramWorker:
         update_id: int,
         processed: bool,
     ) -> None:
+        save_recent_updates = False
         async with self._webhook_state_lock:
             result = self._webhook_update_results.pop(update_id, None)
             if processed:
-                self._remember_webhook_update_locked(update_id)
+                save_recent_updates = self._remember_webhook_update_locked(update_id)
         if result is not None and not result.done():
             result.set_result(processed)
+        if save_recent_updates:
+            self._save_webhook_updates()
 
-    def _remember_webhook_update_locked(self, update_id: int) -> None:
+    def _remember_webhook_update_locked(self, update_id: int) -> bool:
+        if update_id in self._webhook_recent_update_ids:
+            return False
         self._webhook_recent_update_ids[update_id] = None
         while len(self._webhook_recent_update_ids) > MAX_WEBHOOK_RECENT_UPDATE_IDS:
             self._webhook_recent_update_ids.pop(
                 next(iter(self._webhook_recent_update_ids))
             )
+        return True
+
+    def _save_webhook_updates(self) -> None:
+        if self.webhook_update_store is None:
+            return
+        try:
+            self.webhook_update_store.save(self._webhook_recent_update_ids)
+        except Exception:
+            logger.exception("telegram webhook update store save failed")
 
     async def _process_webhook_work_item(self, item: ProviderWorkItem) -> bool:
         key = _webhook_batch_key(item.event)
@@ -3474,6 +3533,9 @@ async def run() -> None:
         ),
         progress_delete_store=ProgressDeleteStore(
             config.runtime_dir / "telegram.progress-deletes.json"
+        ),
+        webhook_update_store=WebhookUpdateStore(
+            config.runtime_dir / "telegram.webhook-updates.json"
         ),
     )
 

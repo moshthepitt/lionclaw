@@ -62,6 +62,7 @@ from lionclaw_channel_telegram.webhook import (
 )
 from lionclaw_channel_telegram.worker import (
     MAX_OUTBOX_RECEIPTS,
+    MAX_WEBHOOK_RECENT_UPDATE_IDS,
     ActiveTurn,
     ActiveTurnStore,
     OffsetStore,
@@ -72,6 +73,7 @@ from lionclaw_channel_telegram.worker import (
     ProviderWorkItem,
     TelegramWorker,
     TypingTarget,
+    WebhookUpdateStore,
     _classify_send_failure,
     _overall_health_status,
     _webhook_batch_key,
@@ -1570,6 +1572,61 @@ class OutboxReceiptStoreTests(unittest.TestCase):
             self.assertIn(f"delivery-{MAX_OUTBOX_RECEIPTS}", receipts)
 
 
+class WebhookUpdateStoreTests(unittest.TestCase):
+    def test_save_replaces_update_file_with_private_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "telegram.webhook-updates.json"
+            path.write_text("{}", encoding="utf-8")
+            path.chmod(0o644)
+            store = WebhookUpdateStore(path)
+
+            store.save({17: None, 18: None})
+
+            self.assertEqual(store.load(), {17: None, 18: None})
+            self.assertFalse(
+                (path.parent / ".telegram.webhook-updates.json.tmp").exists()
+            )
+            self.assertEqual(_file_mode(path), 0o600)
+
+    def test_load_ignores_malformed_update_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "telegram.webhook-updates.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "update_ids": [
+                            17,
+                            True,
+                            -1,
+                            "18",
+                            19,
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(WebhookUpdateStore(path).load(), {17: None, 19: None})
+
+    def test_load_caps_oversized_update_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "telegram.webhook-updates.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "update_ids": list(range(MAX_WEBHOOK_RECENT_UPDATE_IDS + 1)),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            update_ids = WebhookUpdateStore(path).load()
+
+            self.assertEqual(len(update_ids), MAX_WEBHOOK_RECENT_UPDATE_IDS)
+            self.assertNotIn(0, update_ids)
+            self.assertIn(MAX_WEBHOOK_RECENT_UPDATE_IDS, update_ids)
+
+
 class ProgressDeleteStoreTests(unittest.TestCase):
     def test_save_replaces_progress_deletes_without_leaving_temp_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2508,6 +2565,77 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             [message[1] for message in telegram.sent_messages],
             ["Active turn: queued."],
         )
+
+    async def test_webhook_duplicate_after_restart_does_not_replay_local_command(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = WebhookUpdateStore(Path(temp_dir) / "telegram.webhook-updates.json")
+            first_api = FakeLionClawApi()
+            first_telegram = FakeTelegramTransport()
+            first_worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=first_api,
+                telegram=first_telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                webhook_update_store=store,
+            )
+            await first_worker._remember_active_turn(
+                TelegramInboundUpdate(
+                    update_id=872,
+                    event_id="telegram:update:872",
+                    sender_ref="telegram:user:77",
+                    conversation_ref="telegram:chat:77",
+                    message_ref="telegram:message:72",
+                    text="long task",
+                    trigger="dm",
+                    provider_metadata={"chat_type": "private"},
+                ),
+                InboundResponse(outcome="queued", turn_id="turn-1"),
+            )
+            update = Update.model_validate(
+                {
+                    "update_id": 873,
+                    "message": {
+                        "message_id": 73,
+                        "date": 0,
+                        "chat": {"id": 77, "type": "private"},
+                        "from": {
+                            "id": 77,
+                            "is_bot": False,
+                            "first_name": "Alice",
+                        },
+                        "text": "/status",
+                    },
+                }
+            )
+
+            self.assertTrue(await first_worker.process_webhook_update(update))
+            second_api = FakeLionClawApi()
+            second_worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=second_api,
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+                webhook_update_store=store,
+            )
+
+            self.assertTrue(await second_worker.process_webhook_update(update))
+
+        self.assertEqual(first_api.sent_inbound, [])
+        self.assertEqual(
+            [message[1] for message in first_telegram.sent_messages],
+            ["Active turn: queued."],
+        )
+        self.assertEqual(second_api.sent_inbound, [])
 
     async def test_webhook_update_is_rejected_after_worker_shutdown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
