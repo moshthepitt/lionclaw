@@ -5883,6 +5883,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn safe_child_directory_rejects_current_and_parent_components() {
+        let temp_dir = tempdir().expect("temp dir");
+
+        for component in [".", ".."] {
+            let err = ensure_safe_child_directory(temp_dir.path(), &[component])
+                .await
+                .expect_err("relative traversal component should be rejected");
+            assert!(
+                matches!(err, KernelError::Internal(message) if message.contains("unsafe runtime storage path component"))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn runtime_artifact_copy_reserves_unique_destinations_atomically() {
         let temp_dir = tempdir().expect("temp dir");
         let source_dir = temp_dir.path().join("source");
@@ -8261,7 +8275,11 @@ async fn ensure_safe_child_directory(
 
     let mut current = root.to_path_buf();
     for component in components {
-        if component.is_empty() || component.contains('/') || component.contains('\\') {
+        if component.is_empty()
+            || matches!(*component, "." | "..")
+            || component.contains('/')
+            || component.contains('\\')
+        {
             return Err(KernelError::Internal(
                 "unsafe runtime storage path component".to_string(),
             ));
