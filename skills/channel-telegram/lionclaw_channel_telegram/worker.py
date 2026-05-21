@@ -7,6 +7,7 @@ import hmac
 import json
 import logging
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -656,8 +657,6 @@ class TelegramWorker:
                 [item], persist_offsets=False
             )
 
-        if not await self._flush_webhook_batches_for_event(item.event, except_key=key):
-            return False
         future, should_schedule = await self._enqueue_webhook_batch(key, item)
         if should_schedule:
             asyncio.create_task(
@@ -732,7 +731,16 @@ class TelegramWorker:
                 self._webhook_batches[key] = batch
                 should_schedule = True
             batch.items.append(item)
-            return batch.result, should_schedule
+            route_batches = _sorted_webhook_batches_for_route(
+                self._webhook_batches.values(),
+                _webhook_batch_route(key),
+            )
+            if route_batches == [batch]:
+                return batch.result, should_schedule
+            should_schedule = False
+
+        await self._flush_webhook_batches(route_batches)
+        return batch.result, should_schedule
 
     async def _flush_webhook_batches_for_event(
         self,
@@ -744,16 +752,31 @@ class TelegramWorker:
         if route is None:
             return True
         async with self._webhook_state_lock:
-            batches = [
-                batch
-                for key, batch in self._webhook_batches.items()
-                if key != except_key and _webhook_batch_route(key) == route
-            ]
-        processed = True
-        for batch in batches:
+            batches = _sorted_webhook_batches_for_route(
+                (
+                    batch
+                    for key, batch in self._webhook_batches.items()
+                    if key != except_key
+                ),
+                route,
+            )
+        return await self._flush_webhook_batches(batches)
+
+    async def _flush_webhook_batches(self, batches: list[WebhookBatch]) -> bool:
+        for index, batch in enumerate(batches):
             await self._flush_webhook_batch(batch.key, delay_seconds=0.0)
-            processed = await asyncio.shield(batch.result) and processed
-        return processed
+            if not await asyncio.shield(batch.result):
+                await self._reject_webhook_batches(batches[index + 1 :])
+                return False
+        return True
+
+    async def _reject_webhook_batches(self, batches: list[WebhookBatch]) -> None:
+        for batch in batches:
+            async with self._webhook_state_lock:
+                if self._webhook_batches.get(batch.key) is batch:
+                    self._webhook_batches.pop(batch.key, None)
+            if not batch.result.done():
+                batch.result.set_result(False)
 
     async def _flush_webhook_batch(
         self,
@@ -766,15 +789,21 @@ class TelegramWorker:
             batch = self._webhook_batches.pop(key, None)
         if batch is None:
             return
+        route = _webhook_batch_route(key)
+        gate = await self._acquire_webhook_route_gate(route)
         try:
+            if batch.result.done():
+                return
             work_items = sorted(batch.items, key=_provider_work_item_sort_key)
-            processed = await self._process_webhook_route_work_items(
-                _webhook_batch_route(key),
+            processed = await self._process_provider_work_items(
                 work_items,
+                persist_offsets=False,
             )
         except Exception:
             logger.exception("telegram webhook batch processing failed")
             processed = False
+        finally:
+            await self._release_webhook_route_gate(route, gate)
         if not batch.result.done():
             batch.result.set_result(processed)
 
@@ -2595,6 +2624,23 @@ def _webhook_event_route(event: TelegramInboundEvent | None) -> WebhookRouteKey 
 def _webhook_batch_route(key: WebhookBatchKey) -> WebhookRouteKey:
     conversation_ref, thread_ref, *_ = key
     return (conversation_ref, thread_ref)
+
+
+def _sorted_webhook_batches_for_route(
+    batches: Iterable[WebhookBatch],
+    route: WebhookRouteKey,
+) -> list[WebhookBatch]:
+    return sorted(
+        (batch for batch in batches if _webhook_batch_route(batch.key) == route),
+        key=_webhook_batch_sort_key,
+    )
+
+
+def _webhook_batch_sort_key(batch: WebhookBatch) -> tuple[int, ...]:
+    return min(
+        (_provider_work_item_sort_key(item) for item in batch.items),
+        default=(0,),
+    )
 
 
 def _can_merge_work_items(first: ProviderWorkItem, second: ProviderWorkItem) -> bool:

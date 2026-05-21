@@ -65,9 +65,11 @@ from lionclaw_channel_telegram.worker import (
     OutboxReceiptStore,
     PendingProgressDelete,
     ProgressDeleteStore,
+    ProviderWorkItem,
     TelegramWorker,
     _classify_send_failure,
     _overall_health_status,
+    _webhook_batch_key,
 )
 
 BOT = TelegramBotIdentity(user_id=99, username="lionclaw_bot")
@@ -2445,6 +2447,174 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [update.text for update in api.sent_inbound], ["first", "second"]
         )
+
+    async def test_webhook_batch_enqueue_flushes_route_batches_by_update_id(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=api,
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            newer = ProviderWorkItem(
+                (882,),
+                TelegramInboundUpdate(
+                    update_id=882,
+                    event_id="telegram:update:882",
+                    sender_ref="telegram:user:77",
+                    conversation_ref="telegram:chat:77",
+                    message_ref="telegram:message:182",
+                    thread_ref=None,
+                    text="album",
+                    trigger="dm",
+                    attachments=[
+                        TelegramInboundAttachment(
+                            attachment_id="telegram:update:882:attachment:photo:p1",
+                            kind="photo",
+                            provider_file_ref="photo-file",
+                            mime_type="image/jpeg",
+                        )
+                    ],
+                    provider_metadata={
+                        "provider": "telegram",
+                        "update_id": 882,
+                        "chat_type": "private",
+                        "message_date_epoch": 20,
+                        "media_group_id": "album-1",
+                    },
+                ),
+            )
+            older = ProviderWorkItem(
+                (881,),
+                TelegramInboundUpdate(
+                    update_id=881,
+                    event_id="telegram:update:881",
+                    sender_ref="telegram:user:77",
+                    conversation_ref="telegram:chat:77",
+                    message_ref="telegram:message:181",
+                    thread_ref=None,
+                    text="first",
+                    trigger="dm",
+                    provider_metadata={
+                        "provider": "telegram",
+                        "update_id": 881,
+                        "chat_type": "private",
+                        "message_date_epoch": 10,
+                    },
+                ),
+            )
+            newer_key = _webhook_batch_key(newer.event)
+            older_key = _webhook_batch_key(older.event)
+            assert newer_key is not None
+            assert older_key is not None
+
+            newer_result, should_schedule_newer = await worker._enqueue_webhook_batch(
+                newer_key,
+                newer,
+            )
+            older_result, should_schedule_older = await worker._enqueue_webhook_batch(
+                older_key,
+                older,
+            )
+
+        self.assertTrue(should_schedule_newer)
+        self.assertFalse(should_schedule_older)
+        self.assertTrue(await newer_result)
+        self.assertTrue(await older_result)
+        self.assertEqual(
+            [update.text for update in api.sent_inbound],
+            ["first", "album"],
+        )
+
+    async def test_webhook_batch_enqueue_blocks_later_batches_after_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(inbound_outcome="not-a-real-outcome")
+            worker = TelegramWorker(
+                config=replace(
+                    build_config(Path(temp_dir)),
+                    telegram_update_mode="webhook",
+                    telegram_webhook_secret_token="secret",
+                ),
+                lionclaw_api=api,
+                telegram=FakeTelegramTransport(),
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            newer = ProviderWorkItem(
+                (884,),
+                TelegramInboundUpdate(
+                    update_id=884,
+                    event_id="telegram:update:884",
+                    sender_ref="telegram:user:77",
+                    conversation_ref="telegram:chat:77",
+                    message_ref="telegram:message:184",
+                    thread_ref=None,
+                    text="album",
+                    trigger="dm",
+                    attachments=[
+                        TelegramInboundAttachment(
+                            attachment_id="telegram:update:884:attachment:photo:p1",
+                            kind="photo",
+                            provider_file_ref="photo-file",
+                            mime_type="image/jpeg",
+                        )
+                    ],
+                    provider_metadata={
+                        "provider": "telegram",
+                        "update_id": 884,
+                        "chat_type": "private",
+                        "message_date_epoch": 20,
+                        "media_group_id": "album-1",
+                    },
+                ),
+            )
+            older = ProviderWorkItem(
+                (883,),
+                TelegramInboundUpdate(
+                    update_id=883,
+                    event_id="telegram:update:883",
+                    sender_ref="telegram:user:77",
+                    conversation_ref="telegram:chat:77",
+                    message_ref="telegram:message:183",
+                    thread_ref=None,
+                    text="first",
+                    trigger="dm",
+                    provider_metadata={
+                        "provider": "telegram",
+                        "update_id": 883,
+                        "chat_type": "private",
+                        "message_date_epoch": 0,
+                    },
+                ),
+            )
+            newer_key = _webhook_batch_key(newer.event)
+            older_key = _webhook_batch_key(older.event)
+            assert newer_key is not None
+            assert older_key is not None
+
+            newer_result, should_schedule_newer = await worker._enqueue_webhook_batch(
+                newer_key,
+                newer,
+            )
+            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
+                (
+                    older_result,
+                    should_schedule_older,
+                ) = await worker._enqueue_webhook_batch(older_key, older)
+
+        self.assertTrue(should_schedule_newer)
+        self.assertFalse(should_schedule_older)
+        self.assertFalse(await older_result)
+        self.assertFalse(await newer_result)
+        self.assertEqual([update.text for update in api.sent_inbound], ["first"])
 
     async def test_process_webhook_update_reports_processing_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
