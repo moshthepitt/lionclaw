@@ -45,6 +45,7 @@ from lionclaw_channel_telegram.telegram import (
     TelegramPairingClaim,
     TelegramPartialSendError,
     TelegramReferenceError,
+    TelegramUnsupportedContent,
     _coerce_chat_id,
     _coerce_message_id,
     _coerce_thread_id,
@@ -563,6 +564,38 @@ class ExtractInboundEventTests(unittest.TestCase):
         assert isinstance(mapped, TelegramInboundUpdate)
         self.assertEqual(mapped.text, "Please explain lc_0123456789abcdef")
         self.assertEqual(mapped.trigger, "dm")
+
+    def test_unsupported_contact_maps_to_local_feedback_event(self) -> None:
+        update = Update.model_validate(
+            {
+                "update_id": 194,
+                "message": {
+                    "message_id": 94,
+                    "date": 0,
+                    "chat": {"id": 42, "type": "private"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Alice"},
+                    "contact": {
+                        "phone_number": "+15551234567",
+                        "first_name": "Alice",
+                    },
+                },
+            }
+        )
+
+        mapped = extract_inbound_event(update, bot_identity=BOT)
+
+        self.assertIsInstance(mapped, TelegramUnsupportedContent)
+        assert isinstance(mapped, TelegramUnsupportedContent)
+        self.assertEqual(mapped.event_id, "telegram:unsupported:194")
+        self.assertEqual(mapped.kind, "contact")
+        self.assertEqual(mapped.sender_ref, "telegram:user:42")
+        self.assertEqual(mapped.conversation_ref, "telegram:chat:42")
+        self.assertEqual(mapped.message_ref, "telegram:message:94")
+        self.assertEqual(mapped.trigger, "dm")
+        self.assertEqual(
+            mapped.provider_metadata["unsupported_content_kind"],
+            "contact",
+        )
 
     def test_document_caption_becomes_text_and_attachment_descriptor(self) -> None:
         update = Update.model_validate(
@@ -2975,6 +3008,137 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(api.finalized[0][0].event_id, "telegram:update:9")
             self.assertEqual(api.finalized[0][1], [])
             self.assertEqual(telegram.typing_peers, ["telegram:chat:77"])
+
+    async def test_private_unsupported_content_gets_clear_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            offset_store = OffsetStore(Path(temp_dir) / "telegram.offset")
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 901,
+                            "message": {
+                                "message_id": 61,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "contact": {
+                                    "phone_number": "+15551234567",
+                                    "first_name": "Alice",
+                                },
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=offset_store,
+            )
+
+            await worker.process_updates()
+            offset_text = offset_store.path.read_text(encoding="utf-8")
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertEqual(worker.offset, 902)
+        self.assertEqual(offset_text, "902")
+        self.assertEqual(len(telegram.sent_messages), 1)
+        conversation_ref, text, reply_to_ref, thread_ref, _ = telegram.sent_messages[0]
+        self.assertEqual(conversation_ref, "telegram:chat:77")
+        self.assertIn("can't use this Telegram contact yet", text)
+        self.assertEqual(reply_to_ref, "telegram:message:61")
+        self.assertIsNone(thread_ref)
+
+    async def test_addressed_group_unsupported_content_gets_clear_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 902,
+                            "message": {
+                                "message_id": 62,
+                                "date": 0,
+                                "chat": {
+                                    "id": -10077,
+                                    "type": "supergroup",
+                                    "is_forum": True,
+                                },
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "message_thread_id": 7,
+                                "is_topic_message": True,
+                                "dice": {"emoji": "🎲", "value": 4},
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertEqual(len(telegram.sent_messages), 1)
+        conversation_ref, text, reply_to_ref, thread_ref, _ = telegram.sent_messages[0]
+        self.assertEqual(conversation_ref, "telegram:chat:-10077")
+        self.assertIn("can't use this Telegram dice yet", text)
+        self.assertEqual(reply_to_ref, "telegram:message:62")
+        self.assertEqual(thread_ref, "telegram:topic:7")
+
+    async def test_unaddressed_group_unsupported_content_stays_silent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 903,
+                            "message": {
+                                "message_id": 63,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "contact": {
+                                    "phone_number": "+15551234567",
+                                    "first_name": "Alice",
+                                },
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertEqual(telegram.sent_messages, [])
 
     async def test_help_is_channel_local_and_does_not_submit_inbound(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

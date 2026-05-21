@@ -249,7 +249,7 @@ Expected when credentials are available:
   `/new`/`/retry`/`/continue` enter LionClaw as canonical controls, and `/model`
   reaches the runtime
 - inline buttons for status, stop, retry, continue, and new-session acknowledge
-  clicks without leaking controls across chats or forum topics
+  clicks without leaking controls across users, chats, or forum topics
 - a forum topic with a thread grant keeps replies in the same Telegram topic
 - a conversation grant used inside a topic follows the channel scoped-grant
   behavior from Channels v2
@@ -262,6 +262,8 @@ Expected when credentials are available:
   media group
 - a Telegram location and venue reach the runtime as readable text with
   structured provider metadata
+- unsupported Telegram content such as a contact or poll gets a clear local
+  reply in DMs and addressed groups, and stays silent in unaddressed groups
 - a runtime-generated image is returned to Telegram as a native media
   attachment, even when the runtime final text is empty
 - Markdown in runtime answers renders as Telegram formatting, and local

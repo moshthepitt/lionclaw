@@ -100,6 +100,9 @@ TELEGRAM_WEBHOOK_PATH=/telegram/webhook \
   video, stickers, video notes, and animations. Telegram locations and venues
   are forwarded as readable text with structured provider metadata. Provider
   files are not downloaded for pending, blocked, ignored, or duplicate inbound.
+  Unsupported user content such as contacts, polls, dice, and paid media is
+  acknowledged with a clear local reply in DMs and addressed group routes, and
+  is not submitted to the runtime.
 - Back-to-back text updates from the same Telegram route are coalesced into one
   inbound turn when they arrive in the same provider batch. Telegram
   `media_group_id` albums are coalesced before attachment staging so the
@@ -126,8 +129,9 @@ TELEGRAM_WEBHOOK_PATH=/telegram/webhook \
   slash commands are forwarded without the leading mention or `@lionclaw_bot`
   command target.
 - Inline buttons carry compact HMAC-protected callback payloads bound to the
-  conversation, topic, and active turn. Stale or wrong-route callbacks are
-  acknowledged without mutating runtime state.
+  conversation, topic, original Telegram sender, and active turn. Stale,
+  wrong-route, or wrong-actor callbacks are acknowledged without mutating
+  runtime state.
 - Fast turns only show typing. Long turns create one provisional message after a
   short threshold, edit it at a throttled cadence, and delete it when the durable
   outbox answer is ready. Cancelled and failed turns leave a terminal status.

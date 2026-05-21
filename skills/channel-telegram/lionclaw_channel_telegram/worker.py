@@ -46,6 +46,7 @@ from lionclaw_channel_telegram.telegram import (
     TelegramPartialSendError,
     TelegramReferenceError,
     TelegramTransport,
+    TelegramUnsupportedContent,
     extract_inbound_event,
     normalize_telegram_receipt,
 )
@@ -841,6 +842,8 @@ class TelegramWorker:
                 elif isinstance(item.event, TelegramCallbackAction):
                     if not await self._handle_callback_action(item.event):
                         return False
+                elif isinstance(item.event, TelegramUnsupportedContent):
+                    await self._handle_unsupported_content(item.event)
                 elif not await self._submit_inbound(item.event):
                     return False
             if persist_offsets:
@@ -1095,6 +1098,25 @@ class TelegramWorker:
             logger.exception(
                 "telegram callback acknowledgement failed for update_id=%s",
                 callback.update_id,
+            )
+
+    async def _handle_unsupported_content(
+        self,
+        event: TelegramUnsupportedContent,
+    ) -> None:
+        if not _should_notify_unsupported_content(event):
+            return
+        try:
+            await self.telegram.send_message(
+                event.conversation_ref,
+                _unsupported_content_reply(event),
+                reply_to_ref=event.message_ref,
+                thread_ref=event.thread_ref,
+            )
+        except Exception:
+            logger.exception(
+                "telegram unsupported content reply failed for update_id=%s",
+                event.update_id,
             )
 
     async def _submit_inbound(self, update: TelegramInboundUpdate) -> bool:
@@ -2657,7 +2679,10 @@ def _webhook_batch_key(event: TelegramInboundEvent | None) -> WebhookBatchKey | 
 def _webhook_event_route(event: TelegramInboundEvent | None) -> WebhookRouteKey | None:
     if isinstance(
         event,
-        TelegramInboundUpdate | TelegramPairingClaim | TelegramCallbackAction,
+        TelegramInboundUpdate
+        | TelegramPairingClaim
+        | TelegramCallbackAction
+        | TelegramUnsupportedContent,
     ):
         return (event.conversation_ref, event.thread_ref)
     return None
@@ -2857,6 +2882,20 @@ def _telegram_command_text(update: TelegramInboundUpdate) -> str | None:
     if not text_after_mention.startswith("/"):
         return None
     return text_after_mention
+
+
+def _should_notify_unsupported_content(event: TelegramUnsupportedContent) -> bool:
+    if event.provider_metadata.get("chat_type") == "private":
+        return True
+    return event.trigger in {"mention", "reply_to_bot", "thread_continuation"}
+
+
+def _unsupported_content_reply(event: TelegramUnsupportedContent) -> str:
+    return (
+        f"I can't use this Telegram {event.kind} yet. "
+        "Send text, photos, documents, audio, voice, video, stickers, animations, "
+        "locations, or venues."
+    )
 
 
 def _telegram_runtime_command_text(command: TelegramCommand) -> str:

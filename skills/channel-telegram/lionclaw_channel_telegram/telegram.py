@@ -54,6 +54,21 @@ AUDIO_MIME_TYPES = {
     "audio/x-m4a",
     "audio/x-wav",
 }
+UNSUPPORTED_CONTENT_ATTRS = (
+    ("contact", "contact"),
+    ("poll", "poll"),
+    ("dice", "dice"),
+    ("game", "game"),
+    ("story", "story"),
+    ("paid_media", "paid media"),
+    ("invoice", "invoice"),
+    ("passport_data", "passport data"),
+    ("web_app_data", "web app data"),
+    ("users_shared", "shared users"),
+    ("chat_shared", "shared chat"),
+    ("giveaway", "giveaway"),
+    ("giveaway_winners", "giveaway winners"),
+)
 
 
 class TelegramReferenceError(ValueError):
@@ -128,6 +143,19 @@ class TelegramCallbackAction:
 
 
 @dataclass(slots=True, frozen=True)
+class TelegramUnsupportedContent:
+    update_id: int
+    event_id: str
+    sender_ref: str
+    conversation_ref: str
+    message_ref: str | None
+    trigger: str
+    kind: str
+    thread_ref: str | None = None
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True, frozen=True)
 class TelegramDownloadedAttachment:
     attachment: TelegramInboundAttachment
     content: bytes
@@ -155,7 +183,10 @@ class TelegramTextChunk:
 
 
 TelegramInboundEvent = (
-    TelegramInboundUpdate | TelegramPairingClaim | TelegramCallbackAction
+    TelegramInboundUpdate
+    | TelegramPairingClaim
+    | TelegramCallbackAction
+    | TelegramUnsupportedContent
 )
 
 
@@ -662,6 +693,20 @@ def extract_inbound_event(
     text = _normalized_content_text(message, metadata)
     attachments = _normalized_attachments(message, update.update_id, text=text)
     if text is None and not attachments:
+        unsupported_kind = _unsupported_content_kind(message)
+        if unsupported_kind is not None:
+            metadata["unsupported_content_kind"] = unsupported_kind
+            return TelegramUnsupportedContent(
+                update_id=update.update_id,
+                event_id=f"telegram:unsupported:{update.update_id}",
+                sender_ref=_sender_ref(message),
+                conversation_ref=_conversation_ref(message),
+                thread_ref=_thread_ref(message),
+                message_ref=_message_ref(message),
+                trigger=_trigger(message, bot_identity),
+                kind=unsupported_kind,
+                provider_metadata=metadata,
+            )
         return None
 
     return TelegramInboundUpdate(
@@ -1409,6 +1454,13 @@ def _attachments(message: Message, update_id: int) -> list[TelegramInboundAttach
             )
         )
     return descriptors
+
+
+def _unsupported_content_kind(message: Message) -> str | None:
+    for attr, label in UNSUPPORTED_CONTENT_ATTRS:
+        if getattr(message, attr, None) is not None:
+            return label
+    return None
 
 
 def _photo_rank(photo: PhotoSize) -> tuple[int, int]:
