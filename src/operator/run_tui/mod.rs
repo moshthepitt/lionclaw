@@ -46,7 +46,7 @@ use crate::{
             kernel_to_anyhow, local_peer_id_for_project, partial_history_marker,
             resolve_repl_session, resolve_run_runtime_id,
         },
-        runtime::validate_runtime_launch_prerequisites,
+        runtime::validate_runtime_launch_prerequisites_for_work_root,
         target::{inspect_target_work_root, list_project_instance_statuses, TargetContext},
     },
     runtime_timeouts::RuntimeTurnTimeouts,
@@ -624,8 +624,12 @@ impl ConsoleLaunchOptions {
         }
     }
 
-    async fn open_instance(&self, summary: InstanceSummary) -> SelectedInstanceState {
-        open_selected_instance(summary, self).await
+    async fn open_instance(
+        &self,
+        project_root: Option<&Path>,
+        summary: InstanceSummary,
+    ) -> SelectedInstanceState {
+        open_selected_instance(project_root, summary, self).await
     }
 }
 
@@ -995,7 +999,9 @@ impl ConsoleApp {
             .cloned()
             .ok_or_else(|| anyhow!("console has no selected instance"))?;
         let launch = ConsoleLaunchOptions::from_invocation(&invocation);
-        let selected = launch.open_instance(selected_summary).await;
+        let selected = launch
+            .open_instance(project_root.as_deref(), selected_summary)
+            .await;
         let saw_ready_instance = selected.is_ready();
         let project_objects = load_project_objects(&selected).await;
         let audit = load_audit_events(&selected).await;
@@ -1312,7 +1318,10 @@ impl ConsoleApp {
             .cloned()
             .unwrap_or_else(|| self.selected.summary().clone());
         self.status = format!("selected {}", summary.display_name());
-        self.selected = self.launch.open_instance(summary).await;
+        self.selected = self
+            .launch
+            .open_instance(self.project_root.as_deref(), summary)
+            .await;
         if self.selected.is_ready() {
             self.saw_ready_instance = true;
         }

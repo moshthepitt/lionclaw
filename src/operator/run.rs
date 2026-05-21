@@ -21,13 +21,14 @@ use crate::{
     operator::{
         config::OperatorConfig,
         reconcile::{open_runtime_kernel_for_work_root, render_runtime_cache_for_work_root},
-        runtime::{resolve_runtime_id, validate_runtime_launch_prerequisites},
+        runtime::{resolve_runtime_id, validate_runtime_launch_prerequisites_for_work_root},
     },
     runtime_timeouts::RuntimeTurnTimeouts,
 };
 
 pub async fn run_local(
     home: &LionClawHome,
+    project_root: Option<&Path>,
     work_root: &Path,
     instance_name: Option<&str>,
     requested_runtime: Option<String>,
@@ -41,6 +42,7 @@ pub async fn run_local(
     run_local_with_io_and_timeouts(
         RunLocalInvocation {
             home,
+            project_root,
             work_root,
             instance_name,
             requested_runtime,
@@ -66,6 +68,7 @@ pub(crate) async fn run_local_with_io<R: BufRead + Send, W: Write + Send>(
     run_local_with_io_and_timeouts(
         RunLocalInvocation {
             home,
+            project_root: None,
             work_root: &work_root,
             instance_name: Some("main"),
             requested_runtime,
@@ -80,6 +83,7 @@ pub(crate) async fn run_local_with_io<R: BufRead + Send, W: Write + Send>(
 
 pub(crate) struct RunLocalInvocation<'a> {
     pub(crate) home: &'a LionClawHome,
+    pub(crate) project_root: Option<&'a Path>,
     pub(crate) work_root: &'a Path,
     pub(crate) instance_name: Option<&'a str>,
     pub(crate) requested_runtime: Option<String>,
@@ -94,6 +98,7 @@ async fn run_local_with_io_and_timeouts<R: BufRead + Send, W: Write + Send>(
 ) -> Result<()> {
     let RunLocalInvocation {
         home,
+        project_root,
         work_root,
         instance_name,
         requested_runtime,
@@ -106,7 +111,14 @@ async fn run_local_with_io_and_timeouts<R: BufRead + Send, W: Write + Send>(
         requested_runtime.as_deref(),
         instance_name.unwrap_or("selected home"),
     )?;
-    validate_runtime_launch_prerequisites(home, &config, &runtime_id).await?;
+    validate_runtime_launch_prerequisites_for_work_root(
+        home,
+        &config,
+        &runtime_id,
+        project_root,
+        Some(work_root),
+    )
+    .await?;
     render_runtime_cache_for_work_root(home, &config, &runtime_id, work_root).await?;
 
     let effective_timeouts = timeout_override.unwrap_or_else(RuntimeTurnTimeouts::interactive);
@@ -741,6 +753,7 @@ sleep 1
         run_local_with_io_and_timeouts(
             RunLocalInvocation {
                 home: &home,
+                project_root: None,
                 work_root: &work_root,
                 instance_name: Some("main"),
                 requested_runtime: None,

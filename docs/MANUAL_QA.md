@@ -75,6 +75,27 @@ Expected:
 - `status` targets the selected project instance
 - `doctor` reports no blocking setup issues and prints the scoped `run` command
 
+Check explicit runtime mounts:
+
+```bash
+mkdir -p "$PROJ_A/reference-docs"
+"$LIONCLAW_BIN" runtime mount add codex docs --source "$PROJ_A/reference-docs"
+"$LIONCLAW_BIN" runtime mount list codex
+"$LIONCLAW_BIN" runtime mount remove codex docs
+mkdir -p "$PROJ_A/.lionclaw/private-mount"
+if "$LIONCLAW_BIN" runtime mount add codex private --source "$PROJ_A/.lionclaw/private-mount"; then
+  echo "unexpected metadata mount accepted"
+  exit 1
+fi
+```
+
+Expected:
+
+- `add` reports a read-only mount at `/mnt/docs`
+- `list` shows target, source, and access
+- `remove` deletes the mount and a subsequent `list` reports no configured mounts
+- metadata under `.lionclaw/` is rejected as an explicit runtime mount source
+
 ## Phase 2: Direct Run
 
 Start the everyday path:

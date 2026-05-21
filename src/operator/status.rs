@@ -8,6 +8,7 @@ use super::{
     config::{ManagedChannelConfig, OperatorConfig},
     managed_units::{SystemdUserUnitManager, UnitManager},
     runtime_integration::{runtime_auth_guidance, runtime_profile_facts},
+    runtime_mounts::validate_runtime_profile_mounts,
     target::{
         inspect_target_work_root, list_project_instance_statuses, TargetContext, TargetSelection,
     },
@@ -270,20 +271,31 @@ fn readiness_findings(input: &InstanceRenderInput) -> Vec<String> {
     if let Some(finding) = input.work_root_finding.as_deref() {
         findings.push(format!("work root: {finding}"));
     }
-    let Some(runtime_id) = input.config.defaults.runtime.as_deref() else {
-        findings.push("no default runtime configured".to_string());
-        return findings;
-    };
-    let Some(profile) = input.config.runtimes.get(runtime_id) else {
-        findings.push(format!(
+
+    match input.config.defaults.runtime.as_deref() {
+        Some(runtime_id) if input.config.runtimes.contains_key(runtime_id) => {}
+        Some(runtime_id) => findings.push(format!(
             "default runtime profile \"{runtime_id}\" is not configured"
-        ));
-        return findings;
-    };
-    let facts = runtime_profile_facts(profile);
-    if let Some(err) = facts.validation_error {
-        findings.push(format!("runtime profile \"{runtime_id}\" invalid: {err}"));
+        )),
+        None => findings.push("no default runtime configured".to_string()),
     }
+
+    let home = LionClawHome::new(input.home.clone());
+    for (runtime_id, profile) in &input.config.runtimes {
+        if let Err(err) = validate_runtime_profile_mounts(
+            &home,
+            input.project_root.as_deref(),
+            input.work_root.as_deref(),
+            profile,
+        ) {
+            findings.push(format!(
+                "runtime profile \"{runtime_id}\" invalid mounts: {err}"
+            ));
+        } else if let Err(err) = profile.validate() {
+            findings.push(format!("runtime profile \"{runtime_id}\" invalid: {err}"));
+        }
+    }
+
     if findings.is_empty() {
         findings.push("ready".to_string());
     }
@@ -313,6 +325,7 @@ mod tests {
     use std::{fs, os::unix::fs::PermissionsExt};
 
     use super::*;
+    use crate::kernel::runtime::{ConfinementConfig, MountAccess, MountSpec};
     use crate::operator::{
         managed_units::{daemon_unit_name, ensure_unit_identity, FakeUnitManager},
         runtime_integration::configure_runtime_profile_with_engine_resolver,
@@ -356,6 +369,101 @@ mod tests {
         assert!(output.contains("runtime: codex kind=codex bin=codex"));
         assert!(output.contains("image: lionclaw-runtime:v1"));
         assert!(output.contains("readiness: ready"));
+    }
+
+    #[tokio::test]
+    async fn status_reports_invalid_configured_runtime_mounts() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        let home = LionClawHome::new(project.instance.home.clone());
+        let private = home.root().join("config/private");
+        fs::create_dir_all(&private).expect("private mount source");
+        let mut config = OperatorConfig::load(&home).await.expect("load config");
+        configure_test_codex(&mut config, &fake_podman(temp_dir.path()));
+        let runtime = config.runtimes.get_mut("codex").expect("runtime");
+        let ConfinementConfig::Oci(oci) = runtime.confinement_mut();
+        oci.additional_mounts.push(MountSpec {
+            source: private,
+            target: "/mnt/private".to_string(),
+            access: MountAccess::ReadOnly,
+        });
+        config.save(&home).await.expect("save config");
+        let target = TargetContext {
+            project_root: Some(project.project_root.clone()),
+            instance_name: Some("main".to_string()),
+            instance_home: home,
+            work_root: Some(project.instance.work_root.clone()),
+        };
+
+        let output = render_target_status(&target).await.expect("status");
+
+        assert!(output.contains("readiness: run blocked"));
+        assert!(output.contains("invalid mounts"));
+        assert!(output.contains("selected instance home"));
+    }
+
+    #[tokio::test]
+    async fn status_reports_unrepresentable_configured_runtime_mounts() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        let home = LionClawHome::new(project.instance.home.clone());
+        let source = temp_dir.path().join("docs:archive,current");
+        fs::create_dir_all(&source).expect("source");
+        let mut config = OperatorConfig::load(&home).await.expect("load config");
+        configure_test_codex(&mut config, &fake_podman(temp_dir.path()));
+        let runtime = config.runtimes.get_mut("codex").expect("runtime");
+        let ConfinementConfig::Oci(oci) = runtime.confinement_mut();
+        oci.additional_mounts.push(MountSpec {
+            source,
+            target: "/mnt/docs".to_string(),
+            access: MountAccess::ReadOnly,
+        });
+        config.save(&home).await.expect("save config");
+        let target = TargetContext {
+            project_root: Some(project.project_root.clone()),
+            instance_name: Some("main".to_string()),
+            instance_home: home,
+            work_root: Some(project.instance.work_root.clone()),
+        };
+
+        let output = render_target_status(&target).await.expect("status");
+
+        assert!(output.contains("readiness: run blocked"));
+        assert!(output.contains("runtime profile \"codex\" invalid mounts"));
+        assert!(output.contains("Podman --mount"));
+        assert!(output.contains("contains ','"));
+    }
+
+    #[tokio::test]
+    async fn status_reports_invalid_non_default_runtime_mounts() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = init_project(temp_dir.path()).expect("init project");
+        let home = LionClawHome::new(project.instance.home.clone());
+        let missing = temp_dir.path().join("missing-docs");
+        let mut config = OperatorConfig::load(&home).await.expect("load config");
+        configure_test_codex(&mut config, &fake_podman(temp_dir.path()));
+        let reviewer = config.runtimes.get("codex").expect("codex").clone();
+        config.upsert_runtime("reviewer".to_string(), reviewer);
+        let runtime = config.runtimes.get_mut("reviewer").expect("runtime");
+        let ConfinementConfig::Oci(oci) = runtime.confinement_mut();
+        oci.additional_mounts.push(MountSpec {
+            source: missing,
+            target: "/mnt/docs".to_string(),
+            access: MountAccess::ReadOnly,
+        });
+        config.save(&home).await.expect("save config");
+        let target = TargetContext {
+            project_root: Some(project.project_root.clone()),
+            instance_name: Some("main".to_string()),
+            instance_home: home,
+            work_root: Some(project.instance.work_root.clone()),
+        };
+
+        let output = render_target_status(&target).await.expect("status");
+
+        assert!(output.contains("readiness: run blocked"));
+        assert!(output.contains("runtime profile \"reviewer\" invalid mounts"));
+        assert!(output.contains("runtime mount target '/mnt/docs'"));
     }
 
     #[tokio::test]

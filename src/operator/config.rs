@@ -8,6 +8,7 @@ use crate::home::{
     daemon_compat_partition_key, runtime_profile_partition_key, LionClawHome, DEFAULT_WORKSPACE,
 };
 use crate::kernel::runtime::{
+    execution::mount_validation::{normalize_runtime_mount_target, validate_configured_mounts},
     ConfinementConfig, ExecutionPreset, RuntimeAuthKind, RuntimeExecutionProfile,
 };
 use crate::kernel::skills::sanitize_skill_name;
@@ -384,6 +385,12 @@ impl RuntimeProfileConfig {
         }
     }
 
+    pub fn confinement_mut(&mut self) -> &mut ConfinementConfig {
+        match self {
+            Self::Codex { confinement, .. } | Self::OpenCode { confinement, .. } => confinement,
+        }
+    }
+
     pub fn required_runtime_auth(&self) -> Option<RuntimeAuthKind> {
         match self {
             Self::Codex {
@@ -461,6 +468,8 @@ impl RuntimeProfileConfig {
                 {
                     return Err(anyhow!("Podman runtime image is required"));
                 }
+                validate_configured_mounts(&config.additional_mounts, &[])
+                    .map_err(anyhow::Error::msg)?;
             }
         }
 
@@ -527,8 +536,14 @@ fn normalize_confinement_config(config: &mut ConfinementConfig) {
                 .filter(|value| !value.is_empty())
                 .collect();
             for mount in &mut oci.additional_mounts {
-                mount.target = mount.target.trim().to_string();
+                mount.target = normalize_runtime_mount_target(&mount.target)
+                    .unwrap_or_else(|_| mount.target.trim().to_string());
             }
+            oci.additional_mounts.sort_by(|left, right| {
+                left.target
+                    .cmp(&right.target)
+                    .then_with(|| left.source.cmp(&right.source))
+            });
         }
     }
 }
@@ -739,7 +754,8 @@ mod tests {
         RuntimeProfileConfig,
     };
     use crate::kernel::runtime::{
-        ConfinementConfig, ExecutionPreset, NetworkMode, OciConfinementConfig, WorkspaceAccess,
+        ConfinementConfig, ExecutionPreset, MountAccess, MountSpec, NetworkMode,
+        OciConfinementConfig, WorkspaceAccess,
     };
 
     #[test]
@@ -907,6 +923,31 @@ mod tests {
 
         assert_ne!(left.compatibility_key(), right.compatibility_key());
         assert_eq!(left.compatibility_key(), normalized.compatibility_key());
+    }
+
+    #[test]
+    fn runtime_compatibility_key_changes_when_mount_config_changes() {
+        let left_confinement = sample_confinement();
+        let mut right_confinement = sample_confinement();
+        let ConfinementConfig::Oci(oci) = &mut right_confinement;
+        oci.additional_mounts.push(MountSpec {
+            source: Path::new("/var/tmp/lionclaw-docs").to_path_buf(),
+            target: "/mnt/docs".to_string(),
+            access: MountAccess::ReadOnly,
+        });
+
+        let left = RuntimeProfileConfig::Codex {
+            executable: "codex".to_string(),
+            model: Some("gpt-5".to_string()),
+            confinement: left_confinement,
+        };
+        let right = RuntimeProfileConfig::Codex {
+            executable: "codex".to_string(),
+            model: Some("gpt-5".to_string()),
+            confinement: right_confinement,
+        };
+
+        assert_ne!(left.compatibility_key(), right.compatibility_key());
     }
 
     #[test]

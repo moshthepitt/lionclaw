@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::{
     home::LionClawHome,
     operator::{
-        attach::attach_channel_with_binaries,
+        attach::{attach_channel_with_binaries, ChannelAttachContext},
         channel_env::{
             collect_from_process_env, load_channel_env, merge_channel_env, missing_required_env,
             parse_env_file, render_missing_env_repair, save_channel_env,
@@ -42,6 +42,7 @@ pub struct ConnectEnvInputs {
 pub struct ConnectChannelRequest<'a, M> {
     pub home: &'a LionClawHome,
     pub manager: &'a M,
+    pub project_root: Option<&'a Path>,
     pub work_root: &'a Path,
     pub channel_or_path: &'a str,
     pub env_inputs: ConnectEnvInputs,
@@ -91,6 +92,7 @@ where
     let ConnectChannelRequest {
         home,
         manager,
+        project_root,
         work_root,
         channel_or_path,
         env_inputs,
@@ -153,9 +155,12 @@ where
         ChannelLaunchMode::Interactive => {
             rollback.commit()?;
             attach_channel_with_binaries(
-                home,
-                manager,
-                work_root,
+                ChannelAttachContext {
+                    home,
+                    manager,
+                    project_root,
+                    work_root,
+                },
                 channel_id.clone(),
                 None,
                 None,
@@ -167,8 +172,15 @@ where
         ChannelLaunchMode::Background => {
             let channel_was_active =
                 background_channel_is_active(home, manager, &channel_id).await?;
-            if let Err(err) =
-                up_for_work_root(home, manager, &runtime_id, binaries, work_root).await
+            if let Err(err) = up_for_work_root(
+                home,
+                manager,
+                &runtime_id,
+                binaries,
+                project_root,
+                work_root,
+            )
+            .await
             {
                 return rollback_all_and_return(home, &channel_id, rollback, err).await;
             }
@@ -1042,6 +1054,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
             ConnectChannelRequest {
                 home: &home,
                 manager: &manager,
+                project_root: None,
                 work_root: temp_dir.path(),
                 channel_or_path: "telegram",
                 env_inputs: ConnectEnvInputs {
@@ -1091,6 +1104,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
             ConnectChannelRequest {
                 home: &home,
                 manager: &manager,
+                project_root: None,
                 work_root: temp_dir.path(),
                 channel_or_path: "telegram",
                 env_inputs: ConnectEnvInputs::default(),
@@ -1130,6 +1144,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
             ConnectChannelRequest {
                 home: &home,
                 manager: &manager,
+                project_root: None,
                 work_root: temp_dir.path(),
                 channel_or_path: "telegram",
                 env_inputs: ConnectEnvInputs {
@@ -1183,6 +1198,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
             ConnectChannelRequest {
                 home: &home,
                 manager: &manager,
+                project_root: None,
                 work_root: temp_dir.path(),
                 channel_or_path: "telegram",
                 env_inputs: ConnectEnvInputs {
@@ -1235,6 +1251,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
             ConnectChannelRequest {
                 home: &home,
                 manager: &manager,
+                project_root: None,
                 work_root: temp_dir.path(),
                 channel_or_path: "telegram",
                 env_inputs: ConnectEnvInputs {
@@ -1287,6 +1304,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
             ConnectChannelRequest {
                 home: &home,
                 manager: &manager,
+                project_root: None,
                 work_root: temp_dir.path(),
                 channel_or_path: "telegram",
                 env_inputs: ConnectEnvInputs {
@@ -1365,6 +1383,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
             ConnectChannelRequest {
                 home: &home,
                 manager: &manager,
+                project_root: None,
                 work_root: temp_dir.path(),
                 channel_or_path: new_skill.to_str().expect("utf8 path"),
                 env_inputs: ConnectEnvInputs {
@@ -1412,6 +1431,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
             ConnectChannelRequest {
                 home: &home,
                 manager: &manager,
+                project_root: None,
                 work_root: temp_dir.path(),
                 channel_or_path: "telegram",
                 env_inputs: ConnectEnvInputs {
@@ -1438,6 +1458,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
             ConnectChannelRequest {
                 home: &home,
                 manager: &manager,
+                project_root: None,
                 work_root: temp_dir.path(),
                 channel_or_path: "telegram",
                 env_inputs: ConnectEnvInputs {
@@ -1488,6 +1509,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
             ConnectChannelRequest {
                 home: &home,
                 manager: &manager,
+                project_root: None,
                 work_root: temp_dir.path(),
                 channel_or_path: "terminal",
                 env_inputs: ConnectEnvInputs::default(),

@@ -16,6 +16,7 @@ use super::{
         ExecutionBackend, ExecutionOutput, ExecutionRequest, ExecutionSession,
         ExecutionStdoutSender,
     },
+    mount_validation::{podman_bind_mount_argument, PodmanBindMountArgumentForm},
     plan::{ConfinementBackend, MountAccess, MountSpec, NetworkMode, RuntimeAuthKind},
     process::{run_process_streaming, spawn_process_session, ProcessInvocation, ProcessSession},
     runtime_auth::prepare_runtime_auth,
@@ -283,8 +284,9 @@ fn prepare_oci_process_launch(
     }
 
     for mount in &request.plan.mounts {
-        args.push("--volume".to_string());
-        args.push(format_volume_spec(mount)?);
+        let (flag, spec) = format_bind_mount_arg(mount)?;
+        args.push(flag.to_string());
+        args.push(spec);
     }
 
     if workspace_lionclaw_metadata_mask_needed(&request.plan.mounts, &config.tmpfs) {
@@ -708,31 +710,33 @@ fn strip_mount_prefix(requested: &Path, source: &Path) -> Option<PathBuf> {
     requested.strip_prefix(source).ok().map(Path::to_path_buf)
 }
 
-fn format_volume_spec(mount: &MountSpec) -> Result<String> {
-    let source = mount.source.to_str().ok_or_else(|| {
-        anyhow!(
-            "mount source '{}' is not valid UTF-8",
-            mount.source.display()
-        )
-    })?;
-    if source.contains(':') {
-        bail!(
-            "mount source '{}' contains ':' and cannot be represented safely as an OCI volume argument",
-            mount.source.display()
-        );
-    }
-    if mount.target.contains(':') {
-        bail!(
-            "mount target '{}' contains ':' and cannot be represented safely as an OCI volume argument",
-            mount.target
-        );
-    }
-
+fn format_volume_spec(source: &str, mount: &MountSpec) -> String {
     let access = match mount.access {
         MountAccess::ReadOnly => READ_ONLY_BIND_MOUNT_OPTIONS,
         MountAccess::ReadWrite => READ_WRITE_BIND_MOUNT_OPTIONS,
     };
-    Ok(format!("{source}:{}:{access}", mount.target))
+    format!("{source}:{}:{access}", mount.target)
+}
+
+fn format_bind_mount_arg(mount: &MountSpec) -> Result<(&'static str, String)> {
+    let argument =
+        podman_bind_mount_argument(&mount.source, &mount.target).map_err(anyhow::Error::msg)?;
+    match argument.form {
+        PodmanBindMountArgumentForm::Volume => {
+            Ok(("--volume", format_volume_spec(argument.source, mount)))
+        }
+        PodmanBindMountArgumentForm::Mount => {
+            Ok(("--mount", format_mount_spec(argument.source, mount)))
+        }
+    }
+}
+
+fn format_mount_spec(source: &str, mount: &MountSpec) -> String {
+    let access = match mount.access {
+        MountAccess::ReadOnly => "readonly,relabel=private",
+        MountAccess::ReadWrite => "rw,relabel=private",
+    };
+    format!("type=bind,src={source},target={},{}", mount.target, access)
 }
 
 fn workspace_lionclaw_metadata_mask_needed(
@@ -913,6 +917,12 @@ mod tests {
             .args
             .windows(2)
             .any(|pair| { pair == ["--volume".to_string(), "/host/refs:/refs:ro,Z".to_string()] }));
+        assert!(invocation.args.windows(2).any(|pair| {
+            pair == [
+                "--volume".to_string(),
+                "/host/cache:/mnt/cache:rw,Z".to_string(),
+            ]
+        }));
         assert!(invocation
             .args
             .windows(2)
@@ -991,6 +1001,57 @@ mod tests {
             .args
             .windows(2)
             .any(|pair| { pair == ["--network".to_string(), "none".to_string()] }));
+    }
+
+    #[test]
+    fn oci_backend_uses_mount_arg_for_colon_paths() {
+        let mut request = sample_execution_request();
+        request.plan.working_dir = None;
+        request.plan.mounts = vec![
+            MountSpec {
+                source: "/host/refs:archive".into(),
+                target: "/refs".to_string(),
+                access: MountAccess::ReadOnly,
+            },
+            MountSpec {
+                source: "/host/cache".into(),
+                target: "/mnt/cache:archive".to_string(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        let prepared = prepare_oci_process_launch(&request, None).expect("prepare");
+
+        assert!(prepared.args.windows(2).any(|pair| {
+            pair == [
+                "--mount".to_string(),
+                "type=bind,src=/host/refs:archive,target=/refs,readonly,relabel=private"
+                    .to_string(),
+            ]
+        }));
+        assert!(prepared.args.windows(2).any(|pair| {
+            pair == [
+                "--mount".to_string(),
+                "type=bind,src=/host/cache,target=/mnt/cache:archive,rw,relabel=private"
+                    .to_string(),
+            ]
+        }));
+    }
+
+    #[test]
+    fn oci_backend_rejects_bind_mount_paths_with_colon_and_comma() {
+        let mut request = sample_execution_request();
+        request.plan.working_dir = None;
+        request.plan.mounts = vec![MountSpec {
+            source: "/host/refs:archive,current".into(),
+            target: "/refs".to_string(),
+            access: MountAccess::ReadOnly,
+        }];
+
+        let err = prepare_oci_process_launch(&request, None).expect_err("unrepresentable mount");
+
+        assert!(err.to_string().contains("Podman --mount"));
+        assert!(err.to_string().contains("contains ','"));
     }
 
     #[test]
@@ -1326,6 +1387,11 @@ esac
                     source: "/host/refs".into(),
                     target: "/refs".to_string(),
                     access: MountAccess::ReadOnly,
+                },
+                MountSpec {
+                    source: "/host/cache".into(),
+                    target: "/mnt/cache".to_string(),
+                    access: MountAccess::ReadWrite,
                 },
             ],
             mount_runtime_secrets: true,

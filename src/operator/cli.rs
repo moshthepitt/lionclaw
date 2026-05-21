@@ -24,7 +24,7 @@ use crate::{
     home::LionClawHome,
     kernel::{
         jobs::normalize_cron_expression,
-        runtime::{ConfinementConfig, ExecutionLimits, OciConfinementConfig},
+        runtime::{ConfinementConfig, ExecutionLimits, MountAccess, OciConfinementConfig},
     },
     operator::{
         attach::attach_channel,
@@ -55,6 +55,10 @@ use crate::{
         runtime_integration::{
             configure_runtime_profile_with_engine_resolver, configure_runtime_required_message,
             ConfigureRuntimeOutcome,
+        },
+        runtime_mounts::{
+            add_runtime_mount, configured_runtime_mounts, remove_runtime_mount,
+            validate_configured_runtime_mounts, RuntimeMountContext,
         },
         skills::{list_installed_skills, InstalledSkill},
         snapshot::SKILL_INSTALL_METADATA_FILE,
@@ -279,7 +283,18 @@ enum RuntimeCommand {
     Add(Box<RuntimeAddArgs>),
     Rm(RuntimeRmArgs),
     Ls,
+    Mount {
+        #[command(subcommand)]
+        command: RuntimeMountCommand,
+    },
     SetDefault(RuntimeSetDefaultArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum RuntimeMountCommand {
+    List(RuntimeMountListArgs),
+    Add(RuntimeMountAddArgs),
+    Remove(RuntimeMountRemoveArgs),
 }
 
 #[derive(Debug, Args)]
@@ -320,6 +335,29 @@ struct RuntimeRmArgs {
 #[derive(Debug, Args)]
 struct RuntimeSetDefaultArgs {
     id: String,
+}
+
+#[derive(Debug, Args)]
+struct RuntimeMountListArgs {
+    runtime_id: String,
+}
+
+#[derive(Debug, Args)]
+struct RuntimeMountAddArgs {
+    runtime_id: String,
+    target: String,
+    #[arg(long)]
+    source: PathBuf,
+    #[arg(long = "read-only", conflicts_with = "read_write")]
+    read_only: bool,
+    #[arg(long = "read-write", conflicts_with = "read_only")]
+    read_write: bool,
+}
+
+#[derive(Debug, Args)]
+struct RuntimeMountRemoveArgs {
+    runtime_id: String,
+    target: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -741,6 +779,7 @@ pub async fn run() -> Result<ExitCode> {
                 ConnectChannelRequest {
                     home: &target.instance_home,
                     manager: &manager,
+                    project_root: target.project_root.as_deref(),
                     work_root: target.require_work_root()?,
                     channel_or_path: &args.channel_or_path,
                     env_inputs: ConnectEnvInputs {
@@ -779,6 +818,7 @@ pub async fn run() -> Result<ExitCode> {
             } else {
                 run_local(
                     &target.instance_home,
+                    target.project_root.as_deref(),
                     target.require_work_root()?,
                     target.instance_name.as_deref(),
                     args.runtime,
@@ -803,9 +843,13 @@ pub async fn run() -> Result<ExitCode> {
                 let target = resolved_target
                     .as_ref()
                     .ok_or_else(|| anyhow!("up requires a resolved LionClaw target"))?;
-                let message =
-                    up_instance(&target.instance_home, &manager, target.require_work_root()?)
-                        .await?;
+                let message = up_instance(
+                    &target.instance_home,
+                    &manager,
+                    target.project_root.as_deref(),
+                    target.require_work_root()?,
+                )
+                .await?;
                 println!("{message}");
             }
         }
@@ -939,6 +983,78 @@ pub async fn run() -> Result<ExitCode> {
                     }
                 }
             }
+            RuntimeCommand::Mount { command } => {
+                let target = resolved_target.as_ref();
+                let project_root = target.and_then(|target| target.project_root.as_deref());
+                let work_root = target.and_then(|target| target.work_root.as_deref());
+                let mount_context = RuntimeMountContext {
+                    home: &home,
+                    project_root,
+                    work_root,
+                };
+                match command {
+                    RuntimeMountCommand::List(args) => {
+                        let config = OperatorConfig::load(&home).await?;
+                        let mounts = configured_runtime_mounts(&config, &args.runtime_id)?;
+                        if mounts.is_empty() {
+                            println!("no mounts configured for runtime {}", args.runtime_id);
+                        } else {
+                            for mount in mounts {
+                                println!(
+                                    "target={} source={} access={}",
+                                    mount.target,
+                                    mount.source.display(),
+                                    mount.access.as_str()
+                                );
+                            }
+                        }
+                        validate_configured_runtime_mounts(
+                            mount_context.home,
+                            mount_context.project_root,
+                            mount_context.work_root,
+                            &config,
+                            &args.runtime_id,
+                        )?;
+                    }
+                    RuntimeMountCommand::Add(args) => {
+                        let mut config = OperatorConfig::load(&home).await?;
+                        let access = match (args.read_only, args.read_write) {
+                            (_, true) => MountAccess::ReadWrite,
+                            _ => MountAccess::ReadOnly,
+                        };
+                        let mount = add_runtime_mount(
+                            &mut config,
+                            mount_context,
+                            &args.runtime_id,
+                            &args.target,
+                            &args.source,
+                            access,
+                        )?;
+                        config.save(&home).await?;
+                        println!(
+                            "mounted {} at {} ({}) for runtime {}",
+                            mount.source.display(),
+                            mount.target,
+                            mount.access.as_str(),
+                            args.runtime_id
+                        );
+                        print_runtime_state_change_note();
+                    }
+                    RuntimeMountCommand::Remove(args) => {
+                        let mut config = OperatorConfig::load(&home).await?;
+                        let mount =
+                            remove_runtime_mount(&mut config, &args.runtime_id, &args.target)?;
+                        config.save(&home).await?;
+                        println!(
+                            "removed mount {} ({}) from runtime {}",
+                            mount.target,
+                            mount.source.display(),
+                            args.runtime_id
+                        );
+                        print_runtime_state_change_note();
+                    }
+                }
+            }
             RuntimeCommand::SetDefault(args) => {
                 let mut config = OperatorConfig::load(&home).await?;
                 config.set_default_runtime(&args.id)?;
@@ -1043,8 +1159,18 @@ pub async fn run() -> Result<ExitCode> {
             ChannelCommand::Attach(args) => {
                 let manager = SystemdUserUnitManager;
                 let work_root = required_command_work_root(&resolved_target, "channel attach")?;
-                attach_channel(&home, &manager, work_root, args.id, args.peer, args.runtime)
-                    .await?;
+                attach_channel(
+                    &home,
+                    &manager,
+                    resolved_target
+                        .as_ref()
+                        .and_then(|target| target.project_root.as_deref()),
+                    work_root,
+                    args.id,
+                    args.peer,
+                    args.runtime,
+                )
+                .await?;
             }
             ChannelCommand::Pairing { command } => match command {
                 ChannelPairingCommand::List(args) => {
@@ -1566,7 +1692,19 @@ fn resolve_command_target(
             | JobCommand::Rm(_)
             | JobCommand::Runs(_) => Some(WorkRootRequirement::Optional),
         },
-        Command::Runtime { .. } | Command::Skill { .. } => Some(WorkRootRequirement::Optional),
+        Command::Runtime { command } => match command.as_ref() {
+            RuntimeCommand::Mount {
+                command: RuntimeMountCommand::Add(_) | RuntimeMountCommand::List(_),
+            } => Some(WorkRootRequirement::Required),
+            RuntimeCommand::Add(_)
+            | RuntimeCommand::Rm(_)
+            | RuntimeCommand::Ls
+            | RuntimeCommand::Mount {
+                command: RuntimeMountCommand::Remove(_),
+            }
+            | RuntimeCommand::SetDefault(_) => Some(WorkRootRequirement::Optional),
+        },
+        Command::Skill { .. } => Some(WorkRootRequirement::Optional),
         Command::Project { .. } | Command::Instance { .. } | Command::ProjectValidate(_) => None,
     };
 
@@ -2313,6 +2451,48 @@ mod tests {
     }
 
     #[test]
+    fn runtime_mount_commands_parse_under_runtime_namespace() {
+        let cli = Cli::try_parse_from([
+            "lionclaw",
+            "runtime",
+            "mount",
+            "add",
+            "codex",
+            "docs",
+            "--source",
+            "/srv/docs",
+            "--read-write",
+        ])
+        .expect("parse runtime mount add");
+
+        match cli.command {
+            Command::Runtime { command } => match *command {
+                RuntimeCommand::Mount {
+                    command: RuntimeMountCommand::Add(args),
+                } => {
+                    assert_eq!(args.runtime_id, "codex");
+                    assert_eq!(args.target, "docs");
+                    assert_eq!(args.source, PathBuf::from("/srv/docs"));
+                    assert!(args.read_write);
+                }
+                other => panic!("unexpected runtime command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        assert!(Cli::try_parse_from([
+            "lionclaw",
+            "runtime",
+            "mount",
+            "remove",
+            "codex",
+            "/reference/docs",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["lionclaw", "runtime", "mount", "list", "codex"]).is_ok());
+    }
+
+    #[test]
     fn plain_doctor_does_not_pre_resolve_a_target() {
         let target = resolve_command_target(
             &TargetSelection::default(),
@@ -2483,6 +2663,30 @@ mod tests {
                     command: JobCommand::Tick,
                 },
             ),
+            (
+                "runtime mount add",
+                Command::Runtime {
+                    command: Box::new(RuntimeCommand::Mount {
+                        command: RuntimeMountCommand::Add(RuntimeMountAddArgs {
+                            runtime_id: "codex".to_string(),
+                            target: "docs".to_string(),
+                            source: PathBuf::from("/tmp/docs"),
+                            read_only: false,
+                            read_write: false,
+                        }),
+                    }),
+                },
+            ),
+            (
+                "runtime mount list",
+                Command::Runtime {
+                    command: Box::new(RuntimeCommand::Mount {
+                        command: RuntimeMountCommand::List(RuntimeMountListArgs {
+                            runtime_id: "codex".to_string(),
+                        }),
+                    }),
+                },
+            ),
         ];
 
         for (label, command) in commands {
@@ -2507,6 +2711,22 @@ mod tests {
         .expect("runtime ls should resolve target");
         assert_eq!(runtime_list.instance_home.root(), home.as_path());
         assert!(runtime_list.work_root.is_none());
+
+        let runtime_mount_remove = resolve_command_target(
+            &selection,
+            &Command::Runtime {
+                command: Box::new(RuntimeCommand::Mount {
+                    command: RuntimeMountCommand::Remove(RuntimeMountRemoveArgs {
+                        runtime_id: "codex".to_string(),
+                        target: "docs".to_string(),
+                    }),
+                }),
+            },
+        )
+        .expect("runtime mount remove should target home without work root")
+        .expect("runtime mount remove should resolve target");
+        assert_eq!(runtime_mount_remove.instance_home.root(), home.as_path());
+        assert!(runtime_mount_remove.work_root.is_none());
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub mod run;
 pub(crate) mod run_tui;
 pub mod runtime;
 pub mod runtime_integration;
+pub(crate) mod runtime_mounts;
 pub mod skills;
 pub mod snapshot;
 pub mod status;

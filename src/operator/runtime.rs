@@ -16,10 +16,13 @@ use crate::kernel::{
     },
     Kernel,
 };
+use tracing::warn;
 
 use super::config::{
-    daemon_compat_fingerprint_with_runtime_context, OperatorConfig, RuntimeProfileConfig,
+    daemon_compat_fingerprint_with_runtime_context, validate_runtime_command, OperatorConfig,
+    RuntimeProfileConfig,
 };
+use super::runtime_mounts::validate_configured_runtime_mounts;
 
 #[derive(Debug, Clone)]
 pub struct ResolvedRuntimeExecutionContext {
@@ -29,9 +32,15 @@ pub struct ResolvedRuntimeExecutionContext {
 }
 
 pub async fn register_configured_runtimes(kernel: &Kernel, config: &OperatorConfig) -> Result<()> {
-    validate_configured_runtimes(config)?;
-
     for (id, runtime) in &config.runtimes {
+        if let Err(err) = validate_runtime_command(runtime.executable()) {
+            warn!(
+                ?err,
+                runtime_id = %id,
+                "skipping runtime adapter registration for invalid runtime command"
+            );
+            continue;
+        }
         match runtime {
             RuntimeProfileConfig::Codex {
                 executable,
@@ -137,7 +146,20 @@ pub async fn validate_runtime_launch_prerequisites(
     config: &OperatorConfig,
     runtime_id: &str,
 ) -> Result<()> {
+    validate_runtime_launch_prerequisites_for_work_root(home, config, runtime_id, None, None).await
+}
+
+pub async fn validate_runtime_launch_prerequisites_for_work_root(
+    home: &LionClawHome,
+    config: &OperatorConfig,
+    runtime_id: &str,
+    project_root: Option<&Path>,
+    work_root: Option<&Path>,
+) -> Result<()> {
     validate_runtime_availability(config, runtime_id)?;
+    validate_configured_runtime_mounts(home, project_root, work_root, config, runtime_id).map_err(
+        |err| anyhow!("configured runtime profile '{runtime_id}' has invalid mounts: {err}"),
+    )?;
     let profile = config
         .runtime(runtime_id)
         .ok_or_else(|| anyhow!("runtime profile '{runtime_id}' is not configured"))?;
@@ -243,12 +265,17 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        resolve_runtime_execution_context, validate_configured_runtimes,
-        validate_runtime_availability, validate_runtime_launch_prerequisites,
+        register_configured_runtimes, resolve_runtime_execution_context,
+        validate_configured_runtimes, validate_runtime_availability,
+        validate_runtime_launch_prerequisites, validate_runtime_launch_prerequisites_for_work_root,
     };
     use crate::home::LionClawHome;
-    use crate::kernel::runtime::{
-        ConfinementConfig, ExecutionPreset, NetworkMode, OciConfinementConfig, WorkspaceAccess,
+    use crate::kernel::{
+        runtime::{
+            ConfinementConfig, ExecutionPreset, MountAccess, MountSpec, NetworkMode,
+            OciConfinementConfig, WorkspaceAccess,
+        },
+        Kernel,
     };
     use crate::operator::config::{OperatorConfig, RuntimeProfileConfig};
 
@@ -377,6 +404,34 @@ mod tests {
             .contains("configured runtime profile 'broken' is invalid"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_adapter_registration_does_not_require_every_profile_to_be_launchable() {
+        let (_temp_dir, engine) = fake_podman();
+        let home = tempfile::tempdir().expect("home");
+        let kernel = Kernel::new(&home.path().join("lionclaw.db"))
+            .await
+            .expect("kernel");
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), codex_runtime_profile(engine.clone()));
+        config.upsert_runtime(
+            "broken".to_string(),
+            RuntimeProfileConfig::Codex {
+                executable: "codex".to_string(),
+                model: None,
+                confinement: ConfinementConfig::Oci(OciConfinementConfig {
+                    engine,
+                    image: None,
+                    ..OciConfinementConfig::default()
+                }),
+            },
+        );
+
+        register_configured_runtimes(&kernel, &config)
+            .await
+            .expect("non-launchable profile should not block kernel registration");
+    }
+
     fn codex_runtime_profile(engine: String) -> RuntimeProfileConfig {
         RuntimeProfileConfig::Codex {
             executable: "codex".to_string(),
@@ -417,6 +472,41 @@ mod tests {
             .expect_err("missing host Codex auth should fail");
         assert!(err.to_string().contains("codex login"));
         assert!(err.to_string().contains("auth.json"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_prereqs_reject_project_metadata_mount_sources() {
+        let (_temp_dir, engine) = fake_podman();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home = LionClawHome::new(temp_dir.path().join("home"));
+        let project_root = temp_dir.path().join("project");
+        let work_root = temp_dir.path().join("work");
+        let metadata_source = project_root.join(".lionclaw/private");
+        std::fs::create_dir_all(&metadata_source).expect("metadata source");
+        std::fs::create_dir_all(&work_root).expect("work root");
+        home.ensure_base_dirs().await.expect("base dirs");
+        let mut profile = codex_runtime_profile(engine);
+        let ConfinementConfig::Oci(oci) = profile.confinement_mut();
+        oci.additional_mounts.push(MountSpec {
+            source: metadata_source,
+            target: "/mnt/private".to_string(),
+            access: MountAccess::ReadOnly,
+        });
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), profile);
+
+        let err = validate_runtime_launch_prerequisites_for_work_root(
+            &home,
+            &config,
+            "codex",
+            Some(&project_root),
+            Some(&work_root),
+        )
+        .await
+        .expect_err("project metadata mount source");
+
+        assert!(err.to_string().contains("project metadata"));
     }
 
     #[cfg(unix)]

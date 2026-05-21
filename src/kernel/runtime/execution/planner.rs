@@ -8,9 +8,16 @@ use crate::home::{runtime_project_drafts_dir_from_parts, runtime_session_state_d
 use crate::kernel::runtime_policy::{RuntimeExecutionPolicy, RuntimeExecutionRequest};
 use crate::kernel::skills::validate_skill_alias;
 
-use super::plan::{
-    ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset, MountAccess, MountSpec,
-    NetworkMode, OciConfinementConfig, RuntimeAuthKind, WorkspaceAccess, SKILLS_MOUNT_TARGET_ROOT,
+use super::{
+    mount_validation::{
+        mount_target_is_or_under, project_metadata_root_from_instance_home,
+        validate_configured_mounts, MountSourceProtection,
+    },
+    plan::{
+        ConfinementConfig, EffectiveExecutionPlan, ExecutionPreset, MountAccess, MountSpec,
+        NetworkMode, OciConfinementConfig, RuntimeAuthKind, WorkspaceAccess,
+        SKILLS_MOUNT_TARGET_ROOT,
+    },
 };
 
 pub const BUILTIN_PRESET_EVERYDAY: &str = "everyday";
@@ -18,7 +25,6 @@ pub const BUILTIN_PRESET_HIDDEN_COMPACTION: &str = "hidden-compaction";
 const WORKSPACE_MOUNT_TARGET: &str = "/workspace";
 const RUNTIME_MOUNT_TARGET: &str = "/runtime";
 const DRAFTS_MOUNT_TARGET: &str = "/drafts";
-const ATTACHMENTS_MOUNT_TARGET: &str = "/attachments";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeExecutionProfile {
@@ -366,19 +372,14 @@ impl ExecutionPlanner {
 
         match &request.runtime_profile.confinement {
             ConfinementConfig::Oci(config) => {
+                validate_configured_mounts(
+                    &config.additional_mounts,
+                    &configured_mount_protections(
+                        self.runtime_root.as_ref(),
+                        self.project_workspace_root.as_ref(),
+                    ),
+                )?;
                 for mount in &config.additional_mounts {
-                    if is_skills_mount_target(&mount.target) {
-                        return Err(format!(
-                            "runtime additional mount target '{}' is reserved for runtime skill assets",
-                            mount.target
-                        ));
-                    }
-                    if mount_target_is_or_under(&mount.target, ATTACHMENTS_MOUNT_TARGET) {
-                        return Err(format!(
-                            "runtime additional mount target '{}' is reserved for channel attachments",
-                            mount.target
-                        ));
-                    }
                     mounts.push(mount.clone());
                 }
             }
@@ -505,13 +506,6 @@ fn validate_runtime_extra_mounts(mounts: &[MountSpec]) -> Result<(), String> {
     Ok(())
 }
 
-fn mount_target_is_or_under(target: &str, root: &str) -> bool {
-    target == root
-        || target
-            .strip_prefix(root)
-            .is_some_and(|suffix| suffix.starts_with('/'))
-}
-
 fn runtime_session_shape_key(preset: &ExecutionPreset) -> String {
     format!(
         "workspace-{}__network-{}__secrets-{}",
@@ -523,6 +517,34 @@ fn runtime_session_shape_key(preset: &ExecutionPreset) -> String {
             "off"
         }
     )
+}
+
+fn configured_mount_protections(
+    runtime_root: Option<&PathBuf>,
+    project_workspace_root: Option<&PathBuf>,
+) -> Vec<MountSourceProtection> {
+    let mut roots = Vec::new();
+    if let Some(runtime_root) = runtime_root {
+        if let Some(home_root) = runtime_root.parent() {
+            roots.push(MountSourceProtection::new(
+                home_root.to_path_buf(),
+                "the selected instance home",
+            ));
+            if let Some(metadata_root) = project_metadata_root_from_instance_home(home_root) {
+                roots.push(MountSourceProtection::new(
+                    metadata_root,
+                    "project metadata",
+                ));
+            }
+        }
+    }
+    if let Some(project_workspace_root) = project_workspace_root {
+        roots.push(MountSourceProtection::new(
+            project_workspace_root.join(".lionclaw"),
+            "project metadata",
+        ));
+    }
+    roots
 }
 
 fn hidden_compaction_preset() -> ExecutionPreset {
@@ -604,7 +626,7 @@ fn build_runtime_environment(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, time::Duration};
+    use std::{collections::BTreeMap, fs, time::Duration};
 
     use tempfile::tempdir;
     use uuid::Uuid;
@@ -660,11 +682,13 @@ mod tests {
     fn planner_builds_workspace_runtime_and_draft_mounts() {
         let sandbox = tempdir().expect("temp dir");
         let workspace_root = sandbox.path().join("project");
-        let runtime_root = sandbox.path().join("runtime");
+        let runtime_root = sandbox.path().join("home/runtime");
+        let refs_root = sandbox.path().join("refs");
+        fs::create_dir(&refs_root).expect("refs dir");
         let session_id = Uuid::nil();
         let project_key = runtime_project_partition_key(Some(workspace_root.as_path()));
         let extra_mount = MountSpec {
-            source: sandbox.path().join("refs"),
+            source: refs_root,
             target: "/refs".to_string(),
             access: MountAccess::ReadOnly,
         };
@@ -940,7 +964,7 @@ mod tests {
             .expect_err("skill namespace is reserved for kernel runtime skill mounts");
 
         assert!(
-            err.contains("reserved for runtime skill assets"),
+            err.contains("reserved runtime path"),
             "unexpected planner error: {err}"
         );
     }
@@ -1036,7 +1060,158 @@ mod tests {
             .expect_err("channel attachment mount target is kernel-owned");
 
         assert!(
-            err.contains("reserved for channel attachments"),
+            err.contains("reserved runtime path"),
+            "unexpected planner error: {err}"
+        );
+    }
+
+    #[test]
+    fn planner_rejects_invalid_configured_mount_sources_and_duplicates() {
+        let sandbox = tempdir().expect("temp dir");
+        let runtime_root = sandbox.path().join("home/runtime");
+        let private_config = sandbox.path().join("home/config");
+        let refs = sandbox.path().join("refs");
+        fs::create_dir_all(&runtime_root).expect("runtime root");
+        fs::create_dir_all(&private_config).expect("private config");
+        fs::create_dir(&refs).expect("refs");
+
+        for (mounts, expected) in [
+            (
+                vec![MountSpec {
+                    source: sandbox.path().join("missing"),
+                    target: "/mnt/missing".to_string(),
+                    access: MountAccess::ReadOnly,
+                }],
+                "failed to resolve mount source",
+            ),
+            (
+                vec![MountSpec {
+                    source: private_config.clone(),
+                    target: "/mnt/private".to_string(),
+                    access: MountAccess::ReadOnly,
+                }],
+                "selected instance home",
+            ),
+            (
+                vec![
+                    MountSpec {
+                        source: refs.clone(),
+                        target: "/mnt/refs".to_string(),
+                        access: MountAccess::ReadOnly,
+                    },
+                    MountSpec {
+                        source: refs.clone(),
+                        target: "/mnt/refs/".to_string(),
+                        access: MountAccess::ReadOnly,
+                    },
+                ],
+                "duplicate runtime mount target",
+            ),
+        ] {
+            let runtimes = [(
+                "codex".to_string(),
+                RuntimeExecutionProfile::new(
+                    ConfinementConfig::Oci(OciConfinementConfig {
+                        additional_mounts: mounts,
+                        ..OciConfinementConfig::default()
+                    }),
+                    "runtime-codex-v1".to_string(),
+                    None,
+                    None,
+                ),
+            )]
+            .into_iter()
+            .collect();
+            let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+                policy: RuntimeExecutionPolicy::default(),
+                default_preset_name: None,
+                presets: BTreeMap::new(),
+                runtimes,
+                workspace_root: None,
+                project_workspace_root: None,
+                runtime_root: Some(runtime_root.clone()),
+                workspace_name: None,
+                default_idle_timeout: Duration::from_secs(30),
+                default_hard_timeout: Duration::from_secs(90),
+            });
+
+            let err = planner
+                .plan(ExecutionPlanRequest {
+                    session_id: Some(Uuid::nil()),
+                    runtime_id: "codex".to_string(),
+                    purpose: ExecutionPlanPurpose::Interactive,
+                    preset_name: None,
+                    working_dir: None,
+                    env_passthrough_keys: Vec::new(),
+                    skill_mounts: Vec::new(),
+                    extra_mounts: Vec::new(),
+                    timeout_ms: None,
+                })
+                .expect_err("invalid configured mount should fail");
+
+            assert!(
+                err.contains(expected),
+                "expected {expected:?} in planner error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn planner_rejects_project_metadata_mount_sources_inferred_from_instance_home() {
+        let sandbox = tempdir().expect("temp dir");
+        let runtime_root = sandbox
+            .path()
+            .join("project/.lionclaw/instances/main/runtime");
+        let metadata_source = sandbox.path().join("project/.lionclaw/private");
+        fs::create_dir_all(&runtime_root).expect("runtime root");
+        fs::create_dir_all(&metadata_source).expect("metadata source");
+        let runtimes = [(
+            "codex".to_string(),
+            RuntimeExecutionProfile::new(
+                ConfinementConfig::Oci(OciConfinementConfig {
+                    additional_mounts: vec![MountSpec {
+                        source: metadata_source,
+                        target: "/mnt/private".to_string(),
+                        access: MountAccess::ReadOnly,
+                    }],
+                    ..OciConfinementConfig::default()
+                }),
+                "runtime-codex-v1".to_string(),
+                None,
+                None,
+            ),
+        )]
+        .into_iter()
+        .collect();
+        let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
+            policy: RuntimeExecutionPolicy::default(),
+            default_preset_name: None,
+            presets: BTreeMap::new(),
+            runtimes,
+            workspace_root: None,
+            project_workspace_root: None,
+            runtime_root: Some(runtime_root),
+            workspace_name: None,
+            default_idle_timeout: Duration::from_secs(30),
+            default_hard_timeout: Duration::from_secs(90),
+        });
+
+        let err = planner
+            .plan(ExecutionPlanRequest {
+                session_id: Some(Uuid::nil()),
+                runtime_id: "codex".to_string(),
+                purpose: ExecutionPlanPurpose::Interactive,
+                preset_name: None,
+                working_dir: None,
+                env_passthrough_keys: Vec::new(),
+                skill_mounts: Vec::new(),
+                extra_mounts: Vec::new(),
+                timeout_ms: None,
+            })
+            .expect_err("project metadata mount source");
+
+        assert!(
+            err.contains("project metadata"),
             "unexpected planner error: {err}"
         );
     }
