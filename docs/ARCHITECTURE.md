@@ -232,12 +232,13 @@ positional mount value is target identity: a path-safe token resolves to
 `/mnt/<token>`, while an absolute value is used as the exact container target.
 Persisted state remains the execution planner's `MountSpec { source, target,
 access }`; there is no separate mount name. Mount sources must be existing
-canonical directories outside LionClaw project metadata and instance-private
-state. Targets must be absolute, unique within the runtime profile, and outside
-reserved runtime paths: `/workspace`, `/runtime`, `/drafts`, `/attachments`,
-`/lionclaw`, `/run/secrets`, `/proc`, `/sys`, and `/dev`. The operator CLI,
-status/doctor checks, runtime launch validation, and planner all validate the
-configured mounts so hand-edited config cannot bypass planner safety checks.
+canonical directories outside LionClaw project/work-root metadata and
+instance-private state. Targets must be absolute, unique within the runtime
+profile, and outside reserved runtime paths: `/workspace`, `/runtime`,
+`/drafts`, `/attachments`, `/lionclaw`, `/run/secrets`, `/proc`, `/sys`, and
+`/dev`. The operator CLI, status/doctor checks, runtime launch validation, and
+planner all validate the configured mounts so hand-edited config cannot bypass
+planner safety checks.
 
 The operator console treats the transcript as durable conversation: user prompts
 and assistant answer deltas are rendered as message blocks. Runtime status,

@@ -152,9 +152,9 @@ lionclaw runtime mount remove codex docs
 ```
 
 Mounts default to read-only. LionClaw rejects files, missing directories,
-LionClaw metadata and instance-state paths, duplicate targets, and reserved
-runtime paths such as `/workspace`, `/runtime`, `/drafts`, `/attachments`,
-`/lionclaw`, `/run/secrets`, `/proc`, `/sys`, and `/dev`.
+project/work-root metadata and instance-state paths, duplicate targets, and
+reserved runtime paths such as `/workspace`, `/runtime`, `/drafts`,
+`/attachments`, `/lionclaw`, `/run/secrets`, `/proc`, `/sys`, and `/dev`.
 
 ## Projects And Instances
 

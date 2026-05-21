@@ -58,7 +58,7 @@ use crate::{
         },
         runtime_mounts::{
             add_runtime_mount, configured_runtime_mounts, remove_runtime_mount,
-            validate_configured_runtime_mounts,
+            validate_configured_runtime_mounts, RuntimeMountContext,
         },
         skills::{list_installed_skills, InstalledSkill},
         snapshot::SKILL_INSTALL_METADATA_FILE,
@@ -986,13 +986,19 @@ pub async fn run() -> Result<ExitCode> {
             RuntimeCommand::Mount { command } => {
                 let target = resolved_target.as_ref();
                 let project_root = target.and_then(|target| target.project_root.as_deref());
+                let work_root = target.and_then(|target| target.work_root.as_deref());
+                let mount_context = RuntimeMountContext {
+                    home: &home,
+                    project_root,
+                    work_root,
+                };
                 match command {
                     RuntimeMountCommand::List(args) => {
                         let config = OperatorConfig::load(&home).await?;
                         validate_configured_runtime_mounts(
-                            &home,
-                            project_root,
-                            None,
+                            mount_context.home,
+                            mount_context.project_root,
+                            mount_context.work_root,
                             &config,
                             &args.runtime_id,
                         )?;
@@ -1018,8 +1024,7 @@ pub async fn run() -> Result<ExitCode> {
                         };
                         let mount = add_runtime_mount(
                             &mut config,
-                            &home,
-                            project_root,
+                            mount_context,
                             &args.runtime_id,
                             &args.target,
                             &args.source,
@@ -1687,7 +1692,19 @@ fn resolve_command_target(
             | JobCommand::Rm(_)
             | JobCommand::Runs(_) => Some(WorkRootRequirement::Optional),
         },
-        Command::Runtime { .. } | Command::Skill { .. } => Some(WorkRootRequirement::Optional),
+        Command::Runtime { command } => match command.as_ref() {
+            RuntimeCommand::Mount {
+                command: RuntimeMountCommand::Add(_) | RuntimeMountCommand::List(_),
+            } => Some(WorkRootRequirement::Required),
+            RuntimeCommand::Add(_)
+            | RuntimeCommand::Rm(_)
+            | RuntimeCommand::Ls
+            | RuntimeCommand::Mount {
+                command: RuntimeMountCommand::Remove(_),
+            }
+            | RuntimeCommand::SetDefault(_) => Some(WorkRootRequirement::Optional),
+        },
+        Command::Skill { .. } => Some(WorkRootRequirement::Optional),
         Command::Project { .. } | Command::Instance { .. } | Command::ProjectValidate(_) => None,
     };
 
@@ -2646,6 +2663,30 @@ mod tests {
                     command: JobCommand::Tick,
                 },
             ),
+            (
+                "runtime mount add",
+                Command::Runtime {
+                    command: Box::new(RuntimeCommand::Mount {
+                        command: RuntimeMountCommand::Add(RuntimeMountAddArgs {
+                            runtime_id: "codex".to_string(),
+                            target: "docs".to_string(),
+                            source: PathBuf::from("/tmp/docs"),
+                            read_only: false,
+                            read_write: false,
+                        }),
+                    }),
+                },
+            ),
+            (
+                "runtime mount list",
+                Command::Runtime {
+                    command: Box::new(RuntimeCommand::Mount {
+                        command: RuntimeMountCommand::List(RuntimeMountListArgs {
+                            runtime_id: "codex".to_string(),
+                        }),
+                    }),
+                },
+            ),
         ];
 
         for (label, command) in commands {
@@ -2670,6 +2711,22 @@ mod tests {
         .expect("runtime ls should resolve target");
         assert_eq!(runtime_list.instance_home.root(), home.as_path());
         assert!(runtime_list.work_root.is_none());
+
+        let runtime_mount_remove = resolve_command_target(
+            &selection,
+            &Command::Runtime {
+                command: Box::new(RuntimeCommand::Mount {
+                    command: RuntimeMountCommand::Remove(RuntimeMountRemoveArgs {
+                        runtime_id: "codex".to_string(),
+                        target: "docs".to_string(),
+                    }),
+                }),
+            },
+        )
+        .expect("runtime mount remove should target home without work root")
+        .expect("runtime mount remove should resolve target");
+        assert_eq!(runtime_mount_remove.instance_home.root(), home.as_path());
+        assert!(runtime_mount_remove.work_root.is_none());
     }
 
     #[test]

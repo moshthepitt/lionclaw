@@ -18,6 +18,13 @@ use crate::{
     operator::config::{OperatorConfig, RuntimeProfileConfig},
 };
 
+#[derive(Clone, Copy)]
+pub(crate) struct RuntimeMountContext<'a> {
+    pub home: &'a LionClawHome,
+    pub project_root: Option<&'a Path>,
+    pub work_root: Option<&'a Path>,
+}
+
 pub(crate) fn resolve_runtime_mount_target(raw: &str) -> Result<String> {
     let target = raw.trim();
     if target.is_empty() {
@@ -34,8 +41,7 @@ pub(crate) fn resolve_runtime_mount_target(raw: &str) -> Result<String> {
 
 pub(crate) fn add_runtime_mount(
     config: &mut OperatorConfig,
-    home: &LionClawHome,
-    project_root: Option<&Path>,
+    context: RuntimeMountContext<'_>,
     runtime_id: &str,
     target: &str,
     source: &Path,
@@ -48,7 +54,8 @@ pub(crate) fn add_runtime_mount(
         target,
         access,
     };
-    let protections = mount_source_protections(home, project_root, None);
+    let protections =
+        mount_source_protections(context.home, context.project_root, context.work_root);
     validate_configured_mounts(std::slice::from_ref(&mount), &protections)
         .map_err(anyhow::Error::msg)?;
 
@@ -289,8 +296,11 @@ mod tests {
 
         let added = add_runtime_mount(
             &mut config,
-            &home,
-            None,
+            RuntimeMountContext {
+                home: &home,
+                project_root: None,
+                work_root: None,
+            },
             "codex",
             "docs",
             &source,
@@ -331,8 +341,11 @@ mod tests {
 
         let duplicate = add_runtime_mount(
             &mut config,
-            &home,
-            None,
+            RuntimeMountContext {
+                home: &home,
+                project_root: None,
+                work_root: None,
+            },
             "codex",
             "/mnt/docs",
             &source,
@@ -343,8 +356,11 @@ mod tests {
 
         let private_err = add_runtime_mount(
             &mut config,
-            &home,
-            None,
+            RuntimeMountContext {
+                home: &home,
+                project_root: None,
+                work_root: None,
+            },
             "codex",
             "private",
             &private,
@@ -369,14 +385,47 @@ mod tests {
 
         let err = add_runtime_mount(
             &mut config,
-            &home,
-            None,
+            RuntimeMountContext {
+                home: &home,
+                project_root: None,
+                work_root: None,
+            },
             "codex",
             "private",
             &metadata_source,
             MountAccess::ReadOnly,
         )
         .expect_err("project metadata source");
+
+        assert!(err.to_string().contains("project metadata"));
+    }
+
+    #[test]
+    fn add_rejects_work_root_metadata_sources() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project = temp_dir.path().join("project");
+        let work_root = project.join("work");
+        let metadata_source = work_root.join(".lionclaw/private");
+        let home = LionClawHome::new(project.join(".lionclaw/instances/main"));
+        std::fs::create_dir_all(home.root()).expect("home");
+        std::fs::create_dir_all(&metadata_source).expect("work-root metadata source");
+
+        let mut config = OperatorConfig::default();
+        config.upsert_runtime("codex".to_string(), profile("podman".to_string(), None));
+
+        let err = add_runtime_mount(
+            &mut config,
+            RuntimeMountContext {
+                home: &home,
+                project_root: Some(&project),
+                work_root: Some(&work_root),
+            },
+            "codex",
+            "private",
+            &metadata_source,
+            MountAccess::ReadOnly,
+        )
+        .expect_err("work-root metadata source");
 
         assert!(err.to_string().contains("project metadata"));
     }
