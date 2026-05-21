@@ -73,7 +73,7 @@ use crate::{
 use super::{
     audit::AuditLog,
     cancellation::{normalize_cancel_reason, TurnCancellation},
-    capability_broker::{CapabilityBroker, CapabilityExecutionContext},
+    capability_broker::{CapabilityBroker, CapabilityChannelSendRoute, CapabilityExecutionContext},
     channel_attachments::{
         ChannelAttachmentBatchStatus, ChannelAttachmentRecord, ChannelAttachmentRecordStatus,
         ChannelAttachmentStore, DeclareAttachmentRejection, RejectAttachmentUpdate,
@@ -9311,6 +9311,8 @@ fn summarize_capability_output(
         Capability::ChannelSend => json!({
             "channel_id": output.get("channel_id"),
             "conversation_ref": output.get("conversation_ref"),
+            "thread_ref": output.get("thread_ref"),
+            "reply_to_ref": output.get("reply_to_ref"),
             "delivery_id": output.get("delivery_id"),
         }),
         _ => json!({
@@ -9571,6 +9573,13 @@ struct ChannelStreamContext {
     reply_to_ref: Option<String>,
     session_id: Uuid,
     turn_id: Uuid,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedChannelRoute {
+    conversation_ref: String,
+    thread_ref: Option<String>,
+    reply_to_ref: Option<String>,
 }
 
 #[derive(Debug)]
@@ -11508,6 +11517,27 @@ impl Kernel {
             return Ok(None);
         }
 
+        let route = self
+            .resolved_channel_route_for_session(channel_id, session_peer_id, turn_id)
+            .await?;
+
+        Ok(Some(ChannelStreamContext {
+            channel_id: channel_id.to_string(),
+            peer_id: stream_peer_ref_for_session_peer(channel_id, session_peer_id),
+            conversation_ref: route.conversation_ref,
+            thread_ref: route.thread_ref,
+            reply_to_ref: route.reply_to_ref,
+            session_id,
+            turn_id,
+        }))
+    }
+
+    async fn resolved_channel_route_for_session(
+        &self,
+        channel_id: &str,
+        session_peer_id: &str,
+        turn_id: Uuid,
+    ) -> Result<ResolvedChannelRoute, KernelError> {
         let (conversation_ref, thread_ref) =
             delivery_route_for_session_key(channel_id, session_peer_id);
         let reply_to_ref = match self
@@ -11526,15 +11556,11 @@ impl Kernel {
             None => None,
         };
 
-        Ok(Some(ChannelStreamContext {
-            channel_id: channel_id.to_string(),
-            peer_id: stream_peer_ref_for_session_peer(channel_id, session_peer_id),
+        Ok(ResolvedChannelRoute {
             conversation_ref,
             thread_ref,
             reply_to_ref,
-            session_id,
-            turn_id,
-        }))
+        })
     }
 
     async fn emit_queued_channel_turn_status(
@@ -14479,15 +14505,30 @@ impl Kernel {
             }
 
             if reason.is_none() {
-                let broker_session_peer_id = if capability == Capability::ChannelSend {
-                    stream_peer_ref_for_session_peer(session_channel_id, session_peer_id)
+                let resolved_channel_route = if capability == Capability::ChannelSend
+                    && self.applied_channel(session_channel_id).is_some()
+                {
+                    Some(
+                        self.resolved_channel_route_for_session(
+                            session_channel_id,
+                            session_peer_id,
+                            turn_id,
+                        )
+                        .await?,
+                    )
                 } else {
-                    session_peer_id.to_string()
+                    None
                 };
-                let context = CapabilityExecutionContext {
-                    session_channel_id,
-                    session_peer_id: &broker_session_peer_id,
-                };
+                let channel_send_route =
+                    resolved_channel_route
+                        .as_ref()
+                        .map(|route| CapabilityChannelSendRoute {
+                            channel_id: session_channel_id,
+                            conversation_ref: route.conversation_ref.as_str(),
+                            thread_ref: route.thread_ref.as_deref(),
+                            reply_to_ref: route.reply_to_ref.as_deref(),
+                        });
+                let context = CapabilityExecutionContext { channel_send_route };
                 executed = true;
                 match self
                     .capability_broker

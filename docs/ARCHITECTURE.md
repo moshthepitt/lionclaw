@@ -203,6 +203,11 @@ This broker is not the normal filesystem and shell path for program-backed
 runtimes. It is reserved for explicit LionClaw-owned actions, direct runtimes,
 narrow non-runtime surfaces, and tests.
 
+Brokered `channel.send` is route-bound to the current channel session. Runtime
+payloads provide content only; the kernel derives channel, conversation, topic,
+and reply routing from the approved session and active turn before enqueueing an
+outbox delivery.
+
 ## Program-Backed `channel.send`
 
 Program-backed runtimes use a turn-scoped Unix socket for outbound channel
