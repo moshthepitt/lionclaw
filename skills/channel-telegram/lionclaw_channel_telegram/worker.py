@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -122,6 +123,48 @@ class ActiveTurn:
     terminal: bool = False
     terminal_text: str | None = None
     expects_outbox_delivery: bool = False
+
+
+@dataclass(slots=True)
+class ActiveTurnStore:
+    path: Path
+
+    def load(self) -> list[ActiveTurn]:
+        if not self.path.exists():
+            return []
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.exception("telegram active turn store load failed")
+            return []
+        if not isinstance(raw, dict):
+            logger.warning("telegram active turn store ignored non-object payload")
+            return []
+        items = raw.get("active_turns", [])
+        if not isinstance(items, list):
+            logger.warning(
+                "telegram active turn store ignored non-array active_turns payload"
+            )
+            return []
+        active: list[ActiveTurn] = []
+        for value in items:
+            turn = _coerce_active_turn(value)
+            if turn is not None:
+                active.append(turn)
+        return active
+
+    def save(self, active_turns: dict[str, ActiveTurn]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.path.with_name(f".{self.path.name}.tmp")
+        turns = [
+            _active_turn_to_json(active_turns[turn_id])
+            for turn_id in sorted(active_turns)
+        ]
+        tmp_path.write_text(
+            json.dumps({"active_turns": turns}, sort_keys=True),
+            encoding="utf-8",
+        )
+        tmp_path.replace(self.path)
 
 
 @dataclass(slots=True)
@@ -280,6 +323,105 @@ class ProgressDeleteStore:
         tmp_path.replace(self.path)
 
 
+def _active_turn_to_json(turn: ActiveTurn) -> dict[str, object]:
+    now_epoch = time.time()
+    now_loop = _safe_loop_time()
+    visible_after_epoch = now_epoch + max(0.0, turn.visible_after - now_loop)
+    last_edit_epoch = 0.0
+    if turn.last_edit_at > 0.0:
+        last_edit_epoch = now_epoch - max(0.0, now_loop - turn.last_edit_at)
+    return {
+        "turn_id": turn.turn_id,
+        "session_id": turn.session_id,
+        "session_key": turn.session_key,
+        "conversation_ref": turn.target.conversation_ref,
+        "thread_ref": turn.target.thread_ref,
+        "reply_to_ref": turn.reply_to_ref,
+        "generation": turn.generation,
+        "visible_after_epoch": visible_after_epoch,
+        "status_text": turn.status_text,
+        "provisional_message_ref": turn.provisional_message_ref,
+        "last_rendered_text": turn.last_rendered_text,
+        "last_edit_epoch": last_edit_epoch,
+        "can_edit": turn.can_edit,
+        "terminal_text": turn.terminal_text,
+        "expects_outbox_delivery": turn.expects_outbox_delivery,
+    }
+
+
+def _coerce_active_turn(value: object) -> ActiveTurn | None:
+    if not isinstance(value, dict):
+        return None
+    turn_id = value.get("turn_id")
+    conversation_ref = value.get("conversation_ref")
+    generation = value.get("generation")
+    visible_after_epoch = value.get("visible_after_epoch", 0.0)
+    status_text = value.get("status_text", "Queued")
+    can_edit = value.get("can_edit", True)
+    expects_outbox_delivery = value.get("expects_outbox_delivery", False)
+    if (
+        not isinstance(turn_id, str)
+        or not turn_id
+        or not isinstance(conversation_ref, str)
+        or not conversation_ref
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation <= 0
+        or not _is_json_number(visible_after_epoch)
+        or not isinstance(status_text, str)
+        or not status_text
+        or not isinstance(can_edit, bool)
+        or not isinstance(expects_outbox_delivery, bool)
+    ):
+        return None
+    session_id = _optional_string(value.get("session_id"))
+    session_key = _optional_string(value.get("session_key"))
+    thread_ref = _optional_string(value.get("thread_ref"))
+    reply_to_ref = _optional_string(value.get("reply_to_ref"))
+    provisional_message_ref = _optional_string(value.get("provisional_message_ref"))
+    last_rendered_text = _optional_string(value.get("last_rendered_text"))
+    terminal_text = _optional_string(value.get("terminal_text"))
+    visible_after = _epoch_to_loop_time(float(visible_after_epoch))
+    last_edit_epoch = value.get("last_edit_epoch", 0.0)
+    last_edit_at = (
+        _epoch_to_loop_time(float(last_edit_epoch))
+        if _is_json_number(last_edit_epoch) and float(last_edit_epoch) > 0.0
+        else 0.0
+    )
+    return ActiveTurn(
+        turn_id=turn_id,
+        session_id=session_id,
+        session_key=session_key,
+        target=TypingTarget(conversation_ref, thread_ref),
+        reply_to_ref=reply_to_ref,
+        generation=generation,
+        visible_after=visible_after,
+        status_text=status_text,
+        provisional_message_ref=provisional_message_ref,
+        last_rendered_text=last_rendered_text,
+        last_edit_at=last_edit_at,
+        can_edit=can_edit,
+        terminal_text=terminal_text,
+        expects_outbox_delivery=expects_outbox_delivery,
+    )
+
+
+def _optional_string(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _is_json_number(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float))
+
+
+def _epoch_to_loop_time(epoch_seconds: float) -> float:
+    return _safe_loop_time() + max(0.0, epoch_seconds - time.time())
+
+
 def _coerce_pending_progress_delete(
     value: object,
 ) -> PendingProgressDelete | None:
@@ -350,6 +492,7 @@ class TelegramWorker:
         lionclaw_api: LionClawApi,
         telegram: TelegramTransport,
         offset_store: OffsetStore,
+        active_turn_store: ActiveTurnStore | None = None,
         outbox_receipt_store: OutboxReceiptStore | None = None,
         progress_delete_store: ProgressDeleteStore | None = None,
     ) -> None:
@@ -358,6 +501,7 @@ class TelegramWorker:
         self.telegram = telegram
         self.offset_store = offset_store
         self.offset = offset_store.load()
+        self.active_turn_store = active_turn_store
         self.outbox_receipt_store = outbox_receipt_store
         self._outbox_receipts = (
             outbox_receipt_store.load() if outbox_receipt_store is not None else {}
@@ -367,12 +511,24 @@ class TelegramWorker:
         self._typing_deadlines: dict[tuple[str, str | None], float] = {}
         self._typing_routes: dict[str, TypingTarget] = {}
         self._typing_failures: dict[tuple[str, str | None], int] = {}
-        self._active_turns: dict[str, ActiveTurn] = {}
+        loaded_active_turns = (
+            active_turn_store.load() if active_turn_store is not None else []
+        )
+        self._active_turns: dict[str, ActiveTurn] = {
+            turn.turn_id: turn for turn in loaded_active_turns if not turn.terminal
+        }
         self._pending_progress_deletes: dict[tuple[str, str], PendingProgressDelete] = (
             progress_delete_store.load() if progress_delete_store is not None else {}
         )
-        self._route_turns: dict[tuple[str, str | None], str] = {}
+        self._route_turns: dict[tuple[str, str | None], str] = {
+            turn.target.key: turn.turn_id for turn in self._active_turns.values()
+        }
         self._route_generations: dict[tuple[str, str | None], int] = {}
+        for turn in self._active_turns.values():
+            self._route_generations[turn.target.key] = max(
+                turn.generation,
+                self._route_generations.get(turn.target.key, 0),
+            )
         self._poll_in_flight_started_at: float | None = None
         self._last_poll_success_observed_at: float | None = None
         self._last_poll_failure_observed_at: float | None = None
@@ -772,10 +928,15 @@ class TelegramWorker:
         if previous_turn_id == response.turn_id:
             existing = self._active_turns.get(response.turn_id)
             if existing is not None and not existing.terminal:
+                changed = False
                 if existing.session_id is None:
                     existing.session_id = response.session_id
+                    changed = True
                 if existing.session_key is None:
                     existing.session_key = response.session_key
+                    changed = True
+                if changed:
+                    self._save_active_turns()
                 return
         if previous_turn_id is not None and previous_turn_id != response.turn_id:
             previous = self._active_turns.get(previous_turn_id)
@@ -799,6 +960,7 @@ class TelegramWorker:
         )
         self._active_turns[turn.turn_id] = turn
         self._route_turns[target.key] = turn.turn_id
+        self._save_active_turns()
 
     def _advance_route_generation(
         self,
@@ -1098,6 +1260,7 @@ class TelegramWorker:
             turn.provisional_message_ref = _receipt_message_ref(receipt)
             turn.last_rendered_text = text
             turn.last_edit_at = _loop_time()
+            self._save_active_turns()
             return ProgressRenderResult.RENDERED
         edited = await self._edit_progress_message(turn, text, force=force)
         if edited:
@@ -1134,9 +1297,11 @@ class TelegramWorker:
             if _is_noop_edit_failure(err):
                 turn.last_rendered_text = text
                 turn.last_edit_at = now
+                self._save_active_turns()
                 return True
             if _is_permanent_edit_failure(err):
                 turn.can_edit = False
+                self._save_active_turns()
             logger.exception(
                 "telegram progress message edit failed for turn_id=%s",
                 turn.turn_id,
@@ -1144,6 +1309,7 @@ class TelegramWorker:
             return False
         turn.last_rendered_text = text
         turn.last_edit_at = now
+        self._save_active_turns()
         return True
 
     async def _delete_progress_message(self, turn: ActiveTurn) -> bool:
@@ -1158,6 +1324,7 @@ class TelegramWorker:
         if deleted:
             turn.provisional_message_ref = None
             turn.last_rendered_text = None
+            self._save_active_turns()
             return True
         self._schedule_progress_delete(pending)
         return False
@@ -1216,21 +1383,42 @@ class TelegramWorker:
         except Exception:
             logger.exception("telegram progress delete store save failed")
 
+    def _save_active_turns(self) -> None:
+        if self.active_turn_store is None:
+            return
+        try:
+            active_turns = {
+                turn_id: turn
+                for turn_id, turn in self._active_turns.items()
+                if not turn.terminal
+            }
+            self.active_turn_store.save(active_turns)
+        except Exception:
+            logger.exception("telegram active turn store save failed")
+
     def _update_progress_status(self, event: StreamEvent) -> None:
         turn = self._active_turns.get(event.turn_id)
         if turn is None:
             return
+        changed = False
         if event.code == "runtime.artifact":
             turn.expects_outbox_delivery = True
+            changed = True
         if event.code in ACTIVE_STATUS_CODES:
             turn.status_text = ACTIVE_STATUS_CODES[event.code]
+            changed = True
         elif event.code in CANCELLED_STATUS_CODES:
             turn.status_text = "Stopped"
             turn.terminal_text = "Stopped."
+            changed = True
         elif event.code in COMPLETED_STATUS_CODES:
             turn.status_text = "Finishing"
+            changed = True
         elif event.text:
             turn.status_text = _compact_status_text(event.text)
+            changed = True
+        if changed:
+            self._save_active_turns()
 
     async def _terminalize_progress(self, event: StreamEvent, text: str) -> None:
         turn = self._active_turns.get(event.turn_id)
@@ -1241,6 +1429,7 @@ class TelegramWorker:
     async def _terminalize_progress_turn(self, turn: ActiveTurn, text: str) -> None:
         turn.terminal_text = text
         turn.visible_after = min(turn.visible_after, _loop_time())
+        self._save_active_turns()
         render_result = await self._ensure_progress_message(turn, force=True)
         if render_result == ProgressRenderResult.RENDERED:
             turn.terminal = True
@@ -1278,6 +1467,7 @@ class TelegramWorker:
         if event.text.strip():
             turn.expects_outbox_delivery = True
         turn.status_text = "Finishing"
+        self._save_active_turns()
         if turn.provisional_message_ref is not None:
             await self._edit_progress_message(turn, _progress_text(turn), force=True)
 
@@ -1295,6 +1485,7 @@ class TelegramWorker:
                 self._forget_turn(turn)
                 return
             turn.status_text = "Finishing"
+            self._save_active_turns()
             await self._edit_progress_message(turn, _progress_text(turn), force=True)
             return
         turn.terminal = True
@@ -1304,6 +1495,7 @@ class TelegramWorker:
         self._active_turns.pop(turn.turn_id, None)
         if self._route_turns.get(turn.target.key) == turn.turn_id:
             self._route_turns.pop(turn.target.key, None)
+        self._save_active_turns()
 
     def _is_current_generation(self, turn: ActiveTurn) -> bool:
         return self._route_generations.get(turn.target.key) == turn.generation
@@ -1978,6 +2170,13 @@ def _loop_time() -> float:
     return asyncio.get_running_loop().time()
 
 
+def _safe_loop_time() -> float:
+    try:
+        return _loop_time()
+    except RuntimeError:
+        return time.monotonic()
+
+
 async def run() -> None:
     config = WorkerConfig.from_env()
     config.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -1997,6 +2196,9 @@ async def run() -> None:
         lionclaw_api=lionclaw_api,
         telegram=telegram,
         offset_store=OffsetStore(config.telegram_offset_file),
+        active_turn_store=ActiveTurnStore(
+            config.runtime_dir / "telegram.active-turns.json"
+        ),
         outbox_receipt_store=OutboxReceiptStore(
             config.runtime_dir / "telegram.outbox-receipts.json"
         ),
