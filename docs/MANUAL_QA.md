@@ -142,7 +142,6 @@ Use these prompts:
 
 ```text
 Reply with exactly RUN_OK_A_1 and nothing else.
-/model
 /rename LionClaw QA
 Read project-marker.txt from the current workspace and reply with exactly its contents.
 Write a draft file named keep.txt under LIONCLAW_DRAFTS_DIR containing exactly KEEP_OK, and reply only with keep.txt. Do not explain.
@@ -156,7 +155,7 @@ Reply with exactly RESET_OK and nothing else.
 Expected:
 
 - the first answer is `RUN_OK_A_1`
-- `/model`, `/rename`, and `/compact` are handled as native runtime controls,
+- `/rename` and `/compact` are handled as native runtime controls,
   not sent as ordinary prompt text
 - the marker read returns `project-a`
 - `/lionclaw retry` reruns the previous prompt through LionClaw history
@@ -244,12 +243,11 @@ Expected when credentials are available:
   provider files are downloaded before approval
 - Telegram delivery works through the configured runtime after scoped grant
   approval
-- `/help`, `/status`, `/new`, `/stop`, `/retry`, `/continue`, `/model`, and
-  `/settings` behave as documented: Telegram-local commands stay local,
-  `/new`/`/retry`/`/continue` enter LionClaw as canonical controls, and `/model`
-  reaches the runtime
-- inline buttons for status, stop, retry, continue, and new-session acknowledge
-  clicks without leaking controls across users, chats, or forum topics
+- `/help`, `/status`, `/stop`, and `/settings` behave as documented:
+  Telegram-local commands stay local, `/lionclaw reset` and `/lionclaw retry`
+  enter LionClaw as canonical controls, and `/compact` reaches the runtime
+- inline buttons for status and stop acknowledge clicks without leaking
+  controls across users, chats, or forum topics
 - a forum topic with a thread grant keeps replies in the same Telegram topic
 - a conversation grant used inside a topic follows the channel scoped-grant
   behavior from Channels v2

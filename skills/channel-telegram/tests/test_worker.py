@@ -2191,7 +2191,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                                     "is_bot": False,
                                     "first_name": "Alice",
                                 },
-                                "text": "/model gpt-5.2",
+                                "text": "/compact",
                             },
                         }
                     ),
@@ -2207,7 +2207,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             await worker.process_updates()
 
         self.assertEqual(
-            [update.text for update in api.sent_inbound], ["first", "/model gpt-5.2"]
+            [update.text for update in api.sent_inbound], ["first", "/compact"]
         )
 
     async def test_process_updates_batches_media_group_attachments(self) -> None:
@@ -3092,7 +3092,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                             "is_bot": False,
                             "first_name": "Alice",
                         },
-                        "text": "/retry",
+                        "text": "/lionclaw retry",
                     },
                 }
             )
@@ -3163,7 +3163,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                             "is_bot": False,
                             "first_name": "Alice",
                         },
-                        "text": "/retry",
+                        "text": "/lionclaw retry",
                     },
                 }
             )
@@ -4355,7 +4355,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                             "is_bot": False,
                             "first_name": "Alice",
                         },
-                        "text": "/retry",
+                        "text": "/lionclaw retry",
                     },
                 }
             )
@@ -4655,8 +4655,12 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(api.sent_inbound, [])
         self.assertIn("LionClaw controls", telegram.sent_messages[0][1])
+        self.assertIn("/lionclaw retry", telegram.sent_messages[0][1])
+        self.assertIn("/compact", telegram.sent_messages[0][1])
+        self.assertNotIn("/model", telegram.sent_messages[0][1])
+        self.assertEqual(telegram.sent_buttons[0], [])
 
-    async def test_retry_alias_submits_canonical_lionclaw_control(self) -> None:
+    async def test_bare_retry_passes_through_to_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
             telegram = FakeTelegramTransport(
@@ -4689,252 +4693,9 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             await worker.process_updates()
 
         self.assertEqual(len(api.sent_inbound), 1)
-        self.assertEqual(api.sent_inbound[0].text, "/lionclaw retry")
+        self.assertEqual(api.sent_inbound[0].text, "/retry")
 
-    async def test_retry_callback_submits_canonical_lionclaw_control(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            api = FakeLionClawApi()
-            telegram = FakeTelegramTransport(
-                updates=[
-                    Update.model_validate(
-                        {
-                            "update_id": 923,
-                            "message": {
-                                "message_id": 23,
-                                "date": 0,
-                                "chat": {"id": 77, "type": "private"},
-                                "from": {
-                                    "id": 77,
-                                    "is_bot": False,
-                                    "first_name": "Alice",
-                                },
-                                "text": "/help",
-                            },
-                        }
-                    )
-                ]
-            )
-            worker = TelegramWorker(
-                config=build_config(Path(temp_dir)),
-                lionclaw_api=api,
-                telegram=telegram,
-                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
-            )
-
-            await worker.process_updates()
-            retry_payload = telegram.sent_buttons[0][1].action
-            api.sent_inbound.clear()
-            telegram.updates = [
-                Update.model_validate(
-                    {
-                        "update_id": 924,
-                        "callback_query": {
-                            "id": "callback-retry",
-                            "from": {
-                                "id": 77,
-                                "is_bot": False,
-                                "first_name": "Alice",
-                            },
-                            "chat_instance": "chat-instance",
-                            "data": retry_payload,
-                            "message": {
-                                "message_id": 101,
-                                "date": 0,
-                                "chat": {"id": 77, "type": "private"},
-                                "from": {
-                                    "id": 99,
-                                    "is_bot": True,
-                                    "first_name": "LionClaw",
-                                    "username": "lionclaw_bot",
-                                },
-                                "text": "LionClaw controls",
-                            },
-                        },
-                    }
-                )
-            ]
-
-            await worker.process_updates()
-
-        self.assertEqual(telegram.answered_callbacks[-1], ("callback-retry", "Queued"))
-        self.assertEqual(len(api.sent_inbound), 1)
-        self.assertEqual(api.sent_inbound[0].text, "/lionclaw retry")
-
-    async def test_topic_route_callback_survives_inaccessible_message(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            api = FakeLionClawApi()
-            telegram = FakeTelegramTransport(
-                updates=[
-                    Update.model_validate(
-                        {
-                            "update_id": 930,
-                            "message": {
-                                "message_id": 30,
-                                "date": 0,
-                                "chat": {
-                                    "id": -10077,
-                                    "type": "supergroup",
-                                    "is_forum": True,
-                                },
-                                "from": {
-                                    "id": 77,
-                                    "is_bot": False,
-                                    "first_name": "Alice",
-                                },
-                                "message_thread_id": 55,
-                                "is_topic_message": True,
-                                "text": "@lionclaw_bot /help",
-                                "entities": [
-                                    {
-                                        "type": "mention",
-                                        "offset": 0,
-                                        "length": len("@lionclaw_bot"),
-                                    },
-                                    {
-                                        "type": "bot_command",
-                                        "offset": len("@lionclaw_bot "),
-                                        "length": len("/help"),
-                                    },
-                                ],
-                            },
-                        }
-                    )
-                ]
-            )
-            worker = TelegramWorker(
-                config=build_config(Path(temp_dir)),
-                lionclaw_api=api,
-                telegram=telegram,
-                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
-            )
-
-            await worker.process_updates()
-            retry_payload = telegram.sent_buttons[0][1].action
-            self.assertIn("route.-10077.55", retry_payload)
-            api.sent_inbound.clear()
-            telegram.updates = [
-                Update.model_validate(
-                    {
-                        "update_id": 931,
-                        "callback_query": {
-                            "id": "callback-topic-retry-old",
-                            "from": {
-                                "id": 77,
-                                "is_bot": False,
-                                "first_name": "Alice",
-                            },
-                            "chat_instance": "chat-instance",
-                            "data": retry_payload,
-                            "message": {
-                                "message_id": 130,
-                                "date": 0,
-                                "chat": {
-                                    "id": -10077,
-                                    "type": "supergroup",
-                                    "is_forum": True,
-                                },
-                            },
-                        },
-                    }
-                )
-            ]
-
-            await worker.process_updates()
-
-        self.assertEqual(
-            telegram.answered_callbacks[-1],
-            ("callback-topic-retry-old", "Queued"),
-        )
-        self.assertEqual(len(api.sent_inbound), 1)
-        self.assertEqual(api.sent_inbound[0].text, "/lionclaw retry")
-        self.assertEqual(api.sent_inbound[0].conversation_ref, "telegram:chat:-10077")
-        self.assertEqual(api.sent_inbound[0].thread_ref, "telegram:topic:55")
-
-    async def test_route_callback_from_different_sender_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            api = FakeLionClawApi()
-            telegram = FakeTelegramTransport(
-                updates=[
-                    Update.model_validate(
-                        {
-                            "update_id": 925,
-                            "message": {
-                                "message_id": 25,
-                                "date": 0,
-                                "chat": {"id": -10077, "type": "supergroup"},
-                                "from": {
-                                    "id": 77,
-                                    "is_bot": False,
-                                    "first_name": "Alice",
-                                },
-                                "text": "@lionclaw_bot /help",
-                                "entities": [
-                                    {
-                                        "type": "mention",
-                                        "offset": 0,
-                                        "length": len("@lionclaw_bot"),
-                                    },
-                                    {
-                                        "type": "bot_command",
-                                        "offset": len("@lionclaw_bot "),
-                                        "length": len("/help"),
-                                    },
-                                ],
-                            },
-                        }
-                    )
-                ]
-            )
-            worker = TelegramWorker(
-                config=build_config(Path(temp_dir)),
-                lionclaw_api=api,
-                telegram=telegram,
-                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
-            )
-
-            await worker.process_updates()
-            retry_payload = telegram.sent_buttons[0][1].action
-            telegram.updates = [
-                Update.model_validate(
-                    {
-                        "update_id": 926,
-                        "callback_query": {
-                            "id": "callback-retry-bob",
-                            "from": {
-                                "id": 88,
-                                "is_bot": False,
-                                "first_name": "Bob",
-                            },
-                            "chat_instance": "chat-instance",
-                            "data": retry_payload,
-                            "message": {
-                                "message_id": 102,
-                                "date": 0,
-                                "chat": {"id": -10077, "type": "supergroup"},
-                                "from": {
-                                    "id": 99,
-                                    "is_bot": True,
-                                    "first_name": "LionClaw",
-                                    "username": "lionclaw_bot",
-                                },
-                                "text": "LionClaw controls",
-                            },
-                        },
-                    }
-                )
-            ]
-
-            await worker.process_updates()
-
-        self.assertEqual(api.sent_inbound, [])
-        self.assertEqual(
-            telegram.answered_callbacks[-1],
-            ("callback-retry-bob", "That control is no longer valid."),
-        )
-
-    async def test_malformed_callback_mac_is_rejected_without_crashing(self) -> None:
+    async def test_unknown_callback_action_is_rejected_without_crashing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
             telegram = FakeTelegramTransport(
@@ -4943,7 +4704,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                         {
                             "update_id": 927,
                             "callback_query": {
-                                "id": "callback-bad-mac",
+                                "id": "callback-unknown-action",
                                 "from": {
                                     "id": 77,
                                     "is_bot": False,
@@ -4980,89 +4741,10 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(api.sent_inbound, [])
         self.assertEqual(
             telegram.answered_callbacks[-1],
-            ("callback-bad-mac", "That control is no longer valid."),
+            ("callback-unknown-action", "Unknown LionClaw control."),
         )
 
-    async def test_route_callback_works_while_route_has_active_turn(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            api = FakeLionClawApi()
-            telegram = FakeTelegramTransport()
-            worker = TelegramWorker(
-                config=build_config(Path(temp_dir)),
-                lionclaw_api=api,
-                telegram=telegram,
-                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
-            )
-            await worker._remember_active_turn(
-                TelegramInboundUpdate(
-                    update_id=927,
-                    event_id="telegram:update:927",
-                    sender_ref="telegram:user:77",
-                    conversation_ref="telegram:chat:77",
-                    message_ref="telegram:message:27",
-                    text="long task",
-                    trigger="dm",
-                    provider_metadata={"chat_type": "private"},
-                ),
-                InboundResponse(
-                    outcome="queued",
-                    turn_id="turn-1",
-                    session_id="session-1",
-                    session_key="channel:telegram:direct:77",
-                ),
-            )
-            await worker._send_help(
-                TelegramInboundUpdate(
-                    update_id=928,
-                    event_id="telegram:update:928",
-                    sender_ref="telegram:user:77",
-                    conversation_ref="telegram:chat:77",
-                    message_ref="telegram:message:28",
-                    text="/help",
-                    trigger="dm",
-                    provider_metadata={"chat_type": "private"},
-                )
-            )
-            retry_payload = telegram.sent_buttons[-1][1].action
-            telegram.updates = [
-                Update.model_validate(
-                    {
-                        "update_id": 929,
-                        "callback_query": {
-                            "id": "callback-retry-active",
-                            "from": {
-                                "id": 77,
-                                "is_bot": False,
-                                "first_name": "Alice",
-                            },
-                            "chat_instance": "chat-instance",
-                            "data": retry_payload,
-                            "message": {
-                                "message_id": 102,
-                                "date": 0,
-                                "chat": {"id": 77, "type": "private"},
-                                "from": {
-                                    "id": 99,
-                                    "is_bot": True,
-                                    "first_name": "LionClaw",
-                                    "username": "lionclaw_bot",
-                                },
-                                "text": "LionClaw controls",
-                            },
-                        },
-                    }
-                )
-            ]
-
-            await worker.process_updates()
-
-        self.assertEqual(
-            telegram.answered_callbacks[-1], ("callback-retry-active", "Queued")
-        )
-        self.assertEqual(len(api.sent_inbound), 1)
-        self.assertEqual(api.sent_inbound[0].text, "/lionclaw retry")
-
-    async def test_retry_alias_accepts_newline_arguments(self) -> None:
+    async def test_bare_retry_with_arguments_passes_through_to_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
             telegram = FakeTelegramTransport(
@@ -5095,9 +4777,9 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             await worker.process_updates()
 
         self.assertEqual(len(api.sent_inbound), 1)
-        self.assertEqual(api.sent_inbound[0].text, "/lionclaw retry")
+        self.assertEqual(api.sent_inbound[0].text, "/retry\nplease")
 
-    async def test_retry_alias_deletes_superseded_progress_message(
+    async def test_namespaced_lionclaw_retry_deletes_superseded_progress_message(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5120,7 +4802,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                                     "is_bot": False,
                                     "first_name": "Alice",
                                 },
-                                "text": "/retry",
+                                "text": "/lionclaw retry",
                             },
                         }
                     )
@@ -5163,7 +4845,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("turn-1", worker._active_turns)
         self.assertIn("turn-2", worker._active_turns)
 
-    async def test_model_command_passes_through_to_runtime(self) -> None:
+    async def test_runtime_command_passes_through_to_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
             telegram = FakeTelegramTransport(
@@ -5180,7 +4862,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                                     "is_bot": False,
                                     "first_name": "Alice",
                                 },
-                                "text": "/model gpt-5.2",
+                                "text": "/compact",
                             },
                         }
                     )
@@ -5196,7 +4878,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             await worker.process_updates()
 
         self.assertEqual(len(api.sent_inbound), 1)
-        self.assertEqual(api.sent_inbound[0].text, "/model gpt-5.2")
+        self.assertEqual(api.sent_inbound[0].text, "/compact")
 
     async def test_targeted_runtime_command_strips_bot_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5215,12 +4897,12 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                                     "is_bot": False,
                                     "first_name": "Alice",
                                 },
-                                "text": "/model@lionclaw_bot gpt-5.2",
+                                "text": "/compact@lionclaw_bot",
                                 "entities": [
                                     {
                                         "type": "bot_command",
                                         "offset": 0,
-                                        "length": len("/model@lionclaw_bot"),
+                                        "length": len("/compact@lionclaw_bot"),
                                     }
                                 ],
                             },
@@ -5238,7 +4920,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             await worker.process_updates()
 
         self.assertEqual(len(api.sent_inbound), 1)
-        self.assertEqual(api.sent_inbound[0].text, "/model gpt-5.2")
+        self.assertEqual(api.sent_inbound[0].text, "/compact")
 
     async def test_leading_mention_local_command_stays_local(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5304,7 +4986,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                                     "is_bot": False,
                                     "first_name": "Alice",
                                 },
-                                "text": "@lionclaw_bot /model gpt-5.2",
+                                "text": "@lionclaw_bot /compact",
                                 "entities": [
                                     {
                                         "type": "mention",
@@ -5314,7 +4996,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                                     {
                                         "type": "bot_command",
                                         "offset": len("@lionclaw_bot "),
-                                        "length": len("/model"),
+                                        "length": len("/compact"),
                                     },
                                 ],
                             },
@@ -5332,7 +5014,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             await worker.process_updates()
 
         self.assertEqual(len(api.sent_inbound), 1)
-        self.assertEqual(api.sent_inbound[0].text, "/model gpt-5.2")
+        self.assertEqual(api.sent_inbound[0].text, "/compact")
 
     async def test_leading_mention_targeted_runtime_command_normalizes_for_runtime(
         self,
@@ -5353,7 +5035,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                                     "is_bot": False,
                                     "first_name": "Alice",
                                 },
-                                "text": "@lionclaw_bot /model@lionclaw_bot gpt-5.2",
+                                "text": "@lionclaw_bot /compact@lionclaw_bot",
                                 "entities": [
                                     {
                                         "type": "mention",
@@ -5363,7 +5045,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                                     {
                                         "type": "bot_command",
                                         "offset": len("@lionclaw_bot "),
-                                        "length": len("/model@lionclaw_bot"),
+                                        "length": len("/compact@lionclaw_bot"),
                                     },
                                 ],
                             },
@@ -5381,7 +5063,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             await worker.process_updates()
 
         self.assertEqual(len(api.sent_inbound), 1)
-        self.assertEqual(api.sent_inbound[0].text, "/model gpt-5.2")
+        self.assertEqual(api.sent_inbound[0].text, "/compact")
 
     async def test_leading_text_mention_runtime_command_strips_mention(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5400,7 +5082,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                                     "is_bot": False,
                                     "first_name": "Alice",
                                 },
-                                "text": "LionClaw /model gpt-5.2",
+                                "text": "LionClaw /compact",
                                 "entities": [
                                     {
                                         "type": "text_mention",
@@ -5415,7 +5097,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                                     {
                                         "type": "bot_command",
                                         "offset": len("LionClaw "),
-                                        "length": len("/model"),
+                                        "length": len("/compact"),
                                     },
                                 ],
                             },
@@ -5433,7 +5115,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             await worker.process_updates()
 
         self.assertEqual(len(api.sent_inbound), 1)
-        self.assertEqual(api.sent_inbound[0].text, "/model gpt-5.2")
+        self.assertEqual(api.sent_inbound[0].text, "/compact")
 
     async def test_leading_mention_command_targeting_other_bot_passes_through(
         self,
@@ -5948,17 +5630,14 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
             stop_payload = worker._callback_payload(
                 "stop",
-                active.target,
-                actor_ref=active.sender_ref,
                 active=active,
             )
-            route_payload = worker._callback_payload(
-                "continue",
-                active.target,
-                actor_ref=active.sender_ref,
+            status_payload = worker._callback_payload(
+                "status",
+                active=active,
             )
 
-        for payload in (stop_payload, route_payload):
+        for payload in (stop_payload, status_payload):
             mac = payload.rsplit(":", 1)[1]
             self.assertLessEqual(len(payload.encode("utf-8")), 64)
             self.assertEqual(len(mac), 16)
@@ -6082,8 +5761,6 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             active = worker._active_turns["turn-1"]
             stop_payload = worker._callback_payload(
                 "stop",
-                active.target,
-                actor_ref=active.sender_ref,
                 active=active,
             )
             telegram.updates = [
@@ -6315,8 +5992,6 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             )
             payload = worker._callback_payload(
                 "stop",
-                worker._active_turns["turn-1"].target,
-                actor_ref="telegram:user:77",
                 active=worker._active_turns["turn-1"],
             )
             worker._forget_turn(worker._active_turns["turn-1"])

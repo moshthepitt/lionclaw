@@ -288,11 +288,7 @@ class AiogramTelegramTransport:
             [
                 BotCommand(command="help", description="Show LionClaw controls"),
                 BotCommand(command="status", description="Show current turn status"),
-                BotCommand(command="new", description="Start a fresh session"),
                 BotCommand(command="stop", description="Stop the active turn"),
-                BotCommand(command="retry", description="Retry the last turn"),
-                BotCommand(command="continue", description="Continue a partial turn"),
-                BotCommand(command="model", description="Open runtime model controls"),
                 BotCommand(command="settings", description="Show Telegram settings"),
             ]
         )

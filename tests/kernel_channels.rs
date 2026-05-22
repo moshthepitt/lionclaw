@@ -523,7 +523,7 @@ async fn channel_peer_must_be_approved_before_inbound_turn_executes() {
         Some("msg-1002")
     );
     assert!(outbox.deliveries[0].content.text.contains("[mock]"));
-    assert_eq!(outbox.deliveries[0].content.format_hint, "plain");
+    assert_eq!(outbox.deliveries[0].content.format_hint, "markdown");
     assert!(outbox.deliveries[0].content.attachments.is_empty());
     let delivery_id = outbox.deliveries[0].delivery_id;
     let attempt_id = outbox.deliveries[0].attempt_id;
@@ -561,7 +561,7 @@ async fn channel_peer_must_be_approved_before_inbound_turn_executes() {
     assert_eq!(created.details["conversation_ref"], "peer-local");
     assert_eq!(created.details["reply_to_ref"], "msg-1002");
     assert_eq!(created.details["turn_id"], queued_turn_id.to_string());
-    assert_eq!(created.details["content_format_hint"], "plain");
+    assert_eq!(created.details["content_format_hint"], "markdown");
     assert_eq!(created.details["content_attachment_count"], 0);
 
     let leased_audit = kernel
@@ -5851,6 +5851,33 @@ async fn channel_inbound_first_column_slash_input_uses_runtime_control_route() {
         .await;
     assert_turn_completed_before_done(&stream.events, queued_turn_id, "channel runtime control");
 
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "terminal".to_string(),
+            worker_id: "runtime-control-worker".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull runtime-control outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    assert_eq!(
+        outbox.deliveries[0].conversation_ref,
+        "peer-runtime-control"
+    );
+    assert_eq!(
+        outbox.deliveries[0].reply_to_ref.as_deref(),
+        Some("runtime-control-7452")
+    );
+    assert_eq!(
+        outbox.deliveries[0].content.text,
+        "mock runtime handled control"
+    );
+    assert_eq!(outbox.deliveries[0].content.format_hint, "markdown");
+    assert_eq!(outbox.deliveries[0].turn_id, Some(queued_turn_id));
+
     let audit = wait_for_audit_event_count(&kernel, "runtime.control.route", 1).await;
     let queued_turn_id_text = queued_turn_id.to_string();
     assert!(audit.events.iter().any(|event| {
@@ -6011,6 +6038,30 @@ async fn channel_inbound_lionclaw_reset_completes_queued_turn() {
     })
     .await;
     assert_turn_completed_before_done(&stream.events, queued_turn_id, "channel LionClaw reset");
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "terminal".to_string(),
+            worker_id: "lionclaw-reset-worker".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull LionClaw reset outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    assert_eq!(outbox.deliveries[0].conversation_ref, "peer-lionclaw-reset");
+    assert_eq!(
+        outbox.deliveries[0].reply_to_ref.as_deref(),
+        Some("lionclaw-reset-7522")
+    );
+    assert!(outbox.deliveries[0]
+        .content
+        .text
+        .starts_with("opened a fresh session: "));
+    assert_eq!(outbox.deliveries[0].content.format_hint, "markdown");
+    assert_eq!(outbox.deliveries[0].turn_id, Some(queued_turn_id));
 }
 
 #[tokio::test]
@@ -6133,6 +6184,26 @@ async fn channel_inbound_bare_retry_stays_runtime_owned() {
         "completed bare runtime-owned slash command",
     )
     .await;
+
+    let outbox = kernel
+        .pull_channel_outbox(ChannelOutboxPullRequest {
+            channel_id: "terminal".to_string(),
+            worker_id: "bare-runtime-worker".to_string(),
+            conversation_ref: None,
+            thread_ref: None,
+            limit: Some(10),
+            lease_ms: Some(120_000),
+        })
+        .await
+        .expect("pull bare runtime-control outbox");
+    assert_eq!(outbox.deliveries.len(), 1);
+    assert_eq!(outbox.deliveries[0].conversation_ref, "peer-bare-runtime");
+    assert_eq!(
+        outbox.deliveries[0].content.text,
+        "mock runtime does not support '/retry'"
+    );
+    assert_eq!(outbox.deliveries[0].content.format_hint, "markdown");
+    assert_eq!(outbox.deliveries[0].turn_id, Some(queued_turn_id));
 }
 
 async fn wait_for_audit_event_count(

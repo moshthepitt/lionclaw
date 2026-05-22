@@ -10686,29 +10686,19 @@ impl Kernel {
             if !artifacts.saw_error
                 && (!artifacts.assistant_text.trim().is_empty() || !outbox_attachments.is_empty())
             {
-                let source_id = turn_id.to_string();
                 let mut outbox_attachments = outbox_attachments;
-                let delivery = self
-                    .create_channel_delivery_content(
-                        ChannelDeliveryRoute {
-                            channel_id: &stream_context.channel_id,
-                            conversation_ref: &stream_context.conversation_ref,
-                            thread_ref: stream_context.thread_ref.as_deref(),
-                            reply_to_ref: stream_context.reply_to_ref.as_deref(),
-                        },
-                        Some(session.session_id),
-                        Some(turn_id),
-                        Some("session_turn"),
-                        Some(&source_id),
-                        ChannelDeliveryContent {
-                            text: artifacts.assistant_text.clone(),
-                            format_hint: "plain".to_string(),
-                            attachments: outbox_attachments.as_slice().to_vec(),
-                        },
-                    )
-                    .await?;
+                self.enqueue_channel_turn_delivery(
+                    stream_context,
+                    session.session_id,
+                    turn_id,
+                    ChannelDeliveryContent {
+                        text: artifacts.assistant_text.clone(),
+                        format_hint: "markdown".to_string(),
+                        attachments: outbox_attachments.as_slice().to_vec(),
+                    },
+                )
+                .await?;
                 outbox_attachments.mark_persisted();
-                self.audit_channel_outbox_created(&delivery).await?;
             }
         }
 
@@ -10983,6 +10973,17 @@ impl Kernel {
             RuntimeControlOutcome::Handled { .. }
         ) {
             self.mark_runtime_session_ready(&execution_plan).await;
+        }
+        if status == SessionTurnStatus::Completed {
+            if let Some(stream_context) = &channel_stream_context {
+                self.enqueue_channel_turn_text_delivery(
+                    stream_context,
+                    session.session_id,
+                    turn_id,
+                    &assistant_text,
+                )
+                .await?;
+            }
         }
 
         self.audit
@@ -11961,6 +11962,55 @@ impl Kernel {
             .await?;
         self.audit_channel_outbox_created(&delivery).await?;
         Ok(delivery.delivery_id)
+    }
+
+    async fn enqueue_channel_turn_text_delivery(
+        &self,
+        context: &ChannelStreamContext,
+        session_id: Uuid,
+        turn_id: Uuid,
+        text: &str,
+    ) -> Result<(), KernelError> {
+        self.enqueue_channel_turn_delivery(
+            context,
+            session_id,
+            turn_id,
+            ChannelDeliveryContent {
+                text: text.to_string(),
+                format_hint: "markdown".to_string(),
+                attachments: Vec::new(),
+            },
+        )
+        .await
+    }
+
+    async fn enqueue_channel_turn_delivery(
+        &self,
+        context: &ChannelStreamContext,
+        session_id: Uuid,
+        turn_id: Uuid,
+        content: ChannelDeliveryContent,
+    ) -> Result<(), KernelError> {
+        if content.text.trim().is_empty() && content.attachments.is_empty() {
+            return Ok(());
+        }
+        let source_id = turn_id.to_string();
+        let delivery = self
+            .create_channel_delivery_content(
+                ChannelDeliveryRoute {
+                    channel_id: &context.channel_id,
+                    conversation_ref: &context.conversation_ref,
+                    thread_ref: context.thread_ref.as_deref(),
+                    reply_to_ref: context.reply_to_ref.as_deref(),
+                },
+                Some(session_id),
+                Some(turn_id),
+                Some("session_turn"),
+                Some(&source_id),
+                content,
+            )
+            .await?;
+        self.audit_channel_outbox_created(&delivery).await
     }
 
     async fn create_channel_delivery_content(
@@ -13091,9 +13141,10 @@ impl Kernel {
         message: String,
         stream_context: Option<ChannelStreamContext>,
     ) -> Result<(), KernelError> {
+        let turn_id = prepared_turn.turn_id;
         self.session_turns
             .complete_turn(
-                prepared_turn.turn_id,
+                turn_id,
                 SessionTurnCompletion {
                     status: SessionTurnStatus::Completed,
                     assistant_text: message.clone(),
@@ -13110,8 +13161,19 @@ impl Kernel {
         if let Some(context) = &stream_context {
             self.emit_turn_completed_snapshot(context, &message).await?;
         }
-        self.complete_queued_turn(turn, &turn.runtime_id, message.len(), stream_context)
-            .await;
+        self.terminalize_queued_turn(
+            turn,
+            QueuedTurnTerminal::Completed {
+                runtime_id: turn.runtime_id.clone(),
+                assistant_text_len: message.len(),
+            },
+            stream_context.clone(),
+        )
+        .await?;
+        if let Some(context) = &stream_context {
+            self.enqueue_channel_turn_text_delivery(context, turn.session_id, turn_id, &message)
+                .await?;
+        }
         Ok(())
     }
 
@@ -13137,28 +13199,6 @@ impl Kernel {
             .ok_or_else(|| {
                 KernelError::Internal("queued LionClaw control turn was not running".to_string())
             })
-    }
-
-    async fn complete_queued_turn(
-        &self,
-        turn: &ChannelTurnRecord,
-        runtime_id: &str,
-        assistant_text_len: usize,
-        stream_context: Option<ChannelStreamContext>,
-    ) {
-        if let Err(err) = self
-            .terminalize_queued_turn(
-                turn,
-                QueuedTurnTerminal::Completed {
-                    runtime_id: runtime_id.to_string(),
-                    assistant_text_len,
-                },
-                stream_context,
-            )
-            .await
-        {
-            warn!(?err, turn_id = %turn.turn_id, "failed to mark queued channel turn complete");
-        }
     }
 
     async fn fail_queued_turn(

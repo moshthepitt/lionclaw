@@ -30,10 +30,9 @@ Under the hood, the worker:
 7. starts Telegram typing from kernel queue/runtime status events,
 8. renders long-running turns as one provisional Telegram message and edits it
    on throttled progress state changes,
-9. renders inline buttons for safe local controls such as status, stop, retry,
-   continue, and new-session,
-10. intercepts Telegram-local commands such as `/status`, `/stop`, `/retry`,
-   and `/continue` without stealing runtime slash commands such as `/model`,
+9. renders inline buttons for safe active-turn controls such as status and stop,
+10. intercepts Telegram-local commands such as `/status` and `/stop` without
+   stealing runtime slash commands such as `/compact`,
 11. leases provider deliveries from `/v0/channels/outbox/pull`,
 12. sends Telegram messages from outbox leases and reports provider outcomes to
    `/v0/channels/outbox/report`,
@@ -116,15 +115,14 @@ TELEGRAM_WEBHOOK_PATH=/telegram/webhook \
   restart. `LIONCLAW_STREAM_START_MODE` accepts `resume` or `tail`.
 - Telegram delivery is outbox-driven: typing comes from progress streams, final
   answers come from durable outbox leases, no reasoning lane delivery.
-- Telegram has its own visible command menu. `/help`, `/status`, `/new`,
-  `/stop`, `/retry`, `/continue`, and `/settings` are channel-local aliases.
-  `/retry`, `/continue`, and `/new` are translated to canonical `/lionclaw ...`
-  controls before they enter the kernel. `/stop` uses the channel-safe active
-  turn cancellation action with the expected turn id guard. `/model` and unknown
-  slash commands pass through to the runtime after Telegram-only addressing
-  syntax is removed. Bot commands explicitly targeted at a different Telegram
-  bot are never captured as LionClaw-local controls, even inside an active forum
-  topic. In groups, commands with a leading bot mention, for example
+- Telegram has its own visible command menu. `/help`, `/status`, `/stop`, and
+  `/settings` are channel-local controls. Session mutation commands stay
+  namespaced as `/lionclaw reset` and `/lionclaw retry`; bare slash commands
+  pass through to the runtime after Telegram-only addressing syntax is removed.
+  `/stop` uses the channel-safe active turn cancellation action with the
+  expected turn id guard. Bot commands explicitly targeted at a different
+  Telegram bot are never captured as LionClaw-local controls, even inside an
+  active forum topic. In groups, commands with a leading bot mention, for example
   `@lionclaw_bot /status`, are treated like first-column bot commands; runtime
   slash commands are forwarded without the leading mention or `@lionclaw_bot`
   command target.

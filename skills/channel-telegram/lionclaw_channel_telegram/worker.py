@@ -91,16 +91,8 @@ MAX_WEBHOOK_RECENT_UPDATE_IDS = 4096
 LOCAL_TELEGRAM_COMMANDS = {
     "help",
     "status",
-    "new",
     "stop",
-    "retry",
-    "continue",
     "settings",
-}
-LIONCLAW_CONTROL_ALIASES = {
-    "new": "/lionclaw reset",
-    "retry": "/lionclaw retry",
-    "continue": "/lionclaw continue",
 }
 ACTIVE_STATUS_CODES = {
     "queue.started": "Queued",
@@ -113,13 +105,8 @@ CALLBACK_PREFIX = "lc1"
 CALLBACK_ACTION_CODES = {
     "stop": "s",
     "status": "t",
-    "new": "n",
-    "retry": "r",
-    "continue": "c",
 }
 CALLBACK_CODE_ACTIONS = {code: action for action, code in CALLBACK_ACTION_CODES.items()}
-CALLBACK_ROUTE_TARGET = "_"
-CALLBACK_ROUTE_TARGET_PREFIX = "route."
 CALLBACK_MAC_BYTES = 12
 REACTION_RECEIVED = "👀"
 REACTION_COMPLETED = "✅"
@@ -1520,9 +1507,8 @@ class TelegramWorker:
         if parsed is None:
             await self._answer_callback(callback, "Unknown LionClaw control.")
             return True
-        route = _callback_route_for(parsed, callback)
         active = self._active_turn_for_callback(callback, parsed)
-        if active is None and route is None:
+        if active is None:
             await self._answer_callback(callback, "That control is no longer active.")
             return True
         if not self._callback_mac_matches(callback, parsed, active):
@@ -1530,18 +1516,11 @@ class TelegramWorker:
             return True
 
         update = _callback_update(callback, text=f"/{parsed.action}")
-        if route is not None:
-            update = replace(
-                update,
-                conversation_ref=route.conversation_ref,
-                thread_ref=route.thread_ref,
-            )
-        elif active is not None:
-            update = replace(
-                update,
-                conversation_ref=active.target.conversation_ref,
-                thread_ref=active.target.thread_ref,
-            )
+        update = replace(
+            update,
+            conversation_ref=active.target.conversation_ref,
+            thread_ref=active.target.thread_ref,
+        )
         if parsed.action == "stop":
             await self._answer_callback(callback, "Stopping")
             await self._stop_active_turn(update)
@@ -1550,11 +1529,6 @@ class TelegramWorker:
             await self._answer_callback(callback, "Status sent")
             await self._send_status(update)
             return True
-        if parsed.action in LIONCLAW_CONTROL_ALIASES:
-            await self._answer_callback(callback, "Queued")
-            return await self._submit_runtime_passthrough(
-                replace(update, text=LIONCLAW_CONTROL_ALIASES[parsed.action])
-            )
 
         await self._answer_callback(callback, "Unknown LionClaw control.")
         return True
@@ -1564,12 +1538,6 @@ class TelegramWorker:
         callback: TelegramCallbackAction,
         parsed: ParsedCallbackAction,
     ) -> ActiveTurn | None:
-        route = _callback_route_for(parsed, callback)
-        if route is not None:
-            return self._active_turn_for_route(
-                route.conversation_ref,
-                route.thread_ref,
-            )
         active = self._active_turns.get(parsed.target)
         if active is None or active.terminal:
             return None
@@ -1588,33 +1556,16 @@ class TelegramWorker:
         parsed: ParsedCallbackAction,
         active: ActiveTurn | None,
     ) -> bool:
-        route = _callback_route_for(parsed, callback)
-        session_key = None
-        conversation_ref = callback.conversation_ref
-        thread_ref = callback.thread_ref
-        if route is not None:
-            if route.conversation_ref != callback.conversation_ref:
-                return False
-            if (
-                callback.thread_ref is not None
-                and route.thread_ref != callback.thread_ref
-            ):
-                return False
-            conversation_ref = route.conversation_ref
-            thread_ref = route.thread_ref
-        else:
-            if active is None or callback.sender_ref != active.sender_ref:
-                return False
-            session_key = active.session_key if parsed.action == "stop" else None
-            conversation_ref = active.target.conversation_ref
-            thread_ref = active.target.thread_ref
+        if active is None or callback.sender_ref != active.sender_ref:
+            return False
+        session_key = active.session_key if parsed.action == "stop" else None
         expected = _callback_mac(
             self.config.telegram_bot_token,
             parsed.action,
             parsed.target,
             callback.sender_ref,
-            conversation_ref,
-            thread_ref,
+            active.target.conversation_ref,
+            active.target.thread_ref,
             session_key,
         )
         return _constant_time_ascii_equals(parsed.mac, expected)
@@ -1706,14 +1657,6 @@ class TelegramWorker:
         update: TelegramInboundUpdate,
         command: TelegramCommand,
     ) -> bool:
-        if command.name in LIONCLAW_CONTROL_ALIASES:
-            return await self._submit_runtime_passthrough(
-                replace(
-                    update,
-                    text=LIONCLAW_CONTROL_ALIASES[command.name],
-                    attachments=[],
-                )
-            )
         if command.name == "stop":
             await self._stop_active_turn(update)
             return True
@@ -1724,35 +1667,6 @@ class TelegramWorker:
             await self._send_settings(update)
             return True
         await self._send_help(update)
-        return True
-
-    async def _submit_runtime_passthrough(self, update: TelegramInboundUpdate) -> bool:
-        try:
-            response = await self.lionclaw_api.send_inbound(update)
-        except Exception:
-            logger.exception(
-                "lionclaw command submit failed for update_id=%s",
-                update.update_id,
-            )
-            return False
-        if response.outcome not in EXPECTED_INBOUND_OUTCOMES:
-            logger.error(
-                "lionclaw command returned unknown outcome '%s' for update_id=%s",
-                response.outcome,
-                update.update_id,
-            )
-            return False
-        if response.outcome == "pending_approval":
-            await self._set_inbound_reaction(update, REACTION_RECEIVED)
-            await self._notify_pending_approval(update, response.pairing_code)
-        if response.outcome == "queued":
-            self._remember_typing_route(update)
-            await self._remember_active_turn(update, response)
-            await self._start_typing(
-                update.conversation_ref,
-                thread_ref=update.thread_ref,
-                ttl_seconds=INITIAL_TYPING_TTL_SECONDS,
-            )
         return True
 
     async def _stop_active_turn(self, update: TelegramInboundUpdate) -> None:
@@ -1825,23 +1739,19 @@ class TelegramWorker:
             update,
             "Telegram channel settings\n"
             "/status - current turn\n"
-            "/stop - stop active turn\n"
-            "/new - fresh session\n"
-            "/retry - retry last turn\n"
-            "/continue - continue partial turn\n"
-            "/model - runtime model controls",
-            buttons=self._route_control_buttons(update),
+            "/stop - stop active turn",
         )
 
     async def _send_help(self, update: TelegramInboundUpdate) -> None:
         await self._reply(
             update,
             "LionClaw controls\n"
-            "/status, /new, /stop, /retry, /continue, /settings\n\n"
+            "/status, /stop, /settings\n"
+            "/lionclaw reset - fresh session\n"
+            "/lionclaw retry - retry last turn\n\n"
             "Runtime controls\n"
-            "/model and other runtime slash commands go to the runtime.\n"
+            "/compact and other runtime slash commands go to the runtime.\n"
             "Use a leading space before / to send literal slash text.",
-            buttons=self._route_control_buttons(update),
         )
 
     async def _reply(
@@ -1904,30 +1814,6 @@ class TelegramWorker:
                 emoji,
                 exc_info=True,
             )
-
-    def _route_control_buttons(
-        self,
-        update: TelegramInboundUpdate,
-    ) -> list[TelegramActionButton]:
-        route = TypingTarget(update.conversation_ref, update.thread_ref)
-        return [
-            TelegramActionButton(
-                "New",
-                self._callback_payload("new", route, actor_ref=update.sender_ref),
-            ),
-            TelegramActionButton(
-                "Retry",
-                self._callback_payload("retry", route, actor_ref=update.sender_ref),
-            ),
-            TelegramActionButton(
-                "Continue",
-                self._callback_payload(
-                    "continue",
-                    route,
-                    actor_ref=update.sender_ref,
-                ),
-            ),
-        ]
 
     async def _remember_active_turn(
         self,
@@ -2535,8 +2421,6 @@ class TelegramWorker:
                 "Status",
                 self._callback_payload(
                     "status",
-                    turn.target,
-                    actor_ref=turn.sender_ref,
                     active=turn,
                 ),
             )
@@ -2548,8 +2432,6 @@ class TelegramWorker:
                     "Stop",
                     self._callback_payload(
                         "stop",
-                        turn.target,
-                        actor_ref=turn.sender_ref,
                         active=turn,
                     ),
                 ),
@@ -2559,28 +2441,21 @@ class TelegramWorker:
     def _callback_payload(
         self,
         action: str,
-        target: TypingTarget,
         *,
-        actor_ref: str,
-        active: ActiveTurn | None = None,
+        active: ActiveTurn,
     ) -> str:
         code = CALLBACK_ACTION_CODES[action]
-        target_id = (
-            active.turn_id if active is not None else _callback_route_target(target)
-        )
-        session_key = (
-            active.session_key if active is not None and action == "stop" else None
-        )
+        session_key = active.session_key if action == "stop" else None
         mac = _callback_mac(
             self.config.telegram_bot_token,
             action,
-            target_id,
-            actor_ref,
-            target.conversation_ref,
-            target.thread_ref,
+            active.turn_id,
+            active.sender_ref,
+            active.target.conversation_ref,
+            active.target.thread_ref,
             session_key,
         )
-        return f"{CALLBACK_PREFIX}:{code}:{target_id}:{mac}"
+        return f"{CALLBACK_PREFIX}:{code}:{active.turn_id}:{mac}"
 
     async def _complete_progress(self, event: StreamEvent) -> None:
         turn = self._active_turns.get(event.turn_id)
@@ -3238,62 +3113,6 @@ def _parse_callback_action(value: str) -> ParsedCallbackAction | None:
     if action is None or not target or not mac:
         return None
     return ParsedCallbackAction(action=action, target=target, mac=mac)
-
-
-def _callback_route_target(target: TypingTarget) -> str:
-    chat_id = _ref_suffix(target.conversation_ref, "telegram:chat:")
-    if chat_id is None or not _signed_integer_text(chat_id):
-        return CALLBACK_ROUTE_TARGET
-    if target.thread_ref is None:
-        return f"{CALLBACK_ROUTE_TARGET_PREFIX}{chat_id}._"
-    topic_id = _ref_suffix(target.thread_ref, "telegram:topic:")
-    if topic_id is None or not topic_id.isdigit():
-        return CALLBACK_ROUTE_TARGET
-    return f"{CALLBACK_ROUTE_TARGET_PREFIX}{chat_id}.{topic_id}"
-
-
-def _callback_route(
-    target_id: str,
-    callback: TelegramCallbackAction,
-) -> TypingTarget | None:
-    if target_id == CALLBACK_ROUTE_TARGET:
-        return TypingTarget(callback.conversation_ref, callback.thread_ref)
-    if not target_id.startswith(CALLBACK_ROUTE_TARGET_PREFIX):
-        return None
-    route = target_id.removeprefix(CALLBACK_ROUTE_TARGET_PREFIX)
-    chat_id, separator, topic_id = route.partition(".")
-    if separator != "." or not _signed_integer_text(chat_id):
-        return None
-    if topic_id == "_":
-        thread_ref = None
-    elif topic_id.isdigit():
-        thread_ref = f"telegram:topic:{topic_id}"
-    else:
-        return None
-    return TypingTarget(f"telegram:chat:{chat_id}", thread_ref)
-
-
-def _is_route_action(parsed: ParsedCallbackAction) -> bool:
-    return parsed.action in LIONCLAW_CONTROL_ALIASES
-
-
-def _callback_route_for(
-    parsed: ParsedCallbackAction,
-    callback: TelegramCallbackAction,
-) -> TypingTarget | None:
-    if not _is_route_action(parsed):
-        return None
-    return _callback_route(parsed.target, callback)
-
-
-def _ref_suffix(value: str, prefix: str) -> str | None:
-    if value.startswith(prefix):
-        return value.removeprefix(prefix)
-    return None
-
-
-def _signed_integer_text(value: str) -> bool:
-    return value.removeprefix("-").isdigit()
 
 
 def _callback_mac(
