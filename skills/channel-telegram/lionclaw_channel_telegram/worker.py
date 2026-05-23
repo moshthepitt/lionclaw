@@ -2354,6 +2354,8 @@ class TelegramWorker:
         edited = await self._edit_progress_message(turn, text, force=force)
         if edited:
             return ProgressRenderResult.RENDERED
+        if turn.provisional_message_ref is None:
+            return await self._ensure_progress_message(turn, force=force)
         if turn.can_edit:
             return ProgressRenderResult.RETRYABLE_FAILED
         return ProgressRenderResult.TERMINAL_FAILED
@@ -2389,6 +2391,9 @@ class TelegramWorker:
                 turn.last_edit_at = now
                 self._save_active_turns()
                 return True
+            if _is_missing_edit_target(err):
+                self._clear_progress_message_ref(turn)
+                return False
             if _is_permanent_edit_failure(err):
                 turn.can_edit = False
                 self._save_active_turns()
@@ -2401,6 +2406,13 @@ class TelegramWorker:
         turn.last_edit_at = now
         self._save_active_turns()
         return True
+
+    def _clear_progress_message_ref(self, turn: ActiveTurn) -> None:
+        turn.provisional_message_ref = None
+        turn.last_rendered_text = None
+        turn.last_edit_at = 0.0
+        turn.can_edit = True
+        self._save_active_turns()
 
     async def _delete_progress_message(self, turn: ActiveTurn) -> bool:
         if turn.provisional_message_ref is None:
@@ -3737,6 +3749,19 @@ def _is_noop_edit_failure(err: Exception) -> bool:
     return isinstance(err, TelegramBadRequest) and "not modified" in str(err).lower()
 
 
+def _is_missing_edit_target(err: Exception) -> bool:
+    if not isinstance(err, TelegramBadRequest):
+        return False
+    message = str(err).lower()
+    return any(
+        phrase in message
+        for phrase in (
+            "message to edit not found",
+            "message_id_invalid",
+        )
+    )
+
+
 def _is_permanent_edit_failure(err: Exception) -> bool:
     if isinstance(
         err,
@@ -3752,10 +3777,8 @@ def _is_permanent_edit_failure(err: Exception) -> bool:
         return any(
             phrase in message
             for phrase in (
-                "message to edit not found",
                 "message can't be edited",
                 "message is not modified",
-                "message_id_invalid",
                 "not enough rights",
             )
         )

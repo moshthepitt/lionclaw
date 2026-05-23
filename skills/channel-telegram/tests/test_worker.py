@@ -8739,7 +8739,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             [("telegram:chat:77", "telegram:message:101", "Preparing artifact...")],
         )
 
-    async def test_permanent_progress_edit_failure_sends_terminal_fallback(
+    async def test_missing_progress_edit_target_sends_terminal_replacement(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -8784,22 +8784,22 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             await worker.process_updates()
             worker._active_turns["turn-1"].visible_after = 0.0
             await worker.refresh_progress_messages()
-            with self.assertLogs("lionclaw_channel_telegram.worker", level="ERROR"):
-                await worker._process_stream_event(
-                    StreamEvent(
-                        sequence=1,
-                        peer_id="telegram:chat:77",
-                        turn_id="turn-1",
-                        kind="error",
-                        code="runtime.error",
-                        text="bad provider response",
-                    )
+            await worker._process_stream_event(
+                StreamEvent(
+                    sequence=1,
+                    peer_id="telegram:chat:77",
+                    turn_id="turn-1",
+                    kind="error",
+                    code="runtime.error",
+                    text="bad provider response",
                 )
+            )
 
         self.assertEqual(telegram.edited_messages, [])
         self.assertEqual(
             telegram.sent_messages[-1][1], "Turn failed: bad provider response"
         )
+        self.assertNotIn("turn-1", worker._active_turns)
 
     async def test_progress_edit_failure_deletes_progress_after_fallback(
         self,
