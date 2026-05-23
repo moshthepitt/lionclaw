@@ -15,7 +15,7 @@ use lionclaw::{
         ChannelAttachmentFinalizeRequest, ChannelAttachmentMissingReport,
         ChannelAttachmentStageResponse, ChannelAttachmentStatus, ChannelGrantView,
         ChannelHealthCheck, ChannelHealthReportRequest, ChannelHealthReportResponse,
-        ChannelHealthStatus, ChannelInboundOutcome, ChannelInboundRequest,
+        ChannelHealthStatus, ChannelInboundOutcome, ChannelInboundRequest, ChannelOperatorActor,
         ChannelOutboxDeliveryStatusDto, ChannelOutboxPullRequest, ChannelOutboxReportOutcomeDto,
         ChannelOutboxReportRequest, ChannelPairingApproveRequest, ChannelPairingBlockRequest,
         ChannelPairingBlockResponse, ChannelPairingClaimOutcome, ChannelPairingClaimRequest,
@@ -2281,6 +2281,7 @@ async fn channel_pairing_invite_returns_raw_token_once_and_direct_claim_creates_
             thread_ref: None,
             expires_in_ms: None,
             max_claims: None,
+            operator_actor: None,
         })
         .await
         .expect("create direct invite");
@@ -2372,6 +2373,7 @@ async fn channel_pairing_invite_returns_raw_token_once_and_direct_claim_creates_
             thread_ref: None,
             expires_in_ms: None,
             max_claims: None,
+            operator_actor: None,
         })
         .await
         .expect_err("outbound invite should be rejected");
@@ -2390,6 +2392,112 @@ async fn channel_pairing_invite_returns_raw_token_once_and_direct_claim_creates_
 }
 
 #[tokio::test]
+async fn channel_pairing_operator_invite_requires_approved_direct_host_grant() {
+    let env = TestHome::new().await;
+    install_and_bind_channel(&env, "telegram", "invite-operator-skill").await;
+    let kernel = env
+        .kernel_with_options(KernelOptions {
+            default_runtime_id: Some("mock".to_string()),
+            ..KernelOptions::default()
+        })
+        .await;
+
+    let denied = kernel
+        .invite_channel_pairing(ChannelPairingInviteRequest {
+            channel_id: "telegram".to_string(),
+            requested_profile: ChannelRoutingProfile::Conversation,
+            label: Some("group link".to_string()),
+            conversation_ref: None,
+            thread_ref: None,
+            expires_in_ms: None,
+            max_claims: None,
+            operator_actor: Some(ChannelOperatorActor {
+                sender_ref: "telegram:user:host".to_string(),
+            }),
+        })
+        .await
+        .expect_err("unknown actor cannot create channel invite");
+    assert!(matches!(
+        denied,
+        KernelError::BadRequest(message) if message.contains("channel grant is not approved")
+    ));
+
+    let host_invite = kernel
+        .invite_channel_pairing(ChannelPairingInviteRequest {
+            channel_id: "telegram".to_string(),
+            requested_profile: ChannelRoutingProfile::Direct,
+            label: Some("host".to_string()),
+            conversation_ref: None,
+            thread_ref: None,
+            expires_in_ms: None,
+            max_claims: None,
+            operator_actor: None,
+        })
+        .await
+        .expect("create host invite");
+    let host_claim = kernel
+        .claim_channel_pairing(claim_request(
+            "telegram",
+            &host_invite.token,
+            "telegram:user:host",
+            "telegram:chat:host",
+            None,
+        ))
+        .await
+        .expect("claim host invite");
+    assert_eq!(host_claim.outcome, ChannelPairingClaimOutcome::Approved);
+
+    let group_invite = kernel
+        .invite_channel_pairing(ChannelPairingInviteRequest {
+            channel_id: "telegram".to_string(),
+            requested_profile: ChannelRoutingProfile::Conversation,
+            label: Some("group link".to_string()),
+            conversation_ref: None,
+            thread_ref: None,
+            expires_in_ms: Some(600_000),
+            max_claims: Some(1),
+            operator_actor: Some(ChannelOperatorActor {
+                sender_ref: "telegram:user:host".to_string(),
+            }),
+        })
+        .await
+        .expect("approved actor creates group invite");
+
+    assert!(group_invite.token.starts_with("lc_"));
+    let created = wait_for_audit_event_count(&kernel, "channel.pairing.invite_created", 2).await;
+    assert!(created.events.iter().any(|event| {
+        event.details["pairing_id"].as_str() == Some(&group_invite.pairing_id.to_string())
+            && event.details["operator_actor_sender_ref"].as_str() == Some("telegram:user:host")
+    }));
+
+    let claimed = kernel
+        .claim_channel_pairing(claim_request(
+            "telegram",
+            &group_invite.token,
+            "telegram:user:admin",
+            "telegram:chat:-1001",
+            None,
+        ))
+        .await
+        .expect("claim group invite");
+    assert_eq!(claimed.outcome, ChannelPairingClaimOutcome::Approved);
+
+    let queued = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "telegram",
+            "msg-group-bob",
+            "telegram:user:bob",
+            "telegram:chat:-1001",
+            None,
+            "/ask hello",
+            ChannelTrigger::Mention,
+        ))
+        .await
+        .expect("group-wide grant admits another sender");
+    assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
+}
+
+#[tokio::test]
 async fn channel_pairing_invite_block_by_pairing_id_revokes_pending_token() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "loopback", "invite-block-skill").await;
@@ -2404,6 +2512,7 @@ async fn channel_pairing_invite_block_by_pairing_id_revokes_pending_token() {
             thread_ref: None,
             expires_in_ms: None,
             max_claims: None,
+            operator_actor: None,
         })
         .await
         .expect("create invite to block");
@@ -2482,6 +2591,7 @@ async fn channel_pairing_claim_audit_excludes_provider_metadata_and_raw_tokens()
             thread_ref: None,
             expires_in_ms: None,
             max_claims: None,
+            operator_actor: None,
         })
         .await
         .expect("create direct invite");
@@ -2543,6 +2653,7 @@ async fn channel_pairing_invite_rejects_expiry_overflow() {
             thread_ref: None,
             expires_in_ms: Some(i64::MAX as u64),
             max_claims: None,
+            operator_actor: None,
         })
         .await
         .expect_err("overflowing invite expiry should be rejected");
@@ -2554,7 +2665,7 @@ async fn channel_pairing_invite_rejects_expiry_overflow() {
 }
 
 #[tokio::test]
-async fn channel_pairing_conversation_invite_scopes_each_claimed_sender() {
+async fn channel_pairing_conversation_invite_connects_one_conversation() {
     let env = TestHome::new().await;
     install_and_bind_channel(&env, "slack", "invite-conversation-skill").await;
     let kernel = env.kernel().await;
@@ -2567,7 +2678,8 @@ async fn channel_pairing_conversation_invite_scopes_each_claimed_sender() {
             conversation_ref: Some("room-1".to_string()),
             thread_ref: None,
             expires_in_ms: None,
-            max_claims: Some(2),
+            max_claims: None,
+            operator_actor: None,
         })
         .await
         .expect("create conversation invite");
@@ -2615,45 +2727,34 @@ async fn channel_pairing_conversation_invite_scopes_each_claimed_sender() {
         replayed_alice.outcome,
         ChannelPairingClaimOutcome::AlreadyClaimed
     );
-    assert_eq!(replayed_alice.grant_id, alice.grant_id);
-    let one_claim_row = sqlx::query(
-        "SELECT status, claim_count FROM channel_pairing_requests WHERE pairing_id = ?1",
-    )
-    .bind(invite.pairing_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .expect("query one claimed invite");
-    assert_eq!(one_claim_row.get::<String, _>("status"), "pending");
-    assert_eq!(one_claim_row.get::<i64, _>("claim_count"), 1);
-
-    let bob = kernel
-        .claim_channel_pairing(claim_request("slack", &invite.token, "bob", "room-1", None))
-        .await
-        .expect("claim conversation invite for bob");
-    assert_eq!(bob.outcome, ChannelPairingClaimOutcome::Approved);
-
+    assert!(replayed_alice.grant_id.is_none());
     let claimed_row = sqlx::query(
         "SELECT status, claim_count FROM channel_pairing_requests WHERE pairing_id = ?1",
     )
     .bind(invite.pairing_id.to_string())
     .fetch_one(&pool)
     .await
-    .expect("query multi-claim invite");
+    .expect("query claimed conversation invite");
     assert_eq!(claimed_row.get::<String, _>("status"), "approved");
-    assert_eq!(claimed_row.get::<i64, _>("claim_count"), 2);
+    assert_eq!(claimed_row.get::<i64, _>("claim_count"), 1);
+
+    let bob = kernel
+        .claim_channel_pairing(claim_request("slack", &invite.token, "bob", "room-1", None))
+        .await
+        .expect("reuse conversation invite for bob");
+    assert_eq!(bob.outcome, ChannelPairingClaimOutcome::AlreadyClaimed);
+    assert!(bob.grant_id.is_none());
 
     let access = kernel
         .list_channel_pairings(Some("slack".to_string()), None)
         .await
         .expect("list conversation grants");
-    for sender in ["alice", "bob"] {
-        assert!(access.grants.iter().any(|grant| {
-            grant.routing_profile == ChannelRoutingProfile::Conversation
-                && grant.sender_ref.as_deref() == Some(sender)
-                && grant.conversation_ref.as_deref() == Some("room-1")
-                && grant.thread_ref.is_none()
-        }));
-    }
+    assert!(access.grants.iter().any(|grant| {
+        grant.routing_profile == ChannelRoutingProfile::Conversation
+            && grant.sender_ref.is_none()
+            && grant.conversation_ref.as_deref() == Some("room-1")
+            && grant.thread_ref.is_none()
+    }));
 
     let over_claimed = kernel
         .claim_channel_pairing(claim_request(
@@ -2679,6 +2780,7 @@ async fn channel_pairing_conversation_invite_scopes_each_claimed_sender() {
             thread_ref: None,
             expires_in_ms: None,
             max_claims: None,
+            operator_actor: None,
         })
         .await
         .expect("create blocked conversation invite");
@@ -2734,6 +2836,7 @@ async fn channel_pairing_thread_expired_and_invalid_claims_are_denied() {
             thread_ref: None,
             expires_in_ms: None,
             max_claims: None,
+            operator_actor: None,
         })
         .await
         .expect("create thread invite");
@@ -2798,6 +2901,7 @@ async fn channel_pairing_thread_expired_and_invalid_claims_are_denied() {
             thread_ref: None,
             expires_in_ms: None,
             max_claims: None,
+            operator_actor: None,
         })
         .await
         .expect("create blocked thread invite");
@@ -2850,6 +2954,7 @@ async fn channel_pairing_thread_expired_and_invalid_claims_are_denied() {
             thread_ref: None,
             expires_in_ms: None,
             max_claims: None,
+            operator_actor: None,
         })
         .await
         .expect("create expirable invite");
@@ -3218,7 +3323,7 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
     assert_eq!(queued_topic.outcome, ChannelInboundOutcome::Queued);
     assert_eq!(
         queued_topic.session_key.as_deref(),
-        Some("channel:slack:conversation:room-1:sender:alice")
+        Some("channel:slack:conversation:room-1")
     );
 
     let ignored_plain = kernel
@@ -3285,7 +3390,7 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
             "slack",
             "thread-pending",
             "bob",
-            "room-1",
+            "room-2",
             Some("topic-b"),
             "thread continuation",
             ChannelTrigger::ThreadContinuation,
@@ -3310,7 +3415,7 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
             "slack",
             "thread-queued",
             "bob",
-            "room-1",
+            "room-2",
             Some("topic-b"),
             "thread again",
             ChannelTrigger::ThreadContinuation,
@@ -3318,7 +3423,7 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
         .await
         .expect("thread continuation");
     assert_eq!(queued_thread.outcome, ChannelInboundOutcome::Queued);
-    let bob_thread_session_key = thread_session_key("slack", "room-1", "topic-b", "bob");
+    let bob_thread_session_key = thread_session_key("slack", "room-2", "topic-b", "bob");
     assert_eq!(
         queued_thread.session_key.as_deref(),
         Some(bob_thread_session_key.as_str())
@@ -3380,7 +3485,7 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
                 "slack",
                 "thread-attachment",
                 "bob",
-                "room-1",
+                "room-2",
                 Some("topic-b"),
                 "see image",
                 ChannelTrigger::ThreadContinuation,
@@ -3403,7 +3508,7 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
                 "slack",
                 "thread-duplicate-attachment",
                 "bob",
-                "room-1",
+                "room-2",
                 Some("topic-b"),
                 "ambiguous image",
                 ChannelTrigger::ThreadContinuation,

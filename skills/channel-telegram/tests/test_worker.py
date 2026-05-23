@@ -30,6 +30,7 @@ from lionclaw_channel_telegram.api import (
     OutboxContent,
     OutboxDelivery,
     PairingClaimResponse,
+    PairingInviteResponse,
     SessionActionResult,
     StreamEvent,
 )
@@ -1123,6 +1124,54 @@ class LionClawApiTests(unittest.IsolatedAsyncioTestCase):
         )
         await api.close()
 
+    async def test_create_group_invite_uses_operator_scoped_invite_endpoint(
+        self,
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured["path"] = request.url.path
+            captured["payload"] = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={
+                    "pairing_id": "pairing-1",
+                    "channel_id": "telegram",
+                    "token": "lc_0123456789abcdef",
+                    "requested_profile": "conversation",
+                    "expires_at": "2026-05-23T00:00:00Z",
+                    "max_claims": 1,
+                },
+            )
+
+        client = httpx.AsyncClient(
+            base_url="http://127.0.0.1:8979",
+            transport=httpx.MockTransport(handler),
+        )
+        api = build_api(client)
+
+        response = await api.create_group_invite(
+            operator_sender_ref="telegram:user:42",
+            label="Group link",
+        )
+
+        self.assertEqual(response.token, "lc_0123456789abcdef")
+        self.assertEqual(captured["path"], "/v0/channels/pairing/invite")
+        self.assertEqual(
+            captured["payload"],
+            {
+                "channel_id": "telegram",
+                "requested_profile": "conversation",
+                "label": "Group link",
+                "conversation_ref": None,
+                "thread_ref": None,
+                "expires_in_ms": 600000,
+                "max_claims": 1,
+                "operator_actor": {"sender_ref": "telegram:user:42"},
+            },
+        )
+        await api.close()
+
     async def test_pull_stream_normalizes_nullable_text(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
@@ -2037,7 +2086,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 telegram.sent_messages[0],
                 (
                     "telegram:chat:77",
-                    "Pairing approved. You can send a message now.",
+                    "LionClaw is connected. You can send a message now.",
                     "telegram:message:1",
                     None,
                     [],
@@ -4662,6 +4711,352 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("/model", telegram.sent_messages[0][1])
         self.assertEqual(telegram.sent_buttons[0], [])
 
+    async def test_group_help_teaches_ask_without_runtime_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 9101,
+                            "message": {
+                                "message_id": 101,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/help@lionclaw_bot",
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len("/help@lionclaw_bot"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertIn("/ask@lionclaw_bot message", telegram.sent_messages[0][1])
+        self.assertNotIn("/compact", telegram.sent_messages[0][1])
+        self.assertNotIn("/model", telegram.sent_messages[0][1])
+        self.assertEqual(telegram.sent_buttons[0], [])
+
+    async def test_private_settings_includes_connect_group_button(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 9102,
+                            "message": {
+                                "message_id": 102,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/settings",
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertIn("Connect a group", telegram.sent_messages[0][1])
+        self.assertEqual(
+            [button.text for button in telegram.sent_buttons[0]], ["Connect group"]
+        )
+        self.assertTrue(telegram.sent_buttons[0][0].action.startswith("lc1:g:group:"))
+
+    async def test_connect_group_button_creates_one_use_startgroup_link(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 9103,
+                            "message": {
+                                "message_id": 103,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/settings",
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            await worker.process_updates()
+            payload = telegram.sent_buttons[0][0].action
+            telegram.updates = [
+                Update.model_validate(
+                    {
+                        "update_id": 9104,
+                        "callback_query": {
+                            "id": "connect-group",
+                            "from": {
+                                "id": 77,
+                                "is_bot": False,
+                                "first_name": "Alice",
+                            },
+                            "chat_instance": "chat-instance",
+                            "data": payload,
+                            "message": {
+                                "message_id": 104,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 99,
+                                    "is_bot": True,
+                                    "first_name": "LionClaw",
+                                    "username": "lionclaw_bot",
+                                },
+                                "text": "Telegram channel settings",
+                            },
+                        },
+                    }
+                )
+            ]
+
+            await worker.process_updates()
+
+        self.assertEqual(
+            api.group_invites, [("telegram:user:77", "Telegram group link")]
+        )
+        self.assertEqual(
+            telegram.answered_callbacks[-1], ("connect-group", "Group link ready.")
+        )
+        self.assertIn(
+            "https://t.me/lionclaw_bot?startgroup=lc_0123456789abcdef",
+            telegram.sent_messages[-1][1],
+        )
+
+    async def test_connect_group_button_from_other_sender_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            update = TelegramInboundUpdate(
+                update_id=1,
+                event_id="telegram:update:1",
+                sender_ref="telegram:user:77",
+                conversation_ref="telegram:chat:77",
+                message_ref="telegram:message:1",
+                text="/settings",
+                trigger="dm",
+                provider_metadata={"chat_type": "private"},
+            )
+            payload = worker._connect_group_callback_payload(update)
+            telegram.updates = [
+                Update.model_validate(
+                    {
+                        "update_id": 9105,
+                        "callback_query": {
+                            "id": "connect-group-bob",
+                            "from": {
+                                "id": 88,
+                                "is_bot": False,
+                                "first_name": "Bob",
+                            },
+                            "chat_instance": "chat-instance",
+                            "data": payload,
+                            "message": {
+                                "message_id": 105,
+                                "date": 0,
+                                "chat": {"id": 77, "type": "private"},
+                                "from": {
+                                    "id": 99,
+                                    "is_bot": True,
+                                    "first_name": "LionClaw",
+                                    "username": "lionclaw_bot",
+                                },
+                                "text": "Telegram channel settings",
+                            },
+                        },
+                    }
+                )
+            ]
+
+            await worker.process_updates()
+
+        self.assertEqual(api.group_invites, [])
+        self.assertEqual(
+            telegram.answered_callbacks[-1],
+            ("connect-group-bob", "That control is no longer valid."),
+        )
+
+    async def test_group_ask_strips_command_and_submits_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 9106,
+                            "message": {
+                                "message_id": 106,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/ask@lionclaw_bot how are you?",
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len("/ask@lionclaw_bot"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(len(api.sent_inbound), 1)
+        self.assertEqual(api.sent_inbound[0].text, "how are you?")
+
+    async def test_empty_group_ask_gets_usage_without_runtime_submit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 9107,
+                            "message": {
+                                "message_id": 107,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/ask@lionclaw_bot",
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len("/ask@lionclaw_bot"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertIn("Use /ask@lionclaw_bot", telegram.sent_messages[0][1])
+
+    async def test_unconnected_group_pending_approval_hides_pairing_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(
+                inbound_outcome="pending_approval",
+                inbound_pairing_code="pc_abcdef12",
+            )
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 9108,
+                            "message": {
+                                "message_id": 108,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/ask@lionclaw_bot hello",
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len("/ask@lionclaw_bot"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertNotIn("pc_abcdef12", telegram.sent_messages[-1][1])
+        self.assertIn("not connected to this group", telegram.sent_messages[-1][1])
+
     async def test_bare_retry_passes_through_to_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
@@ -6725,7 +7120,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(api.staged_attachments, [])
             self.assertEqual(api.finalized, [])
 
-    async def test_pending_approval_notifies_with_pairing_code_without_download(
+    async def test_pending_approval_notifies_group_without_pairing_code_or_download(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -6778,7 +7173,9 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
                 [
                     (
                         "telegram:chat:-44",
-                        "This Telegram scope needs approval. Pairing code: pc_abcdef12",
+                        "LionClaw is not connected to this group yet.\n\n"
+                        "Ask a connected LionClaw host to open /settings in DM and "
+                        "create a group connection link.",
                         "telegram:message:5",
                         None,
                         [],
@@ -10318,6 +10715,7 @@ class FakeLionClawApi:
         inbound_outcome: str = "queued",
         inbound_pairing_code: str | None = None,
         claim_outcome: str = "approved",
+        invite_error: Exception | None = None,
         report_accepted: bool = True,
         stage_error: Exception | None = None,
         inbound_turn_id: str | None = None,
@@ -10332,6 +10730,7 @@ class FakeLionClawApi:
         self.inbound_outcome = inbound_outcome
         self.inbound_pairing_code = inbound_pairing_code
         self.claim_outcome = claim_outcome
+        self.invite_error = invite_error
         self.report_accepted = report_accepted
         self.stage_error = stage_error
         self.inbound_turn_id = inbound_turn_id
@@ -10343,6 +10742,7 @@ class FakeLionClawApi:
         self.sent_inbound: list[TelegramInboundUpdate] = []
         self.cancel_calls: list[tuple[str, str, str | None, str]] = []
         self.claims: list[TelegramPairingClaim] = []
+        self.group_invites: list[tuple[str, str | None]] = []
         self.staged_attachments: list[
             tuple[TelegramInboundUpdate, TelegramInboundAttachment]
         ] = []
@@ -10393,6 +10793,23 @@ class FakeLionClawApi:
     async def claim_pairing(self, claim: TelegramPairingClaim) -> PairingClaimResponse:
         self.claims.append(claim)
         return PairingClaimResponse(outcome=self.claim_outcome)
+
+    async def create_group_invite(
+        self,
+        *,
+        operator_sender_ref: str,
+        label: str | None = None,
+        expires_in_ms: int = 600000,
+    ) -> PairingInviteResponse:
+        self.group_invites.append((operator_sender_ref, label))
+        if self.invite_error is not None:
+            raise self.invite_error
+        return PairingInviteResponse(
+            pairing_id="pairing-1",
+            token="lc_0123456789abcdef",
+            expires_at="2026-05-23T00:00:00Z",
+            max_claims=1,
+        )
 
     async def stage_attachment(
         self,

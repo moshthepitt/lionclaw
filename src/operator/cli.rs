@@ -1203,6 +1203,7 @@ pub async fn run() -> Result<ExitCode> {
                             thread_ref: args.thread_ref,
                             expires_in_ms,
                             max_claims: args.max_claims,
+                            operator_actor: None,
                         },
                     )
                     .await?;

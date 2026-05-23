@@ -1621,6 +1621,27 @@ impl Kernel {
         Ok(approved.trust_tier)
     }
 
+    async fn require_channel_operator_actor(
+        &self,
+        channel_id: &str,
+        sender_ref: &str,
+    ) -> Result<(), KernelError> {
+        let trust_tier = self
+            .require_channel_grant_scope_approved(
+                channel_id,
+                SessionKeyScope::Direct {
+                    sender_ref: sender_ref.to_string(),
+                },
+            )
+            .await?;
+        if !matches!(trust_tier, TrustTier::Main) {
+            return Err(KernelError::BadRequest(
+                "channel operator actor must have an approved direct host grant".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn find_channel_session_blocking_grant(
         &self,
         channel_id: &str,
@@ -1892,6 +1913,10 @@ impl Kernel {
         let invite = validate_channel_pairing_invite(req)?;
         self.require_active_channel_binding(&invite.channel_id)
             .await?;
+        if let Some(actor_sender_ref) = invite.operator_actor_sender_ref.as_deref() {
+            self.require_channel_operator_actor(&invite.channel_id, actor_sender_ref)
+                .await?;
+        }
 
         let token = generate_pairing_token();
         let token_hash = hash_pairing_code(&token);
@@ -1933,6 +1958,7 @@ impl Kernel {
                     "thread_ref": pairing.thread_ref,
                     "max_claims": pairing.max_claims,
                     "expires_at": pairing.expires_at,
+                    "operator_actor_sender_ref": invite.operator_actor_sender_ref,
                 }),
             )
             .await
@@ -2061,7 +2087,10 @@ impl Kernel {
             .find_blocking_grant_for_scope_in_tx(
                 &mut tx,
                 &claim.channel_id,
-                grant_scope.sender_ref.as_deref(),
+                grant_scope
+                    .sender_ref
+                    .as_deref()
+                    .or(Some(claim.sender_ref.as_str())),
                 grant_scope.conversation_ref.as_deref(),
                 grant_scope.thread_ref.as_deref(),
                 pairing.requested_profile,
@@ -6883,10 +6912,14 @@ fn channel_pairing_continuity_scope(pairing: &ChannelPairingRequestRecord) -> St
             pairing.sender_ref.as_deref().unwrap_or("unknown")
         ),
         ChannelRoutingProfile::Conversation => format!(
-            "{}/conversation:{}/sender:{}",
+            "{}/conversation:{}{}",
             pairing.channel_id,
             pairing.conversation_ref.as_deref().unwrap_or("unknown"),
-            pairing.sender_ref.as_deref().unwrap_or("unknown")
+            pairing
+                .sender_ref
+                .as_deref()
+                .map(|sender_ref| format!("/sender:{sender_ref}"))
+                .unwrap_or_default()
         ),
         ChannelRoutingProfile::Thread => format!(
             "{}/thread:{}/{}",
@@ -7684,6 +7717,7 @@ struct ValidatedPairingInvite {
     thread_ref: Option<String>,
     expires_at: DateTime<Utc>,
     max_claims: u32,
+    operator_actor_sender_ref: Option<String>,
 }
 
 struct GrantScope {
@@ -7779,6 +7813,10 @@ fn validate_channel_pairing_invite(
     let label = trim_optional(req.label);
     let conversation_ref = trim_optional(req.conversation_ref);
     let thread_ref = trim_optional(req.thread_ref);
+    let operator_actor_sender_ref = req
+        .operator_actor
+        .map(|actor| trim_required(actor.sender_ref, "operator_actor.sender_ref"))
+        .transpose()?;
     validate_invite_profile_scope(
         req.requested_profile,
         conversation_ref.as_deref(),
@@ -7805,6 +7843,11 @@ fn validate_channel_pairing_invite(
             "max_claims must be greater than zero".to_string(),
         ));
     }
+    if req.requested_profile == ChannelRoutingProfile::Conversation && max_claims != 1 {
+        return Err(KernelError::BadRequest(
+            "conversation invites connect one conversation and must use max_claims=1".to_string(),
+        ));
+    }
 
     Ok(ValidatedPairingInvite {
         channel_id,
@@ -7814,6 +7857,7 @@ fn validate_channel_pairing_invite(
         thread_ref,
         expires_at,
         max_claims,
+        operator_actor_sender_ref,
     })
 }
 
@@ -8388,7 +8432,7 @@ fn pending_scope_for_profile(
             thread_ref: None,
         }),
         ChannelRoutingProfile::Conversation => Ok(GrantScope {
-            sender_ref: Some(inbound.sender_ref.clone()),
+            sender_ref: None,
             conversation_ref: Some(inbound.conversation_ref.clone()),
             thread_ref: None,
         }),
@@ -8450,7 +8494,7 @@ fn grant_scope_from_token_claim(
                 return Err("conversation_ref_mismatch");
             }
             Ok(GrantScope {
-                sender_ref: Some(claim.sender_ref.clone()),
+                sender_ref: pairing.sender_ref.clone(),
                 conversation_ref: Some(claim.conversation_ref.clone()),
                 thread_ref: None,
             })
@@ -8512,14 +8556,11 @@ fn grant_scope_from_pairing(
             })
         }
         ChannelRoutingProfile::Conversation => {
-            let sender_ref = pairing.sender_ref.clone().ok_or_else(|| {
-                KernelError::BadRequest("conversation grant requires sender_ref".to_string())
-            })?;
             let conversation_ref = pairing.conversation_ref.clone().ok_or_else(|| {
                 KernelError::BadRequest("conversation grant requires conversation_ref".to_string())
             })?;
             Ok(GrantScope {
-                sender_ref: Some(sender_ref),
+                sender_ref: pairing.sender_ref.clone(),
                 conversation_ref: Some(conversation_ref),
                 thread_ref: None,
             })
@@ -8601,18 +8642,21 @@ fn session_key_for_grant(grant: &ChannelGrantRecord) -> Result<String, KernelErr
             ))
         }
         ChannelRoutingProfile::Conversation => {
-            let sender_ref = grant.sender_ref.as_deref().ok_or_else(|| {
-                KernelError::Internal("conversation grant missing sender_ref".to_string())
-            })?;
             let conversation_ref = grant.conversation_ref.as_deref().ok_or_else(|| {
                 KernelError::Internal("conversation grant missing conversation_ref".to_string())
             })?;
-            Ok(format!(
-                "channel:{}:conversation:{}:sender:{}",
+            let conversation_key = format!(
+                "channel:{}:conversation:{}",
                 grant.channel_id,
-                encode_session_key_part(conversation_ref),
-                encode_session_key_part(sender_ref)
-            ))
+                encode_session_key_part(conversation_ref)
+            );
+            match grant.sender_ref.as_deref() {
+                Some(sender_ref) => Ok(format!(
+                    "{conversation_key}:sender:{}",
+                    encode_session_key_part(sender_ref)
+                )),
+                None => Ok(conversation_key),
+            }
         }
         ChannelRoutingProfile::Thread => {
             let sender_ref = grant.sender_ref.as_deref().ok_or_else(|| {
@@ -8740,9 +8784,14 @@ fn parse_session_key_scope(channel_id: &str, session_peer_id: &str) -> Option<Se
 
     let conversation_prefix = format!("channel:{channel_id}:conversation:");
     if let Some(rest) = session_peer_id.strip_prefix(&conversation_prefix) {
-        let (conversation_ref, sender_ref) = rest.split_once(":sender:")?;
+        let (conversation_ref, sender_ref) = match rest.split_once(":sender:") {
+            Some((conversation_ref, sender_ref)) => {
+                (conversation_ref, Some(decode_session_key_part(sender_ref)))
+            }
+            None => (rest, None),
+        };
         return Some(SessionKeyScope::Conversation {
-            sender_ref: decode_session_key_part(sender_ref),
+            sender_ref,
             conversation_ref: decode_session_key_part(conversation_ref),
         });
     }
@@ -9588,7 +9637,7 @@ enum SessionKeyScope {
         sender_ref: String,
     },
     Conversation {
-        sender_ref: String,
+        sender_ref: Option<String>,
         conversation_ref: String,
     },
     Thread {
@@ -9618,7 +9667,7 @@ fn exact_session_grant_lookup(scope: &SessionKeyScope) -> ChannelSessionGrantLoo
             sender_ref,
             conversation_ref,
         } => ChannelSessionGrantLookup {
-            sender_ref: Some(sender_ref),
+            sender_ref: sender_ref.as_deref(),
             conversation_ref: Some(conversation_ref),
             thread_ref: None,
             routing_profile: ChannelRoutingProfile::Conversation,
@@ -9639,15 +9688,18 @@ fn exact_session_grant_lookup(scope: &SessionKeyScope) -> ChannelSessionGrantLoo
 fn blocking_session_grant_lookups(scope: &SessionKeyScope) -> Vec<ChannelSessionGrantLookup<'_>> {
     match scope {
         SessionKeyScope::Direct { .. } => vec![exact_session_grant_lookup(scope)],
-        SessionKeyScope::Conversation { sender_ref, .. } => vec![
-            exact_session_grant_lookup(scope),
-            ChannelSessionGrantLookup {
-                sender_ref: Some(sender_ref),
-                conversation_ref: None,
-                thread_ref: None,
-                routing_profile: ChannelRoutingProfile::Direct,
-            },
-        ],
+        SessionKeyScope::Conversation { sender_ref, .. } => {
+            let mut lookups = vec![exact_session_grant_lookup(scope)];
+            if let Some(sender_ref) = sender_ref {
+                lookups.push(ChannelSessionGrantLookup {
+                    sender_ref: Some(sender_ref),
+                    conversation_ref: None,
+                    thread_ref: None,
+                    routing_profile: ChannelRoutingProfile::Direct,
+                });
+            }
+            lookups
+        }
         SessionKeyScope::Thread {
             sender_ref,
             conversation_ref,
@@ -9656,6 +9708,12 @@ fn blocking_session_grant_lookups(scope: &SessionKeyScope) -> Vec<ChannelSession
             exact_session_grant_lookup(scope),
             ChannelSessionGrantLookup {
                 sender_ref: Some(sender_ref),
+                conversation_ref: Some(conversation_ref),
+                thread_ref: None,
+                routing_profile: ChannelRoutingProfile::Conversation,
+            },
+            ChannelSessionGrantLookup {
+                sender_ref: None,
                 conversation_ref: Some(conversation_ref),
                 thread_ref: None,
                 routing_profile: ChannelRoutingProfile::Conversation,

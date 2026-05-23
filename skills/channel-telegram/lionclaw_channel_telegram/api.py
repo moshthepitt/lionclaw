@@ -33,6 +33,14 @@ class PairingClaimResponse:
 
 
 @dataclass(slots=True, frozen=True)
+class PairingInviteResponse:
+    pairing_id: str
+    token: str
+    expires_at: str
+    max_claims: int
+
+
+@dataclass(slots=True, frozen=True)
 class AttachmentStageResponse:
     status: str
     size_bytes: int
@@ -217,6 +225,35 @@ class LionClawApi:
             outcome=payload["outcome"],
             grant_id=payload.get("grant_id"),
             reason_code=payload.get("reason_code"),
+        )
+
+    async def create_group_invite(
+        self,
+        *,
+        operator_sender_ref: str,
+        label: str | None = None,
+        expires_in_ms: int = 10 * 60 * 1000,
+    ) -> PairingInviteResponse:
+        response = await self._client.post(
+            "/v0/channels/pairing/invite",
+            json={
+                "channel_id": self.channel_id,
+                "requested_profile": "conversation",
+                "label": label,
+                "conversation_ref": None,
+                "thread_ref": None,
+                "expires_in_ms": expires_in_ms,
+                "max_claims": 1,
+                "operator_actor": {"sender_ref": operator_sender_ref},
+            },
+        )
+        _raise_for_status(response)
+        payload = response.json()
+        return PairingInviteResponse(
+            pairing_id=payload["pairing_id"],
+            token=payload["token"],
+            expires_at=payload["expires_at"],
+            max_claims=payload["max_claims"],
         )
 
     async def stage_attachment(

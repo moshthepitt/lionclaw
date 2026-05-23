@@ -14,6 +14,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
+from urllib.parse import quote
 
 from aiogram.exceptions import (
     TelegramBadRequest,
@@ -96,6 +97,7 @@ LOCAL_TELEGRAM_COMMANDS = {
     "stop",
     "settings",
 }
+TELEGRAM_PROMPT_COMMANDS = {"ask"}
 ACTIVE_STATUS_CODES = {
     "queue.started": "Queued",
     "runtime.started": "Working",
@@ -107,6 +109,7 @@ CALLBACK_PREFIX = "lc1"
 CALLBACK_ACTION_CODES = {
     "stop": "s",
     "status": "t",
+    "connect_group": "g",
 }
 CALLBACK_CODE_ACTIONS = {code: action for action, code in CALLBACK_ACTION_CODES.items()}
 CALLBACK_MAC_BYTES = 12
@@ -1493,7 +1496,7 @@ class TelegramWorker:
         try:
             await self.telegram.send_message(
                 claim.conversation_ref,
-                _pairing_claim_reply(response.outcome),
+                _pairing_claim_reply(claim, response.outcome),
                 reply_to_ref=claim.message_ref,
                 thread_ref=claim.thread_ref,
             )
@@ -1508,6 +1511,9 @@ class TelegramWorker:
         parsed = _parse_callback_action(callback.action)
         if parsed is None:
             await self._answer_callback(callback, "Unknown LionClaw control.")
+            return True
+        if parsed.action == "connect_group":
+            await self._handle_connect_group_callback(callback, parsed)
             return True
         active = self._active_turn_for_callback(callback, parsed)
         if active is None:
@@ -1534,6 +1540,85 @@ class TelegramWorker:
 
         await self._answer_callback(callback, "Unknown LionClaw control.")
         return True
+
+    async def _handle_connect_group_callback(
+        self,
+        callback: TelegramCallbackAction,
+        parsed: ParsedCallbackAction,
+    ) -> None:
+        if not self._connect_group_callback_mac_matches(callback, parsed):
+            await self._answer_callback(callback, "That control is no longer valid.")
+            return
+        if callback.provider_metadata.get("chat_type") != "private":
+            await self._answer_callback(callback, "Open this in a LionClaw DM.")
+            return
+
+        try:
+            identity = await self.telegram.bot_identity()
+            if identity.username is None:
+                raise RuntimeError("telegram bot username is unavailable")
+            invite = await self.lionclaw_api.create_group_invite(
+                operator_sender_ref=callback.sender_ref,
+                label="Telegram group link",
+            )
+        except Exception:
+            logger.exception(
+                "telegram group invite creation failed for update_id=%s",
+                callback.update_id,
+            )
+            await self._answer_callback(callback, "Could not create a group link.")
+            await self._send_callback_message(
+                callback,
+                "I could not create a group connection link.\n\n"
+                "This Telegram account must be connected as a LionClaw host first.",
+            )
+            return
+
+        await self._answer_callback(callback, "Group link ready.")
+        await self._send_callback_message(
+            callback,
+            "Connect a Telegram group\n\n"
+            "Open this one-use link, then choose the group to connect:\n"
+            f"{_telegram_startgroup_link(identity.username, invite.token)}\n\n"
+            "You can also share it with a trusted group admin. "
+            "The first group to use it wins.",
+        )
+
+    def _connect_group_callback_mac_matches(
+        self,
+        callback: TelegramCallbackAction,
+        parsed: ParsedCallbackAction,
+    ) -> bool:
+        if parsed.target != "group":
+            return False
+        expected = _callback_mac(
+            self.config.telegram_bot_token,
+            parsed.action,
+            parsed.target,
+            callback.sender_ref,
+            callback.conversation_ref,
+            None,
+            None,
+        )
+        return _constant_time_ascii_equals(parsed.mac, expected)
+
+    async def _send_callback_message(
+        self,
+        callback: TelegramCallbackAction,
+        text: str,
+    ) -> None:
+        try:
+            await self.telegram.send_message(
+                callback.conversation_ref,
+                text,
+                reply_to_ref=callback.message_ref,
+                thread_ref=callback.thread_ref,
+            )
+        except Exception:
+            logger.exception(
+                "telegram callback follow-up message failed for update_id=%s",
+                callback.update_id,
+            )
 
     def _active_turn_for_callback(
         self,
@@ -1608,12 +1693,20 @@ class TelegramWorker:
         command = _telegram_command(update)
         if command is not None:
             command_is_addressed = _telegram_command_is_addressed(update, command)
-            if command.name in LOCAL_TELEGRAM_COMMANDS and command_is_addressed:
-                return await self._handle_telegram_command(update, command)
-            if command_is_addressed:
-                runtime_text = _telegram_runtime_command_text(command)
-                if runtime_text != update.text:
-                    update = replace(update, text=runtime_text)
+            prompt_command_handled = False
+            if command.name in TELEGRAM_PROMPT_COMMANDS and command_is_addressed:
+                if not command.arguments and not update.attachments:
+                    await self._reply(update, _ask_usage(update))
+                    return True
+                update = replace(update, text=command.arguments or None)
+                prompt_command_handled = True
+            if not prompt_command_handled:
+                if command.name in LOCAL_TELEGRAM_COMMANDS and command_is_addressed:
+                    return await self._handle_telegram_command(update, command)
+                if command_is_addressed:
+                    runtime_text = _telegram_runtime_command_text(command)
+                    if runtime_text != update.text:
+                        update = replace(update, text=runtime_text)
 
         try:
             response = await self.lionclaw_api.send_inbound(update)
@@ -1737,14 +1830,46 @@ class TelegramWorker:
         await self._reply(update, f"Active turn: {active.status_text.lower()}.")
 
     async def _send_settings(self, update: TelegramInboundUpdate) -> None:
+        if _is_private_update(update):
+            await self._reply(
+                update,
+                "Telegram channel settings\n\n"
+                "Connect a group with a short-lived one-use link.",
+                buttons=[
+                    TelegramActionButton(
+                        "Connect group",
+                        self._connect_group_callback_payload(update),
+                    )
+                ],
+            )
+            return
+
+        command_suffix = _bot_command_suffix(update)
         await self._reply(
             update,
             "Telegram channel settings\n"
-            "/status - current turn\n"
-            "/stop - stop active turn",
+            "Mode: groups use addressed commands and replies.\n\n"
+            f"/ask{command_suffix} message - ask LionClaw\n"
+            f"/status{command_suffix} - current turn\n"
+            f"/stop{command_suffix} - stop active turn\n\n"
+            "To connect a new group, ask a connected LionClaw host to open "
+            "/settings in DM and create a group connection link.",
         )
 
     async def _send_help(self, update: TelegramInboundUpdate) -> None:
+        if not _is_private_update(update):
+            command_suffix = _bot_command_suffix(update)
+            await self._reply(
+                update,
+                "LionClaw in groups\n\n"
+                f"/ask{command_suffix} message - ask LionClaw\n"
+                f"/status{command_suffix} - current turn\n"
+                f"/stop{command_suffix} - stop active turn\n"
+                f"/settings{command_suffix} - group settings\n\n"
+                "Reply to a LionClaw message to continue that conversation.",
+            )
+            return
+
         await self._reply(
             update,
             "LionClaw controls\n"
@@ -1893,9 +2018,18 @@ class TelegramWorker:
         update: TelegramInboundUpdate,
         pairing_code: str | None,
     ) -> None:
-        text = "This Telegram scope is waiting for operator approval."
-        if pairing_code is not None:
-            text = f"This Telegram scope needs approval. Pairing code: {pairing_code}"
+        if _is_private_update(update):
+            text = "This Telegram chat is waiting for operator approval."
+            if pairing_code is not None:
+                text = (
+                    f"This Telegram chat needs approval. Pairing code: {pairing_code}"
+                )
+        else:
+            text = (
+                "LionClaw is not connected to this group yet.\n\n"
+                "Ask a connected LionClaw host to open /settings in DM and "
+                "create a group connection link."
+            )
         try:
             await self.telegram.send_message(
                 update.conversation_ref,
@@ -2458,6 +2592,20 @@ class TelegramWorker:
             session_key,
         )
         return f"{CALLBACK_PREFIX}:{code}:{active.turn_id}:{mac}"
+
+    def _connect_group_callback_payload(self, update: TelegramInboundUpdate) -> str:
+        action = "connect_group"
+        target = "group"
+        mac = _callback_mac(
+            self.config.telegram_bot_token,
+            action,
+            target,
+            update.sender_ref,
+            update.conversation_ref,
+            None,
+            None,
+        )
+        return f"{CALLBACK_PREFIX}:{CALLBACK_ACTION_CODES[action]}:{target}:{mac}"
 
     async def _complete_progress(self, event: StreamEvent) -> None:
         turn = self._active_turns.get(event.turn_id)
@@ -3495,6 +3643,19 @@ def _telegram_command_is_addressed(
     return update.trigger in {"mention", "reply_to_bot", "thread_continuation"}
 
 
+def _is_private_update(update: TelegramInboundUpdate) -> bool:
+    return update.provider_metadata.get("chat_type") == "private"
+
+
+def _bot_command_suffix(update: TelegramInboundUpdate) -> str:
+    return _bot_command_suffix_from_metadata(update.provider_metadata)
+
+
+def _ask_usage(update: TelegramInboundUpdate) -> str:
+    command_suffix = _bot_command_suffix(update)
+    return f"Use /ask{command_suffix} followed by the message for LionClaw."
+
+
 def _progress_threshold_seconds(update: TelegramInboundUpdate) -> float:
     if update.provider_metadata.get("chat_type") == "private":
         return DM_PROGRESS_THRESHOLD_SECONDS
@@ -3592,16 +3753,36 @@ def _is_permanent_delete_failure(err: Exception) -> bool:
     return False
 
 
-def _pairing_claim_reply(outcome: str) -> str:
+def _pairing_claim_reply(claim: TelegramPairingClaim, outcome: str) -> str:
     if outcome == "approved":
-        return "Pairing approved. You can send a message now."
+        if claim.provider_metadata.get("chat_type") != "private":
+            command_suffix = _bot_command_suffix_from_metadata(claim.provider_metadata)
+            return (
+                "LionClaw is connected to this group.\n\n"
+                f"Use /ask{command_suffix} message to start."
+            )
+        return "LionClaw is connected. You can send a message now."
     if outcome == "already_claimed":
-        return "That pairing link has already been used."
+        return "That group connection link has already been used."
     if outcome == "expired":
-        return "That pairing link has expired."
+        return "That group connection link has expired."
     if outcome == "scope_mismatch":
-        return "That pairing link is not valid for this chat."
-    return "That pairing link is invalid."
+        return "That group connection link is not valid for this chat."
+    return "That group connection link is invalid."
+
+
+def _bot_command_suffix_from_metadata(metadata: dict[str, object]) -> str:
+    bot_username = metadata.get("bot_username")
+    if isinstance(bot_username, str) and bot_username:
+        return f"@{bot_username}"
+    return "@Bot"
+
+
+def _telegram_startgroup_link(username: str, token: str) -> str:
+    bot_username = username.removeprefix("@")
+    encoded_username = quote(bot_username, safe="")
+    encoded_token = quote(token, safe="")
+    return f"https://t.me/{encoded_username}?startgroup={encoded_token}"
 
 
 def _overall_health_status(checks: list[HealthCheck]) -> str:

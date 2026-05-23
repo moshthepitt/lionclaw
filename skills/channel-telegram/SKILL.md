@@ -109,7 +109,9 @@ TELEGRAM_WEBHOOK_PATH=/telegram/webhook \
 - Pairing invite tokens can be claimed through Telegram with `/start lc_<token>`.
   DM links use `https://t.me/<bot_username>?start=lc_<token>`; group links use
   `https://t.me/<bot_username>?startgroup=lc_<token>` where Telegram exposes the
-  payload to the bot.
+  payload to the bot. Approved Telegram hosts can create a short-lived one-use
+  group link from `/settings` in DM; unconnected groups are instructed to use
+  that link path rather than exposing `pc_...` operator approval codes.
 - The worker defaults `consumer_id` to `telegram:<channel_id>` and
   `start_mode=resume`, so unacked progress events are replayed after worker
   restart. `LIONCLAW_STREAM_START_MODE` accepts `resume` or `tail`.
@@ -119,6 +121,9 @@ TELEGRAM_WEBHOOK_PATH=/telegram/webhook \
   `/settings` are channel-local controls. Session mutation commands stay
   namespaced as `/lionclaw reset` and `/lionclaw retry`; bare slash commands
   pass through to the runtime after Telegram-only addressing syntax is removed.
+  In groups, `/ask@<bot_username> message` is a Telegram envelope command that
+  strips `/ask` and submits only the message body to the runtime. It is not a
+  menu command because it requires an argument.
   `/stop` uses the channel-safe active turn cancellation action with the
   expected turn id guard. Bot commands explicitly targeted at a different
   Telegram bot are never captured as LionClaw-local controls, even inside an

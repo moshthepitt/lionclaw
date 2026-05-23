@@ -591,10 +591,15 @@ turn signals the in-memory runtime cancellation token, calls the adapter's
 the same terminalization path.
 Proactive pairing invites reuse `channel_pairing_requests` with
 `claim_policy = token_claim`; raw invite tokens are never stored, claim counts
-advance inside the same transaction that creates the scoped grant, and expired
-blocked, or over-claimed tokens cannot authorize a channel sender. Pairing claim
-audit stores normalized identity and outcome facts only, never raw worker
-provider metadata.
+advance inside the same transaction that creates the scoped grant, and expired,
+blocked, or over-claimed tokens cannot authorize a channel sender. Invite
+creation may carry a channel-neutral operator actor; the kernel validates that
+actor against an approved direct host grant on the same channel before minting
+the token and records the actor in audit. Conversation grants can be
+conversation-wide (`sender_ref` absent) so a delegated group invite connects the
+group rather than the admin who happened to claim the link. Pairing claim audit
+stores normalized identity and outcome facts only, never raw worker provider
+metadata.
 
 Kernel bootstrap converts stale `running` session turns into durable
 `interrupted` turns before they can be reused. Durable pending channel turns are

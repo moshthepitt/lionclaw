@@ -916,6 +916,8 @@ pub struct ChannelPairingInviteRequest {
     pub expires_in_ms: Option<u64>,
     #[serde(default)]
     pub max_claims: Option<u32>,
+    #[serde(default)]
+    pub operator_actor: Option<ChannelOperatorActor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -926,6 +928,12 @@ pub struct ChannelPairingInviteResponse {
     pub requested_profile: ChannelRoutingProfile,
     pub expires_at: DateTime<Utc>,
     pub max_claims: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelOperatorActor {
+    pub sender_ref: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

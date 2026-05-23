@@ -239,8 +239,14 @@ Expected when credentials are available:
 - a group invite shaped like
   `https://t.me/<bot_username>?startgroup=lc_<token>` claims where Telegram
   exposes the payload to the bot
-- unknown targeted Telegram senders receive a pending approval hint and no
-  provider files are downloaded before approval
+- in DM, `/settings` shows a `Connect group` button that creates a short-lived
+  one-use `startgroup` link; the link can be opened by the host or shared with a
+  trusted group admin
+- in groups, `/ask@<bot_username> message` strips the Telegram envelope and
+  submits only `message` to the runtime
+- unknown targeted Telegram groups receive a clean "not connected" setup hint
+  without exposing `pc_...` approval codes, and no provider files are downloaded
+  before approval
 - Telegram delivery works through the configured runtime after scoped grant
   approval
 - `/help`, `/status`, `/stop`, and `/settings` behave as documented:
