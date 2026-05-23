@@ -506,7 +506,10 @@ impl ActivitySummary {
     }
 
     fn is_empty(&self) -> bool {
-        self.event_count == 0 && self.items.is_empty() && self.file_changes.is_empty()
+        self.status == ActivityStatus::Idle
+            && self.event_count == 0
+            && self.items.is_empty()
+            && self.file_changes.is_empty()
     }
 
     fn elapsed_label(&self) -> Option<String> {
@@ -1815,8 +1818,16 @@ impl ConsoleApp {
         self.transcript_scroll.reset_tail();
         self.activity.start();
         self.activity_scroll.reset_tail();
+        self.show_runtime_activity_inspector();
         self.focus = Focus::Run;
         self.status = status.into();
+    }
+
+    fn show_runtime_activity_inspector(&mut self) {
+        self.inspector_subject = InspectorSubject::Activity;
+        if matches!(self.control_pane, ControlPane::Inspector(_)) {
+            self.control_pane = ControlPane::Inspector(InspectorSubject::Activity);
+        }
     }
 
     fn ready_instance(&self) -> Option<&ReadyInstance> {

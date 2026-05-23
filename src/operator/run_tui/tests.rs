@@ -868,6 +868,43 @@ async fn run_turn_autoscrolls_transcript_until_operator_scrolls_away() {
     assert!(rendered.contains("streamed-tail-line-02"));
 }
 
+#[tokio::test]
+async fn run_turn_promotes_side_inspector_to_runtime_activity() {
+    let mut app = ready_test_app(Vec::new()).await;
+    app.open_control_pane(ControlPane::Project);
+
+    app.begin_run_turn("new prompt", "running turn");
+    let rendered = render_to_text(&mut app, 160, 36);
+
+    assert_eq!(app.control_pane, ControlPane::Project);
+    assert_eq!(app.inspector_subject, InspectorSubject::Activity);
+    assert_eq!(app.focus, Focus::Run);
+    assert!(rendered.contains("Activity"));
+    assert!(rendered.contains("status"));
+    assert!(rendered.contains("running"));
+    assert!(!rendered.contains("Current runtime context."));
+}
+
+#[tokio::test]
+async fn run_turn_keeps_visible_inspector_tab_useful_during_runtime() {
+    let mut app = ready_test_app(Vec::new()).await;
+    app.open_control_pane(ControlPane::Inspector(InspectorSubject::Runtime));
+
+    app.begin_run_turn("new prompt", "running turn");
+    let rendered = render_to_text(&mut app, 100, 28);
+
+    assert_eq!(
+        app.control_pane,
+        ControlPane::Inspector(InspectorSubject::Activity)
+    );
+    assert_eq!(app.inspector_subject, InspectorSubject::Activity);
+    assert_eq!(app.focus, Focus::Run);
+    assert!(rendered.contains("Activity"));
+    assert!(rendered.contains("status"));
+    assert!(rendered.contains("running"));
+    assert!(!rendered.contains("executable"));
+}
+
 #[test]
 fn scrollbar_position_maps_pane_bottom_to_ratatui_bottom() {
     assert_eq!(vertical_scroll_limit(100, 20), 80);
