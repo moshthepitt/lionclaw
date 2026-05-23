@@ -730,6 +730,7 @@ impl FromStr for ChannelRoutingProfile {
 #[serde(rename_all = "snake_case")]
 pub enum ChannelTrigger {
     Dm,
+    Command,
     Mention,
     ReplyToBot,
     ThreadContinuation,
@@ -740,6 +741,7 @@ impl ChannelTrigger {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Dm => "dm",
+            Self::Command => "command",
             Self::Mention => "mention",
             Self::ReplyToBot => "reply_to_bot",
             Self::ThreadContinuation => "thread_continuation",
@@ -754,6 +756,7 @@ impl FromStr for ChannelTrigger {
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         match raw {
             "dm" => Ok(Self::Dm),
+            "command" => Ok(Self::Command),
             "mention" => Ok(Self::Mention),
             "reply_to_bot" => Ok(Self::ReplyToBot),
             "thread_continuation" => Ok(Self::ThreadContinuation),

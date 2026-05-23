@@ -2492,7 +2492,7 @@ async fn channel_pairing_operator_invite_requires_approved_direct_host_grant() {
             "telegram:chat:-1001",
             None,
             "/ask hello",
-            ChannelTrigger::Mention,
+            ChannelTrigger::Command,
         ))
         .await
         .expect("group route grant does not authorize unknown actor");
@@ -2510,7 +2510,7 @@ async fn channel_pairing_operator_invite_requires_approved_direct_host_grant() {
             sender_ref: "telegram:user:bob".to_string(),
             conversation_ref: "telegram:chat:-1001".to_string(),
             thread_ref: None,
-            trigger: ChannelTrigger::Mention,
+            trigger: ChannelTrigger::Command,
         })
         .await
         .expect("authorize group command for unknown actor");
@@ -2525,7 +2525,7 @@ async fn channel_pairing_operator_invite_requires_approved_direct_host_grant() {
             "telegram:chat:-1001",
             None,
             "/ask hello",
-            ChannelTrigger::Mention,
+            ChannelTrigger::Command,
         ))
         .await
         .expect("group-wide grant admits approved host actor");
@@ -2537,7 +2537,7 @@ async fn channel_pairing_operator_invite_requires_approved_direct_host_grant() {
             sender_ref: "telegram:user:host".to_string(),
             conversation_ref: "telegram:chat:-1001".to_string(),
             thread_ref: None,
-            trigger: ChannelTrigger::Mention,
+            trigger: ChannelTrigger::Command,
         })
         .await
         .expect("authorize group command for host actor");
@@ -3377,6 +3377,24 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
     assert_eq!(queued_topic.outcome, ChannelInboundOutcome::Queued);
     assert_eq!(
         queued_topic.session_key.as_deref(),
+        Some("channel:slack:conversation:room-1")
+    );
+
+    let queued_command = kernel
+        .ingest_channel_inbound(v2_text_request(
+            "slack",
+            "conversation-command",
+            "alice",
+            "room-1",
+            None,
+            "/status",
+            ChannelTrigger::Command,
+        ))
+        .await
+        .expect("conversation grant handles addressed command");
+    assert_eq!(queued_command.outcome, ChannelInboundOutcome::Queued);
+    assert_eq!(
+        queued_command.session_key.as_deref(),
         Some("channel:slack:conversation:room-1")
     );
 

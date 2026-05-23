@@ -8776,12 +8776,13 @@ fn trigger_allows(profile: ChannelRoutingProfile, trigger: ChannelTrigger) -> bo
         ChannelRoutingProfile::Conversation => {
             matches!(
                 trigger,
-                ChannelTrigger::Mention | ChannelTrigger::ReplyToBot
+                ChannelTrigger::Command | ChannelTrigger::Mention | ChannelTrigger::ReplyToBot
             )
         }
         ChannelRoutingProfile::Thread => matches!(
             trigger,
-            ChannelTrigger::Mention
+            ChannelTrigger::Command
+                | ChannelTrigger::Mention
                 | ChannelTrigger::ReplyToBot
                 | ChannelTrigger::ThreadContinuation
         ),
