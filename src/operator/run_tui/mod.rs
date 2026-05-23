@@ -110,21 +110,23 @@ const ACTIVITY_DONE_MARKERS: &[&str] = &[
     "mounted",
     "granted",
     "compacted",
-    " edited:",
+    "edited:",
 ];
 const ACTIVITY_COMMAND_MARKERS: &[&str] = &[
     "command",
     "exec",
-    " running:",
-    " ran:",
-    " searched:",
-    " read:",
-    " inspected:",
-    " opened:",
-    " found:",
+    "running:",
+    "ran:",
+    "searched:",
+    "read:",
+    "inspected:",
+    "opened:",
+    "found:",
+    "viewed:",
 ];
 const ACTIVITY_PROGRESS_MARKERS: &[&str] =
-    &["progress", "checking", "reading", "research", " editing:"];
+    &["progress", "checking", "reading", "research", "editing:"];
+const ACTIVITY_RUNTIME_SOURCES: &[&str] = &["codex", "opencode", "claude", "gemini"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VerticalScroll {
@@ -544,30 +546,26 @@ impl ActivitySummary {
                 {
                     self.record_file_change(file_change);
                 } else if let Some(text) = event.text.as_deref() {
-                    self.push_item(ActivityItemKind::FileChange, normalize_activity_text(text));
+                    self.push_normalized_item(ActivityItemKind::FileChange, text);
                 }
             }
             (StreamEventKindDto::Status, _, Some(text)) => {
                 self.close_progress_item();
-                let kind = classify_activity_status(text);
-                if kind == ActivityItemKind::Command {
-                    self.command_count = self.command_count.saturating_add(1);
-                }
-                if kind == ActivityItemKind::Progress {
-                    self.progress_count = self.progress_count.saturating_add(1);
-                }
-                self.push_item(kind, normalize_activity_text(text));
+                let text = normalize_activity_text(text);
+                let kind = classify_activity_status(&text);
+                self.count_activity_kind(kind);
+                self.push_item(kind, text);
             }
             (StreamEventKindDto::Error, _, Some(text))
                 if is_non_failure_terminal_code(event.code.as_deref()) =>
             {
                 self.close_progress_item();
-                self.push_item(ActivityItemKind::Status, normalize_activity_text(text));
+                self.push_normalized_item(ActivityItemKind::Status, text);
             }
             (StreamEventKindDto::Error, _, Some(text)) => {
                 self.close_progress_item();
                 self.fail();
-                self.push_item(ActivityItemKind::Error, normalize_activity_text(text));
+                self.push_normalized_item(ActivityItemKind::Error, text);
             }
             (StreamEventKindDto::TurnCompleted | StreamEventKindDto::Done, _, _) => {
                 self.close_progress_item();
@@ -591,6 +589,22 @@ impl ActivitySummary {
             self.file_changes.drain(0..overflow);
         }
         self.push_item(ActivityItemKind::FileChange, text);
+    }
+
+    fn count_activity_kind(&mut self, kind: ActivityItemKind) {
+        match kind {
+            ActivityItemKind::Command => {
+                self.command_count = self.command_count.saturating_add(1);
+            }
+            ActivityItemKind::Progress => {
+                self.progress_count = self.progress_count.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    fn push_normalized_item(&mut self, kind: ActivityItemKind, text: &str) -> Option<usize> {
+        self.push_item(kind, normalize_activity_text(text))
     }
 
     fn record_progress_delta(&mut self, delta: &str) {
@@ -2134,21 +2148,22 @@ fn is_non_failure_terminal_code(code: Option<&str>) -> bool {
 
 fn classify_activity_status(text: &str) -> ActivityItemKind {
     let lower = text.to_ascii_lowercase();
-    if contains_any(&lower, ACTIVITY_ERROR_MARKERS) {
+    if contains_activity_marker(&lower, ACTIVITY_ERROR_MARKERS) {
         ActivityItemKind::Error
-    } else if contains_any(&lower, ACTIVITY_DONE_MARKERS) {
+    } else if contains_activity_marker(&lower, ACTIVITY_DONE_MARKERS) {
         ActivityItemKind::Done
-    } else if contains_any(&lower, ACTIVITY_COMMAND_MARKERS) {
+    } else if contains_activity_marker(&lower, ACTIVITY_COMMAND_MARKERS) {
         ActivityItemKind::Command
-    } else if contains_any(&lower, ACTIVITY_PROGRESS_MARKERS) {
+    } else if contains_activity_marker(&lower, ACTIVITY_PROGRESS_MARKERS) {
         ActivityItemKind::Progress
     } else {
         ActivityItemKind::Status
     }
 }
 
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
+fn contains_activity_marker(text: &str, markers: &[&str]) -> bool {
+    text.split_whitespace()
+        .any(|token| markers.iter().any(|marker| token.starts_with(marker)))
 }
 
 fn plural_s(count: usize) -> &'static str {
@@ -2161,10 +2176,40 @@ fn plural_s(count: usize) -> &'static str {
 
 fn normalize_activity_text(text: &str) -> String {
     let trimmed = text.trim();
-    trimmed
-        .strip_prefix("codex item: ")
-        .map(|item| format!("codex {item}"))
-        .unwrap_or(trimmed.to_string())
+    let item_text = trimmed.strip_prefix("codex item: ").unwrap_or(trimmed);
+    strip_activity_source_label(item_text).to_string()
+}
+
+fn strip_activity_source_label(text: &str) -> &str {
+    for source in ACTIVITY_RUNTIME_SOURCES {
+        let Some(prefix) = text.get(..source.len()) else {
+            continue;
+        };
+        let Some(rest) = text.get(source.len()..) else {
+            continue;
+        };
+        if !prefix.eq_ignore_ascii_case(source) {
+            continue;
+        };
+        if let Some(stripped) = rest.strip_prefix(':') {
+            return stripped.trim_start();
+        }
+        if let Some(stripped) = rest.strip_prefix(' ') {
+            let stripped = stripped.trim_start();
+            if is_known_activity_phrase(stripped) {
+                return stripped;
+            }
+        }
+    }
+    text
+}
+
+fn is_known_activity_phrase(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    contains_activity_marker(&lower, ACTIVITY_ERROR_MARKERS)
+        || contains_activity_marker(&lower, ACTIVITY_DONE_MARKERS)
+        || contains_activity_marker(&lower, ACTIVITY_COMMAND_MARKERS)
+        || contains_activity_marker(&lower, ACTIVITY_PROGRESS_MARKERS)
 }
 
 fn summarize_activity_text(prefix: &str, text: &str) -> String {

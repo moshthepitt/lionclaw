@@ -118,7 +118,7 @@ fn stream_events_append_answers_and_summarize_runtime_activity() {
     assert!(activity
         .items
         .iter()
-        .any(|item| item.text == "codex ran: cargo test"));
+        .any(|item| item.text == "ran: cargo test"));
 }
 
 #[test]
@@ -202,6 +202,7 @@ fn activity_classification_accepts_runtime_neutral_summaries() {
     let mut activity = ActivitySummary::new();
     activity.start();
     for text in [
+        "codex searched: Android CLI official docs",
         "opencode searched: README.md",
         "claude running: cargo test",
         "runtime progress: reading docs",
@@ -215,12 +216,44 @@ fn activity_classification_accepts_runtime_neutral_summaries() {
         });
     }
 
-    assert_eq!(activity.command_count, 2);
+    assert_eq!(activity.command_count, 3);
     assert_eq!(activity.progress_count, 1);
     assert!(activity
         .items
         .iter()
-        .any(|item| item.text == "opencode searched: README.md"));
+        .any(|item| item.text == "searched: Android CLI official docs"));
+    assert!(activity
+        .items
+        .iter()
+        .any(|item| item.text == "searched: README.md"));
+    assert!(!activity
+        .items
+        .iter()
+        .any(|item| item.text.contains("codex searched:")));
+}
+
+#[test]
+fn activity_text_normalization_removes_redundant_runtime_source() {
+    assert_eq!(
+        normalize_activity_text("codex searched: Android CLI official docs"),
+        "searched: Android CLI official docs"
+    );
+    assert_eq!(
+        normalize_activity_text("Codex searched: Android CLI official docs"),
+        "searched: Android CLI official docs"
+    );
+    assert_eq!(
+        normalize_activity_text("opencode: permission requested"),
+        "permission requested"
+    );
+    assert_eq!(
+        normalize_activity_text("runtime started"),
+        "runtime started"
+    );
+    assert_eq!(
+        normalize_activity_text("codex login required"),
+        "codex login required"
+    );
 }
 
 #[test]
@@ -381,7 +414,10 @@ fn transcript_rendering_inserts_live_activity_after_active_prompt() {
         .position(|line| line.contains("lionclaw"))
         .expect("answer heading");
     assert!(runtime_index < answer_index);
-    assert!(rendered.iter().any(|line| line.contains("codex running")));
+    assert!(rendered
+        .iter()
+        .any(|line| line.contains("running: cargo test")));
+    assert!(!rendered.iter().any(|line| line.contains("codex running")));
 }
 
 #[test]
