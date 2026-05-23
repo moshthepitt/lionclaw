@@ -13392,6 +13392,10 @@ impl Kernel {
         if let Some(context) = &stream_context {
             self.emit_turn_completed_snapshot(context, &message).await?;
         }
+        if let Some(context) = &stream_context {
+            self.enqueue_channel_turn_text_delivery(context, turn.session_id, turn_id, &message)
+                .await?;
+        }
         self.terminalize_queued_turn(
             turn,
             QueuedTurnTerminal::Completed {
@@ -13401,10 +13405,6 @@ impl Kernel {
             stream_context.clone(),
         )
         .await?;
-        if let Some(context) = &stream_context {
-            self.enqueue_channel_turn_text_delivery(context, turn.session_id, turn_id, &message)
-                .await?;
-        }
         Ok(())
     }
 

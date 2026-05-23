@@ -6041,7 +6041,7 @@ async fn channel_inbound_first_column_slash_input_uses_runtime_control_route() {
 
     let outbox = kernel
         .pull_channel_outbox(ChannelOutboxPullRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             worker_id: "runtime-control-worker".to_string(),
             conversation_ref: None,
             thread_ref: None,
@@ -6312,7 +6312,7 @@ async fn channel_inbound_lionclaw_reset_completes_queued_turn() {
 
     let outbox = kernel
         .pull_channel_outbox(ChannelOutboxPullRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             worker_id: "lionclaw-reset-worker".to_string(),
             conversation_ref: None,
             thread_ref: None,
@@ -6456,7 +6456,7 @@ async fn channel_inbound_bare_retry_stays_runtime_owned() {
     )
     .await;
 
-    let stream = wait_for_stream_events(&kernel, "terminal", "terminal-bare-runtime", |events| {
+    let stream = wait_for_stream_events(&kernel, "loopback", "loopback-bare-runtime", |events| {
         stream_has_completed_and_done(events, queued_turn_id)
     })
     .await;
@@ -6468,7 +6468,7 @@ async fn channel_inbound_bare_retry_stays_runtime_owned() {
 
     let outbox = kernel
         .pull_channel_outbox(ChannelOutboxPullRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             worker_id: "bare-runtime-worker".to_string(),
             conversation_ref: None,
             thread_ref: None,
