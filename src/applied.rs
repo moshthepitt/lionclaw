@@ -751,7 +751,7 @@ mod tests {
             .await
             .expect("load config");
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
-            id: "terminal".to_string(),
+            id: "loopback".to_string(),
             skill: "visible".to_string(),
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
@@ -788,7 +788,7 @@ mod tests {
             .await
             .expect("load config");
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
-            id: "terminal".to_string(),
+            id: "loopback".to_string(),
             skill: "visible".to_string(),
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
@@ -799,7 +799,7 @@ mod tests {
         let first = AppliedState::load(&home).await.expect("load first state");
 
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
-            id: "terminal".to_string(),
+            id: "loopback".to_string(),
             skill: "visible".to_string(),
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),

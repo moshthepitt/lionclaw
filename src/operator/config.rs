@@ -783,8 +783,8 @@ mod tests {
         let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let mut config = OperatorConfig::default();
         config.upsert_channel(ManagedChannelConfig {
-            id: "terminal".to_string(),
-            skill: "terminal".to_string(),
+            id: "loopback".to_string(),
+            skill: "loopback".to_string(),
             launch_mode: ChannelLaunchMode::default(),
             worker: default_channel_worker(),
             required_env: Vec::new(),
@@ -805,8 +805,8 @@ mod tests {
         let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let mut config = OperatorConfig::default();
         config.upsert_channel(ManagedChannelConfig {
-            id: "terminal".to_string(),
-            skill: "terminal".to_string(),
+            id: "loopback".to_string(),
+            skill: "loopback".to_string(),
             launch_mode: ChannelLaunchMode::Interactive,
             worker: default_channel_worker(),
             required_env: Vec::new(),

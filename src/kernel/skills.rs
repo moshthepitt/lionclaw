@@ -163,7 +163,7 @@ body"#;
 
     #[test]
     fn validates_path_safe_skill_aliases() {
-        validate_skill_alias("terminal").expect("valid alias");
+        validate_skill_alias("loopback").expect("valid alias");
         validate_skill_alias("channel.terminal_1").expect("valid alias");
         validate_skill_alias(" terminal").expect_err("leading whitespace");
         validate_skill_alias(".terminal").expect_err("leading dot");

@@ -453,7 +453,7 @@ mod tests {
 
         let snapshot = install_snapshot(
             &home,
-            "terminal",
+            "loopback",
             source_dir.to_string_lossy().as_ref(),
             "local",
         )
@@ -482,7 +482,7 @@ mod tests {
 
         let err = install_snapshot(
             &home,
-            "terminal",
+            "loopback",
             source_dir.to_string_lossy().as_ref(),
             "local",
         )
@@ -516,7 +516,7 @@ mod tests {
 
         let err = install_snapshot(
             &home,
-            "terminal",
+            "loopback",
             source_dir.to_string_lossy().as_ref(),
             "local",
         )
@@ -543,7 +543,7 @@ mod tests {
 
         let first = install_snapshot(
             &home,
-            "terminal",
+            "loopback",
             source_dir.to_string_lossy().as_ref(),
             "local",
         )
@@ -551,7 +551,7 @@ mod tests {
         fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).expect("chmod 755");
         let second = install_snapshot(
             &home,
-            "terminal",
+            "loopback",
             source_dir.to_string_lossy().as_ref(),
             "local",
         )
@@ -578,7 +578,7 @@ mod tests {
         fs::create_dir_all(home.skills_dir()).expect("skills dir");
         let snapshot = install_snapshot(
             &home,
-            "terminal",
+            "loopback",
             source_dir.to_string_lossy().as_ref(),
             "local",
         )
@@ -590,7 +590,7 @@ mod tests {
 
         let err = install_snapshot(
             &home,
-            "terminal",
+            "loopback",
             source_dir.to_string_lossy().as_ref(),
             "local",
         )

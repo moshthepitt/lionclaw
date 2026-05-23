@@ -2633,7 +2633,7 @@ mod tests {
                 "channel attach",
                 Command::Channel {
                     command: ChannelCommand::Attach(ChannelAttachArgs {
-                        id: "terminal".to_string(),
+                        id: "loopback".to_string(),
                         peer: None,
                         runtime: None,
                     }),
@@ -2870,7 +2870,7 @@ mod tests {
             "channel",
             "pairing",
             "block",
-            "terminal",
+            "loopback",
             sender_ref.as_str(),
         ])
         .expect("parse sender ref block");
@@ -2882,7 +2882,7 @@ mod tests {
                         command: ChannelPairingCommand::Block(args),
                     },
             } => {
-                assert_eq!(args.channel_id, "terminal");
+                assert_eq!(args.channel_id, "loopback");
                 assert_eq!(args.sender_ref.as_deref(), Some(sender_ref.as_str()));
                 assert!(args.pairing_id.is_none());
             }
@@ -2899,7 +2899,7 @@ mod tests {
             "channel",
             "pairing",
             "block",
-            "terminal",
+            "loopback",
             "--pairing-id",
             pairing_id_raw.as_str(),
         ])
@@ -2912,7 +2912,7 @@ mod tests {
                         command: ChannelPairingCommand::Block(args),
                     },
             } => {
-                assert_eq!(args.channel_id, "terminal");
+                assert_eq!(args.channel_id, "loopback");
                 assert!(args.sender_ref.is_none());
                 assert_eq!(args.pairing_id, Some(pairing_id));
             }
@@ -2928,7 +2928,7 @@ mod tests {
         let output = render_channel_pairing_list(&ChannelPairingListResponse {
             pairings: vec![ChannelPairingView {
                 pairing_id,
-                channel_id: "terminal".to_string(),
+                channel_id: "loopback".to_string(),
                 sender_ref: Some("alice".to_string()),
                 conversation_ref: Some("chat-1".to_string()),
                 thread_ref: None,
@@ -2940,7 +2940,7 @@ mod tests {
             }],
             grants: vec![ChannelGrantView {
                 grant_id,
-                channel_id: "terminal".to_string(),
+                channel_id: "loopback".to_string(),
                 sender_ref: Some("alice".to_string()),
                 conversation_ref: Some("chat-1".to_string()),
                 thread_ref: None,
@@ -3038,8 +3038,8 @@ mod tests {
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let mut config = OperatorConfig::default();
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
-            id: "terminal".to_string(),
-            skill: "terminal".to_string(),
+            id: "loopback".to_string(),
+            skill: "loopback".to_string(),
             launch_mode: ChannelLaunchMode::Interactive,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: Vec::new(),
@@ -3059,7 +3059,7 @@ mod tests {
             .expect("channel list");
 
         assert!(rendered.contains("instance: main"));
-        assert!(rendered.contains("terminal"));
+        assert!(rendered.contains("loopback"));
         assert!(rendered.contains("interactive"));
         assert!(rendered.contains("telegram"));
         assert!(rendered.contains("background"));

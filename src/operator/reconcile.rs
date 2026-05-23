@@ -1182,7 +1182,7 @@ mod tests {
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         for key in ["", "BAD=KEY", "BAD\0KEY"] {
             let result = std::panic::catch_unwind(|| {
-                resolve_required_channel_env(&home, "terminal", &[key.to_string()])
+                resolve_required_channel_env(&home, "loopback", &[key.to_string()])
             })
             .expect("invalid required_env key should not panic");
 

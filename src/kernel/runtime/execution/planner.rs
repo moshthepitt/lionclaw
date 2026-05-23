@@ -795,8 +795,8 @@ mod tests {
     fn planner_mounts_runtime_skill_snapshots_read_only() {
         let sandbox = tempdir().expect("temp dir");
         let skill_mount = MountSpec {
-            source: sandbox.path().join(".lionclaw/skills/terminal"),
-            target: "/lionclaw/skills/terminal".to_string(),
+            source: sandbox.path().join(".lionclaw/skills/loopback"),
+            target: "/lionclaw/skills/loopback".to_string(),
             access: MountAccess::ReadOnly,
         };
         let planner = ExecutionPlanner::new(ExecutionPlannerConfig {
@@ -858,8 +858,8 @@ mod tests {
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
                 skill_mounts: vec![MountSpec {
-                    source: sandbox.path().join(".lionclaw/skills/terminal"),
-                    target: "/lionclaw/skills/terminal".to_string(),
+                    source: sandbox.path().join(".lionclaw/skills/loopback"),
+                    target: "/lionclaw/skills/loopback".to_string(),
                     access: MountAccess::ReadWrite,
                 }],
                 extra_mounts: Vec::new(),
@@ -899,7 +899,7 @@ mod tests {
                     working_dir: None,
                     env_passthrough_keys: Vec::new(),
                     skill_mounts: vec![MountSpec {
-                        source: sandbox.path().join(".lionclaw/skills/terminal"),
+                        source: sandbox.path().join(".lionclaw/skills/loopback"),
                         target: target.to_string(),
                         access: MountAccess::ReadOnly,
                     }],
@@ -924,7 +924,7 @@ mod tests {
                 ConfinementConfig::Oci(OciConfinementConfig {
                     additional_mounts: vec![MountSpec {
                         source: sandbox.path().join("override"),
-                        target: "/lionclaw/skills/terminal".to_string(),
+                        target: "/lionclaw/skills/loopback".to_string(),
                         access: MountAccess::ReadWrite,
                     }],
                     ..OciConfinementConfig::default()
@@ -1501,8 +1501,8 @@ mod tests {
                 working_dir: None,
                 env_passthrough_keys: Vec::new(),
                 skill_mounts: vec![MountSpec {
-                    source: sandbox.path().join(".lionclaw/skills/terminal"),
-                    target: "/lionclaw/skills/terminal".to_string(),
+                    source: sandbox.path().join(".lionclaw/skills/loopback"),
+                    target: "/lionclaw/skills/loopback".to_string(),
                     access: MountAccess::ReadOnly,
                 }],
                 extra_mounts: Vec::new(),

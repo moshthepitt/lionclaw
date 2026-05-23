@@ -1320,7 +1320,7 @@ mod tests {
             .write_active(&ActiveContinuitySnapshot {
                 matters_today: vec!["CI is failing".to_string()],
                 open_loops: vec!["Review release notes".to_string()],
-                pending_approvals: vec!["terminal/alice".to_string()],
+                pending_approvals: vec!["loopback/alice".to_string()],
                 pending_proposals: vec!["Remember release checklist preference".to_string()],
                 recent_outputs: vec!["Daily Brief".to_string()],
             })

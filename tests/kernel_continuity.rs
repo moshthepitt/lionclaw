@@ -205,7 +205,7 @@ async fn prompt_loading_rejects_symlinked_identity_files() {
     std::fs::remove_file(env.workspace_root().join("SOUL.md")).expect("remove soul file");
     symlink(&outside, env.workspace_root().join("SOUL.md")).expect("symlink soul file");
 
-    install_and_bind_channel(&env, "terminal").await;
+    install_and_bind_channel(&env, "loopback").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
@@ -252,7 +252,7 @@ async fn pairing_and_failed_turn_update_active_and_daily_continuity() {
     bootstrap_workspace(&env.workspace_root())
         .await
         .expect("bootstrap workspace");
-    install_and_bind_channel(&env, "terminal").await;
+    install_and_bind_channel(&env, "loopback").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
@@ -267,7 +267,7 @@ async fn pairing_and_failed_turn_update_active_and_daily_continuity() {
 
     kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "pairing-alice",
             "alice",
             "hello",
@@ -293,9 +293,9 @@ async fn pairing_and_failed_turn_update_active_and_daily_continuity() {
         .expect("read active");
     let daily = read_all_markdown(env.workspace_root().join("continuity/daily"));
 
-    assert!(active.contains("terminal/alice"));
+    assert!(active.contains("loopback/alice"));
     assert!(active.contains("failed"));
-    assert!(daily.contains("Pairing required for terminal/alice"));
+    assert!(daily.contains("Pairing required for loopback/alice"));
     assert!(daily.contains("Session turn failed"));
 }
 
@@ -406,7 +406,7 @@ async fn active_continuity_global_slices_are_bounded_to_recent_items() {
     bootstrap_workspace(&env.workspace_root())
         .await
         .expect("bootstrap workspace");
-    install_and_bind_channel(&env, "terminal").await;
+    install_and_bind_channel(&env, "loopback").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
@@ -483,7 +483,7 @@ async fn active_continuity_global_slices_are_bounded_to_recent_items() {
         sqlx::query(
             "INSERT INTO channel_pairing_requests \
              (pairing_id, channel_id, code_hash, claim_policy, sender_ref, conversation_ref, thread_ref, requested_profile, status, label, max_claims, claim_count, created_at_ms, expires_at_ms, claimed_at_ms, updated_at_ms) \
-             VALUES (?1, 'terminal', ?2, 'operator_approval', ?3, NULL, NULL, 'direct', 'pending', NULL, 1, 0, ?4, NULL, NULL, ?4)",
+             VALUES (?1, 'loopback', ?2, 'operator_approval', ?3, NULL, NULL, 'direct', 'pending', NULL, 1, 0, ?4, NULL, NULL, ?4)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(format!("hash-{index:02}"))
@@ -513,10 +513,10 @@ async fn active_continuity_global_slices_are_bounded_to_recent_items() {
         .await
         .expect("read active");
 
-    assert!(!active.contains("terminal/peer-00"));
-    assert!(!active.contains("terminal/peer-01"));
-    assert!(active.contains("terminal/peer-02"));
-    assert!(active.contains("terminal/peer-06"));
+    assert!(!active.contains("loopback/peer-00"));
+    assert!(!active.contains("loopback/peer-01"));
+    assert!(active.contains("loopback/peer-02"));
+    assert!(active.contains("loopback/peer-06"));
 
     assert!(!active.contains("Job 'attention-00' needs attention"));
     assert!(!active.contains("Job 'attention-01' needs attention"));
@@ -580,7 +580,7 @@ async fn approve_channel_pairing_rolls_back_when_audit_append_fails() {
     bootstrap_workspace(&env.workspace_root())
         .await
         .expect("bootstrap workspace");
-    install_and_bind_channel(&env, "terminal").await;
+    install_and_bind_channel(&env, "loopback").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
@@ -589,7 +589,7 @@ async fn approve_channel_pairing_rolls_back_when_audit_append_fails() {
         })
         .await;
 
-    let pairing_code = seed_pending_pairing(&kernel, "terminal", "alice").await;
+    let pairing_code = seed_pending_pairing(&kernel, "loopback", "alice").await;
 
     let pool = SqlitePool::connect(&env.db_url())
         .await
@@ -601,7 +601,7 @@ async fn approve_channel_pairing_rolls_back_when_audit_append_fails() {
 
     let err = kernel
         .approve_channel_pairing(ChannelPairingApproveRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             pairing_id: None,
             pairing_code: Some(pairing_code),
             label: None,
@@ -614,7 +614,7 @@ async fn approve_channel_pairing_rolls_back_when_audit_append_fails() {
 
     let pairings = kernel
         .list_channel_pairings(
-            Some("terminal".to_string()),
+            Some("loopback".to_string()),
             Some(ChannelPairingStatus::Pending),
         )
         .await
@@ -633,7 +633,7 @@ async fn revoke_channel_grant_rolls_back_when_audit_append_fails() {
     bootstrap_workspace(&env.workspace_root())
         .await
         .expect("bootstrap workspace");
-    install_and_bind_channel(&env, "terminal").await;
+    install_and_bind_channel(&env, "loopback").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
@@ -642,10 +642,10 @@ async fn revoke_channel_grant_rolls_back_when_audit_append_fails() {
         })
         .await;
 
-    let pairing_code = seed_pending_pairing(&kernel, "terminal", "alice").await;
+    let pairing_code = seed_pending_pairing(&kernel, "loopback", "alice").await;
     let grant = kernel
         .approve_channel_pairing(ChannelPairingApproveRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             pairing_id: None,
             pairing_code: Some(pairing_code),
             label: None,
@@ -666,7 +666,7 @@ async fn revoke_channel_grant_rolls_back_when_audit_append_fails() {
 
     let err = kernel
         .revoke_channel_grant(ChannelGrantRevokeRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             grant_id: grant.grant_id,
             reason: None,
         })
@@ -787,7 +787,7 @@ async fn approve_channel_pairing_succeeds_when_active_continuity_refresh_fails()
     bootstrap_workspace(&env.workspace_root())
         .await
         .expect("bootstrap workspace");
-    install_and_bind_channel(&env, "terminal").await;
+    install_and_bind_channel(&env, "loopback").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
@@ -796,12 +796,12 @@ async fn approve_channel_pairing_succeeds_when_active_continuity_refresh_fails()
         })
         .await;
 
-    let pairing_code = seed_pending_pairing(&kernel, "terminal", "alice").await;
+    let pairing_code = seed_pending_pairing(&kernel, "loopback", "alice").await;
     break_active_continuity_refresh(&env);
 
     let response = kernel
         .approve_channel_pairing(ChannelPairingApproveRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             pairing_id: None,
             pairing_code: Some(pairing_code),
             label: None,
@@ -822,7 +822,7 @@ async fn pairing_pending_continuity_succeeds_when_active_refresh_fails() {
     bootstrap_workspace(&env.workspace_root())
         .await
         .expect("bootstrap workspace");
-    install_and_bind_channel(&env, "terminal").await;
+    install_and_bind_channel(&env, "loopback").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
@@ -835,7 +835,7 @@ async fn pairing_pending_continuity_succeeds_when_active_refresh_fails() {
 
     kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "pairing-refresh-failure",
             "alice",
             "hello",
@@ -845,7 +845,7 @@ async fn pairing_pending_continuity_succeeds_when_active_refresh_fails() {
 
     let pairings = kernel
         .list_channel_pairings(
-            Some("terminal".to_string()),
+            Some("loopback".to_string()),
             Some(ChannelPairingStatus::Pending),
         )
         .await
@@ -858,7 +858,7 @@ async fn pairing_pending_continuity_succeeds_when_active_refresh_fails() {
     assert_eq!(alice.status, ChannelPairingStatus::Pending);
 
     let daily = read_all_markdown(env.workspace_root().join("continuity/daily"));
-    assert!(daily.contains("Pairing required for terminal/alice"));
+    assert!(daily.contains("Pairing required for loopback/alice"));
 
     assert_refresh_failure_event(&kernel, "channel.inbound.pending", "kernel").await;
 }

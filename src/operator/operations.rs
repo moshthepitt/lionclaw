@@ -677,16 +677,16 @@ mod tests {
         let project = init_project(temp_dir.path()).expect("init project");
         let reviewer = create_project_instance(&project.project_root, "reviewer", None, false)
             .expect("reviewer");
-        let terminal = create_project_instance(&project.project_root, "terminal", None, false)
-            .expect("terminal");
+        let loopback = create_project_instance(&project.project_root, "loopback", None, false)
+            .expect("loopback");
         let main_home = LionClawHome::new(project.instance.home);
         let reviewer_home = LionClawHome::new(reviewer.home);
-        let terminal_home = LionClawHome::new(terminal.home);
+        let loopback_home = LionClawHome::new(loopback.home);
         let manager = FakeUnitManager::default();
 
         configure_channel(&main_home, "telegram", ChannelLaunchMode::Background).await;
         apply_channel_unit(&main_home, &manager, "telegram").await;
-        configure_channel(&terminal_home, "telegram", ChannelLaunchMode::Interactive).await;
+        configure_channel(&loopback_home, "telegram", ChannelLaunchMode::Interactive).await;
         configure_channel(&reviewer_home, "slack", ChannelLaunchMode::Background).await;
         apply_channel_unit(&reviewer_home, &manager, "slack").await;
 
