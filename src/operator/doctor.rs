@@ -2622,7 +2622,7 @@ mod tests {
     #[tokio::test]
     async fn doctor_does_not_warn_when_interactive_channel_has_no_worker_health_report() {
         let (_temp_dir, home, commands, config, _pool) =
-            doctor_channel_fixture("terminal", ChannelLaunchMode::Interactive).await;
+            doctor_channel_fixture("loopback", ChannelLaunchMode::Interactive).await;
         let mut findings = Vec::new();
         let mut observations = Vec::new();
 
@@ -2637,7 +2637,7 @@ mod tests {
         .await;
 
         assert!(!findings.iter().any(|finding| {
-            finding.subject.as_ref() == "channel \"terminal\" has no worker health report"
+            finding.subject.as_ref() == "channel \"loopback\" has no worker health report"
         }));
         assert!(observations.is_empty());
     }

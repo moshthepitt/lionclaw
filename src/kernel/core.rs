@@ -6116,7 +6116,7 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         home.ensure_base_dirs().await.expect("base dirs");
-        let skill_dir = write_installed_skill(&home, "terminal", "terminal skill").await;
+        let skill_dir = write_installed_skill(&home, "loopback", "loopback skill").await;
         let kernel = kernel_with_home(&home).await;
 
         let runtime_skills = kernel
@@ -6135,16 +6135,16 @@ mod tests {
         );
         assert_eq!(
             mounts[0].source.file_name(),
-            Some(std::ffi::OsStr::new("terminal"))
+            Some(std::ffi::OsStr::new("loopback"))
         );
         assert!(mounts[0]
             .source
             .components()
             .any(|component| component.as_os_str() == std::ffi::OsStr::new(".applied")));
-        assert_eq!(mounts[0].target, "/lionclaw/skills/terminal");
+        assert_eq!(mounts[0].target, "/lionclaw/skills/loopback");
         assert_eq!(mounts[0].access, MountAccess::ReadOnly);
         assert_eq!(runtime_skills.len(), 1);
-        assert_eq!(runtime_skills[0].alias, "terminal");
+        assert_eq!(runtime_skills[0].alias, "loopback");
     }
 
     #[tokio::test]
@@ -6152,7 +6152,7 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         home.ensure_base_dirs().await.expect("base dirs");
-        let skill_dir = write_installed_skill(&home, "terminal", "first revision").await;
+        let skill_dir = write_installed_skill(&home, "loopback", "first revision").await;
         let kernel = kernel_with_home(&home).await;
 
         let runtime_skills = kernel
@@ -6208,13 +6208,13 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         home.ensure_base_dirs().await.expect("base dirs");
-        write_installed_skill(&home, "terminal", "terminal skill").await;
+        write_installed_skill(&home, "loopback", "loopback skill").await;
         let mut config = crate::operator::config::OperatorConfig::load(&home)
             .await
             .expect("load config");
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
-            id: "terminal".to_string(),
-            skill: "terminal".to_string(),
+            id: "loopback".to_string(),
+            skill: "loopback".to_string(),
             launch_mode: crate::operator::config::ChannelLaunchMode::Background,
             worker: crate::operator::config::default_channel_worker(),
             required_env: Vec::new(),
@@ -6261,8 +6261,8 @@ mod tests {
                     access: MountAccess::ReadWrite,
                 },
                 MountSpec {
-                    source: temp_dir.path().join("skills/terminal"),
-                    target: "/lionclaw/skills/terminal".to_string(),
+                    source: temp_dir.path().join("skills/loopback"),
+                    target: "/lionclaw/skills/loopback".to_string(),
                     access: MountAccess::ReadOnly,
                 },
             ],
@@ -6276,12 +6276,12 @@ mod tests {
             .await
             .expect("materialize runtime plan");
 
-        let link = runtime_state_root.join("home/.codex/skills/terminal");
+        let link = runtime_state_root.join("home/.codex/skills/loopback");
         assert_eq!(
             tokio::fs::read_link(&link)
                 .await
                 .expect("read runtime skill link"),
-            PathBuf::from("/lionclaw/skills/terminal")
+            PathBuf::from("/lionclaw/skills/loopback")
         );
     }
 

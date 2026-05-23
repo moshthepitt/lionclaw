@@ -8,8 +8,9 @@ use lionclaw::{
     home::LionClawHome,
     kernel::{Kernel, KernelOptions},
     operator::{
+        channel_metadata::discover_channel_skill,
         config::ChannelLaunchMode,
-        reconcile::{add_channel, add_skill, remove_skill},
+        reconcile::{add_channel, add_channel_with_worker, add_skill, remove_skill},
         target::init_project,
     },
 };
@@ -69,6 +70,33 @@ impl TestHome {
         .expect("add channel");
     }
 
+    pub async fn install_channel_fixture(&self, alias: &str, channel_id: &str) {
+        let source = write_channel_fixture_source(self.temp_dir(), alias, channel_id);
+        let discovered = discover_channel_skill(&self.home, &source.display().to_string())
+            .expect("discover generated channel fixture");
+        assert_eq!(discovered.metadata.id, channel_id);
+        assert_eq!(discovered.metadata.env, Vec::<String>::new());
+
+        add_skill(
+            &self.home,
+            alias.to_string(),
+            discovered.skill_dir.display().to_string(),
+            "local".to_string(),
+        )
+        .await
+        .expect("install channel fixture skill");
+        add_channel_with_worker(
+            &self.home,
+            discovered.metadata.id.clone(),
+            alias.to_string(),
+            discovered.metadata.launch,
+            discovered.metadata.worker.clone(),
+            discovered.metadata.env.clone(),
+        )
+        .await
+        .expect("bind channel fixture");
+    }
+
     pub async fn kernel(&self) -> Kernel {
         self.kernel_with_options(KernelOptions::default()).await
     }
@@ -110,6 +138,7 @@ impl TestHome {
     }
 }
 
+#[allow(dead_code)]
 pub fn write_skill_source(
     root: &Path,
     skill_name: &str,
@@ -133,6 +162,31 @@ pub fn write_skill_source(
         write_executable(&worker, "#!/usr/bin/env bash\n");
     }
 
+    skill_dir
+}
+
+fn write_channel_fixture_source(root: &Path, alias: &str, channel_id: &str) -> PathBuf {
+    let skill_dir = root.join("channel-fixtures").join(alias);
+    if skill_dir.exists() {
+        fs::remove_dir_all(&skill_dir).expect("clear channel fixture source");
+    }
+    fs::create_dir_all(skill_dir.join("scripts")).expect("create channel fixture source");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        format!("---\nname: {alias}\ndescription: test-only loopback channel fixture\n---\n"),
+    )
+    .expect("write channel fixture skill md");
+    fs::write(
+        skill_dir.join("lionclaw.toml"),
+        format!(
+            "version = 1\n\n[channel]\nid = \"{channel_id}\"\nlaunch = \"background\"\nworker = \"scripts/worker\"\nenv = []\n"
+        ),
+    )
+    .expect("write channel fixture metadata");
+    write_executable(
+        &skill_dir.join("scripts/worker"),
+        "#!/bin/sh\nprintf '%s\\n' 'test-only channel fixture worker'\n",
+    );
     skill_dir
 }
 

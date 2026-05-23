@@ -1490,10 +1490,32 @@ env = ["TELEGRAM_BOT_TOKEN"]
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn connect_terminal_configures_interactive_channel_before_attaching() {
+    async fn connect_explicit_interactive_channel_configures_before_attaching() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         seed_configured_runtime(&home, temp_dir.path()).await;
+        let skill_source = temp_dir.path().join("channel-fixture");
+        fs::create_dir_all(skill_source.join("scripts")).expect("scripts dir");
+        fs::write(
+            skill_source.join("SKILL.md"),
+            "---\nname: channel-fixture\ndescription: test channel\n---\n",
+        )
+        .expect("skill md");
+        fs::write(
+            skill_source.join("lionclaw.toml"),
+            r#"version = 1
+
+[channel]
+id = "test-channel"
+launch = "interactive"
+worker = "scripts/worker"
+"#,
+        )
+        .expect("channel metadata");
+        write_executable(
+            skill_source.join("scripts/worker").as_path(),
+            "#!/usr/bin/env bash\n",
+        );
         let listener = TcpListener::bind("127.0.0.1:0").expect("reserve daemon bind");
         let mut config = OperatorConfig::load(&home).await.expect("load config");
         config.daemon.bind = format!(
@@ -1511,7 +1533,7 @@ env = ["TELEGRAM_BOT_TOKEN"]
                 manager: &manager,
                 project_root: None,
                 work_root: temp_dir.path(),
-                channel_or_path: "terminal",
+                channel_or_path: skill_source.to_str().expect("utf8 skill source"),
                 env_inputs: ConnectEnvInputs::default(),
                 interactive: false,
                 hide_prompt_input: false,
@@ -1526,8 +1548,8 @@ env = ["TELEGRAM_BOT_TOKEN"]
         assert!(err.to_string().contains("non-LionClaw listener"));
         let config = OperatorConfig::load(&home).await.expect("load config");
         assert!(config.channels.iter().any(|channel| {
-            channel.id == "terminal"
-                && channel.skill == "terminal"
+            channel.id == "test-channel"
+                && channel.skill == "test-channel"
                 && channel.launch_mode == ChannelLaunchMode::Interactive
         }));
     }

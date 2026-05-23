@@ -283,8 +283,8 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir");
         let runtime_root = temp_dir.path().join("runtime");
         let mounts = vec![MountSpec {
-            source: temp_dir.path().join("skills/terminal"),
-            target: "/lionclaw/skills/terminal".to_string(),
+            source: temp_dir.path().join("skills/loopback"),
+            target: "/lionclaw/skills/loopback".to_string(),
             access: MountAccess::ReadOnly,
         }];
 
@@ -292,10 +292,10 @@ mod tests {
             .await
             .expect("project codex skills");
 
-        let link = runtime_root.join("home/.codex/skills/terminal");
+        let link = runtime_root.join("home/.codex/skills/loopback");
         assert_eq!(
             tokio::fs::read_link(&link).await.expect("read link"),
-            PathBuf::from("/lionclaw/skills/terminal")
+            PathBuf::from("/lionclaw/skills/loopback")
         );
     }
 
@@ -394,12 +394,12 @@ mod tests {
         let temp_dir = tempdir().expect("temp dir");
         let runtime_root = temp_dir.path().join("runtime");
         let native_root = runtime_root.join("home/.codex/skills");
-        tokio::fs::create_dir_all(native_root.join("terminal"))
+        tokio::fs::create_dir_all(native_root.join("loopback"))
             .await
             .expect("create native dir");
         let mounts = vec![MountSpec {
-            source: temp_dir.path().join("skills/terminal"),
-            target: "/lionclaw/skills/terminal".to_string(),
+            source: temp_dir.path().join("skills/loopback"),
+            target: "/lionclaw/skills/loopback".to_string(),
             access: MountAccess::ReadOnly,
         }];
 
@@ -408,7 +408,7 @@ mod tests {
             .expect_err("unmanaged alias collision should fail");
 
         assert!(err.to_string().contains("not LionClaw-managed"));
-        assert!(tokio::fs::try_exists(native_root.join("terminal"))
+        assert!(tokio::fs::try_exists(native_root.join("loopback"))
             .await
             .expect("check native dir"));
     }
@@ -434,8 +434,8 @@ mod tests {
         .expect("create home symlink");
 
         let mounts = vec![MountSpec {
-            source: temp_dir.path().join("skills/terminal"),
-            target: "/lionclaw/skills/terminal".to_string(),
+            source: temp_dir.path().join("skills/loopback"),
+            target: "/lionclaw/skills/loopback".to_string(),
             access: MountAccess::ReadOnly,
         }];
 

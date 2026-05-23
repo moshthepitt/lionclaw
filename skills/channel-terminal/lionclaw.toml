@@ -1,6 +1,0 @@
-version = 1
-
-[channel]
-id = "terminal"
-launch = "interactive"
-worker = "scripts/worker"

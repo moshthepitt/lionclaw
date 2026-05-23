@@ -487,11 +487,11 @@ mod tests {
             "#!/usr/bin/env bash\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"inspect\" ]; then\n  printf 'sha256:test-runtime-image\\n'\n  exit 0\nfi\nexit 0\n",
         );
 
-        let skill_source = temp_dir.path().join("channel-terminal");
+        let skill_source = temp_dir.path().join("channel-fixture");
         fs::create_dir_all(skill_source.join("scripts")).expect("skill dir");
         fs::write(
             skill_source.join("SKILL.md"),
-            "---\nname: channel-terminal\ndescription: test\n---\n",
+            "---\nname: channel-fixture\ndescription: test\n---\n",
         )
         .expect("skill md");
         write_executable(
@@ -518,7 +518,7 @@ mod tests {
         config.save(&home).await.expect("save config");
         add_skill(
             &home,
-            "terminal".to_string(),
+            "loopback".to_string(),
             skill_source.to_string_lossy().to_string(),
             "local".to_string(),
         )
@@ -526,8 +526,8 @@ mod tests {
         .expect("install channel skill");
         add_channel(
             &home,
-            "terminal".to_string(),
-            "terminal".to_string(),
+            "loopback".to_string(),
+            "loopback".to_string(),
             launch_mode,
             Vec::new(),
         )
@@ -631,7 +631,7 @@ mod tests {
                 project_root: None,
                 work_root: &current_work_root(),
             },
-            "terminal".to_string(),
+            "loopback".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
             &binaries(),
@@ -658,7 +658,7 @@ mod tests {
                 project_root: None,
                 work_root: &current_work_root(),
             },
-            "terminal".to_string(),
+            "loopback".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
             &binaries(),
@@ -683,7 +683,7 @@ mod tests {
                 project_root: None,
                 work_root: &current_work_root(),
             },
-            "terminal".to_string(),
+            "loopback".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
             &binaries(),
@@ -703,7 +703,7 @@ mod tests {
         let env = spec.env.into_iter().collect::<BTreeMap<_, _>>();
         assert_eq!(
             env.get("LIONCLAW_CHANNEL_ID").map(String::as_str),
-            Some("terminal")
+            Some("loopback")
         );
         assert_eq!(
             env.get("LIONCLAW_PEER_ID").map(String::as_str),
@@ -715,7 +715,7 @@ mod tests {
         );
         assert!(env
             .get("LIONCLAW_CONSUMER_ID")
-            .is_some_and(|value| value.starts_with("interactive:terminal:mosh:")));
+            .is_some_and(|value| value.starts_with("interactive:loopback:mosh:")));
         assert_eq!(
             manager
                 .unit_status(&test_daemon_unit_name(&home))
@@ -732,8 +732,8 @@ mod tests {
             seed_interactive_channel(ChannelLaunchMode::Interactive).await;
         add_channel(
             &home,
-            "terminal".to_string(),
-            "terminal".to_string(),
+            "loopback".to_string(),
+            "loopback".to_string(),
             ChannelLaunchMode::Interactive,
             vec!["PATH".to_string()],
         )
@@ -741,7 +741,7 @@ mod tests {
         .expect("update channel required env");
         let mut channel_env = ChannelEnv::new();
         channel_env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
-        merge_channel_env(&home, "terminal", &channel_env).expect("persist channel env");
+        merge_channel_env(&home, "loopback", &channel_env).expect("persist channel env");
 
         let spec = prepare_channel_attach(
             ChannelAttachContext {
@@ -750,7 +750,7 @@ mod tests {
                 project_root: None,
                 work_root: &current_work_root(),
             },
-            "terminal".to_string(),
+            "loopback".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
             &binaries(),
@@ -765,8 +765,8 @@ mod tests {
 
         add_channel(
             &home,
-            "terminal".to_string(),
-            "terminal".to_string(),
+            "loopback".to_string(),
+            "loopback".to_string(),
             ChannelLaunchMode::Interactive,
             vec!["LIONCLAW_TEST_MISSING_REQUIRED_ENV".to_string()],
         )
@@ -780,7 +780,7 @@ mod tests {
                 project_root: None,
                 work_root: &current_work_root(),
             },
-            "terminal".to_string(),
+            "loopback".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
             &binaries(),
@@ -810,7 +810,7 @@ mod tests {
         launch_channel_attach(ChannelAttachSpec {
             worker_path: worker,
             bind_addr: "127.0.0.1:0".to_string(),
-            env: vec![("LIONCLAW_CHANNEL_ID".to_string(), "terminal".to_string())],
+            env: vec![("LIONCLAW_CHANNEL_ID".to_string(), "loopback".to_string())],
             started_managed_units: false,
             expected_daemon_fingerprint: String::new(),
         })
@@ -818,7 +818,7 @@ mod tests {
         .expect("launch worker");
 
         let env_output = fs::read_to_string(output).expect("env output");
-        assert!(env_output.contains("LIONCLAW_CHANNEL_ID=terminal\n"));
+        assert!(env_output.contains("LIONCLAW_CHANNEL_ID=loopback\n"));
         if std::env::var_os("HOME").is_some() {
             assert!(
                 !env_output.lines().any(|line| line.starts_with("HOME=")),
@@ -832,7 +832,7 @@ mod tests {
     async fn prepare_channel_attach_uses_applied_worker_snapshot_after_startup() {
         let (_temp_dir, home, _manager) =
             seed_interactive_channel(ChannelLaunchMode::Interactive).await;
-        let manager = RemovingInstalledSkillOnStartManager::new(&home, "terminal");
+        let manager = RemovingInstalledSkillOnStartManager::new(&home, "loopback");
 
         let spec = prepare_channel_attach(
             ChannelAttachContext {
@@ -841,7 +841,7 @@ mod tests {
                 project_root: None,
                 work_root: &current_work_root(),
             },
-            "terminal".to_string(),
+            "loopback".to_string(),
             Some("mosh".to_string()),
             Some("codex".to_string()),
             &binaries(),
@@ -854,7 +854,7 @@ mod tests {
             "daemon should be ensured when unreachable"
         );
         assert!(
-            !home.skills_dir().join("terminal").exists(),
+            !home.skills_dir().join("loopback").exists(),
             "test manager should remove the live installed alias"
         );
         assert!(
@@ -906,7 +906,7 @@ mod tests {
                 project_root: None,
                 work_root: &current_work_root(),
             },
-            "terminal".to_string(),
+            "loopback".to_string(),
             None,
             Some("codex".to_string()),
             &binaries(),
@@ -962,7 +962,7 @@ mod tests {
                 project_root: None,
                 work_root: &current_work_root(),
             },
-            "terminal".to_string(),
+            "loopback".to_string(),
             None,
             Some("codex".to_string()),
             &binaries(),
@@ -1023,7 +1023,7 @@ mod tests {
                 project_root: None,
                 work_root: &current_work_root(),
             },
-            "terminal".to_string(),
+            "loopback".to_string(),
             None,
             Some("codex".to_string()),
             &binaries(),
@@ -1086,7 +1086,7 @@ mod tests {
                 project_root: None,
                 work_root: &current_work_root(),
             },
-            "terminal".to_string(),
+            "loopback".to_string(),
             None,
             Some("missing".to_string()),
             &binaries(),
@@ -1136,7 +1136,7 @@ mod tests {
                 project_root: None,
                 work_root: &current_work_root(),
             },
-            "terminal".to_string(),
+            "loopback".to_string(),
             None,
             Some("codex".to_string()),
             &binaries(),
@@ -1168,7 +1168,7 @@ mod tests {
                 project_root: None,
                 work_root: &current_work_root(),
             },
-            "terminal".to_string(),
+            "loopback".to_string(),
             None,
             Some("codex".to_string()),
             &binaries(),
@@ -1220,7 +1220,7 @@ mod tests {
                 project_root: None,
                 work_root: &current_work_root(),
             },
-            "terminal".to_string(),
+            "loopback".to_string(),
             None,
             Some("codex".to_string()),
             &binaries(),

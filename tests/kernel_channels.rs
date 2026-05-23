@@ -95,7 +95,7 @@ async fn list_channels_returns_config_derived_binding_fields() {
     env.install_skill("interactive-skill", &skill_source).await;
     add_channel(
         env.home(),
-        "terminal".to_string(),
+        "loopback".to_string(),
         "interactive-skill".to_string(),
         ChannelLaunchMode::Interactive,
         Vec::new(),
@@ -112,7 +112,7 @@ async fn list_channels_returns_config_derived_binding_fields() {
 
     assert_eq!(bindings.len(), 1);
     let binding = &bindings[0];
-    assert_eq!(binding.channel_id, "terminal");
+    assert_eq!(binding.channel_id, "loopback");
     assert_eq!(binding.skill_alias, "interactive-skill");
     assert_eq!(binding.launch_mode, "interactive");
 }
@@ -1439,7 +1439,7 @@ async fn channel_turn_with_runtime_artifact_rejects_symlinked_outbox_root() {
 #[tokio::test]
 async fn channel_outbox_terminal_failure_records_failed_status_and_audit() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "local-cli", "channel-outbox-terminal-failure-skill").await;
+    install_and_bind_channel(&env, "local-cli", "channel-outbox-loopback-failure-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -1450,17 +1450,17 @@ async fn channel_outbox_terminal_failure_records_failed_status_and_audit() {
     create_pending_pairing(
         &kernel,
         "local-cli",
-        "peer-terminal-failure",
-        "msg-outbox-terminal-failure-pairing",
+        "peer-loopback-failure",
+        "msg-outbox-loopback-failure-pairing",
     )
     .await;
-    approve_pairing(&kernel, "local-cli", "peer-terminal-failure").await;
+    approve_pairing(&kernel, "local-cli", "peer-loopback-failure").await;
     let queued = kernel
         .ingest_channel_inbound(v2_text_request(
             "local-cli",
-            "msg-outbox-terminal-failure",
-            "peer-terminal-failure",
-            "peer-terminal-failure",
+            "msg-outbox-loopback-failure",
+            "peer-loopback-failure",
+            "peer-loopback-failure",
             None,
             "hello terminal failure",
             ChannelTrigger::Dm,
@@ -1471,7 +1471,7 @@ async fn channel_outbox_terminal_failure_records_failed_status_and_audit() {
     wait_for_stream_events(
         &kernel,
         "local-cli",
-        "outbox-terminal-failure-stream",
+        "outbox-loopback-failure-stream",
         |events| {
             events.iter().any(|event| {
                 event.turn_id == Some(queued_turn_id) && event.kind == StreamEventKindDto::Done
@@ -1483,7 +1483,7 @@ async fn channel_outbox_terminal_failure_records_failed_status_and_audit() {
     let outbox = kernel
         .pull_channel_outbox(ChannelOutboxPullRequest {
             channel_id: "local-cli".to_string(),
-            worker_id: "worker-terminal-failure".to_string(),
+            worker_id: "worker-loopback-failure".to_string(),
             conversation_ref: None,
             thread_ref: None,
             limit: Some(1),
@@ -1497,14 +1497,14 @@ async fn channel_outbox_terminal_failure_records_failed_status_and_audit() {
             delivery_id: outbox.deliveries[0].delivery_id,
             attempt_id: outbox.deliveries[0].attempt_id,
             channel_id: "local-cli".to_string(),
-            worker_id: "worker-terminal-failure".to_string(),
+            worker_id: "worker-loopback-failure".to_string(),
             outcome: ChannelOutboxReportOutcomeDto::TerminalFailed,
             provider_receipt: None,
             error_code: Some("provider.blocked".to_string()),
             error_text: Some("recipient blocked delivery".to_string()),
         })
         .await
-        .expect("report terminal outbox failure");
+        .expect("report loopback outbox failure");
 
     assert!(report.accepted);
     assert_eq!(report.status, ChannelOutboxDeliveryStatusDto::Failed);
@@ -1524,7 +1524,7 @@ async fn channel_outbox_terminal_failure_records_failed_status_and_audit() {
         .expect("terminal failure audit for delivery");
     assert_eq!(
         terminal_event.details["conversation_ref"],
-        "peer-terminal-failure"
+        "peer-loopback-failure"
     );
     assert_eq!(
         terminal_event.details["turn_id"],
@@ -1623,12 +1623,12 @@ async fn channel_stream_pull_and_ack_round_trip() {
 #[tokio::test]
 async fn channel_stream_tail_starts_from_current_head() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "channel-tail-skill").await;
+    install_and_bind_channel(&env, "loopback", "channel-tail-skill").await;
     let kernel = env.kernel().await;
 
     let pending = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "tail-5001",
             "peer-tail",
             "peer-tail",
@@ -1642,8 +1642,8 @@ async fn channel_stream_tail_starts_from_current_head() {
 
     let initial = kernel
         .pull_channel_stream(ChannelStreamPullRequest {
-            channel_id: "terminal".to_string(),
-            consumer_id: "terminal-worker".to_string(),
+            channel_id: "loopback".to_string(),
+            consumer_id: "loopback-worker".to_string(),
             start_mode: Some(ChannelStreamStartMode::Tail),
             start_after_sequence: None,
             limit: Some(10),
@@ -1657,13 +1657,13 @@ async fn channel_stream_tail_starts_from_current_head() {
 #[tokio::test]
 async fn channel_stream_rejects_tail_with_explicit_start_sequence() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "tail-sequence-skill").await;
+    install_and_bind_channel(&env, "loopback", "tail-sequence-skill").await;
     let kernel = env.kernel().await;
 
     let err = kernel
         .pull_channel_stream(ChannelStreamPullRequest {
-            channel_id: "terminal".to_string(),
-            consumer_id: "terminal-worker".to_string(),
+            channel_id: "loopback".to_string(),
+            consumer_id: "loopback-worker".to_string(),
             start_mode: Some(ChannelStreamStartMode::Tail),
             start_after_sequence: Some(12),
             limit: Some(10),
@@ -1742,13 +1742,13 @@ async fn channel_stream_long_poll_wakes_for_new_events() {
 #[tokio::test]
 async fn channel_backed_session_open_requires_approved_peer() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "open-skill").await;
+    install_and_bind_channel(&env, "loopback", "open-skill").await;
     let kernel = env.kernel().await;
 
     let unapproved_err = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
-            peer_id: direct_session_key("terminal", "peer-open"),
+            channel_id: "loopback".to_string(),
+            peer_id: direct_session_key("loopback", "peer-open"),
             trust_tier: TrustTier::Untrusted,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -1759,11 +1759,11 @@ async fn channel_backed_session_open_requires_approved_peer() {
         KernelError::BadRequest(message) if message.contains("not approved")
     ));
 
-    create_pending_pairing(&kernel, "terminal", "peer-open", "open-7001").await;
+    create_pending_pairing(&kernel, "loopback", "peer-open", "open-7001").await;
     let pending_err = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
-            peer_id: direct_session_key("terminal", "peer-open"),
+            channel_id: "loopback".to_string(),
+            peer_id: direct_session_key("loopback", "peer-open"),
             trust_tier: TrustTier::Untrusted,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -1774,11 +1774,11 @@ async fn channel_backed_session_open_requires_approved_peer() {
         KernelError::BadRequest(message) if message.contains("not approved")
     ));
 
-    approve_pairing(&kernel, "terminal", "peer-open").await;
+    approve_pairing(&kernel, "loopback", "peer-open").await;
     let opened = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
-            peer_id: direct_session_key("terminal", "peer-open"),
+            channel_id: "loopback".to_string(),
+            peer_id: direct_session_key("loopback", "peer-open"),
             trust_tier: TrustTier::Untrusted,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -1790,14 +1790,14 @@ async fn channel_backed_session_open_requires_approved_peer() {
 #[tokio::test]
 async fn direct_channel_session_turn_streams_turn_completed_then_done() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "direct-turn-skill").await;
+    install_and_bind_channel(&env, "loopback", "direct-turn-skill").await;
     let kernel = env.kernel().await;
-    create_pending_pairing(&kernel, "terminal", "peer-direct", "direct-7051").await;
-    approve_pairing(&kernel, "terminal", "peer-direct").await;
+    create_pending_pairing(&kernel, "loopback", "peer-direct", "direct-7051").await;
+    approve_pairing(&kernel, "loopback", "peer-direct").await;
     let session = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
-            peer_id: direct_session_key("terminal", "peer-direct"),
+            channel_id: "loopback".to_string(),
+            peer_id: direct_session_key("loopback", "peer-direct"),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -1820,8 +1820,8 @@ async fn direct_channel_session_turn_streams_turn_completed_then_done() {
 
     let stream = kernel
         .pull_channel_stream(ChannelStreamPullRequest {
-            channel_id: "terminal".to_string(),
-            consumer_id: "terminal-consumer".to_string(),
+            channel_id: "loopback".to_string(),
+            consumer_id: "loopback-consumer".to_string(),
             start_mode: Some(ChannelStreamStartMode::Resume),
             start_after_sequence: None,
             limit: Some(50),
@@ -1835,7 +1835,7 @@ async fn direct_channel_session_turn_streams_turn_completed_then_done() {
 #[tokio::test]
 async fn channels_v2_pending_pairing_hashes_code_and_rejects_runtime_id() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "v2-pairing-skill").await;
+    install_and_bind_channel(&env, "loopback", "v2-pairing-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -1844,7 +1844,7 @@ async fn channels_v2_pending_pairing_hashes_code_and_rejects_runtime_id() {
         .await;
 
     let rejected = serde_json::from_value::<ChannelInboundRequest>(serde_json::json!({
-        "channel_id": "terminal",
+        "channel_id": "loopback",
         "event_id": "event-runtime",
         "sender_ref": "alice",
         "conversation_ref": "alice",
@@ -1861,7 +1861,7 @@ async fn channels_v2_pending_pairing_hashes_code_and_rejects_runtime_id() {
 
     let pending = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "event-1",
             "alice",
             "alice",
@@ -1878,7 +1878,7 @@ async fn channels_v2_pending_pairing_hashes_code_and_rejects_runtime_id() {
     assert_eq!(pairing_code.len(), 23);
 
     let pairings = kernel
-        .list_channel_pairings(Some("terminal".to_string()), None)
+        .list_channel_pairings(Some("loopback".to_string()), None)
         .await
         .expect("list pairings");
     assert_eq!(pairings.pairings.len(), 1);
@@ -1899,7 +1899,7 @@ async fn channels_v2_pending_pairing_hashes_code_and_rejects_runtime_id() {
 
     let duplicate = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "event-1",
             "alice",
             "alice",
@@ -1914,7 +1914,7 @@ async fn channels_v2_pending_pairing_hashes_code_and_rejects_runtime_id() {
 
     let invalid_approve = kernel
         .approve_channel_pairing(ChannelPairingApproveRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             pairing_id: Some(pairing_id),
             pairing_code: Some(pairing_code.clone()),
             routing_profile: None,
@@ -1929,7 +1929,7 @@ async fn channels_v2_pending_pairing_hashes_code_and_rejects_runtime_id() {
 
     let grant = kernel
         .approve_channel_pairing(ChannelPairingApproveRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             pairing_id: None,
             pairing_code: Some(pairing_code),
             routing_profile: None,
@@ -1943,7 +1943,7 @@ async fn channels_v2_pending_pairing_hashes_code_and_rejects_runtime_id() {
     assert_eq!(grant.sender_ref.as_deref(), Some("alice"));
 
     let access_state = kernel
-        .list_channel_pairings(Some("terminal".to_string()), None)
+        .list_channel_pairings(Some("loopback".to_string()), None)
         .await
         .expect("list channel access state");
     let listed_grant = access_state
@@ -1956,7 +1956,7 @@ async fn channels_v2_pending_pairing_hashes_code_and_rejects_runtime_id() {
 
     let queued = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "event-2",
             "alice",
             "alice",
@@ -1969,7 +1969,7 @@ async fn channels_v2_pending_pairing_hashes_code_and_rejects_runtime_id() {
     assert_eq!(queued.outcome, ChannelInboundOutcome::Queued);
     assert_eq!(
         queued.session_key.as_deref(),
-        Some(direct_session_key("terminal", "alice").as_str())
+        Some(direct_session_key("loopback", "alice").as_str())
     );
     let queued_turn_id = queued.turn_id.expect("queued turn id");
 
@@ -2269,12 +2269,12 @@ async fn channels_v2_direct_block_denies_scoped_session_access() {
 #[tokio::test]
 async fn channel_pairing_invite_returns_raw_token_once_and_direct_claim_creates_grant() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "invite-direct-skill").await;
+    install_and_bind_channel(&env, "loopback", "invite-direct-skill").await;
     let kernel = env.kernel().await;
 
     let invite = kernel
         .invite_channel_pairing(ChannelPairingInviteRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             requested_profile: ChannelRoutingProfile::Direct,
             label: Some("alice".to_string()),
             conversation_ref: None,
@@ -2306,7 +2306,7 @@ async fn channel_pairing_invite_returns_raw_token_once_and_direct_claim_creates_
     assert_eq!(row.get::<i64, _>("claim_count"), 0);
 
     let pairings = kernel
-        .list_channel_pairings(Some("terminal".to_string()), None)
+        .list_channel_pairings(Some("loopback".to_string()), None)
         .await
         .expect("list invite pairing");
     let serialized = serde_json::to_value(&pairings.pairings[0]).expect("serialize pairing");
@@ -2315,7 +2315,7 @@ async fn channel_pairing_invite_returns_raw_token_once_and_direct_claim_creates_
 
     let claimed = kernel
         .claim_channel_pairing(claim_request(
-            "terminal",
+            "loopback",
             &invite.token,
             "sender-alice",
             "dm-alice",
@@ -2327,7 +2327,7 @@ async fn channel_pairing_invite_returns_raw_token_once_and_direct_claim_creates_
     let grant_id = claimed.grant_id.expect("direct claim grant id");
 
     let access = kernel
-        .list_channel_pairings(Some("terminal".to_string()), None)
+        .list_channel_pairings(Some("loopback".to_string()), None)
         .await
         .expect("list grants");
     let grant = access
@@ -2352,7 +2352,7 @@ async fn channel_pairing_invite_returns_raw_token_once_and_direct_claim_creates_
 
     let reused = kernel
         .claim_channel_pairing(claim_request(
-            "terminal",
+            "loopback",
             &invite.token,
             "sender-bob",
             "dm-bob",
@@ -2365,7 +2365,7 @@ async fn channel_pairing_invite_returns_raw_token_once_and_direct_claim_creates_
 
     let outbound = kernel
         .invite_channel_pairing(ChannelPairingInviteRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             requested_profile: ChannelRoutingProfile::Outbound,
             label: None,
             conversation_ref: None,
@@ -2392,12 +2392,12 @@ async fn channel_pairing_invite_returns_raw_token_once_and_direct_claim_creates_
 #[tokio::test]
 async fn channel_pairing_invite_block_by_pairing_id_revokes_pending_token() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "invite-block-skill").await;
+    install_and_bind_channel(&env, "loopback", "invite-block-skill").await;
     let kernel = env.kernel().await;
 
     let invite = kernel
         .invite_channel_pairing(ChannelPairingInviteRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             requested_profile: ChannelRoutingProfile::Direct,
             label: Some("exposed invite".to_string()),
             conversation_ref: None,
@@ -2410,7 +2410,7 @@ async fn channel_pairing_invite_block_by_pairing_id_revokes_pending_token() {
 
     let blocked = kernel
         .block_channel_pairing(ChannelPairingBlockRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             pairing_id: Some(invite.pairing_id),
             sender_ref: None,
             conversation_ref: None,
@@ -2435,7 +2435,7 @@ async fn channel_pairing_invite_block_by_pairing_id_revokes_pending_token() {
 
     let claim = kernel
         .claim_channel_pairing(claim_request(
-            "terminal",
+            "loopback",
             &invite.token,
             "sender-alice",
             "dm-alice",
@@ -2448,7 +2448,7 @@ async fn channel_pairing_invite_block_by_pairing_id_revokes_pending_token() {
     assert!(claim.grant_id.is_none());
 
     let access = kernel
-        .list_channel_pairings(Some("terminal".to_string()), None)
+        .list_channel_pairings(Some("loopback".to_string()), None)
         .await
         .expect("list blocked invite");
     let listed = access
@@ -2470,12 +2470,12 @@ async fn channel_pairing_invite_block_by_pairing_id_revokes_pending_token() {
 #[tokio::test]
 async fn channel_pairing_claim_audit_excludes_provider_metadata_and_raw_tokens() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "invite-audit-skill").await;
+    install_and_bind_channel(&env, "loopback", "invite-audit-skill").await;
     let kernel = env.kernel().await;
 
     let invite = kernel
         .invite_channel_pairing(ChannelPairingInviteRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             requested_profile: ChannelRoutingProfile::Direct,
             label: None,
             conversation_ref: None,
@@ -2488,7 +2488,7 @@ async fn channel_pairing_claim_audit_excludes_provider_metadata_and_raw_tokens()
     let raw_token = invite.token.clone();
     let approved = kernel
         .claim_channel_pairing(ChannelPairingClaimRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             token: raw_token.clone(),
             sender_ref: "sender-alice".to_string(),
             conversation_ref: "dm-alice".to_string(),
@@ -2508,7 +2508,7 @@ async fn channel_pairing_claim_audit_excludes_provider_metadata_and_raw_tokens()
     let invalid_token = "lc_invalid-denied-token";
     let denied = kernel
         .claim_channel_pairing(ChannelPairingClaimRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             token: invalid_token.to_string(),
             sender_ref: "sender-bob".to_string(),
             conversation_ref: "dm-bob".to_string(),
@@ -2531,12 +2531,12 @@ async fn channel_pairing_claim_audit_excludes_provider_metadata_and_raw_tokens()
 #[tokio::test]
 async fn channel_pairing_invite_rejects_expiry_overflow() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "invite-expiry-skill").await;
+    install_and_bind_channel(&env, "loopback", "invite-expiry-skill").await;
     let kernel = env.kernel().await;
 
     let err = kernel
         .invite_channel_pairing(ChannelPairingInviteRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             requested_profile: ChannelRoutingProfile::Direct,
             label: None,
             conversation_ref: None,
@@ -2892,12 +2892,12 @@ async fn channel_pairing_thread_expired_and_invalid_claims_are_denied() {
 #[tokio::test]
 async fn channels_v2_admission_rolls_back_dedupe_when_turn_cannot_be_queued() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "v2-atomic-skill").await;
+    install_and_bind_channel(&env, "loopback", "v2-atomic-skill").await;
     let kernel_without_runtime = env.kernel().await;
 
     let pending = kernel_without_runtime
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "atomic-pending",
             "alice",
             "alice",
@@ -2910,7 +2910,7 @@ async fn channels_v2_admission_rolls_back_dedupe_when_turn_cannot_be_queued() {
     let pairing_code = pending.pairing_code.expect("pairing code");
     kernel_without_runtime
         .approve_channel_pairing(ChannelPairingApproveRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             pairing_id: None,
             pairing_code: Some(pairing_code),
             routing_profile: None,
@@ -2922,7 +2922,7 @@ async fn channels_v2_admission_rolls_back_dedupe_when_turn_cannot_be_queued() {
 
     let err = kernel_without_runtime
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "atomic-event",
             "alice",
             "alice",
@@ -2938,7 +2938,7 @@ async fn channels_v2_admission_rolls_back_dedupe_when_turn_cannot_be_queued() {
 
     let pool = connect_test_pool(&env.home().db_path()).await;
     let persisted_event_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM channel_inbound_events WHERE channel_id = 'terminal' AND event_id = 'atomic-event'",
+        "SELECT COUNT(*) FROM channel_inbound_events WHERE channel_id = 'loopback' AND event_id = 'atomic-event'",
     )
     .fetch_one(&pool)
     .await
@@ -2953,7 +2953,7 @@ async fn channels_v2_admission_rolls_back_dedupe_when_turn_cannot_be_queued() {
         .await;
     let queued = kernel_with_runtime
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "atomic-event",
             "alice",
             "alice",
@@ -3053,24 +3053,24 @@ async fn channels_v2_migration_uses_legacy_message_id_for_event_identity() {
         INSERT INTO sessions
             (session_id, channel_id, peer_id, project_scope, trust_tier, history_policy, created_at_ms, last_turn_at_ms, last_activity_at_ms, turn_count)
         VALUES
-            ('session-1', 'terminal', 'alice', 'project-test', 'main', 'interactive', 1000, 1002, 1002, 2);
+            ('session-1', 'loopback', 'alice', 'project-test', 'main', 'interactive', 1000, 1002, 1002, 2);
 
         INSERT INTO channel_peers
             (channel_id, peer_id, status, trust_tier, pairing_code, first_seen_ms, updated_at_ms)
         VALUES
-            ('terminal', 'alice', 'approved', 'main', 'raw-code', 1000, 1002);
+            ('loopback', 'alice', 'approved', 'main', 'raw-code', 1000, 1002);
 
         INSERT INTO channel_messages
             (message_id, channel_id, peer_id, direction, external_message_id, update_id, content, created_at_ms)
         VALUES
-            ('message-a', 'terminal', 'alice', 'inbound', 'duplicate-provider-id', NULL, 'first prompt', 1001),
-            ('message-b', 'terminal', 'alice', 'inbound', 'duplicate-provider-id', NULL, 'second prompt', 1002);
+            ('message-a', 'loopback', 'alice', 'inbound', 'duplicate-provider-id', NULL, 'first prompt', 1001),
+            ('message-b', 'loopback', 'alice', 'inbound', 'duplicate-provider-id', NULL, 'second prompt', 1002);
 
         INSERT INTO channel_turns
             (turn_id, channel_id, peer_id, session_id, inbound_message_id, runtime_id, status, last_error, queued_at_ms, started_at_ms, finished_at_ms, answer_checkpoint_sequence)
         VALUES
-            ('turn-a', 'terminal', 'alice', 'session-1', 'message-a', 'mock', 'completed', NULL, 1001, 1001, 1001, NULL),
-            ('turn-b', 'terminal', 'alice', 'session-1', 'message-b', 'mock', 'completed', NULL, 1002, 1002, 1002, NULL);
+            ('turn-a', 'loopback', 'alice', 'session-1', 'message-a', 'mock', 'completed', NULL, 1001, 1001, 1001, NULL),
+            ('turn-b', 'loopback', 'alice', 'session-1', 'message-b', 'mock', 'completed', NULL, 1002, 1002, 1002, NULL);
         "#,
     )
     .execute(&pool)
@@ -3535,7 +3535,7 @@ async fn channels_v2_scoped_grants_triggers_and_attachment_wait_state() {
 #[tokio::test]
 async fn channel_attachment_stage_finalize_queues_manifest_and_runtime_mount() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "attachment-skill").await;
+    install_and_bind_channel(&env, "loopback", "attachment-skill").await;
     let release_runtime = std::sync::Arc::new(tokio::sync::Notify::new());
     let kernel = env
         .kernel_with_options(KernelOptions {
@@ -3553,8 +3553,8 @@ async fn channel_attachment_stage_finalize_queues_manifest_and_runtime_mount() {
         )
         .await;
 
-    create_pending_pairing(&kernel, "terminal", "peer-attach", "attach-1001").await;
-    approve_pairing(&kernel, "terminal", "peer-attach").await;
+    create_pending_pairing(&kernel, "loopback", "peer-attach", "attach-1001").await;
+    approve_pairing(&kernel, "loopback", "peer-attach").await;
 
     let staged_content = b"hello staged attachment".to_vec();
     let attachment_request = ChannelInboundRequest {
@@ -3579,7 +3579,7 @@ async fn channel_attachment_stage_finalize_queues_manifest_and_runtime_mount() {
             },
         ],
         ..v2_text_request(
-            "terminal",
+            "loopback",
             "attach-1002",
             "peer-attach",
             "peer-attach",
@@ -3612,7 +3612,7 @@ async fn channel_attachment_stage_finalize_queues_manifest_and_runtime_mount() {
         .home()
         .runtime_dir()
         .join("channels")
-        .join(test_storage_component("terminal"))
+        .join(test_storage_component("loopback"))
         .join("attachments")
         .join(test_storage_component("attach-1002"))
         .join(test_storage_component("att-doc"))
@@ -3629,7 +3629,7 @@ async fn channel_attachment_stage_finalize_queues_manifest_and_runtime_mount() {
 
     let staged = kernel
         .stage_channel_attachment(ChannelAttachmentStageInput {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "attach-1002".to_string(),
             attachment_id: "att-doc".to_string(),
             kind: "document".to_string(),
@@ -3652,7 +3652,7 @@ async fn channel_attachment_stage_finalize_queues_manifest_and_runtime_mount() {
     );
     let restaged = kernel
         .stage_channel_attachment(ChannelAttachmentStageInput {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "attach-1002".to_string(),
             attachment_id: "att-doc".to_string(),
             kind: "document".to_string(),
@@ -3676,7 +3676,7 @@ async fn channel_attachment_stage_finalize_queues_manifest_and_runtime_mount() {
 
     let finalized = kernel
         .finalize_channel_attachments(ChannelAttachmentFinalizeRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "attach-1002".to_string(),
             worker_id: "attachment-worker-test".to_string(),
             missing: vec![ChannelAttachmentMissingReport {
@@ -3743,7 +3743,7 @@ async fn channel_attachment_stage_finalize_queues_manifest_and_runtime_mount() {
     let pool = connect_test_pool(&env.home().db_path()).await;
     let row = sqlx::query(
         "SELECT status, filename, storage_path FROM channel_attachments \
-         WHERE channel_id = 'terminal' AND event_id = 'attach-1002' AND attachment_id = 'att-doc'",
+         WHERE channel_id = 'loopback' AND event_id = 'attach-1002' AND attachment_id = 'att-doc'",
     )
     .fetch_one(&pool)
     .await
@@ -3762,7 +3762,7 @@ async fn channel_attachment_stage_finalize_queues_manifest_and_runtime_mount() {
 #[tokio::test]
 async fn channel_attachment_waiting_turn_blocks_later_session_turns() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "attachment-order-skill").await;
+    install_and_bind_channel(&env, "loopback", "attachment-order-skill").await;
     let prompts = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let kernel = env
         .kernel_with_options(KernelOptions {
@@ -3780,14 +3780,14 @@ async fn channel_attachment_waiting_turn_blocks_later_session_turns() {
         )
         .await;
 
-    create_pending_pairing(&kernel, "terminal", "peer-order", "order-pairing").await;
-    approve_pairing(&kernel, "terminal", "peer-order").await;
+    create_pending_pairing(&kernel, "loopback", "peer-order", "order-pairing").await;
+    approve_pairing(&kernel, "loopback", "peer-order").await;
 
     let waiting = kernel
         .ingest_channel_inbound(ChannelInboundRequest {
             attachments: vec![attachment_descriptor("order-att")],
             ..v2_text_request(
-                "terminal",
+                "loopback",
                 "order-waiting",
                 "peer-order",
                 "peer-order",
@@ -3805,7 +3805,7 @@ async fn channel_attachment_waiting_turn_blocks_later_session_turns() {
 
     let later = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "order-later",
             "peer-order",
             "peer-order",
@@ -3835,7 +3835,7 @@ async fn channel_attachment_waiting_turn_blocks_later_session_turns() {
 
     let finalized = kernel
         .finalize_channel_attachments(ChannelAttachmentFinalizeRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "order-waiting".to_string(),
             worker_id: "attachment-worker-test".to_string(),
             missing: vec![ChannelAttachmentMissingReport {
@@ -3863,7 +3863,7 @@ async fn channel_attachment_waiting_turn_blocks_later_session_turns() {
 #[tokio::test]
 async fn channel_lionclaw_retry_preserves_attachment_manifest_and_mount() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "attachment-retry-skill").await;
+    install_and_bind_channel(&env, "loopback", "attachment-retry-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -3874,12 +3874,12 @@ async fn channel_lionclaw_retry_preserves_attachment_manifest_and_mount() {
 
     create_pending_pairing(
         &kernel,
-        "terminal",
+        "loopback",
         "peer-attach-retry",
         "attach-retry-1001",
     )
     .await;
-    approve_pairing(&kernel, "terminal", "peer-attach-retry").await;
+    approve_pairing(&kernel, "loopback", "peer-attach-retry").await;
 
     let staged_content = b"retry attachment content".to_vec();
     let waiting = kernel
@@ -3894,7 +3894,7 @@ async fn channel_lionclaw_retry_preserves_attachment_manifest_and_mount() {
                 caption: Some("retry caption".to_string()),
             }],
             ..v2_text_request(
-                "terminal",
+                "loopback",
                 "attach-retry-1002",
                 "peer-attach-retry",
                 "peer-attach-retry",
@@ -3912,7 +3912,7 @@ async fn channel_lionclaw_retry_preserves_attachment_manifest_and_mount() {
 
     let staged = kernel
         .stage_channel_attachment(ChannelAttachmentStageInput {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "attach-retry-1002".to_string(),
             attachment_id: "att-retry".to_string(),
             kind: "document".to_string(),
@@ -3931,7 +3931,7 @@ async fn channel_lionclaw_retry_preserves_attachment_manifest_and_mount() {
 
     kernel
         .finalize_channel_attachments(ChannelAttachmentFinalizeRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "attach-retry-1002".to_string(),
             worker_id: "attachment-retry-worker-test".to_string(),
             missing: Vec::new(),
@@ -3954,7 +3954,7 @@ async fn channel_lionclaw_retry_preserves_attachment_manifest_and_mount() {
 
     let retry = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "attach-retry-1003",
             "peer-attach-retry",
             "peer-attach-retry",
@@ -3987,7 +3987,7 @@ async fn channel_lionclaw_retry_preserves_attachment_manifest_and_mount() {
 
     let retry_again = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "attach-retry-1004",
             "peer-attach-retry",
             "peer-attach-retry",
@@ -4020,7 +4020,7 @@ async fn channel_lionclaw_retry_preserves_attachment_manifest_and_mount() {
 
     let plain_same_prompt = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "attach-retry-1005",
             "peer-attach-retry",
             "peer-attach-retry",
@@ -4050,7 +4050,7 @@ async fn channel_lionclaw_retry_preserves_attachment_manifest_and_mount() {
 
     let plain_retry = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "attach-retry-1006",
             "peer-attach-retry",
             "peer-attach-retry",
@@ -4078,7 +4078,7 @@ async fn channel_lionclaw_retry_preserves_attachment_manifest_and_mount() {
 
     let plain_retry_again = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "attach-retry-1007",
             "peer-attach-retry",
             "peer-attach-retry",
@@ -4120,7 +4120,7 @@ async fn channel_lionclaw_retry_preserves_attachment_manifest_and_mount() {
 #[tokio::test]
 async fn channel_attachment_only_turn_runs_from_runtime_manifest() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "attachment-only-skill").await;
+    install_and_bind_channel(&env, "loopback", "attachment-only-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -4129,8 +4129,8 @@ async fn channel_attachment_only_turn_runs_from_runtime_manifest() {
         })
         .await;
 
-    create_pending_pairing(&kernel, "terminal", "peer-attach-only", "attach-only-1001").await;
-    approve_pairing(&kernel, "terminal", "peer-attach-only").await;
+    create_pending_pairing(&kernel, "loopback", "peer-attach-only", "attach-only-1001").await;
+    approve_pairing(&kernel, "loopback", "peer-attach-only").await;
 
     let staged_content = b"attachment-only content".to_vec();
     let waiting = kernel
@@ -4146,7 +4146,7 @@ async fn channel_attachment_only_turn_runs_from_runtime_manifest() {
                 caption: None,
             }],
             ..v2_text_request(
-                "terminal",
+                "loopback",
                 "attach-only-1002",
                 "peer-attach-only",
                 "peer-attach-only",
@@ -4164,7 +4164,7 @@ async fn channel_attachment_only_turn_runs_from_runtime_manifest() {
 
     let staged = kernel
         .stage_channel_attachment(ChannelAttachmentStageInput {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "attach-only-1002".to_string(),
             attachment_id: "att-only".to_string(),
             kind: "document".to_string(),
@@ -4187,7 +4187,7 @@ async fn channel_attachment_only_turn_runs_from_runtime_manifest() {
 
     let finalized = kernel
         .finalize_channel_attachments(ChannelAttachmentFinalizeRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "attach-only-1002".to_string(),
             worker_id: "attachment-only-worker-test".to_string(),
             missing: Vec::new(),
@@ -4218,7 +4218,7 @@ async fn channel_attachment_projection_rejects_symlinked_parent() {
     use std::os::unix::fs::symlink;
 
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "attachment-symlink-projection-skill").await;
+    install_and_bind_channel(&env, "loopback", "attachment-symlink-projection-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -4227,8 +4227,8 @@ async fn channel_attachment_projection_rejects_symlinked_parent() {
         })
         .await;
 
-    create_pending_pairing(&kernel, "terminal", "peer-symlink", "symlink-1001").await;
-    approve_pairing(&kernel, "terminal", "peer-symlink").await;
+    create_pending_pairing(&kernel, "loopback", "peer-symlink", "symlink-1001").await;
+    approve_pairing(&kernel, "loopback", "peer-symlink").await;
     let waiting = kernel
         .ingest_channel_inbound(ChannelInboundRequest {
             attachments: vec![ChannelAttachmentDescriptor {
@@ -4241,7 +4241,7 @@ async fn channel_attachment_projection_rejects_symlinked_parent() {
                 caption: None,
             }],
             ..v2_text_request(
-                "terminal",
+                "loopback",
                 "symlink-1002",
                 "peer-symlink",
                 "peer-symlink",
@@ -4259,7 +4259,7 @@ async fn channel_attachment_projection_rejects_symlinked_parent() {
 
     kernel
         .stage_channel_attachment(ChannelAttachmentStageInput {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "symlink-1002".to_string(),
             attachment_id: "att-doc".to_string(),
             kind: "document".to_string(),
@@ -4277,13 +4277,13 @@ async fn channel_attachment_projection_rejects_symlinked_parent() {
         .home()
         .runtime_dir()
         .join("channels")
-        .join(test_storage_component("terminal"))
+        .join(test_storage_component("loopback"))
         .join("attachment-projections");
     symlink(&outside, &projection_parent).expect("symlink projection parent");
 
     let finalized = kernel
         .finalize_channel_attachments(ChannelAttachmentFinalizeRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "symlink-1002".to_string(),
             worker_id: "attachment-worker-symlink-test".to_string(),
             missing: Vec::new(),
@@ -4319,7 +4319,7 @@ async fn channel_attachment_projection_rejects_symlinked_parent() {
 #[tokio::test]
 async fn channel_attachment_temp_cleanup_ignores_staged_blobs() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "attachment-temp-cleanup-skill").await;
+    install_and_bind_channel(&env, "loopback", "attachment-temp-cleanup-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -4328,8 +4328,8 @@ async fn channel_attachment_temp_cleanup_ignores_staged_blobs() {
         })
         .await;
 
-    create_pending_pairing(&kernel, "terminal", "peer-temp", "temp-1001").await;
-    approve_pairing(&kernel, "terminal", "peer-temp").await;
+    create_pending_pairing(&kernel, "loopback", "peer-temp", "temp-1001").await;
+    approve_pairing(&kernel, "loopback", "peer-temp").await;
     let content = b"committed staged blob".to_vec();
     let waiting = kernel
         .ingest_channel_inbound(ChannelInboundRequest {
@@ -4343,7 +4343,7 @@ async fn channel_attachment_temp_cleanup_ignores_staged_blobs() {
                 caption: None,
             }],
             ..v2_text_request(
-                "terminal",
+                "loopback",
                 "temp-1002",
                 "peer-temp",
                 "peer-temp",
@@ -4361,7 +4361,7 @@ async fn channel_attachment_temp_cleanup_ignores_staged_blobs() {
 
     kernel
         .stage_channel_attachment(ChannelAttachmentStageInput {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "temp-1002".to_string(),
             attachment_id: "att-temp".to_string(),
             kind: "document".to_string(),
@@ -4376,7 +4376,7 @@ async fn channel_attachment_temp_cleanup_ignores_staged_blobs() {
     let pool = connect_test_pool(&env.home().db_path()).await;
     let storage_path: String = sqlx::query_scalar(
         "SELECT storage_path FROM channel_attachments \
-         WHERE channel_id = 'terminal' AND event_id = 'temp-1002' AND attachment_id = 'att-temp'",
+         WHERE channel_id = 'loopback' AND event_id = 'temp-1002' AND attachment_id = 'att-temp'",
     )
     .fetch_one(&pool)
     .await
@@ -4426,7 +4426,7 @@ async fn attachment_maintenance_removes_stale_runtime_projections() {
         .home()
         .runtime_dir()
         .join("channels")
-        .join(test_storage_component("terminal"))
+        .join(test_storage_component("loopback"))
         .join("attachment-projections")
         .join(test_storage_component("projection-cleanup-1001"))
         .join(uuid::Uuid::new_v4().to_string());
@@ -4452,7 +4452,7 @@ async fn attachment_maintenance_removes_stale_runtime_projections() {
 #[tokio::test]
 async fn channel_attachment_storage_identity_does_not_collide_after_sanitizing() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "attachment-collision-skill").await;
+    install_and_bind_channel(&env, "loopback", "attachment-collision-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -4461,8 +4461,8 @@ async fn channel_attachment_storage_identity_does_not_collide_after_sanitizing()
         })
         .await;
 
-    create_pending_pairing(&kernel, "terminal", "peer-collision", "collision-1001").await;
-    approve_pairing(&kernel, "terminal", "peer-collision").await;
+    create_pending_pairing(&kernel, "loopback", "peer-collision", "collision-1001").await;
+    approve_pairing(&kernel, "loopback", "peer-collision").await;
     let first_id = "a/b";
     let second_id = "a_2fb";
     let waiting = kernel
@@ -4488,7 +4488,7 @@ async fn channel_attachment_storage_identity_does_not_collide_after_sanitizing()
                 },
             ],
             ..v2_text_request(
-                "terminal",
+                "loopback",
                 "collision-1002",
                 "peer-collision",
                 "peer-collision",
@@ -4506,7 +4506,7 @@ async fn channel_attachment_storage_identity_does_not_collide_after_sanitizing()
 
     let first_runtime_path = kernel
         .stage_channel_attachment(ChannelAttachmentStageInput {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "collision-1002".to_string(),
             attachment_id: first_id.to_string(),
             kind: "document".to_string(),
@@ -4521,7 +4521,7 @@ async fn channel_attachment_storage_identity_does_not_collide_after_sanitizing()
         .expect("first runtime path");
     let second_runtime_path = kernel
         .stage_channel_attachment(ChannelAttachmentStageInput {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "collision-1002".to_string(),
             attachment_id: second_id.to_string(),
             kind: "document".to_string(),
@@ -4539,7 +4539,7 @@ async fn channel_attachment_storage_identity_does_not_collide_after_sanitizing()
     let pool = connect_test_pool(&env.home().db_path()).await;
     let rows = sqlx::query(
         "SELECT attachment_id, storage_path FROM channel_attachments \
-         WHERE channel_id = 'terminal' AND event_id = 'collision-1002' \
+         WHERE channel_id = 'loopback' AND event_id = 'collision-1002' \
          ORDER BY attachment_id",
     )
     .fetch_all(&pool)
@@ -4569,7 +4569,7 @@ async fn channel_attachment_storage_identity_does_not_collide_after_sanitizing()
 #[tokio::test]
 async fn channel_attachment_stage_requires_waiting_declared_attachment() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "attachment-precondition-skill").await;
+    install_and_bind_channel(&env, "loopback", "attachment-precondition-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -4582,7 +4582,7 @@ async fn channel_attachment_stage_requires_waiting_declared_attachment() {
         .ingest_channel_inbound(ChannelInboundRequest {
             attachments: vec![attachment_descriptor("pending-attachment")],
             ..v2_text_request(
-                "terminal",
+                "loopback",
                 "precondition-pending",
                 "peer-unapproved",
                 "peer-unapproved",
@@ -4597,7 +4597,7 @@ async fn channel_attachment_stage_requires_waiting_declared_attachment() {
 
     let err = kernel
         .stage_channel_attachment(ChannelAttachmentStageInput {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "precondition-pending".to_string(),
             attachment_id: "pending-attachment".to_string(),
             kind: "image".to_string(),
@@ -4612,17 +4612,17 @@ async fn channel_attachment_stage_requires_waiting_declared_attachment() {
 
     create_pending_pairing(
         &kernel,
-        "terminal",
+        "loopback",
         "peer-precondition",
         "precondition-1001",
     )
     .await;
-    approve_pairing(&kernel, "terminal", "peer-precondition").await;
+    approve_pairing(&kernel, "loopback", "peer-precondition").await;
     let waiting = kernel
         .ingest_channel_inbound(ChannelInboundRequest {
             attachments: vec![attachment_descriptor("declared-attachment")],
             ..v2_text_request(
-                "terminal",
+                "loopback",
                 "precondition-waiting",
                 "peer-precondition",
                 "peer-precondition",
@@ -4640,7 +4640,7 @@ async fn channel_attachment_stage_requires_waiting_declared_attachment() {
 
     let err = kernel
         .stage_channel_attachment(ChannelAttachmentStageInput {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "precondition-waiting".to_string(),
             attachment_id: "not-declared".to_string(),
             kind: "image".to_string(),
@@ -4655,7 +4655,7 @@ async fn channel_attachment_stage_requires_waiting_declared_attachment() {
 
     let queued = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "precondition-1002",
             "peer-precondition",
             "peer-precondition",
@@ -4669,7 +4669,7 @@ async fn channel_attachment_stage_requires_waiting_declared_attachment() {
 
     let err = kernel
         .stage_channel_attachment(ChannelAttachmentStageInput {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "precondition-1002".to_string(),
             attachment_id: "not-declared".to_string(),
             kind: "image".to_string(),
@@ -4686,7 +4686,7 @@ async fn channel_attachment_stage_requires_waiting_declared_attachment() {
 #[tokio::test]
 async fn channel_attachment_descriptor_size_policy_records_rejections() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "attachment-size-skill").await;
+    install_and_bind_channel(&env, "loopback", "attachment-size-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -4694,8 +4694,8 @@ async fn channel_attachment_descriptor_size_policy_records_rejections() {
         })
         .await;
 
-    create_pending_pairing(&kernel, "terminal", "peer-size", "size-1001").await;
-    approve_pairing(&kernel, "terminal", "peer-size").await;
+    create_pending_pairing(&kernel, "loopback", "peer-size", "size-1001").await;
+    approve_pairing(&kernel, "loopback", "peer-size").await;
 
     let queued = kernel
         .ingest_channel_inbound(ChannelInboundRequest {
@@ -4704,7 +4704,7 @@ async fn channel_attachment_descriptor_size_policy_records_rejections() {
                 ..attachment_descriptor("too-large")
             }],
             ..v2_text_request(
-                "terminal",
+                "loopback",
                 "size-1002",
                 "peer-size",
                 "peer-size",
@@ -4736,7 +4736,7 @@ async fn channel_attachment_descriptor_size_policy_records_rejections() {
     let pool = connect_test_pool(&env.home().db_path()).await;
     let (status, reason_code): (String, String) = sqlx::query_as(
         "SELECT status, rejection_code FROM channel_attachments \
-         WHERE channel_id = 'terminal' AND event_id = 'size-1002' AND attachment_id = 'too-large'",
+         WHERE channel_id = 'loopback' AND event_id = 'size-1002' AND attachment_id = 'too-large'",
     )
     .fetch_one(&pool)
     .await
@@ -4767,7 +4767,7 @@ async fn channel_attachment_descriptor_size_policy_records_rejections() {
                 },
             ],
             ..v2_text_request(
-                "terminal",
+                "loopback",
                 "size-1003",
                 "peer-size",
                 "peer-size",
@@ -4784,7 +4784,7 @@ async fn channel_attachment_descriptor_size_policy_records_rejections() {
     );
     let (status, reason_code): (String, String) = sqlx::query_as(
         "SELECT status, rejection_code FROM channel_attachments \
-         WHERE channel_id = 'terminal' AND event_id = 'size-1003' AND attachment_id = 'large-c'",
+         WHERE channel_id = 'loopback' AND event_id = 'size-1003' AND attachment_id = 'large-c'",
     )
     .fetch_one(&pool)
     .await
@@ -4796,7 +4796,7 @@ async fn channel_attachment_descriptor_size_policy_records_rejections() {
 #[tokio::test]
 async fn channel_attachment_stage_policy_rejection_is_manifested() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "attachment-stage-policy-skill").await;
+    install_and_bind_channel(&env, "loopback", "attachment-stage-policy-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -4805,8 +4805,8 @@ async fn channel_attachment_stage_policy_rejection_is_manifested() {
         })
         .await;
 
-    create_pending_pairing(&kernel, "terminal", "peer-policy", "policy-1001").await;
-    approve_pairing(&kernel, "terminal", "peer-policy").await;
+    create_pending_pairing(&kernel, "loopback", "peer-policy", "policy-1001").await;
+    approve_pairing(&kernel, "loopback", "peer-policy").await;
 
     let waiting = kernel
         .ingest_channel_inbound(ChannelInboundRequest {
@@ -4816,7 +4816,7 @@ async fn channel_attachment_stage_policy_rejection_is_manifested() {
                 ..attachment_descriptor("too-large-upload")
             }],
             ..v2_text_request(
-                "terminal",
+                "loopback",
                 "policy-1002",
                 "peer-policy",
                 "peer-policy",
@@ -4834,7 +4834,7 @@ async fn channel_attachment_stage_policy_rejection_is_manifested() {
 
     let rejected = kernel
         .stage_channel_attachment(ChannelAttachmentStageInput {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "policy-1002".to_string(),
             attachment_id: "too-large-upload".to_string(),
             kind: "image".to_string(),
@@ -4858,7 +4858,7 @@ async fn channel_attachment_stage_policy_rejection_is_manifested() {
 
     let finalized = kernel
         .finalize_channel_attachments(ChannelAttachmentFinalizeRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "policy-1002".to_string(),
             worker_id: "attachment-worker-policy-test".to_string(),
             missing: vec![ChannelAttachmentMissingReport {
@@ -4890,7 +4890,7 @@ async fn channel_attachment_stage_policy_rejection_is_manifested() {
     let pool = connect_test_pool(&env.home().db_path()).await;
     let reason_code: String = sqlx::query_scalar(
         "SELECT rejection_code FROM channel_attachments \
-         WHERE channel_id = 'terminal' AND event_id = 'policy-1002' AND attachment_id = 'too-large-upload'",
+         WHERE channel_id = 'loopback' AND event_id = 'policy-1002' AND attachment_id = 'too-large-upload'",
     )
     .fetch_one(&pool)
     .await
@@ -4901,7 +4901,7 @@ async fn channel_attachment_stage_policy_rejection_is_manifested() {
 #[tokio::test]
 async fn channel_attachment_stage_http_oversized_upload_records_policy_rejection() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "attachment-stage-http-policy-skill").await;
+    install_and_bind_channel(&env, "loopback", "attachment-stage-http-policy-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -4910,8 +4910,8 @@ async fn channel_attachment_stage_http_oversized_upload_records_policy_rejection
         })
         .await;
 
-    create_pending_pairing(&kernel, "terminal", "peer-http-policy", "http-policy-1001").await;
-    approve_pairing(&kernel, "terminal", "peer-http-policy").await;
+    create_pending_pairing(&kernel, "loopback", "peer-http-policy", "http-policy-1001").await;
+    approve_pairing(&kernel, "loopback", "peer-http-policy").await;
 
     let waiting = kernel
         .ingest_channel_inbound(ChannelInboundRequest {
@@ -4921,7 +4921,7 @@ async fn channel_attachment_stage_http_oversized_upload_records_policy_rejection
                 ..attachment_descriptor("too-large-http-upload")
             }],
             ..v2_text_request(
-                "terminal",
+                "loopback",
                 "http-policy-1002",
                 "peer-http-policy",
                 "peer-http-policy",
@@ -4958,7 +4958,7 @@ async fn channel_attachment_stage_http_oversized_upload_records_policy_rejection
     let body = multipart_stage_body(
         boundary,
         &[
-            ("channel_id", "terminal"),
+            ("channel_id", "loopback"),
             ("event_id", "http-policy-1002"),
             ("attachment_id", "too-large-http-upload"),
             ("kind", "image"),
@@ -4996,7 +4996,7 @@ async fn channel_attachment_stage_http_oversized_upload_records_policy_rejection
 
     let finalized = kernel
         .finalize_channel_attachments(ChannelAttachmentFinalizeRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "http-policy-1002".to_string(),
             worker_id: "attachment-worker-http-policy-test".to_string(),
             missing: Vec::new(),
@@ -5025,7 +5025,7 @@ async fn channel_attachment_stage_http_oversized_upload_records_policy_rejection
     let pool = connect_test_pool(&env.home().db_path()).await;
     let reason_code: String = sqlx::query_scalar(
         "SELECT rejection_code FROM channel_attachments \
-         WHERE channel_id = 'terminal' AND event_id = 'http-policy-1002' AND attachment_id = 'too-large-http-upload'",
+         WHERE channel_id = 'loopback' AND event_id = 'http-policy-1002' AND attachment_id = 'too-large-http-upload'",
     )
     .fetch_one(&pool)
     .await
@@ -5105,7 +5105,7 @@ async fn latest_session_snapshot_is_project_scoped() {
         .await;
     let session_a = kernel_a
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             peer_id: "alice".to_string(),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
@@ -5122,7 +5122,7 @@ async fn latest_session_snapshot_is_project_scoped() {
 
     let snapshot = kernel_b
         .latest_session_snapshot(SessionLatestQuery {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             peer_id: "alice".to_string(),
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -5132,7 +5132,7 @@ async fn latest_session_snapshot_is_project_scoped() {
 
     let session_b = kernel_b
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             peer_id: "alice".to_string(),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
@@ -5145,7 +5145,7 @@ async fn latest_session_snapshot_is_project_scoped() {
 #[tokio::test]
 async fn latest_session_snapshot_uses_stream_head_before_first_answer_checkpoint() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "resume-head-skill").await;
+    install_and_bind_channel(&env, "loopback", "resume-head-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("slow-answer".to_string()),
@@ -5162,12 +5162,12 @@ async fn latest_session_snapshot_uses_stream_head_before_first_answer_checkpoint
         )
         .await;
 
-    create_pending_pairing(&kernel, "terminal", "peer-resume-head", "resume-head-7251").await;
-    approve_pairing(&kernel, "terminal", "peer-resume-head").await;
+    create_pending_pairing(&kernel, "loopback", "peer-resume-head", "resume-head-7251").await;
+    approve_pairing(&kernel, "loopback", "peer-resume-head").await;
     let _session = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
-            peer_id: direct_session_key("terminal", "peer-resume-head"),
+            channel_id: "loopback".to_string(),
+            peer_id: direct_session_key("loopback", "peer-resume-head"),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -5176,7 +5176,7 @@ async fn latest_session_snapshot_uses_stream_head_before_first_answer_checkpoint
 
     kernel
         .ingest_channel_inbound(ChannelInboundRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "resume-head-7252".to_string(),
             sender_ref: "peer-resume-head".to_string(),
             conversation_ref: "peer-resume-head".to_string(),
@@ -5194,14 +5194,14 @@ async fn latest_session_snapshot_uses_stream_head_before_first_answer_checkpoint
 
     let resume_after_sequence = wait_for_running_snapshot_without_answer(
         &kernel,
-        "terminal",
-        &direct_session_key("terminal", "peer-resume-head"),
+        "loopback",
+        &direct_session_key("loopback", "peer-resume-head"),
     )
     .await;
 
     let answer_text = wait_for_answer_delta_after_sequence(
         &kernel,
-        "terminal",
+        "loopback",
         "terminal-resume-head",
         resume_after_sequence,
     )
@@ -5212,7 +5212,7 @@ async fn latest_session_snapshot_uses_stream_head_before_first_answer_checkpoint
 #[tokio::test]
 async fn bootstrap_recovers_durable_pending_channel_turns() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "recover-pending-skill").await;
+    install_and_bind_channel(&env, "loopback", "recover-pending-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -5220,12 +5220,12 @@ async fn bootstrap_recovers_durable_pending_channel_turns() {
         })
         .await;
 
-    create_pending_pairing(&kernel, "terminal", "peer-recover", "recover-pairing").await;
-    approve_pairing(&kernel, "terminal", "peer-recover").await;
-    let session_key = direct_session_key("terminal", "peer-recover");
+    create_pending_pairing(&kernel, "loopback", "peer-recover", "recover-pairing").await;
+    approve_pairing(&kernel, "loopback", "peer-recover").await;
+    let session_key = direct_session_key("loopback", "peer-recover");
     let session = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             peer_id: session_key.clone(),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Conservative),
@@ -5240,7 +5240,7 @@ async fn bootstrap_recovers_durable_pending_channel_turns() {
     sqlx::query(
         "INSERT INTO channel_inbound_events \
          (event_id, channel_id, sender_ref, conversation_ref, thread_ref, message_ref, text, trigger, attachments_json, reply_to_ref, provider_metadata_json, received_at_ms, created_at_ms) \
-         VALUES (?1, 'terminal', 'peer-recover', 'peer-recover', NULL, ?1, 'recover after restart', 'dm', '[]', NULL, '{}', ?2, ?2)",
+         VALUES (?1, 'loopback', 'peer-recover', 'peer-recover', NULL, ?1, 'recover after restart', 'dm', '[]', NULL, '{}', ?2, ?2)",
     )
     .bind(inbound_event_id)
     .bind(now_ms)
@@ -5261,7 +5261,7 @@ async fn bootstrap_recovers_durable_pending_channel_turns() {
     sqlx::query(
         "INSERT INTO channel_turns \
          (turn_id, channel_id, session_key, session_id, inbound_event_id, runtime_id, status, last_error, answer_checkpoint_sequence, queued_at_ms, started_at_ms, finished_at_ms) \
-         VALUES (?1, 'terminal', ?2, ?3, ?4, 'mock', 'pending', NULL, NULL, ?5, NULL, NULL)",
+         VALUES (?1, 'loopback', ?2, ?3, ?4, 'mock', 'pending', NULL, NULL, ?5, NULL, NULL)",
     )
     .bind(turn_id.to_string())
     .bind(&session_key)
@@ -5295,7 +5295,7 @@ async fn bootstrap_recovers_durable_pending_channel_turns() {
 #[tokio::test]
 async fn channel_session_actions_return_immediately_and_respect_peer_blocking() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "action-skill").await;
+    install_and_bind_channel(&env, "loopback", "action-skill").await;
     let kernel = env.kernel().await;
     kernel
         .register_runtime_adapter(
@@ -5307,12 +5307,12 @@ async fn channel_session_actions_return_immediately_and_respect_peer_blocking() 
         )
         .await;
 
-    create_pending_pairing(&kernel, "terminal", "peer-action", "action-7301").await;
-    approve_pairing(&kernel, "terminal", "peer-action").await;
+    create_pending_pairing(&kernel, "loopback", "peer-action", "action-7301").await;
+    approve_pairing(&kernel, "loopback", "peer-action").await;
     let session = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
-            peer_id: direct_session_key("terminal", "peer-action"),
+            channel_id: "loopback".to_string(),
+            peer_id: direct_session_key("loopback", "peer-action"),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -5357,7 +5357,7 @@ async fn channel_session_actions_return_immediately_and_respect_peer_blocking() 
 
     kernel
         .block_channel_pairing(ChannelPairingBlockRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             pairing_id: None,
             sender_ref: Some("peer-action".to_string()),
             conversation_ref: None,
@@ -5379,7 +5379,7 @@ async fn channel_session_actions_return_immediately_and_respect_peer_blocking() 
 #[tokio::test]
 async fn channel_active_turn_cancel_stops_runtime_and_persists_cancelled_status() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "cancel-skill").await;
+    install_and_bind_channel(&env, "loopback", "cancel-skill").await;
     let started = Arc::new(tokio::sync::Notify::new());
     let cancel_calls = Arc::new(AtomicUsize::new(0));
     let cancel_reason = Arc::new(tokio::sync::Mutex::new(None));
@@ -5400,12 +5400,12 @@ async fn channel_active_turn_cancel_stops_runtime_and_persists_cancelled_status(
         )
         .await;
 
-    create_pending_pairing(&kernel, "terminal", "peer-cancel", "cancel-7601").await;
-    approve_pairing(&kernel, "terminal", "peer-cancel").await;
-    let session_key = direct_session_key("terminal", "peer-cancel");
+    create_pending_pairing(&kernel, "loopback", "peer-cancel", "cancel-7601").await;
+    approve_pairing(&kernel, "loopback", "peer-cancel").await;
+    let session_key = direct_session_key("loopback", "peer-cancel");
     let session = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             peer_id: session_key.clone(),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
@@ -5415,7 +5415,7 @@ async fn channel_active_turn_cancel_stops_runtime_and_persists_cancelled_status(
 
     let queued = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "cancel-7602",
             "peer-cancel",
             "peer-cancel",
@@ -5433,7 +5433,7 @@ async fn channel_active_turn_cancel_stops_runtime_and_persists_cancelled_status(
     let stale = kernel
         .session_action(SessionActionRequest::CancelActiveTurn {
             session_id: session.session_id,
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             session_key: session_key.clone(),
             expected_turn_id: Some(uuid::Uuid::new_v4()),
             reason: Some("operator stop".to_string()),
@@ -5447,7 +5447,7 @@ async fn channel_active_turn_cancel_stops_runtime_and_persists_cancelled_status(
     let cancelled = kernel
         .session_action(SessionActionRequest::CancelActiveTurn {
             session_id: session.session_id,
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             session_key: session_key.clone(),
             expected_turn_id: Some(turn_id),
             reason: Some("operator stop".to_string()),
@@ -5475,7 +5475,7 @@ async fn channel_active_turn_cancel_stops_runtime_and_persists_cancelled_status(
     assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
     assert_eq!(cancel_reason.lock().await.as_deref(), Some("operator stop"));
 
-    let stream = wait_for_stream_events(&kernel, "terminal", "terminal-cancel", |events| {
+    let stream = wait_for_stream_events(&kernel, "loopback", "loopback-cancel", |events| {
         let codes = events
             .iter()
             .filter(|event| event.turn_id == Some(turn_id))
@@ -5494,7 +5494,7 @@ async fn channel_active_turn_cancel_stops_runtime_and_persists_cancelled_status(
 #[tokio::test]
 async fn repeated_active_turn_cancel_returns_clear_conflict() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "repeat-cancel-skill").await;
+    install_and_bind_channel(&env, "loopback", "repeat-cancel-skill").await;
     let started = Arc::new(tokio::sync::Notify::new());
     let cancel_started = Arc::new(tokio::sync::Notify::new());
     let release_cancel = Arc::new(tokio::sync::Notify::new());
@@ -5519,16 +5519,16 @@ async fn repeated_active_turn_cancel_returns_clear_conflict() {
 
     create_pending_pairing(
         &kernel,
-        "terminal",
+        "loopback",
         "peer-repeat-cancel",
         "cancel-repeat-7801",
     )
     .await;
-    approve_pairing(&kernel, "terminal", "peer-repeat-cancel").await;
-    let session_key = direct_session_key("terminal", "peer-repeat-cancel");
+    approve_pairing(&kernel, "loopback", "peer-repeat-cancel").await;
+    let session_key = direct_session_key("loopback", "peer-repeat-cancel");
     let session = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             peer_id: session_key.clone(),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
@@ -5538,7 +5538,7 @@ async fn repeated_active_turn_cancel_returns_clear_conflict() {
 
     let queued = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "cancel-repeat-7802",
             "peer-repeat-cancel",
             "peer-repeat-cancel",
@@ -5556,7 +5556,7 @@ async fn repeated_active_turn_cancel_returns_clear_conflict() {
     kernel
         .session_action(SessionActionRequest::CancelActiveTurn {
             session_id: session.session_id,
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             session_key: session_key.clone(),
             expected_turn_id: Some(turn_id),
             reason: Some("operator stop".to_string()),
@@ -5570,7 +5570,7 @@ async fn repeated_active_turn_cancel_returns_clear_conflict() {
     let repeated = kernel
         .session_action(SessionActionRequest::CancelActiveTurn {
             session_id: session.session_id,
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             session_key: session_key.clone(),
             expected_turn_id: Some(turn_id),
             reason: Some("operator stop again".to_string()),
@@ -5595,7 +5595,7 @@ async fn repeated_active_turn_cancel_returns_clear_conflict() {
 #[tokio::test]
 async fn channel_waiting_turn_cancel_unblocks_following_pending_turn() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "waiting-cancel-skill").await;
+    install_and_bind_channel(&env, "loopback", "waiting-cancel-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -5603,12 +5603,12 @@ async fn channel_waiting_turn_cancel_unblocks_following_pending_turn() {
         })
         .await;
 
-    create_pending_pairing(&kernel, "terminal", "peer-wait-cancel", "cancel-wait-7701").await;
-    approve_pairing(&kernel, "terminal", "peer-wait-cancel").await;
-    let session_key = direct_session_key("terminal", "peer-wait-cancel");
+    create_pending_pairing(&kernel, "loopback", "peer-wait-cancel", "cancel-wait-7701").await;
+    approve_pairing(&kernel, "loopback", "peer-wait-cancel").await;
+    let session_key = direct_session_key("loopback", "peer-wait-cancel");
     let session = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             peer_id: session_key.clone(),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
@@ -5628,7 +5628,7 @@ async fn channel_waiting_turn_cancel_unblocks_following_pending_turn() {
                 caption: Some("waiting attachment".to_string()),
             }],
             ..v2_text_request(
-                "terminal",
+                "loopback",
                 "cancel-wait-7702",
                 "peer-wait-cancel",
                 "peer-wait-cancel",
@@ -5647,7 +5647,7 @@ async fn channel_waiting_turn_cancel_unblocks_following_pending_turn() {
 
     let later = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "cancel-wait-7703",
             "peer-wait-cancel",
             "peer-wait-cancel",
@@ -5662,7 +5662,7 @@ async fn channel_waiting_turn_cancel_unblocks_following_pending_turn() {
     let cancelled = kernel
         .session_action(SessionActionRequest::CancelActiveTurn {
             session_id: session.session_id,
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             session_key: session_key.clone(),
             expected_turn_id: Some(waiting_turn_id),
             reason: Some("attachment no longer needed".to_string()),
@@ -5675,7 +5675,7 @@ async fn channel_waiting_turn_cancel_unblocks_following_pending_turn() {
     wait_for_joined_turn_statuses(&pool, waiting_turn_id, "cancelled", "cancelled").await;
     wait_for_joined_turn_statuses(&pool, later_turn_id, "completed", "completed").await;
 
-    let stream = wait_for_stream_events(&kernel, "terminal", "terminal-wait-cancel", |events| {
+    let stream = wait_for_stream_events(&kernel, "loopback", "loopback-wait-cancel", |events| {
         events.iter().any(|event| {
             event.turn_id == Some(waiting_turn_id)
                 && event.code.as_deref() == Some("queue.cancelled")
@@ -5694,7 +5694,7 @@ async fn channel_waiting_turn_cancel_unblocks_following_pending_turn() {
 #[tokio::test]
 async fn channel_runtime_error_event_persists_failed_turn_and_supports_continue() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "failure-skill").await;
+    install_and_bind_channel(&env, "loopback", "failure-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("partial-failure".to_string()),
@@ -5711,12 +5711,12 @@ async fn channel_runtime_error_event_persists_failed_turn_and_supports_continue(
         )
         .await;
 
-    create_pending_pairing(&kernel, "terminal", "peer-failure", "failure-7301").await;
-    approve_pairing(&kernel, "terminal", "peer-failure").await;
+    create_pending_pairing(&kernel, "loopback", "peer-failure", "failure-7301").await;
+    approve_pairing(&kernel, "loopback", "peer-failure").await;
     let session = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
-            peer_id: direct_session_key("terminal", "peer-failure"),
+            channel_id: "loopback".to_string(),
+            peer_id: direct_session_key("loopback", "peer-failure"),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -5725,7 +5725,7 @@ async fn channel_runtime_error_event_persists_failed_turn_and_supports_continue(
 
     let queued = kernel
         .ingest_channel_inbound(ChannelInboundRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             event_id: "failure-7302".to_string(),
             sender_ref: "peer-failure".to_string(),
             conversation_ref: "peer-failure".to_string(),
@@ -5782,7 +5782,7 @@ async fn channel_runtime_error_event_persists_failed_turn_and_supports_continue(
 #[tokio::test]
 async fn channel_inbound_first_column_slash_input_uses_runtime_control_route() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "runtime-control-skill").await;
+    install_and_bind_channel(&env, "loopback", "runtime-control-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -5792,16 +5792,16 @@ async fn channel_inbound_first_column_slash_input_uses_runtime_control_route() {
 
     create_pending_pairing(
         &kernel,
-        "terminal",
+        "loopback",
         "peer-runtime-control",
         "runtime-control-7451",
     )
     .await;
-    approve_pairing(&kernel, "terminal", "peer-runtime-control").await;
-    let session_key = direct_session_key("terminal", "peer-runtime-control");
+    approve_pairing(&kernel, "loopback", "peer-runtime-control").await;
+    let session_key = direct_session_key("loopback", "peer-runtime-control");
     let session = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             peer_id: session_key,
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
@@ -5811,7 +5811,7 @@ async fn channel_inbound_first_column_slash_input_uses_runtime_control_route() {
 
     let queued = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "runtime-control-7452",
             "peer-runtime-control",
             "peer-runtime-control",
@@ -5840,7 +5840,7 @@ async fn channel_inbound_first_column_slash_input_uses_runtime_control_route() {
     .await;
 
     let stream =
-        wait_for_stream_events(&kernel, "terminal", "terminal-runtime-control", |events| {
+        wait_for_stream_events(&kernel, "loopback", "loopback-runtime-control", |events| {
             let codes = events
                 .iter()
                 .filter_map(|event| event.code.as_deref())
@@ -5863,7 +5863,7 @@ async fn channel_inbound_first_column_slash_input_uses_runtime_control_route() {
 #[tokio::test]
 async fn channel_inbound_lionclaw_retry_uses_lionclaw_action_route() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "lionclaw-action-skill").await;
+    install_and_bind_channel(&env, "loopback", "lionclaw-action-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -5873,16 +5873,16 @@ async fn channel_inbound_lionclaw_retry_uses_lionclaw_action_route() {
 
     create_pending_pairing(
         &kernel,
-        "terminal",
+        "loopback",
         "peer-lionclaw-action",
         "lionclaw-action-7501",
     )
     .await;
-    approve_pairing(&kernel, "terminal", "peer-lionclaw-action").await;
-    let session_key = direct_session_key("terminal", "peer-lionclaw-action");
+    approve_pairing(&kernel, "loopback", "peer-lionclaw-action").await;
+    let session_key = direct_session_key("loopback", "peer-lionclaw-action");
     let session = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             peer_id: session_key,
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
@@ -5904,7 +5904,7 @@ async fn channel_inbound_lionclaw_retry_uses_lionclaw_action_route() {
 
     let queued = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "lionclaw-action-7502",
             "peer-lionclaw-action",
             "peer-lionclaw-action",
@@ -5933,7 +5933,7 @@ async fn channel_inbound_lionclaw_retry_uses_lionclaw_action_route() {
     .await;
 
     let stream =
-        wait_for_stream_events(&kernel, "terminal", "terminal-lionclaw-action", |events| {
+        wait_for_stream_events(&kernel, "loopback", "loopback-lionclaw-action", |events| {
             stream_has_completed_and_done(events, queued_turn_id)
         })
         .await;
@@ -5950,7 +5950,7 @@ async fn channel_inbound_lionclaw_retry_uses_lionclaw_action_route() {
 #[tokio::test]
 async fn channel_inbound_lionclaw_reset_completes_queued_turn() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "lionclaw-reset-skill").await;
+    install_and_bind_channel(&env, "loopback", "lionclaw-reset-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -5960,16 +5960,16 @@ async fn channel_inbound_lionclaw_reset_completes_queued_turn() {
 
     create_pending_pairing(
         &kernel,
-        "terminal",
+        "loopback",
         "peer-lionclaw-reset",
         "lionclaw-reset-7521",
     )
     .await;
-    approve_pairing(&kernel, "terminal", "peer-lionclaw-reset").await;
-    let session_key = direct_session_key("terminal", "peer-lionclaw-reset");
+    approve_pairing(&kernel, "loopback", "peer-lionclaw-reset").await;
+    let session_key = direct_session_key("loopback", "peer-lionclaw-reset");
     let session = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             peer_id: session_key,
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
@@ -5979,7 +5979,7 @@ async fn channel_inbound_lionclaw_reset_completes_queued_turn() {
 
     let queued = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "lionclaw-reset-7522",
             "peer-lionclaw-reset",
             "peer-lionclaw-reset",
@@ -6006,7 +6006,7 @@ async fn channel_inbound_lionclaw_reset_completes_queued_turn() {
     )
     .await;
 
-    let stream = wait_for_stream_events(&kernel, "terminal", "terminal-lionclaw-reset", |events| {
+    let stream = wait_for_stream_events(&kernel, "loopback", "loopback-lionclaw-reset", |events| {
         stream_has_completed_and_done(events, queued_turn_id)
     })
     .await;
@@ -6016,7 +6016,7 @@ async fn channel_inbound_lionclaw_reset_completes_queued_turn() {
 #[tokio::test]
 async fn channel_inbound_unknown_lionclaw_command_does_not_become_runtime_prompt() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "lionclaw-unknown-skill").await;
+    install_and_bind_channel(&env, "loopback", "lionclaw-unknown-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -6026,16 +6026,16 @@ async fn channel_inbound_unknown_lionclaw_command_does_not_become_runtime_prompt
 
     create_pending_pairing(
         &kernel,
-        "terminal",
+        "loopback",
         "peer-lionclaw-unknown",
         "lionclaw-unknown-7531",
     )
     .await;
-    approve_pairing(&kernel, "terminal", "peer-lionclaw-unknown").await;
-    let session_key = direct_session_key("terminal", "peer-lionclaw-unknown");
+    approve_pairing(&kernel, "loopback", "peer-lionclaw-unknown").await;
+    let session_key = direct_session_key("loopback", "peer-lionclaw-unknown");
     let session = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             peer_id: session_key,
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
@@ -6045,7 +6045,7 @@ async fn channel_inbound_unknown_lionclaw_command_does_not_become_runtime_prompt
 
     let queued = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "lionclaw-unknown-7532",
             "peer-lionclaw-unknown",
             "peer-lionclaw-unknown",
@@ -6077,7 +6077,7 @@ async fn channel_inbound_unknown_lionclaw_command_does_not_become_runtime_prompt
 #[tokio::test]
 async fn channel_inbound_bare_retry_stays_runtime_owned() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "bare-runtime-skill").await;
+    install_and_bind_channel(&env, "loopback", "bare-runtime-skill").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -6087,16 +6087,16 @@ async fn channel_inbound_bare_retry_stays_runtime_owned() {
 
     create_pending_pairing(
         &kernel,
-        "terminal",
+        "loopback",
         "peer-bare-runtime",
         "bare-runtime-7551",
     )
     .await;
-    approve_pairing(&kernel, "terminal", "peer-bare-runtime").await;
-    let session_key = direct_session_key("terminal", "peer-bare-runtime");
+    approve_pairing(&kernel, "loopback", "peer-bare-runtime").await;
+    let session_key = direct_session_key("loopback", "peer-bare-runtime");
     let session = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             peer_id: session_key,
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
@@ -6106,7 +6106,7 @@ async fn channel_inbound_bare_retry_stays_runtime_owned() {
 
     let queued = kernel
         .ingest_channel_inbound(v2_text_request(
-            "terminal",
+            "loopback",
             "bare-runtime-7552",
             "peer-bare-runtime",
             "peer-bare-runtime",
@@ -6574,7 +6574,7 @@ async fn create_aged_waiting_attachment_batch(
     pairing_event_id: &str,
     inbound_event_id: &str,
 ) -> (Kernel, uuid::Uuid, sqlx::SqlitePool) {
-    install_and_bind_channel(env, "terminal", skill_name).await;
+    install_and_bind_channel(env, "loopback", skill_name).await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             default_runtime_id: Some("mock".to_string()),
@@ -6583,14 +6583,14 @@ async fn create_aged_waiting_attachment_batch(
         })
         .await;
 
-    create_pending_pairing(&kernel, "terminal", peer_id, pairing_event_id).await;
-    approve_pairing(&kernel, "terminal", peer_id).await;
+    create_pending_pairing(&kernel, "loopback", peer_id, pairing_event_id).await;
+    approve_pairing(&kernel, "loopback", peer_id).await;
     let waiting = kernel
         .ingest_channel_inbound(ChannelInboundRequest {
             text: None,
             attachments: vec![captioned_attachment_descriptor("stale-att", "stale image")],
             ..v2_text_request(
-                "terminal",
+                "loopback",
                 inbound_event_id,
                 peer_id,
                 peer_id,
@@ -6612,7 +6612,7 @@ async fn create_aged_waiting_attachment_batch(
          SET created_at_ms = 1, updated_at_ms = 1 \
          WHERE channel_id = ?1 AND event_id = ?2",
     )
-    .bind("terminal")
+    .bind("loopback")
     .bind(inbound_event_id)
     .execute(&pool)
     .await
@@ -6648,7 +6648,7 @@ async fn assert_stale_attachment_batch_finalized(
         "SELECT status FROM channel_attachment_batches \
          WHERE channel_id = ?1 AND event_id = ?2",
     )
-    .bind("terminal")
+    .bind("loopback")
     .bind(event_id)
     .fetch_one(pool)
     .await
@@ -7533,7 +7533,7 @@ impl RuntimeAdapter for BlockingCancelAdapter {
 #[tokio::test]
 async fn channel_session_start_failure_streams_error_before_done() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "start-failure-skill").await;
+    install_and_bind_channel(&env, "loopback", "start-failure-skill").await;
     let kernel = env.kernel().await;
     kernel
         .register_runtime_adapter(
@@ -7546,16 +7546,16 @@ async fn channel_session_start_failure_streams_error_before_done() {
 
     create_pending_pairing(
         &kernel,
-        "terminal",
+        "loopback",
         "peer-start-failure",
         "start-failure-7351",
     )
     .await;
-    approve_pairing(&kernel, "terminal", "peer-start-failure").await;
+    approve_pairing(&kernel, "loopback", "peer-start-failure").await;
     let session = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
-            peer_id: direct_session_key("terminal", "peer-start-failure"),
+            channel_id: "loopback".to_string(),
+            peer_id: direct_session_key("loopback", "peer-start-failure"),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -7594,8 +7594,8 @@ async fn channel_session_start_failure_streams_error_before_done() {
 
     let stream = kernel
         .pull_channel_stream(ChannelStreamPullRequest {
-            channel_id: "terminal".to_string(),
-            consumer_id: "terminal-start-failure".to_string(),
+            channel_id: "loopback".to_string(),
+            consumer_id: "loopback-start-failure".to_string(),
             start_mode: Some(ChannelStreamStartMode::Resume),
             start_after_sequence: None,
             limit: Some(50),
@@ -7616,7 +7616,7 @@ async fn channel_session_start_failure_streams_error_before_done() {
 #[tokio::test]
 async fn channel_close_failure_does_not_override_streamed_runtime_error() {
     let env = TestHome::new().await;
-    install_and_bind_channel(&env, "terminal", "close-failure-skill").await;
+    install_and_bind_channel(&env, "loopback", "close-failure-skill").await;
     let kernel = env.kernel().await;
     kernel
         .register_runtime_adapter(
@@ -7631,16 +7631,16 @@ async fn channel_close_failure_does_not_override_streamed_runtime_error() {
 
     create_pending_pairing(
         &kernel,
-        "terminal",
+        "loopback",
         "peer-close-failure",
         "close-failure-7401",
     )
     .await;
-    approve_pairing(&kernel, "terminal", "peer-close-failure").await;
+    approve_pairing(&kernel, "loopback", "peer-close-failure").await;
     let session = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
-            peer_id: direct_session_key("terminal", "peer-close-failure"),
+            channel_id: "loopback".to_string(),
+            peer_id: direct_session_key("loopback", "peer-close-failure"),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
@@ -7679,8 +7679,8 @@ async fn channel_close_failure_does_not_override_streamed_runtime_error() {
 
     let stream = kernel
         .pull_channel_stream(ChannelStreamPullRequest {
-            channel_id: "terminal".to_string(),
-            consumer_id: "terminal-close-failure".to_string(),
+            channel_id: "loopback".to_string(),
+            consumer_id: "loopback-close-failure".to_string(),
             start_mode: Some(ChannelStreamStartMode::Resume),
             start_after_sequence: None,
             limit: Some(50),

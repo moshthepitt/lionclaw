@@ -266,10 +266,10 @@ struct ProjectValidateArgs {
     podman_bin: Option<String>,
     #[arg(long = "runtime-image")]
     runtime_image: String,
-    #[arg(long = "terminal-alias")]
-    terminal_alias: String,
-    #[arg(long = "terminal-source")]
-    terminal_source: String,
+    #[arg(long = "channel-alias")]
+    channel_alias: String,
+    #[arg(long = "channel-source")]
+    channel_source: String,
     #[arg(long = "channel-id")]
     channel_id: String,
     #[arg(long = "launch-mode")]
@@ -2092,10 +2092,10 @@ async fn validate_project_managed_config(
         .iter()
         .find(|channel| channel.id == args.channel_id)
     {
-        if channel.skill != args.terminal_alias {
+        if channel.skill != args.channel_alias {
             issues.push(format!(
                 "channel {:?} has skill={:?}; expected {:?}",
-                args.channel_id, channel.skill, args.terminal_alias
+                args.channel_id, channel.skill, args.channel_alias
             ));
         }
         if channel.launch_mode != expected_launch_mode {
@@ -2110,8 +2110,8 @@ async fn validate_project_managed_config(
 
     let mut expected_skills = BTreeMap::new();
     expected_skills.insert(
-        args.terminal_alias.clone(),
-        format!("local:{}", args.terminal_source),
+        args.channel_alias.clone(),
+        format!("local:{}", args.channel_source),
     );
     for spec in &args.project_skills {
         let (alias, source) = parse_project_skill_spec(spec)?;
@@ -2633,7 +2633,7 @@ mod tests {
                 "channel attach",
                 Command::Channel {
                     command: ChannelCommand::Attach(ChannelAttachArgs {
-                        id: "terminal".to_string(),
+                        id: "loopback".to_string(),
                         peer: None,
                         runtime: None,
                     }),
@@ -2870,7 +2870,7 @@ mod tests {
             "channel",
             "pairing",
             "block",
-            "terminal",
+            "loopback",
             sender_ref.as_str(),
         ])
         .expect("parse sender ref block");
@@ -2882,7 +2882,7 @@ mod tests {
                         command: ChannelPairingCommand::Block(args),
                     },
             } => {
-                assert_eq!(args.channel_id, "terminal");
+                assert_eq!(args.channel_id, "loopback");
                 assert_eq!(args.sender_ref.as_deref(), Some(sender_ref.as_str()));
                 assert!(args.pairing_id.is_none());
             }
@@ -2899,7 +2899,7 @@ mod tests {
             "channel",
             "pairing",
             "block",
-            "terminal",
+            "loopback",
             "--pairing-id",
             pairing_id_raw.as_str(),
         ])
@@ -2912,7 +2912,7 @@ mod tests {
                         command: ChannelPairingCommand::Block(args),
                     },
             } => {
-                assert_eq!(args.channel_id, "terminal");
+                assert_eq!(args.channel_id, "loopback");
                 assert!(args.sender_ref.is_none());
                 assert_eq!(args.pairing_id, Some(pairing_id));
             }
@@ -2928,7 +2928,7 @@ mod tests {
         let output = render_channel_pairing_list(&ChannelPairingListResponse {
             pairings: vec![ChannelPairingView {
                 pairing_id,
-                channel_id: "terminal".to_string(),
+                channel_id: "loopback".to_string(),
                 sender_ref: Some("alice".to_string()),
                 conversation_ref: Some("chat-1".to_string()),
                 thread_ref: None,
@@ -2940,7 +2940,7 @@ mod tests {
             }],
             grants: vec![ChannelGrantView {
                 grant_id,
-                channel_id: "terminal".to_string(),
+                channel_id: "loopback".to_string(),
                 sender_ref: Some("alice".to_string()),
                 conversation_ref: Some("chat-1".to_string()),
                 thread_ref: None,
@@ -3038,8 +3038,8 @@ mod tests {
         let home = LionClawHome::new(temp_dir.path().join(".lionclaw"));
         let mut config = OperatorConfig::default();
         config.upsert_channel(crate::operator::config::ManagedChannelConfig {
-            id: "terminal".to_string(),
-            skill: "terminal".to_string(),
+            id: "loopback".to_string(),
+            skill: "loopback".to_string(),
             launch_mode: ChannelLaunchMode::Interactive,
             worker: crate::operator::channel_metadata::DEFAULT_CHANNEL_WORKER.to_string(),
             required_env: Vec::new(),
@@ -3059,7 +3059,7 @@ mod tests {
             .expect("channel list");
 
         assert!(rendered.contains("instance: main"));
-        assert!(rendered.contains("terminal"));
+        assert!(rendered.contains("loopback"));
         assert!(rendered.contains("interactive"));
         assert!(rendered.contains("telegram"));
         assert!(rendered.contains("background"));
@@ -3202,12 +3202,12 @@ mod tests {
             runtime_bin: "codex".to_string(),
             podman_bin: Some("/usr/bin/podman".to_string()),
             runtime_image: "project-runtime:v1".to_string(),
-            terminal_alias: "terminal".to_string(),
-            terminal_source: root
-                .join("skills/channel-terminal")
+            channel_alias: "test-channel".to_string(),
+            channel_source: root
+                .join("skills/channel-fixture")
                 .to_string_lossy()
                 .to_string(),
-            channel_id: "terminal".to_string(),
+            channel_id: "test-channel".to_string(),
             launch_mode: "interactive".to_string(),
             project_skills: Vec::new(),
         }
@@ -3263,11 +3263,11 @@ mod tests {
     async fn project_validate_reports_existing_skill_source_mismatch() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join("home"));
-        let skill_dir = home.skills_dir().join("terminal");
+        let skill_dir = home.skills_dir().join("test-channel");
         std::fs::create_dir_all(&skill_dir).expect("skill dir");
         std::fs::write(
             skill_dir.join(SKILL_INSTALL_METADATA_FILE),
-            "source = \"local:/other/channel-terminal\"\n",
+            "source = \"local:/other/channel-fixture\"\n",
         )
         .expect("skill metadata");
         let args = project_validate_args(temp_dir.path());
@@ -3278,14 +3278,14 @@ mod tests {
 
         assert!(issues
             .iter()
-            .any(|issue| issue.contains("skill \"terminal\" has source")));
+            .any(|issue| issue.contains("skill \"test-channel\" has source")));
     }
 
     #[tokio::test]
     async fn project_validate_reports_existing_skill_metadata_missing_source() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join("home"));
-        let skill_dir = home.skills_dir().join("terminal");
+        let skill_dir = home.skills_dir().join("test-channel");
         std::fs::create_dir_all(&skill_dir).expect("skill dir");
         std::fs::write(
             skill_dir.join(SKILL_INSTALL_METADATA_FILE),
@@ -3300,7 +3300,7 @@ mod tests {
 
         assert!(issues
             .iter()
-            .any(|issue| issue.contains("skill \"terminal\" has source=\"\"")));
+            .any(|issue| issue.contains("skill \"test-channel\" has source=\"\"")));
     }
 
     #[test]

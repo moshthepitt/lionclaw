@@ -770,7 +770,7 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
         .await
         .expect("bootstrap assistant workspace");
     install_skill(&env, "job-scope-reader").await;
-    install_and_bind_channel(&env, "terminal", "terminal-delivery").await;
+    install_and_bind_channel(&env, "loopback", "loopback-delivery").await;
     let kernel = env
         .kernel_with_options(KernelOptions {
             workspace_root: Some(env.workspace_root()),
@@ -778,18 +778,18 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
             ..KernelOptions::default()
         })
         .await;
-    approve_channel_grant(&kernel, "terminal", "alice").await;
-    let terminal_session_key = "channel:terminal:direct:alice".to_string();
+    approve_channel_grant(&kernel, "loopback", "alice").await;
+    let loopback_session_key = "channel:loopback:direct:alice".to_string();
 
     let seed_session = kernel
         .open_session(SessionOpenRequest {
-            channel_id: "terminal".to_string(),
-            peer_id: terminal_session_key.clone(),
+            channel_id: "loopback".to_string(),
+            peer_id: loopback_session_key.clone(),
             trust_tier: TrustTier::Main,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
         .await
-        .expect("seed interactive terminal session");
+        .expect("seed interactive loopback session");
 
     let created = kernel
         .create_job(JobCreateRequest {
@@ -801,7 +801,7 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
             prompt_text: "please use job-scope-reader [cap:fs.read]".to_string(),
             allow_capabilities: vec!["fs.read".to_string()],
             delivery: Some(lionclaw::contracts::JobDeliveryTargetDto {
-                channel_id: "terminal".to_string(),
+                channel_id: "loopback".to_string(),
                 conversation_ref: "alice".to_string(),
                 thread_ref: None,
                 reply_to_ref: None,
@@ -838,25 +838,25 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
         Some(true)
     );
 
-    let latest_terminal = kernel
+    let latest_loopback = kernel
         .latest_session_snapshot(SessionLatestQuery {
-            channel_id: "terminal".to_string(),
-            peer_id: terminal_session_key,
+            channel_id: "loopback".to_string(),
+            peer_id: loopback_session_key,
             history_policy: Some(SessionHistoryPolicy::Interactive),
         })
         .await
-        .expect("load latest terminal session");
+        .expect("load latest loopback session");
     assert_eq!(
-        latest_terminal
+        latest_loopback
             .session
-            .expect("terminal session")
+            .expect("loopback session")
             .session_id,
         seed_session.session_id
     );
 
     let outbox = kernel
         .pull_channel_outbox(ChannelOutboxPullRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             worker_id: "scheduler-test".to_string(),
             conversation_ref: None,
             thread_ref: None,
@@ -864,7 +864,7 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
             lease_ms: Some(120_000),
         })
         .await
-        .expect("pull terminal outbox");
+        .expect("pull loopback outbox");
     assert_eq!(outbox.deliveries.len(), 1);
     assert_eq!(outbox.deliveries[0].conversation_ref, "alice");
     assert!(outbox.deliveries[0].content.text.contains("[mock]"));
@@ -909,7 +909,7 @@ async fn scheduled_job_capabilities_are_job_scoped_and_delivery_keeps_interactiv
 #[tokio::test]
 async fn scheduled_job_failure_delivers_summary_and_dead_letters() {
     let env = TestEnv::new();
-    install_and_bind_channel(&env, "terminal", "terminal-failure").await;
+    install_and_bind_channel(&env, "loopback", "loopback-failure").await;
     let kernel = env.kernel().await;
     kernel
         .register_runtime_adapter("always-fail", Arc::new(AlwaysFailRuntimeAdapter))
@@ -925,7 +925,7 @@ async fn scheduled_job_failure_delivers_summary_and_dead_letters() {
             prompt_text: "this will fail".to_string(),
             allow_capabilities: Vec::new(),
             delivery: Some(lionclaw::contracts::JobDeliveryTargetDto {
-                channel_id: "terminal".to_string(),
+                channel_id: "loopback".to_string(),
                 conversation_ref: "bob".to_string(),
                 thread_ref: None,
                 reply_to_ref: None,
@@ -967,7 +967,7 @@ async fn scheduled_job_failure_delivers_summary_and_dead_letters() {
 
     let outbox = kernel
         .pull_channel_outbox(ChannelOutboxPullRequest {
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             worker_id: "scheduler-failure-test".to_string(),
             conversation_ref: None,
             thread_ref: None,
@@ -986,7 +986,7 @@ async fn scheduled_job_failure_delivers_summary_and_dead_letters() {
         .report_channel_outbox(ChannelOutboxReportRequest {
             delivery_id: outbox.deliveries[0].delivery_id,
             attempt_id: outbox.deliveries[0].attempt_id,
-            channel_id: "terminal".to_string(),
+            channel_id: "loopback".to_string(),
             worker_id: "scheduler-failure-test".to_string(),
             outcome: ChannelOutboxReportOutcomeDto::Delivered,
             provider_receipt: Some(serde_json::json!({"message_id": "provider-1"})),

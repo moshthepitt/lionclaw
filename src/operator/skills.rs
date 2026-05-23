@@ -166,17 +166,17 @@ mod tests {
     async fn list_installed_skills_reports_metadata_and_invalid_entries() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join("home"));
-        let terminal = home.skills_dir().join("terminal");
+        let loopback = home.skills_dir().join("loopback");
         let broken = home.skills_dir().join("broken");
-        tokio::fs::create_dir_all(&terminal)
+        tokio::fs::create_dir_all(&loopback)
             .await
-            .expect("terminal dir");
+            .expect("loopback dir");
         tokio::fs::create_dir_all(&broken)
             .await
             .expect("broken dir");
         tokio::fs::write(
-            terminal.join(SKILL_INSTALL_METADATA_FILE),
-            "source = \"local:/skills/terminal\"\nreference = \"local\"\n",
+            loopback.join(SKILL_INSTALL_METADATA_FILE),
+            "source = \"local:/skills/loopback\"\nreference = \"local\"\n",
         )
         .await
         .expect("metadata");
@@ -186,8 +186,8 @@ mod tests {
         assert_eq!(skills.len(), 2);
         assert_eq!(skills[0].alias, "broken");
         assert!(matches!(skills[0].status, SkillStatus::Invalid(_)));
-        assert_eq!(skills[1].alias, "terminal");
-        assert_eq!(skills[1].source.as_deref(), Some("local:/skills/terminal"));
+        assert_eq!(skills[1].alias, "loopback");
+        assert_eq!(skills[1].source.as_deref(), Some("local:/skills/loopback"));
         assert_eq!(skills[1].reference.as_deref(), Some("local"));
         assert_eq!(skills[1].status, SkillStatus::Ready);
     }

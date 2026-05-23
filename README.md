@@ -179,8 +179,8 @@ the current instance commands.
 ## Channels And Background Work
 
 Channels are skills that run outside the Rust core. They connect LionClaw to a
-transport without baking Telegram, terminal UI, Slack, or future integrations
-into the trusted kernel.
+transport without baking Telegram, Slack, or future integrations into the
+trusted kernel.
 
 Interactive channels run in the current terminal. Background channels are
 managed through the platform backend and store required channel env in the
