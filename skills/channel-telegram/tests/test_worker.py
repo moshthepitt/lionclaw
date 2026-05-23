@@ -8333,6 +8333,64 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker._active_turns, {})
         self.assertEqual(worker._route_turns, {})
 
+    async def test_final_delivery_cannot_reopen_progress_while_reacting(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            telegram = BlockingReactionTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=FakeLionClawApi(),
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            progress_ref = await self._remember_visible_progress(worker)
+            turn = worker._active_turns["turn-1"]
+            turn.status_text = "Finishing"
+            turn.expects_outbox_delivery = True
+            telegram.block_reactions = True
+
+            delivery = asyncio.create_task(
+                worker._process_outbox_delivery(
+                    OutboxDelivery(
+                        delivery_id="delivery-1",
+                        attempt_id="attempt-1",
+                        conversation_ref="telegram:chat:77",
+                        turn_id="turn-1",
+                        content=OutboxContent(
+                            text="",
+                            attachments=[
+                                OutboxAttachment(
+                                    attachment_id="artifact-1",
+                                    path="/tmp/chart.png",
+                                    filename="chart.png",
+                                    mime_type="image/png",
+                                )
+                            ],
+                        ),
+                    )
+                )
+            )
+            await telegram.reaction_started.wait()
+            await worker.refresh_progress_messages()
+            telegram.release_reaction.set()
+            await delivery
+
+        self.assertEqual(
+            telegram.sent_messages,
+            [
+                ("telegram:chat:77", "Queued...", "telegram:message:70", None, []),
+                ("telegram:chat:77", "", None, None, ["/tmp/chart.png"]),
+            ],
+        )
+        self.assertEqual(
+            telegram.deleted_messages,
+            [("telegram:chat:77", progress_ref)],
+        )
+        self.assertEqual(worker._active_turns, {})
+        self.assertEqual(worker._route_turns, {})
+
     async def test_long_turn_creates_edits_and_deletes_one_progress_message(
         self,
     ) -> None:
@@ -12094,6 +12152,27 @@ class BlockingProgressTelegramTransport(FakeTelegramTransport):
             )
         )
         return {"message_id": 202, "chat_id": conversation_ref}
+
+
+class BlockingReactionTelegramTransport(FakeTelegramTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_reactions = False
+        self.reaction_started = asyncio.Event()
+        self.release_reaction = asyncio.Event()
+
+    async def set_reaction(
+        self,
+        conversation_ref: str,
+        message_ref: str,
+        emoji: str,
+    ) -> None:
+        if not self.block_reactions:
+            await super().set_reaction(conversation_ref, message_ref, emoji)
+            return
+        self.reaction_started.set()
+        await self.release_reaction.wait()
+        await super().set_reaction(conversation_ref, message_ref, emoji)
 
 
 def _utf16_len(text: str) -> int:

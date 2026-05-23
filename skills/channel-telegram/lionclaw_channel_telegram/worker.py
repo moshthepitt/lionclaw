@@ -1923,8 +1923,7 @@ class TelegramWorker:
         if result.turn_id is None:
             if active.provisional_message_ref is not None:
                 await self._delete_progress_message(active)
-            active.terminal = True
-            self._forget_turn(active)
+            self._retire_turn(active)
             await self._reply(update, "No active LionClaw turn is running here.")
 
     async def _send_status(self, update: TelegramInboundUpdate) -> None:
@@ -2412,8 +2411,7 @@ class TelegramWorker:
                 turn.terminal_text is not None
                 and turn.last_rendered_text == turn.terminal_text
             ):
-                turn.terminal = True
-                self._forget_turn(turn)
+                self._retire_turn(turn)
 
     async def _ensure_progress_message(
         self,
@@ -2681,8 +2679,7 @@ class TelegramWorker:
     async def _finish_terminal_progress_turn(self, turn: ActiveTurn, text: str) -> None:
         render_result = await self._ensure_progress_message(turn, force=True)
         if render_result == ProgressRenderResult.RENDERED:
-            turn.terminal = True
-            self._forget_turn(turn)
+            self._retire_turn(turn)
             return
         if render_result == ProgressRenderResult.RETRYABLE_FAILED:
             return
@@ -2691,8 +2688,7 @@ class TelegramWorker:
             if not fallback_sent:
                 return
             await self._delete_progress_message(turn)
-        turn.terminal = True
-        self._forget_turn(turn)
+        self._retire_turn(turn)
 
     async def _send_progress_fallback(self, turn: ActiveTurn, text: str) -> bool:
         try:
@@ -2801,6 +2797,10 @@ class TelegramWorker:
         if self._route_turns.get(turn.target.key) == turn.turn_id:
             self._route_turns.pop(turn.target.key, None)
         self._save_active_turns()
+
+    def _retire_turn(self, turn: ActiveTurn) -> None:
+        turn.terminal = True
+        self._forget_turn(turn)
 
     def _is_current_generation(self, turn: ActiveTurn) -> bool:
         return self._route_generations.get(turn.target.key) == turn.generation
@@ -3110,6 +3110,7 @@ class TelegramWorker:
         final_delivery: bool = False,
         progress_delete: ProgressDeleteResult = ProgressDeleteResult.SKIPPED,
     ) -> None:
+        self._retire_turn(turn)
         if turn.provisional_message_ref is not None:
             if final_delivery:
                 if progress_delete == ProgressDeleteResult.SKIPPED:
@@ -3122,8 +3123,6 @@ class TelegramWorker:
                 await self._mark_successful_progress_message(turn)
                 await self._delete_progress_message(turn)
         await self._set_turn_reaction(turn, REACTION_COMPLETED)
-        turn.terminal = True
-        self._forget_turn(turn)
 
     async def _mark_successful_progress_message(self, turn: ActiveTurn) -> bool:
         if turn.provisional_message_ref is None:
