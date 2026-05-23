@@ -239,22 +239,24 @@ Expected when credentials are available:
 - a group invite shaped like
   `https://t.me/<bot_username>?startgroup=lc_<token>` claims where Telegram
   exposes the payload to the bot
-- in DM, `/settings` shows a `Connect group` button that creates a short-lived
-  one-use `startgroup` link; the link can be opened by the host or shared with a
-  trusted group admin
-- in groups, `/ask@<bot_username> message` strips the Telegram envelope and
-  submits only `message` to the runtime
+- in DM, `/settings` is account/channel focused, while `/connections` shows a
+  `Connect group` button that creates a short-lived one-use `startgroup` link;
+  the link can be opened by the host or shared with a trusted group admin
+- in connected groups, chat-scoped menu commands are installed so `/ask message`
+  strips the Telegram envelope and submits only `message` to the runtime; empty
+  `/ask` opens a Telegram reply prompt
 - in connected groups, only Telegram accounts that are also connected as
-  approved direct hosts can run `/ask@<bot_username>`, runtime slash commands,
-  or LionClaw group controls
+  approved direct hosts can run `/ask`, runtime slash commands, or LionClaw
+  group controls
 - unknown targeted Telegram groups receive a clean "not connected" setup hint
   without exposing `pc_...` approval codes, and no provider files are downloaded
   before approval
 - Telegram delivery works through the configured runtime after scoped grant
   approval
-- `/help`, `/status`, `/stop`, and `/settings` behave as documented:
-  Telegram-local commands stay local, `/lionclaw reset` and `/lionclaw retry`
-  enter LionClaw as canonical controls, and `/compact` reaches the runtime
+- `/help`, `/status`, `/stop`, `/settings`, and `/connections` behave as
+  documented: Telegram-local commands stay local, `/lionclaw reset` and
+  `/lionclaw retry` enter LionClaw as canonical controls, and `/compact` reaches
+  the runtime
 - inline buttons for status and stop acknowledge clicks without leaking
   controls across users, chats, or forum topics
 - a forum topic with a thread grant keeps replies in the same Telegram topic
