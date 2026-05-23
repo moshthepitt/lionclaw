@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn ignores_local_runtime_cache_directories() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let source_dir = write_skill_source(temp_dir.path(), "channel-terminal");
+        let source_dir = write_skill_source(temp_dir.path(), "channel-fixture");
         fs::create_dir_all(source_dir.join(".venv/bin")).expect("venv dir");
         fs::create_dir_all(source_dir.join("pkg/__pycache__")).expect("pycache dir");
         fs::create_dir_all(source_dir.join(".pytest_cache")).expect("pytest cache dir");
@@ -471,7 +471,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let source_dir = write_skill_source(temp_dir.path(), "channel-terminal");
+        let source_dir = write_skill_source(temp_dir.path(), "channel-fixture");
         let outside_assets = temp_dir.path().join("outside-assets");
         fs::create_dir_all(&outside_assets).expect("outside assets");
         fs::write(outside_assets.join("token.txt"), "leaked-token\n").expect("token");
@@ -500,7 +500,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let source_dir = temp_dir.path().join("channel-terminal");
+        let source_dir = temp_dir.path().join("channel-fixture");
         fs::create_dir_all(source_dir.join("scripts")).expect("source dir");
         fs::write(source_dir.join("scripts/worker"), "#!/usr/bin/env bash\n").expect("worker");
         let outside_skill = temp_dir.path().join("outside-SKILL.md");
@@ -534,7 +534,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let source_dir = write_skill_source(temp_dir.path(), "channel-terminal");
+        let source_dir = write_skill_source(temp_dir.path(), "channel-fixture");
         let worker = source_dir.join("scripts/worker");
         fs::set_permissions(&worker, fs::Permissions::from_mode(0o644)).expect("chmod 644");
 
@@ -573,7 +573,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let source_dir = write_skill_source(temp_dir.path(), "channel-terminal");
+        let source_dir = write_skill_source(temp_dir.path(), "channel-fixture");
         let home = crate::home::LionClawHome::new(temp_dir.path().join(".lionclaw"));
         fs::create_dir_all(home.skills_dir()).expect("skills dir");
         let snapshot = install_snapshot(

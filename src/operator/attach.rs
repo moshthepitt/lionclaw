@@ -487,11 +487,11 @@ mod tests {
             "#!/usr/bin/env bash\nif [ \"${1:-}\" = \"image\" ] && [ \"${2:-}\" = \"inspect\" ]; then\n  printf 'sha256:test-runtime-image\\n'\n  exit 0\nfi\nexit 0\n",
         );
 
-        let skill_source = temp_dir.path().join("channel-terminal");
+        let skill_source = temp_dir.path().join("channel-fixture");
         fs::create_dir_all(skill_source.join("scripts")).expect("skill dir");
         fs::write(
             skill_source.join("SKILL.md"),
-            "---\nname: channel-terminal\ndescription: test\n---\n",
+            "---\nname: channel-fixture\ndescription: test\n---\n",
         )
         .expect("skill md");
         write_executable(

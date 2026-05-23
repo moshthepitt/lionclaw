@@ -266,10 +266,10 @@ struct ProjectValidateArgs {
     podman_bin: Option<String>,
     #[arg(long = "runtime-image")]
     runtime_image: String,
-    #[arg(long = "terminal-alias")]
-    terminal_alias: String,
-    #[arg(long = "terminal-source")]
-    terminal_source: String,
+    #[arg(long = "channel-alias")]
+    channel_alias: String,
+    #[arg(long = "channel-source")]
+    channel_source: String,
     #[arg(long = "channel-id")]
     channel_id: String,
     #[arg(long = "launch-mode")]
@@ -2092,10 +2092,10 @@ async fn validate_project_managed_config(
         .iter()
         .find(|channel| channel.id == args.channel_id)
     {
-        if channel.skill != args.terminal_alias {
+        if channel.skill != args.channel_alias {
             issues.push(format!(
                 "channel {:?} has skill={:?}; expected {:?}",
-                args.channel_id, channel.skill, args.terminal_alias
+                args.channel_id, channel.skill, args.channel_alias
             ));
         }
         if channel.launch_mode != expected_launch_mode {
@@ -2110,8 +2110,8 @@ async fn validate_project_managed_config(
 
     let mut expected_skills = BTreeMap::new();
     expected_skills.insert(
-        args.terminal_alias.clone(),
-        format!("local:{}", args.terminal_source),
+        args.channel_alias.clone(),
+        format!("local:{}", args.channel_source),
     );
     for spec in &args.project_skills {
         let (alias, source) = parse_project_skill_spec(spec)?;
@@ -3202,12 +3202,12 @@ mod tests {
             runtime_bin: "codex".to_string(),
             podman_bin: Some("/usr/bin/podman".to_string()),
             runtime_image: "project-runtime:v1".to_string(),
-            terminal_alias: "terminal".to_string(),
-            terminal_source: root
-                .join("skills/channel-terminal")
+            channel_alias: "test-channel".to_string(),
+            channel_source: root
+                .join("skills/channel-fixture")
                 .to_string_lossy()
                 .to_string(),
-            channel_id: "terminal".to_string(),
+            channel_id: "test-channel".to_string(),
             launch_mode: "interactive".to_string(),
             project_skills: Vec::new(),
         }
@@ -3263,11 +3263,11 @@ mod tests {
     async fn project_validate_reports_existing_skill_source_mismatch() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join("home"));
-        let skill_dir = home.skills_dir().join("terminal");
+        let skill_dir = home.skills_dir().join("test-channel");
         std::fs::create_dir_all(&skill_dir).expect("skill dir");
         std::fs::write(
             skill_dir.join(SKILL_INSTALL_METADATA_FILE),
-            "source = \"local:/other/channel-terminal\"\n",
+            "source = \"local:/other/channel-fixture\"\n",
         )
         .expect("skill metadata");
         let args = project_validate_args(temp_dir.path());
@@ -3278,14 +3278,14 @@ mod tests {
 
         assert!(issues
             .iter()
-            .any(|issue| issue.contains("skill \"terminal\" has source")));
+            .any(|issue| issue.contains("skill \"test-channel\" has source")));
     }
 
     #[tokio::test]
     async fn project_validate_reports_existing_skill_metadata_missing_source() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let home = LionClawHome::new(temp_dir.path().join("home"));
-        let skill_dir = home.skills_dir().join("terminal");
+        let skill_dir = home.skills_dir().join("test-channel");
         std::fs::create_dir_all(&skill_dir).expect("skill dir");
         std::fs::write(
             skill_dir.join(SKILL_INSTALL_METADATA_FILE),
@@ -3300,7 +3300,7 @@ mod tests {
 
         assert!(issues
             .iter()
-            .any(|issue| issue.contains("skill \"terminal\" has source=\"\"")));
+            .any(|issue| issue.contains("skill \"test-channel\" has source=\"\"")));
     }
 
     #[test]

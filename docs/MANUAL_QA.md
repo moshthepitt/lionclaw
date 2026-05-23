@@ -4,6 +4,11 @@ This is the live acceptance checklist for behavior-changing LionClaw work. It
 uses product commands first and keeps platform commands only for environment
 evidence.
 
+The local runtime, project, instance, job, background-daemon, and doctor phases
+are runnable without a configured external channel. Provider-channel acceptance
+requires real provider credentials and a real provider conversation; record
+those checks as skipped when credentials are unavailable.
+
 Record each phase as:
 
 ```text
@@ -205,25 +210,7 @@ Expected:
 - the answer is `project-b`
 - project B does not reuse project A work-root state
 
-## Phase 5: Channels
-
-From project A, attach the terminal channel:
-
-```bash
-cd "$PROJ_A"
-"$LIONCLAW_BIN" connect terminal
-```
-
-Approve the peer with the command printed by the terminal worker, then send a
-message through the terminal UI.
-
-Expected:
-
-- scoped grant approval is explicit
-- the channel response comes from the configured runtime
-- `lionclaw logs -f` can inspect the selected instance without raw HTTP
-- `doctor` surfaces channel pairing/outbox state and worker health without
-  contacting provider APIs
+## Phase 5: Provider Channels
 
 Telegram is credential-gated manual QA. Run it only when a real bot token and
 chat flow are available; do not fake Telegram with local shims in this
@@ -240,6 +227,11 @@ Expected when credentials are available:
 - the default runtime image can run common assistant probes such as
   `codex --version`, `opencode --version`, `python3 --version`,
   `ffprobe -version`, `file --version`, `jq --version`, and `pdftotext -v`
+- scoped grant approval is explicit
+- the channel response comes from the configured runtime
+- `lionclaw logs -f` can inspect the selected instance without raw HTTP
+- `doctor` surfaces channel pairing/outbox state and worker health without
+  contacting provider APIs
 - the token is stored in selected-instance private channel env
 - `doctor` does not print the token and shows the latest Telegram worker health
   report after the worker has submitted one
@@ -284,10 +276,11 @@ cd "$PROJ_A"
 Expected:
 
 - the managed daemon is active
-- configured background workers are active
+- configured background workers are active when a background provider channel
+  was configured
 - `doctor` reports stable `[LC-D...]` findings when there is drift
-- `doctor` warns when a configured background channel has no worker health
-  report or its latest report is more than ten minutes old
+- `doctor` warns when a configured background provider channel has no worker
+  health report or its latest report is more than ten minutes old
 - `doctor` does not repair, start, stop, allocate, or rewrite state
 - `down` stops only units owned by the selected instance
 
@@ -300,16 +293,14 @@ journalctl --user -u 'lionclaw*.service' -n 100 --no-pager
 
 ## Phase 7: Jobs
 
-With the terminal channel available:
+Create and run a local job:
 
 ```bash
 cd "$PROJ_A"
 "$LIONCLAW_BIN" job add qa-brief \
   --runtime codex \
   --schedule "every 1d" \
-  --prompt "Reply with exactly JOB_OK and nothing else." \
-  --deliver-channel terminal \
-  --deliver-conversation "${USER:-local}"
+  --prompt "Reply with exactly JOB_OK and nothing else."
 "$LIONCLAW_BIN" job ls
 "$LIONCLAW_BIN" job run qa-brief
 "$LIONCLAW_BIN" job runs qa-brief
@@ -319,8 +310,10 @@ cd "$PROJ_A"
 Expected:
 
 - manual job run succeeds
-- delivery is enqueued, then reaches the approved channel conversation after the worker reports provider delivery
 - job history is visible through the CLI
+- if a provider channel was configured in Phase 5, a separate delivery job can
+  target that approved conversation and should reach the provider through the
+  outbox lease/report flow
 
 ## Phase 8: Doctor Diagnostics
 

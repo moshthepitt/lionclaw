@@ -74,9 +74,8 @@ Instead, LionClaw constrains the runtime launch:
 ### Skill-Owned Edges
 
 Skills are installable packages of instructions, channel workers, and
-integration logic. Channels are skills. Telegram, terminal UI, and future
-transports stay outside the trusted Rust core and integrate through kernel
-APIs.
+integration logic. Channels are skills. Telegram and future transports stay
+outside the trusted Rust core and integrate through kernel APIs.
 
 Skill text can influence prompt context. It cannot grant permissions.
 
@@ -440,9 +439,8 @@ External channel skills integrate over HTTP:
    Deliveries carry `conversation_ref`, optional `thread_ref`, optional
    `reply_to_ref`, `content`, and a stable `delivery_id`. Each pull creates an
    `attempt_id`; workers perform one provider send attempt per lease. Pulls may
-   optionally scope to a `conversation_ref` / `thread_ref` so interactive
-   per-peer workers, such as the terminal channel, do not lease another peer's
-   delivery.
+   optionally scope to a `conversation_ref` / `thread_ref` so per-peer workers
+   do not lease another peer's delivery.
 7. `POST /v0/channels/outbox/report` records provider outcomes. `delivered`
    stores provider receipt data, `retryable_failed` returns the delivery to
    kernel-owned exponential backoff, and `terminal_failed` closes it. Stale

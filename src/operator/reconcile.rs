@@ -1979,7 +1979,7 @@ mod tests {
         let runtime_stub = temp_dir.path().join("codex-stub.sh");
         fs::write(&runtime_stub, "#!/usr/bin/env bash\ncat >/dev/null\n").expect("runtime stub");
         make_executable(&runtime_stub);
-        let skill_source = write_skill_source(temp_dir.path(), "channel-terminal", "test", true);
+        let skill_source = write_skill_source(temp_dir.path(), "channel-fixture", "test", true);
 
         config.runtimes = [("codex".to_string(), test_codex_runtime(&runtime_stub))]
             .into_iter()
@@ -1991,7 +1991,7 @@ mod tests {
         write_test_codex_auth(&home).await;
         add_skill(
             &home,
-            "terminal".to_string(),
+            "test-channel".to_string(),
             skill_source.to_string_lossy().to_string(),
             "local".to_string(),
         )
@@ -1999,8 +1999,8 @@ mod tests {
         .expect("install skill");
         add_channel(
             &home,
-            "terminal".to_string(),
-            "terminal".to_string(),
+            "test-channel".to_string(),
+            "test-channel".to_string(),
             ChannelLaunchMode::Interactive,
             Vec::new(),
         )
@@ -2025,7 +2025,7 @@ mod tests {
         assert_eq!(state.applied_state.channels().len(), 1);
         assert_eq!(
             manager
-                .unit_status("lionclaw-channel-terminal.service")
+                .unit_status("lionclaw-channel-test-channel.service")
                 .await
                 .expect("unit status"),
             "not-found"
