@@ -29,6 +29,7 @@ from aiogram.exceptions import (
 from aiogram.types import Update
 
 from lionclaw_channel_telegram.api import (
+    ActorAuthorizeResponse,
     AttachmentMissingReport,
     HealthCheck,
     InboundResponse,
@@ -1735,13 +1736,17 @@ class TelegramWorker:
                 and not _is_private_update(update)
             ):
                 update = _with_command_trigger(update, command)
+                if not await self._authorize_command_actor(
+                    update,
+                    command=command,
+                ):
+                    return True
                 if not command.arguments and not update.attachments:
-                    if await self._authorize_command_actor(update):
-                        await self._reply(
-                            update,
-                            _ask_prompt_text(),
-                            reply_prompt="Ask LionClaw",
-                        )
+                    await self._reply(
+                        update,
+                        _ask_prompt_text(),
+                        reply_prompt="Ask LionClaw",
+                    )
                     return True
                 update = replace(update, text=command.arguments or None)
                 prompt_command_handled = True
@@ -1754,6 +1759,8 @@ class TelegramWorker:
                     update = _with_command_trigger(update, command)
                     if runtime_text != update.text:
                         update = replace(update, text=runtime_text)
+                elif not _is_private_update(update):
+                    return True
 
         try:
             response = await self.lionclaw_api.send_inbound(update)
@@ -1833,9 +1840,14 @@ class TelegramWorker:
             "settings",
         }:
             return True
-        return await self._authorize_command_actor(update)
+        return await self._authorize_command_actor(update, command=command)
 
-    async def _authorize_command_actor(self, update: TelegramInboundUpdate) -> bool:
+    async def _authorize_command_actor(
+        self,
+        update: TelegramInboundUpdate,
+        *,
+        command: TelegramCommand | None = None,
+    ) -> bool:
         try:
             response = await self.lionclaw_api.authorize_actor(update)
         except Exception:
@@ -1851,6 +1863,8 @@ class TelegramWorker:
             return True
         if response.reason_code == "blocked_grant":
             await self._reply(update, "This Telegram access is blocked.")
+            return False
+        if _should_ignore_bare_unconnected_group_command(update, command, response):
             return False
         await self._notify_pending_approval(update, response.reason_code, None)
         return False
@@ -1935,10 +1949,11 @@ class TelegramWorker:
         await self._reply(
             update,
             "Telegram channel settings\n"
-            "Mode: groups use addressed commands and replies.\n\n"
+            "Mode: groups use the command menu, addressed commands, and replies.\n\n"
             "/ask message - ask LionClaw\n"
             "/status - current turn\n"
             "/stop - stop active turn\n\n"
+            f"{_group_command_addressing_hint(update)}\n\n"
             "To connect a new group, ask a connected LionClaw host to open "
             "/connections in DM and create a group connection link.",
         )
@@ -1973,6 +1988,7 @@ class TelegramWorker:
                 "/status - current turn\n"
                 "/stop - stop active turn\n"
                 "/settings - group settings\n\n"
+                f"{_group_command_addressing_hint(update)}\n\n"
                 "Reply to a LionClaw message to continue that conversation.",
             )
             return
@@ -2405,7 +2421,7 @@ class TelegramWorker:
         *,
         force: bool = False,
     ) -> ProgressRenderResult:
-        if not self._is_current_generation(turn):
+        if not self._is_live_turn(turn):
             return ProgressRenderResult.TERMINAL_FAILED
         text = _progress_text(turn)
         if turn.provisional_message_ref is None:
@@ -2425,7 +2441,11 @@ class TelegramWorker:
                 if _is_permanent_send_failure(err):
                     return ProgressRenderResult.TERMINAL_FAILED
                 return ProgressRenderResult.RETRYABLE_FAILED
-            turn.provisional_message_ref = _receipt_message_ref(receipt)
+            message_ref = _receipt_message_ref(receipt)
+            if not self._is_live_turn(turn):
+                await self._delete_orphaned_progress_message(turn, message_ref)
+                return ProgressRenderResult.TERMINAL_FAILED
+            turn.provisional_message_ref = message_ref
             turn.last_rendered_text = text
             turn.last_edit_at = _loop_time()
             self._save_active_turns()
@@ -2492,6 +2512,19 @@ class TelegramWorker:
         turn.last_edit_at = 0.0
         turn.can_edit = True
         self._save_active_turns()
+
+    async def _delete_orphaned_progress_message(
+        self,
+        turn: ActiveTurn,
+        message_ref: str,
+    ) -> None:
+        pending = PendingProgressDelete(
+            turn_id=turn.turn_id,
+            conversation_ref=turn.target.conversation_ref,
+            message_ref=message_ref,
+        )
+        if not await self._delete_progress_ref(pending):
+            self._schedule_progress_delete(pending)
 
     async def _delete_progress_message(self, turn: ActiveTurn) -> bool:
         if turn.provisional_message_ref is None:
@@ -2771,6 +2804,13 @@ class TelegramWorker:
 
     def _is_current_generation(self, turn: ActiveTurn) -> bool:
         return self._route_generations.get(turn.target.key) == turn.generation
+
+    def _is_live_turn(self, turn: ActiveTurn) -> bool:
+        return (
+            self._active_turns.get(turn.turn_id) is turn
+            and not turn.terminal
+            and self._is_current_generation(turn)
+        )
 
     def _remember_typing_route(self, update: TelegramInboundUpdate) -> None:
         target = TypingTarget(update.conversation_ref, update.thread_ref)
@@ -3837,6 +3877,24 @@ def _telegram_command_is_addressed(
     return update.trigger in {"mention", "reply_to_bot", "thread_continuation"}
 
 
+def _should_ignore_bare_unconnected_group_command(
+    update: TelegramInboundUpdate,
+    command: TelegramCommand | None,
+    response: ActorAuthorizeResponse,
+) -> bool:
+    if (
+        command is None
+        or _is_private_update(update)
+        or command.target_username is not None
+    ):
+        return False
+    if update.provider_metadata.get("leading_command") != command.name:
+        return False
+    if update.trigger in {"mention", "reply_to_bot", "thread_continuation"}:
+        return False
+    return response.reason_code not in {"actor_approval_required", "blocked_grant"}
+
+
 def _with_command_trigger(
     update: TelegramInboundUpdate,
     command: TelegramCommand,
@@ -3862,6 +3920,18 @@ def _is_private_update(update: TelegramInboundUpdate) -> bool:
 
 def _ask_prompt_text() -> str:
     return "Reply with the message for LionClaw."
+
+
+def _group_command_addressing_hint(update: TelegramInboundUpdate) -> str:
+    username = update.provider_metadata.get("bot_username")
+    if isinstance(username, str) and username:
+        return (
+            f"Multi-bot groups: type /command@{username} when entering commands "
+            "manually."
+        )
+    return (
+        "Multi-bot groups: type /command@bot_username when entering commands manually."
+    )
 
 
 def _progress_threshold_seconds(update: TelegramInboundUpdate) -> float:

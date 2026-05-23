@@ -4899,6 +4899,104 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram.group_commands_configured, ["telegram:chat:-10077"])
         self.assertIn("No active LionClaw turn", telegram.sent_messages[0][1])
 
+    async def test_bare_group_command_is_ignored_when_group_is_unconnected(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(
+                authorize_actor_response=ActorAuthorizeResponse(
+                    authorized=False,
+                    reason_code="conversation_approval_required",
+                )
+            )
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 91014,
+                            "message": {
+                                "message_id": 114,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/status",
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len("/status"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertEqual(len(api.authorized_actors), 1)
+        self.assertEqual(telegram.sent_messages, [])
+
+    async def test_addressed_group_command_explains_unconnected_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(
+                authorize_actor_response=ActorAuthorizeResponse(
+                    authorized=False,
+                    reason_code="conversation_approval_required",
+                )
+            )
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 91015,
+                            "message": {
+                                "message_id": 115,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/status@lionclaw_bot",
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len("/status@lionclaw_bot"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertEqual(len(api.authorized_actors), 1)
+        self.assertIn("not connected to this group", telegram.sent_messages[0][1])
+
     async def test_group_local_commands_require_approved_actor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi(
@@ -5348,6 +5446,56 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram.sent_reply_prompts, [None])
         self.assertIn("not connected as a LionClaw host", telegram.sent_messages[0][1])
 
+    async def test_bare_group_ask_with_text_is_ignored_when_group_is_unconnected(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi(
+                authorize_actor_response=ActorAuthorizeResponse(
+                    authorized=False,
+                    reason_code="conversation_approval_required",
+                )
+            )
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 91073,
+                            "message": {
+                                "message_id": 173,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/ask hello",
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len("/ask"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertEqual(len(api.authorized_actors), 1)
+        self.assertEqual(telegram.sent_messages, [])
+
     async def test_private_ask_command_passes_through_to_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
@@ -5697,6 +5845,48 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api.sent_inbound), 1)
         self.assertEqual(api.sent_inbound[0].text, "/compact")
 
+    async def test_bare_group_runtime_command_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api = FakeLionClawApi()
+            telegram = FakeTelegramTransport(
+                updates=[
+                    Update.model_validate(
+                        {
+                            "update_id": 932,
+                            "message": {
+                                "message_id": 32,
+                                "date": 0,
+                                "chat": {"id": -10077, "type": "supergroup"},
+                                "from": {
+                                    "id": 77,
+                                    "is_bot": False,
+                                    "first_name": "Alice",
+                                },
+                                "text": "/compact",
+                                "entities": [
+                                    {
+                                        "type": "bot_command",
+                                        "offset": 0,
+                                        "length": len("/compact"),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                ]
+            )
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=api,
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+
+            await worker.process_updates()
+
+        self.assertEqual(api.sent_inbound, [])
+        self.assertEqual(telegram.sent_messages, [])
+
     async def test_targeted_runtime_command_strips_bot_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
@@ -5934,7 +6124,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api.sent_inbound), 1)
         self.assertEqual(api.sent_inbound[0].text, "/compact")
 
-    async def test_leading_mention_command_targeting_other_bot_passes_through(
+    async def test_leading_mention_command_targeting_other_bot_is_ignored(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5980,11 +6170,10 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
             await worker.process_updates()
 
-        self.assertEqual(len(api.sent_inbound), 1)
-        self.assertEqual(api.sent_inbound[0].text, "@lionclaw_bot /stop@other_bot")
+        self.assertEqual(api.sent_inbound, [])
         self.assertEqual(api.cancel_calls, [])
 
-    async def test_unaddressed_group_local_command_passes_through(self) -> None:
+    async def test_unaddressed_group_local_command_is_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
             telegram = FakeTelegramTransport(
@@ -6016,11 +6205,10 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
             await worker.process_updates()
 
-        self.assertEqual(len(api.sent_inbound), 1)
-        self.assertEqual(api.sent_inbound[0].text, "/stop")
+        self.assertEqual(api.sent_inbound, [])
         self.assertEqual(api.cancel_calls, [])
 
-    async def test_topic_command_targeting_other_bot_passes_through(self) -> None:
+    async def test_topic_command_targeting_other_bot_is_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             api = FakeLionClawApi()
             telegram = FakeTelegramTransport(
@@ -6084,8 +6272,7 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
 
             await worker.process_updates()
 
-        self.assertEqual(len(api.sent_inbound), 1)
-        self.assertEqual(api.sent_inbound[0].text, "/stop@other_bot")
+        self.assertEqual(api.sent_inbound, [])
         self.assertEqual(api.cancel_calls, [])
         self.assertIn("turn-1", worker._active_turns)
 
@@ -7851,6 +8038,78 @@ class TelegramWorkerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(telegram.edited_messages, [])
         self.assertEqual(telegram.deleted_messages, [])
+        self.assertEqual(worker._active_turns, {})
+        self.assertEqual(worker._route_turns, {})
+
+    async def test_in_flight_progress_send_is_deleted_after_final_delivery(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            telegram = BlockingProgressTelegramTransport()
+            worker = TelegramWorker(
+                config=build_config(Path(temp_dir)),
+                lionclaw_api=FakeLionClawApi(),
+                telegram=telegram,
+                offset_store=OffsetStore(Path(temp_dir) / "telegram.offset"),
+            )
+            await worker._remember_active_turn(
+                TelegramInboundUpdate(
+                    update_id=962,
+                    event_id="telegram:update:962",
+                    sender_ref="telegram:user:77",
+                    conversation_ref="telegram:chat:-10077",
+                    message_ref="telegram:message:62",
+                    text="quick group turn",
+                    trigger="command",
+                    provider_metadata={"chat_type": "supergroup"},
+                ),
+                InboundResponse(
+                    outcome="queued",
+                    turn_id="turn-1",
+                    session_id="session-1",
+                    session_key="channel:telegram:conversation:group",
+                ),
+            )
+            worker._active_turns["turn-1"].visible_after = 0.0
+            worker._active_turns["turn-1"].status_text = "Finishing"
+
+            progress = asyncio.create_task(worker.refresh_progress_messages())
+            await telegram.progress_send_started.wait()
+            await worker._process_outbox_delivery(
+                OutboxDelivery(
+                    delivery_id="delivery-1",
+                    attempt_id="attempt-1",
+                    conversation_ref="telegram:chat:-10077",
+                    turn_id="turn-1",
+                    content=OutboxContent(text="final answer"),
+                )
+            )
+            telegram.release_progress_send.set()
+            await progress
+
+        self.assertEqual(
+            telegram.sent_messages,
+            [
+                (
+                    "telegram:chat:-10077",
+                    "final answer",
+                    None,
+                    None,
+                    [],
+                ),
+                (
+                    "telegram:chat:-10077",
+                    "Finishing...",
+                    "telegram:message:62",
+                    None,
+                    [],
+                ),
+            ],
+        )
+        self.assertEqual(
+            telegram.deleted_messages,
+            [("telegram:chat:-10077", "telegram:message:202")],
+        )
         self.assertEqual(worker._active_turns, {})
         self.assertEqual(worker._route_turns, {})
 
@@ -11782,6 +12041,55 @@ class BlockingUpdatesTelegramTransport(FakeTelegramTransport):
         self.poll_started.set()
         await self._release.wait()
         return []
+
+
+class BlockingProgressTelegramTransport(FakeTelegramTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.progress_send_started = asyncio.Event()
+        self.release_progress_send = asyncio.Event()
+
+    async def send_message(
+        self,
+        conversation_ref: str,
+        text: str,
+        reply_to_ref: str | None = None,
+        thread_ref: str | None = None,
+        format_hint: str = "plain",
+        attachments: Sequence[TelegramOutboundAttachment] = (),
+        resume_receipt: dict[str, object] | None = None,
+        buttons: Sequence[TelegramActionButton] = (),
+        reply_prompt: str | None = None,
+    ) -> dict[str, object]:
+        if not buttons:
+            return await super().send_message(
+                conversation_ref,
+                text,
+                reply_to_ref,
+                thread_ref,
+                format_hint=format_hint,
+                attachments=attachments,
+                resume_receipt=resume_receipt,
+                buttons=buttons,
+                reply_prompt=reply_prompt,
+            )
+
+        self.sent_buttons.append(list(buttons))
+        self.sent_reply_prompts.append(reply_prompt)
+        self.resume_receipts.append(resume_receipt)
+        self.progress_send_started.set()
+        await self.release_progress_send.wait()
+        self.sent_format_hints.append(format_hint)
+        self.sent_messages.append(
+            (
+                conversation_ref,
+                text,
+                reply_to_ref,
+                thread_ref,
+                [attachment.path for attachment in attachments],
+            )
+        )
+        return {"message_id": 202, "chat_id": conversation_ref}
 
 
 def _utf16_len(text: str) -> int:
